@@ -1,3 +1,4 @@
+# Python
 .venv/
 venv/
 __pycache__/
@@ -9,11 +10,25 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# Secrets and local env
 .env
 .env.*
 !.env.example
+
+# Data / runtime
 *.sqlite
 *.sqlite3
 .langgraph_api/
 .ipynb_checkpoints/
+
+# OS / copy artifacts
 .DS_Store
+*:Zone.Identifier
+
+# Claude Code: machine-local permission grants (keep .claude/settings.json)
+.claude/settings.local.json
+
+# Serena: local overlay and index cache (keep .serena/project.yml)
+.serena/cache/
+.serena/project.local.yml
