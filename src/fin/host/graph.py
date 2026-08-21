@@ -434,9 +434,12 @@ def compile_graph(
         # Step 2: invoke the model. The script is the source of
         # truth — this is the only place we call the LLM in v1.
         answer_message: BaseMessage = bound_model.invoke(state["messages"])
+        # NOTE: ``evidence`` is intentionally omitted from this return.
+        # The ``operator.add`` reducer in ``AgentState`` only fires when
+        # a node actually returns the key; omitting it leaves the prior
+        # evidence list untouched (tool_node returns the new items).
         return {
             "messages": [answer_message],
-            "evidence": list(state.get("evidence", [])),
             "step_count": next_step,
             "status": "running",
             "repair_count": int(state.get("repair_count", 0)),
