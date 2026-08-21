@@ -18,8 +18,8 @@ fin's role relative to iknow-memory: the caller of `retrieve`, not the search en
 _Avoid_: client, chatbot
 
 **iknow-memory**:
-The existing TypeScript MCP memory server (separate repo). It owns ingest and retrieve algorithms; this repo must not reimplement cosine, hybrid fusion, or RRF.
-_Avoid_: vector backend, knowledge base, our retrieval code
+The existing TypeScript MCP memory server (separate repo). It owns vector ingest and cosine / hybrid / RRF ranking. fin v1 is an independent system with its own retrieve adapter; a later adapter may call iknow-memory over MCP without changing the host graph.
+_Avoid_: treating fin as the long-term vector backend, pausing fin until iknow-memory ships
 
 ### Seams
 
@@ -28,14 +28,18 @@ The only retrieve dependency fin is allowed to have: `query` (+ optional filters
 _Avoid_: search API, vector store
 
 **retrieve adapter**:
-The current in-process implementation of the retrieve port (local corpus or small index). Swappable later for an MCP client to iknow-memory without changing the host graph.
-_Avoid_: mock retriever, stub, fake memory
+v1's real in-process retrieve: lexical BM25 over page-passage chunks, each carrying a locator as `source_ref`. Not a stub. Swappable later (for example an MCP client to iknow-memory) without changing the host graph.
+_Avoid_: mock retriever, empty adapter, whole-page-only as the only chunk grain, cosine as v1's ranking
 
 ### Agent
 
 **agent loop**:
 The model repeatedly picks a tool or a final answer until a stop condition (done, refuse, step cap). Step order is not hardcoded.
 _Avoid_: pipeline, chain, fixed graph of retrieve-then-generate
+
+**locator**:
+v1 cite identity: `document_id`, `version` (that PDF's sha256 in the corpus manifest), and 1-based `page` from pdfplumber. The claimed span is a quote string, not a locator field; the citation verifier checks it is a contiguous substring of the frozen page text. Retrieve chunks carry a locator as `source_ref`; a chunk is not the identity.
+_Avoid_: chunk_id, char offset, bbox, page-less citation
 
 **citation verifier**:
 A deterministic check that each cited locator actually contains the claimed span. Failed cites send the loop back or force refuse; the model does not self-attest grounding.
