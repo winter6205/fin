@@ -41,6 +41,32 @@ from typing import Final, Iterable
 from fin.corpus.extracted import Locator
 
 
+# ----- shared hidden-bounce marker (SSOT, ADR 0021) -----
+#
+# The marker the host graph (T6) injects into the model's next-turn
+# system message when the gate bounces. CLI / HTTP rendering (T7, T9)
+# must strip this marker before printing. The marker is the single
+# source of truth — every consumer (``graph.py``, ``cli.py``, ``http.py``)
+# imports it from here. Do NOT redefine the literal anywhere else.
+HIDDEN_BOUNCE_MARKER: Final[str] = "[FIN_HIDDEN_BOUNCE]"
+
+# Strip the marker (and the whitespace immediately around it) from any
+# string before user-facing output. Used by ``cli.py`` and ``http.py``.
+_HIDDEN_BOUNCE_RE: Final[re.Pattern[str]] = re.compile(
+    r"\s*" + re.escape(HIDDEN_BOUNCE_MARKER) + r"\s*"
+)
+
+
+def strip_hidden_bounce_marker(text: str) -> str:
+    """Remove every occurrence of ``HIDDEN_BOUNCE_MARKER`` from ``text``.
+
+    Whitespace immediately around the marker is folded in (the gate's
+    template typically leaves a leading newline). The marker is the
+    single source of truth — see ``HIDDEN_BOUNCE_MARKER`` above.
+    """
+    return _HIDDEN_BOUNCE_RE.sub("", text)
+
+
 # v1 document-id locator pattern (ADR 0006 / CONTEXT.md vocabulary).
 # Matches the manifest ``document_id`` shape (e.g. ``AAPL-2022Q3``):
 # 2-5 uppercase letters, a dash, four digits, then ``Q1``/``Q2``/
