@@ -20,9 +20,10 @@ The two fuses live in ``AgentState``:
   ``step_count >= STEP_CAP`` (default 32) the run ends with
   ``status == "step_cap"``. ``STEP_CAP`` is in fin state — NOT in
   LangGraph ``recursion_limit``. The graph factory sets
-  LangGraph's recursion limit strictly higher (``RECURSION_LIMIT``
-  = 50) so the agent-loop fuse always fires first (ADR 0008 +
-  spec success criteria item 5).
+  LangGraph's recursion limit strictly higher (see
+  ``RECURSION_LIMIT`` in ``state.py``, currently 70) so the
+  agent-loop fuse always fires first (ADR 0008 + spec success
+  criteria item 5).
 * ``repair_count`` is the citation-repair counter the gate uses to
   decide bounce vs. refuse. It is independent of the step cap.
 
@@ -61,6 +62,7 @@ from langgraph.types import Command
 from fin.corpus.errors import IngestMissingError
 from fin.corpus.extracted import Locator, load_extracted_tree
 from fin.host.citation_gate import (
+    HIDDEN_BOUNCE_MARKER,
     Citation,
     EvidenceItem,
     verify_citations,
@@ -103,8 +105,9 @@ _DEFAULT_EXTRACTED_ROOT = _DEFAULT_DATA_DIR / "extracted"
 
 # Marker the gate uses on the next pass to recognize a bounce
 # template in the message history. The marker is data; CLI / HTTP
-# rendering (T7, T9) strip it before printing per ADR 0021.
-_BOUNCE_MARKER = "[FIN_HIDDEN_BOUNCE]"
+# rendering (T7, T9) strip it before printing per ADR 0021. Imported
+# from ``citation_gate`` (the SSOT) so a rename touches one file.
+_BOUNCE_MARKER = HIDDEN_BOUNCE_MARKER
 
 
 def _resolve_path(value: Path | str | None, default: Path) -> Path:
@@ -211,20 +214,29 @@ def _make_read_file_tool():
             # clamped to 3, so the loop is bounded. The gate
             # matches spans anywhere in ``page_text``; emitting
             # one item per page keeps each EvidenceItem's locator
-            # faithful to the source page (ADR 0021).
+            # faithful to the source page (ADR 0021). We slice the
+            # joined text by the ``\n\n`` separator the tool uses
+            # so the gate cannot over-attribute a span to multiple
+            # pages when ``page_limit > 1``.
             try:
                 page_count_value = int(result["page_count"])
             except (KeyError, TypeError, ValueError):
                 page_count_value = page
             end_page = min(page + page_limit - 1, page_count_value)
-            for page_num in range(page, end_page + 1):
+            page_text_parts = result["text"].split("\n\n")
+            for offset, page_num in enumerate(range(page, end_page + 1)):
                 locator = Locator(
                     document_id=result["document_id"],
                     version=result["version"],
                     page=page_num,
                 )
+                page_text = (
+                    page_text_parts[offset]
+                    if offset < len(page_text_parts)
+                    else result["text"]
+                )
                 new_evidence.append(
-                    EvidenceItem(locator=locator, page_text=result["text"])
+                    EvidenceItem(locator=locator, page_text=page_text)
                 )
         tool_message = ToolMessage(
             content=json.dumps(result, default=str),
@@ -358,8 +370,9 @@ def compile_graph(
         The agent-loop step fuse. Default ``STEP_CAP`` (32).
     recursion_limit
         LangGraph's recursion limit. Default ``RECURSION_LIMIT``
-        (50). Strictly greater than ``step_cap`` so the agent-loop
-        fuse fires first (spec success criteria item 5).
+        from ``fin.host.state`` (currently ``2 * STEP_CAP + 6 = 70``).
+        Strictly greater than ``step_cap`` so the agent-loop fuse
+        fires first (spec success criteria item 5).
 
     Returns
     -------

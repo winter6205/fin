@@ -32,13 +32,16 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
 from fin.corpus.errors import IngestMissingError
+from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER, strip_hidden_bounce_marker
 from fin.host.graph import ConcurrentRunError, compile_graph
 
 
 # Hidden bounce marker the gate stamps on internal SystemMessages
 # (T6 / ADR 0021). Defensive: HTTP serialization must NEVER leak
-# this string into the response body.
-_HIDDEN_BOUNCE_MARKER = "[FIN_HIDDEN_BOUNCE]"
+# this string into the response body. The literal lives in
+# ``fin.host.citation_gate`` (SSOT) — imported here so a rename
+# touches one file.
+_HIDDEN_BOUNCE_MARKER = HIDDEN_BOUNCE_MARKER
 
 
 # ----- request / response schemas -----
@@ -248,10 +251,8 @@ def ask(body: AskRequest, graph: Any = Depends(get_graph)) -> AskResponse:
     reason_value = raw.get("status_reason", "") or ""
 
     # Defensive strip: ADR 0021 forbids leaking the bounce marker.
-    if _HIDDEN_BOUNCE_MARKER in answer_value:
-        answer_value = answer_value.replace(_HIDDEN_BOUNCE_MARKER, "")
-    if _HIDDEN_BOUNCE_MARKER in reason_value:
-        reason_value = reason_value.replace(_HIDDEN_BOUNCE_MARKER, "")
+    answer_value = strip_hidden_bounce_marker(answer_value)
+    reason_value = strip_hidden_bounce_marker(reason_value)
 
     citations_payload: list[CitationSchema] = []
     if status_value == "done":

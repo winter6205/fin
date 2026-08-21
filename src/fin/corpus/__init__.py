@@ -1,6 +1,6 @@
-"""Corpus capability slice: frozen 10-Qs, ingest, and the page-level catalog.
+"""Corpus capability slice: frozen 10-Qs and the page-level catalog.
 
-Public surface:
+Public surface (ask-path only — no PDF deps):
 
 * ``IngestMissingError`` / ``ManifestShaMismatchError`` — typed errors
   the host graph, retrieve adapter, and citation gate consume to fail
@@ -12,9 +12,13 @@ Public surface:
 * ``load_extracted_tree`` — the ask-path loader. This module does NOT
   import ``pdfplumber``; if you see that import, the ask-path
   contract (ADR 0020) has been violated.
-* ``run_ingest`` — the idempotent ingest command. Verifies the
-  manifest's per-document sha256 against the on-disk PDFs and writes
-  ``data/corpus/extracted/`` deterministically.
+
+NOT re-exported here (intentional — importing ``fin.corpus`` MUST stay
+pdfplumber-free on the ask path, per the contract above; callers that
+need the ingest command use ``fin.corpus.ingest.run_ingest`` directly,
+which only the operator ever runs):
+
+* ``run_ingest`` — the idempotent ingest command. Imports pdfplumber.
 """
 
 from fin.corpus.errors import IngestMissingError, ManifestShaMismatchError
@@ -24,7 +28,6 @@ from fin.corpus.extracted import (
     Passage,
     load_extracted_tree,
 )
-from fin.corpus.ingest import run_ingest
 
 __all__ = [
     "ExtractedPage",
@@ -33,5 +36,4 @@ __all__ = [
     "ManifestShaMismatchError",
     "Passage",
     "load_extracted_tree",
-    "run_ingest",
 ]

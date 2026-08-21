@@ -45,7 +45,6 @@ CLI test suite.
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 import uuid
 from typing import Any, Callable, Iterable
@@ -54,13 +53,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from fin.corpus.errors import IngestMissingError
 from fin.host import ConcurrentRunError
-
-
-# Hidden bounce marker injected by the citation gate into the model's
-# next-turn SystemMessage (ADR 0021). The CLI strips it from any text
-# it prints — answer prose, citation quotes, or anywhere else the
-# marker would otherwise leak.
-_BOUNCE_MARKER_RE = re.compile(r"\s*\[FIN_HIDDEN_BOUNCE\]\s*")
+from fin.host.citation_gate import strip_hidden_bounce_marker
 
 
 # ----- typed errors -----
@@ -81,16 +74,6 @@ class RuntimeGraphUnavailableError(CliError):
 
 
 # ----- pure helpers -----
-
-
-def strip_hidden_bounce_marker(text: str) -> str:
-    """Remove the ``[FIN_HIDDEN_BOUNCE]`` marker (and any whitespace
-    immediately surrounding it) from ``text``.
-
-    Marker-free text is returned untouched — a defensive strip, not a
-    normalizer.
-    """
-    return _BOUNCE_MARKER_RE.sub("", text)
 
 
 def _derive_answer(state: dict[str, Any]) -> str:
