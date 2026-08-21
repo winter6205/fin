@@ -10,10 +10,11 @@ two fuses that bound v1 runs:
   fin state too; it is independent of the step cap.
 
 ``AgentState`` is annotated so LangGraph merges ``messages`` via
-``add_messages`` (preserves prior chat) and overwrites every other
-key with the last value the node returned. Evidence is a plain
-``list`` (last-write-wins); nodes that mutate evidence must return
-the full list, not just the new items.
+``add_messages`` (preserves prior chat) and accumulates ``evidence``
+via ``operator.add`` (cumulative across this run's tool calls).
+Every other key is overwritten with the last value the node
+returned. Nodes that mutate ``evidence`` return ONLY the new items;
+nodes that do not mutate ``evidence`` omit it from their return.
 
 The status field is a closed enum: ``"running"``, ``"done"``,
 ``"refuse"``, ``"step_cap"``. The graph factory raises if any node
@@ -27,6 +28,7 @@ outside the LangGraph state machine.
 
 from __future__ import annotations
 
+import operator
 from typing import Annotated, Final, Literal, TypedDict
 
 from langchain_core.messages import BaseMessage
@@ -128,7 +130,12 @@ class AgentState(TypedDict, total=False):
     """
 
     messages: Annotated[list[BaseMessage], add_messages]
-    evidence: list[EvidenceItem]
+    # operator.add accumulator: nodes return ONLY the new items they
+    # produced this turn; LangGraph appends to the prior list. This
+    # makes cross-period / multi-tool-call runs accumulate evidence
+    # instead of overwriting on every tool invocation. A node that
+    # does not produce evidence must omit this key from its return.
+    evidence: Annotated[list[EvidenceItem], operator.add]
     repair_count: int
     step_count: int
     answer: str
