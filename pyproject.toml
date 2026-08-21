@@ -5,6 +5,8 @@ description = "A bounded 10-Q research agent: model-in-the-loop, code-verified c
 requires-python = ">=3.12,<3.13"
 readme = "README.md"
 dependencies = [
+    "langchain-core>=1.6.0",
+    "langgraph>=1.2.11",
     "pdfplumber>=0.11.10",
     "rank-bm25>=0.2.2",
 ]
