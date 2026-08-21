@@ -1,0 +1,13 @@
+{
+  "folders": [
+    {
+      "name": "fin",
+      "path": "."
+    },
+    {
+      "name": "iknow-memory",
+      "path": "../iknow-memory"
+    }
+  ],
+  "settings": {}
+}
