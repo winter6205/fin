@@ -4,7 +4,12 @@ version = "0.1.0"
 description = "A bounded 10-Q research agent: model-in-the-loop, code-verified citations."
 requires-python = ">=3.12,<3.13"
 readme = "README.md"
-requires-dist = []
+requires-dist = [
+    "pdfplumber>=0.11.10",
+]
+dependencies = [
+    "pdfplumber>=0.11.10",
+]
 
 [build-system]
 requires = ["hatchling"]
