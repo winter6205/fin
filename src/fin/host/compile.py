@@ -6,12 +6,12 @@ production. Tests do NOT use this module — T6's ``compile_graph``
 takes the ``checkpointer`` and ``model`` directly, and tests pass
 ``InMemorySaver()`` plus ``ScriptedChatModel``. This separation
 keeps the test surface hermetic (no live Postgres, no live LLM)
-and the production surface explicit (ADR 0015 + ADR 0013).
+and the production surface explicit (ADR 0015 + ADR 0022).
 
 Why a helper at all
 -------------------
 ADR 0015 fixes ``PostgresSaver`` + ``FIN_CHECKPOINT_URL`` for
-the durable v1 path. ADR 0013 fixes the runtime model selection
+the durable v1 path. ADR 0022 fixes the runtime model selection
 by ``FIN_MODEL`` (+ ``FIN_BASE_URL`` for the OpenAI-compatible
 proxy on port 20128). Wiring both at every call site would
 scatter the same lines (env read → model build → saver build →
@@ -56,11 +56,6 @@ give it. So ``FIN_BASE_URL`` SHOULD include ``/v1`` — passing
 requests to ``http://localhost:20128/chat/completions`` (404 at
 the proxy). The default below is ``http://localhost:20128/v1``;
 the proxy receives ``POST /v1/chat/completions`` as expected.
-
-The 9router proxy also accepts the Anthropic Messages API at
-``/v1/messages`` (ADR 0013 path 2). Operators who prefer that
-path can swap to ``ChatAnthropic`` and override ``FIN_BASE_URL``
-to the bare host — but the v1 default is OpenAI Chat Completions.
 """
 
 from __future__ import annotations
@@ -79,7 +74,7 @@ from fin.host.graph import compile_graph
 # ----- public constants -----
 
 
-# ADR 0013 default for ``FIN_MODEL``. The local proxy at
+# ADR 0022 default for ``FIN_MODEL``. The local proxy at
 # ``DEFAULT_BASE_URL`` exposes a model whose id uses a slash
 # separator (``provider/model``); ``ChatOpenAI`` passes it
 # verbatim to the proxy.
@@ -234,7 +229,7 @@ def compile_for_runtime(
         url = checkpointer_url
 
     # Step 2: resolve the model spec + base_url. Both are
-    # optional with sensible defaults; ADR 0013 fixes the
+    # optional with sensible defaults; ADR 0022 fixes the
     # model, the local-proxy URL is a deployment knob. We
     # resolve BEFORE the saver so a bad model name fails fast
     # without touching Postgres.
