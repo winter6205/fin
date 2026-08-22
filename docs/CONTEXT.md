@@ -88,12 +88,12 @@ LangGraph `interrupt` may be compiled into the host graph. v1 does not ship plan
 _Avoid_: declarative plan-mode as v1, Studio as the required v1 interface
 
 **v1 model**:
-The agent-loop LLM is selected at runtime by `FIN_MODEL` for LangChain `init_chat_model` (default `anthropic:claude-sonnet-4-5-20250929`). Keys stay in environment variables.
-_Avoid_: compiled-in model name as the only option, LLM-as-judge as the citation gate
+The agent-loop LLM is `ChatOpenAI` selected at runtime by `FIN_MODEL` (default `fin/MiniMax-M3`) and `FIN_BASE_URL` (OpenAI-compatible Chat Completions; the URL includes `/v1`). Keys stay in environment variables; slash ids do not go through `init_chat_model`.
+_Avoid_: compiled-in model name as the only option, `init_chat_model` for slash ids, `minimax-cn/MiniMax-M3` as the v1 default, LLM-as-judge as the citation gate
 
 **model client**:
-LangChain `ChatModel` (`init_chat_model`) plus the messages and tool-calling protocol (`bind_tools` / tool schema). LangGraph orchestrates the run; it does not replace this layer.
-_Avoid_: raw vendor HTTP as the v1 client, treating LangGraph as the chat SDK
+LangChain `ChatModel` (`ChatOpenAI` in v1) plus the messages and tool-calling protocol (`bind_tools` / tool schema). LangGraph orchestrates the run; it does not replace this layer.
+_Avoid_: raw vendor HTTP as the v1 client, treating LangGraph as the chat SDK, `init_chat_model` as the required constructor
 
 **loop skeleton**:
 v1's host graph is authored in fin: model node, tool node, citation verifier, caps. It does not copy a research or RAG product repository into `src/fin`.
