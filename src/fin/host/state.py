@@ -219,6 +219,15 @@ class AgentState(TypedDict, total=False):
         ``{name, summary, tool_call_id}``; the SPA renders
         ``summary`` and correlates by ``tool_call_id``. Raw tool
         JSON never reaches the wire (spec line 32).
+    in_flight
+        T4 (spec line 38: ``running`` signal while a run is in
+        flight). Per-send run-scoped marker carried on the state
+        schema so the reset contract covers it. The LIVE source of
+        truth for GET-while-running is the per-thread lock
+        (``graph.is_locked(thread_id)``); this field is state-schema
+        bookkeeping so a follow-up send starts from a clean
+        ``False`` rather than inheriting whatever the prior run
+        wrote. Overwrite semantics; defaults ``False``.
     """
 
     messages: Annotated[list[BaseMessage], add_messages]
@@ -251,6 +260,10 @@ class AgentState(TypedDict, total=False):
     # line 34).
     thinking_text: str
     tool_summaries: Annotated[list[dict[str, str]], operator.add]
+    # T4: run-scoped ``in_flight`` marker (overwrite semantics).
+    # See docstring above. Cleared on every fresh send by
+    # :func:`reset_input_state`.
+    in_flight: bool
 
 
 def reset_input_state(question: str) -> dict[str, Any]:
@@ -280,6 +293,12 @@ def reset_input_state(question: str) -> dict[str, Any]:
         "status": "running",
         "thinking_text": "",
         "tool_summaries": [],
+        # T4: every fresh send clears the in-flight marker. The
+        # live GET-while-running signal lives on the per-thread
+        # lock (graph.is_locked), not on this state field; we
+        # reset it for state-schema completeness so a follow-up
+        # send starts from a clean ``False`` (T4 acceptance).
+        "in_flight": False,
     }
 
 

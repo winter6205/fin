@@ -37,6 +37,7 @@ from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.host import ScriptedChatModel, compile_graph
+from fin.host.state import reset_input_state
 
 
 # ----- shared fixtures -----
@@ -976,9 +977,9 @@ def test_spa_catchall_blocks_path_traversal():
     """The reviewer-empirical exploit: URL-encoded ../ escapes
     web/dist on the catch-all. Must be 404 with no repo-file
     leakage. Regression for Standards #1 / Spec #1."""
-    from fin.host.http import app as http_app
+    from fin.host.http import app
 
-    client = TestClient(http_app)
+    client = TestClient(app)
     r = client.get("/..%2f..%2fpyproject.toml")
     assert r.status_code == 404
     assert "pyproject" not in r.text  # no leakage of repo file content
@@ -987,9 +988,9 @@ def test_spa_catchall_blocks_path_traversal():
 def test_spa_catchall_blocks_deep_traversal_and_still_serves_spa():
     """Deeper escapes stay contained; legitimate SPA routes still
     fall back to index.html."""
-    from fin.host.http import app as http_app
+    from fin.host.http import app
 
-    client = TestClient(http_app)
+    client = TestClient(app)
     assert client.get("/..%2f..%2f..%2fetc%2fpasswd").status_code == 404
     assert client.get("/..%2fREADME.md").status_code == 404
 
@@ -1528,3 +1529,387 @@ def test_follow_up_resets_answer_citations_status_in_checkpoint(
     # tuple.
     assert state2.values.get("citations") in ((), [])
     assert state2.values.get("status") == "refuse"
+
+# ===== T4: crash resume from the last complete node (#31) =====
+
+
+def _resume(client: TestClient, thread_id: str) -> tuple[int, Any]:
+    """POST /resume without streaming; returns (status, response)."""
+    return client.post(f"/api/threads/{thread_id}/resume")
+
+
+def _post_resume_events(
+    client: TestClient, thread_id: str
+) -> list[tuple[str, Any]]:
+    """POST /resume and parse the SSE event stream."""
+    with client.stream(
+        "POST", f"/api/threads/{thread_id}/resume"
+    ) as r:
+        assert r.status_code == 200, r.status_code
+        assert r.headers["content-type"].startswith("text/event-stream")
+        body = "".join(r.iter_text())
+    return _parse_sse_events(body)
+
+
+class CrashAfterToolCallModel(ScriptedChatModel):
+    """Scripted model that records ``_call_count`` so the resume tests
+    can prove the checkpointed AIMessage is NOT regenerated."""
+
+    call_count: int = 0
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self.call_count += 1
+        return super()._generate(
+            messages, stop=stop, run_manager=run_manager, **kwargs
+        )
+
+
+def _install_crash_graph(
+    http_app: FastAPI, span: str
+) -> tuple[Any, CrashAfterToolCallModel]:
+    """Graph + scripted model for the T4 resume path.
+
+    Script: step 1 emits ``AIMessage(tool_calls=[read_file])``;
+    step 2 emits a terminal grounded answer quoting ``span`` (the
+    AAPL page-1 fixture text, so the post-resume run can reach
+    ``done`` through the citation gate). The test drives the run
+    only up to the model-complete frame and drops the generator
+    mid-``tool_node``, leaving the LangGraph checkpoint at
+    ``next=('tools',)``.
+    """
+    from fin.host.http import get_graph
+
+    answer = f"Resumed per the filing: {span}"
+    model = CrashAfterToolCallModel(script=_read_then_answer_script(answer))
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+    return g, model
+
+
+def _crash_after_model_complete(
+    g: Any, *, thread_id: str, question: str
+) -> dict[str, Any]:
+    """Drive the graph directly: stream ``values`` mode and abandon the
+    generator right after the model-complete frame (HumanMessage +
+    AIMessage(tool_calls=[...])). Returns a snapshot of the
+    checkpointed state at crash time.
+
+    TestClient buffers the HTTP response and drains the full generator
+    before ``iter_text()`` yields — the HTTP send path can never
+    crash mid-graph deterministically. The crash has to happen at
+    the graph proxy directly; the ``_LockedGraph`` ``finally`` releases
+    the per-thread lock when the generator goes out of scope, leaving
+    the LangGraph checkpoint at ``next=('tools',)``.
+    """
+    cfg = {"configurable": {"thread_id": thread_id}}
+    # Drive via the locked proxy — same seam the route uses — so the
+    # lock is acquired and released by the proxy's ``finally``.
+    gen = g.stream(
+        reset_input_state(question),
+        config=cfg,
+        stream_mode="values",
+    )
+    for state in gen:
+        msgs = state.get("messages", []) or []
+        if msgs and getattr(msgs[-1], "tool_calls", None):
+            # Model node has just written a complete AIMessage with
+            # tool_calls; abandon BEFORE tool_node runs.
+            break
+    # Release the generator explicitly so the proxy's lock-acquiring
+    # ``finally`` runs deterministically (CPython would do this on
+    # GC, but make it explicit for the test).
+    gen.close()
+    snap = g._graph.get_state(cfg)
+    assert snap.next == ("tools",), (
+        f"crash precondition failed: expected pending tools, got {snap.next}"
+    )
+    return snap
+
+
+def test_resume_continues_from_last_complete_node_no_human_message_appended(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """THE T4 binding acceptance test (spec line 37).
+
+    A scripted run reaches the complete
+    ``AIMessage(tool_calls=[read_file])`` checkpoint BEFORE
+    ``tool_node`` runs; the generator is dropped there (simulated
+    crash). ``POST /resume`` -> ``stream(None)``:
+
+    * does NOT append another HumanMessage;
+    * does NOT regenerate the checkpointed model message
+      (model invoked exactly once more for the post-tool answer);
+    * executes ``tool_node``;
+    * reaches terminal ``done``.
+    """
+    g, model = _install_crash_graph(http_app, aapl_page1_text)
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    tid = created["id"]
+
+    # --- crash mid-run ---
+    snap = _crash_after_model_complete(g, thread_id=tid, question="q1")
+    msgs_after_crash = list(snap.values.get("messages", []))
+    n_after_crash = len(msgs_after_crash)
+    human_ids = {m.id for m in msgs_after_crash if m.__class__.__name__ == "HumanMessage"}
+    assert len(human_ids) == 1  # exactly one user turn so far
+
+    # --- resume ---
+    events = _post_resume_events(client, tid)
+
+    status_event = next(d for n, d in events if n == "status")
+    assert status_event["status"] == "done"
+
+    final = g._graph.get_state({"configurable": {"thread_id": tid}})
+    assert final.next == ()
+    final_msgs = list(final.values["messages"])
+
+    # NO new HumanMessage appended by the resume.
+    final_human = [
+        m for m in final_msgs if m.__class__.__name__ == "HumanMessage"
+    ]
+    assert len(final_human) == 1, (
+        f"resume must not append a HumanMessage; got {len(final_human)}"
+    )
+    assert final_human[0].id in human_ids  # SAME user turn survived
+
+    # The message list grew by ToolMessage + post-resume AIMessage (two
+    # new entries). NOT by HumanMessage + AIMessage (which would be
+    # the case for a fresh send).
+    assert len(final_msgs) == n_after_crash + 2
+
+    # The checkpointed model message was NOT regenerated: same id,
+    # same single instance.
+    ai_with_tools_before = [
+        m for m in msgs_after_crash if getattr(m, "tool_calls", None)
+    ]
+    ai_with_tools_after = [
+        m for m in final_msgs if getattr(m, "tool_calls", None)
+    ]
+    assert len(ai_with_tools_before) == 1 and len(ai_with_tools_after) == 1
+    assert ai_with_tools_before[0].id == ai_with_tools_after[0].id
+
+    # Model calls: once for the pre-crash tool-call step, once for
+    # the post-resume terminal answer. NOT three.
+    assert model.call_count == 2, f"model regenerated: {model.call_count}"
+
+
+def test_resume_after_complete_aimessage_does_not_regenerate_that_message(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """Counter variant of the binding test: ``_call_count`` proves
+    the pre-crash model invocation is never replayed."""
+    g, model = _install_crash_graph(http_app, aapl_page1_text)
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    tid = created["id"]
+
+    _crash_after_model_complete(g, thread_id=tid, question="q1")
+    assert model.call_count == 1, model.call_count
+
+    events = _post_resume_events(client, tid)
+    assert next(d for n, d in events if n == "status")["status"] == "done"
+    # Exactly ONE new model call after resume (the post-tool answer).
+    assert model.call_count == 2, model.call_count
+
+
+def test_get_thread_in_flight_true_while_lock_held(
+    client: TestClient, fresh_store, http_app: FastAPI
+) -> None:
+    """GET while the per-thread lock is held reports ``in_flight=true``
+    on the latest turn row; after completion it reports ``false``
+    (spec line 38)."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    from fin.host.http import get_graph
+    from fin.host.scripted_model import ScriptedChatModel as SCM
+
+    class BlockingModel(SCM):
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            entered.set()
+            release.wait(timeout=5.0)
+            return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    blocking = BlockingModel(script=_read_then_answer_script("x" * 40))
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=blocking,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    tid = created["id"]
+
+    results: dict[str, Any] = {}
+
+    def hit() -> None:
+        with client.stream(
+            "POST", f"/api/threads/{tid}/messages", json={"question": "q"}
+        ) as r:
+            list(r.iter_text())
+            results["send"] = r.status_code
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f = ex.submit(hit)
+        assert entered.wait(timeout=5.0), "run never entered the graph"
+
+        detail = client.get(f"/api/threads/{tid}").json()
+        turns = detail["turns"]
+        # No completed run row exists yet while the FIRST send is
+        # still running; the running signal must still be observable
+        # via a thread-level flag on the response.
+        assert any(t.get("in_flight") for t in turns) or detail.get(
+            "in_flight"
+        ), f"no running signal while lock held: {detail}"
+
+        release.set()
+        f.result(timeout=10.0)
+
+    assert results["send"] == 200
+    detail_done = client.get(f"/api/threads/{tid}").json()
+    assert all(not t["in_flight"] for t in detail_done["turns"])
+    if "in_flight" in detail_done:
+        assert detail_done["in_flight"] is False
+
+
+def test_resume_unknown_thread_returns_404(client: TestClient, fresh_store) -> None:
+    """Resume against a non-existent thread id -> 404."""
+    r = client.post("/api/threads/nope/resume")
+    assert r.status_code == 404
+    assert r.json() == {"error": "thread_not_found"}
+
+
+def test_resume_concurrent_returns_409_before_stream(
+    client: TestClient, fresh_store, http_app: FastAPI
+) -> None:
+    """A POST /resume racing an in-flight run returns 409 with an
+    ``application/json`` body BEFORE StreamingResponse headers."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    from fin.host.http import get_graph
+    from fin.host.scripted_model import ScriptedChatModel as SCM
+
+    class BlockingModel(SCM):
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            entered.set()
+            release.wait(timeout=5.0)
+            return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    blocking = BlockingModel(script=_read_then_answer_script("x" * 40))
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=blocking,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    tid = created["id"]
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        def hit_send():
+            with client.stream(
+                "POST", f"/api/threads/{tid}/messages", json={"question": "q"}
+            ) as r:
+                list(r.iter_text())
+
+        f1 = ex.submit(hit_send)
+        assert entered.wait(timeout=5.0), "send never entered the graph"
+        f2 = ex.submit(lambda: _resume(client, tid))
+        resume_resp = f2.result(timeout=10.0)
+        release.set()
+        f1.result(timeout=10.0)
+
+    assert resume_resp.status_code == 409
+    assert resume_resp.headers["content-type"].startswith("application/json")
+    assert not resume_resp.headers["content-type"].startswith("text/event-stream")
+    assert resume_resp.json() == {"error": "concurrent_run"}
+
+
+def test_resume_completed_thread_returns_204(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """A thread whose prior run reached a terminal node has nothing to
+    resume -> 204 No Content (LangGraph's stream(None) would be a
+    no-op and the spec forbids it)."""
+    answer = f"Per the filing: {aapl_page1_text[:80]}"
+    _install_graph(http_app, _read_then_answer_script(answer))
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    _post_message(client, created["id"], "q")
+
+    r = client.post(f"/api/threads/{created['id']}/resume")
+    assert r.status_code == 204
+    assert r.content == b""
+
+
+def test_switching_threads_does_not_paint_deltas_to_other_thread(
+    client: TestClient, fresh_store, http_app: FastAPI
+) -> None:
+    """Cross-thread paint guard at the ROUTE level: each request's
+    ``config['configurable']['thread_id']`` pins its graph stream to
+    that thread, so thread B's responses never carry thread A's
+    content. (The SPA store additionally guards
+    ``current.id !== threadId``; this pins the underlying contract.)"""
+    entered = threading.Event()
+    release = threading.Event()
+
+    from fin.host.http import get_graph
+    from fin.host.scripted_model import ScriptedChatModel as SCM
+
+    class BlockingModel(SCM):
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            entered.set()
+            release.wait(timeout=5.0)
+            return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    blocking = BlockingModel(script=_read_then_answer_script("x" * 40))
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=blocking,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    thread_a = client.post("/api/threads", json={"first_message": "A"}).json()["id"]
+    thread_b = client.post("/api/threads", json={"first_message": "B"}).json()["id"]
+
+    marker_a = "UNIQUE_THREAD_A_MARKER_7f3a"
+
+    seen_b: dict[str, Any] = {}
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        def hit_a() -> None:
+            with client.stream(
+                "POST", f"/api/threads/{thread_a}/messages", json={"question": marker_a}
+            ) as r:
+                list(r.iter_text())
+
+        f1 = ex.submit(hit_a)
+        assert entered.wait(timeout=5.0)
+
+        # While A holds the lock, B's GET must be clean AND its own
+        # send must 409-free proceed on ITS OWN pinned config...
+        body_b = client.get(f"/api/threads/{thread_b}").text
+        assert marker_a not in body_b
+        # ...but a concurrent send on B is rejected because this
+        # increment allows ONE in-flight run total (spec line 48);
+        # the important assertion is B's GET carries no A content.
+        r_send_b = client.post(
+            f"/api/threads/{thread_b}/messages", json={"question": "b-question"}
+        )
+        seen_b["send_status"] = r_send_b.status_code
+
+        release.set()
+        f1.result(timeout=10.0)
+
+    body_a = client.get(f"/api/threads/{thread_a}").text
+    body_b_final = client.get(f"/api/threads/{thread_b}").text
+    assert marker_a in body_a          # A kept its own content
+    assert marker_a not in body_b_final  # B never received A's content
+

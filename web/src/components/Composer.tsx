@@ -19,6 +19,17 @@ export default function Composer({
 }: ComposerProps) {
   const sendQuestion = useWorkspaceStore((s) => s.sendQuestion);
   const sending = useWorkspaceStore((s) => s.sendingQuestion);
+  // T4 (spec line 38): disable the composer while the thread's
+  // per-run lock is held (live GET signal) or while a resume is
+  // streaming. ``in_flight`` covers both the pre-first-turn window
+  // (thread-level) and the latest-turn window (turn-level).
+  const threadInFlight = useWorkspaceStore(
+    (s) => s.activeThread?.id === threadId && s.activeThread.in_flight === true
+  );
+  const resumingThis = useWorkspaceStore(
+    (s) => s.resumingThreadId === threadId
+  );
+  const busy = sending || threadInFlight || resumingThis;
   // T3: per-thread "ask for reasoning" toggle. Persisted in
   // localStorage so a reload keeps the operator's preference; the
   // request body carries ``thinking`` so the backend can pass it
@@ -80,7 +91,7 @@ export default function Composer({
           }
         }}
         placeholder="Ask about the frozen 10-Qs…"
-        disabled={sending}
+        disabled={busy}
         rows={3}
         className="w-full resize-none border border-black bg-card p-2 text-sm disabled:opacity-50"
       />
@@ -99,10 +110,10 @@ export default function Composer({
         </span>
         <button
           type="submit"
-          disabled={sending || !draft.trim()}
+          disabled={busy || !draft.trim()}
           className="border border-black bg-card px-4 py-1.5 text-sm font-medium hover:bg-accent hover:text-white disabled:opacity-50"
         >
-          {sending ? "Running…" : "Send"}
+          {busy ? "Running…" : "Send"}
         </button>
       </div>
     </form>

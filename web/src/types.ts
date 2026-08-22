@@ -43,11 +43,31 @@ export interface Turn {
   // Mirrored on the SSE status frame and the persisted turn row so
   // reload keeps the copy.
   assistant_message?: string;
+  // T4 (spec line 38): GET-while-running signal on the turn row.
+  // Mirrors ``fin.host.workspace_http.TurnRow.in_flight``. True
+  // only on the most-recent row of a thread whose lock is held,
+  // which by construction can only be the latest turn. Drives the
+  // T4 banner + Resume button in ThreadPage.
+  in_flight?: boolean;
   created_at: string;
 }
 
 export interface ThreadDetail extends ThreadListItem {
   turns: Turn[];
+  // T4: thread-level live running signal (lock held, no RunRecord
+  // persisted yet). The Composer reads this too so submission is
+  // disabled BEFORE the optimistic turn surfaces. Mirrors
+  // ``ThreadDetailResponse.in_flight``.
+  in_flight?: boolean;
+  // T4 fix (code-review H1): a checkpoint with ``next`` nodes is
+  // present AND the lock is NOT held — i.e. the process died
+  // mid-run and the operator should see the Resume banner. The
+  // banner used to be keyed off the live ``in_flight`` flag,
+  // which made it appear during a process-alive refresh (when
+  // it is forbidden) and never appear after a real crash (when
+  // it is needed). The server derives this from
+  // ``pending_nodes(thread_id) and not is_locked``.
+  pending_checkpoint?: boolean;
 }
 
 export interface Filing {

@@ -97,6 +97,16 @@ class RunRecord:
     history consistent with the live surface so a reload does not
     lose the copy. Empty on ``done`` (the run produced a real
     ``answer``).
+
+    T4: ``in_flight`` is NOT persisted on this record's storage
+    columns. A stored run row is by definition terminal (the
+    route appends it only after the stream completes), so any
+    value read back from storage would always be ``False``. The
+    live running signal comes from the per-thread lock probe at
+    serialization time (see ``_serialize_run`` in
+    ``fin.host.workspace_http``); this dataclass field exists so
+    that seam has an explicit, typed slot to fill instead of the
+    HTTP layer bolting an untyped key onto the dict.
     """
 
     id: str
@@ -114,6 +124,10 @@ class RunRecord:
     tool_summaries: list[dict[str, str]] = field(default_factory=list)
     assistant_message: str = ""
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # T4 (spec line 38): live running marker stamped at GET
+    # serialization time from ``graph.is_locked(thread_id)``,
+    # never persisted. Defaults ``False``.
+    in_flight: bool = False
 
 
 # ----- enum + validation -----
@@ -419,7 +433,11 @@ CREATE TABLE IF NOT EXISTS fin_run (
     thinking_text     TEXT NOT NULL DEFAULT '',
     tool_summaries    JSONB NOT NULL DEFAULT '[]'::jsonb,
     assistant_message TEXT NOT NULL DEFAULT '',
-    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- T4 (spec line 38): persisted rows are by definition terminal;
+    -- the column exists so the storage shape matches RunRecord. The
+    -- LIVE running signal is the per-thread lock probe, never this.
+    in_flight         BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 -- T2 column migration: add ``assistant_message`` to existing
@@ -435,6 +453,10 @@ ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS assistant_message TEXT NOT NULL DEF
 -- the durable runtime does not raise on the first T3 INSERT.
 ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS thinking_text TEXT NOT NULL DEFAULT '';
 ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS tool_summaries JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+-- T4 column migration: pre-T4 tables lack ``in_flight``. Persisted
+-- rows are terminal so the default ``FALSE`` is always correct.
+ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS in_flight BOOLEAN NOT NULL DEFAULT FALSE;
 """
 
 
@@ -495,6 +517,8 @@ class PostgresThreadStore:
             # an older row predates the ADD COLUMN.
             assistant_message=row[9] or "",
             created_at=row[10],
+            # T4: coerce a pre-migration NULL to False defensively.
+            in_flight=bool(row[11]) if len(row) > 11 else False,
         )
 
     # -- threads --
@@ -606,8 +630,8 @@ class PostgresThreadStore:
                 conn.execute(
                     "INSERT INTO fin_run (id, thread_id, question, status, "
                     "status_reason, answer, citations, thinking_text, "
-                    "tool_summaries, assistant_message, created_at) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    "tool_summaries, assistant_message, created_at, in_flight) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (
                         record.id,
                         record.thread_id,
@@ -620,6 +644,8 @@ class PostgresThreadStore:
                         json.dumps(record.tool_summaries),
                         record.assistant_message,
                         record.created_at,
+                        # Persisted rows are terminal; always False.
+                        False,
                     ),
                 )
                 conn.commit()
@@ -650,7 +676,7 @@ class PostgresThreadStore:
             rows = conn.execute(
                 "SELECT id, thread_id, question, status, status_reason, "
                 "answer, citations, thinking_text, tool_summaries, "
-                "assistant_message, created_at "
+                "assistant_message, created_at, in_flight "
                 "FROM fin_run WHERE thread_id = %s ORDER BY created_at ASC",
                 (thread_id,),
             ).fetchall()

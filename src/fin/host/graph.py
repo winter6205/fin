@@ -900,6 +900,32 @@ class _LockedGraph:
             return False
         return True
 
+    def pending_nodes(self, thread_id: str) -> tuple[str, ...]:
+        """T4: return LangGraph's pending-node tuple for ``thread_id``'s
+        latest checkpoint. Empty tuple when the last run reached a
+        terminal node (done / refuse / step_cap) OR when the thread
+        has no checkpoint at all (a freshly-created thread that has
+        never been sent on).
+
+        The workspace ``POST /resume`` route uses this seam to
+        decide whether ``stream(None)`` will actually do work — if
+        the tuple is empty, the route returns ``204`` (no run to
+        resume). Reaching through ``_graph.checkpointer.get_state``
+        would couple the HTTP layer to the compiled graph's
+        internals; this method is the documented seam mirroring
+        :meth:`delete_thread`'s rationale.
+
+        Read-only path: does NOT acquire the per-thread lock. The
+        route probes ``is_locked`` first, so under normal use no
+        concurrent write is in flight; even if one were, reading a
+        checkpoint while another run is mid-superstep yields the
+        most-recently-committed snapshot — still well-defined.
+        """
+        snapshot = self._graph.get_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        return tuple(snapshot.next or ())
+
     @staticmethod
     def _release_thread(lock: threading.Lock) -> None:
         lock.release()
