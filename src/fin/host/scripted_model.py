@@ -24,11 +24,11 @@ PDF extraction, no corpus code.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterator
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from pydantic import Field
 
 
@@ -38,24 +38,38 @@ class ScriptedChatModel(BaseChatModel):
     Parameters
     ----------
     script
-        The sequence of ``AIMessage``s the model will return. An
-        ``AIMessage`` with ``tool_calls=[...]`` routes the graph
-        to the tool node; one without routes to the citation gate.
-        If the script is empty, the first call returns a no-op
-        ``AIMessage("")`` so a misconfigured test fails fast in a
-        readable way.
+        The sequence of ``AIMessage``s the model will return via
+        sync ``_generate``. An ``AIMessage`` with
+        ``tool_calls=[...]`` routes the graph to the tool node; one
+        without routes to the citation gate. If the script is
+        empty, the first call returns a no-op ``AIMessage("")`` so
+        a misconfigured test fails fast in a readable way.
 
         Once the script is exhausted, the last ``AIMessage`` is
         returned forever. This keeps step-cap tests deterministic
         without making the model raise.
+    stream_script
+        The sequence of ``AIMessageChunk``s ``_stream`` yields when
+        the test wants to exercise the token-by-token path (T3
+        workspace SSE). When non-empty, ``stream()`` yields chunks
+        from this list (replaying the last one forever once
+        exhausted); when empty, ``stream()`` delegates to
+        ``script`` via the sync ``_generate`` path so the model is
+        useful regardless of which surface a test exercises.
+
+        Both ``script`` and ``stream_script`` may be set; they
+        drive the sync and streaming code paths respectively and
+        never cross over.
     bound_tools
         The list of tools the host graph passed to ``bind_tools``.
         Tests inspect this attribute to confirm wiring.
     """
 
     script: list[AIMessage] = Field(default_factory=list)
+    stream_script: list[AIMessageChunk] = Field(default_factory=list)
     bound_tools: list[Any] = Field(default_factory=list)
     _index: int = 0  # mutated across calls; underscore-prefixed to dodge Pydantic field validation
+    _stream_index: int = 0  # mutated across stream() calls
 
     @property
     def _llm_type(self) -> str:
@@ -118,6 +132,120 @@ class ScriptedChatModel(BaseChatModel):
         )
 
         return ChatResult(generations=[ChatGeneration(message=message)])
+
+    def _stream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: Any = None,
+        **kwargs: Any,
+    ) -> Iterator[ChatGenerationChunk]:
+        """Yield one response's worth of ``AIMessageChunk``s.
+
+        How this maps to the host graph's loop: the host graph's
+        ``model_node`` calls ``model.stream(state["messages"])``
+        ONCE per agent-loop iteration and consumes every chunk of
+        that response. ``_stream`` therefore yields the entire
+        current response on each invocation, not a single chunk.
+
+        The ``stream_script`` list represents ONE response (a flat
+        sequence of chunks the model would emit for one turn).
+        On the first ``stream()`` call the entire script is
+        yielded in order; every subsequent call yields ONLY the
+        LAST chunk so a step-cap test (the model keeps wanting to
+        call a tool forever) loops deterministically without the
+        model raising. This mirrors the sync ``_generate``
+        contract (``script[-1]`` replays forever) on the streaming
+        surface.
+
+        ``stream_script`` empty -> ``_generate`` result wrapped in
+        one chunk. The same scripted model works for sync and
+        streaming tests with no extra setup.
+
+        A parallel ``_stream_index`` (vs. sharing ``_index`` with
+        ``_generate``) keeps the two surfaces independent; a test
+        that exercises both paths can mutate one without
+        disturbing the other.
+        """
+        if not self.stream_script:
+            result = self._generate(
+                messages, stop=stop, run_manager=run_manager, **kwargs
+            )
+            for generation in result.generations:
+                chunk = AIMessageChunk(
+                    content=generation.message.content,
+                    tool_calls=list(generation.message.tool_calls),
+                    additional_kwargs=dict(generation.message.additional_kwargs),
+                )
+                yield ChatGenerationChunk(message=chunk)
+            return
+
+        templates = list(self.stream_script)
+        if self._stream_index == 0:
+            # First ``stream()`` call: walk the entire script in
+            # order so the caller sees one response assembled from
+            # N chunks. Advance the index past the end so subsequent
+            # calls hit the exhausted branch.
+            self._stream_index = len(self.stream_script)
+            for template in templates:
+                yield ChatGenerationChunk(
+                    message=AIMessageChunk(
+                        content=template.content,
+                        tool_call_chunks=list(template.tool_call_chunks),
+                        additional_kwargs=dict(template.additional_kwargs),
+                    )
+                )
+            return
+
+        # ``stream_script`` exhausted. Mixed models (both
+        # ``stream_script`` and ``script`` set) want the sync path
+        # to take over so the next model call sees the first
+        # ``script`` entry instead of looping the streamed tool
+        # call. The sync path also handles step-cap loop determinism
+        # via ``_generate``'s own ``script[-1]`` replay. Delegating
+        # keeps the two surfaces aligned: stream is one response
+        # per ``stream()`` call, sync is one response per
+        # ``_generate`` call, and a model that mixes both gets a
+        # single coherent iteration.
+        if self.script:
+            result = self._generate(
+                messages, stop=stop, run_manager=run_manager, **kwargs
+            )
+            for generation in result.generations:
+                chunk = AIMessageChunk(
+                    content=generation.message.content,
+                    tool_calls=list(generation.message.tool_calls),
+                    additional_kwargs=dict(generation.message.additional_kwargs),
+                )
+                yield ChatGenerationChunk(message=chunk)
+            return
+
+        # Pure ``stream_script`` (no sync script): replay the ENTIRE
+        # final response (every chunk in order) so the assembled
+        # ``AIMessage`` is identical across calls. Mirrors the sync
+        # ``_generate`` contract (``script[-1]`` replays forever as a
+        # complete message) on the streaming surface.
+        #
+        # Why ``all chunks`` and not ``last chunk only``: replaying a
+        # bare continuation fragment (the typical last-chunk shape
+        # when a tool call is split across chunks) produces an
+        # ``AIMessage`` whose ``tool_calls`` have ``name`` and
+        # ``id`` as ``None`` / empty. The downstream ``ToolNode``
+        # then trips its "invalid tool name" error path, which
+        # tries to construct a ``ToolMessage(tool_call_id=None)``
+        # and raises a Pydantic ``ValidationError`` — masking the
+        # step-cap loop determinism this behaviour was meant to
+        # provide. Replaying the full response keeps every tool
+        # call fully-formed so step-cap loops land on a stable
+        # AIMessage shape on every iteration.
+        for template in templates:
+            yield ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content=template.content,
+                    tool_call_chunks=list(template.tool_call_chunks),
+                    additional_kwargs=dict(template.additional_kwargs),
+                )
+            )
 
 
 __all__ = ["ScriptedChatModel"]

@@ -53,7 +53,13 @@ import threading
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
@@ -72,6 +78,11 @@ from fin.host.state import (
     REPAIR_CAP,
     RECURSION_LIMIT,
     STEP_CAP,
+)
+from fin.host.stream_map import (
+    assemble_final_ai_message,
+    format_tool_summary,
+    strip_thinking_from_answer,
 )
 from fin.host.tools import list_files, read_file
 from fin.retrieve import BM25Adapter
@@ -118,19 +129,32 @@ def _resolve_path(value: Path | str | None, default: Path) -> Path:
 
 
 def _last_ai_text(messages: list[BaseMessage]) -> str:
-    """Return the textual content of the last ``AIMessage`` in
-    ``messages``. Empty string if there is no ``AIMessage`` or the
-    last ``AIMessage`` is empty (model returned only tool_calls)."""
+    """Return the THINKING-STRIPPED textual content of the last
+    ``AIMessage`` in ``messages``. Empty string if there is no
+    ``AIMessage`` or the last ``AIMessage`` is empty (model returned
+    only tool_calls).
+
+    Why strip here (T3 / SC60): the citation gate and every
+    user-visible answer surface read this function's output. When
+    the proxy inlines ``<thinking>...</thinking>`` into content
+    (fallback shape; ADR 0022 normally routes thinking through
+    ``additional_kwargs.reasoning_details``, which this function
+    never reads), the private scratchpad must not pass as the
+    answer. Stripping at THIS seam means the gate, ``/ask``, and
+    the workspace SSE all agree on one definition of answer prose.
+    """
     for message in reversed(messages):
         if isinstance(message, AIMessage):
             content = message.content
             if isinstance(content, str):
-                return content
+                return strip_thinking_from_answer(content)
             # Some providers return content as a list of blocks;
             # the citation gate treats the raw string, so coerce.
-            return "".join(
-                block.get("text", "") if isinstance(block, dict) else str(block)
-                for block in content
+            return strip_thinking_from_answer(
+                "".join(
+                    block.get("text", "") if isinstance(block, dict) else str(block)
+                    for block in content
+                )
             )
     return ""
 
@@ -319,6 +343,124 @@ def _make_retrieve_tool(adapter: BM25Adapter):
     return retrieve_tool
 
 
+# ----- T3 helpers: tool-summary + thinking extraction -----
+
+
+def _pending_tool_calls(state: AgentState) -> list[tuple[str, dict, str]]:
+    """Return the (name, args, tool_call_id) tuples the last
+    ``AIMessage`` declared.
+
+    The prebuilt ``ToolNode`` consumes them but does not surface
+    ``args`` back to the caller; we read it from the message list
+    so the summary formatter can render
+    ``"company=AAPL"`` / ``"p.4"`` / etc. without re-parsing raw
+    ``ToolMessage`` JSON.
+    """
+    messages = state.get("messages", [])
+    for message in reversed(messages):
+        if isinstance(message, AIMessage) and message.tool_calls:
+            return [
+                (
+                    call.get("name", ""),
+                    call.get("args") or {},
+                    call.get("id", ""),
+                )
+                for call in message.tool_calls
+            ]
+    return []
+
+
+def _tool_result_for_call(call_id: str, tool_messages: list[BaseMessage]) -> dict | None:
+    """Pick the ``ToolMessage`` matching ``call_id``.
+
+    The result is JSON in ``ToolMessage.content``; the summarizer
+    prefers parsed dicts (``{"filings": [...]}`` /
+    ``{"chunks": [...]}`` / ``{"text": ..., "document_id": ...}``)
+    and falls back to ``None`` for unparseable payloads (the
+    formatter can still render ``args`` even when the result is
+    missing - e.g. an error ToolMessage).
+    """
+    import json
+
+    for tm in tool_messages:
+        if not isinstance(tm, ToolMessage):
+            continue
+        if getattr(tm, "tool_call_id", "") != call_id:
+            continue
+        try:
+            return json.loads(tm.content)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _build_tool_summaries(
+    pending: list[tuple[str, dict, str]],
+    tool_messages: list[BaseMessage],
+) -> list[dict[str, str]]:
+    """Render one ``{name, summary, tool_call_id}`` dict per call.
+
+    The summary text is the human one-liner the SPA renders in the
+    ``#F5F5F4`` tools region (spec line 32); the ``tool_call_id``
+    correlates with the ``tool_call`` SSE frame so the SPA can
+    pair the live "running" indicator with the post-run trace.
+    """
+    rendered: list[dict[str, str]] = []
+    for name, args, call_id in pending:
+        if not call_id:
+            continue
+        result = _tool_result_for_call(call_id, tool_messages)
+        rendered.append(
+            {
+                "name": name,
+                "summary": format_tool_summary(name, result=result, args=args),
+                "tool_call_id": call_id,
+            }
+        )
+    return rendered
+
+
+def _extract_thinking_text(message: AIMessage) -> str:
+    """Pull the thinking prose from an ``AIMessage`` for the turn row.
+
+    Sources (in order):
+    1. ``additional_kwargs.reasoning_details`` list — each entry's
+       ``text`` field concatenated. This is the
+       ``reasoning_split=true`` shape the MiniMax proxy emits
+       (ADR 0022).
+    2. Inline ``<thinking>...</thinking>`` blocks already stripped
+       from ``message.content`` by ``_last_ai_text`` — we read
+       ``content`` here so a proxy that ONLY inlined thinking (no
+       reasoning_details) still surfaces the prose to the turn row.
+    """
+    pieces: list[str] = []
+    details = message.additional_kwargs.get("reasoning_details")
+    if isinstance(details, list):
+        for entry in details:
+            if isinstance(entry, dict):
+                text = entry.get("text")
+                if isinstance(text, str):
+                    pieces.append(text)
+    # If no reasoning_details, fall back to stripping any inline
+    # ``<thinking>`` block from content. The block is already
+    # absent from the message's content in the split-channel case;
+    # here we surface it for the persisted turn row.
+    content = message.content
+    if isinstance(content, str):
+        import re
+
+        match_iter = re.finditer(
+            r"<thinking\b[^>]*>(.*?)</thinking\s*>",
+            content,
+            re.IGNORECASE | re.DOTALL,
+        )
+        for match in match_iter:
+            pieces.append(match.group(1))
+    return "\n".join(piece for piece in pieces if piece)
+
+
+
+
 # ----- the graph factory -----
 
 
@@ -444,20 +586,101 @@ def compile_graph(
                 "step_count": next_step,
                 "status": "step_cap",
                 "status_reason": "step_cap",
+                # T3: the fuse entry also resets the per-call
+                # thinking text (no model ran, nothing streamed).
+                "thinking_text": "",
             }
-        # Step 2: invoke the model. The script is the source of
-        # truth — this is the only place we call the LLM in v1.
-        answer_message: BaseMessage = bound_model.invoke(state["messages"])
+        # Step 2: STREAM the model (T3 / spec line 27 / ADR 0026).
+        # Token deltas are observed by the workspace SSE layer via
+        # LangGraph's ``stream_mode="messages"``; THIS node still
+        # returns exactly one state update containing ONE complete
+        # ``AIMessage`` — the durable contract (spec line 37: a
+        # checkpoint after model_node holds full content AND full
+        # parsed ``tool_calls`` so T4 resume never regenerates the
+        # turn). ``assemble_final_ai_message`` joins chunks into
+        # that message, preserving ``tool_calls`` and
+        # ``additional_kwargs.reasoning_details`` (ADR 0022
+        # round-trip: the next model call sees prior reasoning).
+        #
+        # ``thinking_text`` accumulates ONLY thinking prose from
+        # ``reasoning_details`` (the split-channel shape) plus any
+        # inline ``<thinking>`` block stripped out of content. It is
+        # stored on state for the turn row; it NEVER merges into the
+        # answer content (SC60).
+        stream = bound_model.stream(state["messages"])
+        answer_message = assemble_final_ai_message(stream)
+        thinking_text = _extract_thinking_text(answer_message)
         # NOTE: ``evidence`` is intentionally omitted from this return.
-        # The ``operator.add`` reducer in ``AgentState`` only fires when
-        # a node actually returns the key; omitting it leaves the prior
-        # evidence list untouched (tool_node returns the new items).
+        # The reducer in ``AgentState`` only fires when a node actually
+        # returns the key; omitting it leaves the prior evidence list
+        # untouched (tool_node returns the new items).
         return {
             "messages": [answer_message],
             "step_count": next_step,
             "status": "running",
             "repair_count": int(state.get("repair_count", 0)),
+            "thinking_text": thinking_text,
         }
+
+    def tool_node_with_summaries(state: AgentState) -> dict[str, Any]:
+        """Run the prebuilt ToolNode, then append human-readable
+        one-liners to ``state['tool_summaries']``.
+
+        Why a wrapper (vs. registering ToolNode directly): the
+        summaries are presentation state derived from the SAME
+        ``(name, args, result)`` triples the tool functions saw.
+        Deriving them inside the tools would couple ADR 0009 tool
+        contracts to UI copy; deriving them here keeps ToolNode as
+        the executor and this wrapper as the only summarizer.
+
+        Raw ``ToolMessage.content`` JSON never enters a summary -
+        the formatter renders name + short human phrase only
+        (spec line 32).
+
+        Return-shape note: when ANY wrapped tool returns a
+        ``Command`` (``read_file`` / ``retrieve`` do), the prebuilt
+        ``ToolNode._func`` returns a LIST of per-call updates —
+        each either a ``Command(update={...})`` or a plain
+        ``{messages: [ToolMessage]}`` dict — instead of one flat
+        dict. LangGraph merges that list itself when a node returns
+        it verbatim, but this wrapper must merge it manually to
+        attach ``tool_summaries``. We fold every entry's
+        ``messages`` / ``evidence`` into ONE state update so the
+        reducer semantics are identical to the unwrapped node.
+        """
+        pending = list(_pending_tool_calls(state))
+        raw_update: Any = tool_dispatcher.invoke(state)
+
+        merged_messages: list[Any] = []
+        merged_evidence: list[Any] = []
+        if isinstance(raw_update, dict):
+            merged_messages.extend(raw_update.get("messages", []))
+        elif isinstance(raw_update, list):
+            # Per-call entries in tool-call order; flatten.
+            for entry in raw_update:
+                if isinstance(entry, Command):
+                    payload = entry.update or {}
+                    merged_messages.extend(payload.get("messages", []))
+                    merged_evidence.extend(payload.get("evidence", []))
+                elif isinstance(entry, dict):
+                    merged_messages.extend(entry.get("messages", []))
+                elif isinstance(entry, list):
+                    for item in entry:
+                        if isinstance(item, Command):
+                            payload = item.update or {}
+                            merged_messages.extend(payload.get("messages", []))
+                            merged_evidence.extend(payload.get("evidence", []))
+                        elif isinstance(item, BaseMessage):
+                            merged_messages.append(item)
+                elif isinstance(entry, BaseMessage):
+                    merged_messages.append(entry)
+
+        new_summaries = _build_tool_summaries(pending, merged_messages)
+        update: dict[str, Any] = {"messages": merged_messages}
+        if merged_evidence:
+            update["evidence"] = merged_evidence
+        update["tool_summaries"] = new_summaries
+        return update
 
     def citation_gate_node(state: AgentState) -> dict[str, Any]:
         # Pull the last ``AIMessage``'s text as the candidate
@@ -539,7 +762,12 @@ def compile_graph(
 
     graph = StateGraph(AgentState)
     graph.add_node("model", model_node)
-    graph.add_node("tools", tool_dispatcher)
+    # ``tool_node_with_summaries`` wraps ``tool_dispatcher`` so the
+    # graph executor still emits ``ToolMessage``s unchanged; the
+    # wrapper only ADDS the ``tool_summaries`` field to the state
+    # update (T3). The forward edge ``tools -> model`` still routes
+    # back to model_node for the next agent-loop iteration.
+    graph.add_node("tools", tool_node_with_summaries)
     graph.add_node("citation_gate", citation_gate_node)
 
     graph.add_edge(START, "model")
@@ -654,6 +882,23 @@ class _LockedGraph:
                 f"another invoke is already in flight on thread_id={thread_id!r}"
             )
         return lock
+
+    def is_locked(self, thread_id: str) -> bool:
+        """T3 helper for the workspace route: non-blocking probe
+        of the per-thread lock. ``True`` when another run is in
+        flight. The workspace send path uses this to decide
+        ``409`` BEFORE returning the StreamingResponse so the 409
+        body carries ``application/json`` (spec line 26 + T2).
+        """
+        with self._meta_lock:
+            lock = self._thread_locks.get(thread_id)
+        if lock is None:
+            return False
+        acquired = lock.acquire(blocking=False)
+        if acquired:
+            lock.release()
+            return False
+        return True
 
     @staticmethod
     def _release_thread(lock: threading.Lock) -> None:

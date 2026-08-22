@@ -254,6 +254,21 @@ def compile_for_runtime(
         model=model_name,
         base_url=base_url,
         api_key=api_key,
+        # T3 (ADR 0022, ADR 0026, specs line 27): the MiniMax proxy
+        # splits the model's reasoning into
+        # ``additional_kwargs["reasoning_details"]`` on streamed
+        # chunks when ``reasoning_split`` is true. The thinking
+        # ``type`` defaults to ``adaptive`` (on); the workspace
+        # send path swaps to ``disabled`` per the operator's
+        # "Think step by step" toggle (see ``SendMessageRequest``).
+        # ``ChatOpenAI`` forwards ``model_kwargs`` as the JSON
+        # body sent to the proxy.
+        model_kwargs={
+            "extra_body": {
+                "thinking": {"type": "adaptive"},
+                "reasoning_split": True,
+            }
+        },
     )
 
     # Step 4: open the Postgres connection via the context

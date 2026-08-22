@@ -405,11 +405,27 @@ def test_send_message_step_cap_emits_status_step_cap_and_empty_citations(
 
     events = _parse_sse_events(body)
     event_types = [name for name, _ in events]
-    # Spec line 30 order: status -> answer (empty) -> citations ([]).
-    assert event_types == ["status", "answer", "citations"]
-    assert events[0][1]["status"] == "step_cap"
-    assert events[1][1] == {"text": ""}
-    assert events[2][1] == []
+    # Wire order per spec line 30: the terminal frames keep the
+    # fixed ``status`` -> ``answer`` -> ``citations`` order;
+    # T3 streaming frames (thinking / tool_call / tool_result)
+    # appear BEFORE ``status``. A step_cap run whose model
+    # never reaches done keeps looping tool calls - so the SSE
+    # carries one tool_call / tool_result per loop tick before
+    # the final ``status`` (``step_cap``).
+    assert "status" in event_types
+    assert "answer" in event_types
+    assert "citations" in event_types
+    status_i = event_types.index("status")
+    answer_i = event_types.index("answer")
+    citations_i = event_types.index("citations")
+    assert status_i < answer_i < citations_i
+    # Streaming frames precede the terminal status frame.
+    assert event_types.index("tool_call") < status_i
+    assert event_types.index("tool_result") < status_i
+    status_event = events[status_i][1]
+    assert status_event["status"] == "step_cap"
+    assert events[answer_i][1] == {"text": ""}
+    assert events[citations_i][1] == []
 
 
 def test_send_message_empty_question_returns_204_no_content(
@@ -531,6 +547,197 @@ def test_send_message_response_does_not_leak_hidden_bounce_marker(
     thread_body = client.get(f"/api/threads/{created['id']}").json()
     serialized = json.dumps(thread_body)
     assert "[FIN_HIDDEN_BOUNCE]" not in serialized
+
+
+# ===== T3 streaming frames on POST /messages =====
+
+
+def test_send_message_streaming_emits_thinking_and_tool_call_frames(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """A scripted model that streams thinking prose via
+    ``reasoning_details`` (ADR 0022) AND emits a tool call produces
+    the T3 wire shape:
+
+    ``thinking`` -> ``tool_call`` -> ``tool_result`` -> ``status``
+    -> ``answer`` -> ``citations`` (terminal per spec line 30).
+
+    The ``thinking`` frame carries the streamed prose; the
+    ``tool_call`` frame carries ``name`` / ``args`` /
+    ``tool_call_id``; the ``tool_result`` frame parses the
+    tool's JSON content."""
+    from langchain_core.messages import AIMessageChunk
+
+    from fin.host.http import get_graph
+    from fin.host.scripted_model import ScriptedChatModel
+
+    answer = f"Per the filing: {aapl_page1_text[:80]}"
+    model = ScriptedChatModel(
+        stream_script=[
+            AIMessageChunk(
+                content="",
+                additional_kwargs={
+                    "reasoning_details": [{"text": "let me read the filing"}]
+                },
+                tool_call_chunks=[
+                    {"name": "read_file", "args": "", "id": "c-read", "index": 0}
+                ],
+            ),
+            AIMessageChunk(
+                content="",
+                tool_call_chunks=[
+                    {
+                        "name": None,
+                        "args": '{"document_id": "AAPL-2022Q3", "version": "%s", "page": 1, "page_limit": 1}'
+                        % AAPL_2022Q3_VERSION,
+                        "id": None,
+                        "index": 0,
+                    }
+                ],
+            ),
+        ],
+        script=[
+            AIMessage(content=answer),
+        ],
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    events = _post_message(client, created["id"], "q")
+    types = [name for name, _ in events]
+    assert types.index("thinking") < types.index("status")
+    assert types.index("tool_call") < types.index("tool_result") < types.index("status")
+
+    thinking_event = next(d for n, d in events if n == "thinking")
+    assert "let me read the filing" in thinking_event["text"]
+
+    tool_call_event = next(d for n, d in events if n == "tool_call")
+    assert tool_call_event["name"] == "read_file"
+    assert tool_call_event["tool_call_id"] == "c-read"
+    assert tool_call_event["args"]["document_id"] == "AAPL-2022Q3"
+
+    tool_result_event = next(d for n, d in events if n == "tool_result")
+    assert tool_result_event["tool_call_id"] == "c-read"
+    assert tool_result_event["name"] == "read_file"
+    # T3 fix (code-review #3): the wire shape is the human-readable
+    # summary, NOT the raw ToolMessage JSON. Spec line 32.
+    assert "summary" in tool_result_event
+    assert "AAPL-2022Q3" in tool_result_event["summary"]
+    assert "result" not in tool_result_event
+
+    status_event = next(d for n, d in events if n == "status")
+    assert status_event["status"] == "done"
+
+    answer_event = next(d for n, d in events if n == "answer")
+    assert answer_event["text"] == answer
+
+    citations_event = next(d for n, d in events if n == "citations")
+    assert isinstance(citations_event, list) and len(citations_event) >= 1
+
+
+def test_send_message_turn_row_exposes_tool_summaries_as_dicts(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """T3 (spec line 32): the persisted turn row carries
+    ``tool_summaries`` as a list of ``{name, summary, tool_call_id}``
+    dicts (one per tool call). The SPA renders ``summary`` and
+    correlates by ``tool_call_id``."""
+    from fin.host.http import get_graph
+
+    answer = f"Per the filing: {aapl_page1_text[:80]}"
+    _install_graph(http_app, _read_then_answer_script(answer))
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    _post_message(client, created["id"], "q")
+
+    detail = client.get(f"/api/threads/{created['id']}").json()
+    run = detail["turns"][0]
+    summaries = run["tool_summaries"]
+    assert len(summaries) == 1
+    entry = summaries[0]
+    assert set(entry.keys()) == {"name", "summary", "tool_call_id"}
+    assert entry["name"] == "read_file"
+    assert entry["tool_call_id"] == "c-read"
+    assert "AAPL-2022Q3" in entry["summary"]
+    assert "p.1" in entry["summary"]
+
+
+def test_send_message_thinking_frame_emitted_with_stripped_prose(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """SC60 binding: the SSE ``thinking`` frame carries the
+    scratchpad prose verbatim (it is the model's private notes);
+    the SSE ``answer`` frame carries the GROUNDED answer prose
+    with any inline ``<thinking>...</thinking>`` block already
+    stripped (the citation-gate seam). A model that inlined the
+    thinking into content MUST emit the thinking frame AND
+    surface the post-strip answer text in the answer frame."""
+    from langchain_core.messages import AIMessageChunk
+
+    from fin.host.http import get_graph
+    from fin.host.scripted_model import ScriptedChatModel
+
+    span = aapl_page1_text[:80]
+    raw_answer = f"<thinking>private scratchpad</thinking>{span}"
+    model = ScriptedChatModel(
+        script=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {
+                            "document_id": AAPL_2022Q3,
+                            "version": AAPL_2022Q3_VERSION,
+                            "page": 1,
+                            "page_limit": 1,
+                        },
+                        "id": "c-read",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content=raw_answer),
+        ]
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    events = _post_message(client, created["id"], "q")
+
+    # The answer frame must carry the post-strip span ONLY - no
+    # inline ``<thinking>`` block (SC60 binding on the wire).
+    answer_event = next(d for n, d in events if n == "answer")
+    assert "private scratchpad" not in answer_event["text"]
+    assert answer_event["text"] == span
+
+    # The inline ``<thinking>`` block IS surfaced on its own
+    # ``thinking`` frame (the SPA renders it collapsed) - while
+    # the ANSWER frame carries only the post-strip span. That is
+    # the SC60 wire binding: scratchpad visible as thinking,
+    # never inside answer.
+    thinking_events = [d for n, d in events if n == "thinking"]
+    assert len(thinking_events) == 1
+    assert "private scratchpad" in thinking_events[0]["text"]
+
+    # The persisted turn row mirrors the SSE: answer without
+    # inline thinking, ``thinking_text`` populated with the
+    # extracted inline prose (so a reload renders the same
+    # scratchpad the live frame showed).
+    detail = client.get(f"/api/threads/{created['id']}").json()
+    run = detail["turns"][0]
+    assert "private scratchpad" not in run["answer"]
+    assert run["thinking_text"] == "private scratchpad"
 
 
 # ----- H2 regression: saver failure surfaces as 500 -----
@@ -889,7 +1096,10 @@ def test_follow_up_resets_step_count_to_zero(
     model._index = 0
     model.script = _read_then_answer_script(answer1)
     events1 = _post_message(client, tid, "q1")
-    assert events1[0][1]["status"] == "done"
+    # Look up the terminal status frame by name (T3 emits
+    # streaming frames before ``status``).
+    status_events_1 = [d for n, d in events1 if n == "status"]
+    assert status_events_1 and status_events_1[0]["status"] == "done"
 
     # Run 2: 3 entries (list_files, read_file, answer-with-span).
     # With reset: done. Without reset: step_cap on the 3rd entry.
@@ -915,7 +1125,7 @@ def test_follow_up_resets_step_count_to_zero(
         f"expected 5 total model calls (2 in run 1 + 3 in run 2), "
         f"got {model.call_count}; all lengths: {model.seen_lengths}"
     )
-    assert events2[0][1]["status"] == "done", events2
+    assert next(d for n, d in events2 if n == "status")["status"] == "done", events2
 
 
 # ----- follow-up resets repair_count -----
@@ -943,8 +1153,8 @@ def test_follow_up_resets_repair_count_to_zero(
     model._index = 0
     model.script = [AIMessage(content="vague answer with no evidence")]
     events1 = _post_message(client, tid, "q1")
-    assert events1[0][1]["status"] == "refuse"
-    assert events1[0][1]["reason"] == "citation_repair_cap"
+    assert next(d for n, d in events1 if n == "status")["status"] == "refuse"
+    assert next(d for n, d in events1 if n == "status")["reason"] == "citation_repair_cap"
 
     # Run 2: bounce once, then answer with a span. With the
     # reset this works (repair_count 0 -> bounce -> 1 -> done).
@@ -976,7 +1186,7 @@ def test_follow_up_resets_repair_count_to_zero(
         AIMessage(content=answer2),
     ]
     events2 = _post_message(client, tid, "q2")
-    assert events2[0][1]["status"] == "done", events2
+    assert next(d for n, d in events2 if n == "status")["status"] == "done", events2
 
 
 # ----- follow-up resets evidence (SC62 binding test, plus one extra) -----
@@ -1002,8 +1212,12 @@ def test_follow_up_resets_evidence(
     model._index = 0
     model.script = _read_then_answer_script(answer1)
     events1 = _post_message(client, tid, "q1")
-    assert events1[0][1]["status"] == "done"
-    assert len(events1[2][1]) >= 1  # citations non-empty
+    # Look up the terminal status frame by name (T3 emits
+    # streaming frames before ``status``).
+    status_events_1 = [d for n, d in events1 if n == "status"]
+    assert status_events_1 and status_events_1[0]["status"] == "done"
+    _cit1 = next(d for n, d in events1 if n == "citations")
+    assert len(_cit1) >= 1  # citations non-empty
 
     # Run 2: prose-only answer quoting run 1's page text. With
     # reset, evidence is empty -> gate cannot match -> bounces
@@ -1012,13 +1226,15 @@ def test_follow_up_resets_evidence(
     model._index = 0
     model.script = [AIMessage(content=answer2)]
     events2 = _post_message(client, tid, "q2")
-    assert events2[0][1]["status"] == "refuse", (
+    _st2 = next(d for n, d in events2 if n == "status")
+    assert _st2["status"] == "refuse", (
         f"SC62: follow-up must NOT inherit run-1 evidence; "
-        f"got status={events2[0][1]['status']}"
+        f"got status={_st2['status']}"
     )
-    assert events2[0][1]["reason"] == "citation_repair_cap"
+    assert _st2["reason"] == "citation_repair_cap"
     # citations frame is [] on refuse (spec line 67).
-    assert events2[2][1] == []
+    _cit2 = next(d for n, d in events2 if n == "citations")
+    assert _cit2 == []
 
 
 def test_follow_up_does_not_inherit_prior_run_citations(
@@ -1041,8 +1257,12 @@ def test_follow_up_does_not_inherit_prior_run_citations(
     model._index = 0
     model.script = _read_then_answer_script(answer1)
     events1 = _post_message(client, tid, "q1")
-    assert events1[0][1]["status"] == "done"
-    assert len(events1[2][1]) >= 1
+    # Look up the terminal status frame by name (T3 emits
+    # streaming frames before ``status``).
+    status_events_1 = [d for n, d in events1 if n == "status"]
+    assert status_events_1 and status_events_1[0]["status"] == "done"
+    _cit1 = next(d for n, d in events1 if n == "citations")
+    assert len(_cit1) >= 1
 
     # Run 2: same span, no tool call.
     answer2 = f"Per the filing: {aapl_page1_text[:80]}"
@@ -1051,9 +1271,10 @@ def test_follow_up_does_not_inherit_prior_run_citations(
     events2 = _post_message(client, tid, "q2")
 
     # Wire contract: refuse (not done), citations [].
-    status_event = events2[0][1]
+    status_event = next(d for n, d in events2 if n == "status")
     assert status_event["status"] != "done"
-    assert events2[2][1] == []
+    _cit2 = next(d for n, d in events2 if n == "citations")
+    assert _cit2 == []
 
     # GET turn table: the persisted row for run 2 must mirror
     # the live SSE shape (empty citations, status refuse).
@@ -1212,13 +1433,18 @@ def test_send_message_step_cap_emits_status_with_ordinary_person_copy(
 
     events = _post_message(client, created["id"], "q")
 
-    status_event = events[0][1]
+    # T3: the looping tool-call script emits tool_call /
+    # tool_result frames BEFORE the terminal status frame; look
+    # the status frame up by name instead of by position.
+    status_event = next(d for n, d in events if n == "status")
     assert status_event["status"] == "step_cap"
     assert "32-step fuse" in status_event["assistant_message"]
     assert status_event["assistant_message"] != ""
 
-    assert events[1][1] == {"text": ""}
-    assert events[2][1] == []
+    answer_event = next(d for n, d in events if n == "answer")
+    citations_event = next(d for n, d in events if n == "citations")
+    assert answer_event == {"text": ""}
+    assert citations_event == []
 
     detail = client.get(f"/api/threads/{created['id']}").json()
     run = detail["turns"][0]
@@ -1239,7 +1465,7 @@ def test_send_message_done_status_has_empty_assistant_message(
 
     created = client.post("/api/threads", json={"first_message": "q"}).json()
     events = _post_message(client, created["id"], "q")
-    status_event = events[0][1]
+    status_event = next(d for n, d in events if n == "status")
     assert status_event["status"] == "done"
     assert status_event["assistant_message"] == ""
 
@@ -1284,8 +1510,9 @@ def test_follow_up_resets_answer_citations_status_in_checkpoint(
     events2 = _post_message(client, tid, "q2")
 
     # Wire shape: refuse, no citations.
-    assert events2[0][1]["status"] == "refuse"
-    assert events2[2][1] == []
+    assert next(d for n, d in events2 if n == "status")["status"] == "refuse"
+    _cit2 = next(d for n, d in events2 if n == "citations")
+    assert _cit2 == []
 
     # The checkpointed state for run 2 must show CLEAN run-scoped
     # fields: answer / citations / status reset by ``reset_input_state``

@@ -75,24 +75,62 @@ export interface SendResult {
   assistantMessage: string;
 }
 
+// T3 streaming events surfaced to the caller as they arrive.
+// The store threads each one into the optimistic turn so the
+// tools region + scratchpad fill in while the run is live.
+export type SendEvent =
+  | { type: "thinking"; text: string }
+  | {
+      type: "tool_call";
+      name: string;
+      args: Record<string, unknown>;
+      tool_call_id: string;
+    }
+  | {
+      type: "tool_result";
+      tool_call_id: string;
+      name: string;
+      result: unknown;
+    }
+  | {
+      type: "status";
+      run_id: string;
+      status: SendResult["status"];
+      reason?: string | null;
+      assistant_message: string;
+    }
+  | { type: "answer"; text: string }
+  | { type: "citations"; citations: Citation[] };
+
 export class ConcurrentRunError extends Error {}
 export class IngestMissingError extends Error {}
+
+/** Request body for the send path. ``thinking`` is the operator's
+ * reasoning preference toggle (T3); the backend forwards it to the
+ * model provider. */
+export interface SendRequest {
+  question: string;
+  thinking?: boolean;
+}
 
 /**
  * POST one question to a thread. Reads the SSE stream via fetch +
  * reader (NOT native EventSource) and resolves with the terminal
- * events. T1 is sync-invoke wrapped in SSE; T3 will surface deltas.
+ * events. T3 surfaces streaming frames (thinking / tool_call /
+ * tool_result) via the optional ``onEvent`` callback so the SPA
+ * can render the tools region + scratchpad while the run is live.
  */
 export async function sendMessage(
   threadId: string,
-  question: string
+  request: SendRequest,
+  onEvent?: (e: SendEvent) => void
 ): Promise<SendResult> {
   const res = await fetch(
     `/api/threads/${encodeURIComponent(threadId)}/messages`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question }),
+      body: JSON.stringify(request),
     }
   );
 
@@ -168,6 +206,47 @@ export async function sendMessage(
       }
 
       switch (eventName) {
+        case "thinking": {
+          // T3: per-AIMessage scratchpad prose. The SPA renders
+          // it collapsed / line-clamped; the prose never
+          // participates in citation matching (SC60 binding).
+          const t = payload as { text: string };
+          onEvent?.({ type: "thinking", text: t.text ?? "" });
+          break;
+        }
+        case "tool_call": {
+          // T3 (spec line 32): ``name`` / ``args`` /
+          // ``tool_call_id`` so the SPA can render a running
+          // indicator while the tool runs.
+          const tc = payload as {
+            name: string;
+            args: Record<string, unknown>;
+            tool_call_id: string;
+          };
+          onEvent?.({
+            type: "tool_call",
+            name: tc.name,
+            args: tc.args ?? {},
+            tool_call_id: tc.tool_call_id,
+          });
+          break;
+        }
+        case "tool_result": {
+          // T3: ``tool_call_id`` + JSON-decoded ``result`` so the
+          // SPA can flip the running row to its final shape.
+          const tr = payload as {
+            tool_call_id: string;
+            name: string;
+            result: unknown;
+          };
+          onEvent?.({
+            type: "tool_result",
+            tool_call_id: tr.tool_call_id,
+            name: tr.name,
+            result: tr.result,
+          });
+          break;
+        }
         case "status": {
           // The status frame carries the server-minted ``run_id``
           // so the optimistic turn the store renders can match
@@ -186,16 +265,27 @@ export async function sendMessage(
           if (typeof s.run_id === "string" && s.run_id.length > 0) {
             result.run_id = s.run_id;
           }
+          onEvent?.({
+            type: "status",
+            run_id: result.run_id,
+            status: s.status,
+            reason: s.reason ?? null,
+            assistant_message: s.assistant_message ?? "",
+          });
           break;
         }
         case "citations":
           result.citations = payload as SendResult["citations"];
+          onEvent?.({ type: "citations", citations: result.citations });
           break;
         case "answer":
           result.answerText = (payload as { text: string }).text;
+          onEvent?.({ type: "answer", text: result.answerText });
           break;
         default:
-          // T3 will add thinking/tool_call/tool_result frames here.
+          // Unknown event type - skip rather than crash. Future
+          // T3+ event types slot in here without breaking
+          // older clients.
           break;
       }
     }

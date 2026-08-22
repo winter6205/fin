@@ -77,8 +77,12 @@ class RunRecord:
     """One run (= one user send) on a research thread.
 
     This is the assistant-turn row for GET ``/api/threads/{id}``.
-    T1 keeps ``thinking_text`` empty and ``tool_summaries`` empty;
-    T3 populates them. ``citations`` is a list of plain dicts with
+    T3 populates ``thinking_text`` (the streamed thinking prose)
+    and ``tool_summaries`` (one ``{name, summary, tool_call_id}``
+    dict per tool call observed this run — the SPA renders
+    ``summary`` and correlates by ``tool_call_id``; spec line 32).
+    Raw ToolMessage JSON never enters a summary string.
+    ``citations`` is a list of plain dicts with
     keys ``document_id`` / ``version`` / ``page`` / ``quote`` (the
     same shape the citation gate emits).
 
@@ -103,7 +107,11 @@ class RunRecord:
     answer: str = ""
     citations: list[dict[str, Any]] = field(default_factory=list)
     thinking_text: str = ""
-    tool_summaries: list[str] = field(default_factory=list)
+    # One ``{name, summary, tool_call_id}`` dict per tool call
+    # observed so far in the run; appended by ``tool_node`` and
+    # persisted as JSONB. Typed as ``dict[str, str]`` (not a
+    # nested dataclass) so the JSONB round-trip needs no codec.
+    tool_summaries: list[dict[str, str]] = field(default_factory=list)
     assistant_message: str = ""
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -420,6 +428,13 @@ CREATE TABLE IF NOT EXISTS fin_run (
 -- NULL-safe via the table default so old rows read back as the
 -- empty string.
 ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS assistant_message TEXT NOT NULL DEFAULT '';
+
+-- T3 column migration: pre-T3 tables may lack ``thinking_text`` /
+-- ``tool_summaries``. Both are listed in the CREATE TABLE above
+-- for fresh installs; the ALTERs cover existing prod tables so
+-- the durable runtime does not raise on the first T3 INSERT.
+ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS thinking_text TEXT NOT NULL DEFAULT '';
+ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS tool_summaries JSONB NOT NULL DEFAULT '[]'::jsonb;
 """
 
 

@@ -146,6 +146,153 @@ def test_in_memory_thread_store_append_run_then_list_runs() -> None:
     assert [r.answer for r in runs] == ["a1", "a2"]
 
 
+def test_run_record_tool_summaries_roundtrip_as_dicts() -> None:
+    """T3 (spec line 32): ``RunRecord.tool_summaries`` carries one
+    ``{name, summary, tool_call_id}`` dict per tool call; the
+    in-memory store's deepcopy isolation must preserve the dict
+    shape through append + list. A string-list regression (T1's
+    placeholder shape) would fail the key check."""
+    from fin.host.thread_store import InMemoryThreadStore, RunRecord
+
+    store = InMemoryThreadStore()
+    store.create_thread(id="t-ts", title="x")
+    record = RunRecord(
+        id="r-ts",
+        thread_id="t-ts",
+        question="q",
+        status="done",
+        answer="a",
+        citations=[],
+        thinking_text="chain of thought",
+        tool_summaries=[
+            {
+                "name": "read_file",
+                "summary": "AAPL-2022Q3 p.1",
+                "tool_call_id": "c-1",
+            }
+        ],
+    )
+    store.append_run(record)
+    runs = store.list_runs("t-ts")
+    assert runs[0].thinking_text == "chain of thought"
+    assert runs[0].tool_summaries == [
+        {"name": "read_file", "summary": "AAPL-2022Q3 p.1", "tool_call_id": "c-1"}
+    ]
+    entry = runs[0].tool_summaries[0]
+    assert set(entry.keys()) == {"name", "summary", "tool_call_id"}
+    # Deepcopy isolation: mutating the returned list must not
+    # corrupt the stored record.
+    runs[0].tool_summaries.append({"name": "x", "summary": "y", "tool_call_id": "z"})
+    again = store.list_runs("t-ts")
+    assert len(again[0].tool_summaries) == 1
+
+
+def test_postgres_run_sql_round_trips_tool_summaries_jsonb(monkeypatch) -> None:
+    """The Postgres INSERT serializes ``tool_summaries`` as a JSON
+    array of dicts and ``_row_to_run`` parses it back to dicts.
+    Stubbed psycopg records the params so the JSONB contract is
+    pinned without a live database."""
+    import json
+    from datetime import datetime, timezone
+
+    from fin.host.thread_store import PostgresThreadStore, RunRecord
+
+    captured_params: list[tuple] = []
+    row_back: list[tuple] = []
+
+    class _StubCursor:
+        def __init__(self, value):
+            self._value = value
+
+        def fetchone(self):
+            return self._value
+
+    class _StubConn:
+        def execute(self, sql, params=None):
+            if params is not None:
+                captured_params.append(params)
+                # Mirror the SELECT column order used by list_runs.
+                row_back.append(
+                    (
+                        params[0],  # id
+                        params[1],  # thread_id
+                        params[2],  # question
+                        params[3],  # status
+                        params[4],  # status_reason
+                        params[5],  # answer
+                        params[6],  # citations json
+                        params[7],  # thinking_text
+                        params[8],  # tool_summaries json
+                        params[9],  # assistant_message
+                        params[10],  # created_at
+                    )
+                )
+            return _StubCursor(row_back[-1] if row_back else None)
+
+        def commit(self):
+            pass
+
+    class _StubCM:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __enter__(self):
+            return self._conn
+
+        def __exit__(self, *exc):
+            return False
+
+    import fin.host.thread_store as ts_mod
+
+    monkeypatch.setattr(
+        ts_mod.psycopg,
+        "connect",
+        lambda *a, **kw: _StubCM(_StubConn()),
+    )
+
+    store = PostgresThreadStore.__new__(PostgresThreadStore)
+    store._url = "postgresql://stub"
+    summaries = [
+        {"name": "list_files", "summary": "12 filings", "tool_call_id": "c-lf"},
+    ]
+    created = datetime(2026, 8, 23, tzinfo=timezone.utc)
+    store.append_run(
+        RunRecord(
+            id="r-pg",
+            thread_id="t-pg",
+            question="q",
+            status="done",
+            answer="a",
+            citations=[],
+            thinking_text="thoughts",
+            tool_summaries=summaries,
+            assistant_message="",
+            created_at=created,
+        )
+    )
+    # The persisted JSON is an array of dicts.
+    persisted = json.loads(captured_params[0][8])
+    assert persisted == [
+        {"name": "list_files", "summary": "12 filings", "tool_call_id": "c-lf"}
+    ]
+    # _row_to_run parses it back to dicts.
+    parsed = store._row_to_run(row_back[0])
+    assert parsed.tool_summaries == [
+        {"name": "list_files", "summary": "12 filings", "tool_call_id": "c-lf"}
+    ]
+
+
+def test_postgres_schema_contains_t3_column_migrations() -> None:
+    """Pre-T3 ``fin_run`` tables must be upgraded idempotently: the
+    schema SQL contains ``ADD COLUMN IF NOT EXISTS`` for
+    ``thinking_text`` and ``tool_summaries`` so a durable boot on an
+    old table does not raise on the first T3 INSERT."""
+    from fin.host.thread_store import _SCHEMA_SQL
+
+    assert "ADD COLUMN IF NOT EXISTS thinking_text" in _SCHEMA_SQL
+    assert "ADD COLUMN IF NOT EXISTS tool_summaries" in _SCHEMA_SQL
+
+
 def test_in_memory_thread_store_append_run_unknown_thread_raises() -> None:
     """Appending a run for an unknown thread is a programmer error;
     the store raises ``ThreadNotFoundError`` so a misconfigured route

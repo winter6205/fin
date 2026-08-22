@@ -38,6 +38,12 @@ class RunResponsePayload(TypedDict):
     persisted ``RunRecord`` both carry this string so a reload
     never loses the copy. ``/ask`` ignores the field because the
     AskResponse wire shape is frozen.
+
+    T3 streaming fields: ``thinking_text`` and ``tool_summaries``
+    are surfaced here (already bounce-marker-stripped) so the
+    workspace SSE + RunRecord persistence reach the SSOT helper.
+    ``/ask`` ignores both — the AskResponse wire shape is frozen
+    (the streaming shapes live only on the workspace surface).
     """
 
     status: RunStatus
@@ -45,6 +51,8 @@ class RunResponsePayload(TypedDict):
     reason: str
     citations: list[dict[str, Any]]
     assistant_message: str
+    thinking_text: str
+    tool_summaries: list[dict[str, str]]
 
 
 # Ordinary-person copy the SPA renders when a run ended
@@ -121,6 +129,34 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
     reason_value = strip_hidden_bounce_marker(str(raw.get("status_reason", "") or ""))
     raw_citations = raw.get("citations", ()) or ()
 
+    # T3 streaming fields: pull thinking prose and one-liner tool
+    # summaries off the raw state. ``strip_hidden_bounce_marker``
+    # runs on the thinking text and on every summary string so a
+    # gate-emitted marker cannot leak into the workspace turn row
+    # (ADR 0021). The shapes come from
+    # ``graph.model_node`` / ``graph._build_tool_summaries`` and
+    # are defaulted to empty strings / empty lists if the run
+    # ended before either was populated (e.g. a refused first
+    # turn with no model call).
+    thinking_value = strip_hidden_bounce_marker(
+        str(raw.get("thinking_text", "") or "")
+    )
+    raw_summaries = raw.get("tool_summaries", ()) or ()
+    summaries_value: list[dict[str, str]] = []
+    if isinstance(raw_summaries, list):
+        for entry in raw_summaries:
+            if not isinstance(entry, dict):
+                continue
+            summaries_value.append(
+                {
+                    "name": str(entry.get("name", "")),
+                    "summary": strip_hidden_bounce_marker(
+                        str(entry.get("summary", ""))
+                    ),
+                    "tool_call_id": str(entry.get("tool_call_id", "")),
+                }
+            )
+
     if status_value == "done":
         citations_payload: list[dict[str, Any]] = [
             {
@@ -140,6 +176,8 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
             # answer IS the answer); empty string keeps the
             # wire shape stable across terminal statuses.
             assistant_message="",
+            thinking_text=thinking_value,
+            tool_summaries=summaries_value,
         )
 
     # ``refuse`` / ``step_cap`` keep their status + reason; anything
@@ -160,6 +198,12 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
         # The mapping is reason-aware for ``refuse`` and
         # status-fixed for ``step_cap``; see ``ordinary_person_copy``.
         assistant_message=ordinary_person_copy(collapsed_status, reason_value),
+        # Thinking + tool summaries still travel on ``refuse`` /
+        # ``step_cap`` if a model turn produced them before the
+        # fuse fired; the SPA's turn row shows them. Empty when
+        # the run ended before any model call.
+        thinking_text=thinking_value,
+        tool_summaries=summaries_value,
     )
 
 
