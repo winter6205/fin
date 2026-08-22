@@ -83,7 +83,7 @@ from fin.host.graph import compile_graph
 # ``DEFAULT_BASE_URL`` exposes a model whose id uses a slash
 # separator (``provider/model``); ``ChatOpenAI`` passes it
 # verbatim to the proxy.
-DEFAULT_MODEL = "minimax-cn/MiniMax-M3"
+DEFAULT_MODEL = "fin/MiniMax-M3"
 
 # OpenAI Chat-Completions proxy URL (the official ``openai``
 # SDK appends ``/chat/completions`` to ``base_url``). The
@@ -187,7 +187,7 @@ def compile_for_runtime(
         :class:`MissingCheckpointURLError`.
     model_name
         Model id passed verbatim to the proxy (e.g.
-        ``"minimax-cn/MiniMax-M3"``). Defaults to
+        ``"fin/MiniMax-M3"``). Defaults to
         ``os.environ.get("FIN_MODEL", DEFAULT_MODEL)``.
     base_url
         OpenAI-compatible chat-completions endpoint (the
