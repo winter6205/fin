@@ -130,7 +130,7 @@ def compile_for_http(
         ``PostgresSaver``. ``None`` triggers the prod lazy path.
     model
         A LangChain ``BaseChatModel``. Tests pass
-        ``ScriptedChatModel``; T8 passes the ``ChatAnthropic``
+        ``ScriptedChatModel``; T8 passes the ``ChatOpenAI``
         instance built from ``FIN_MODEL`` + ``FIN_BASE_URL``.
         ``None`` triggers the prod lazy path.
     **kwargs
