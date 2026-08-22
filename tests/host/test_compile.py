@@ -200,7 +200,14 @@ def test_env_example_default_model_matches_adr_0013() -> None:
 def test_env_example_default_base_url_matches_default_constant() -> None:
     env = _load_env_example()
     assert env["FIN_BASE_URL"] == DEFAULT_BASE_URL
-    assert env["FIN_BASE_URL"] == "http://localhost:20128/v1"
+    # The default MUST NOT include /v1 — the official Anthropic
+    # SDK appends /v1/messages itself. Passing base_url with
+    # /v1 would result in /v1/v1/messages (404 at the proxy).
+    assert env["FIN_BASE_URL"] == "http://localhost:20128"
+    assert not env["FIN_BASE_URL"].endswith("/v1"), (
+        ".env.example FIN_BASE_URL must not end with /v1; the "
+        "Anthropic SDK appends /v1/messages"
+    )
 
 
 def test_compose_service_url_matches_env_example_url() -> None:
@@ -307,21 +314,23 @@ def test_compile_for_runtime_raises_missing_checkpoint_url(
         compile_for_runtime()
 
 
-def _install_fake_langchain_openai(
+def _install_fake_langchain_anthropic(
     monkeypatch: pytest.MonkeyPatch, captured: dict[str, object]
 ) -> None:
-    """Inject a fake ``langchain_openai`` module so the function's
-    lazy import resolves to a stub ``ChatOpenAI`` without requiring
-    the real ``langchain-openai`` package (which the prod boot
-    path needs but tests don't).
+    """Inject a fake ``langchain_anthropic`` module so the function's
+    lazy import resolves to a stub ``ChatAnthropic`` without
+    requiring the real ``langchain-anthropic`` package (which the
+    prod boot path needs but tests don't).
 
     The stub captures ``model``, ``base_url``, and ``api_key`` so
     each test can assert the contract end-to-end without making
-    any network call.
+    any network call. ``ChatAnthropic`` exposes the same three
+    keyword arguments to the proxy; the test surface is identical
+    to what ``ChatOpenAI`` had.
     """
-    fake_mod = types.ModuleType("langchain_openai")
+    fake_mod = types.ModuleType("langchain_anthropic")
 
-    class _FakeChatOpenAI:
+    class _FakeChatAnthropic:
         def __init__(
             self,
             *,
@@ -334,8 +343,8 @@ def _install_fake_langchain_openai(
             captured["base_url"] = base_url
             captured["api_key"] = api_key
 
-    fake_mod.ChatOpenAI = _FakeChatOpenAI
-    monkeypatch.setitem(sys.modules, "langchain_openai", fake_mod)
+    fake_mod.ChatAnthropic = _FakeChatAnthropic
+    monkeypatch.setitem(sys.modules, "langchain_anthropic", fake_mod)
 
 
 def _install_fake_postgres_saver(
@@ -365,7 +374,7 @@ def test_compile_for_runtime_uses_default_model_when_unset(
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
 
     captured: dict[str, object] = {}
-    _install_fake_langchain_openai(monkeypatch, captured)
+    _install_fake_langchain_anthropic(monkeypatch, captured)
     _install_fake_postgres_saver(monkeypatch, _FakePostgresSaver)
 
     graph_calls: list[dict[str, object]] = []
@@ -383,7 +392,10 @@ def test_compile_for_runtime_uses_default_model_when_unset(
     assert captured["model"] == DEFAULT_MODEL
     assert captured["model"] == "minimax-cn/MiniMax-M3"
     assert captured["base_url"] == DEFAULT_BASE_URL
-    assert captured["base_url"] == "http://localhost:20128/v1"
+    # The Anthropic SDK appends /v1/messages; passing base_url
+    # with /v1 would yield /v1/v1/messages (404). The default
+    # is bare http://localhost:20128.
+    assert captured["base_url"] == "http://localhost:20128"
     assert captured["api_key"] == "sk-no-key-required", (
         "api_key must fall back to the no-key placeholder when "
         "ANTHROPIC_API_KEY is unset"
@@ -406,7 +418,7 @@ def test_compile_for_runtime_reads_fin_model_from_env(
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
 
     captured: dict[str, object] = {}
-    _install_fake_langchain_openai(monkeypatch, captured)
+    _install_fake_langchain_anthropic(monkeypatch, captured)
     _install_fake_postgres_saver(monkeypatch, _FakePostgresSaver)
 
     monkeypatch.setattr(
@@ -421,13 +433,13 @@ def test_compile_for_runtime_reads_fin_base_url_from_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``FIN_BASE_URL`` from the env is forwarded to
-    ``ChatOpenAI`` as ``base_url=``. Operators override the
-    default proxy URL via env."""
+    ``ChatAnthropic`` as ``base_url=``. Operators override the
+    default proxy URL via env (e.g. WSL2 gateway IP)."""
     monkeypatch.setenv("FIN_BASE_URL", "https://api.example.com/v1")
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
 
     captured: dict[str, object] = {}
-    _install_fake_langchain_openai(monkeypatch, captured)
+    _install_fake_langchain_anthropic(monkeypatch, captured)
     _install_fake_postgres_saver(monkeypatch, _FakePostgresSaver)
 
     monkeypatch.setattr(
@@ -452,7 +464,7 @@ def test_compile_for_runtime_passes_anthropic_api_key_as_api_key(
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake-key")
 
     captured: dict[str, object] = {}
-    _install_fake_langchain_openai(monkeypatch, captured)
+    _install_fake_langchain_anthropic(monkeypatch, captured)
     _install_fake_postgres_saver(monkeypatch, _FakePostgresSaver)
 
     monkeypatch.setattr(
@@ -476,7 +488,7 @@ def test_compile_for_runtime_wraps_setup_failure_as_typed_error(
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://bad")
 
     captured: dict[str, object] = {}
-    _install_fake_langchain_openai(monkeypatch, captured)
+    _install_fake_langchain_anthropic(monkeypatch, captured)
     _install_fake_postgres_saver(monkeypatch, _BrokenPostgresSaver)
 
     with pytest.raises(CheckpointSetupError) as excinfo:

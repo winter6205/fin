@@ -12,11 +12,11 @@ Why a helper at all
 -------------------
 ADR 0015 fixes ``PostgresSaver`` + ``FIN_CHECKPOINT_URL`` for
 the durable v1 path. ADR 0013 fixes the runtime model selection
-by ``FIN_MODEL`` (+ ``FIN_BASE_URL`` for the OpenAI-compatible
-proxy at ``http://localhost:20128/v1``). Wiring both at every
-call site would scatter the same lines (env read → model build
-→ saver build → ``compile_graph``) across T7 and T9 and risk
-drift. Centralising them here gives us one place to:
+by ``FIN_MODEL`` (+ ``FIN_BASE_URL`` for the Anthropic-compatible
+proxy on port 20128). Wiring both at every call site would
+scatter the same lines (env read → model build → saver build →
+``compile_graph``) across T7 and T9 and risk drift. Centralising
+them here gives us one place to:
 
 * raise ``MissingCheckpointURLError`` when ``FIN_CHECKPOINT_URL``
   is unset (a silent default would point checkpoints at the wrong
@@ -41,11 +41,21 @@ HTTP process. Tests append fakes, so no real resource is held.
 
 Lazy imports
 ------------
-``ChatOpenAI`` and ``PostgresSaver`` are imported inside the
+``ChatAnthropic`` and ``PostgresSaver`` are imported inside the
 function — not at module top — so the module is importable even
 when those heavy runtime deps are missing or have been replaced
 in ``sys.modules`` by a test fixture. Production boot pulls the
 real symbols; tests inject fakes.
+
+URL contract (Anthropic SDK)
+----------------------------
+``ChatAnthropic`` is built on the official ``anthropic`` SDK;
+the SDK appends ``/v1/messages`` to whatever ``base_url`` you
+give it. So ``FIN_BASE_URL`` MUST NOT include ``/v1`` — passing
+``http://localhost:20128/v1`` would result in requests to
+``http://localhost:20128/v1/v1/messages`` (the proxy would 404).
+The default below is bare ``http://localhost:20128``; the
+proxy receives ``POST /v1/messages`` as expected.
 """
 
 from __future__ import annotations
@@ -65,17 +75,16 @@ from fin.host.graph import compile_graph
 
 
 # ADR 0013 default for ``FIN_MODEL``. The local proxy at
-# ``DEFAULT_BASE_URL`` exposes a model whose id is OpenAI-style
-# (``provider/model``); the slash would otherwise confuse a
-# naive ``init_chat_model`` parser. We construct ``ChatOpenAI``
-# directly with this string as the ``model=`` argument, which
-# passes the value verbatim to the proxy.
+# ``DEFAULT_BASE_URL`` exposes a model whose id uses a slash
+# separator; we pass it verbatim to ``ChatAnthropic`` so the
+# proxy receives the full id (e.g. ``minimax-cn/MiniMax-M3``).
 DEFAULT_MODEL = "minimax-cn/MiniMax-M3"
 
-# OpenAI-compatible proxy serving the v1 chat model. ADR 0013 +
-# dev-only local proxy (not a public URL). Operators running
-# against Anthropic's hosted API override via ``FIN_BASE_URL``.
-DEFAULT_BASE_URL = "http://localhost:20128/v1"
+# Anthropic Messages-API proxy URL (no trailing ``/v1`` — the
+# official ``anthropic`` SDK appends ``/v1/messages`` itself).
+# Operators running against Anthropic's hosted API override via
+# ``FIN_BASE_URL=https://api.anthropic.com``.
+DEFAULT_BASE_URL = "http://localhost:20128"
 
 # The exact ``FIN_CHECKPOINT_URL`` example shipped in
 # ``.env.example`` and asserted by the URL-match acceptance gate
@@ -174,12 +183,14 @@ def compile_for_runtime(
         ``"minimax-cn/MiniMax-M3"``). Defaults to
         ``os.environ.get("FIN_MODEL", DEFAULT_MODEL)``.
     base_url
-        OpenAI-compatible chat-completions endpoint. Defaults to
+        Anthropic-compatible proxy endpoint (no trailing
+        ``/v1`` — the SDK appends ``/v1/messages``). Defaults to
         ``os.environ.get("FIN_BASE_URL", DEFAULT_BASE_URL)``.
         The local v1 dev proxy listens on
-        ``http://localhost:20128/v1``; cloud deployments override
-        via env. The proxy is expected to forward
-        ``Authorization: Bearer <key>`` upstream.
+        ``http://localhost:20128`` and receives
+        ``POST /v1/messages``; WSL2 users override with the
+        Windows-host gateway IP, e.g.
+        ``http://172.31.128.1:20128``.
     env
         Mapping to read env-style keys from. Defaults to
         ``os.environ``. Tests inject a ``monkeypatch.setenv``
@@ -228,17 +239,16 @@ def compile_for_runtime(
     # Step 3: lazy import the runtime deps. Module import stays
     # cheap when the heavy packages are absent; tests inject
     # fakes into ``sys.modules``.
-    from langchain_openai import ChatOpenAI
+    from langchain_anthropic import ChatAnthropic
     from langgraph.checkpoint.postgres import PostgresSaver
 
     # ``ANTHROPIC_API_KEY`` is the user's chosen credential
-    # name in their shell; the proxy accepts any non-empty
-    # ``Authorization: Bearer`` token and forwards it. We
-    # pass it through verbatim — the value never leaves the
-    # module.
+    # name in their shell; ``ChatAnthropic`` forwards it as the
+    # ``x-api-key`` header. The local 9router proxy passes the
+    # header through; we never log the value.
     api_key = _read_env(env, "ANTHROPIC_API_KEY") or "sk-no-key-required"
 
-    model = ChatOpenAI(
+    model = ChatAnthropic(
         model=model_name,
         base_url=base_url,
         api_key=api_key,
