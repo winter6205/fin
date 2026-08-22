@@ -11,11 +11,12 @@ and the production surface explicit (ADR 0015 + ADR 0013).
 Why a helper at all
 -------------------
 ADR 0015 fixes ``PostgresSaver`` + ``FIN_CHECKPOINT_URL`` for
-the durable v1 path. ADR 0013 fixes ``init_chat_model`` selected
-by ``FIN_MODEL``. Wiring both at every call site would scatter
-the same four lines (env read → model build → saver build →
-``compile_graph``) across T7 and T9 and risk drift. Centralising
-them here gives us one place to:
+the durable v1 path. ADR 0013 fixes the runtime model selection
+by ``FIN_MODEL`` (+ ``FIN_BASE_URL`` for the OpenAI-compatible
+proxy at ``http://localhost:20128/v1``). Wiring both at every
+call site would scatter the same lines (env read → model build
+→ saver build → ``compile_graph``) across T7 and T9 and risk
+drift. Centralising them here gives us one place to:
 
 * raise ``MissingCheckpointURLError`` when ``FIN_CHECKPOINT_URL``
   is unset (a silent default would point checkpoints at the wrong
@@ -40,7 +41,7 @@ HTTP process. Tests append fakes, so no real resource is held.
 
 Lazy imports
 ------------
-``init_chat_model`` and ``PostgresSaver`` are imported inside the
+``ChatOpenAI`` and ``PostgresSaver`` are imported inside the
 function — not at module top — so the module is importable even
 when those heavy runtime deps are missing or have been replaced
 in ``sys.modules`` by a test fixture. Production boot pulls the
@@ -63,11 +64,18 @@ from fin.host.graph import compile_graph
 # ----- public constants -----
 
 
-# ADR 0013 default for ``FIN_MODEL``. Kept here (not in
-# ``state.py``) because it's a deployment knob, not graph
-# state. ``.env.example`` and the test suite both anchor on this
-# value.
-DEFAULT_MODEL = "anthropic:claude-sonnet-4-5-20250929"
+# ADR 0013 default for ``FIN_MODEL``. The local proxy at
+# ``DEFAULT_BASE_URL`` exposes a model whose id is OpenAI-style
+# (``provider/model``); the slash would otherwise confuse a
+# naive ``init_chat_model`` parser. We construct ``ChatOpenAI``
+# directly with this string as the ``model=`` argument, which
+# passes the value verbatim to the proxy.
+DEFAULT_MODEL = "minimax-cn/MiniMax-M3"
+
+# OpenAI-compatible proxy serving the v1 chat model. ADR 0013 +
+# dev-only local proxy (not a public URL). Operators running
+# against Anthropic's hosted API override via ``FIN_BASE_URL``.
+DEFAULT_BASE_URL = "http://localhost:20128/v1"
 
 # The exact ``FIN_CHECKPOINT_URL`` example shipped in
 # ``.env.example`` and asserted by the URL-match acceptance gate
@@ -149,6 +157,7 @@ def compile_for_runtime(
     *,
     checkpointer_url: str | None = None,
     model_name: str | None = None,
+    base_url: str | None = None,
     env: Mapping[str, str] | None = None,
 ) -> Any:
     """Build the durable v1 host graph for CLI / HTTP boot.
@@ -161,9 +170,16 @@ def compile_for_runtime(
         no fallback — a missing value raises
         :class:`MissingCheckpointURLError`.
     model_name
-        LangChain chat-model spec (``"provider:model-id"``).
-        Defaults to ``os.environ.get("FIN_MODEL",
-        DEFAULT_MODEL)``.
+        Model id passed verbatim to the proxy (e.g.
+        ``"minimax-cn/MiniMax-M3"``). Defaults to
+        ``os.environ.get("FIN_MODEL", DEFAULT_MODEL)``.
+    base_url
+        OpenAI-compatible chat-completions endpoint. Defaults to
+        ``os.environ.get("FIN_BASE_URL", DEFAULT_BASE_URL)``.
+        The local v1 dev proxy listens on
+        ``http://localhost:20128/v1``; cloud deployments override
+        via env. The proxy is expected to forward
+        ``Authorization: Bearer <key>`` upstream.
     env
         Mapping to read env-style keys from. Defaults to
         ``os.environ``. Tests inject a ``monkeypatch.setenv``
@@ -199,19 +215,34 @@ def compile_for_runtime(
     else:
         url = checkpointer_url
 
-    # Step 2: resolve the model spec. ``FIN_MODEL`` is optional;
-    # ADR 0013 fixes the default. We resolve BEFORE the saver so
-    # a bad model name fails fast without touching Postgres.
+    # Step 2: resolve the model spec + base_url. Both are
+    # optional with sensible defaults; ADR 0013 fixes the
+    # model, the local-proxy URL is a deployment knob. We
+    # resolve BEFORE the saver so a bad model name fails fast
+    # without touching Postgres.
     if model_name is None:
         model_name = _read_env(env, "FIN_MODEL") or DEFAULT_MODEL
+    if base_url is None:
+        base_url = _read_env(env, "FIN_BASE_URL") or DEFAULT_BASE_URL
 
     # Step 3: lazy import the runtime deps. Module import stays
     # cheap when the heavy packages are absent; tests inject
     # fakes into ``sys.modules``.
-    from langchain.chat_models import init_chat_model
+    from langchain_openai import ChatOpenAI
     from langgraph.checkpoint.postgres import PostgresSaver
 
-    model = init_chat_model(model_name)
+    # ``ANTHROPIC_API_KEY`` is the user's chosen credential
+    # name in their shell; the proxy accepts any non-empty
+    # ``Authorization: Bearer`` token and forwards it. We
+    # pass it through verbatim — the value never leaves the
+    # module.
+    api_key = _read_env(env, "ANTHROPIC_API_KEY") or "sk-no-key-required"
+
+    model = ChatOpenAI(
+        model=model_name,
+        base_url=base_url,
+        api_key=api_key,
+    )
 
     # Step 4: open the Postgres connection via the context
     # manager and run ``setup()`` once (idempotent — creates
@@ -252,6 +283,7 @@ def compile_for_runtime(
 
 
 __all__ = [
+    "DEFAULT_BASE_URL",
     "DEFAULT_MODEL",
     "EXPECTED_CHECKPOINT_URL",
     "CheckpointSetupError",
