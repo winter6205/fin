@@ -79,6 +79,10 @@ _Avoid_: one question per thread, treating a refuse as killing the session
 One graph `invoke` on a thread (`run_id`): done / refuse / `step_cap` end the run; a follow-up is a new run on the same `thread_id`; crash resume continues the in-flight run; at most one run is active per thread.
 _Avoid_: collapsing run into thread_id, concurrent invokes on one thread
 
+**research thread**:
+The product conversation: one `thread_id` the operator talks in; each question is a run; follow-ups keep messages and citations. This is how fin is used after v1; it is not a chatbot identity and not a one-shot `/ask` demo.
+_Avoid_: chatbot, Q&A session, demo ask, one-shot invoke as the product UX
+
 **v1 surface**:
 The first ship binary is a CLI that compiles the host graph; v1 HTTP exposes that same compiled graph and must call sync `invoke` (not `ainvoke`) so the sync `PostgresSaver` stays valid. HITL / interrupt UX is not a v1 product surface; crash resume continues the in-flight run on that `thread_id`.
 _Avoid_: HTTP-only first ship, separate graphs per transport, approval UI as v1
