@@ -76,16 +76,16 @@ A conversation session: follow-up questions reuse this id so checkpoints and mes
 _Avoid_: one question per thread, treating a refuse as killing the session
 
 **run**:
-One graph `invoke` on a thread (`run_id`): done / refuse / `step_cap` end the run; a follow-up is a new run on the same `thread_id`; crash resume continues the in-flight run; at most one run is active per thread.
-_Avoid_: collapsing run into thread_id, concurrent invokes on one thread
+One graph `invoke` or `stream` on a thread (`run_id`): `done` / `refuse` / `step_cap` end the run; a follow-up is a new run on the same `thread_id` that resets run-scoped evidence and caps. Crash resume continues that in-flight `run_id` from the last complete host-graph node; at most one run is active per thread.
+_Avoid_: collapsing run into thread_id, concurrent invokes on one thread, deleting the user turn to “sanitize” a crash
 
 **research thread**:
 The product conversation: one `thread_id` the operator talks in; each question is a run; follow-ups keep messages and citations. This is how fin is used after v1; it is not a chatbot identity and not a one-shot `/ask` demo.
 _Avoid_: chatbot, Q&A session, demo ask, one-shot invoke as the product UX
 
 **workspace**:
-A local web UI server: list, open, resume, and delete a research thread; thinking (when the model emits it) and tool calls stream on the turn then collapse; citations sit on the assistant message. Streaming HTTP is this UI's transport on the same compiled graph, not a second product.
-_Avoid_: chatbot, CLI REPL as the product, hosted accounts this increment, raw tool JSON as the UI, always-expanded traces, Studio, POST /ask as the conversation surface
+A local web UI server: create, list, open, resume, and delete a research thread; thinking streams unframed then collapses; tool calls stream then collapse as human-readable traces; citations sit on the assistant turn (inline chips plus a sources list). Streaming HTTP is that UI's transport on the same compiled graph; GET history is turn rows; thinking on/off is the model `extra_body.thinking` knob; crash resume continues the in-flight run from the last complete host-graph node.
+_Avoid_: chatbot, CLI REPL as the product, hosted accounts this increment, raw tool JSON as the UI, always-expanded traces, Studio, POST /ask as the conversation surface, rolling back a user turn on crash
 
 **v1 surface**:
 The first ship binary is a CLI that compiles the host graph; v1 HTTP exposes that same compiled graph and must call sync `invoke` (not `ainvoke`) so the sync `PostgresSaver` stays valid. HITL / interrupt UX is not a v1 product surface; crash resume continues the in-flight run on that `thread_id`.
