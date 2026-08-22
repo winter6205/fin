@@ -70,6 +70,9 @@ export interface SendResult {
   reason?: string | null;
   citations: Citation[];
   answerText: string;
+  // T2: ordinary-person copy from the SSE ``status`` frame
+  // (non-empty only on refuse / step_cap).
+  assistantMessage: string;
 }
 
 export class ConcurrentRunError extends Error {}
@@ -105,6 +108,7 @@ export async function sendMessage(
       status: "done",
       citations: [],
       answerText: "",
+      assistantMessage: "",
     };
   }
   if (!res.ok || !res.body) {
@@ -130,6 +134,7 @@ export async function sendMessage(
     reason: null,
     citations: [],
     answerText: "",
+    assistantMessage: "",
   };
 
   const reader = res.body.getReader();
@@ -166,14 +171,18 @@ export async function sendMessage(
         case "status": {
           // The status frame carries the server-minted ``run_id``
           // so the optimistic turn the store renders can match
-          // the persisted RunRecord BEFORE any re-GET.
+          // the persisted RunRecord BEFORE any re-GET. T2 adds
+          // ``assistant_message`` (ordinary-person copy on
+          // refuse / step_cap).
           const s = payload as {
             run_id?: string;
             status: SendResult["status"];
             reason?: string;
+            assistant_message?: string;
           };
           result.status = s.status;
           result.reason = s.reason ?? null;
+          result.assistantMessage = s.assistant_message ?? "";
           if (typeof s.run_id === "string" && s.run_id.length > 0) {
             result.run_id = s.run_id;
           }

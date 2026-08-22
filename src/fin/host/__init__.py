@@ -24,6 +24,8 @@ from fin.host.graph import ConcurrentRunError, compile_graph
 from fin.host.scripted_model import ScriptedChatModel
 from fin.host.state import (
     AgentState,
+    EVIDENCE_RESET,
+    EvidenceReset,
     REPAIR_CAP,
     RECURSION_LIMIT,
     STEP_CAP,
@@ -34,6 +36,8 @@ from fin.host.tools import list_files, read_file
 
 __all__ = [
     "AgentState",
+    "EVIDENCE_RESET",
+    "EvidenceReset",
     "BounceResult",
     "Citation",
     "CitationGateError",
