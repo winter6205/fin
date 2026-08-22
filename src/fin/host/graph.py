@@ -345,10 +345,11 @@ def compile_graph(
         the checkpointer itself (ADR 0015).
     model
         A LangChain ``BaseChatModel``. Tests pass
-        ``ScriptedChatModel``; production (T7 / T9) passes
-        ``init_chat_model(os.environ["FIN_MODEL"])``. The factory
-        calls ``bind_tools`` on it to register the three host
-        tools.
+        ``ScriptedChatModel``; production (T7 / T9) passes the
+        ``ChatOpenAI`` instance built by T8's
+        ``compile_for_runtime`` from ``FIN_MODEL`` + ``FIN_BASE_URL``.
+        The factory calls ``bind_tools`` on it to register the
+        three host tools.
     adapter
         An already-built ``BM25Adapter`` (T4). If ``None``, the
         factory builds one from ``manifest_path`` + ``extracted_root``

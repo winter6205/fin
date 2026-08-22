@@ -130,9 +130,9 @@ def compile_for_http(
         ``PostgresSaver``. ``None`` triggers the prod lazy path.
     model
         A LangChain ``BaseChatModel``. Tests pass
-        ``ScriptedChatModel``; T8 passes
-        ``init_chat_model(os.environ["FIN_MODEL"])``. ``None``
-        triggers the prod lazy path.
+        ``ScriptedChatModel``; T8 passes the ``ChatOpenAI``
+        instance built from ``FIN_MODEL`` + ``FIN_BASE_URL``.
+        ``None`` triggers the prod lazy path.
     **kwargs
         Forwarded to ``compile_graph`` (adapter, manifest_path,
         extracted_root, known_document_ids, step_cap,

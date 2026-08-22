@@ -21,13 +21,15 @@ suite stays hermetic.
 
 Reference: ADR 0015 (``PostgresSaver`` + ``FIN_CHECKPOINT_URL``,
 ``InMemorySaver`` only in tests), ADR 0013 (``FIN_MODEL`` default
-``anthropic:claude-sonnet-4-5-20250929``), spec success-criteria
-item 7 (``docker compose config`` exits 0 and the example URL
-matches the service).
+``minimax-cn/MiniMax-M3`` served by OpenAI-compatible proxy at
+``FIN_BASE_URL`` default ``http://localhost:20128/v1``), spec
+success-criteria item 7 (``docker compose config`` exits 0 and
+the example URL matches the service).
 """
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import types
@@ -39,6 +41,7 @@ import pytest
 import yaml
 
 from fin.host.compile import (
+    DEFAULT_BASE_URL,
     DEFAULT_MODEL,
     EXPECTED_CHECKPOINT_URL,
     CheckpointSetupError,
@@ -69,10 +72,23 @@ def _load_compose_spec() -> dict:
 def _load_env_example() -> dict[str, str]:
     """Parse ``.env.example`` as a simple ``KEY=VALUE`` map.
 
-    Comments and blank lines are ignored. Values are taken as the
-    literal right-hand side (no shell expansion).
+    Comments and blank lines are ignored. Values are shell-
+    expanded in two narrow ways so a template like
+    ``${FIN_MODEL:-minimax-cn/MiniMax-M3}`` resolves to the
+    fallback (``minimax-cn/MiniMax-M3``) — i.e. what the operator
+    sees when they have not set the variable. This matches the
+    contract that ``.env.example`` is a self-documenting template
+    AND that the resolved defaults match the production
+    constants.
+
+    Recognised patterns:
+
+    * ``${VAR}`` → ``"<unset>"`` (placeholder with no fallback).
+    * ``${VAR:-default}`` → ``default``.
+    * anything else → literal text.
     """
     pairs: dict[str, str] = {}
+    placeholder = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?::-([^}]*))?\}")
     for raw in ENV_EXAMPLE_PATH.read_text().splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -80,7 +96,12 @@ def _load_env_example() -> dict[str, str]:
         if "=" not in line:
             continue
         key, _, value = line.partition("=")
-        pairs[key.strip()] = value.strip()
+        value = value.strip()
+        m = placeholder.fullmatch(value)
+        if m is not None:
+            fallback = m.group(2)
+            value = fallback if fallback is not None else "<unset>"
+        pairs[key.strip()] = value
     return pairs
 
 
@@ -147,6 +168,10 @@ def test_env_example_has_required_keys() -> None:
     assert "FIN_MODEL" in env, (
         ".env.example must define FIN_MODEL (ADR 0013)"
     )
+    assert "FIN_BASE_URL" in env, (
+        ".env.example must define FIN_BASE_URL (ADR 0013 — "
+        "OpenAI-compatible proxy endpoint)"
+    )
 
 
 def test_env_example_url_matches_expected() -> None:
@@ -169,7 +194,13 @@ def test_env_example_url_is_well_formed_postgres() -> None:
 def test_env_example_default_model_matches_adr_0013() -> None:
     env = _load_env_example()
     assert env["FIN_MODEL"] == DEFAULT_MODEL
-    assert env["FIN_MODEL"] == "anthropic:claude-sonnet-4-5-20250929"
+    assert env["FIN_MODEL"] == "minimax-cn/MiniMax-M3"
+
+
+def test_env_example_default_base_url_matches_default_constant() -> None:
+    env = _load_env_example()
+    assert env["FIN_BASE_URL"] == DEFAULT_BASE_URL
+    assert env["FIN_BASE_URL"] == "http://localhost:20128/v1"
 
 
 def test_compose_service_url_matches_env_example_url() -> None:
@@ -276,21 +307,35 @@ def test_compile_for_runtime_raises_missing_checkpoint_url(
         compile_for_runtime()
 
 
-def _install_fake_langchain_chat_models(
-    monkeypatch: pytest.MonkeyPatch, captured: dict[str, str]
+def _install_fake_langchain_openai(
+    monkeypatch: pytest.MonkeyPatch, captured: dict[str, object]
 ) -> None:
-    """Inject a fake ``langchain.chat_models`` module so the
-    function's lazy import returns a stub ``init_chat_model``
-    without requiring the real ``langchain`` meta-package (which
-    is intentionally not in v1's pre-add deps)."""
-    fake_mod = types.ModuleType("langchain.chat_models")
+    """Inject a fake ``langchain_openai`` module so the function's
+    lazy import resolves to a stub ``ChatOpenAI`` without requiring
+    the real ``langchain-openai`` package (which the prod boot
+    path needs but tests don't).
 
-    def _init_chat_model(name, **_kwargs: object) -> tuple[str, str]:
-        captured["name"] = name
-        return ("fake-model", name)
+    The stub captures ``model``, ``base_url``, and ``api_key`` so
+    each test can assert the contract end-to-end without making
+    any network call.
+    """
+    fake_mod = types.ModuleType("langchain_openai")
 
-    fake_mod.init_chat_model = _init_chat_model
-    monkeypatch.setitem(sys.modules, "langchain.chat_models", fake_mod)
+    class _FakeChatOpenAI:
+        def __init__(
+            self,
+            *,
+            model: str,
+            base_url: str | None = None,
+            api_key: str | None = None,
+            **_kwargs: object,
+        ) -> None:
+            captured["model"] = model
+            captured["base_url"] = base_url
+            captured["api_key"] = api_key
+
+    fake_mod.ChatOpenAI = _FakeChatOpenAI
+    monkeypatch.setitem(sys.modules, "langchain_openai", fake_mod)
 
 
 def _install_fake_postgres_saver(
@@ -307,18 +352,20 @@ def _install_fake_postgres_saver(
 def test_compile_for_runtime_uses_default_model_when_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``FIN_MODEL`` falls back to the ADR 0013 default.
+    """``FIN_MODEL`` and ``FIN_BASE_URL`` fall back to the
+    ADR 0013 defaults when env is unset.
 
     The model-construction step is stubbed via a fake
-    ``init_chat_model``. PostgresSaver is stubbed too, so we
-    reach ``compile_graph`` and can confirm the function's
-    end-to-end plumbing without a live database.
+    ``ChatOpenAI``. PostgresSaver is stubbed too, so we reach
+    ``compile_graph`` and can confirm the function's end-to-end
+    plumbing without a live database.
     """
     monkeypatch.delenv("FIN_MODEL", raising=False)
+    monkeypatch.delenv("FIN_BASE_URL", raising=False)
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
 
-    captured: dict[str, str] = {}
-    _install_fake_langchain_chat_models(monkeypatch, captured)
+    captured: dict[str, object] = {}
+    _install_fake_langchain_openai(monkeypatch, captured)
     _install_fake_postgres_saver(monkeypatch, _FakePostgresSaver)
 
     graph_calls: list[dict[str, object]] = []
@@ -333,25 +380,33 @@ def test_compile_for_runtime_uses_default_model_when_unset(
 
     result = compile_for_runtime()
     assert result == "compiled-graph"
-    assert captured["name"] == DEFAULT_MODEL
+    assert captured["model"] == DEFAULT_MODEL
+    assert captured["model"] == "minimax-cn/MiniMax-M3"
+    assert captured["base_url"] == DEFAULT_BASE_URL
+    assert captured["base_url"] == "http://localhost:20128/v1"
+    assert captured["api_key"] == "sk-no-key-required", (
+        "api_key must fall back to the no-key placeholder when "
+        "ANTHROPIC_API_KEY is unset"
+    )
     assert len(graph_calls) == 1, (
         "compile_for_runtime must call compile_graph exactly once"
     )
     call = graph_calls[0]
-    assert call["model"] == ("fake-model", DEFAULT_MODEL)
     assert isinstance(call["checkpointer"], _FakePostgresSaver)
 
 
 def test_compile_for_runtime_reads_fin_model_from_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``FIN_MODEL`` from the env is passed to
-    ``init_chat_model`` verbatim (ADR 0013)."""
+    """``FIN_MODEL`` from the env is passed to ``ChatOpenAI``
+    verbatim (ADR 0013). The slash in the model id must NOT be
+    parsed as a provider separator — we wire ``ChatOpenAI``
+    directly with ``model=``."""
     monkeypatch.setenv("FIN_MODEL", "fake:custom-model-x")
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
 
-    captured: dict[str, str] = {}
-    _install_fake_langchain_chat_models(monkeypatch, captured)
+    captured: dict[str, object] = {}
+    _install_fake_langchain_openai(monkeypatch, captured)
     _install_fake_postgres_saver(monkeypatch, _FakePostgresSaver)
 
     monkeypatch.setattr(
@@ -359,7 +414,55 @@ def test_compile_for_runtime_reads_fin_model_from_env(
     )
 
     compile_for_runtime()
-    assert captured["name"] == "fake:custom-model-x"
+    assert captured["model"] == "fake:custom-model-x"
+
+
+def test_compile_for_runtime_reads_fin_base_url_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``FIN_BASE_URL`` from the env is forwarded to
+    ``ChatOpenAI`` as ``base_url=``. Operators override the
+    default proxy URL via env."""
+    monkeypatch.setenv("FIN_BASE_URL", "https://api.example.com/v1")
+    monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
+
+    captured: dict[str, object] = {}
+    _install_fake_langchain_openai(monkeypatch, captured)
+    _install_fake_postgres_saver(monkeypatch, _FakePostgresSaver)
+
+    monkeypatch.setattr(
+        "fin.host.compile.compile_graph", lambda **kw: "compiled-graph"
+    )
+
+    compile_for_runtime()
+    assert captured["base_url"] == "https://api.example.com/v1"
+    # base_url override does not change the default model.
+    assert captured["model"] == DEFAULT_MODEL
+
+
+def test_compile_for_runtime_passes_anthropic_api_key_as_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ANTHROPIC_API_KEY`` from the env is forwarded to
+    ``ChatOpenAI`` as ``api_key=`` (the proxy accepts any
+    non-empty ``Authorization: Bearer`` token). The user's
+    secret value must reach ChatOpenAI without ever being
+    logged or echoed."""
+    monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake-key")
+
+    captured: dict[str, object] = {}
+    _install_fake_langchain_openai(monkeypatch, captured)
+    _install_fake_postgres_saver(monkeypatch, _FakePostgresSaver)
+
+    monkeypatch.setattr(
+        "fin.host.compile.compile_graph", lambda **kw: "compiled-graph"
+    )
+
+    compile_for_runtime()
+    assert captured["api_key"] == "sk-test-fake-key"
+    # The captured dict is in-memory only; the test process
+    # never writes the value to disk or stdout.
 
 
 def test_compile_for_runtime_wraps_setup_failure_as_typed_error(
@@ -372,8 +475,8 @@ def test_compile_for_runtime_wraps_setup_failure_as_typed_error(
     """
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://bad")
 
-    captured: dict[str, str] = {}
-    _install_fake_langchain_chat_models(monkeypatch, captured)
+    captured: dict[str, object] = {}
+    _install_fake_langchain_openai(monkeypatch, captured)
     _install_fake_postgres_saver(monkeypatch, _BrokenPostgresSaver)
 
     with pytest.raises(CheckpointSetupError) as excinfo:
