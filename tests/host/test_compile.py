@@ -20,7 +20,7 @@ mocked via ``monkeypatch`` so the default ``uv run pytest -q``
 suite stays hermetic.
 
 Reference: ADR 0015 (``PostgresSaver`` + ``FIN_CHECKPOINT_URL``,
-``InMemorySaver`` only in tests), ADR 0013 (``FIN_MODEL`` default
+``InMemorySaver`` only in tests), ADR 0022 (``FIN_MODEL`` default
 ``fin/MiniMax-M3`` served by OpenAI-compatible proxy at
 ``FIN_BASE_URL`` default ``http://localhost:20128/v1``), spec
 success-criteria item 7 (``docker compose config`` exits 0 and
@@ -166,10 +166,10 @@ def test_env_example_has_required_keys() -> None:
         ".env.example must define FIN_CHECKPOINT_URL (ADR 0015)"
     )
     assert "FIN_MODEL" in env, (
-        ".env.example must define FIN_MODEL (ADR 0013)"
+        ".env.example must define FIN_MODEL (ADR 0022)"
     )
     assert "FIN_BASE_URL" in env, (
-        ".env.example must define FIN_BASE_URL (ADR 0013 — "
+        ".env.example must define FIN_BASE_URL (ADR 0022 — "
         "OpenAI-compatible proxy endpoint)"
     )
 
@@ -360,7 +360,7 @@ def test_compile_for_runtime_uses_default_model_when_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``FIN_MODEL`` and ``FIN_BASE_URL`` fall back to the
-    ADR 0013 defaults when env is unset.
+    ADR 0022 defaults when env is unset.
 
     The model-construction step is stubbed via a fake
     ``ChatOpenAI``. PostgresSaver is stubbed too, so we reach
@@ -408,7 +408,7 @@ def test_compile_for_runtime_reads_fin_model_from_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``FIN_MODEL`` from the env is passed to ``ChatOpenAI``
-    verbatim (ADR 0013). The slash in the model id must NOT be
+    verbatim (ADR 0022). The slash in the model id must NOT be
     parsed as a provider separator — we wire ``ChatOpenAI``
     directly with ``model=``."""
     monkeypatch.setenv("FIN_MODEL", "fake:custom-model-x")

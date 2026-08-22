@@ -18,7 +18,7 @@ Quoted from `docs/CONTEXT.md`:
   - Python 3.12 package at `src/fin` (uv + pytest).
   - Ingest command that turns the frozen 12 PDFs into page text + page-passage chunks under `data/corpus/extracted/` (committed). Query path never opens a PDF.
   - Pure-function tools `list_files`, `retrieve`, `read_file` per ADR 0009, over extracted pages; BM25 (`rank-bm25` or equivalent in-process lexical) built in RAM at process start.
-  - Host graph authored in this repo: model node + ToolNode + citation gate on the path to END + step cap 32 in fin state. LangChain `init_chat_model` via `FIN_MODEL`. Sync compile with `PostgresSaver` (`FIN_CHECKPOINT_URL`); tests use `InMemorySaver`.
+  - Host graph authored in this repo: model node + ToolNode + citation gate on the path to END + step cap 32 in fin state. LangChain `ChatOpenAI` via `FIN_MODEL` + `FIN_BASE_URL` (ADR 0022). Sync compile with `PostgresSaver` (`FIN_CHECKPOINT_URL`); tests use `InMemorySaver`.
   - Citation gate (before the run is `done`): evidence is locators+text from this run's `retrieve` / `read_file` results. A supporting span is a contiguous substring of the answer, length ≥ 32, that appears on an evidenced page. Pass → code fills the user-visible citations from those spans. Recoverable fail → template bounce, hidden from CLI/HTTP user rendering, back to the model. Unknown locator → `refuse` immediately. Repair cap 3 then `refuse`. `step_cap` is a distinct stop.
   - CLI `python -m fin`: question in, stdout of `status`, answer prose, code-filled citations; optional `--thread-id`.
   - Thin FastAPI HTTP on the same compiled graph, sync `invoke`, no auth, localhost.
@@ -53,7 +53,7 @@ Quoted from `docs/CONTEXT.md`:
 
 ## Inherits / Changes
 
-**Inherits (workspace today):** frozen 12 PDFs + `data/corpus/manifest.json` (ADR 0004); retrieve port (ADR 0001); LangGraph runtime (ADR 0002); thin slice (ADR 0003); locator = page identity + quote span (ADR 0006); in-process BM25 adapter (ADR 0007); verifier failure policy (ADR 0008); tool contracts (ADR 0009); `FIN_MODEL` + CLI-first + HTTP same graph (ADR 0013); LangChain model client (ADR 0014); `PostgresSaver` / test `InMemorySaver` (ADR 0015); `thread_id` session / `run` = one invoke (ADR 0016); no HITL UX (ADR 0018). No `src/fin` or `pyproject.toml` yet.
+**Inherits (workspace today):** frozen 12 PDFs + `data/corpus/manifest.json` (ADR 0004); retrieve port (ADR 0001); LangGraph runtime (ADR 0002); thin slice (ADR 0003); locator = page identity + quote span (ADR 0006); in-process BM25 adapter (ADR 0007); verifier failure policy (ADR 0008); tool contracts (ADR 0009); CLI-first + HTTP same graph (ADR 0013); LangChain model client (ADR 0014); `ChatOpenAI` + `FIN_MODEL` / `FIN_BASE_URL` default `fin/MiniMax-M3` (ADR 0022); `PostgresSaver` / test `InMemorySaver` (ADR 0015); `thread_id` session / `run` = one invoke (ADR 0016); no HITL UX (ADR 0018). Application package is in `src/fin`.
 
 **Confirmed stack (assumption gate):** Python 3.12, uv, `src/fin`, pytest, FastAPI HTTP, `rank-bm25` (or equivalent), extracted tree at `data/corpus/extracted/` committed, extractive span ≥ 32 characters, CLI `python -m fin`, default tests without live LLM, `eval` mark for nine gold cases.
 
