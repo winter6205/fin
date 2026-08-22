@@ -1,0 +1,392 @@
+"""Unit tests for the workspace thread / run store.
+
+The store is the persistence seam for the workspace HTTP surface
+(T1, #28). Two implementations live behind a single protocol:
+
+* ``InMemoryThreadStore`` - used by tests and when
+  ``FIN_CHECKPOINT_URL`` is unset.
+* ``PostgresThreadStore`` - uses ``psycopg`` directly against the
+  same Postgres URL the durable graph uses, creates a ``fin_thread``
+  + ``fin_run`` schema idempotently on construction.
+
+These tests do not boot the host graph. The store is pure data.
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+import uuid
+from datetime import datetime, timezone
+
+import pytest
+
+
+# ----- InMemoryThreadStore round-trip -----
+
+
+def test_in_memory_thread_store_create_list_get_delete_roundtrip() -> None:
+    """The basic CRUD contract on the in-process store."""
+    from fin.host.thread_store import InMemoryThreadStore
+
+    store = InMemoryThreadStore()
+
+    assert store.list_threads() == []
+
+    t = store.create_thread(id="t-1", title="Revenue thread")
+    assert t.id == "t-1"
+    assert t.title == "Revenue thread"
+    assert isinstance(t.created_at, datetime)
+
+    listed = store.list_threads()
+    assert [row.id for row in listed] == ["t-1"]
+    assert listed[0].title == "Revenue thread"
+
+    fetched = store.get_thread("t-1")
+    assert fetched is not None
+    assert fetched.id == "t-1"
+    assert fetched.title == "Revenue thread"
+
+    assert store.delete_thread("t-1") is True
+    assert store.get_thread("t-1") is None
+    assert store.list_threads() == []
+
+    # Second delete on a missing id returns False (idempotent contract
+    # for callers; HTTP layer translates to 404).
+    assert store.delete_thread("t-1") is False
+
+
+def test_in_memory_thread_store_get_unknown_returns_none_not_exception() -> None:
+    """``get_thread`` for an unknown id is the documented lookup miss
+    (None), not an exception."""
+    from fin.host.thread_store import InMemoryThreadStore
+
+    store = InMemoryThreadStore()
+    assert store.get_thread("does-not-exist") is None
+
+
+def test_in_memory_thread_store_list_threads_sorted_by_created_at_desc() -> None:
+    """``list_threads`` orders newest-first so the sidebar surfaces
+    the freshest thread at the top."""
+    from fin.host.thread_store import InMemoryThreadStore
+
+    store = InMemoryThreadStore()
+    store.create_thread(id="t-1", title="oldest")
+    store.create_thread(id="t-2", title="middle")
+    store.create_thread(id="t-3", title="newest")
+
+    ids = [row.id for row in store.list_threads()]
+    assert ids == ["t-3", "t-2", "t-1"]
+
+
+def test_in_memory_thread_store_concurrent_create_is_serialized() -> None:
+    """Eight threads racing on ``create_thread`` with distinct ids do
+    not corrupt the underlying dict (the lock is held across the
+    mutation + list rebuild)."""
+    from fin.host.thread_store import InMemoryThreadStore
+
+    store = InMemoryThreadStore()
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(8)
+
+    def worker(index: int) -> None:
+        try:
+            barrier.wait(timeout=5.0)
+            store.create_thread(id=f"t-{index}", title=f"title-{index}")
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+
+    assert not errors
+    listed = store.list_threads()
+    assert {row.id for row in listed} == {f"t-{i}" for i in range(8)}
+    assert len(listed) == 8
+
+
+# ----- run record (per-invocation) -----
+
+
+def _make_run(thread_id: str, *, run_id: str | None = None, status: str = "done", answer: str = "x") -> object:
+    """Build a RunRecord fixture without importing the concrete class."""
+    from fin.host.thread_store import RunRecord
+
+    return RunRecord(
+        id=run_id or str(uuid.uuid4()),
+        thread_id=thread_id,
+        question="what was revenue?",
+        status=status,
+        status_reason="" if status == "done" else ("unknown_locator" if status == "refuse" else "step_cap"),
+        answer=answer,
+        citations=[],
+        thinking_text="",
+        tool_summaries=[],
+        created_at=datetime.now(tz=timezone.utc),
+    )
+
+
+def test_in_memory_thread_store_append_run_then_list_runs() -> None:
+    """``append_run`` records a run; ``list_runs`` returns them in
+    created_at order. Unknown thread raises ``ThreadNotFoundError``."""
+    from fin.host.thread_store import InMemoryThreadStore, ThreadNotFoundError
+
+    store = InMemoryThreadStore()
+    store.create_thread(id="t-1", title="x")
+
+    r1 = _make_run("t-1", answer="a1")
+    r2 = _make_run("t-1", answer="a2")
+    store.append_run(r1)
+    store.append_run(r2)
+
+    runs = store.list_runs("t-1")
+    assert [r.answer for r in runs] == ["a1", "a2"]
+
+
+def test_in_memory_thread_store_append_run_unknown_thread_raises() -> None:
+    """Appending a run for an unknown thread is a programmer error;
+    the store raises ``ThreadNotFoundError`` so a misconfigured route
+    fails loudly instead of silently attaching to a missing thread."""
+    from fin.host.thread_store import InMemoryThreadStore, ThreadNotFoundError
+
+    store = InMemoryThreadStore()
+    bogus = _make_run("nope")
+    with pytest.raises(ThreadNotFoundError):
+        store.append_run(bogus)
+
+
+def test_in_memory_thread_store_list_runs_unknown_thread_raises() -> None:
+    from fin.host.thread_store import InMemoryThreadStore, ThreadNotFoundError
+
+    store = InMemoryThreadStore()
+    with pytest.raises(ThreadNotFoundError):
+        store.list_runs("nope")
+
+
+def test_in_memory_thread_store_delete_thread_cascades_runs() -> None:
+    """Deleting a thread also drops its run records so a follow-up
+    create with the same id starts clean."""
+    from fin.host.thread_store import InMemoryThreadStore
+
+    store = InMemoryThreadStore()
+    store.create_thread(id="t-1", title="x")
+    store.append_run(_make_run("t-1", answer="a1"))
+    store.append_run(_make_run("t-1", answer="a2"))
+    assert len(store.list_runs("t-1")) == 2
+
+    assert store.delete_thread("t-1") is True
+    store.create_thread(id="t-1", title="x again")
+    assert store.list_runs("t-1") == []
+
+
+# ----- status validation at the seam (H3 / Standards #9) -----
+
+
+def test_in_memory_append_run_rejects_malformed_status() -> None:
+    """A typo'd status fails LOUDLY at the store seam instead of
+    silently persisting a bogus row that only breaks the next
+    reader (Pydantic serializer)."""
+    from fin.host.thread_store import InMemoryThreadStore, RunRecord, ThreadStoreError
+
+    store = InMemoryThreadStore()
+    store.create_thread(id="t-1", title="x")
+    bogus = _make_run("t-1")
+    object.__setattr__(bogus, "status", "refuss")  # frozen dataclass; test-only
+    with pytest.raises(ThreadStoreError, match="must be one of"):
+        store.append_run(bogus)
+
+
+def test_in_memory_append_run_accepts_all_closed_enum_values() -> None:
+    """Every member of the closed ``RunStatus`` enum passes the seam."""
+    from fin.host.thread_store import InMemoryThreadStore
+
+    store = InMemoryThreadStore()
+    store.create_thread(id="t-1", title="x")
+    for i, status in enumerate(("done", "refuse", "step_cap")):
+        store.append_run(_make_run("t-1", run_id=f"r-{i}", status=status))
+    runs = store.list_runs("t-1")
+    assert [r.status for r in runs] == ["done", "refuse", "step_cap"]
+
+
+def test_postgres_append_run_rejects_malformed_status(pg_store) -> None:
+    """Same seam validation on the Postgres implementation — a bad
+    status never reaches an INSERT."""
+    from fin.host.thread_store import ThreadStoreError
+
+    pg_store.create_thread(id="pg-1", title="x")
+    bogus = _make_run("pg-1")
+    object.__setattr__(bogus, "status", "done ")
+    with pytest.raises(ThreadStoreError):
+        pg_store.append_run(bogus)
+
+
+# ----- deepcopy isolation on list_runs (M8 / Standards #17) -----
+
+
+def test_in_memory_list_runs_returns_isolated_copies() -> None:
+    """Mutating a returned run's mutable fields must NOT corrupt the
+    store. The old code returned the SAME list objects stored
+    internally; ``list_runs`` now deepcopies so the docstring
+    promise ("caller cannot mutate store state") is enforced."""
+    from fin.host.thread_store import InMemoryThreadStore
+
+    store = InMemoryThreadStore()
+    store.create_thread(id="t-1", title="x")
+    record = _make_run(
+        "t-1",
+        run_id="r-1",
+        answer="original",
+    )
+    # Give the record a non-empty citation dict to mutate through.
+    object.__setattr__(
+        record,
+        "citations",
+        [{"document_id": "AAPL-2022Q3", "version": "v", "page": 1, "quote": "q"}],
+    )
+    store.append_run(record)
+
+    runs = store.list_runs("t-1")
+    runs[0].citations[0]["document_id"] = "MUTATED"
+    runs2 = store.list_runs("t-1")
+    assert runs2[0].citations[0]["document_id"] == "AAPL-2022Q3"
+    # The original in-store object is untouched too.
+    assert store.list_runs("t-1")[0].answer == "original"
+
+
+def test_postgres_list_runs_returns_isolated_copies(pg_store) -> None:
+    """Same isolation contract on the Postgres path."""
+    pg_store.create_thread(id="pg-1", title="x")
+    record = _make_run("pg-1", run_id="r-1", answer="a")
+    pg_store.append_run(record)
+
+    runs = pg_store.list_runs("pg-1")
+    assert len(runs) == 1
+
+
+# ----- store-minted ids (M9 / Standards #14) -----
+
+
+def test_create_thread_without_id_mints_uuid() -> None:
+    """``create_thread(title=...)`` without an explicit id mints a
+    UUID4 — the v1 route relies on this so the HTTP layer does not
+    own id allocation."""
+    from fin.host.thread_store import InMemoryThreadStore
+
+    store = InMemoryThreadStore()
+    t1 = store.create_thread(title="no id passed")
+    t2 = store.create_thread(title="nor here")
+    assert t1.id != t2.id
+    assert len(t1.id) == 36  # canonical uuid4 string
+
+
+def test_create_thread_duplicate_explicit_id_raises() -> None:
+    """Duplicate explicit id is loud, not silent overwrite."""
+    from fin.host.thread_store import InMemoryThreadStore, ThreadStoreError
+
+    store = InMemoryThreadStore()
+    store.create_thread(id="dup", title="first")
+    with pytest.raises(ThreadStoreError, match="already exists"):
+        store.create_thread(id="dup", title="second")
+
+
+# ----- PostgresThreadStore round-trip (env-gated) -----
+
+
+POSTGRES_URL_ENV = "FIN_CHECKPOINT_URL"
+
+
+@pytest.fixture
+def postgres_store_url() -> str:
+    """Skip when ``FIN_CHECKPOINT_URL`` is not configured."""
+    url = os.environ.get(POSTGRES_URL_ENV, "").strip()
+    if not url:
+        pytest.skip(
+            "FIN_CHECKPOINT_URL is not set; PostgresThreadStore is "
+            "untested in this environment"
+        )
+    return url
+
+
+@pytest.fixture
+def pg_store(postgres_store_url: str):
+    """Build a Postgres store, yield it, and clean up rows on teardown."""
+    from fin.host.thread_store import PostgresThreadStore
+
+    store = PostgresThreadStore(postgres_store_url)
+    yield store
+    try:
+        import psycopg
+
+        with psycopg.connect(postgres_store_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM fin_thread")
+                cur.execute("DELETE FROM fin_run")
+            conn.commit()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def test_postgres_thread_store_create_list_get_delete_roundtrip(pg_store) -> None:
+    """End-to-end round-trip against a real Postgres: create, list,
+    get, delete."""
+    t = pg_store.create_thread(id="pg-1", title="hello")
+    assert t.id == "pg-1"
+    assert pg_store.get_thread("pg-1") is not None
+    assert any(row.id == "pg-1" for row in pg_store.list_threads())
+
+    assert pg_store.delete_thread("pg-1") is True
+    assert pg_store.get_thread("pg-1") is None
+
+
+def test_postgres_thread_store_run_append_and_list(pg_store) -> None:
+    """Run records persist with foreign-key cascade on delete."""
+    pg_store.create_thread(id="pg-1", title="x")
+    r1 = _make_run("pg-1", answer="a1")
+    r2 = _make_run("pg-1", answer="a2")
+    pg_store.append_run(r1)
+    pg_store.append_run(r2)
+
+    runs = pg_store.list_runs("pg-1")
+    assert [r.answer for r in runs] == ["a1", "a2"]
+
+    # Delete cascades to fin_run.
+    pg_store.delete_thread("pg-1")
+    pg_store.create_thread(id="pg-1", title="x2")
+    assert pg_store.list_runs("pg-1") == []
+
+
+def test_postgres_thread_store_append_unknown_thread_raises(pg_store) -> None:
+    """FK enforcement: appending a run for a non-existent thread is
+    rejected by Postgres with a foreign-key violation, surfaced as
+    ThreadNotFoundError by the store."""
+    from fin.host.thread_store import ThreadNotFoundError
+
+    bogus = _make_run("nope")
+    with pytest.raises(ThreadNotFoundError):
+        pg_store.append_run(bogus)
+
+
+# ----- compile helper (env-based selection) -----
+
+
+def test_default_thread_store_when_env_unset(monkeypatch) -> None:
+    """``default_thread_store`` returns the in-memory implementation
+    when ``FIN_CHECKPOINT_URL`` is unanswered."""
+    from fin.host.thread_store import default_thread_store
+
+    monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
+    store = default_thread_store()
+    assert store.__class__.__name__ == "InMemoryThreadStore"
+
+
+def test_default_thread_store_when_env_set(monkeypatch, postgres_store_url: str) -> None:
+    """When ``FIN_CHECKPOINT_URL`` is set, the default is the Postgres
+    implementation."""
+    from fin.host.thread_store import default_thread_store
+
+    monkeypatch.setenv("FIN_CHECKPOINT_URL", postgres_store_url)
+    store = default_thread_store()
+    assert store.__class__.__name__ == "PostgresThreadStore"

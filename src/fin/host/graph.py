@@ -724,6 +724,46 @@ class _LockedGraph:
         finally:
             self._release_thread(lock)
 
+    def delete_thread(self, thread_id: str) -> None:
+        """Forward ``thread_id`` to the inner graph's
+        ``checkpointer.delete_thread`` under the SAME per-thread
+        lock used by ``invoke`` / ``stream``.
+
+        Why the lock: deleting a thread while a ``graph.invoke``
+        is mid-flight on the same ``thread_id`` would race the
+        saver's pending writes. The lock mirrors ``invoke``'s
+        critical-section so delete serializes against in-flight
+        runs (the second ``invoke`` would have raised
+        ``ConcurrentRunError`` already, but T4 will stream
+        longer-running runs that must not see a delete mid-flight).
+
+        Why a public method (not ``graph._graph.checkpointer.delete_thread``
+        from the route): the workspace HTTP layer deletes the
+        metadata row FIRST and then needs to drop the
+        checkpoint tuples. Reaching through ``_graph`` to
+        ``checkpointer`` couples the route to the compiled
+        graph's internals; this method is the documented seam.
+        """
+        lock = self._acquire_thread(thread_id)
+        try:
+            checkpointer = getattr(self._graph, "checkpointer", None)
+            delete_thread_fn = getattr(checkpointer, "delete_thread", None)
+            # WHY ``AttributeError`` (not a typed error): the HTTP
+            # delete route distinguishes "graph wired without a
+            # checkpointer" (a boot/wiring bug -> warn, metadata
+            # row is already gone, return 200) from "the saver
+            # itself failed" (runtime outage -> 500). Raising the
+            # same exception type ``getattr`` would raise keeps
+            # that split structural instead of string-matching on
+            # messages.
+            if not callable(delete_thread_fn):
+                raise AttributeError(
+                    "underlying graph has no checkpointer.delete_thread"
+                )
+            delete_thread_fn(thread_id)
+        finally:
+            self._release_thread(lock)
+
 
 __all__ = [
     "ConcurrentRunError",
