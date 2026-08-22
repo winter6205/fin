@@ -346,7 +346,7 @@ def compile_graph(
     model
         A LangChain ``BaseChatModel``. Tests pass
         ``ScriptedChatModel``; production (T7 / T9) passes the
-        ``ChatAnthropic`` instance built by T8's
+        ``ChatOpenAI`` instance built by T8's
         ``compile_for_runtime`` from ``FIN_MODEL`` + ``FIN_BASE_URL``.
         The factory calls ``bind_tools`` on it to register the
         three host tools.
