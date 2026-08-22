@@ -20,3 +20,14 @@ Upstream freeze: [docugami/private fixture source](https://github.com/docugami/p
 ## Status
 
 v1 host-agent ships: ingest artifacts are in git; CLI (`python -m fin`) and HTTP `POST /ask` share one compiled host graph. Default model is `fin/MiniMax-M3` via `FIN_MODEL` + `FIN_BASE_URL` (ADR 0022).
+
+## Running the workspace server (T1)
+
+`fin-serve` binds `0.0.0.0:8000` and serves both the API routes and the built SPA same-origin. The SPA is NOT committed — it is a build artifact:
+
+```bash
+cd web && npm install && npm run build   # produces web/dist/
+uv run fin-serve                          # serves API + SPA on :8000
+```
+
+Without a built `web/dist/`, only the API routes serve and boot logs a WARNING (`SPA dist directory ... not found`) — that warning is the signal to run the build step.

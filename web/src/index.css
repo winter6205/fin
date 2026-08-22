@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Soft Brutalism: page bg #FAFAF7, cards white, 1px black borders,
+   single blue accent. Focus ring uses the same accent so keyboard
+   navigation is visible everywhere. */
+body {
+  @apply bg-page text-black font-sans antialiased;
+}
+
+*:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 1px;
+}
