@@ -15,9 +15,10 @@ contract single-sourced.
 
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import Any, Final, TypedDict
 
 from fin.host.citation_gate import strip_hidden_bounce_marker
+from fin.host.state import STEP_CAP
 from fin.host.thread_store import RunStatus
 
 
@@ -29,12 +30,69 @@ class RunResponsePayload(TypedDict):
     populated from this dict. ``answer`` is empty on ``refuse`` /
     ``step_cap`` per ADR 0021 — no model prose surfaces when the
     gate said no.
+
+    ``assistant_message`` is the ordinary-person copy (T2 / spec
+    SC67) the SPA renders when the run ended ``refuse`` or
+    ``step_cap``. Empty on ``done`` (the run produced a real
+    ``answer``). The workspace SSE ``status`` frame and the
+    persisted ``RunRecord`` both carry this string so a reload
+    never loses the copy. ``/ask`` ignores the field because the
+    AskResponse wire shape is frozen.
     """
 
     status: RunStatus
     answer: str
     reason: str
     citations: list[dict[str, Any]]
+    assistant_message: str
+
+
+# Ordinary-person copy the SPA renders when a run ended
+# ``refuse`` or ``step_cap`` (T2 / spec SC67). The mapping lives
+# here so the workspace send path, the ``/ask`` route, and the
+# CLI's stderr hint all reach for the SAME strings — single
+# source of truth for the wording (Standards #14).
+ORDINARY_PERSON_COPY: Final[dict[str, str]] = {
+    # Gate's unknown-locator path: the model claimed a
+    # ``document_id`` shape but no in-corpus filing matches.
+    "unknown_locator": (
+        "I can't ground this answer in the frozen 10-Qs. Try a "
+        "more specific question."
+    ),
+    # Gate bounced REPAIR_CAP times without grounding the answer.
+    "citation_repair_cap": (
+        "I couldn't match the answer to the cited pages after a "
+        "few tries - try rephrasing or narrower scope."
+    ),
+    # Fin-owned step-cap fuse fired before a terminal decision.
+    "step_cap": (
+        f"Hit the {STEP_CAP}-step fuse. Try breaking this into a "
+        "smaller question."
+    ),
+}
+
+
+def ordinary_person_copy(status: str, reason: str) -> str:
+    """Return the ordinary-person copy for a terminal status.
+
+    ``done`` -> ``""`` (the run produced a real ``answer``).
+    ``refuse`` -> keyed by ``reason`` (``unknown_locator`` /
+    ``citation_repair_cap``).
+    ``step_cap`` -> the step-cap string regardless of ``reason``.
+    Unknown terminal -> ``""`` (defensive; the gate never
+    produces one).
+
+    The function is intentionally NOT order-sensitive: callers
+    pass the (status, reason) the gate emitted, and the helper
+    does the dispatch.
+    """
+    if status == "done":
+        return ""
+    if status == "step_cap":
+        return ORDINARY_PERSON_COPY["step_cap"]
+    if status == "refuse":
+        return ORDINARY_PERSON_COPY.get(reason, "")
+    return ""
 
 
 def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
@@ -78,6 +136,10 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
             answer=answer_value,
             reason=reason_value,
             citations=citations_payload,
+            # ``done`` never carries ordinary-person copy (the
+            # answer IS the answer); empty string keeps the
+            # wire shape stable across terminal statuses.
+            assistant_message="",
         )
 
     # ``refuse`` / ``step_cap`` keep their status + reason; anything
@@ -93,7 +155,17 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
         answer="",
         reason=reason_value,
         citations=[],
+        # Ordinary-person copy is what the SPA renders in the
+        # answer-bubble slot when ``answer`` is empty (T2).
+        # The mapping is reason-aware for ``refuse`` and
+        # status-fixed for ``step_cap``; see ``ordinary_person_copy``.
+        assistant_message=ordinary_person_copy(collapsed_status, reason_value),
     )
 
 
-__all__ = ["RunResponsePayload", "_run_to_response_payload"]
+__all__ = [
+    "ORDINARY_PERSON_COPY",
+    "RunResponsePayload",
+    "_run_to_response_payload",
+    "ordinary_person_copy",
+]

@@ -85,6 +85,14 @@ class RunRecord:
     ``status`` is a closed enum — see :data:`RunStatus` — so
     downstream code (``AskResponse``, ``TurnRow``, the gate) can
     pattern-match without re-validating.
+
+    ``assistant_message`` is the ordinary-person copy the SPA
+    renders when ``status`` is ``refuse`` or ``step_cap`` (T2). It
+    is the same string the workspace SSE ``status`` event carries
+    in ``assistant_message``; the turn-row mirror keeps GET
+    history consistent with the live surface so a reload does not
+    lose the copy. Empty on ``done`` (the run produced a real
+    ``answer``).
     """
 
     id: str
@@ -96,6 +104,7 @@ class RunRecord:
     citations: list[dict[str, Any]] = field(default_factory=list)
     thinking_text: str = ""
     tool_summaries: list[str] = field(default_factory=list)
+    assistant_message: str = ""
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -168,6 +177,13 @@ class ThreadStore(Protocol):
         ``delete_thread`` does not produce a torn view."""
         ...
 
+    def update_thread_title(self, thread_id: str, *, title: str) -> ThreadRecord:
+        """Set ``title`` on the thread row; return the refreshed
+        ``ThreadRecord``. Concrete bodies live in
+        :class:`InMemoryThreadStore` and :class:`PostgresThreadStore`.
+        """
+        ...
+
     def delete_thread(self, thread_id: str) -> bool:
         """Drop the metadata row AND every associated run row.
         In-memory: a single ``del self._threads[thread_id]``
@@ -206,6 +222,25 @@ class ThreadStore(Protocol):
         handing back independent copies so a stray
         ``run.citations.append(...)`` cannot reach into store
         state.
+        """
+        ...
+
+    def update_thread_title(self, thread_id: str, *, title: str) -> ThreadRecord:
+        """Set ``title`` on the thread row; return the refreshed
+        ``ThreadRecord``.
+
+        Raises ``ThreadNotFoundError`` when ``thread_id`` is
+        unknown — the workspace HTTP layer translates that to 404
+        the same way ``append_run`` does (lookups via
+        ``get_thread`` map miss -> ``None`` -> 404; writes via
+        this method raise because a write to a missing row is
+        a misconfigured caller, not a user-visible state).
+
+        Why the explicit method (vs. ``get_thread`` + ``create_thread``):
+        the workspace send path calls this only on the "first
+        real send updates the default-empty-thread title" branch
+        (T2 acceptance); a generic rename surface is out of scope
+        (spec forbids thread rename chrome).
         """
         ...
 
@@ -274,6 +309,23 @@ class InMemoryThreadStore:
             record = self._threads.get(thread_id)
             if record is None:
                 return None
+            return ThreadRecord(
+                id=record.id, title=record.title, created_at=record.created_at
+            )
+
+    def update_thread_title(self, thread_id: str, *, title: str) -> ThreadRecord:
+        # WHY the lock spans (lookup, mutate, return): a
+        # concurrent ``delete_thread`` for the same id must NOT
+        # race the lookup and produce a half-applied title on
+        # a doomed cell. Same invariant the rest of the store
+        # holds — one lock, atomic read-then-write.
+        with self._lock:
+            record = self._threads.get(thread_id)
+            if record is None:
+                raise ThreadNotFoundError(
+                    f"cannot update title on unknown thread {thread_id!r}"
+                )
+            record.title = title
             return ThreadRecord(
                 id=record.id, title=record.title, created_at=record.created_at
             )
@@ -349,17 +401,25 @@ CREATE TABLE IF NOT EXISTS fin_thread (
 );
 
 CREATE TABLE IF NOT EXISTS fin_run (
-    id             TEXT PRIMARY KEY,
-    thread_id      TEXT NOT NULL REFERENCES fin_thread(id) ON DELETE CASCADE,
-    question       TEXT NOT NULL,
-    status         TEXT NOT NULL,
-    status_reason  TEXT NOT NULL DEFAULT '',
-    answer         TEXT NOT NULL DEFAULT '',
-    citations      JSONB NOT NULL DEFAULT '[]'::jsonb,
-    thinking_text  TEXT NOT NULL DEFAULT '',
-    tool_summaries JSONB NOT NULL DEFAULT '[]'::jsonb,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    id                TEXT PRIMARY KEY,
+    thread_id         TEXT NOT NULL REFERENCES fin_thread(id) ON DELETE CASCADE,
+    question          TEXT NOT NULL,
+    status            TEXT NOT NULL,
+    status_reason     TEXT NOT NULL DEFAULT '',
+    answer            TEXT NOT NULL DEFAULT '',
+    citations         JSONB NOT NULL DEFAULT '[]'::jsonb,
+    thinking_text     TEXT NOT NULL DEFAULT '',
+    tool_summaries    JSONB NOT NULL DEFAULT '[]'::jsonb,
+    assistant_message TEXT NOT NULL DEFAULT '',
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- T2 column migration: add ``assistant_message`` to existing
+-- ``fin_run`` tables without breaking fresh boots. ``ADD COLUMN
+-- IF NOT EXISTS`` is supported since Postgres 9.6; the column is
+-- NULL-safe via the table default so old rows read back as the
+-- empty string.
+ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS assistant_message TEXT NOT NULL DEFAULT '';
 """
 
 
@@ -413,7 +473,13 @@ class PostgresThreadStore:
             tool_summaries=copy.deepcopy(
                 json.loads(row[8]) if isinstance(row[8], str) else list(row[8])
             ),
-            created_at=row[9],
+            # ``assistant_message`` defaults to "" on the Python
+            # side if the row predates the T2 migration; the
+            # SQL column also defaults to '' for fresh installs.
+            # We coerce ``None`` to ``""`` defensively in case
+            # an older row predates the ADD COLUMN.
+            assistant_message=row[9] or "",
+            created_at=row[10],
         )
 
     # -- threads --
@@ -462,6 +528,27 @@ class PostgresThreadStore:
             ).fetchone()
             return self._row_to_thread(row) if row else None
 
+    def update_thread_title(self, thread_id: str, *, title: str) -> ThreadRecord:
+        # WHY ``UPDATE ... RETURNING``: a single round-trip
+        # both mutates the row and yields the refreshed
+        # ``ThreadRecord`` so the HTTP layer can serialize the
+        # updated title without a follow-up ``get_thread``.
+        # Unknown id maps to ``ThreadNotFoundError`` so the
+        # caller sees the same exception the in-memory store
+        # raises (the HTTP layer translates it to 404).
+        with self._connect() as conn:
+            row = conn.execute(
+                "UPDATE fin_thread SET title = %s WHERE id = %s "
+                "RETURNING id, title, created_at",
+                (title, thread_id),
+            ).fetchone()
+            conn.commit()
+            if row is None:
+                raise ThreadNotFoundError(
+                    f"cannot update title on unknown thread {thread_id!r}"
+                )
+            return self._row_to_thread(row)
+
     def delete_thread(self, thread_id: str) -> bool:
         # WHY FK cascade does the run cleanup: the schema
         # declares ``fin_run.thread_id`` REFERENCES
@@ -478,6 +565,8 @@ class PostgresThreadStore:
             deleted = cur.rowcount > 0
             conn.commit()
             return deleted
+
+    # -- threads (continued) --
 
     # -- runs --
 
@@ -502,8 +591,8 @@ class PostgresThreadStore:
                 conn.execute(
                     "INSERT INTO fin_run (id, thread_id, question, status, "
                     "status_reason, answer, citations, thinking_text, "
-                    "tool_summaries, created_at) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    "tool_summaries, assistant_message, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (
                         record.id,
                         record.thread_id,
@@ -514,6 +603,7 @@ class PostgresThreadStore:
                         json.dumps(record.citations),
                         record.thinking_text,
                         json.dumps(record.tool_summaries),
+                        record.assistant_message,
                         record.created_at,
                     ),
                 )
@@ -544,7 +634,8 @@ class PostgresThreadStore:
                 raise ThreadNotFoundError(f"unknown thread {thread_id!r}")
             rows = conn.execute(
                 "SELECT id, thread_id, question, status, status_reason, "
-                "answer, citations, thinking_text, tool_summaries, created_at "
+                "answer, citations, thinking_text, tool_summaries, "
+                "assistant_message, created_at "
                 "FROM fin_run WHERE thread_id = %s ORDER BY created_at ASC",
                 (thread_id,),
             ).fetchall()

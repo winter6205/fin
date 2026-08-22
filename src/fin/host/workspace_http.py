@@ -60,6 +60,7 @@ from pydantic import BaseModel, Field
 
 from fin.corpus.catalog import list_filings
 from fin.host.run_payload import _run_to_response_payload
+from fin.host.state import EVIDENCE_RESET, reset_input_state
 from fin.host.thread_store import (
     RunRecord,
     ThreadNotFoundError,
@@ -105,7 +106,14 @@ class CitationPayload(BaseModel):
 
 
 class TurnRow(BaseModel):
-    """One row in the turn table - one user send + assistant reply."""
+    """One row in the turn table - one user send + assistant reply.
+
+    ``assistant_message`` is the ordinary-person copy the SPA
+    renders when ``status`` is ``refuse`` or ``step_cap`` (T2 /
+    spec SC67). Empty on ``done``. Mirrored on the
+    ``RunRecord`` and on the SSE ``status`` frame so reload and
+    live surfaces agree.
+    """
 
     run_id: str
     question: str
@@ -115,6 +123,7 @@ class TurnRow(BaseModel):
     citations: list[CitationPayload] = Field(default_factory=list)
     thinking_text: str = ""
     tool_summaries: list[str] = Field(default_factory=list)
+    assistant_message: str = ""
     created_at: str
 
 
@@ -164,6 +173,7 @@ def _serialize_run(run: RunRecord) -> dict[str, Any]:
         "citations": list(run.citations),
         "thinking_text": run.thinking_text,
         "tool_summaries": list(run.tool_summaries),
+        "assistant_message": run.assistant_message,
         "created_at": run.created_at.isoformat(),
     }
 
@@ -308,6 +318,38 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                 status_code=404, content={"error": "thread_not_found"}
             )
 
+        # T2: title update on the first real send. The T1 path
+        # set the title from ``first_message`` at create time;
+        # when the user created the thread empty (corpus-card
+        # click) the title was the default placeholder. We
+        # rewrite it from the question here, using the SAME
+        # first-line / 50-char / ellipsis rule ``create_thread``
+        # uses. Only when the current title is the default
+        # placeholder — a real first_message would have set a
+        # non-default title and we never overwrite user intent.
+        #
+        # Done BEFORE the graph invoke: if the run raises a
+        # ``ConcurrentRunError`` (409) the title still updates
+        # — the user's question is real intent, the 409 just
+        # means another run is in flight.
+        if thread.title == _DEFAULT_TITLE:
+            derived = _derive_title(body.question)
+            if derived != _DEFAULT_TITLE:
+                try:
+                    thread = store.update_thread_title(
+                        thread_id, title=derived
+                    )
+                except ThreadNotFoundError:
+                    # Race: thread was deleted between the
+                    # 404-check above and this update. Surface
+                    # 404 - same shape as the unknown-thread
+                    # guard above. Sidebar stays clean (the
+                    # deleted thread was never on it).
+                    return JSONResponse(
+                        status_code=404,
+                        content={"error": "thread_not_found"},
+                    )
+
         # Mint the run_id up front so the SSE ``status`` event can
         # carry it before any graph work happens. The same id is
         # persisted on the RunRecord, so the optimistic turn the
@@ -319,8 +361,18 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
         # NO StreamingResponse headers are sent yet, so the 409
         # body's content-type is ``application/json`` and contains
         # no event-stream frames.
+        #
+        # T2: the input state ALWAYS passes ``EVIDENCE_RESET`` +
+        # ``repair_count=0`` + ``step_count=0``. The reducer
+        # clears ``evidence`` (impossible with ``operator.add +
+        # []``); the explicit zero counts override any prior
+        # run's checkpointed values so a follow-up post starts
+        # a fresh run, not a continuation. ``messages`` keeps
+        # accumulating via ``add_messages`` because we DO NOT
+        # reset that key; the helper clears the six run-scoped
+        # fields per ADR 0016 / spec line 34.
         result = graph.invoke(
-            {"messages": [HumanMessage(content=body.question)]},
+            reset_input_state(body.question),
             config={"configurable": {"thread_id": thread_id}},
         )
         payload = _run_to_response_payload(result)
@@ -340,6 +392,7 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                     citations=payload["citations"],
                     thinking_text="",
                     tool_summaries=[],
+                    assistant_message=payload["assistant_message"],
                 )
             )
         except ThreadNotFoundError:
@@ -356,6 +409,12 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
         # TERMINAL so the client can close its reader once it sees
         # them). Both done and refuse/step_cap emit all three
         # frames; refuse/step_cap carry empty answer + [].
+        #
+        # T2: the ``status`` frame also carries ``assistant_message``
+        # (ordinary-person copy on refuse/step_cap, empty on done)
+        # so the SPA can render the copy before the answer bubble
+        # appears. The same string is persisted on the RunRecord
+        # above so reload stays consistent.
         frames: list[str] = [
             _format_sse(
                 "status",
@@ -363,6 +422,7 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                     "run_id": run_id,
                     "status": payload["status"],
                     "reason": payload["reason"] or None,
+                    "assistant_message": payload["assistant_message"],
                 },
             ),
             _format_sse("answer", {"text": payload["answer"]}),

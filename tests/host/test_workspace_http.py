@@ -789,3 +789,515 @@ def test_spa_catchall_blocks_deep_traversal_and_still_serves_spa():
     spa = client.get("/some/spa/route")
     assert spa.status_code == 200
     assert "fin workspace" in spa.text
+
+
+
+# ===== T2: follow-up resets run-scoped fields (ADR 0016 / spec SC62) =====
+
+
+class _RecordingModel(ScriptedChatModel):
+    """Records the message-list length and cumulative call count of
+    every ``_generate`` call so tests can prove cross-run accumulation
+    without touching privates.
+
+    Same shape as ``tests/host/test_cli.py::_RecordingModel``; a local
+    copy keeps the workspace test surface self-contained.
+    """
+
+    seen_lengths: list[int] = []
+    call_count: int = 0  # total ``_generate`` invocations (cumulative)
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self.seen_lengths.append(len(messages))
+        self.call_count += 1
+        return super()._generate(
+            messages, stop=stop, run_manager=run_manager, **kwargs
+        )
+
+
+def _install_graph_with_model(
+    http_app: FastAPI,
+    *,
+    step_cap: int | None = None,
+    known_ids: set[str] | None = None,
+) -> tuple[Any, _RecordingModel]:
+    """Build a scripted graph whose model reference is returned so
+    tests can mutate ``script`` / ``_index`` between sends. Mirrors
+    ``_install_graph`` but exposes the model for multi-send tests.
+    """
+    from fin.host.http import get_graph
+
+    model = _RecordingModel(script=[AIMessage(content="never reached")])
+    kwargs: dict[str, Any] = {
+        "checkpointer": InMemorySaver(),
+        "model": model,
+        "known_document_ids": known_ids or KNOWN_IDS,
+    }
+    if step_cap is not None:
+        kwargs["step_cap"] = step_cap
+    g = compile_graph(**kwargs)
+    http_app.dependency_overrides[get_graph] = lambda: g
+    return g, model
+
+
+def _post_message(
+    client: TestClient,
+    thread_id: str,
+    question: str,
+) -> list[tuple[str, Any]]:
+    """POST one message and return the parsed SSE events."""
+    with client.stream(
+        "POST",
+        f"/api/threads/{thread_id}/messages",
+        json={"question": question},
+    ) as r:
+        assert r.status_code == 200, r.status_code
+        body = "".join(r.iter_text())
+    return _parse_sse_events(body)
+
+
+# ----- follow-up resets step_count -----
+
+def test_follow_up_resets_step_count_to_zero(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """Two sends on the same thread, both targeting ``done``: if
+    ``step_count`` leaked across runs, the second run would trip
+    ``step_cap`` (bound to 5) on its second model-node entry. A
+    clean reset lets run 2 reach ``done`` on the same script.
+
+    The script uses one ``read_file`` tool call followed by the
+    answer-with-span; two model-node entries per run. With
+    ``step_cap=5`` (allowed entries: 1..4) and run 1 leaving
+    ``step_count=2``, a leaked run 2 would compute
+    ``next_step=3``, ``next_step=4`` (both OK), and the run
+    would also ``done`` ... so the test uses a three-entry
+    run-2 script (``list_files`` + ``read_file`` + answer) so
+    the leaked budget runs out at entry 3.
+    """
+    # step_cap=5 -> model_node fires when next_step >= 5, so a
+    # leaked step_count=2 leaves room for entries 3,4 (2 calls)
+    # but the 3rd call (next_step=5) trips the fuse without
+    # calling the model. The reset path lets all three calls run.
+    g, model = _install_graph_with_model(http_app, step_cap=5)
+
+    created = client.post("/api/threads", json={"first_message": "q1"}).json()
+    tid = created["id"]
+
+    # Run 1: read_file + answer-with-span -> done (2 entries).
+    answer1 = f"Per the filing: {aapl_page1_text[:80]}"
+    model._index = 0
+    model.script = _read_then_answer_script(answer1)
+    events1 = _post_message(client, tid, "q1")
+    assert events1[0][1]["status"] == "done"
+
+    # Run 2: 3 entries (list_files, read_file, answer-with-span).
+    # With reset: done. Without reset: step_cap on the 3rd entry.
+    answer2 = f"Follow-up: {aapl_page1_text[:80]}"
+    model._index = 0
+    model.script = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "list_files", "args": {}, "id": "c-loop-2", "type": "tool_call"}
+            ],
+        ),
+        *_read_then_answer_script(answer2)[0:1],  # read_file
+        *_read_then_answer_script(answer2)[1:2],  # answer
+    ]
+    events2 = _post_message(client, tid, "q2")
+    # Run 1 had 2 entries (model call_count = 2). Run 2 needs 3
+    # entries (list_files, read_file, answer) and would trip
+    # ``step_cap`` on the 3rd entry WITHOUT the reset (the fuse
+    # fires before the model is invoked). The reset path lets
+    # the 3rd call happen: call_count == 5.
+    assert model.call_count == 5, (
+        f"expected 5 total model calls (2 in run 1 + 3 in run 2), "
+        f"got {model.call_count}; all lengths: {model.seen_lengths}"
+    )
+    assert events2[0][1]["status"] == "done", events2
+
+
+# ----- follow-up resets repair_count -----
+
+def test_follow_up_resets_repair_count_to_zero(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """Run 1 bounces REPAIR_CAP times -> ``refuse`` /
+    ``citation_repair_cap`` (``repair_count`` checkpointed at 3).
+    Run 2: script bounces once (repair would go 0->1 with reset,
+    3->4 / cap-exceeded without), then answers with a grounded
+    span. With reset: ``done``. Without: ``refuse`` immediately
+    on the first bounce because ``repair_count=3 >= cap=3``.
+    """
+    g, model = _install_graph_with_model(http_app)
+
+    created = client.post("/api/threads", json={"first_message": "q1"}).json()
+    tid = created["id"]
+
+    # Run 1: prose-only answer, no tool call -> bounces 3 times
+    # -> refuse citation_repair_cap. The script exhausted after
+    # the first AIMessage is fine: ScriptedChatModel keeps
+    # returning the last message forever, so the gate keeps
+    # bouncing until the cap fires.
+    model._index = 0
+    model.script = [AIMessage(content="vague answer with no evidence")]
+    events1 = _post_message(client, tid, "q1")
+    assert events1[0][1]["status"] == "refuse"
+    assert events1[0][1]["reason"] == "citation_repair_cap"
+
+    # Run 2: bounce once, then answer with a span. With the
+    # reset this works (repair_count 0 -> bounce -> 1 -> done).
+    # Without the reset, repair_count=3 >= cap fires
+    # citation_repair_cap on the bounce entry.
+    answer2 = f"Second: {aapl_page1_text[:80]}"
+    model._index = 0
+    model.script = [
+        # entry 1: read_file (the tool call produces evidence)
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "read_file",
+                    "args": {
+                        "document_id": AAPL_2022Q3,
+                        "version": AAPL_2022Q3_VERSION,
+                        "page": 1,
+                        "page_limit": 1,
+                    },
+                    "id": "c-read2",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        # entry 2: prose that bounces (no extractive span)
+        AIMessage(content="second vague answer no evidence"),
+        # entry 3: prose with the extractive span -> done
+        AIMessage(content=answer2),
+    ]
+    events2 = _post_message(client, tid, "q2")
+    assert events2[0][1]["status"] == "done", events2
+
+
+# ----- follow-up resets evidence (SC62 binding test, plus one extra) -----
+
+def test_follow_up_resets_evidence(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """Run 1 reads AAPL-2022Q3 page 1; run 2 sends an answer that
+    ONLY quotes that page WITHOUT re-fetching. With the reset,
+    evidence is empty in run 2, so the gate cannot match the
+    span and the run ends ``refuse`` / ``citation_repair_cap``
+    (not ``done``). Without the reset, evidence carries the
+    first run's page text and the gate ``done``s on the stale
+    span (the SC62 bug).
+    """
+    g, model = _install_graph_with_model(http_app)
+
+    created = client.post("/api/threads", json={"first_message": "q1"}).json()
+    tid = created["id"]
+
+    # Run 1: read_file + answer-with-span.
+    answer1 = f"Per the filing: {aapl_page1_text[:80]}"
+    model._index = 0
+    model.script = _read_then_answer_script(answer1)
+    events1 = _post_message(client, tid, "q1")
+    assert events1[0][1]["status"] == "done"
+    assert len(events1[2][1]) >= 1  # citations non-empty
+
+    # Run 2: prose-only answer quoting run 1's page text. With
+    # reset, evidence is empty -> gate cannot match -> bounces
+    # until cap -> refuse citation_repair_cap.
+    answer2 = f"Per the filing: {aapl_page1_text[:80]}"
+    model._index = 0
+    model.script = [AIMessage(content=answer2)]
+    events2 = _post_message(client, tid, "q2")
+    assert events2[0][1]["status"] == "refuse", (
+        f"SC62: follow-up must NOT inherit run-1 evidence; "
+        f"got status={events2[0][1]['status']}"
+    )
+    assert events2[0][1]["reason"] == "citation_repair_cap"
+    # citations frame is [] on refuse (spec line 67).
+    assert events2[2][1] == []
+
+
+def test_follow_up_does_not_inherit_prior_run_citations(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """Binding SC62 test for the citations frame on the wire:
+    run 1 ends ``done`` with citations; run 2 quotes the same
+    span without re-fetching -> citations event MUST be empty
+    and status MUST NOT be ``done``. The persisted turn row on
+    GET must reflect the empty sources list (matches the live
+    SSE shape so reload does not resurrect the stale citations).
+    """
+    g, model = _install_graph_with_model(http_app)
+
+    created = client.post("/api/threads", json={"first_message": "q1"}).json()
+    tid = created["id"]
+
+    # Run 1: done with citations.
+    answer1 = f"Per the filing: {aapl_page1_text[:80]}"
+    model._index = 0
+    model.script = _read_then_answer_script(answer1)
+    events1 = _post_message(client, tid, "q1")
+    assert events1[0][1]["status"] == "done"
+    assert len(events1[2][1]) >= 1
+
+    # Run 2: same span, no tool call.
+    answer2 = f"Per the filing: {aapl_page1_text[:80]}"
+    model._index = 0
+    model.script = [AIMessage(content=answer2)]
+    events2 = _post_message(client, tid, "q2")
+
+    # Wire contract: refuse (not done), citations [].
+    status_event = events2[0][1]
+    assert status_event["status"] != "done"
+    assert events2[2][1] == []
+
+    # GET turn table: the persisted row for run 2 must mirror
+    # the live SSE shape (empty citations, status refuse).
+    detail = client.get(f"/api/threads/{tid}").json()
+    turns = detail["turns"]
+    assert len(turns) == 2
+    run2_persisted = turns[1]
+    assert run2_persisted["status"] != "done"
+    assert run2_persisted["citations"] == []
+
+
+# ----- title update on first real send (T2 acceptance: sidebar title) -----
+
+def test_send_message_title_updates_from_first_question_when_default(
+    client: TestClient, fresh_store
+) -> None:
+    """Create a thread without a first_message (corpus-card path) ->
+    title is the default "New thread". Send the first question:
+    title updates to that question (first line, truncated)."""
+    _install_graph_with_model(client.app)
+
+    created = client.post("/api/threads", json={}).json()
+    assert created["title"] == "New thread"
+
+    _post_message(client, created["id"], "What was Apple revenue?")
+
+    detail = client.get(f"/api/threads/{created['id']}").json()
+    assert detail["title"] == "What was Apple revenue?"
+
+
+def test_send_message_title_truncates_to_50_chars_with_ellipsis_on_first_question(
+    client: TestClient, fresh_store
+) -> None:
+    """Same rule as ``create_thread``: 50-char cap + ellipsis on
+    overflow."""
+    _install_graph_with_model(client.app)
+
+    created = client.post("/api/threads", json={}).json()
+    long_q = "x" * 80  # 80 chars
+    _post_message(client, created["id"], long_q)
+
+    detail = client.get(f"/api/threads/{created['id']}").json()
+    assert detail["title"] == "x" * 50 + "…"
+    assert len(detail["title"]) == 51
+
+
+def test_send_message_title_does_not_overwrite_explicit_title_from_create(
+    client: TestClient, fresh_store
+) -> None:
+    """If the thread was created WITH a first_message ("Old"), the
+    first send's question ("New") must NOT overwrite the title.
+    The default-placeholder guard fires only on the create-time
+    default."""
+    _install_graph_with_model(client.app)
+
+    created = client.post(
+        "/api/threads", json={"first_message": "Old"}
+    ).json()
+    assert created["title"] == "Old"
+
+    _post_message(client, created["id"], "New title candidate")
+
+    detail = client.get(f"/api/threads/{created['id']}").json()
+    assert detail["title"] == "Old"
+
+
+# ----- ordinary-person copy on refuse / step_cap (T2 / spec SC67) -----
+
+def test_send_message_refuse_emits_status_with_ordinary_person_copy(
+    client: TestClient, fresh_store, http_app: FastAPI
+) -> None:
+    """Unknown-locator scripted run -> ``status`` SSE frame
+    carries the explainer copy in ``assistant_message``;
+    citations event is ``[]``; answer is empty. The copy is
+    the same string the SPA renders in the answer bubble.
+    """
+    _install_graph_with_model(http_app)
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+
+    # unknown_locator: model claims a non-corpus id regex shape.
+    # Update the model already installed by the fixture (it has
+    # the default one-element script; swap it).
+    from fin.host.http import get_graph
+
+    model = ScriptedChatModel(
+        script=[
+            AIMessage(
+                content=(
+                    "Per the ZZZZ-9999Q1 filing revenue grew across all "
+                    "segments and operating margin improved."
+                )
+            )
+        ]
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    events = _post_message(client, created["id"], "q")
+
+    status_event = events[0][1]
+    assert status_event["status"] == "refuse"
+    assert status_event["reason"] == "unknown_locator"
+    assert "can't ground" in status_event["assistant_message"]
+    assert status_event["assistant_message"] != ""
+
+    # Answer empty, citations [].
+    assert events[1][1] == {"text": ""}
+    assert events[2][1] == []
+
+    # GET turn table mirrors the SSE: empty sources list, ordinary
+    # copy on the persisted turn row.
+    detail = client.get(f"/api/threads/{created['id']}").json()
+    run = detail["turns"][0]
+    assert run["status"] == "refuse"
+    assert run["citations"] == []
+    assert "can't ground" in run["assistant_message"]
+
+
+def test_send_message_step_cap_emits_status_with_ordinary_person_copy(
+    client: TestClient, fresh_store, http_app: FastAPI
+) -> None:
+    """Step-cap scripted run -> ``status`` SSE frame carries the
+    32-step fuse explainer in ``assistant_message``; citations
+    ``[]``; answer empty.
+    """
+    from fin.host.http import get_graph
+
+    _install_graph_with_model(http_app)
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+
+    model = ScriptedChatModel(
+        script=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "list_files",
+                        "args": {},
+                        "id": "c-loop",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    events = _post_message(client, created["id"], "q")
+
+    status_event = events[0][1]
+    assert status_event["status"] == "step_cap"
+    assert "32-step fuse" in status_event["assistant_message"]
+    assert status_event["assistant_message"] != ""
+
+    assert events[1][1] == {"text": ""}
+    assert events[2][1] == []
+
+    detail = client.get(f"/api/threads/{created['id']}").json()
+    run = detail["turns"][0]
+    assert run["status"] == "step_cap"
+    assert run["citations"] == []
+    assert "32-step fuse" in run["assistant_message"]
+
+
+def test_send_message_done_status_has_empty_assistant_message(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """Defensive: a successful ``done`` run carries ``assistant_message``
+    = ``""`` (the run produced a real ``answer``; the ordinary-copy
+    slot is for non-terminal user-facing copy).
+    """
+    answer = f"Per the filing: {aapl_page1_text[:80]}"
+    _install_graph(http_app, _read_then_answer_script(answer))
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    events = _post_message(client, created["id"], "q")
+    status_event = events[0][1]
+    assert status_event["status"] == "done"
+    assert status_event["assistant_message"] == ""
+
+
+def test_follow_up_resets_answer_citations_status_in_checkpoint(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """H2 binding regression: spec line 34 says follow-up resets
+    ``answer`` / ``citations`` / ``status`` in addition to evidence
+    and the caps. Reach through ``_LockedGraph._graph.get_state`` to
+    inspect the checkpointed values; they must be empty / cleared
+    after the follow-up, NOT carry over the prior run's answer /
+    citations / status.
+
+    Without ``reset_input_state`` clearing all six fields, the gate
+    runs on prior-run evidence AND any tool_node / gate decisions
+    written by the prior run persist into the new run's state.
+    """
+    g, model = _install_graph_with_model(http_app)
+
+    created = client.post("/api/threads", json={"first_message": "q1"}).json()
+    tid = created["id"]
+
+    # Run 1: done with answer + citations.
+    answer1 = f"Per the filing: {aapl_page1_text[:80]}"
+    model._index = 0
+    model.script = _read_then_answer_script(answer1)
+    _post_message(client, tid, "q1")
+
+    state1 = g._graph.get_state(
+        {"configurable": {"thread_id": tid}}
+    )
+    assert state1.values.get("status") == "done"
+    assert state1.values.get("answer") == answer1
+    assert len(state1.values.get("citations") or ()) >= 1
+
+    # Run 2: scripted answer with NO tool call, model quotes prior
+    # span without re-fetching -> gate refuses (no evidenced span).
+    answer2 = "Sorry, no answer."
+    model._index = 0
+    model.script = [AIMessage(content=answer2)]
+    events2 = _post_message(client, tid, "q2")
+
+    # Wire shape: refuse, no citations.
+    assert events2[0][1]["status"] == "refuse"
+    assert events2[2][1] == []
+
+    # The checkpointed state for run 2 must show CLEAN run-scoped
+    # fields: answer / citations / status reset by ``reset_input_state``
+    # BEFORE invoke, then re-populated by the run. The PRIOR run's
+    # ``answer`` / ``citations`` must NOT bleed through.
+    state2 = g._graph.get_state(
+        {"configurable": {"thread_id": tid}}
+    )
+    # ``answer`` is populated only on done; refuse runs leave it "".
+    assert state2.values.get("answer") == ""
+    # ``citations`` is populated only on done; refuse runs leave it
+    # cleared (the reset dict passes ``[]``) — NOT the prior run's
+    # tuple.
+    assert state2.values.get("citations") in ((), [])
+    assert state2.values.get("status") == "refuse"

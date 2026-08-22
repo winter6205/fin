@@ -102,6 +102,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           citations: result.citations,
           thinking_text: "",
           tool_summaries: [],
+          assistant_message: result.assistantMessage,
           created_at: new Date().toISOString(),
         };
         set({

@@ -9,11 +9,11 @@ import CorpusCard from "../components/CorpusCard";
 import type { Turn } from "../types";
 import { useWorkspaceStore } from "../store";
 
-const ORDINARY_COPY: Record<string, string> = {
-  refuse:
-    "Could not ground this answer in the frozen 10-Qs. Try rephrasing or asking about the listed filings.",
-  step_cap: "Hit the 32-step fuse before finishing. Try a narrower question.",
-};
+// T2 fix: the SPA's refuse / step_cap ordinary-person copy is the
+// server-emitted ``assistant_message`` (see run_payload.ORDINARY_PERSON_COPY).
+// A client-side duplicate was rendering two near-identical sentences and
+// leaking the raw enum reason ("(unknown_locator)"). Delete the duplicate
+// so ``assistant_message`` is the sole user-facing copy on those turns.
 
 export default function ThreadPage() {
   const { thread_id } = useParams<{ thread_id: string }>();
@@ -24,7 +24,7 @@ export default function ThreadPage() {
   // Prefill from navigation state (corpus card click).
   const navState = location.state as { prefill?: string } | null;
   const [prefill, setPrefill] = useState<string | null>(
-    navState?.prefill ?? null
+    navState?.prefill ?? null,
   );
 
   // Re-sync from the persisted turn table when we arrive at a
@@ -42,9 +42,7 @@ export default function ThreadPage() {
   return (
     <main className="flex flex-col h-full">
       <header className="border-b border-black px-4 py-3 bg-page">
-        <h2 className="text-sm font-semibold truncate">
-          {activeThread.title}
-        </h2>
+        <h2 className="text-sm font-semibold truncate">{activeThread.title}</h2>
         <p className="text-xs text-gray-500">
           Created {new Date(activeThread.created_at).toLocaleString()}
         </p>
@@ -75,7 +73,10 @@ function EmptyThreadCorpusGrid() {
   const corpus = useWorkspaceStore((s) => s.corpus);
   if (corpus.length === 0) return null;
   return (
-    <section aria-label="Start with a filing" className="max-w-3xl mx-auto pt-4">
+    <section
+      aria-label="Start with a filing"
+      className="max-w-3xl mx-auto pt-4"
+    >
       <h3 className="text-sm font-semibold text-gray-500 mb-2">
         Or start from a filing
       </h3>
@@ -101,6 +102,14 @@ function TurnView({ turn }: { turn: Turn }) {
         {turn.answer ? (
           <p className="text-sm whitespace-pre-wrap">{turn.answer}</p>
         ) : null}
+        {/* T2 spec SC67: refuse / step_cap turns show the
+            ordinary-person copy in the answer-bubble slot with an
+            empty sources list underneath - not a blank crash. */}
+        {!turn.answer && turn.assistant_message ? (
+          <p className="text-sm whitespace-pre-wrap text-gray-700 italic">
+            {turn.assistant_message}
+          </p>
+        ) : null}
         <CitationList citations={turn.citations} />
       </div>
     </article>
@@ -109,25 +118,24 @@ function TurnView({ turn }: { turn: Turn }) {
 
 function StatusLine({
   status,
-  reason,
+  reason: _reason,
 }: {
   status: Turn["status"];
   reason: string;
 }) {
   if (status === "done") {
     return (
-      <p className="text-xs uppercase tracking-wide text-gray-400 mb-1">
-        done
-      </p>
+      <p className="text-xs uppercase tracking-wide text-gray-400 mb-1">done</p>
     );
   }
-  const copy =
-    status === "refuse"
-      ? ORDINARY_COPY.refuse + (reason ? ` (${reason})` : "")
-      : ORDINARY_COPY.step_cap;
+  // T2 fix: refuse / step_cap ordinary-person copy is the server's
+  // ``assistant_message`` rendered by the parent ``TurnView``. ``StatusLine``
+  // is now a small status label only — no client-side duplicate copy and
+  // no raw ``reason`` enum leak.
+  const label = status === "refuse" ? "did not finish" : "step fuse hit";
   return (
-    <p className="text-sm text-gray-600 italic border-l-2 border-black pl-2 mb-2">
-      {copy}
+    <p className="text-xs uppercase tracking-wide text-gray-400 mb-1">
+      {label}
     </p>
   );
 }

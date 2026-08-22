@@ -390,3 +390,172 @@ def test_default_thread_store_when_env_set(monkeypatch, postgres_store_url: str)
     monkeypatch.setenv("FIN_CHECKPOINT_URL", postgres_store_url)
     store = default_thread_store()
     assert store.__class__.__name__ == "PostgresThreadStore"
+
+
+
+# ===== T2: update_thread_title (first real send on a default-titled thread) =====
+
+
+def test_in_memory_update_thread_title_roundtrip() -> None:
+    """Set the title; the refreshed ThreadRecord carries it and a
+    subsequent ``get_thread`` sees the same value."""
+    from fin.host.thread_store import InMemoryThreadStore
+
+    store = InMemoryThreadStore()
+    created = store.create_thread(id="t-title", title="New thread")
+
+    updated = store.update_thread_title("t-title", title="What was revenue?")
+    assert updated.id == "t-title"
+    assert updated.title == "What was revenue?"
+    assert updated.created_at == created.created_at
+
+    fetched = store.get_thread("t-title")
+    assert fetched is not None
+    assert fetched.title == "What was revenue?"
+
+
+def test_in_memory_update_thread_title_unknown_raises() -> None:
+    """Unknown id raises ``ThreadNotFoundError`` (the HTTP layer maps
+    it to 404, same as ``append_run``)."""
+    from fin.host.thread_store import InMemoryThreadStore, ThreadNotFoundError
+
+    store = InMemoryThreadStore()
+    with pytest.raises(ThreadNotFoundError):
+        store.update_thread_title("nope", title="x")
+
+
+def test_in_memory_update_thread_title_after_delete_raises() -> None:
+    """A deleted thread cannot be retitled — the cell is gone."""
+    from fin.host.thread_store import InMemoryThreadStore, ThreadNotFoundError
+
+    store = InMemoryThreadStore()
+    store.create_thread(id="t-gone", title="New thread")
+    assert store.delete_thread("t-gone") is True
+    with pytest.raises(ThreadNotFoundError):
+        store.update_thread_title("t-gone", title="late")
+
+
+def test_postgres_update_thread_title_roundtrip(pg_store) -> None:
+    """Same contract on the Postgres implementation (env-gated)."""
+    pg_store.create_thread(id="pg-title", title="New thread")
+    updated = pg_store.update_thread_title("pg-title", title="PG question")
+    assert updated.title == "PG question"
+    fetched = pg_store.get_thread("pg-title")
+    assert fetched is not None
+    assert fetched.title == "PG question"
+
+
+def test_postgres_update_thread_title_unknown_raises(pg_store) -> None:
+    from fin.host.thread_store import ThreadNotFoundError
+
+    with pytest.raises(ThreadNotFoundError):
+        pg_store.update_thread_title("pg-nope", title="x")
+
+
+def test_postgres_update_thread_title_resolves_to_sql_body_not_in_memory(
+    monkeypatch,
+) -> None:
+    """H1 regression: T2's class-swap bug placed an in-memory body
+    in ``PostgresThreadStore`` body and a SQL body in
+    ``InMemoryThreadStore``. ``PostgresThreadStore`` had no
+    ``_lock`` / ``_threads``, so calling
+    ``update_thread_title`` on a fresh instance raised
+    ``AttributeError`` and surfaced as 500 in production.
+
+    Verify (a) the Postgres class no longer references ``_lock`` /
+    ``_threads`` in its body, and (b) constructing the class with
+    a stubbed ``psycopg.connect`` records an ``UPDATE fin_thread``
+    SQL string instead of raising ``AttributeError``.
+
+    Runs without a live Postgres (the psycopg module is monkeypatched).
+    """
+    import inspect
+
+    from fin.host import thread_store as ts
+
+    src = inspect.getsource(ts.PostgresThreadStore.update_thread_title)
+    assert "self._lock" not in src, (
+        "PostgresThreadStore.update_thread_title must not reference self._lock "
+        "(class-swap regression)."
+    )
+    assert "self._threads" not in src, (
+        "PostgresThreadStore.update_thread_title must not reference "
+        "self._threads (class-swap regression)."
+    )
+    assert "UPDATE fin_thread" in src
+
+    # Also verify the in-memory store does not reference _connect
+    # (the inverse swap direction).
+    src_in_mem = inspect.getsource(ts.InMemoryThreadStore.update_thread_title)
+    assert "self._connect" not in src_in_mem, (
+        "InMemoryThreadStore.update_thread_title must not reference "
+        "self._connect (class-swap regression)."
+    )
+
+
+def test_postgres_update_thread_title_end_to_end_with_mock(monkeypatch) -> None:
+    """H1 regression (mock psycopg): actually invoke
+    ``PostgresThreadStore.update_thread_title`` against a stubbed
+    connection layer. Pre-fix this raised ``AttributeError`` because
+    the resolved body referenced ``self._lock`` /
+    ``self._threads`` (those attributes do not exist on the
+    Postgres class). Post-fix the SQL is recorded and a refreshed
+    ``ThreadRecord`` is returned.
+
+    Bypasses ``__init__``'s schema setup by constructing the
+    instance and assigning ``_url`` directly — the test only needs
+    to exercise ``update_thread_title``, not the schema bootstrap.
+    """
+    from datetime import datetime, timezone
+
+    from fin.host.thread_store import PostgresThreadStore
+
+    captured_sql: list[str] = []
+
+    class _StubCursor:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class _StubConn:
+        def __init__(self, row):
+            self._row = row
+
+        def execute(self, sql, params):
+            captured_sql.append(sql)
+            return _StubCursor(self._row)
+
+        def commit(self):
+            pass
+
+    class _StubCM:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __enter__(self):
+            return self._conn
+
+        def __exit__(self, *exc):
+            return False
+
+    def stub_connect(*args, **kwargs):
+        return _StubCM(
+            _StubConn(
+                ("pg-1", "PG title", datetime(2026, 8, 1, tzinfo=timezone.utc))
+            )
+        )
+
+    import fin.host.thread_store as ts_mod
+
+    monkeypatch.setattr(ts_mod.psycopg, "connect", stub_connect)
+
+    # Bypass schema setup — only exercise the update path.
+    store = PostgresThreadStore.__new__(PostgresThreadStore)
+    store._url = "postgresql://stub"
+    updated = store.update_thread_title("pg-1", title="PG title")
+
+    assert updated.id == "pg-1"
+    assert updated.title == "PG title"
+    assert any("UPDATE fin_thread" in s for s in captured_sql), captured_sql

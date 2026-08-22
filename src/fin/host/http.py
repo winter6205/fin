@@ -37,6 +37,7 @@ from fin.corpus.errors import IngestMissingError
 from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER
 from fin.host.graph import ConcurrentRunError, compile_graph
 from fin.host.run_payload import _run_to_response_payload
+from fin.host.state import EVIDENCE_RESET, reset_input_state
 from fin.host.thread_store import default_thread_store
 
 
@@ -251,8 +252,13 @@ def ask(body: AskRequest, graph: Any = Depends(get_graph)) -> AskResponse:
     """
     thread_id = body.thread_id or str(uuid.uuid4())
 
+    # T2: explicit reset of run-scoped fields (ADR 0016 / spec
+    # SC62). Without ``EVIDENCE_RESET`` the prior run's evidence
+    # would carry into the new run, letting the citation gate
+    # ``done`` on stale pages. The helper clears the six
+    # run-scoped fields per ADR 0016 / spec line 34.
     raw = graph.invoke(
-        {"messages": [HumanMessage(content=body.question)]},
+        reset_input_state(body.question),
         config={"configurable": {"thread_id": thread_id}},
     )
 

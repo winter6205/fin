@@ -25,6 +25,10 @@ export interface Turn {
   citations: Citation[];
   thinking_text?: string;
   tool_summaries?: string[];
+  // T2: ordinary-person copy on refuse / step_cap (empty on done).
+  // Mirrored on the SSE status frame and the persisted turn row so
+  // reload keeps the copy.
+  assistant_message?: string;
   created_at: string;
 }
 
