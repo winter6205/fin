@@ -160,13 +160,23 @@ export async function sendMessage(
     throw new Error(`HTTP ${res.status}: ${detail}`);
   }
 
+  return consumeSseStream(res.body, onEvent);
+}
+
+/**
+ * Shared SSE consumption loop for the send AND resume paths
+ * (T4). Reads ``body`` frame-by-frame, dispatches each typed event
+ * to ``onEvent``, and accumulates the terminal ``SendResult``.
+ * Extracted from ``sendMessage`` so the resume path cannot drift
+ * on frame parsing / error tolerance.
+ */
+async function consumeSseStream(
+  body: ReadableStream<Uint8Array>,
+  onEvent?: (e: SendEvent) => void
+): Promise<SendResult> {
   const result: SendResult = {
-    // Run id starts empty; the ``status`` SSE frame is the first
-    // terminal event the server emits and carries the
-    // server-minted id. The id is required for the optimistic
-    // turn in the store, so callers that re-resolve before any
-    // event arrived will still get a uuid for the placeholder
-    // (it gets reconciled on the ``status`` event).
+    // Run id starts as a local placeholder; the ``status`` SSE
+    // frame carries the server-minted id and overwrites it.
     run_id: crypto.randomUUID(),
     status: "done",
     reason: null,
@@ -175,7 +185,7 @@ export async function sendMessage(
     assistantMessage: "",
   };
 
-  const reader = res.body.getReader();
+  const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
 
@@ -292,4 +302,53 @@ export async function sendMessage(
   }
 
   return result;
+}
+
+/**
+ * T4 (spec line 39): resume an interrupted run from the last
+ * complete node. Mirrors ``sendMessage``'s SSE shape exactly so
+ * the store can drive the same ``onEvent`` path; the only
+ * differences are the route (``POST /resume`` instead of
+ * ``/messages``) and the 204 / 409 / 404 / 503 rejection handling
+ * which all happen BEFORE any SSE header.
+ *
+ * The store is responsible for the switch-thread guard: if the
+ * operator has navigated to a different thread by the time the
+ * resumed stream finishes, the store must NOT paint the result
+ * onto the new thread.
+ */
+export async function resumeThread(
+  threadId: string,
+  onEvent?: (e: SendEvent) => void
+): Promise<SendResult> {
+  const res = await fetch(
+    `/api/threads/${encodeURIComponent(threadId)}/resume`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    }
+  );
+
+  // Rejection order matches the route definition: every failure
+  // resolves BEFORE the SSE header, so we read the response body
+  // for the typed error and throw.
+  if (res.status === 404) throw new Error("HTTP 404: thread_not_found");
+  if (res.status === 409) throw new ConcurrentRunError("concurrent_run");
+  if (res.status === 204) {
+    // Nothing-to-resume no-op. Return an empty terminal result so
+    // the caller still reconciles its state cleanly.
+    return {
+      run_id: crypto.randomUUID(),
+      status: "done",
+      citations: [],
+      answerText: "",
+      assistantMessage: "",
+    };
+  }
+  if (res.status === 503) throw new IngestMissingError("ingest_missing");
+  if (!res.ok || !res.body) {
+    throw new Error(`HTTP ${res.status}`);
+  }
+
+  return consumeSseStream(res.body, onEvent);
 }

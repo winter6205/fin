@@ -9,6 +9,28 @@ import CorpusCard from "../components/CorpusCard";
 import type { Turn } from "../types";
 import { useWorkspaceStore } from "../store";
 
+// T4 (spec line 38-39): the interrupted-run banner. Shown when
+// the latest turn row reports ``in_flight`` after a reload —
+// i.e. the process crashed mid-run and the checkpoint is still
+// pending. The Resume button drives POST /resume; while the
+// resumed stream is live the button shows "Resuming…" and the
+// Composer stays disabled via ``resumingThreadId``.
+function InterruptedRunBanner({ threadId }: { threadId: string }) {
+  const resumingThreadId = useWorkspaceStore((s) => s.resumingThreadId);
+  if (resumingThreadId !== threadId) return null;
+
+  return (
+    <div className="max-w-3xl mx-auto mb-4 border border-black bg-tool px-3 py-2 flex items-center justify-between">
+      <p className="text-sm text-gray-700">
+        A previous run was interrupted. Resuming from the last complete step…
+      </p>
+      <span className="text-xs font-mono uppercase tracking-wide text-gray-500">
+        Resuming…
+      </span>
+    </div>
+  );
+}
+
 // T2 fix: the SPA's refuse / step_cap ordinary-person copy is the
 // server-emitted ``assistant_message`` (see run_payload.ORDINARY_PERSON_COPY).
 // A client-side duplicate was rendering two near-identical sentences and
@@ -35,9 +57,29 @@ export default function ThreadPage() {
     void open(thread_id).catch(() => undefined);
   }, [thread_id]);
 
+  // T4 fix (code-review H2): the ``resumingThreadId`` selector
+  // MUST be called above the early-return so the hook count stays
+  // stable across renders (Rule of Hooks). Earlier layout
+  // crashed React on every thread navigation with "Rendered more
+  // hooks than during the previous render".
+  const resumingThreadId = useWorkspaceStore((s) => s.resumingThreadId);
+
   if (!thread_id || !activeThread || activeThread.id !== thread_id) {
     return <main className="p-6 text-sm text-gray-500">Loading thread…</main>;
   }
+
+  // T4 (code-review H1): the Resume button is shown when the
+  // server reports a PENDING checkpoint (process died mid-run;
+  // the lock has been released but the last node did not
+  // finish). The previous implementation keyed off
+  // ``latestTurn.in_flight`` (the live-lock signal), which made
+  // the button appear DURING a process-alive refresh (when it
+  // is forbidden) and never appear after a crash (when it is
+  // needed). The new signal ``pending_checkpoint`` comes from
+  // the server-side ``pending_nodes`` probe and is only true
+  // when a checkpoint is genuinely resumable.
+  const pendingCheckpoint = activeThread.pending_checkpoint === true;
+  const isResuming = resumingThreadId === thread_id;
 
   return (
     <main className="flex flex-col h-full">
@@ -49,6 +91,15 @@ export default function ThreadPage() {
       </header>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        {/* T4: crash banner shown when GET reports a PENDING
+            checkpoint (process died mid-run). The lock is no
+            longer held; only a checkpoint is left. Resume button
+            drives ``resumeThread`` which POSTs /resume. */}
+        {pendingCheckpoint && !isResuming ? (
+          <CrashResumeBanner threadId={thread_id} />
+        ) : null}
+        {isResuming ? <InterruptedRunBanner threadId={thread_id} /> : null}
+
         {activeThread.turns.map((turn) => (
           <TurnView key={turn.run_id} turn={turn} />
         ))}
@@ -66,6 +117,33 @@ export default function ThreadPage() {
         onPrefillConsumed={() => setPrefill(null)}
       />
     </main>
+  );
+}
+
+// T4 (spec line 39): the "previous run was interrupted" banner
+// with a Resume button. Replaces the T1 sending-state visual for
+// the crash-resume case. Click triggers ``resumeThread(threadId)``
+// which POSTs /resume; the banner flips to the
+// ``InterruptedRunBanner`` while the resume stream is live, then
+// the openThread() reconcile fetches the terminal turn and the
+// banner disappears.
+function CrashResumeBanner({ threadId }: { threadId: string }) {
+  const resumeThread = useWorkspaceStore((s) => s.resumeThread);
+  return (
+    <div className="max-w-3xl mx-auto border border-black bg-tool px-3 py-2 flex items-center justify-between">
+      <p className="text-sm text-gray-700">
+        Previous run was interrupted. Resume from the last complete step.
+      </p>
+      <button
+        type="button"
+        onClick={() => {
+          void resumeThread(threadId);
+        }}
+        className="border border-black bg-card px-3 py-1 text-sm font-medium hover:bg-accent hover:text-white"
+      >
+        Resume
+      </button>
+    </div>
   );
 }
 

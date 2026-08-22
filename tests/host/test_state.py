@@ -230,3 +230,31 @@ def test_reset_input_state_clears_thinking_and_tool_summaries() -> None:
     reset = reset_input_state("hello")
     assert reset["thinking_text"] == ""
     assert reset["tool_summaries"] == []
+
+
+# ===== T4: in_flight on AgentState + reset_input_state coverage =====
+
+
+def test_agent_state_in_flight_field_is_bool() -> None:
+    """T4 (spec line 38: GET-while-running signal). The state schema
+    carries the run-scoped ``in_flight`` marker; the live signal lives
+    on ``graph.is_locked``, but the field exists so the reset
+    contract covers it."""
+    import typing
+
+    annotations = typing.get_type_hints(AgentState)
+    assert "in_flight" in annotations
+    assert annotations["in_flight"] is bool
+
+
+def test_reset_input_state_clears_in_flight() -> None:
+    """T4 binding: ``reset_input_state`` MUST include
+    ``in_flight=False`` so a follow-up send starts from a clean
+    run-scoped marker rather than inheriting whatever the prior
+    run wrote. The lock (``graph.is_locked``) is the live source of
+    truth for the GET signal; this just keeps the state schema
+    coherent."""
+    from fin.host.state import reset_input_state
+
+    reset = reset_input_state("hello")
+    assert reset["in_flight"] is False

@@ -187,6 +187,27 @@ def test_run_record_tool_summaries_roundtrip_as_dicts() -> None:
     assert len(again[0].tool_summaries) == 1
 
 
+def test_postgres_run_record_in_flight_round_trip(pg_store) -> None:
+    """T4: the Postgres implementation persists ``in_flight`` as a
+    NOT NULL BOOLEAN column with default ``False``; round-tripping a
+    freshly-appended run returns ``False`` (the storage-layer
+    invariant — persisted rows are always terminal)."""
+    from fin.host.thread_store import RunRecord
+
+    pg_store.create_thread(id="pg-if", title="x")
+    pg_store.append_run(
+        RunRecord(
+            id="r-if",
+            thread_id="pg-if",
+            question="q",
+            status="done",
+        )
+    )
+    runs = pg_store.list_runs("pg-if")
+    assert len(runs) == 1
+    assert runs[0].in_flight is False
+
+
 def test_postgres_run_sql_round_trips_tool_summaries_jsonb(monkeypatch) -> None:
     """The Postgres INSERT serializes ``tool_summaries`` as a JSON
     array of dicts and ``_row_to_run`` parses it back to dicts.
@@ -225,6 +246,7 @@ def test_postgres_run_sql_round_trips_tool_summaries_jsonb(monkeypatch) -> None:
                         params[8],  # tool_summaries json
                         params[9],  # assistant_message
                         params[10],  # created_at
+                        params[11],  # T4: in_flight (always False on insert)
                     )
                 )
             return _StubCursor(row_back[-1] if row_back else None)
@@ -311,6 +333,23 @@ def test_in_memory_thread_store_list_runs_unknown_thread_raises() -> None:
     store = InMemoryThreadStore()
     with pytest.raises(ThreadNotFoundError):
         store.list_runs("nope")
+
+
+def test_in_memory_run_record_in_flight_default_false() -> None:
+    """T4: every persisted run is by definition terminal (the route
+    appends it only after the stream completes), so the default
+    ``in_flight`` is ``False``. The HTTP serializer overrides this on
+    the LATEST row when the lock probe returns ``True``; the
+    storage layer itself never persists ``True``."""
+    from fin.host.thread_store import RunRecord
+
+    record = RunRecord(
+        id="r",
+        thread_id="t",
+        question="q",
+        status="done",
+    )
+    assert record.in_flight is False
 
 
 def test_in_memory_thread_store_delete_thread_cascades_runs() -> None:

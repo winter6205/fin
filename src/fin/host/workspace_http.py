@@ -164,12 +164,32 @@ class TurnRow(BaseModel):
     tool_summaries: list[ToolSummaryPayload] = Field(default_factory=list)
     assistant_message: str = ""
     created_at: str
+    # T4 (spec line 38): the live GET-while-running signal. Stamped
+    # at serialization time from ``graph.is_locked(thread_id)`` on
+    # the LATEST turn row; older rows always serialize ``False``
+    # because a stored RunRecord is by definition terminal.
+    in_flight: bool = False
 
 
 class ThreadDetailResponse(BaseModel):
     id: str
     title: str
     created_at: str
+    # T4: thread-level live running signal. True while the
+    # per-thread lock is held - covers the window where the run is
+    # executing but no RunRecord exists yet (a row is appended only
+    # after its stream completes). The SPA disables the Composer on
+    # this flag even before any turn row appears.
+    in_flight: bool = False
+    # T4 fix (code-review H1): a checkpoint with ``next`` nodes is
+    # present AND the lock is NOT held — i.e. the process died
+    # mid-run and the operator should see the Resume banner. The
+    # previous implementation keyed off ``in_flight``, which made
+    # the banner appear during a process-alive refresh (when it is
+    # forbidden) and never appear after a real crash (when it is
+    # needed). ``pending_checkpoint`` derives from
+    # ``pending_nodes(thread_id) and not is_locked``.
+    pending_checkpoint: bool = False
     turns: list[TurnRow]
 
 
@@ -201,8 +221,14 @@ def _serialize_thread(thread: ThreadRecord) -> dict[str, str]:
     }
 
 
-def _serialize_run(run: RunRecord) -> dict[str, Any]:
-    """Translate a ``RunRecord`` into the turn-table JSON shape."""
+def _serialize_run(run: RunRecord, *, in_flight: bool = False) -> dict[str, Any]:
+    """Translate a ``RunRecord`` into the turn-table JSON shape.
+
+    T4: ``in_flight`` carries the live lock-probe result for the
+    thread. Only the newest row can legitimately be ``True`` — the
+    GET route passes the probe result for the last row and
+    ``False`` for all earlier ones.
+    """
     return {
         "run_id": run.id,
         "question": run.question,
@@ -217,6 +243,7 @@ def _serialize_run(run: RunRecord) -> dict[str, Any]:
         "tool_summaries": [dict(entry) for entry in run.tool_summaries],
         "assistant_message": run.assistant_message,
         "created_at": run.created_at.isoformat(),
+        "in_flight": in_flight,
     }
 
 
@@ -454,6 +481,69 @@ def _build_sse_frames(
     yield _format_sse("citations", payload["citations"])
 
 
+def _citations_wire_payload(citations: list[Any]) -> list[dict[str, Any]]:
+    """Normalise ``payload["citations"]`` into the wire dict shape.
+
+    ``_run_to_response_payload`` emits plain dicts; older fixtures /
+    callers may carry ``Citation`` dataclasses. Both collapse to the
+    ``CitationPayload`` model-dump shape here so every emitter sends
+    one identical shape (Standards: single source of truth for the
+    wire).
+    """
+    out: list[dict[str, Any]] = []
+    for c in citations:
+        if isinstance(c, dict):
+            out.append(
+                CitationPayload(
+                    document_id=c["document_id"],
+                    version=c["version"],
+                    page=c["page"],
+                    quote=c["quote"],
+                ).model_dump()
+            )
+        else:
+            out.append(
+                CitationPayload(
+                    document_id=c.document_id,
+                    version=c.version,
+                    page=c.page,
+                    quote=c.quote,
+                ).model_dump()
+            )
+    return out
+
+
+def _terminal_sse_frames(
+    *,
+    run_id: str,
+    payload: RunResponsePayload,
+    thinking_type: str | None = None,
+) -> Iterator[str]:
+    """Yield the fixed-order terminal frames: ``status`` -> ``answer``
+    -> ``citations`` (spec line 30; citations is TERMINAL so the SPA
+    closes its reader).
+
+    Shared by the T4 ``send_message`` and ``resume`` routes so the two
+    surfaces cannot drift on order / marker-stripping / citation
+    shaping. ``thinking_type`` is an optional extra key the send route
+    echoes on the status frame; resume omits it.
+    """
+    safe_answer = strip_thinking_from_answer(
+        payload["answer"] if payload["status"] == "done" else ""
+    )
+    status_body: dict[str, Any] = {
+        "run_id": run_id,
+        "status": payload["status"],
+        "reason": payload["reason"] or None,
+        "assistant_message": payload["assistant_message"],
+    }
+    if thinking_type is not None:
+        status_body["thinking_type"] = thinking_type
+    yield _format_sse("status", status_body)
+    yield _format_sse("answer", {"text": safe_answer})
+    yield _format_sse("citations", _citations_wire_payload(payload["citations"]))
+
+
 # ----- route factory -----
 
 
@@ -488,6 +578,7 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
     @router.get("/threads/{thread_id}", response_model=ThreadDetailResponse)
     def get_thread(
         thread_id: str,
+        graph: Any = Depends(get_graph),
         store: ThreadStore = Depends(get_thread_store),
     ) -> dict:
         thread = store.get_thread(thread_id)
@@ -496,9 +587,36 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                 status_code=404, content={"error": "thread_not_found"}
             )
         runs = store.list_runs(thread_id)
+        # T4 (spec line 38): GET while a lock is held reports
+        # running. The probe is the live signal; only the newest
+        # row can be in flight because a stored RunRecord is
+        # appended only after its stream completed. Defensive
+        # ``hasattr`` mirrors ``delete_thread``'s wiring-bug
+        # tolerance for graph stand-ins without the seam.
+        is_locked = False
+        if hasattr(graph, "is_locked"):
+            is_locked = bool(graph.is_locked(thread_id))
+        # T4 fix (code-review H1): ``pending_checkpoint`` is true
+        # exactly when a checkpoint exists with non-empty ``next``
+        # nodes AND the lock is NOT held — i.e. the prior run died
+        # before reaching a terminal node. The Resume banner keys
+        # off this flag (NOT ``in_flight``, which is the live-lock
+        # signal and must NOT trigger a Resume button).
+        pending_checkpoint = False
+        if (
+            not is_locked
+            and hasattr(graph, "pending_nodes")
+            and bool(graph.pending_nodes(thread_id))
+        ):
+            pending_checkpoint = True
         return {
             **_serialize_thread(thread),
-            "turns": [_serialize_run(r) for r in runs],
+            "in_flight": is_locked,
+            "pending_checkpoint": pending_checkpoint,
+            "turns": [
+                _serialize_run(r, in_flight=(is_locked and i == len(runs) - 1))
+                for i, r in enumerate(runs)
+            ],
         }
 
     @router.delete("/threads/{thread_id}")
@@ -793,49 +911,139 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                     "assistant_message": "Thread was deleted while the run was in flight.",
                 })
                 return
-            # Terminal frames per spec line 30: status -> answer -> citations.
-            yield _format_sse(
-                "status",
-                {
+            # Terminal frames per spec line 30: status -> answer ->
+            # citations. Shared with the T4 resume route so the two
+            # emitters cannot drift.
+            yield from _terminal_sse_frames(
+                run_id=run_id, payload=payload, thinking_type=thinking_type
+            )
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    @router.post("/threads/{thread_id}/resume")
+    def resume_thread(
+        thread_id: str,
+        graph: Any = Depends(get_graph),
+        store: ThreadStore = Depends(get_thread_store),
+    ) -> Response:
+        """T4 crash resume (spec line 39 / ADR 0026 / ADR 0018).
+
+        Continues an interrupted run from the LAST COMPLETE
+        host-graph node via ``graph.stream(None, config=...)`` —
+        LangGraph's ``input=None`` contract means "resume from the
+        last checkpoint". No new ``HumanMessage`` is appended (the
+        user turn is never deleted nor duplicated), and a completed
+        ``model_node`` message (full content + parsed ``tool_calls``,
+        per spec line 37) is NOT regenerated: the checkpointer
+        resumes at the pending node (``tools`` after a model-complete
+        crash).
+
+        Rejection order mirrors the send path so every failure mode
+        resolves BEFORE any SSE header:
+
+        * 404 - unknown thread metadata row;
+        * 409 - a run is currently in flight on this thread
+          (lock probe; ``application/json`` body, no stream);
+        * 204 - nothing to resume: the prior run reached a terminal
+          node (LangGraph's ``stream(None)`` on a terminal
+          checkpoint is a documented no-op and the spec forbids
+          calling it);
+        * 503 - ingest missing (shared handler, raised by the graph
+          dependency itself).
+        """
+        # Unknown thread -> 404 BEFORE any probe or stream.
+        thread = store.get_thread(thread_id)
+        if thread is None:
+            return JSONResponse(
+                status_code=404, content={"error": "thread_not_found"}
+            )
+
+        # Concurrent-run guard BEFORE StreamingResponse headers, same
+        # shape as send_message's T3 fix: raising here lets the typed
+        # exception handler emit 409 with application/json.
+        if hasattr(graph, "is_locked") and graph.is_locked(thread_id):
+            raise ConcurrentRunError(
+                f"another run is already in flight on thread_id={thread_id!r}"
+            )
+
+        # Nothing to resume -> 204 No Content. A terminal checkpoint
+        # (``pending_nodes() == ()``) means the prior run finished;
+        # LangGraph's ``stream(None)`` would be a no-op and the spec
+        # forbids that path. Also covers a never-sent thread (no
+        # checkpoint at all).
+        if not hasattr(graph, "pending_nodes") or not graph.pending_nodes(thread_id):
+            return Response(status_code=204)
+
+        # Mint a NEW run id for the resumed remainder. The prior
+        # run's turn row already exists in the store; this row holds
+        # whatever the remainder produces. The SSE ``status`` frame
+        # carries this id so the SPA can reconcile its optimistic
+        # turn with the persisted rows.
+        run_id = str(uuid.uuid4())
+
+        def event_stream() -> Iterator[str]:
+            """Yield SSE frames for the resumed remainder.
+
+            Drives ``graph.stream(None, ...)`` node-by-node with the
+            SAME per-message dedup + frame mapping as the send path.
+            The first ``values`` frame replays the pre-resume
+            checkpoint state, so ``seen_message_ids`` must be seeded
+            from it — otherwise the checkpointed messages would be
+            re-emitted onto the wire as if they were new (the send
+            path avoids this because its first frame contains only
+            the fresh HumanMessage).
+
+            RunRecord persistence mirrors the send path: best-effort,
+            skipped when the thread was deleted mid-stream.
+            """
+            seen_message_ids: set[str] = set()
+            final_state: dict[str, Any] | None = None
+            for node_state in graph.stream(
+                None,
+                config={"configurable": {"thread_id": thread_id}},
+                stream_mode="values",
+            ):
+                final_state = node_state
+                for message in node_state.get("messages", []):
+                    mid = getattr(message, "id", None)
+                    if mid and mid in seen_message_ids:
+                        continue
+                    if mid:
+                        seen_message_ids.add(mid)
+                    yield from _frames_for_message(message)
+
+            if final_state is None:
+                return
+            payload = _run_to_response_payload(final_state)
+            try:
+                store.append_run(
+                    RunRecord(
+                        id=run_id,
+                        thread_id=thread_id,
+                        question=f"[resumed] {thread.title}"[:_TITLE_MAX_CHARS],
+                        status=payload["status"],
+                        status_reason=payload["reason"],
+                        answer=payload["answer"],
+                        citations=payload["citations"],
+                        thinking_text=payload["thinking_text"],
+                        tool_summaries=payload["tool_summaries"],
+                        assistant_message=payload["assistant_message"],
+                    )
+                )
+            except ThreadNotFoundError:
+                yield _format_sse("status", {
                     "run_id": run_id,
-                    "status": payload["status"],
-                    "reason": payload["reason"] or None,
-                    "assistant_message": payload["assistant_message"],
-                    "thinking_type": thinking_type,
-                },
-            )
-            yield _format_sse(
-                "answer",
-                {"text": strip_thinking_from_answer(
-                    payload["answer"] if payload["status"] == "done" else ""
-                )},
-            )
-            citations_payload = []
-            for c in payload["citations"]:
-                # ``payload["citations"]`` may already be a list of
-                # dicts (the run_payload helper's wire shape) — pass
-                # through. Older callers / test fixtures may carry
-                # ``Citation`` dataclasses; normalise either to the
-                # CitationPayload dict shape on the wire.
-                if isinstance(c, dict):
-                    citations_payload.append(
-                        CitationPayload(
-                            document_id=c["document_id"],
-                            version=c["version"],
-                            page=c["page"],
-                            quote=c["quote"],
-                        ).model_dump()
-                    )
-                else:
-                    citations_payload.append(
-                        CitationPayload(
-                            document_id=c.document_id,
-                            version=c.version,
-                            page=c.page,
-                            quote=c.quote,
-                        ).model_dump()
-                    )
-            yield _format_sse("citations", citations_payload)
+                    "status": "refuse",
+                    "reason": "thread_not_found",
+                    "assistant_message": "Thread was deleted while the run was resuming.",
+                })
+                return
+            # Terminal frames per spec line 30 (shared emitter).
+            yield from _terminal_sse_frames(run_id=run_id, payload=payload)
 
         return StreamingResponse(
             event_stream(),
