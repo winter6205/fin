@@ -84,8 +84,8 @@ The product conversation: one `thread_id` the operator talks in; each question i
 _Avoid_: chatbot, Q&A session, demo ask, one-shot invoke as the product UX
 
 **workspace**:
-The post-v1 product surface: a web UI server where a person lists, opens, and resumes a research thread; the in-flight run streams into that thread; citations sit on the assistant turn. Streaming HTTP is this UI's transport over the same compiled graph, not a second product.
-_Avoid_: chatbot, chat app, CLI REPL as the product, Studio, POST /ask as the conversation surface
+A local web UI server: list, open, resume, and delete a research thread; thinking (when the model emits it) and tool calls stream on the turn then collapse; citations sit on the assistant message. Streaming HTTP is this UI's transport on the same compiled graph, not a second product.
+_Avoid_: chatbot, CLI REPL as the product, hosted accounts this increment, raw tool JSON as the UI, always-expanded traces, Studio, POST /ask as the conversation surface
 
 **v1 surface**:
 The first ship binary is a CLI that compiles the host graph; v1 HTTP exposes that same compiled graph and must call sync `invoke` (not `ainvoke`) so the sync `PostgresSaver` stays valid. HITL / interrupt UX is not a v1 product surface; crash resume continues the in-flight run on that `thread_id`.
