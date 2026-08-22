@@ -83,6 +83,10 @@ _Avoid_: collapsing run into thread_id, concurrent invokes on one thread
 The product conversation: one `thread_id` the operator talks in; each question is a run; follow-ups keep messages and citations. This is how fin is used after v1; it is not a chatbot identity and not a one-shot `/ask` demo.
 _Avoid_: chatbot, Q&A session, demo ask, one-shot invoke as the product UX
 
+**workspace**:
+The post-v1 product surface: a web UI server where a person lists, opens, and resumes a research thread; the in-flight run streams into that thread; citations sit on the assistant turn. Streaming HTTP is this UI's transport over the same compiled graph, not a second product.
+_Avoid_: chatbot, chat app, CLI REPL as the product, Studio, POST /ask as the conversation surface
+
 **v1 surface**:
 The first ship binary is a CLI that compiles the host graph; v1 HTTP exposes that same compiled graph and must call sync `invoke` (not `ainvoke`) so the sync `PostgresSaver` stays valid. HITL / interrupt UX is not a v1 product surface; crash resume continues the in-flight run on that `thread_id`.
 _Avoid_: HTTP-only first ship, separate graphs per transport, approval UI as v1
