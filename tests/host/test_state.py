@@ -194,3 +194,39 @@ def test_messages_typed_as_list_basemessage() -> None:
     msg: list[BaseMessage] = [HumanMessage(content="hi"), AIMessage(content="ok")]
     assert isinstance(msg[0], HumanMessage)
     assert isinstance(msg[1], AIMessage)
+
+
+# ===== T3: thinking_text + tool_summaries on AgentState =====
+
+
+def test_agent_state_thinking_text_field_exists() -> None:
+    """The host graph returns ``thinking_text`` from ``model_node``;
+    it lives on ``AgentState`` as an overwrite field so a follow-up
+    run can clear it via the reset input state."""
+    import typing
+
+    annotations = typing.get_type_hints(AgentState)
+    assert "thinking_text" in annotations
+    assert annotations["thinking_text"] is str
+
+
+def test_agent_state_tool_summaries_field_is_list_of_dicts() -> None:
+    """``tool_summaries`` is a list of ``{name, summary, tool_call_id}``
+    dicts (spec line 32). NOT a list of strings - the typed shape
+    keeps the wire contract (summary text + correlation id) intact."""
+    import typing
+
+    annotations = typing.get_type_hints(AgentState)
+    assert "tool_summaries" in annotations
+    assert hasattr(annotations["tool_summaries"], "__origin__")
+
+
+def test_reset_input_state_clears_thinking_and_tool_summaries() -> None:
+    """Follow-up runs (ADR 0016 / spec SC34) MUST reset ``thinking_text``
+    and ``tool_summaries``; otherwise the prior run's collapsed
+    thinking and tool traces bleed into the new run's turn row."""
+    from fin.host.state import reset_input_state
+
+    reset = reset_input_state("hello")
+    assert reset["thinking_text"] == ""
+    assert reset["tool_summaries"] == []

@@ -50,7 +50,7 @@ import time
 from pathlib import Path
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.extracted import Locator, load_extracted_tree
@@ -776,3 +776,274 @@ def test_state_schema_exposes_step_cap_constants():
     # TypedDict is a class; attribute existence is asserted by
     # importability of the class itself.
     assert AgentState is not None
+
+
+# ===== T3: model_node streams; thinking strip; tool summaries =====
+
+
+def test_model_node_streams_not_invokes(aapl_page1_text):
+    """T3 spec line 27: ``model_node`` calls ``model.stream()`` (NOT
+    blocking ``invoke``). We pin this with a recording scripted
+    model whose ``_generate`` raises - if the node still called the
+    sync path the graph would crash; if it streams, the run
+    completes."""
+    from fin.host.scripted_model import ScriptedChatModel as SCM
+
+    class SyncForbidden(SCM):
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            raise AssertionError(
+                "model_node must stream (spec line 27), not invoke"
+            )
+
+    answer = f"Per the filing: {aapl_page1_text[:80]}"
+    model = SyncForbidden(
+        script=[
+            AIMessage(content=answer),
+        ],
+        stream_script=[AIMessageChunk(content=answer)],
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    out = g.invoke(
+        {
+            "messages": [HumanMessage("q")],
+            "evidence": [
+                EvidenceItem(
+                    locator=Locator(AAPL_2022Q3, AAPL_2022Q3_VERSION, 1),
+                    page_text=aapl_page1_text,
+                )
+            ],
+            "repair_count": 0,
+            "step_count": 0,
+        },
+        config=_thread_config("t-stream-only"),
+    )
+    assert out["status"] == "done"
+
+
+def test_streamed_thinking_never_lands_in_answer_or_state_answer(
+    aapl_page1_text,
+):
+    """SC60 binding test (graph level): a streamed thinking delta
+    plus an answer chunk assemble into an ``AIMessage`` where ONLY
+    the answer prose is content. The state's ``answer`` and the
+    citation gate's candidate must never contain the thinking text.
+
+    The thinking arrives via ``additional_kwargs.reasoning_details``
+    (the MiniMax ``reasoning_split`` shape, ADR 0022)."""
+    thinking = "INTERNAL SCRATCHPAD the operator must never see in answer"
+    answer = f"Per the filing: {aapl_page1_text[:80]}"
+    model = ScriptedChatModel(
+        stream_script=[
+            AIMessageChunk(
+                content="",
+                additional_kwargs={
+                    "reasoning_details": [{"type": "reasoning.text", "text": thinking}]
+                },
+            ),
+            AIMessageChunk(content=answer),
+        ]
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    # Seed evidence so the gate can match the answer span; without
+    # evidence the gate would bounce (no evidenced span) and refuse
+    # after the cap - which is the WRONG failure mode to test
+    # here. This test pins the THINKING-STRIP semantics, not the
+    # bounce path.
+    state_in = reset_input_state_for_test("q")
+    state_in["evidence"] = [
+        EvidenceItem(
+            locator=Locator(AAPL_2022Q3, AAPL_2022Q3_VERSION, 1),
+            page_text=aapl_page1_text,
+        )
+    ]
+    out = g.invoke(state_in, config=_thread_config("t-thinking-split"))
+    assert out["status"] == "done"
+    # The answer field holds only the real prose.
+    assert out["answer"] == answer
+    assert thinking not in out["answer"]
+    # The checkpointed AIMessage carries reasoning_details on
+    # additional_kwargs for replay (ADR 0022 round-trip) but NOT in
+    # content.
+    ai_messages = [m for m in out["messages"] if isinstance(m, AIMessage)]
+    last_ai = ai_messages[-1]
+    assert last_ai.content == answer
+    details = last_ai.additional_kwargs.get("reasoning_details")
+    assert details and details[0]["text"] == thinking
+
+
+def test_inline_thinking_block_is_stripped_before_citation_gate(
+    aapl_page1_text,
+):
+    """When the proxy inlines ``<thinking>...</thinking>`` into the
+    answer content (fallback shape), the gate must see STRIPPED
+    prose so the thinking text cannot pass as the answer AND the
+    evidenced span after the block still matches (done path).
+
+    SC60 binding: verify_citations receives thinking-stripped prose;
+    a >=32-char evidenced span still ends ``done``."""
+    span = aapl_page1_text[:80]
+    raw = f"<thinking>private chain of thought</thinking>{span}"
+    # The model returned a SYNC AIMessage with the inline block
+    # because the streaming-shape proxy is the more common case
+    # (ADR 0022) - but the gate's strip path is the same seam.
+    model = ScriptedChatModel(script=[AIMessage(content=raw)])
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    state_in = reset_input_state_for_test("q")
+    state_in["evidence"] = [
+        EvidenceItem(
+            locator=Locator(AAPL_2022Q3, AAPL_2022Q3_VERSION, 1),
+            page_text=aapl_page1_text,
+        )
+    ]
+    out = g.invoke(state_in, config=_thread_config("t-inline-thinking"))
+    # The gate matched the span AFTER stripping -> done.
+    assert out["status"] == "done"
+    # The persisted answer has no thinking text.
+    assert "private chain of thought" not in out["answer"]
+    assert out["answer"] == span
+
+
+def test_verify_citations_receives_stripped_prose_with_thinking_in_content(
+    aapl_page1_text,
+):
+    """Unit-level pin of the strip seam: ``graph._last_ai_text``
+    returns thinking-stripped prose when the proxy inlined a
+    ``<thinking>`` block into content. Without the strip the gate
+    would bounce (the leading thinking text breaks nothing per se,
+    but the DONE result's ``answer`` would carry the private text -
+    which SC60 forbids)."""
+    from fin.host.graph import _last_ai_text
+
+    span = aapl_page1_text[:80]
+    msg = AIMessage(
+        content=f"<thinking>secret</thinking>\n{span}",
+        additional_kwargs={},
+    )
+    text = _last_ai_text([msg])
+    assert "secret" not in text
+    assert span in text
+
+
+def test_tool_summaries_appended_by_tool_node(aapl_page1_text):
+    """``tool_node`` appends one human-readable summary per tool call
+    to ``state['tool_summaries']``; each entry carries name +
+    summary + tool_call_id. Raw ToolMessage JSON stays off the
+    summary string."""
+    model = ScriptedChatModel(
+        script=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {
+                            "document_id": AAPL_2022Q3,
+                            "version": AAPL_2022Q3_VERSION,
+                            "page": 1,
+                            "page_limit": 1,
+                        },
+                        "id": "c-read-1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content=f"Answer: {aapl_page1_text[:80]}"),
+        ]
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    out = g.invoke(
+        reset_input_state_for_test("q"),
+        config=_thread_config("t-tool-summary"),
+    )
+    summaries = out.get("tool_summaries") or []
+    assert len(summaries) == 1
+    entry = summaries[0]
+    assert set(entry.keys()) == {"name", "summary", "tool_call_id"}
+    assert entry["name"] == "read_file"
+    assert entry["tool_call_id"] == "c-read-1"
+    assert f"{AAPL_2022Q3} p.1" in entry["summary"]
+    # Raw JSON never leaks into the summary.
+    assert "{" not in entry["summary"]
+
+
+def test_checkpointed_message_after_stream_has_complete_tool_calls():
+    """Spec line 37 (T4 groundwork): after ``model_node`` completes,
+    the CHECKPOINTED message list contains one complete ``AIMessage``
+    with full parsed ``tool_calls`` - not chunks. A resume from that
+    point can execute tools without regenerating the model turn."""
+    model = ScriptedChatModel(
+        stream_script=[
+            AIMessageChunk(
+                content="",
+                tool_call_chunks=[
+                    {"name": "list_files", "args": "", "id": "c-tc", "index": 0}
+                ],
+            ),
+            AIMessageChunk(
+                content="",
+                tool_call_chunks=[
+                    {"name": None, "args": '{"company": "AAPL"}', "id": None, "index": 0}
+                ],
+            ),
+        ]
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    cfg = _thread_config("t-checkpoint-toolcalls")
+    try:
+        list(g.stream(reset_input_state_for_test("q"), config=cfg))
+    except AssertionError:
+        # The scripted loop replays the tool-call chunk forever until
+        # step cap; any terminal outcome is fine for this test.
+        pass
+    state = g._graph.get_state(cfg)
+    values = state.values
+    ai_messages = [m for m in values.get("messages", []) if isinstance(m, AIMessage)]
+    assert ai_messages, "no AIMessage was checkpointed"
+    first_ai = ai_messages[0]
+    # Complete tool_calls on the checkpoint (not chunks).
+    assert first_ai.tool_calls
+    call = first_ai.tool_calls[0]
+    assert call["name"] == "list_files"
+    assert call["id"] == "c-tc"
+    assert call["args"] == {"company": "AAPL"}
+
+
+# ----- helpers -----
+
+
+def reset_input_state_for_test(question: str) -> dict:
+    """Build a minimal reset input (mirrors ``reset_input_state``)
+    without importing it twice in this file's tests."""
+    from fin.host.state import EVIDENCE_RESET
+
+    return {
+        "messages": [HumanMessage(question)],
+        "evidence": EVIDENCE_RESET,
+        "repair_count": 0,
+        "step_count": 0,
+        "answer": "",
+        "citations": [],
+        "status": "running",
+        "thinking_text": "",
+        "tool_summaries": [],
+    }

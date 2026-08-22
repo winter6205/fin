@@ -29,6 +29,7 @@ outside the LangGraph state machine.
 
 from __future__ import annotations
 
+import operator
 from dataclasses import dataclass
 from typing import Annotated, Any, Final, Literal, TypedDict
 
@@ -206,6 +207,18 @@ class AgentState(TypedDict, total=False):
         continue.
     status_reason
         Free-text reason. Set on ``"refuse"`` and ``"step_cap"``.
+    thinking_text
+        T3: the full thinking prose streamed by this run's LAST
+        ``model_node`` entry (from ``additional_kwargs.reasoning_details``
+        or inline ``<thinking>`` blocks). Overwrite semantics -
+        each model call replaces the prior value; the workspace
+        surface persists the final value on the turn row.
+    tool_summaries
+        T3: human-readable one-liners for each tool call observed
+        this run, appended by ``tool_node``. Each entry is
+        ``{name, summary, tool_call_id}``; the SPA renders
+        ``summary`` and correlates by ``tool_call_id``. Raw tool
+        JSON never reaches the wire (spec line 32).
     """
 
     messages: Annotated[list[BaseMessage], add_messages]
@@ -226,16 +239,29 @@ class AgentState(TypedDict, total=False):
     citations: tuple[Citation, ...]
     status: Status
     status_reason: str
+    # T3 streaming fields. ``thinking_text`` carries the full
+    # streamed thinking prose for THIS run's last model call (the
+    # SPA collapses it to a one-line duration label after the
+    # run). ``tool_summaries`` carries one ``{name, summary,
+    # tool_call_id}`` dict per tool call observed so far in the
+    # run; ``tool_node_with_summaries`` returns the
+    # ``operator.add`` delta so multi-round agent-loop iterations
+    # accumulate across rounds instead of overwriting. Both are
+    # reset per-run via ``reset_input_state`` (ADR 0016 / spec
+    # line 34).
+    thinking_text: str
+    tool_summaries: Annotated[list[dict[str, str]], operator.add]
 
 
 def reset_input_state(question: str) -> dict[str, Any]:
     """Build the standard run-scoped reset input for ``graph.invoke``.
 
-    Every invoke resets the six run-scoped fields (ADR 0016, spec
-    line 34) while leaving ``messages`` to ``add_messages``
-    accumulation. Centralised so the three call sites (``/ask``,
-    ``/api/threads/{id}/messages``, CLI ``run``) cannot drift on
-    which fields are reset.
+    Every invoke resets the eight run-scoped fields (ADR 0016, spec
+    line 34 - the six v1 fields plus T3's ``thinking_text`` /
+    ``tool_summaries``) while leaving ``messages`` to
+    ``add_messages`` accumulation. Centralised so the three call
+    sites (``/ask``, ``/api/threads/{id}/messages``, CLI ``run``)
+    cannot drift on which fields are reset.
 
     Returns a dict suitable for ``graph.invoke(state, config=...)``
     that clears ``evidence`` (via the ``EVIDENCE_RESET`` sentinel),
@@ -252,6 +278,8 @@ def reset_input_state(question: str) -> dict[str, Any]:
         "answer": "",
         "citations": [],
         "status": "running",
+        "thinking_text": "",
+        "tool_summaries": [],
     }
 
 

@@ -4,7 +4,13 @@
 
 import { create } from "zustand";
 import * as api from "./api";
-import type { Filing, ThreadDetail, ThreadListItem, Turn } from "./types";
+import type {
+  Filing,
+  ThreadDetail,
+  ThreadListItem,
+  ToolSummary,
+  Turn,
+} from "./types";
 
 interface WorkspaceState {
   threads: ThreadListItem[];
@@ -20,7 +26,8 @@ interface WorkspaceState {
   removeThread: (threadId: string) => Promise<void>;
   sendQuestion: (
     threadId: string,
-    question: string
+    question: string,
+    thinkingOn?: boolean
   ) => Promise<api.SendResult | null>;
 }
 
@@ -71,45 +78,130 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }));
   },
 
-  async sendQuestion(threadId, question) {
+  async sendQuestion(threadId, question, thinkingOn = false) {
     if (!question.trim()) return null; // Empty submit is a no-op.
     if (get().sendingQuestion) return null; // No queue in T1.
     set({ sendingQuestion: true });
-    try {
-      const result = await api.sendMessage(threadId, question);
-      // Reconcile by re-GET'ing the thread: the SSE body carries
-      // the terminal events but NOT the persisted RunRecord id
-      // reliably until the status frame. ``openThread`` REPLACES
-      // the optimistic turn with the server-persisted row so the
-      // ``run_id`` (and any field the T1 payload omits) lines up
-      // with what ``GET /api/threads/{id}`` returns. This replaces
-      // the previous local ``crypto.randomUUID()`` + ``refreshThreads``
-      // (sidebar-only) approach which left the optimistic turn with
-      // a different id than the persisted one until reload.
+
+    // T3: optimistic turn the SSE frames thread into. Allocated
+    // up front so the api client can ``onEvent`` updates against
+    // the SAME turn (matched by ``run_id``). On the first
+    // ``status`` frame we reconcile the run_id with the
+    // server-minted one and patch the turn.
+    // ``run_id`` is typed as the UUID template literal in types.ts;
+    // crypto.randomUUID() already satisfies it. The template-literal
+    // type is what makes the reconcile-on-status patch typecheck.
+    let optimisticRunId: Turn["run_id"] = crypto.randomUUID();
+    const baseTurn: Turn = {
+      run_id: optimisticRunId,
+      question,
+      status: "done",
+      status_reason: "",
+      answer: "",
+      citations: [],
+      thinking_text: "",
+      tool_summaries: [],
+      assistant_message: "",
+      created_at: new Date().toISOString(),
+    };
+
+    // Helpers bound to the latest state so ``onEvent`` callbacks
+    // always patch the most-recent snapshot of the optimistic
+    // turn (the array reference is stable across renders).
+    const patchTurn = (patcher: (t: Turn) => Turn) => {
       const current = get().activeThread;
-      if (current && current.id === threadId) {
-        const optimisticTurn: Turn = {
-          // Server-minted id from the ``status`` SSE frame. The
-          // api client stamps the SSE frame's run_id onto
-          // ``SendResult.run_id`` so this placeholder uses the
-          // SAME id the RunRecord was persisted with — no
-          // reconciliation gap.
-          run_id: result.run_id,
-          question,
-          status: result.status,
-          status_reason: result.reason ?? "",
-          answer: result.answerText,
-          citations: result.citations,
-          thinking_text: "",
-          tool_summaries: [],
-          assistant_message: result.assistantMessage,
-          created_at: new Date().toISOString(),
-        };
-        set({
-          activeThread: { ...current, turns: [...current.turns, optimisticTurn] },
-        });
-        await get().openThread(threadId);
-      }
+      if (!current || current.id !== threadId) return;
+      const nextTurns = current.turns.map((t) =>
+        t.run_id === optimisticRunId ? patcher(t) : t
+      );
+      set({ activeThread: { ...current, turns: nextTurns } });
+    };
+
+    const initial = get().activeThread;
+    if (initial && initial.id === threadId) {
+      set({
+        activeThread: { ...initial, turns: [...initial.turns, baseTurn] },
+      });
+    }
+
+    try {
+      const result = await api.sendMessage(
+        threadId,
+        { question, thinking: thinkingOn },
+        (event) => {
+        switch (event.type) {
+          case "thinking":
+            patchTurn((t) => ({
+              ...t,
+              thinking_text: t.thinking_text
+                ? `${t.thinking_text}\n${event.text}`
+                : event.text,
+            }));
+            break;
+          case "tool_call": {
+            // Append a placeholder row so the operator sees a
+            // running indicator while the tool executes. The
+            // matching ``tool_result`` either fills the summary
+            // (when the tool returns a structured payload) or
+            // leaves it as a "running" placeholder.
+            const placeholder: ToolSummary = {
+              name: event.name,
+              summary: "running…",
+              tool_call_id: event.tool_call_id,
+            };
+            patchTurn((t) => ({
+              ...t,
+              tool_summaries: [...(t.tool_summaries ?? []), placeholder],
+            }));
+            break;
+          }
+          case "tool_result": {
+            // Replace the matching "running…" placeholder with
+            // the formatted one-liner. The server already
+            // formatted it (spec line 32) so the SPA does not
+            // duplicate the formatter.
+            const formatted = formatToolResultSummary(
+              event.name,
+              event.result,
+            );
+            patchTurn((t) => ({
+              ...t,
+              tool_summaries: (t.tool_summaries ?? []).map((s) =>
+                s.tool_call_id === event.tool_call_id
+                  ? { ...s, summary: formatted }
+                  : s,
+              ),
+            }));
+            break;
+          }
+          case "status":
+            // Server-minted run id wins over the local placeholder.
+            optimisticRunId = event.run_id;
+            patchTurn((t) => ({
+              ...t,
+              run_id: event.run_id,
+              status: event.status,
+              status_reason: event.reason ?? "",
+              assistant_message: event.assistant_message,
+            }));
+            break;
+          case "answer":
+            patchTurn((t) => ({ ...t, answer: event.text }));
+            break;
+          case "citations":
+            patchTurn((t) => ({ ...t, citations: event.citations }));
+            break;
+        }
+        },
+      );
+      // Reconcile by re-GET'ing the thread: the SSE body carries
+      // the terminal events but the persisted RunRecord id and
+      // any field the streaming payload omits (e.g. citation
+      // ``quote`` strings) only surface on a follow-up GET.
+      // ``openThread`` REPLACES the optimistic turn with the
+      // server-persisted row so the ``run_id`` lines up with
+      // what ``GET /api/threads/{id}`` returns.
+      await get().openThread(threadId);
       await get().refreshThreads();
       return result;
     } finally {
@@ -117,3 +209,39 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
   },
 }));
+
+// Format a tool_result event into the same one-liner the server
+// would have produced via ``format_tool_summary`` (defensive: the
+// server already shipped ``tool_summaries`` on the persisted row
+// after the run, but the LIVE tool_result frame carries the raw
+// JSON; this lets the optimistic row flip from "running…" to a
+// stable label WITHOUT waiting for the persisted re-GET).
+function formatToolResultSummary(
+  name: string,
+  result: unknown,
+): string {
+  if (result && typeof result === "object") {
+    const r = result as Record<string, unknown>;
+    if (name === "list_files") {
+      const filings = Array.isArray(r.filings) ? r.filings : [];
+      return `${filings.length} filing${filings.length === 1 ? "" : "s"}`;
+    }
+    if (name === "retrieve") {
+      const chunks = Array.isArray(r.chunks) ? r.chunks : [];
+      const query = typeof r.query === "string" ? r.query : "";
+      return `${query ? `'${query}'` : ""} -> ${chunks.length} hit${
+        chunks.length === 1 ? "" : "s"
+      }`;
+    }
+    if (name === "read_file") {
+      const doc = typeof r.document_id === "string" ? r.document_id : "";
+      const page = typeof r.page === "number" ? r.page : 1;
+      return `${doc} p.${page}`;
+    }
+  }
+  if (typeof result === "object" && result !== null) {
+    const err = (result as Record<string, unknown>).error;
+    if (typeof err === "string") return `error: ${err}`;
+  }
+  return name || "tool";
+}

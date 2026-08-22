@@ -3,7 +3,7 @@
 
 import { useEffect, useState } from "react";
 import { useLocation, useParams } from "react-router-dom";
-import CitationList from "../components/CitationChips";
+import AnswerWithCitations from "../components/CitationChips";
 import Composer from "../components/Composer";
 import CorpusCard from "../components/CorpusCard";
 import type { Turn } from "../types";
@@ -99,8 +99,37 @@ function TurnView({ turn }: { turn: Turn }) {
       </div>
       <div className="border border-black bg-card p-3">
         <StatusLine status={turn.status} reason={turn.status_reason ?? ""} />
+        {/* T3 (spec): the model's reasoning prose, unframed and
+            line-clamped to 3 lines; click to expand. Empty when the
+            model surfaced no reasoning (SC60 binding: this prose
+            never participates in citation matching server-side). */}
+        {turn.thinking_text ? (
+          <ThinkingAccordion text={turn.thinking_text} />
+        ) : null}
+        {/* T3 (spec): one collapsed row per tool call observed this
+            run, ``bg-tool`` (#F5F5F4) panel per spec. Rows arrive
+            live via SSE (``tool_call`` -> "running…" placeholder,
+            ``tool_result`` -> formatted one-liner) and persist on
+            the turn as ``tool_summaries`` after reload. */}
+        {turn.tool_summaries && turn.tool_summaries.length > 0 ? (
+          <div className="mb-2 space-y-1">
+            {turn.tool_summaries.map((s, i) => (
+              <details
+                key={`${s.tool_call_id}-${i}`}
+                className="bg-tool px-2 py-1 text-xs"
+              >
+                <summary className="cursor-pointer select-none font-mono">
+                  {s.name}: {s.summary}
+                </summary>
+              </details>
+            ))}
+          </div>
+        ) : null}
         {turn.answer ? (
-          <p className="text-sm whitespace-pre-wrap">{turn.answer}</p>
+          <AnswerWithCitations
+            answer={turn.answer}
+            citations={turn.citations}
+          />
         ) : null}
         {/* T2 spec SC67: refuse / step_cap turns show the
             ordinary-person copy in the answer-bubble slot with an
@@ -110,9 +139,34 @@ function TurnView({ turn }: { turn: Turn }) {
             {turn.assistant_message}
           </p>
         ) : null}
-        <CitationList citations={turn.citations} />
       </div>
     </article>
+  );
+}
+
+// T3: "Thinking" region — unframed (no border/background, per spec),
+// collapsed to 3 lines via ``line-clamp-3``; click toggles full prose.
+function ThinkingAccordion({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mb-2">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="text-xs font-semibold uppercase tracking-wide text-gray-400 hover:text-gray-600"
+      >
+        Thinking {open ? "−" : "+"}
+      </button>
+      <p
+        className={
+          open
+            ? "mt-1 text-xs text-gray-600 whitespace-pre-wrap break-words"
+            : "mt-1 text-xs text-gray-600 whitespace-pre-wrap break-words line-clamp-3"
+        }
+      >
+        {text}
+      </p>
+    </div>
   );
 }
 
