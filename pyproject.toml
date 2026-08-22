@@ -6,6 +6,8 @@ requires-python = ">=3.12,<3.13"
 readme = "README.md"
 dependencies = [
     "fastapi>=0.115.0",
+    "langchain>=0.3",
+    "langchain-anthropic>=0.3",
     "langchain-core>=1.6.0",
     "langgraph>=1.2.11",
     "langgraph-checkpoint-postgres>=2.0.0",
