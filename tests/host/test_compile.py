@@ -172,6 +172,10 @@ def test_env_example_has_required_keys() -> None:
         ".env.example must define FIN_BASE_URL (ADR 0022 — "
         "OpenAI-compatible proxy endpoint)"
     )
+    assert "ANTHROPIC_AUTH_TOKEN" in env, (
+        ".env.example must define ANTHROPIC_AUTH_TOKEN "
+        "(Bearer token for the OpenAI-compatible proxy)"
+    )
 
 
 def test_env_example_url_matches_expected() -> None:
@@ -369,6 +373,7 @@ def test_compile_for_runtime_uses_default_model_when_unset(
     """
     monkeypatch.delenv("FIN_MODEL", raising=False)
     monkeypatch.delenv("FIN_BASE_URL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
 
     captured: dict[str, object] = {}
@@ -395,7 +400,7 @@ def test_compile_for_runtime_uses_default_model_when_unset(
     assert captured["base_url"] == "http://localhost:20128/v1"
     assert captured["api_key"] == "sk-no-key-required", (
         "api_key must fall back to the no-key placeholder when "
-        "ANTHROPIC_API_KEY is unset"
+        "ANTHROPIC_AUTH_TOKEN is unset"
     )
     assert len(graph_calls) == 1, (
         "compile_for_runtime must call compile_graph exactly once"
@@ -449,16 +454,16 @@ def test_compile_for_runtime_reads_fin_base_url_from_env(
     assert captured["model"] == DEFAULT_MODEL
 
 
-def test_compile_for_runtime_passes_anthropic_api_key_as_api_key(
+def test_compile_for_runtime_passes_anthropic_auth_token_as_api_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``ANTHROPIC_API_KEY`` from the env is forwarded to
+    """``ANTHROPIC_AUTH_TOKEN`` from the env is forwarded to
     ``ChatOpenAI`` as ``api_key=`` (the proxy accepts any
     non-empty ``Authorization: Bearer`` token). The user's
     secret value must reach ChatOpenAI without ever being
     logged or echoed."""
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake-key")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-test-fake-key")
 
     captured: dict[str, object] = {}
     _install_fake_langchain_openai(monkeypatch, captured)

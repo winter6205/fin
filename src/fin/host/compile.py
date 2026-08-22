@@ -244,11 +244,11 @@ def compile_for_runtime(
     from langchain_openai import ChatOpenAI
     from langgraph.checkpoint.postgres import PostgresSaver
 
-    # ``ANTHROPIC_API_KEY`` is the user's chosen credential
-    # name in their shell; ``ChatOpenAI`` forwards it as the
+    # ``ANTHROPIC_AUTH_TOKEN`` is the operator credential in
+    # this environment; ``ChatOpenAI`` forwards it as the
     # ``Authorization: Bearer <key>`` header. The local 9router
     # proxy passes the header through; we never log the value.
-    api_key = _read_env(env, "ANTHROPIC_API_KEY") or "sk-no-key-required"
+    api_key = _read_env(env, "ANTHROPIC_AUTH_TOKEN") or "sk-no-key-required"
 
     model = ChatOpenAI(
         model=model_name,
