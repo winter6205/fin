@@ -21,7 +21,7 @@ suite stays hermetic.
 
 Reference: ADR 0015 (``PostgresSaver`` + ``FIN_CHECKPOINT_URL``,
 ``InMemorySaver`` only in tests), ADR 0013 (``FIN_MODEL`` default
-``minimax-cn/MiniMax-M3`` served by OpenAI-compatible proxy at
+``fin/MiniMax-M3`` served by OpenAI-compatible proxy at
 ``FIN_BASE_URL`` default ``http://localhost:20128/v1``), spec
 success-criteria item 7 (``docker compose config`` exits 0 and
 the example URL matches the service).
@@ -74,8 +74,8 @@ def _load_env_example() -> dict[str, str]:
 
     Comments and blank lines are ignored. Values are shell-
     expanded in two narrow ways so a template like
-    ``${FIN_MODEL:-minimax-cn/MiniMax-M3}`` resolves to the
-    fallback (``minimax-cn/MiniMax-M3``) — i.e. what the operator
+    ``${FIN_MODEL:-fin/MiniMax-M3}`` resolves to the
+    fallback (``fin/MiniMax-M3``) — i.e. what the operator
     sees when they have not set the variable. This matches the
     contract that ``.env.example`` is a self-documenting template
     AND that the resolved defaults match the production
@@ -194,7 +194,7 @@ def test_env_example_url_is_well_formed_postgres() -> None:
 def test_env_example_default_model_matches_adr_0013() -> None:
     env = _load_env_example()
     assert env["FIN_MODEL"] == DEFAULT_MODEL
-    assert env["FIN_MODEL"] == "minimax-cn/MiniMax-M3"
+    assert env["FIN_MODEL"] == "fin/MiniMax-M3"
 
 
 def test_env_example_default_base_url_matches_default_constant() -> None:
@@ -388,7 +388,7 @@ def test_compile_for_runtime_uses_default_model_when_unset(
     result = compile_for_runtime()
     assert result == "compiled-graph"
     assert captured["model"] == DEFAULT_MODEL
-    assert captured["model"] == "minimax-cn/MiniMax-M3"
+    assert captured["model"] == "fin/MiniMax-M3"
     assert captured["base_url"] == DEFAULT_BASE_URL
     # The OpenAI SDK appends /chat/completions; base_url must
     # include /v1 so the SDK hits /v1/chat/completions.
