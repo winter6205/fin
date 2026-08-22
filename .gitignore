@@ -11,6 +11,13 @@ dist/
 build/
 *.egg-info/
 
+# Node / JS (workspace prototype frontend)
+node_modules/
+.vite/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+
 # Secrets and local env
 .env
 .env.*
