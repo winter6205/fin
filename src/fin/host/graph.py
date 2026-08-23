@@ -591,15 +591,15 @@ def compile_graph(
             # Step cap wins on the next entry: we have already
             # spent ``step_cap`` agent-loop ticks without reaching
             # done / refuse. ADR 0008 — this is the runaway fuse,
-            # NOT a citation failure.
+            # NOT a citation failure. No model ran on this entry,
+            # so the run's accumulated thinking survives verbatim
+            # (T4 #37: the turn row keeps what streamed so far).
             return {
                 "messages": [],
                 "step_count": next_step,
                 "status": "step_cap",
                 "status_reason": "step_cap",
-                # T3: the fuse entry also resets the per-call
-                # thinking text (no model ran, nothing streamed).
-                "thinking_text": "",
+                "thinking_text": str(state.get("thinking_text", "") or ""),
             }
         # Step 1b: T3 (#34) — pick the model binding for this run's
         # thinking preference. ``configurable.thinking_type ==
@@ -633,7 +633,19 @@ def compile_graph(
         # answer content (SC60).
         stream = selected_model.stream(state["messages"])
         answer_message = assemble_final_ai_message(stream)
-        thinking_text = _extract_thinking_text(answer_message)
+        # T4 (#37): ``thinking_text`` ACCUMULATES across this run's
+        # model calls (each call's prose joined with a newline) so
+        # the persisted turn row matches what the delta wire
+        # streamed — the reload view and the live view agree.
+        # ``reset_input_state`` clears the field at run start, and
+        # a resume continues accumulating onto the checkpointed
+        # value (same run, spec line 39).
+        this_call_thinking = _extract_thinking_text(answer_message)
+        prior_thinking = str(state.get("thinking_text", "") or "")
+        if prior_thinking and this_call_thinking:
+            thinking_text = prior_thinking + "\n" + this_call_thinking
+        else:
+            thinking_text = prior_thinking or this_call_thinking
         # NOTE: ``evidence`` is intentionally omitted from this return.
         # The reducer in ``AgentState`` only fires when a node actually
         # returns the key; omitting it leaves the prior evidence list

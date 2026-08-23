@@ -101,6 +101,9 @@ export type SendEvent =
       status: SendResult["status"];
       reason?: string | null;
       assistant_message: string;
+      // T4 (#37): the run's total thinking duration in ms, known
+      // by stream end; drives the live turn's collapse label.
+      thinking_ms?: number;
     }
   | { type: "answer"; text: string }
   | { type: "citations"; citations: Citation[] };
@@ -272,6 +275,7 @@ async function consumeSseStream(
             status: SendResult["status"];
             reason?: string;
             assistant_message?: string;
+            thinking_ms?: number;
           };
           result.status = s.status;
           result.reason = s.reason ?? null;
@@ -285,6 +289,7 @@ async function consumeSseStream(
             status: s.status,
             reason: s.reason ?? null,
             assistant_message: s.assistant_message ?? "",
+            thinking_ms: s.thinking_ms,
           });
           break;
         }

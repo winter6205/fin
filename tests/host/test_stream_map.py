@@ -530,3 +530,55 @@ def test_split_partial_tag_only_delta_waits_without_looping() -> None:
     c = split_stream_delta(a.state, "nking>x</thinking>ok")
     assert c.thinking == "x"
     assert c.answer == "ok"
+
+
+# ----- T4 (#37): thinking duration clock -----
+
+
+def test_thinking_clock_no_thinking_is_zero() -> None:
+    from fin.host.stream_map import ThinkingClock
+
+    clock = ThinkingClock(now_fn=lambda: 0.0)
+    clock.tick_other()
+    clock.close()
+    assert clock.total_ms == 0
+
+
+def test_thinking_clock_accumulates_one_segment() -> None:
+    from fin.host.stream_map import ThinkingClock
+
+    t = [0.0]
+    clock = ThinkingClock(now_fn=lambda: t[0])
+    clock.tick_thinking()
+    t[0] = 1.5
+    clock.tick_other()
+    clock.close()
+    assert clock.total_ms == 1500
+
+
+def test_thinking_clock_accumulates_across_segments() -> None:
+    from fin.host.stream_map import ThinkingClock
+
+    t = [0.0]
+    clock = ThinkingClock(now_fn=lambda: t[0])
+    clock.tick_thinking()          # segment 1 starts
+    t[0] = 0.5
+    clock.tick_other()             # tool_call closes segment 1
+    clock.tick_other()             # tool_result — no open segment
+    t[0] = 1.0
+    clock.tick_thinking()          # segment 2 starts
+    t[0] = 1.25
+    clock.close()                  # stream end closes segment 2
+    assert clock.total_ms == 750
+
+
+def test_thinking_clock_consecutive_thinking_ticks_do_not_restack() -> None:
+    from fin.host.stream_map import ThinkingClock
+
+    t = [0.0]
+    clock = ThinkingClock(now_fn=lambda: t[0])
+    clock.tick_thinking()
+    t[0] = 2.0
+    clock.tick_thinking()          # already open — no restart
+    clock.close()
+    assert clock.total_ms == 2000

@@ -116,8 +116,13 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       answer: "",
       citations: [],
       thinking_text: "",
+      thinking_duration_ms: 0,
       tool_summaries: [],
       assistant_message: "",
+      // T4 (#37): the optimistic turn is LIVE until the terminal
+      // status frame — the thinking region line-clamps and the tool
+      // rows stay open while the run streams, then collapse.
+      in_flight: true,
       created_at: new Date().toISOString(),
     };
 
@@ -197,6 +202,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
               status: event.status,
               status_reason: event.reason ?? "",
               assistant_message: event.assistant_message,
+              // T4 (#37): the run ended — thinking collapses to the
+              // duration label, tool rows collapse.
+              in_flight: false,
+              thinking_duration_ms: event.thinking_ms ?? t.thinking_duration_ms,
             }));
             break;
           case "answer":
@@ -300,6 +309,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
               status_reason: event.reason ?? "",
               assistant_message: event.assistant_message,
               in_flight: false,
+              thinking_duration_ms: event.thinking_ms ?? t.thinking_duration_ms,
             }));
             break;
           case "answer":

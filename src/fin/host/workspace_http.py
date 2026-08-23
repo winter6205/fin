@@ -62,6 +62,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from dataclasses import dataclass
 from typing import Any, Iterator, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException
@@ -80,6 +81,7 @@ from fin.host.graph import ConcurrentRunError
 from fin.host.run_payload import RunResponsePayload, _run_to_response_payload
 from fin.host.stream_map import (
     InlineFilterState,
+    ThinkingClock,
     format_tool_summary,
     reasoning_delta_from_chunk,
     split_stream_delta,
@@ -95,6 +97,21 @@ from fin.host.thread_store import (
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RunStreamOutcome:
+    """What ``_stream_run_frames`` hands back when the run's wire ends.
+
+    ``final_state`` is the last ``values`` frame (``None`` when the
+    stream produced nothing). ``thinking_ms`` is the run's total
+    streamed-thinking duration (T4, #37) — persisted on the
+    ``RunRecord`` and echoed on the terminal ``status`` frame so the
+    SPA's post-run collapse label matches the stored turn row.
+    """
+
+    final_state: dict[str, Any] | None
+    thinking_ms: int
 
 
 # Maximum characters of the first message used as the thread title.
@@ -169,6 +186,10 @@ class TurnRow(BaseModel):
     answer: str = ""
     citations: list[CitationPayload] = Field(default_factory=list)
     thinking_text: str = ""
+    # T4 (#37, spec line 31): total thinking duration in ms. Drives
+    # the post-run one-line collapse label ("Thought for 4.2s");
+    # a reload restores it from this row. 0 when no thinking.
+    thinking_duration_ms: int = 0
     # T3 (spec line 32): one dict per tool call observed this run;
     # keys are exactly ``name`` / ``summary`` / ``tool_call_id``.
     tool_summaries: list[ToolSummaryPayload] = Field(default_factory=list)
@@ -247,6 +268,7 @@ def _serialize_run(run: RunRecord, *, in_flight: bool = False) -> dict[str, Any]
         "answer": run.answer,
         "citations": list(run.citations),
         "thinking_text": run.thinking_text,
+        "thinking_duration_ms": run.thinking_duration_ms,
         # T3 shape: one {name, summary, tool_call_id} dict per
         # tool call; deep-copied so a caller cannot mutate the
         # record's list through the serialized view.
@@ -273,8 +295,8 @@ def _format_sse(event: str, data: Any) -> str:
 # ----- SSE frame builders (T1 #33 / T3) -----
 
 
-def _node_frames_for_message(message: BaseMessage) -> Iterator[str]:
-    """Yield the node-complete frames for one message.
+def _node_frame_payloads(message: BaseMessage) -> Iterator[tuple[str, Any]]:
+    """Yield the node-complete ``(event, data)`` frames for a message.
 
     Node-complete frames are synthesized from ``values``-mode
     emissions (each arrives AFTER the node's checkpoint write):
@@ -302,7 +324,7 @@ def _node_frames_for_message(message: BaseMessage) -> Iterator[str]:
                     args = json.loads(args)
                 except (TypeError, ValueError):
                     args = {}
-            yield _format_sse(
+            yield (
                 "tool_call",
                 {
                     "name": call.get("name", ""),
@@ -324,7 +346,7 @@ def _node_frames_for_message(message: BaseMessage) -> Iterator[str]:
         # Strip the marker from the human-readable summary so a
         # bounce template embedded in tool output never escapes
         # to the SPA (ADR 0021).
-        yield _format_sse(
+        yield (
             "tool_result",
             {
                 "name": tool_name,
@@ -343,7 +365,7 @@ def _stream_run_frames(
     config: dict[str, Any],
     seen_message_ids: set[str],
 ) -> Iterator[str]:
-    """Drive one run on the combined delta wire; return the final state.
+    """Drive one run on the combined delta wire; return the outcome.
 
     The shared engine behind the send route (T1, #33) and the
     resume route (T2, #36) so the two surfaces cannot drift on the
@@ -364,9 +386,23 @@ def _stream_run_frames(
       it with the pre-resume checkpoint's ids so checkpointed
       messages do not replay onto the wire).
 
-    Returns the last ``values`` state (``None`` when the stream
-    produced nothing — callers skip persistence then).
+    Every emitted frame ticks the :class:`ThinkingClock` (T4, #37)
+    so the run's total thinking duration is known when the stream
+    ends. The generator's return value carries the final state and
+    ``thinking_ms``; ``None`` final state means the stream produced
+    nothing (callers skip persistence then).
     """
+    clock = ThinkingClock()
+
+    def _frame(event: str, data: Any) -> str:
+        # T4 (#37): thinking frames open a duration segment; every
+        # other frame closes it — the collapse label's data.
+        if event == "thinking":
+            clock.tick_thinking()
+        else:
+            clock.tick_other()
+        return _format_sse(event, data)
+
     filter_state = InlineFilterState()
     final_state: dict[str, Any] | None = None
     for mode, payload in graph.stream(
@@ -384,7 +420,7 @@ def _stream_run_frames(
                 continue
             reasoning = reasoning_delta_from_chunk(chunk)
             if reasoning:
-                yield _format_sse(
+                yield _frame(
                     "thinking",
                     {"text": strip_hidden_bounce_marker(reasoning)},
                 )
@@ -393,9 +429,9 @@ def _stream_run_frames(
                 split = split_stream_delta(filter_state, content)
                 filter_state = split.state
                 if split.thinking:
-                    yield _format_sse("thinking", {"text": split.thinking})
+                    yield _frame("thinking", {"text": split.thinking})
                 if split.answer:
-                    yield _format_sse("answer", {"text": split.answer})
+                    yield _frame("answer", {"text": split.answer})
         else:
             final_state = payload
             for message in payload.get("messages", []) or []:
@@ -404,16 +440,18 @@ def _stream_run_frames(
                     continue
                 if mid:
                     seen_message_ids.add(mid)
-                yield from _node_frames_for_message(message)
+                for event, data in _node_frame_payloads(message):
+                    yield _frame(event, data)
 
     # Stream end: release any held-back inline-filter fragment so
     # the live view never silently loses trailing text.
     tail = split_stream_delta(filter_state, "", final=True)
     if tail.thinking:
-        yield _format_sse("thinking", {"text": tail.thinking})
+        yield _frame("thinking", {"text": tail.thinking})
     if tail.answer:
-        yield _format_sse("answer", {"text": tail.answer})
-    return final_state
+        yield _frame("answer", {"text": tail.answer})
+    clock.close()
+    return RunStreamOutcome(final_state=final_state, thinking_ms=clock.total_ms)
 
 
 def _citations_wire_payload(citations: list[Any]) -> list[dict[str, Any]]:
@@ -453,15 +491,17 @@ def _terminal_sse_frames(
     run_id: str,
     payload: RunResponsePayload,
     thinking_type: str | None = None,
+    thinking_ms: int | None = None,
 ) -> Iterator[str]:
     """Yield the fixed-order terminal frames: ``status`` -> ``answer``
     -> ``citations`` (spec line 30; citations is TERMINAL so the SPA
     closes its reader).
 
-    Shared by the T4 ``send_message`` and ``resume`` routes so the two
-    surfaces cannot drift on order / marker-stripping / citation
-    shaping. ``thinking_type`` is an optional extra key the send route
-    echoes on the status frame; resume omits it.
+    Shared by the send and resume routes so the two surfaces cannot
+    drift on order / marker-stripping / citation shaping. Optional
+    extras on the status frame: ``thinking_type`` (send route echo)
+    and ``thinking_ms`` (T4, #37 — the collapse label's duration,
+    known by stream end).
     """
     safe_answer = strip_thinking_from_answer(
         payload["answer"] if payload["status"] == "done" else ""
@@ -474,6 +514,8 @@ def _terminal_sse_frames(
     }
     if thinking_type is not None:
         status_body["thinking_type"] = thinking_type
+    if thinking_ms is not None:
+        status_body["thinking_ms"] = thinking_ms
     yield _format_sse("status", status_body)
     yield _format_sse("answer", {"text": safe_answer})
     yield _format_sse("citations", _citations_wire_payload(payload["citations"]))
@@ -723,18 +765,20 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
             # (spec line 34).
             if hasattr(graph, "checkpoint_message_ids"):
                 seen_message_ids |= graph.checkpoint_message_ids(thread_id)
-            final_state = yield from _stream_run_frames(
+            outcome = yield from _stream_run_frames(
                 graph,
                 input_value=reset_input_state(body.question),
                 config=config,
                 seen_message_ids=seen_message_ids,
             )
 
-            if final_state is None:
+            if outcome.final_state is None:
                 return
-            payload = _run_to_response_payload(final_state)
+            payload = _run_to_response_payload(outcome.final_state)
             # Persist the run record so the GET turn table surfaces
-            # it without re-invoking the graph.
+            # it without re-invoking the graph. T4 (#37): the
+            # thinking duration rides the row so a reload restores
+            # the collapsed one-line duration label.
             try:
                 store.append_run(
                     RunRecord(
@@ -746,6 +790,7 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                         answer=payload["answer"],
                         citations=payload["citations"],
                         thinking_text=payload["thinking_text"],
+                        thinking_duration_ms=outcome.thinking_ms,
                         tool_summaries=payload["tool_summaries"],
                         assistant_message=payload["assistant_message"],
                     )
@@ -763,9 +808,14 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                 return
             # Terminal frames per spec line 30: status -> answer ->
             # citations. Shared with the T4 resume route so the two
-            # emitters cannot drift.
+            # emitters cannot drift. T4 (#37): the status frame
+            # carries the thinking duration for the live collapse
+            # label.
             yield from _terminal_sse_frames(
-                run_id=run_id, payload=payload, thinking_type=thinking_type
+                run_id=run_id,
+                payload=payload,
+                thinking_type=thinking_type,
+                thinking_ms=outcome.thinking_ms,
             )
 
         return StreamingResponse(
@@ -853,16 +903,16 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
             seen_message_ids: set[str] = set()
             if hasattr(graph, "checkpoint_message_ids"):
                 seen_message_ids |= graph.checkpoint_message_ids(thread_id)
-            final_state = yield from _stream_run_frames(
+            outcome = yield from _stream_run_frames(
                 graph,
                 input_value=None,
                 config={"configurable": {"thread_id": thread_id}},
                 seen_message_ids=seen_message_ids,
             )
 
-            if final_state is None:
+            if outcome.final_state is None:
                 return
-            payload = _run_to_response_payload(final_state)
+            payload = _run_to_response_payload(outcome.final_state)
             try:
                 store.append_run(
                     RunRecord(
@@ -874,6 +924,7 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                         answer=payload["answer"],
                         citations=payload["citations"],
                         thinking_text=payload["thinking_text"],
+                        thinking_duration_ms=outcome.thinking_ms,
                         tool_summaries=payload["tool_summaries"],
                         assistant_message=payload["assistant_message"],
                     )
@@ -886,8 +937,14 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                     "assistant_message": "Thread was deleted while the run was resuming.",
                 })
                 return
-            # Terminal frames per spec line 30 (shared emitter).
-            yield from _terminal_sse_frames(run_id=run_id, payload=payload)
+            # Terminal frames per spec line 30 (shared emitter). The
+            # resume's thinking duration is the REMAINDER's, not the
+            # crashed prefix's (that time is unknowable post-crash).
+            yield from _terminal_sse_frames(
+                run_id=run_id,
+                payload=payload,
+                thinking_ms=outcome.thinking_ms,
+            )
 
         return StreamingResponse(
             event_stream(),

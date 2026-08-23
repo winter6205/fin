@@ -353,6 +353,13 @@ def _install_fake_langchain_openai(
         def bind_tools(self, _tools: object) -> "_FakeChatOpenAI":
             return self
 
+        # T3 (#34): ``compile_graph`` layers the no-thinking
+        # preference onto the tool binding via ``.bind(extra_body=...)``
+        # — the real ChatOpenAI (Runnable) exposes ``bind``; the fake
+        # mirrors it so the compile path runs end-to-end.
+        def bind(self, **_kwargs: object) -> "_FakeChatOpenAI":
+            return self
+
     fake_mod.ChatOpenAI = _FakeChatOpenAI
     monkeypatch.setitem(sys.modules, "langchain_openai", fake_mod)
 

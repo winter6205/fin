@@ -2347,3 +2347,92 @@ def test_send_message_thinking_false_applies_disabled_extra_body(
     status_event = next(d for n, d in events if n == "status")
     assert model.seen_extra_bodies[-1] is None
     assert status_event.get("thinking_type") == "adaptive"
+
+
+# ----- T4 (#37): post-run collapse data (thinking duration) -----
+
+
+def test_send_message_persists_thinking_duration_and_echoes_on_status(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str,
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run's thinking duration (ThinkingClock over the delta
+    wire) is echoed on the terminal ``status`` frame and persisted
+    on the turn row so a reload restores the collapsed one-line
+    duration label (spec line 31)."""
+    from langchain_core.messages import AIMessageChunk
+
+    import fin.host.stream_map as stream_map
+    from fin.host.http import get_graph
+
+    # Deterministic clock: each call advances 0.75s. The run's wire
+    # opens one thinking segment on the delta and closes it on the
+    # first non-thinking frame; stream end closes any remainder.
+    ticks = iter([0.0, 0.75, 1.5, 2.25, 3.0, 3.75, 4.5, 5.25, 6.0])
+    monkeypatch.setattr(
+        stream_map, "_monotonic", lambda: next(ticks, 99.0)
+    )
+
+    model = ScriptedChatModel(
+        stream_responses=[
+            [
+                AIMessageChunk(
+                    content="",
+                    additional_kwargs={
+                        "reasoning_details": [{"text": "thinking hard"}]
+                    },
+                    tool_call_chunks=[
+                        {
+                            "name": "read_file",
+                            "args": '{"document_id": "%s", "version": "%s", "page": 1, "page_limit": 1}'
+                            % (AAPL_2022Q3, AAPL_2022Q3_VERSION),
+                            "id": "c-read",
+                            "index": 0,
+                        }
+                    ],
+                ),
+            ],
+            [AIMessageChunk(content=f"Per the filing: {aapl_page1_text[:80]}")],
+        ],
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    events = _post_message(client, created["id"], "q")
+
+    status_event = next(d for n, d in events if n == "status")
+    assert status_event["status"] == "done"
+    # The status frame carries a non-negative integer duration.
+    assert isinstance(status_event.get("thinking_ms"), int)
+    assert status_event["thinking_ms"] >= 0
+
+    # The persisted turn row round-trips the same duration and the
+    # collapsed thinking text.
+    detail = client.get(f"/api/threads/{created['id']}").json()
+    run = detail["turns"][0]
+    assert run["thinking_duration_ms"] == status_event["thinking_ms"]
+    assert "thinking hard" in run["thinking_text"]
+
+
+def test_turn_row_includes_duration_zero_when_no_thinking(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """A run whose model never emits thinking persists duration 0
+    and empty thinking text; the SPA then renders no thinking
+    region at all (spec line 31: region appears only after the
+    first thinking event)."""
+    answer = f"Per the filing: {aapl_page1_text[:80]}"
+    _install_graph(http_app, _read_then_answer_script(answer))
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    _post_message(client, created["id"], "q")
+
+    detail = client.get(f"/api/threads/{created['id']}").json()
+    run = detail["turns"][0]
+    assert run["thinking_duration_ms"] == 0
+    assert run["thinking_text"] == ""
