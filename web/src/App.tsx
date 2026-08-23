@@ -1,5 +1,11 @@
 import { useEffect, useState } from "react";
-import { Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
+import {
+  Navigate,
+  Route,
+  Routes,
+  useNavigate,
+  useParams,
+} from "react-router-dom";
 import Sidebar from "./components/Sidebar";
 import HomePage from "./pages/HomePage";
 import ThreadPage from "./pages/ThreadPage";
@@ -36,9 +42,7 @@ function ThreadRoute() {
 
   if (!thread_id) return <Navigate to="/" replace />;
   if (loading) {
-    return (
-      <main className="p-6 text-sm text-gray-500">Loading thread…</main>
-    );
+    return <main className="p-6 text-sm text-gray-500">Loading thread…</main>;
   }
   if (!activeThread || activeThread.id !== thread_id) {
     return <NotFoundThread />;
@@ -46,14 +50,22 @@ function ThreadRoute() {
   return <ThreadPage />;
 }
 
+// T4.5 fix (spec line 41 + SC line 66): the SC says "/t/{unknown} is
+// not a blank chat (404 + back to list)". The earlier layout placed
+// this card against `<main className="p-8">` so it pinned to the
+// top-left and left ~90% of the viewport blank - functionally a blank
+// chat surface. Center the card vertically with a min-height so the
+// "404 + back" presentation has visual weight, then point the user
+// at the thread list.
 function NotFoundThread() {
   const navigate = useNavigate();
   return (
-    <main className="p-8">
-      <div className="max-w-md border border-black bg-card p-6">
+    <main className="flex items-center justify-center min-h-[60vh] p-8">
+      <div className="max-w-lg border border-black bg-card p-6">
         <h2 className="text-lg font-semibold mb-2">Thread not found</h2>
         <p className="text-sm text-gray-600 mb-4">
-          This research thread does not exist (it may have been deleted).
+          This research thread does not exist (it may have been deleted, or the
+          server was restarted without durable checkpoint storage).
         </p>
         <button
           onClick={() => navigate("/")}
