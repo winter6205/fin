@@ -212,7 +212,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
               // server-formatted one-liner.
               const placeholder: ToolSummary = {
                 name: event.name,
-                summary: "running…",
+                summary: "运行中…",
                 tool_call_id: event.tool_call_id,
               };
               patchTurn((t) => ({
@@ -327,7 +327,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           case "tool_call": {
             const placeholder: ToolSummary = {
               name: event.name,
-              summary: "running…",
+              summary: "运行中…",
               tool_call_id: event.tool_call_id,
             };
             patchLatestTurn(threadId, (t) => ({
