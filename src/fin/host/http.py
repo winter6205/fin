@@ -36,6 +36,7 @@ from pydantic import BaseModel, Field
 from fin.corpus.errors import IngestMissingError
 from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER
 from fin.host.graph import ConcurrentRunError, compile_graph
+from fin.host.operator_env import apply_dotenv
 from fin.host.run_payload import _run_to_response_payload
 from fin.host.state import EVIDENCE_RESET, reset_input_state
 from fin.host.thread_store import default_thread_store
@@ -404,7 +405,12 @@ def serve() -> None:
     false idempotent (a second call would re-register the
     catch-all). The module-level ``_spa_mounted`` flag
     short-circuits the second call correctly.
+
+    ``apply_dotenv`` runs first so ``FIN_*`` from a local ``.env``
+    are in ``os.environ`` before the first request compiles the
+    graph. Explicit process env still wins.
     """
+    apply_dotenv()
     import uvicorn
 
     uvicorn.run("fin.host.http:app", host="0.0.0.0", port=8000, log_level="info")

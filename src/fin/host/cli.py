@@ -54,6 +54,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from fin.corpus.errors import IngestMissingError
 from fin.host import ConcurrentRunError
 from fin.host.citation_gate import strip_hidden_bounce_marker
+from fin.host.operator_env import apply_dotenv
 from fin.host.run_payload import ordinary_person_copy
 from fin.host.state import EVIDENCE_RESET, reset_input_state
 
@@ -256,8 +257,10 @@ def _default_graph_factory() -> Any:
     The import is LAZY — neither LLM-provider nor Postgres-checkpointer
     modules are touched unless this function is actually called. The
     ``--help`` path therefore never instantiates an LLM, a graph, or a
-    checkpointer (ADR 0013 + ADR 0015).
+    checkpointer (ADR 0013 + ADR 0015). A local ``.env`` is applied
+    here (not at argparse) so ``--help`` stays import-light.
     """
+    apply_dotenv()
     try:
         from fin.host.compile import compile_for_runtime  # type: ignore[import-not-found]
     except ModuleNotFoundError as exc:
