@@ -359,6 +359,13 @@ def compile_for_runtime_dev(
     ``MissingCheckpointURLError`` when no URL — is INTACT. The dev
     path is a separate, opt-in (by absence) entry so tests asserting
     the prod contract stay green.
+
+    The model side is **NOT** auto-faked here. If
+    ``FIN_BASE_URL`` is unset, the prod default (``DEFAULT_BASE_URL``
+    = ``http://localhost:20128/v1``) is used and the model call
+    will surface a real ``OpenAIConnectionError`` if no proxy is
+    listening there — better a loud failure than a hidden scripted
+    substitute masquerading as a real conversation.
     """
     import logging
     import warnings
