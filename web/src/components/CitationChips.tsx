@@ -10,10 +10,22 @@
 // each verified span; the sources list lives under the prose and
 // shows the locator + a tap-to-reveal quote.
 
-import { useState } from "react";
+import { useId, useState } from "react";
 import type { Citation } from "../types";
 
 type AnswerPart = string | { quote: string; index: number };
+
+type IndexedCitation = { citation: Citation; globalIndex: number };
+
+type PageGroup = {
+  page: number;
+  citations: IndexedCitation[];
+};
+
+type DocumentGroup = {
+  document_id: string;
+  pages: PageGroup[];
+};
 
 function splitAnswerAtCitations(
   answer: string,
@@ -57,23 +69,40 @@ function splitAnswerAtCitations(
   return out;
 }
 
-function SourcesList({ citations }: { citations: Citation[] }) {
-  if (!citations || citations.length === 0) return null;
-  return (
-    <ul
-      className="mt-2 border-t border-black/20 pt-2 space-y-1"
-      aria-label="Sources"
-    >
-      {citations.map((c, i) => (
-        <SourceRow
-          key={`${c.document_id}-${c.page}-${i}`}
-          citation={c}
-          index={i + 1}
-        />
-      ))}
-    </ul>
-  );
+function groupCitationsByDocumentAndPage(
+  citations: Citation[],
+): DocumentGroup[] {
+  const docMap = new Map<string, Map<number, IndexedCitation[]>>();
+
+  for (let i = 0; i < citations.length; i += 1) {
+    const citation = citations[i];
+    let pageMap = docMap.get(citation.document_id);
+    if (!pageMap) {
+      pageMap = new Map();
+      docMap.set(citation.document_id, pageMap);
+    }
+    const pageCitations = pageMap.get(citation.page) ?? [];
+    pageCitations.push({ citation, globalIndex: i + 1 });
+    pageMap.set(citation.page, pageCitations);
+  }
+
+  return Array.from(docMap.entries()).map(([document_id, pageMap]) => ({
+    document_id,
+    pages: Array.from(pageMap.entries())
+      .sort(([a], [b]) => a - b)
+      .map(([page, pageCitations]) => ({
+        page,
+        citations: pageCitations,
+      })),
+  }));
 }
+
+function countUniquePages(citations: Citation[]): number {
+  return new Set(citations.map((c) => `${c.document_id}:${c.page}`)).size;
+}
+
+const focusRingClass =
+  "focus:outline-none focus:ring-2 focus:ring-[#2563EB] focus:ring-offset-1 focus:ring-offset-[#FAFAF7]";
 
 function SourceRow({ citation, index }: { citation: Citation; index: number }) {
   const [open, setOpen] = useState(false);
@@ -87,7 +116,7 @@ function SourceRow({ citation, index }: { citation: Citation; index: number }) {
         onClick={() => setOpen((v) => !v)}
         onFocus={() => setOpen(true)}
         onBlur={() => setOpen(false)}
-        className="text-left underline decoration-dotted underline-offset-2 hover:text-black focus:outline-none focus:ring-2 focus:ring-[#2563EB] focus:ring-offset-1 focus:ring-offset-[#FAFAF7]"
+        className={`text-left underline decoration-dotted underline-offset-2 hover:text-black ${focusRingClass}`}
       >
         {label}
       </button>
@@ -102,6 +131,123 @@ function SourceRow({ citation, index }: { citation: Citation; index: number }) {
         “{citation.quote}”
       </p>
     </li>
+  );
+}
+
+function PageSourcesGroup({
+  group,
+  defaultCollapsed,
+}: {
+  group: PageGroup;
+  defaultCollapsed: boolean;
+}) {
+  const [open, setOpen] = useState(!defaultCollapsed);
+  const spanCount = group.citations.length;
+  const panelId = `source-page-${group.page}-${group.citations[0]?.globalIndex ?? 0}`;
+
+  return (
+    <div className="border-t border-black first:border-t-0">
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={panelId}
+        onClick={() => setOpen((v) => !v)}
+        className={`w-full text-left px-3 py-1 text-xs font-mono text-gray-700 hover:bg-tool ${focusRingClass}`}
+      >
+        p.{group.page} · {spanCount} span{spanCount === 1 ? "" : "s"}
+      </button>
+      {open ? (
+        <ul id={panelId} className="px-3 pb-2 space-y-1">
+          {group.citations.map(({ citation, globalIndex }) => (
+            <SourceRow
+              key={`${citation.document_id}-${citation.page}-${globalIndex}`}
+              citation={citation}
+              index={globalIndex}
+            />
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
+function DocumentSourcesGroup({
+  group,
+  defaultCollapsed,
+}: {
+  group: DocumentGroup;
+  defaultCollapsed: boolean;
+}) {
+  const [open, setOpen] = useState(!defaultCollapsed);
+  const pageCount = group.pages.length;
+  const spanCount = group.pages.reduce(
+    (sum, page) => sum + page.citations.length,
+    0,
+  );
+  const panelId = `source-doc-${group.document_id}`;
+
+  return (
+    <div className="border-t border-black first:border-t-0">
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={panelId}
+        onClick={() => setOpen((v) => !v)}
+        className={`w-full text-left px-2 py-1.5 text-xs font-mono font-medium hover:bg-tool ${focusRingClass}`}
+      >
+        {group.document_id} · {pageCount} 页 · {spanCount} spans
+      </button>
+      {open ? (
+        <div id={panelId}>
+          {group.pages.map((pageGroup) => (
+            <PageSourcesGroup
+              key={`${group.document_id}-${pageGroup.page}`}
+              group={pageGroup}
+              defaultCollapsed={defaultCollapsed}
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function SourcesList({ citations }: { citations: Citation[] }) {
+  const spanCount = citations?.length ?? 0;
+  const pageCount = countUniquePages(citations ?? []);
+  const defaultCollapsed = spanCount > 10;
+  const [open, setOpen] = useState(!defaultCollapsed);
+  const panelId = useId();
+  if (!citations || citations.length === 0) return null;
+
+  const grouped = groupCitationsByDocumentAndPage(citations);
+
+  return (
+    <section className="mt-2 border border-black bg-card" aria-label="Sources">
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-controls={panelId}
+        onClick={() => setOpen((v) => !v)}
+        className={`w-full text-left px-2 py-1.5 text-xs font-mono font-medium hover:bg-tool ${focusRingClass}`}
+      >
+        Sources（出处）· {pageCount} 页 · {spanCount} spans
+      </button>
+      <p className="px-2 pb-1.5 text-xs text-gray-600 border-b border-black">
+        citation gate 匹配片段，可能有半句重叠，不代表发送失败
+      </p>
+      {open ? (
+        <div id={panelId}>
+          {grouped.map((docGroup) => (
+            <DocumentSourcesGroup
+              key={docGroup.document_id}
+              group={docGroup}
+              defaultCollapsed={defaultCollapsed}
+            />
+          ))}
+        </div>
+      ) : null}
+    </section>
   );
 }
 
