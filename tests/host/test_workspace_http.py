@@ -2436,3 +2436,70 @@ def test_turn_row_includes_duration_zero_when_no_thinking(
     run = detail["turns"][0]
     assert run["thinking_duration_ms"] == 0
     assert run["thinking_text"] == ""
+
+
+def test_bounce_retry_emits_answer_reset_between_attempts(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """When the citation gate BOUNCES an attempt (hidden
+    SystemMessage), the wire must signal the retry boundary with an
+    ``answer`` reset frame — otherwise the SPA's live view
+    concatenates every failed attempt's prose into one growing
+    answer. The reset frame carries ``{"text": "", "reset": true}``
+    between attempt N's deltas and attempt N+1's deltas."""
+    from langchain_core.messages import AIMessageChunk
+
+    from fin.host.http import get_graph
+
+    grounded = f"Per the filing: {aapl_page1_text[:80]}"
+    read_call = [
+        {
+            "name": "read_file",
+            "args": '{"document_id": "%s", "version": "%s", "page": 1, "page_limit": 1}'
+            % (AAPL_2022Q3, AAPL_2022Q3_VERSION),
+            "id": "c-read",
+            "index": 0,
+        }
+    ]
+    model = ScriptedChatModel(
+        stream_responses=[
+            [AIMessageChunk(content="", tool_call_chunks=read_call)],
+            # attempt 1: prose with no verifiable span -> gate bounce
+            [AIMessageChunk(content="Totally ungrounded handwaving here.")],
+            # attempt 2: grounded -> done
+            [AIMessageChunk(content=grounded[:40]), AIMessageChunk(content=grounded[40:])],
+        ],
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    events = _post_message(client, created["id"], "q")
+    names = [n for n, _ in events]
+
+    status_event = next(d for n, d in events if n == "status")
+    assert status_event["status"] == "done"
+
+    resets = [
+        (i, d)
+        for i, (n, d) in enumerate(events)
+        if n == "answer" and d.get("reset") is True
+    ]
+    assert len(resets) == 1, names
+    reset_i, reset_d = resets[0]
+    assert reset_d["text"] == ""
+
+    # The reset sits AFTER the failed attempt's deltas and BEFORE
+    # the grounded attempt's deltas.
+    answer_idx = [i for i, n in enumerate(names) if n == "answer"]
+    ungrounded_delta = next(
+        i for i in answer_idx if "handwaving" in events[i][1]["text"]
+    )
+    grounded_delta = next(
+        i for i in answer_idx if "Per the filing" in events[i][1]["text"]
+    )
+    assert ungrounded_delta < reset_i < grounded_delta

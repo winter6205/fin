@@ -17,6 +17,12 @@ interface WorkspaceState {
   corpus: Filing[];
   activeThread: ThreadDetail | null;
   loadingThreads: boolean;
+  // T5 (#35): true once the FIRST refreshThreads completed. The
+  // restore-on-return logic must distinguish "not loaded yet"
+  // (initial ``loadingThreads === false`` before App's effect
+  // starts the fetch) from "loaded and genuinely empty" — otherwise
+  // the one-shot restore treats a valid marker as stale.
+  threadsLoaded: boolean;
   sendingQuestion: boolean;
   // T4: ``resumeThread(threadId)`` sets this while the resume SSE
   // stream is active so the Composer can disable itself and so a
@@ -74,6 +80,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   corpus: [],
   activeThread: null,
   loadingThreads: false,
+  threadsLoaded: false,
   sendingQuestion: false,
   resumingThreadId: null,
 
@@ -83,7 +90,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       const threads = await api.listThreads();
       set({ threads });
     } finally {
-      set({ loadingThreads: false });
+      set({ loadingThreads: false, threadsLoaded: true });
     }
   },
 
@@ -240,7 +247,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           case "answer":
             patchTurn((t) => ({
               ...t,
-              answer: statusSeen ? event.text : t.answer + event.text,
+              answer: (statusSeen || event.reset)
+                ? event.text
+                : t.answer + event.text,
             }));
             break;
           case "citations":
@@ -344,7 +353,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           case "answer":
             patchLatestTurn(threadId, (t) => ({
               ...t,
-              answer: statusSeen ? event.text : t.answer + event.text,
+              answer: (statusSeen || event.reset)
+                ? event.text
+                : t.answer + event.text,
             }));
             break;
           case "citations":

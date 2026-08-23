@@ -105,7 +105,7 @@ export type SendEvent =
       // by stream end; drives the live turn's collapse label.
       thinking_ms?: number;
     }
-  | { type: "answer"; text: string }
+  | { type: "answer"; text: string; reset?: boolean }
   | { type: "citations"; citations: Citation[] };
 
 export class ConcurrentRunError extends Error {}
@@ -194,6 +194,10 @@ async function consumeSseStream(
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  // T1 (#33): answer frames are DELTAS while the run streams; the
+  // post-``status`` frame is the authoritative full text (replace);
+  // a ``reset`` frame (bounce retry boundary) clears the attempt.
+  let sawStatus = false;
 
   for (;;) {
     const { done, value } = await reader.read();
@@ -270,6 +274,7 @@ async function consumeSseStream(
           // the persisted RunRecord BEFORE any re-GET. T2 adds
           // ``assistant_message`` (ordinary-person copy on
           // refuse / step_cap).
+          sawStatus = true;
           const s = payload as {
             run_id?: string;
             status: SendResult["status"];
@@ -297,10 +302,22 @@ async function consumeSseStream(
           result.citations = payload as SendResult["citations"];
           onEvent?.({ type: "citations", citations: result.citations });
           break;
-        case "answer":
-          result.answerText = (payload as { text: string }).text;
-          onEvent?.({ type: "answer", text: result.answerText });
+        case "answer": {
+          const a = payload as { text: string; reset?: boolean };
+          if (sawStatus) {
+            result.answerText = a.text ?? "";
+          } else if (a.reset) {
+            result.answerText = "";
+          } else {
+            result.answerText += a.text ?? "";
+          }
+          onEvent?.({
+            type: "answer",
+            text: a.text ?? "",
+            reset: a.reset === true,
+          });
           break;
+        }
         default:
           // Unknown event type - skip rather than crash. Future
           // T3+ event types slot in here without breaking

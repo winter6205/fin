@@ -71,6 +71,7 @@ from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
     BaseMessage,
+    SystemMessage,
     ToolMessage,
 )
 from pydantic import BaseModel, Field
@@ -440,6 +441,18 @@ def _stream_run_frames(
                     continue
                 if mid:
                     seen_message_ids.add(mid)
+                if isinstance(message, SystemMessage):
+                    # The gate's hidden bounce template: the previous
+                    # attempt failed verification and the model is
+                    # about to retry. Signal the retry boundary so
+                    # the live view RESETS its answer accumulator
+                    # instead of concatenating every failed
+                    # attempt's prose (spec line 30 keeps the event
+                    # TYPE ``answer``; ``reset`` is an additive
+                    # payload key). The template itself never
+                    # reaches the wire (ADR 0021).
+                    yield _frame("answer", {"text": "", "reset": True})
+                    continue
                 for event, data in _node_frame_payloads(message):
                     yield _frame(event, data)
 
