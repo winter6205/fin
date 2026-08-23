@@ -1672,6 +1672,12 @@ def test_resume_continues_from_last_complete_node_no_human_message_appended(
     human_ids = {m.id for m in msgs_after_crash if m.__class__.__name__ == "HumanMessage"}
     assert len(human_ids) == 1  # exactly one user turn so far
 
+    # the tracked change regression: a real crash (pending nodes, no terminal
+    # row) must still surface the Resume banner signal; mid-flight
+    # refuse finalization must not clear this path.
+    after_crash = client.get(f"/api/threads/{tid}").json()
+    assert after_crash["pending_checkpoint"] is True
+
     # --- resume ---
     events = _post_resume_events(client, tid)
 
@@ -1710,6 +1716,9 @@ def test_resume_continues_from_last_complete_node_no_human_message_appended(
     # Model calls: once for the pre-crash tool-call step, once for
     # the post-resume terminal answer. NOT three.
     assert model.call_count == 2, f"model regenerated: {model.call_count}"
+
+    after_resume = client.get(f"/api/threads/{tid}").json()
+    assert after_resume["pending_checkpoint"] is False
 
 
 def test_resume_after_complete_aimessage_does_not_regenerate_that_message(
