@@ -22,10 +22,10 @@ function InterruptedRunBanner({ threadId }: { threadId: string }) {
   return (
     <div className="max-w-3xl mx-auto mb-4 border border-black bg-tool px-3 py-2 flex items-center justify-between">
       <p className="text-sm text-gray-700">
-        A previous run was interrupted. Resuming from the last complete step…
+        上一轮运行被中断，正在从最后一个完整步骤 Resume…
       </p>
       <span className="text-xs font-mono uppercase tracking-wide text-gray-500">
-        Resuming…
+        正在 Resume…
       </span>
     </div>
   );
@@ -65,7 +65,7 @@ export default function ThreadPage() {
   const resumingThreadId = useWorkspaceStore((s) => s.resumingThreadId);
 
   if (!thread_id || !activeThread || activeThread.id !== thread_id) {
-    return <main className="p-6 text-sm text-gray-500">Loading thread…</main>;
+    return <main className="p-6 text-sm text-gray-500">加载对话中…</main>;
   }
 
   // T4 (code-review H1): the Resume button is shown when the
@@ -86,7 +86,7 @@ export default function ThreadPage() {
       <header className="border-b border-black px-4 py-3 bg-page">
         <h2 className="text-sm font-semibold truncate">{activeThread.title}</h2>
         <p className="text-xs text-gray-500">
-          Created {new Date(activeThread.created_at).toLocaleString()}
+          创建于 {new Date(activeThread.created_at).toLocaleString()}
         </p>
       </header>
 
@@ -132,7 +132,7 @@ function CrashResumeBanner({ threadId }: { threadId: string }) {
   return (
     <div className="max-w-3xl mx-auto border border-black bg-tool px-3 py-2 flex items-center justify-between">
       <p className="text-sm text-gray-700">
-        Previous run was interrupted. Resume from the last complete step.
+        上一轮运行中断。从最后一个完整步骤 Resume。
       </p>
       <button
         type="button"
@@ -151,12 +151,9 @@ function EmptyThreadCorpusGrid() {
   const corpus = useWorkspaceStore((s) => s.corpus);
   if (corpus.length === 0) return null;
   return (
-    <section
-      aria-label="Start with a filing"
-      className="max-w-3xl mx-auto pt-4"
-    >
+    <section aria-label="从 filing 开始" className="max-w-3xl mx-auto pt-4">
       <h3 className="text-sm font-semibold text-gray-500 mb-2">
-        Or start from a filing
+        或从一份 filing 开始
       </h3>
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         {corpus.map((f) => (
@@ -260,7 +257,7 @@ function ThinkingAccordion({
   const showDurationLabel =
     !live && typeof durationMs === "number" && durationMs > 0;
   const label = showDurationLabel
-    ? `Thought for ${formatThinkingDuration(durationMs as number)}`
+    ? `Thinking · ${formatThinkingDuration(durationMs as number)}`
     : "Thinking";
   return (
     <div className="mb-2">
@@ -295,14 +292,14 @@ function StatusLine({
 }) {
   if (status === "done") {
     return (
-      <p className="text-xs uppercase tracking-wide text-gray-400 mb-1">done</p>
+      <p className="text-xs uppercase tracking-wide text-gray-400 mb-1">完成</p>
     );
   }
   // T2 fix: refuse / step_cap ordinary-person copy is the server's
   // ``assistant_message`` rendered by the parent ``TurnView``. ``StatusLine``
   // is now a small status label only — no client-side duplicate copy and
   // no raw ``reason`` enum leak.
-  const label = status === "refuse" ? "did not finish" : "step fuse hit";
+  const label = status === "refuse" ? "未完成" : "步数上限（step_cap）";
   return (
     <p className="text-xs uppercase tracking-wide text-gray-400 mb-1">
       {label}

@@ -42,7 +42,7 @@ function ThreadRoute() {
 
   if (!thread_id) return <Navigate to="/" replace />;
   if (loading) {
-    return <main className="p-6 text-sm text-gray-500">Loading thread…</main>;
+    return <main className="p-6 text-sm text-gray-500">加载对话中…</main>;
   }
   if (!activeThread || activeThread.id !== thread_id) {
     return <NotFoundThread />;
@@ -62,16 +62,16 @@ function NotFoundThread() {
   return (
     <main className="flex items-center justify-center min-h-[60vh] p-8">
       <div className="max-w-lg border border-black bg-card p-6">
-        <h2 className="text-lg font-semibold mb-2">Thread not found</h2>
+        <h2 className="text-lg font-semibold mb-2">对话不存在</h2>
         <p className="text-sm text-gray-600 mb-4">
-          This research thread does not exist (it may have been deleted, or the
-          server was restarted without durable checkpoint storage).
+          此研究 thread 不存在（可能已删除，或服务重启后未保留持久化
+          checkpoint）。
         </p>
         <button
           onClick={() => navigate("/")}
           className="border border-black px-3 py-1.5 text-sm hover:bg-accent hover:text-white"
         >
-          Back to threads
+          返回对话列表
         </button>
       </div>
     </main>
