@@ -2121,3 +2121,171 @@ def test_send_message_inline_thinking_stream_never_reaches_answer_frames(
         events[i][1]["text"] for i, n in enumerate(names) if n == "thinking"
     )
     assert "private reasoning here" in thinking_joined
+
+
+# ----- T2 (#36): resume streams the remainder on the same delta wire -----
+
+
+class _StreamCallCountingModel(ScriptedChatModel):
+    """ScriptedChatModel counting ``_stream`` invocations.
+
+    The T2 resume path streams EVERY model call (model_node always
+    calls ``model.stream``), so counting ``_generate`` calls would
+    read zero; count at the ``_stream`` seam instead.
+    """
+
+    stream_calls: int = 0
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
+        self.stream_calls += 1
+        yield from super()._stream(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+def test_resume_streams_remainder_deltas_on_same_wire(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """T2 (#36) binding acceptance: after a crash between a complete
+    tool-call ``AIMessage`` and ``tool_node``, ``POST /resume``
+    continues the run and the SSE carries the REMAINDER's thinking /
+    answer as per-chunk DELTAS (same live-turn behaviour as T1) —
+    not one dump after the remainder finishes. No HumanMessage is
+    appended and the checkpointed model message is not regenerated.
+    """
+    from langchain_core.messages import AIMessageChunk
+
+    from fin.host.http import get_graph
+
+    answer = f"Resumed per the filing: {aapl_page1_text[:80]}"
+    model = _StreamCallCountingModel(
+        stream_responses=[
+            # pre-crash response: tool call via streamed chunks
+            [
+                AIMessageChunk(
+                    content="",
+                    tool_call_chunks=[
+                        {
+                            "name": "read_file",
+                            "args": '{"document_id": "%s", "version": "%s", "page": 1, "page_limit": 1}'
+                            % (AAPL_2022Q3, AAPL_2022Q3_VERSION),
+                            "id": "c-read",
+                            "index": 0,
+                        }
+                    ],
+                ),
+            ],
+            # resumed response: one thinking delta + answer in 2 chunks
+            [
+                AIMessageChunk(
+                    content="",
+                    additional_kwargs={
+                        "reasoning_details": [{"text": "resumed thinking"}]
+                    },
+                ),
+                AIMessageChunk(content=answer[: len(answer) // 2]),
+                AIMessageChunk(content=answer[len(answer) // 2 :]),
+            ],
+        ],
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    tid = created["id"]
+
+    snap = _crash_after_model_complete(g, thread_id=tid, question="q1")
+    msgs_after_crash = list(snap.values.get("messages", []))
+    assert model.stream_calls == 1
+
+    events = _post_resume_events(client, tid)
+    names = [n for n, _ in events]
+    status_i = names.index("status")
+
+    # The remainder ran: exactly ONE more model stream call.
+    assert model.stream_calls == 2
+
+    # The remainder's thinking delta + answer deltas arrived BEFORE
+    # terminal status — as separate delta frames, not one dump.
+    thinking_idx = [i for i, n in enumerate(names) if n == "thinking"]
+    answer_idx = [i for i, n in enumerate(names) if n == "answer"]
+    assert len([i for i in thinking_idx if i < status_i]) >= 1
+    deltas = [i for i in answer_idx if i < status_i]
+    assert len(deltas) >= 2
+    joined = "".join(events[i][1]["text"] for i in deltas)
+    assert joined == answer
+    assert events[answer_idx[-1]][1]["text"] == answer
+    # The tool node ran before the resumed model call; its result
+    # frame precedes the resumed deltas.
+    assert names.index("tool_result") < thinking_idx[0] < deltas[0]
+    # Citations terminal.
+    assert names[-1] == "citations"
+    assert events[status_i][1]["status"] == "done"
+
+    # No HumanMessage appended; the crashed model message was not
+    # regenerated (message list grew by ToolMessage + AIMessage).
+    final = g._graph.get_state({"configurable": {"thread_id": tid}})
+    final_msgs = list(final.values["messages"])
+    assert len(final_msgs) == len(msgs_after_crash) + 2
+    humans = [m for m in final_msgs if m.__class__.__name__ == "HumanMessage"]
+    assert len(humans) == 1
+    ai_tools = [m for m in final_msgs if getattr(m, "tool_calls", None)]
+    assert len(ai_tools) == 1
+    assert ai_tools[0].id == [
+        m for m in msgs_after_crash if getattr(m, "tool_calls", None)
+    ][0].id
+
+
+def test_resume_does_not_replay_checkpointed_frames(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """The pre-crash checkpoint's messages (HumanMessage + the
+    complete tool-call AIMessage) must NOT re-emit their frames on
+    the resume stream: the first ``values`` frame replays the whole
+    checkpoint state and the route seeds its dedup set from it."""
+    from langchain_core.messages import AIMessageChunk
+
+    from fin.host.http import get_graph
+
+    answer = f"Resumed per the filing: {aapl_page1_text[:80]}"
+    model = ScriptedChatModel(
+        stream_responses=[
+            [
+                AIMessageChunk(
+                    content="",
+                    tool_call_chunks=[
+                        {
+                            "name": "read_file",
+                            "args": '{"document_id": "%s", "version": "%s", "page": 1, "page_limit": 1}'
+                            % (AAPL_2022Q3, AAPL_2022Q3_VERSION),
+                            "id": "c-read",
+                            "index": 0,
+                        }
+                    ],
+                ),
+            ],
+            [AIMessageChunk(content=answer)],
+        ],
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    tid = created["id"]
+    _crash_after_model_complete(g, thread_id=tid, question="q1")
+
+    events = _post_resume_events(client, tid)
+    names = [n for n, _ in events]
+
+    # Exactly ONE tool_call frame (the pre-crash model message's
+    # frames are NOT replayed) and one tool_result frame.
+    assert names.count("tool_call") == 0, names
+    tool_result_events = [d for n, d in events if n == "tool_result"]
+    assert len(tool_result_events) == 1
+    assert tool_result_events[0]["tool_call_id"] == "c-read"
