@@ -19,9 +19,10 @@ export default function HomePage() {
   // home/corpus — never a blank chat. One-shot per mount so a
   // deliberate later navigation home does not bounce the operator
   // away again.
+  const threadsLoaded = useWorkspaceStore((s) => s.threadsLoaded);
   const restoreAttempted = useRef(false);
   useEffect(() => {
-    if (restoreAttempted.current || loadingThreads) return;
+    if (restoreAttempted.current || !threadsLoaded) return;
     restoreAttempted.current = true;
     let lastId: string | null = null;
     try {
@@ -41,7 +42,7 @@ export default function HomePage() {
         /* storage unavailable. */
       }
     }
-  }, [loadingThreads, threads, navigate]);
+  }, [threadsLoaded, threads, navigate]);
 
   return (
     <main className="p-6">

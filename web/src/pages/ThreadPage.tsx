@@ -180,7 +180,13 @@ function TurnView({ turn }: { turn: Turn }) {
         </div>
       </div>
       <div className="border border-black bg-card p-3">
-        <StatusLine status={turn.status} reason={turn.status_reason ?? ""} />
+        {/* T4 (#37): while THIS turn streams, the optimistic status
+            placeholder would read "done" (the wire carries no
+            running status per spec line 30) — hide the status line
+            until the run actually ends. */}
+        {!live ? (
+          <StatusLine status={turn.status} reason={turn.status_reason ?? ""} />
+        ) : null}
         {/* T4 (spec line 31): thinking is unframed; while the run is
             live it line-clamps to a few lines; after the run it
             collapses to a one-line duration label that expands the
