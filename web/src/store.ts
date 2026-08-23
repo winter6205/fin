@@ -11,6 +11,7 @@ import type {
   ToolSummary,
   Turn,
 } from "./types";
+import { mergeAnswerDelta } from "./turnStream";
 
 interface WorkspaceState {
   threads: ThreadListItem[];
@@ -171,14 +172,19 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // Helpers bound to the latest state so ``onEvent`` callbacks
     // always patch the most-recent snapshot of the optimistic
     // turn (the array reference is stable across renders).
-    const patchTurn = (patcher: (t: Turn) => Turn) => {
+    const patchTurnByRunId = (
+      runId: Turn["run_id"],
+      patcher: (t: Turn) => Turn,
+    ) => {
       const current = get().activeThread;
       if (!current || current.id !== threadId) return;
       const nextTurns = current.turns.map((t) =>
-        t.run_id === optimisticRunId ? patcher(t) : t,
+        t.run_id === runId ? patcher(t) : t,
       );
       set({ activeThread: { ...current, turns: nextTurns } });
     };
+    const patchTurn = (patcher: (t: Turn) => Turn) =>
+      patchTurnByRunId(optimisticRunId, patcher);
 
     const initial = get().activeThread;
     if (initial && initial.id === threadId) {
@@ -188,11 +194,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
 
     try {
-      // T1 (#33): the wire emits answer DELTAS while the model
-      // streams and one authoritative full-text ``answer`` frame
-      // AFTER ``status`` (fixed server order). Deltas append; the
-      // post-status frame replaces (it also drops prose from a
-      // bounced attempt the gate later refused).
+      // T1 (#33): answer frames are DELTAS while the model streams; after
+      // ``status`` the wire may emit one authoritative frame — on ``done``
+      // runs we keep a non-empty draft; on refuse/step_cap an empty frame
+      // clears the draft so SC67 copy renders from ``assistant_message``.
       let statusSeen = false;
       const result = await api.sendMessage(
         threadId,
@@ -234,11 +239,13 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
               }));
               break;
             }
-            case "status":
+            case "status": {
               statusSeen = true;
-              // Server-minted run id wins over the local placeholder.
-              optimisticRunId = event.run_id;
-              patchTurn((t) => ({
+              // Patch by the CLIENT placeholder id first — updating
+              // ``optimisticRunId`` before the patch would orphan the
+              // optimistic row and freeze the live view until GET.
+              const priorRunId = optimisticRunId;
+              patchTurnByRunId(priorRunId, (t) => ({
                 ...t,
                 run_id: event.run_id,
                 status: event.status,
@@ -250,14 +257,16 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
                 thinking_duration_ms:
                   event.thinking_ms ?? t.thinking_duration_ms,
               }));
+              optimisticRunId = event.run_id;
               break;
+            }
             case "answer":
               patchTurn((t) => ({
                 ...t,
-                answer:
-                  statusSeen || event.reset
-                    ? event.text
-                    : t.answer + event.text,
+                answer: mergeAnswerDelta(t.answer, event.text, {
+                  statusSeen,
+                  reset: event.reset,
+                }),
               }));
               break;
             case "citations":
@@ -266,14 +275,20 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           }
         },
       );
-      // Reconcile by re-GET'ing the thread: the SSE body carries
-      // the terminal events but the persisted RunRecord id and
-      // any field the streaming payload omits (e.g. citation
-      // ``quote`` strings) only surface on a follow-up GET.
-      // ``openThread`` REPLACES the optimistic turn with the
-      // server-persisted row so the ``run_id`` lines up with
-      // what ``GET /api/threads/{id}`` returns.
-      await get().openThread(threadId);
+      // The SSE stream already delivered terminal status, answer, and
+      // citations. Re-GET'ing here used to replace the live turn row
+      // and caused a visible retract/repop even when merge logic ran
+      // immediately after — keep the streamed row; refresh the sidebar
+      // list only. Reload still uses GET via ThreadPage's effect.
+      const cur = get().activeThread;
+      if (cur?.id === threadId) {
+        patchTurn((t) => ({
+          ...t,
+          in_flight: false,
+          citations:
+            result.citations.length > 0 ? result.citations : t.citations,
+        }));
+      }
       await get().refreshThreads();
       return result;
     } finally {
@@ -291,8 +306,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 
     // Optimistic local patch: while the resume is streaming, mark
     // the most-recent persisted turn as in_flight so the banner +
-    // Resume button can render. The server is the source of truth
-    // — the openThread() reconcile at the end overwrites this.
+    // Resume button can render. Cleared by the status frame or
+    // finalize patch below (no re-GET over the streamed row).
     const before = get().activeThread;
     if (before && before.id === threadId && before.turns.length > 0) {
       const last = before.turns.length - 1;
@@ -305,9 +320,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
 
     try {
-      // Same delta semantics as sendQuestion (T1 #33): append
-      // thinking / answer fragments; the post-status answer frame
-      // replaces with the authoritative text.
+      // Same delta semantics as sendQuestion (T1 #33): append while
+      // streaming; post-status empty frame clears refuse/step_cap draft.
       let statusSeen = false;
       const result = await api.resumeThread(threadId, (event) => {
         // Switch-thread guard: if the operator navigated away
@@ -361,8 +375,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           case "answer":
             patchLatestTurn(threadId, (t) => ({
               ...t,
-              answer:
-                statusSeen || event.reset ? event.text : t.answer + event.text,
+              answer: mergeAnswerDelta(t.answer, event.text, {
+                statusSeen,
+                reset: event.reset,
+              }),
             }));
             break;
           case "citations":
@@ -374,10 +390,16 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         }
       });
 
-      // Reconcile with persisted state. Same shape as
-      // sendQuestion's tail — openThread() REPLACES the optimistic
-      // patches with the server-persisted row.
-      await get().openThread(threadId);
+      // Same as sendQuestion: do not re-GET over the streamed row.
+      const cur = get().activeThread;
+      if (cur?.id === threadId) {
+        patchLatestTurn(threadId, (t) => ({
+          ...t,
+          in_flight: false,
+          citations:
+            result.citations.length > 0 ? result.citations : t.citations,
+        }));
+      }
       await get().refreshThreads();
       return result;
     } finally {
