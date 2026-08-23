@@ -2569,7 +2569,21 @@ def test_scripted_model_raises_emits_terminal_status(
     # after the citations frame's blank-line separator.
     assert body.endswith("event: citations\ndata: []\n\n")
 
-    # The half-run state must NOT be persisted: final_state was None,
-    # so the caller skipped append_run entirely.
+    # The refused run IS persisted (spec line 67: GET history shows
+    # empty sources plus non-empty assistant copy — a turn that
+    # vanishes on reconcile is a swallowed blank). The user's
+    # question stays visible with the terminal refuse status and
+    # ordinary-person copy; the row id matches the SSE run_id so the
+    # SPA's openThread reconcile keeps (not wipes) the live turn.
     detail = client.get(f"/api/threads/{created['id']}").json()
-    assert detail["turns"] == []
+    assert len(detail["turns"]) == 1
+    row = detail["turns"][0]
+    assert row["question"] == "q"
+    assert row["status"] == "refuse"
+    assert "stream raised mid-flight" in row["status_reason"]
+    assert "RuntimeError" in row["status_reason"]
+    assert row["run_id"] == status_event["run_id"]
+    assert row["answer"] == ""
+    assert row["citations"] == []
+    assert row["assistant_message"]
+    assert row["in_flight"] is False

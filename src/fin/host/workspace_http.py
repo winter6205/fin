@@ -109,10 +109,20 @@ class RunStreamOutcome:
     streamed-thinking duration (T4, #37) — persisted on the
     ``RunRecord`` and echoed on the terminal ``status`` frame so the
     SPA's post-run collapse label matches the stored turn row.
+
+    ``refuse_reason`` / ``refuse_copy`` are set ONLY on the
+    mid-flight-raise path: the engine already emitted the terminal
+    refuse frames itself, and callers persist them on a
+    ``RunRecord`` so the failed exchange stays in the turn table
+    (spec line 67: GET history shows empty sources plus non-empty
+    assistant copy) instead of being wiped by the SPA's
+    openThread reconcile.
     """
 
     final_state: dict[str, Any] | None
     thinking_ms: int
+    refuse_reason: str | None = None
+    refuse_copy: str | None = None
 
 
 # Maximum characters of the first message used as the thread title.
@@ -399,9 +409,9 @@ def _stream_run_frames(
     so the run's total thinking duration is known when the stream
     ends. The generator's return value carries the final state and
     ``thinking_ms``; ``None`` final state means the stream produced
-    nothing (callers skip persistence then). On exception the
-    generator still emits status / answer / citations before
-    returning.
+    nothing. On exception the generator still emits status / answer
+    / citations before returning; the send caller then persists a
+    refuse row (``refuse_reason`` set), the resume caller skips.
     """
     clock = ThinkingClock()
 
@@ -491,16 +501,17 @@ def _stream_run_frames(
             extra={"run_id": run_id, "thread_id": thread_id},
         )
         reason = f"stream raised mid-flight: {type(exc).__name__}"
+        copy = (
+            "The answer stream failed partway through. Try "
+            "sending the question again."
+        )
         yield _format_sse(
             "status",
             {
                 "run_id": run_id,
                 "status": "refuse",
                 "reason": reason,
-                "assistant_message": (
-                    "The answer stream failed partway through. Try "
-                    "sending the question again."
-                ),
+                "assistant_message": copy,
                 "thinking_ms": clock.total_ms,
             },
         )
@@ -509,7 +520,12 @@ def _stream_run_frames(
         )
         yield _format_sse("citations", _citations_wire_payload([]))
         clock.close()
-        return RunStreamOutcome(final_state=None, thinking_ms=clock.total_ms)
+        return RunStreamOutcome(
+            final_state=None,
+            thinking_ms=clock.total_ms,
+            refuse_reason=reason,
+            refuse_copy=copy,
+        )
     clock.close()
     return RunStreamOutcome(final_state=final_state, thinking_ms=clock.total_ms)
 
@@ -835,6 +851,42 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
             )
 
             if outcome.final_state is None:
+                if outcome.refuse_reason is None:
+                    # Exit condition: empty stream WITHOUT an
+                    # exception — the engine emitted no values frame
+                    # and no terminal frames; there is no failure to
+                    # persist, so exit without touching the store.
+                    return
+                # Mid-flight raise: the engine already emitted the
+                # terminal refuse frames itself. Persist the refusal
+                # so the turn table keeps the user's question and the
+                # ordinary-person copy (spec line 67: GET history
+                # shows empty sources plus non-empty assistant copy)
+                # — without the row, the SPA's openThread reconcile
+                # replaces its optimistic turn with the server's
+                # empty list and the failed exchange vanishes.
+                try:
+                    store.append_run(
+                        RunRecord(
+                            id=run_id,
+                            thread_id=thread_id,
+                            question=body.question,
+                            status="refuse",
+                            status_reason=outcome.refuse_reason,
+                            answer="",
+                            citations=[],
+                            thinking_text="",
+                            thinking_duration_ms=outcome.thinking_ms,
+                            tool_summaries=[],
+                            assistant_message=outcome.refuse_copy or "",
+                        )
+                    )
+                except ThreadNotFoundError:
+                    # No extra frame here — the engine's terminal
+                    # frames already closed the wire (the normal
+                    # branch below can still add one because its
+                    # frames have not been emitted yet).
+                    return
                 return
             payload = _run_to_response_payload(outcome.final_state)
             # Persist the run record so the GET turn table surfaces
@@ -975,6 +1027,15 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
             )
 
             if outcome.final_state is None:
+                # Mid-flight raise on a RESUME: unlike the send path,
+                # persist nothing — when the original send row exists
+                # it already tells the story, and appending a refuse
+                # row per failed Resume click would spam the turn
+                # table. KNOWN GAP (follow-up): after a process death
+                # there is no send row at all, so a resume that also
+                # raises leaves the question invisible in history;
+                # fixing that needs the checkpointed HumanMessage,
+                # which this route does not carry.
                 return
             payload = _run_to_response_payload(outcome.final_state)
             try:
