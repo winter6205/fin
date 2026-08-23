@@ -887,6 +887,18 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                     # branch below can still add one because its
                     # frames have not been emitted yet).
                     return
+                # Mid-flight refuse persisted a terminal row but the
+                # LangGraph checkpoint may still list pending next
+                # nodes. Finalize via the graph seam so GET does not
+                # report ``pending_checkpoint: true`` above a terminal
+                # turn (issue #46). Defensive ``hasattr`` mirrors
+                # ``delete_thread`` / ``pending_nodes`` wiring tolerance.
+                if hasattr(graph, "finalize_abandoned_run"):
+                    graph.finalize_abandoned_run(
+                        thread_id,
+                        status="refuse",
+                        status_reason=outcome.refuse_reason,
+                    )
                 return
             payload = _run_to_response_payload(outcome.final_state)
             # Persist the run record so the GET turn table surfaces
