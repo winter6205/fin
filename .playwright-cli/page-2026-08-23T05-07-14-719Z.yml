@@ -1,0 +1,17 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e5]:
+      - heading "fin" [level=1] [ref=e6]
+      - paragraph [ref=e7]: 10-Q research workspace
+    - button "+ New thread" [ref=e9] [cursor=pointer]
+    - navigation "Research threads" [ref=e10]:
+      - list [ref=e71]:
+        - listitem [ref=e72]:
+          - link "New thread" [ref=e73] [cursor=pointer]:
+            - /url: /t/33b20f6c-9f4d-46f3-b311-df444949d195
+          - button "Delete New thread" [ref=e75] [cursor=pointer]: x
+  - main [ref=e76]:
+    - generic [ref=e77]:
+      - heading "Thread not found" [level=2] [ref=e78]
+      - paragraph [ref=e79]: This research thread does not exist (it may have been deleted).
+      - button "Back to threads" [ref=e80] [cursor=pointer]

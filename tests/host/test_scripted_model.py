@@ -28,7 +28,7 @@ production breaks too.
 from __future__ import annotations
 
 import pytest
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 
 from fin.host.scripted_model import ScriptedChatModel
 
@@ -230,3 +230,68 @@ def test_stream_with_empty_script_falls_back_to_sync_invoke() -> None:
     # we got SOMETHING (the LangChain base may add a sentinel).
     real = [c for c in chunks if c.content]
     assert any(c.content == "fallback" for c in real)
+
+
+# ----- stream_responses: one full response per model call (T1 #33) -----
+
+
+def test_stream_responses_yields_one_full_response_per_stream_call() -> None:
+    """``stream_responses`` scripts MULTIPLE model calls: each
+    ``stream()`` invocation consumes ONE response (a list of
+    chunks) in order. The T1 wire tests need call 1 to stream a
+    tool-call response and call 2 to stream thinking + answer
+    deltas — ``stream_script`` alone cannot express two distinct
+    streamed responses."""
+    model = ScriptedChatModel(
+        stream_responses=[
+            [AIMessageChunk(content="a"), AIMessageChunk(content="b")],
+            [AIMessageChunk(content="c")],
+        ]
+    )
+    first = list(model.stream([HumanMessage(content="q")]))
+    second = list(model.stream([HumanMessage(content="q")]))
+    third = list(model.stream([HumanMessage(content="q")]))
+    assert [c.content for c in first if c.content] == ["a", "b"]
+    assert [c.content for c in second if c.content] == ["c"]
+    # Exhausted: the LAST response replays in full (mirrors the
+    # sync ``script[-1]`` contract).
+    assert [c.content for c in third if c.content] == ["c"]
+
+
+def test_stream_responses_preserves_chunk_fields_verbatim() -> None:
+    """Chunks replay with ``additional_kwargs`` (reasoning_details)
+    and ``tool_call_chunks`` intact so the delta mapper sees the
+    exact shapes the proxy emits."""
+    model = ScriptedChatModel(
+        stream_responses=[
+            [
+                AIMessageChunk(
+                    content="",
+                    additional_kwargs={
+                        "reasoning_details": [{"text": "plan"}]
+                    },
+                    tool_call_chunks=[
+                        {"name": "list_files", "args": "", "id": "c1", "index": 0}
+                    ],
+                )
+            ]
+        ]
+    )
+    chunks = list(model.stream([HumanMessage(content="q")]))
+    chunk = next(c for c in chunks if c.additional_kwargs)
+    assert chunk.additional_kwargs["reasoning_details"] == [
+        {"text": "plan"}
+    ]
+    assert chunk.tool_call_chunks[0]["name"] == "list_files"
+
+
+def test_stream_responses_takes_precedence_over_stream_script() -> None:
+    """When both are set, ``stream_responses`` drives the streamed
+    path; ``stream_script`` (single-response legacy shape) stays for
+    existing tests."""
+    model = ScriptedChatModel(
+        stream_responses=[[AIMessageChunk(content="resp")]],
+        stream_script=[AIMessageChunk(content="legacy")],
+    )
+    chunks = list(model.stream([HumanMessage(content="q")]))
+    assert [c.content for c in chunks if c.content] == ["resp"]

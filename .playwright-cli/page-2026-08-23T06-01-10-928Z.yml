@@ -1,0 +1,75 @@
+- generic [ref=f3e3]:
+  - complementary [ref=f3e4]:
+    - generic [ref=f3e5]:
+      - heading "fin" [level=1] [ref=f3e6]
+      - paragraph [ref=f3e7]: 10-Q research workspace
+    - button "+ New thread" [ref=f3e9] [cursor=pointer]
+    - navigation "Research threads" [ref=f3e10]:
+      - list [ref=f3e72]:
+        - listitem [ref=f3e73]:
+          - link "New thread" [ref=f3e74] [cursor=pointer]:
+            - /url: /t/66a47ea3-da87-47de-ac5c-f4f39259fc58
+          - button "Delete New thread" [ref=f3e76] [cursor=pointer]: x
+  - main [ref=f3e77]:
+    - generic [ref=f3e78]:
+      - heading "New thread" [level=2] [ref=f3e79]
+      - paragraph [ref=f3e80]: Created 8/23/2026, 2:01:07 PM
+    - region "Start with a filing" [ref=f3e82]:
+      - heading "Or start from a filing" [level=3] [ref=f3e83]
+      - generic [ref=f3e84]:
+        - button [ref=f3e85] [cursor=pointer]:
+          - paragraph [ref=f3e86]: AAPL-2022Q3
+          - paragraph [ref=f3e87]: AAPL · 2022 Q3
+          - paragraph [ref=f3e88]: 28 pages
+        - button [ref=f3e89] [cursor=pointer]:
+          - paragraph [ref=f3e90]: AAPL-2023Q1
+          - paragraph [ref=f3e91]: AAPL · 2023 Q1
+          - paragraph [ref=f3e92]: 46 pages
+        - button [ref=f3e93] [cursor=pointer]:
+          - paragraph [ref=f3e94]: AAPL-2023Q2
+          - paragraph [ref=f3e95]: AAPL · 2023 Q2
+          - paragraph [ref=f3e96]: 28 pages
+        - button [ref=f3e97] [cursor=pointer]:
+          - paragraph [ref=f3e98]: AAPL-2023Q3
+          - paragraph [ref=f3e99]: AAPL · 2023 Q3
+          - paragraph [ref=f3e100]: 29 pages
+        - button [ref=f3e101] [cursor=pointer]:
+          - paragraph [ref=f3e102]: AMZN-2022Q3
+          - paragraph [ref=f3e103]: AMZN · 2022 Q3
+          - paragraph [ref=f3e104]: 50 pages
+        - button [ref=f3e105] [cursor=pointer]:
+          - paragraph [ref=f3e106]: AMZN-2023Q1
+          - paragraph [ref=f3e107]: AMZN · 2023 Q1
+          - paragraph [ref=f3e108]: 52 pages
+        - button [ref=f3e109] [cursor=pointer]:
+          - paragraph [ref=f3e110]: AMZN-2023Q2
+          - paragraph [ref=f3e111]: AMZN · 2023 Q2
+          - paragraph [ref=f3e112]: 51 pages
+        - button [ref=f3e113] [cursor=pointer]:
+          - paragraph [ref=f3e114]: AMZN-2023Q3
+          - paragraph [ref=f3e115]: AMZN · 2023 Q3
+          - paragraph [ref=f3e116]: 51 pages
+        - button [ref=f3e117] [cursor=pointer]:
+          - paragraph [ref=f3e118]: MSFT-2022Q3
+          - paragraph [ref=f3e119]: MSFT · 2022 Q3
+          - paragraph [ref=f3e120]: 80 pages
+        - button [ref=f3e121] [cursor=pointer]:
+          - paragraph [ref=f3e122]: MSFT-2023Q1
+          - paragraph [ref=f3e123]: MSFT · 2023 Q1
+          - paragraph [ref=f3e124]: 72 pages
+        - button [ref=f3e125] [cursor=pointer]:
+          - paragraph [ref=f3e126]: MSFT-2023Q2
+          - paragraph [ref=f3e127]: MSFT · 2023 Q2
+          - paragraph [ref=f3e128]: 74 pages
+        - button [ref=f3e129] [cursor=pointer]:
+          - paragraph [ref=f3e130]: MSFT-2023Q3
+          - paragraph [ref=f3e131]: MSFT · 2023 Q3
+          - paragraph [ref=f3e132]: 67 pages
+    - generic [ref=f3e133]:
+      - textbox "Ask about the frozen 10-Qs…" [ref=f3e134]
+      - generic [ref=f3e135]:
+        - generic [ref=f3e136]:
+          - checkbox "Think step by step" [ref=f3e137]
+          - text: Think step by step
+        - generic [ref=f3e138]: Enter to send · Shift+Enter for newline
+        - button "Send" [disabled] [ref=f3e139]

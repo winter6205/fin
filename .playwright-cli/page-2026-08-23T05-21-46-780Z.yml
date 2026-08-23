@@ -1,0 +1,19 @@
+- generic [ref=f1e3]:
+  - complementary [ref=f1e4]:
+    - generic [ref=f1e5]:
+      - heading "fin" [level=1] [ref=f1e6]
+      - paragraph [ref=f1e7]: 10-Q research workspace
+    - button "+ New thread" [ref=f1e9] [cursor=pointer]
+    - navigation "Research threads" [ref=f1e10]:
+      - list
+  - main [ref=f1e12]:
+    - heading "Research threads" [level=2] [ref=f1e13]
+    - paragraph [ref=f1e14]: Ask about the frozen AAPL / MSFT / AMZN 10-Qs.
+    - region "Thread list" [ref=f1e15]:
+      - paragraph [ref=f1e16]: No threads yet — start with a question below, or pick a filing.
+    - region "Corpus" [ref=f1e17]:
+      - heading "Corpus (frozen 12)" [level=3] [ref=f1e18]
+      - generic [ref=f1e19]:
+        - paragraph [ref=f1e20]: Corpus is empty
+        - paragraph [ref=f1e21]: The frozen filings are not ingested yet — run the ingest step to populate the extracted tree.
+        - button "+ New thread" [ref=f1e22] [cursor=pointer]

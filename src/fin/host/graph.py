@@ -926,6 +926,31 @@ class _LockedGraph:
         )
         return tuple(snapshot.next or ())
 
+    def checkpoint_message_ids(self, thread_id: str) -> set[str]:
+        """Return the message ids on ``thread_id``'s latest checkpoint.
+
+        The workspace send / resume routes seed their SSE dedup set
+        with these ids so a follow-up send (whose first ``values``
+        frame replays the whole accumulated message list) and a
+        crash resume (whose first frame replays the pre-crash
+        checkpoint) never re-emit run-1's ``tool_call`` /
+        ``tool_result`` frames onto the new stream (spec line 34).
+        Empty set for a thread with no checkpoint.
+
+        Read-only path: does NOT acquire the per-thread lock; the
+        routes call it before starting the run, when no writer is
+        in flight (they probe ``is_locked`` first).
+        """
+        snapshot = self._graph.get_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        messages = (snapshot.values or {}).get("messages") or []
+        return {
+            mid
+            for mid in (getattr(m, "id", None) for m in messages)
+            if mid
+        }
+
     @staticmethod
     def _release_thread(lock: threading.Lock) -> None:
         lock.release()

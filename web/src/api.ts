@@ -78,6 +78,9 @@ export interface SendResult {
 // T3 streaming events surfaced to the caller as they arrive.
 // The store threads each one into the optimistic turn so the
 // tools region + scratchpad fill in while the run is live.
+// T1 (#33): ``thinking`` / ``answer`` frames are DELTAS (fragments
+// to concatenate); the authoritative full answer arrives on the
+// terminal ``answer`` frame AFTER ``status`` (fixed server order).
 export type SendEvent =
   | { type: "thinking"; text: string }
   | {
@@ -90,7 +93,7 @@ export type SendEvent =
       type: "tool_result";
       tool_call_id: string;
       name: string;
-      result: unknown;
+      summary: string;
     }
   | {
       type: "status";
@@ -217,9 +220,10 @@ async function consumeSseStream(
 
       switch (eventName) {
         case "thinking": {
-          // T3: per-AIMessage scratchpad prose. The SPA renders
-          // it collapsed / line-clamped; the prose never
-          // participates in citation matching (SC60 binding).
+          // T1 (#33): token deltas — each frame's ``text`` is a
+          // FRAGMENT of the run's thinking prose; the store
+          // concatenates. The prose never participates in citation
+          // matching (SC60 binding).
           const t = payload as { text: string };
           onEvent?.({ type: "thinking", text: t.text ?? "" });
           break;
@@ -242,18 +246,18 @@ async function consumeSseStream(
           break;
         }
         case "tool_result": {
-          // T3: ``tool_call_id`` + JSON-decoded ``result`` so the
-          // SPA can flip the running row to its final shape.
+          // T3 wire shape: ``{name, summary, tool_call_id}`` — the
+          // server-formatted one-liner, never raw ToolMessage JSON.
           const tr = payload as {
             tool_call_id: string;
             name: string;
-            result: unknown;
+            summary?: string;
           };
           onEvent?.({
             type: "tool_result",
             tool_call_id: tr.tool_call_id,
             name: tr.name,
-            result: tr.result,
+            summary: tr.summary ?? tr.name,
           });
           break;
         }
