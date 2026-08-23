@@ -2289,3 +2289,61 @@ def test_resume_does_not_replay_checkpointed_frames(
     tool_result_events = [d for n, d in events if n == "tool_result"]
     assert len(tool_result_events) == 1
     assert tool_result_events[0]["tool_call_id"] == "c-read"
+
+
+# ----- T3 (#34): global thinking preference -----
+
+
+def test_send_message_thinking_false_applies_disabled_extra_body(
+    client: TestClient, fresh_store, http_app: FastAPI
+) -> None:
+    """``{"thinking": false}`` on the send body makes THIS run's
+    model calls carry the disabled ``extra_body`` (adaptive stays
+    the default when the flag is absent / true)."""
+    from langchain_core.messages import AIMessageChunk
+
+    from fin.host.http import get_graph
+
+    class _Recorder(ScriptedChatModel):
+        seen_extra_bodies: list = []
+
+        def _stream(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
+            self.seen_extra_bodies.append(kwargs.get("extra_body"))
+            yield from super()._stream(
+                messages, stop=stop, run_manager=run_manager, **kwargs
+            )
+
+    model = _Recorder(
+        stream_responses=[[AIMessageChunk(content="plain answer text")]]
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    tid = created["id"]
+
+    # Preference OFF -> disabled binding for the run.
+    with client.stream(
+        "POST",
+        f"/api/threads/{tid}/messages",
+        json={"question": "off run", "thinking": False},
+    ) as r:
+        body = "".join(r.iter_text())
+    events = _parse_sse_events(body)
+    status_event = next(d for n, d in events if n == "status")
+    assert model.seen_extra_bodies[-1] == {
+        "thinking": {"type": "disabled"},
+        "reasoning_split": True,
+    }
+    assert status_event.get("thinking_type") == "disabled"
+
+    # Default (omitted) -> boot binding, no layered extra_body; the
+    # status frame echoes adaptive.
+    events = _post_message(client, tid, "default run")
+    status_event = next(d for n, d in events if n == "status")
+    assert model.seen_extra_bodies[-1] is None
+    assert status_event.get("thinking_type") == "adaptive"

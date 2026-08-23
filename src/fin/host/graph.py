@@ -63,6 +63,7 @@ from langchain_core.messages import (
 from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
+from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
 
 from fin.corpus.errors import IngestMissingError
@@ -561,6 +562,16 @@ def compile_graph(
     bound_model = model.bind_tools(
         [list_files_tool, read_file_tool, retrieve_tool]
     )
+    # T3 (#34): the off-preference binding layers the MiniMax
+    # ``extra_body`` (``thinking.type=disabled``) on top of the same
+    # bound tools. ``reasoning_split`` STAYS ``True`` so
+    # ``reasoning_details`` round-trip / replay is unaffected by the
+    # preference (spec line 28). ``model_node`` selects per run via
+    # ``configurable.thinking_type`` — no shared model mutation, so
+    # concurrent runs on other threads cannot leak the preference.
+    bound_model_no_thinking = bound_model.bind(
+        extra_body={"thinking": {"type": "disabled"}, "reasoning_split": True}
+    )
 
     tool_dispatcher = ToolNode(
         [list_files_tool, read_file_tool, retrieve_tool],
@@ -570,7 +581,7 @@ def compile_graph(
 
     # ----- node functions -----
 
-    def model_node(state: AgentState) -> dict[str, Any]:
+    def model_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         # Step 1: step-cap fuse. Increment ``step_count`` and check
         # BEFORE invoking the model — when the fuse fires we never
         # call the LLM again (spec success criteria item 5).
@@ -590,6 +601,19 @@ def compile_graph(
                 # thinking text (no model ran, nothing streamed).
                 "thinking_text": "",
             }
+        # Step 1b: T3 (#34) — pick the model binding for this run's
+        # thinking preference. ``configurable.thinking_type ==
+        # "disabled"`` (the operator's global off preference) swaps
+        # to the no-thinking binding for EVERY model call in the
+        # run (including bounce retries); absent / any other value
+        # keeps the boot-time binding (adaptive, ADR 0022). Selecting
+        # a pre-built binding — instead of mutating the shared
+        # model's kwargs — keeps concurrent runs on other threads
+        # isolated.
+        configurable = dict((config or {}).get("configurable") or {})
+        selected_model = bound_model
+        if configurable.get("thinking_type") == "disabled":
+            selected_model = bound_model_no_thinking
         # Step 2: STREAM the model (T3 / spec line 27 / ADR 0026).
         # Token deltas are observed by the workspace SSE layer via
         # LangGraph's ``stream_mode="messages"``; THIS node still
@@ -607,7 +631,7 @@ def compile_graph(
         # inline ``<thinking>`` block stripped out of content. It is
         # stored on state for the turn row; it NEVER merges into the
         # answer content (SC60).
-        stream = bound_model.stream(state["messages"])
+        stream = selected_model.stream(state["messages"])
         answer_message = assemble_final_ai_message(stream)
         thinking_text = _extract_thinking_text(answer_message)
         # NOTE: ``evidence`` is intentionally omitted from this return.

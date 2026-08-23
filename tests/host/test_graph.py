@@ -1047,3 +1047,74 @@ def reset_input_state_for_test(question: str) -> dict:
         "thinking_text": "",
         "tool_summaries": [],
     }
+
+
+# ----- T3 (#34): thinking preference reaches the model binding -----
+
+
+class _ExtraBodyRecordingModel(ScriptedChatModel):
+    """Record the ``extra_body`` kwarg each ``_stream`` call saw.
+
+    The per-run thinking preference is applied by selecting a
+    differently-bound model (``bind(extra_body=...)``), so the
+    observable seam is the kwarg the model receives.
+    """
+
+    seen_extra_bodies: list = []
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
+        self.seen_extra_bodies.append(kwargs.get("extra_body"))
+        yield from super()._stream(
+            messages, stop=stop, run_manager=run_manager, **kwargs
+        )
+
+
+def test_thinking_type_disabled_config_selects_disabled_binding() -> None:
+    """``configurable.thinking_type == "disabled"`` makes every
+    model call in the run carry the MiniMax ``extra_body`` with
+    ``thinking.type=disabled`` while ``reasoning_split`` STAYS on
+    (converter replay continuity, spec line 28)."""
+    from langchain_core.messages import AIMessageChunk
+
+    model = _ExtraBodyRecordingModel(
+        stream_responses=[[AIMessageChunk(content="ok")]]
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids={"X"},
+    )
+    g.invoke(
+        {"messages": [HumanMessage(content="q")]},
+        config={
+            "configurable": {"thread_id": "t-pref-off", "thinking_type": "disabled"}
+        },
+    )
+    assert model.seen_extra_bodies
+    assert all(
+        body == {"thinking": {"type": "disabled"}, "reasoning_split": True}
+        for body in model.seen_extra_bodies
+    )
+
+
+def test_default_config_keeps_boot_thinking_binding() -> None:
+    """Without ``thinking_type`` (the default / on preference) the
+    model binding is the boot-time one — NO extra_body kwarg is
+    layered on top of the compiled extra_body (adaptive,
+    ADR 0022)."""
+    from langchain_core.messages import AIMessageChunk
+
+    model = _ExtraBodyRecordingModel(
+        stream_responses=[[AIMessageChunk(content="ok")]]
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids={"X"},
+    )
+    g.invoke(
+        {"messages": [HumanMessage(content="q")]},
+        config={"configurable": {"thread_id": "t-pref-default"}},
+    )
+    assert model.seen_extra_bodies
+    assert all(body is None for body in model.seen_extra_bodies)

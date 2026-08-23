@@ -94,7 +94,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }));
   },
 
-  async sendQuestion(threadId, question, thinkingOn = false) {
+  async sendQuestion(threadId, question, thinkingOn = true) {
     if (!question.trim()) return null; // Empty submit is a no-op.
     if (get().sendingQuestion) return null; // No queue in T1.
     set({ sendingQuestion: true });
