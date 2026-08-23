@@ -1672,6 +1672,12 @@ def test_resume_continues_from_last_complete_node_no_human_message_appended(
     human_ids = {m.id for m in msgs_after_crash if m.__class__.__name__ == "HumanMessage"}
     assert len(human_ids) == 1  # exactly one user turn so far
 
+    # Issue #46 regression: a real crash (pending nodes, no terminal
+    # row) must still surface the Resume banner signal; mid-flight
+    # refuse finalization must not clear this path.
+    after_crash = client.get(f"/api/threads/{tid}").json()
+    assert after_crash["pending_checkpoint"] is True
+
     # --- resume ---
     events = _post_resume_events(client, tid)
 
@@ -1710,6 +1716,9 @@ def test_resume_continues_from_last_complete_node_no_human_message_appended(
     # Model calls: once for the pre-crash tool-call step, once for
     # the post-resume terminal answer. NOT three.
     assert model.call_count == 2, f"model regenerated: {model.call_count}"
+
+    after_resume = client.get(f"/api/threads/{tid}").json()
+    assert after_resume["pending_checkpoint"] is False
 
 
 def test_resume_after_complete_aimessage_does_not_regenerate_that_message(
@@ -2587,3 +2596,11 @@ def test_scripted_model_raises_emits_terminal_status(
     assert row["citations"] == []
     assert row["assistant_message"]
     assert row["in_flight"] is False
+
+    # Issue #46: mid-flight refuse must NOT leave a pending checkpoint
+    # — the CrashResume banner keys off ``pending_checkpoint``, not
+    # ``in_flight``, and a terminal refuse turn must not show it.
+    assert detail["pending_checkpoint"] is False
+
+    resume_resp = _resume(client, created["id"])
+    assert resume_resp.status_code == 204
