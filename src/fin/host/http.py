@@ -123,18 +123,28 @@ def compile_for_http(
 
     Production path (``checkpointer=None``, ``model=None``)
     lazy-imports T8's ``compile_for_runtime`` and caches the
-    resulting graph. If T8 has not been merged the import fails
-    and ``compile_for_http()`` raises — tests pass explicit
-    ``checkpointer`` + ``model`` args and bypass the lazy path
-    entirely.
+    resulting graph. If ``FIN_CHECKPOINT_URL`` is unset (typical
+    WSL / laptop dev boot without Postgres), falls back to
+    ``compile_for_runtime_dev`` which uses ``InMemorySaver`` and
+    emits a WARNING that state is non-persistent. The fallback is
+    one-way per process: a single dev-mode boot stays dev-mode
+    for its lifetime. Tests pass explicit ``checkpointer`` +
+    ``model`` args and bypass both paths entirely.
     """
     if checkpointer is None and model is None:
         global _http_graph_singleton
         with _http_singleton_lock:
             if _http_graph_singleton is None:
-                from fin.host.compile import compile_for_runtime
+                from fin.host.compile import (
+                    MissingCheckpointURLError,
+                    compile_for_runtime,
+                    compile_for_runtime_dev,
+                )
 
-                _http_graph_singleton = compile_for_runtime()
+                try:
+                    _http_graph_singleton = compile_for_runtime()
+                except MissingCheckpointURLError:
+                    _http_graph_singleton = compile_for_runtime_dev()
             return _http_graph_singleton
     return compile_graph(
         checkpointer=checkpointer,
