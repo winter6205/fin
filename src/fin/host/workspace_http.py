@@ -362,15 +362,23 @@ def _node_frame_payloads(message: BaseMessage) -> Iterator[tuple[str, Any]]:
 def _stream_run_frames(
     graph: Any,
     *,
+    run_id: str,
     input_value: Any,
     config: dict[str, Any],
     seen_message_ids: set[str],
+    thread_id: str | None = None,
 ) -> Iterator[str]:
     """Drive one run on the combined delta wire; return the outcome.
 
     The shared engine behind the send route (T1, #33) and the
     resume route (T2, #36) so the two surfaces cannot drift on the
-    wire contract. Consumes ``graph.stream`` with
+    wire contract. On exception the generator still emits
+    ``status`` / ``answer`` / ``citations`` before returning so the
+    SPA's reader closes cleanly instead of hanging on a truncated
+    stream (mid-flight failures otherwise leave the live view
+    frozen in ``running``).
+
+    Consumes ``graph.stream`` with
     ``stream_mode=["messages", "values"]``:
 
     * ``messages`` items arrive DURING ``model_node`` execution —
@@ -391,7 +399,9 @@ def _stream_run_frames(
     so the run's total thinking duration is known when the stream
     ends. The generator's return value carries the final state and
     ``thinking_ms``; ``None`` final state means the stream produced
-    nothing (callers skip persistence then).
+    nothing (callers skip persistence then). On exception the
+    generator still emits status / answer / citations before
+    returning.
     """
     clock = ThinkingClock()
 
@@ -406,63 +416,100 @@ def _stream_run_frames(
 
     filter_state = InlineFilterState()
     final_state: dict[str, Any] | None = None
-    for mode, payload in graph.stream(
-        input_value,
-        config=config,
-        stream_mode=["messages", "values"],
-    ):
-        if mode == "messages":
-            chunk, meta = payload
-            # The aggregated end-of-call AIMessage is not a chunk;
-            # only per-token AIMessageChunks carry new deltas.
-            if not isinstance(chunk, AIMessageChunk):
-                continue
-            if meta.get("langgraph_node") != "model":
-                continue
-            reasoning = reasoning_delta_from_chunk(chunk)
-            if reasoning:
-                yield _frame(
-                    "thinking",
-                    {"text": strip_hidden_bounce_marker(reasoning)},
-                )
-            content = chunk.content
-            if isinstance(content, str) and content:
-                split = split_stream_delta(filter_state, content)
-                filter_state = split.state
-                if split.thinking:
-                    yield _frame("thinking", {"text": split.thinking})
-                if split.answer:
-                    yield _frame("answer", {"text": split.answer})
-        else:
-            final_state = payload
-            for message in payload.get("messages", []) or []:
-                mid = getattr(message, "id", None)
-                if mid and mid in seen_message_ids:
+    try:
+        for mode, payload in graph.stream(
+            input_value,
+            config=config,
+            stream_mode=["messages", "values"],
+        ):
+            if mode == "messages":
+                chunk, meta = payload
+                # The aggregated end-of-call AIMessage is not a chunk;
+                # only per-token AIMessageChunks carry new deltas.
+                if not isinstance(chunk, AIMessageChunk):
                     continue
-                if mid:
-                    seen_message_ids.add(mid)
-                if isinstance(message, SystemMessage):
-                    # The gate's hidden bounce template: the previous
-                    # attempt failed verification and the model is
-                    # about to retry. Signal the retry boundary so
-                    # the live view RESETS its answer accumulator
-                    # instead of concatenating every failed
-                    # attempt's prose (spec line 30 keeps the event
-                    # TYPE ``answer``; ``reset`` is an additive
-                    # payload key). The template itself never
-                    # reaches the wire (ADR 0021).
-                    yield _frame("answer", {"text": "", "reset": True})
+                if meta.get("langgraph_node") != "model":
                     continue
-                for event, data in _node_frame_payloads(message):
-                    yield _frame(event, data)
+                reasoning = reasoning_delta_from_chunk(chunk)
+                if reasoning:
+                    yield _frame(
+                        "thinking",
+                        {"text": strip_hidden_bounce_marker(reasoning)},
+                    )
+                content = chunk.content
+                if isinstance(content, str) and content:
+                    split = split_stream_delta(filter_state, content)
+                    filter_state = split.state
+                    if split.thinking:
+                        yield _frame("thinking", {"text": split.thinking})
+                    if split.answer:
+                        yield _frame("answer", {"text": split.answer})
+            else:
+                final_state = payload
+                for message in payload.get("messages", []) or []:
+                    mid = getattr(message, "id", None)
+                    if mid and mid in seen_message_ids:
+                        continue
+                    if mid:
+                        seen_message_ids.add(mid)
+                    if isinstance(message, SystemMessage):
+                        # The gate's hidden bounce template: the previous
+                        # attempt failed verification and the model is
+                        # about to retry. Signal the retry boundary so
+                        # the live view RESETS its answer accumulator
+                        # instead of concatenating every failed
+                        # attempt's prose (spec line 30 keeps the event
+                        # TYPE ``answer``; ``reset`` is an additive
+                        # payload key). The template itself never
+                        # reaches the wire (ADR 0021).
+                        yield _frame("answer", {"text": "", "reset": True})
+                        continue
+                    for event, data in _node_frame_payloads(message):
+                        yield _frame(event, data)
 
-    # Stream end: release any held-back inline-filter fragment so
-    # the live view never silently loses trailing text.
-    tail = split_stream_delta(filter_state, "", final=True)
-    if tail.thinking:
-        yield _frame("thinking", {"text": tail.thinking})
-    if tail.answer:
-        yield _frame("answer", {"text": tail.answer})
+        # Stream end: release any held-back inline-filter fragment so
+        # the live view never silently loses trailing text.
+        tail = split_stream_delta(filter_state, "", final=True)
+        if tail.thinking:
+            yield _frame("thinking", {"text": tail.thinking})
+        if tail.answer:
+            yield _frame("answer", {"text": tail.answer})
+    except Exception as exc:
+        # Mid-flight failure (model raise, node crash): without this
+        # boundary the exception escapes the generator, FastAPI kills
+        # the SSE body before any terminal frame, and the SPA's reader
+        # hangs waiting for ``citations`` (spec line 96: terminal
+        # statuses carry explicit copy — never swallowed blanks).
+        # Emit the refuse-shaped terminal sequence so the client sees
+        # a closed stream, log with traceback for the operator, and
+        # report ``final_state=None`` so callers skip persistence of
+        # a half-run state. The exception type name goes into
+        # ``reason``; the message itself stays out of the wire (it may
+        # carry provider internals).
+        logger.exception(
+            "run stream raised mid-flight",
+            extra={"run_id": run_id, "thread_id": thread_id},
+        )
+        reason = f"stream raised mid-flight: {type(exc).__name__}"
+        yield _format_sse(
+            "status",
+            {
+                "run_id": run_id,
+                "status": "refuse",
+                "reason": reason,
+                "assistant_message": (
+                    "The answer stream failed partway through. Try "
+                    "sending the question again."
+                ),
+                "thinking_ms": clock.total_ms,
+            },
+        )
+        yield _format_sse(
+            "answer", {"text": strip_thinking_from_answer("")}
+        )
+        yield _format_sse("citations", _citations_wire_payload([]))
+        clock.close()
+        return RunStreamOutcome(final_state=None, thinking_ms=clock.total_ms)
     clock.close()
     return RunStreamOutcome(final_state=final_state, thinking_ms=clock.total_ms)
 
@@ -780,9 +827,11 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                 seen_message_ids |= graph.checkpoint_message_ids(thread_id)
             outcome = yield from _stream_run_frames(
                 graph,
+                run_id=run_id,
                 input_value=reset_input_state(body.question),
                 config=config,
                 seen_message_ids=seen_message_ids,
+                thread_id=thread_id,
             )
 
             if outcome.final_state is None:
@@ -918,9 +967,11 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                 seen_message_ids |= graph.checkpoint_message_ids(thread_id)
             outcome = yield from _stream_run_frames(
                 graph,
+                run_id=run_id,
                 input_value=None,
                 config={"configurable": {"thread_id": thread_id}},
                 seen_message_ids=seen_message_ids,
+                thread_id=thread_id,
             )
 
             if outcome.final_state is None:
