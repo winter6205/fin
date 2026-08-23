@@ -309,10 +309,12 @@ def test_two_runs_on_same_thread_real_spans(aapl_page1_text, capsys):
     assert captured.out.count("status: done") == 2
     # The explicit thread id is echoed on stderr for BOTH runs.
     assert captured.err.count("thread_id: t-acc") == 2
-    # Run 1 saw [1, 3] messages; run 2 continues the checkpointed
-    # history: strictly larger at every subsequent model call.
+    # Run 1 saw [2, 4] messages: host SystemMessage is prepended
+    # at each model call (not checkpointed), then Human, then
+    # AI+Tool. Run 2 continues the checkpointed history: strictly
+    # larger at every subsequent model call.
     lengths = model.seen_lengths
-    assert lengths[:2] == [1, 3]
+    assert lengths[:2] == [2, 4]
     assert len(lengths) >= 4
     assert lengths[2] > lengths[1]
     assert lengths[3] > lengths[2]

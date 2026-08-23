@@ -936,6 +936,75 @@ def test_verify_citations_receives_stripped_prose_with_thinking_in_content(
     assert span in text
 
 
+def test_last_ai_text_strips_minimax_think_tags(aapl_page1_text):
+    """MiniMax default inline tag is ``<think>``. The gate reads
+    ``_last_ai_text``; if those tags survive, every ordinary
+    answer fails citation matching after the model thinks."""
+    from fin.host.graph import _last_ai_text
+
+    span = aapl_page1_text[:80]
+    msg = AIMessage(
+        content=f"<think>planning the retrieve call</think>\n{span}",
+        additional_kwargs={},
+    )
+    text = _last_ai_text([msg])
+    assert "planning the retrieve call" not in text
+    assert span in text
+
+
+def test_model_node_sends_host_instructions_before_user_turn(aapl_page1_text):
+    """The live model sees only HumanMessage + tools unless the
+    host prepends instructions. Without the citation/tool contract
+    in context, MiniMax answers from memory, the gate bounces, and
+    the workspace run refuses. Instructions are call-scoped (not
+    checkpointed) so follow-ups do not stack copies."""
+    from langchain_core.messages import SystemMessage
+
+    from fin.host.agent_instructions import HOST_INSTRUCTIONS_MARKER
+    from fin.host.scripted_model import ScriptedChatModel as SCM
+
+    seen: list[list] = []
+    span = aapl_page1_text[:80]
+
+    class Recording(SCM):
+        def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+            seen.append(list(messages))
+            return super()._stream(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    model = Recording(
+        script=[AIMessage(content=span)],
+        stream_script=[AIMessageChunk(content=span)],
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    out = g.invoke(
+        {
+            "messages": [HumanMessage("What was Apple net sales?")],
+            "evidence": [
+                EvidenceItem(
+                    locator=Locator(AAPL_2022Q3, AAPL_2022Q3_VERSION, 1),
+                    page_text=aapl_page1_text,
+                )
+            ],
+            "repair_count": 0,
+            "step_count": 0,
+        },
+        config=_thread_config("t-host-instructions"),
+    )
+    assert out["status"] == "done"
+    assert seen, "model_node must call stream()"
+    first = seen[0]
+    assert isinstance(first[0], SystemMessage)
+    assert HOST_INSTRUCTIONS_MARKER in str(first[0].content)
+    assert not any(
+        isinstance(m, SystemMessage) and HOST_INSTRUCTIONS_MARKER in str(m.content)
+        for m in out["messages"]
+    )
+
+
 def test_tool_summaries_appended_by_tool_node(aapl_page1_text):
     """``tool_node`` appends one human-readable summary per tool call
     to ``state['tool_summaries']``; each entry carries name +

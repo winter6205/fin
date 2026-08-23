@@ -11,6 +11,7 @@ export default function HomePage() {
   const threads = useWorkspaceStore((s) => s.threads);
   const corpus = useWorkspaceStore((s) => s.corpus);
   const loadingThreads = useWorkspaceStore((s) => s.loadingThreads);
+  const corpusLoaded = useWorkspaceStore((s) => s.corpusLoaded);
   const navigate = useNavigate();
 
   // T5 (#35, spec line 42): a RETURNING visit restores the last
@@ -82,12 +83,22 @@ export default function HomePage() {
         <h3 className="text-base font-semibold mb-2">Corpus (frozen 12)</h3>
         {corpus.length === 0 ? (
           <div className="border border-black bg-card p-4 max-w-md">
-            <p className="text-sm font-medium mb-1">Corpus is empty</p>
-            <p className="text-sm text-gray-600 mb-3">
-              The frozen filings are not ingested yet — run the ingest step
-              to populate the extracted tree.
+            <p className="text-sm font-medium mb-1">
+              {corpusLoaded ? "Corpus is empty" : "Loading corpus…"}
             </p>
-            <StartEmptyThreadButton />
+            {corpusLoaded ? (
+              <>
+                <p className="text-sm text-gray-600 mb-3">
+                  The frozen filings are not ingested yet — run the ingest step
+                  to populate the extracted tree.
+                </p>
+                <StartEmptyThreadButton />
+              </>
+            ) : (
+              <p className="text-sm text-gray-600">
+                Fetching the frozen 12 filings.
+              </p>
+            )}
           </div>
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">

@@ -195,20 +195,18 @@ def _build_default_model(
         model=model_name,
         base_url=base_url,
         api_key=api_key,
-        # T3 (ADR 0022, ADR 0026, spec line 27): the MiniMax proxy
-        # splits the model's reasoning into
-        # ``additional_kwargs["reasoning_details"]`` on streamed
-        # chunks when ``reasoning_split`` is true. The thinking
-        # ``type`` defaults to ``adaptive`` (on); the workspace
-        # send path swaps to ``disabled`` per the operator's
-        # "Think step by step" toggle (see ``SendMessageRequest``).
-        # ``ChatOpenAI`` forwards ``model_kwargs`` as the JSON body.
-        model_kwargs={
-            "extra_body": {
-                "thinking": {"type": "adaptive"},
-                "reasoning_split": True,
-            }
+        # Nested ``model_kwargs={"extra_body": ...}`` is rejected by
+        # ChatOpenAI ("specify extra_body explicitly"). Without the
+        # split channel MiniMax inlines ``<think>`` into content and
+        # the workspace turn looks like a failed chat.
+        extra_body={
+            "thinking": {"type": "adaptive"},
+            "reasoning_split": True,
         },
+        # A hung completion holds the per-thread lock and disables
+        # the composer for that research thread. Bound the wait.
+        timeout=120.0,
+        max_retries=1,
     )
 
 

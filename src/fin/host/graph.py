@@ -80,9 +80,11 @@ from fin.host.state import (
     RECURSION_LIMIT,
     STEP_CAP,
 )
+from fin.host.agent_instructions import messages_for_model
 from fin.host.stream_map import (
     assemble_final_ai_message,
     format_tool_summary,
+    inline_thinking_segments,
     strip_thinking_from_answer,
 )
 from fin.host.tools import list_files, read_file
@@ -448,15 +450,7 @@ def _extract_thinking_text(message: AIMessage) -> str:
     # here we surface it for the persisted turn row.
     content = message.content
     if isinstance(content, str):
-        import re
-
-        match_iter = re.finditer(
-            r"<thinking\b[^>]*>(.*?)</thinking\s*>",
-            content,
-            re.IGNORECASE | re.DOTALL,
-        )
-        for match in match_iter:
-            pieces.append(match.group(1))
+        pieces.extend(inline_thinking_segments(content))
     return "\n".join(piece for piece in pieces if piece)
 
 
@@ -631,7 +625,7 @@ def compile_graph(
         # inline ``<thinking>`` block stripped out of content. It is
         # stored on state for the turn row; it NEVER merges into the
         # answer content (SC60).
-        stream = selected_model.stream(state["messages"])
+        stream = selected_model.stream(messages_for_model(state["messages"]))
         answer_message = assemble_final_ai_message(stream)
         # T4 (#37): ``thinking_text`` ACCUMULATES across this run's
         # model calls (each call's prose joined with a newline) so
