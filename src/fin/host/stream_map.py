@@ -281,6 +281,55 @@ def reasoning_delta_from_chunk(chunk: AIMessageChunk) -> str:
     return "".join(pieces)
 
 
+# ----- thinking duration clock (T4, #37) -----
+
+
+def _monotonic() -> float:
+    import time
+
+    return time.monotonic()
+
+
+class ThinkingClock:
+    """Accumulate wall-clock time the run spent streaming thinking.
+
+    Spec line 31: after the run, the thinking region collapses to a
+    one-line duration label. The clock opens a segment on the first
+    ``thinking`` frame, closes it when any other frame follows (the
+    model moved on to a tool call or the answer), and closes again
+    at stream end. Multiple model calls in one run yield multiple
+    segments whose durations sum.
+
+    ``now_fn`` is injectable so tests drive deterministic elapsed
+    times; the default reads ``time.monotonic`` once per tick.
+    """
+
+    def __init__(self, now_fn=None) -> None:
+        self._now = now_fn or _monotonic
+        self._start: float | None = None
+        self._total: float = 0.0
+
+    def tick_thinking(self) -> None:
+        """A ``thinking`` frame: open a segment if none is open."""
+        if self._start is None:
+            self._start = self._now()
+
+    def tick_other(self) -> None:
+        """Any non-thinking frame: close an open segment."""
+        if self._start is not None:
+            self._total += self._now() - self._start
+            self._start = None
+
+    def close(self) -> None:
+        """Stream end: close any open segment."""
+        self.tick_other()
+
+    @property
+    def total_ms(self) -> int:
+        """Total thinking time in whole milliseconds."""
+        return int(round(self._total * 1000))
+
+
 # ----- tool summary formatters (spec line 32) -----
 
 
@@ -435,6 +484,7 @@ def format_tool_summary(
 __all__ = [
     "DeltaSplit",
     "InlineFilterState",
+    "ThinkingClock",
     "assemble_final_ai_message",
     "format_tool_summary",
     "reasoning_delta_from_chunk",

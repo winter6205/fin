@@ -168,6 +168,10 @@ function EmptyThreadCorpusGrid() {
 }
 
 function TurnView({ turn }: { turn: Turn }) {
+  // T4 (#37): while THIS turn is live (optimistic send or a
+  // lock-held latest row) the tool rows stay open and the thinking
+  // region line-clamps; after the run both collapse.
+  const live = turn.in_flight === true;
   return (
     <article className="max-w-3xl mx-auto space-y-2">
       <div className="flex justify-end">
@@ -177,24 +181,27 @@ function TurnView({ turn }: { turn: Turn }) {
       </div>
       <div className="border border-black bg-card p-3">
         <StatusLine status={turn.status} reason={turn.status_reason ?? ""} />
-        {/* T3 (spec): the model's reasoning prose, unframed and
-            line-clamped to 3 lines; click to expand. Empty when the
-            model surfaced no reasoning (SC60 binding: this prose
-            never participates in citation matching server-side). */}
+        {/* T4 (spec line 31): thinking is unframed; while the run is
+            live it line-clamps to a few lines; after the run it
+            collapses to a one-line duration label that expands the
+            full text. Region exists only when thinking streamed. */}
         {turn.thinking_text ? (
-          <ThinkingAccordion text={turn.thinking_text} />
+          <ThinkingAccordion
+            text={turn.thinking_text}
+            durationMs={turn.thinking_duration_ms}
+            live={live}
+          />
         ) : null}
-        {/* T3 (spec): one collapsed row per tool call observed this
-            run, ``bg-tool`` (#F5F5F4) panel per spec. Rows arrive
-            live via SSE (``tool_call`` -> "running…" placeholder,
-            ``tool_result`` -> formatted one-liner) and persist on
-            the turn as ``tool_summaries`` after reload. */}
+        {/* T4 (spec line 32): tool rows are separate light-gray
+            (#F5F5F4) details — visible while that call runs, then
+            collapse after the run. Correlated by tool_call_id. */}
         {turn.tool_summaries && turn.tool_summaries.length > 0 ? (
           <div className="mb-2 space-y-1">
             {turn.tool_summaries.map((s, i) => (
               <details
                 key={`${s.tool_call_id}-${i}`}
                 className="bg-tool px-2 py-1 text-xs"
+                open={live}
               >
                 <summary className="cursor-pointer select-none font-mono">
                   {s.name}: {s.summary}
@@ -222,10 +229,33 @@ function TurnView({ turn }: { turn: Turn }) {
   );
 }
 
-// T3: "Thinking" region — unframed (no border/background, per spec),
-// collapsed to 3 lines via ``line-clamp-3``; click toggles full prose.
-function ThinkingAccordion({ text }: { text: string }) {
+// T4 (#37): the thinking region — unframed (no border/background,
+// per spec line 31). While the run is LIVE the prose line-clamps to
+// a few lines (click expands); AFTER the run it collapses to a
+// one-line duration label ("Thought for 4.2s") that expands the
+// full text on click. When no duration was measured (0ms / legacy
+// rows) a completed run falls back to the plain collapsed label.
+function formatThinkingDuration(ms: number): string {
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const totalSeconds = Math.round(ms / 1000);
+  return `${Math.floor(totalSeconds / 60)}m ${totalSeconds % 60}s`;
+}
+
+function ThinkingAccordion({
+  text,
+  durationMs,
+  live,
+}: {
+  text: string;
+  durationMs?: number;
+  live: boolean;
+}) {
   const [open, setOpen] = useState(false);
+  const showDurationLabel =
+    !live && typeof durationMs === "number" && durationMs > 0;
+  const label = showDurationLabel
+    ? `Thought for ${formatThinkingDuration(durationMs as number)}`
+    : "Thinking";
   return (
     <div className="mb-2">
       <button
@@ -233,17 +263,19 @@ function ThinkingAccordion({ text }: { text: string }) {
         onClick={() => setOpen((v) => !v)}
         className="text-xs font-semibold uppercase tracking-wide text-gray-400 hover:text-gray-600"
       >
-        Thinking {open ? "−" : "+"}
+        {label} {open ? "−" : "+"}
       </button>
-      <p
-        className={
-          open
-            ? "mt-1 text-xs text-gray-600 whitespace-pre-wrap break-words"
-            : "mt-1 text-xs text-gray-600 whitespace-pre-wrap break-words line-clamp-3"
-        }
-      >
-        {text}
-      </p>
+      {open || live ? (
+        <p
+          className={
+            open
+              ? "mt-1 text-xs text-gray-600 whitespace-pre-wrap break-words"
+              : "mt-1 text-xs text-gray-600 whitespace-pre-wrap break-words line-clamp-3"
+          }
+        >
+          {text}
+        </p>
+      ) : null}
     </div>
   );
 }

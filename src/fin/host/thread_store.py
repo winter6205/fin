@@ -117,6 +117,12 @@ class RunRecord:
     answer: str = ""
     citations: list[dict[str, Any]] = field(default_factory=list)
     thinking_text: str = ""
+    # T4 (#37, spec line 31): total streamed-thinking duration in
+    # milliseconds. Accumulated by the route's ThinkingClock during
+    # the run; persisted so a reload restores the collapsed
+    # one-line duration label. 0 when the model surfaced no
+    # thinking.
+    thinking_duration_ms: int = 0
     # One ``{name, summary, tool_call_id}`` dict per tool call
     # observed so far in the run; appended by ``tool_node`` and
     # persisted as JSONB. Typed as ``dict[str, str]`` (not a
@@ -431,6 +437,7 @@ CREATE TABLE IF NOT EXISTS fin_run (
     answer            TEXT NOT NULL DEFAULT '',
     citations         JSONB NOT NULL DEFAULT '[]'::jsonb,
     thinking_text     TEXT NOT NULL DEFAULT '',
+    thinking_duration_ms INTEGER NOT NULL DEFAULT 0,
     tool_summaries    JSONB NOT NULL DEFAULT '[]'::jsonb,
     assistant_message TEXT NOT NULL DEFAULT '',
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -457,6 +464,10 @@ ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS tool_summaries JSONB NOT NULL DEFAU
 -- T4 column migration: pre-T4 tables lack ``in_flight``. Persisted
 -- rows are terminal so the default ``FALSE`` is always correct.
 ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS in_flight BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- T4 (#37) column migration: thinking duration for the post-run
+-- collapse label. 0 = no thinking streamed.
+ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS thinking_duration_ms INTEGER NOT NULL DEFAULT 0;
 """
 
 
@@ -511,14 +522,17 @@ class PostgresThreadStore:
                 json.loads(row[8]) if isinstance(row[8], str) else list(row[8])
             ),
             # ``assistant_message`` defaults to "" on the Python
-            # side if the row predates the T2 migration; the
-            # SQL column also defaults to '' for fresh installs.
+            # side if the row predates the T2 migration; the SQL
+            # column also defaults to '' for fresh installs.
             # We coerce ``None`` to ``""`` defensively in case
             # an older row predates the ADD COLUMN.
             assistant_message=row[9] or "",
             created_at=row[10],
             # T4: coerce a pre-migration NULL to False defensively.
             in_flight=bool(row[11]) if len(row) > 11 else False,
+            # T4 (#37): duration column rides last; 0 when the row
+            # predates the migration (no measurable thinking).
+            thinking_duration_ms=int(row[12] or 0) if len(row) > 12 else 0,
         )
 
     # -- threads --
@@ -630,8 +644,9 @@ class PostgresThreadStore:
                 conn.execute(
                     "INSERT INTO fin_run (id, thread_id, question, status, "
                     "status_reason, answer, citations, thinking_text, "
-                    "tool_summaries, assistant_message, created_at, in_flight) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    "tool_summaries, assistant_message, created_at, in_flight, "
+                    "thinking_duration_ms) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (
                         record.id,
                         record.thread_id,
@@ -646,6 +661,7 @@ class PostgresThreadStore:
                         record.created_at,
                         # Persisted rows are terminal; always False.
                         False,
+                        record.thinking_duration_ms,
                     ),
                 )
                 conn.commit()
@@ -676,7 +692,8 @@ class PostgresThreadStore:
             rows = conn.execute(
                 "SELECT id, thread_id, question, status, status_reason, "
                 "answer, citations, thinking_text, tool_summaries, "
-                "assistant_message, created_at, in_flight "
+                "assistant_message, created_at, in_flight, "
+                "thinking_duration_ms "
                 "FROM fin_run WHERE thread_id = %s ORDER BY created_at ASC",
                 (thread_id,),
             ).fetchall()

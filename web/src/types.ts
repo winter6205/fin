@@ -36,6 +36,10 @@ export interface Turn {
   // T3: the run's streamed thinking prose (collapsed / line-clamped
   // in the UI). Empty when the model surfaced no reasoning.
   thinking_text?: string;
+  // T4 (#37): total thinking duration in ms. After the run the
+  // thinking region collapses to a one-line duration label
+  // ("Thought for 4.2s"); 0 / undefined when no thinking streamed.
+  thinking_duration_ms?: number;
   // T3: one entry per tool call observed this run (dicts, not
   // strings - T1's placeholder shape).
   tool_summaries?: ToolSummary[];
