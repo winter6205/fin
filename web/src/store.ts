@@ -46,6 +46,29 @@ interface WorkspaceState {
   resumeThread: (threadId: string) => Promise<api.SendResult | null>;
 }
 
+// T5 (#35): the last opened thread id, persisted so a returning
+// visit lands back on that thread. Plain-string localStorage I/O —
+// storage failures degrade to "no restore" (wrapped by callers).
+const LAST_THREAD_KEY = "fin.lastThread";
+
+function rememberLastThread(threadId: string): void {
+  try {
+    window.localStorage.setItem(LAST_THREAD_KEY, threadId);
+  } catch {
+    /* storage unavailable - no restore on next visit. */
+  }
+}
+
+function clearLastThread(threadId: string): void {
+  try {
+    if (window.localStorage.getItem(LAST_THREAD_KEY) === threadId) {
+      window.localStorage.removeItem(LAST_THREAD_KEY);
+    }
+  } catch {
+    /* storage unavailable - nothing to clear. */
+  }
+}
+
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   threads: [],
   corpus: [],
@@ -74,6 +97,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // route can render its not-found copy. We do NOT re-invoke the
     // graph on reload; GET only.
     const detail = await api.getThread(threadId);
+    // T5 (#35): a successfully opened thread becomes the one a
+    // returning visit restores.
+    rememberLastThread(threadId);
     set({ activeThread: detail });
   },
 
@@ -85,6 +111,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 
   async removeThread(threadId: string) {
     await api.deleteThread(threadId);
+    // T5 (#35): a deleted thread must never be restored on the next
+    // visit — drop the marker when it pointed here.
+    clearLastThread(threadId);
     set((s) => ({
       threads: s.threads.filter((t) => t.id !== threadId),
       activeThread:

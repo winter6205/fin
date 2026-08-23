@@ -2,7 +2,7 @@
 // ordinary-person bound copy; clicking a card creates a thread and
 // prefills the composer (NO auto-send per spec).
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import CorpusCard from "../components/CorpusCard";
 import { useWorkspaceStore } from "../store";
@@ -11,6 +11,37 @@ export default function HomePage() {
   const threads = useWorkspaceStore((s) => s.threads);
   const corpus = useWorkspaceStore((s) => s.corpus);
   const loadingThreads = useWorkspaceStore((s) => s.loadingThreads);
+  const navigate = useNavigate();
+
+  // T5 (#35, spec line 42): a RETURNING visit restores the last
+  // opened `/t/{id}` when that id still exists. First visit (no
+  // stored id, or the thread was deleted / is unknown) stays on
+  // home/corpus — never a blank chat. One-shot per mount so a
+  // deliberate later navigation home does not bounce the operator
+  // away again.
+  const restoreAttempted = useRef(false);
+  useEffect(() => {
+    if (restoreAttempted.current || loadingThreads) return;
+    restoreAttempted.current = true;
+    let lastId: string | null = null;
+    try {
+      lastId = window.localStorage.getItem("fin.lastThread");
+    } catch {
+      return;
+    }
+    if (!lastId) return;
+    if (threads.some((t) => t.id === lastId)) {
+      navigate(`/t/${lastId}`, { replace: true });
+    } else {
+      // Stale marker (thread deleted elsewhere / unknown id):
+      // drop it so future visits do not re-check a dead id.
+      try {
+        window.localStorage.removeItem("fin.lastThread");
+      } catch {
+        /* storage unavailable. */
+      }
+    }
+  }, [loadingThreads, threads, navigate]);
 
   return (
     <main className="p-6">
