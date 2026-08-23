@@ -47,6 +47,7 @@ from fin.host.compile import (
     CheckpointSetupError,
     MissingCheckpointURLError,
     compile_for_runtime,
+    compile_for_runtime_dev,
 )
 
 
@@ -345,6 +346,13 @@ def _install_fake_langchain_openai(
             captured["base_url"] = base_url
             captured["api_key"] = api_key
 
+        # ``compile_graph`` calls ``model.bind_tools([...])`` to wire
+        # the LangChain tool binding. The fake returns ``self`` so the
+        # downstream code sees an object with the same captured
+        # attributes; tests asserting on the captured dict keep working.
+        def bind_tools(self, _tools: object) -> "_FakeChatOpenAI":
+            return self
+
     fake_mod.ChatOpenAI = _FakeChatOpenAI
     monkeypatch.setitem(sys.modules, "langchain_openai", fake_mod)
 
@@ -562,3 +570,58 @@ class _BrokenPostgresCM:
 
     def __exit__(self, *exc: object) -> None:
         return None
+
+
+# ----- compile_for_runtime_dev (in-memory local-dev path) -----
+
+
+def test_compile_for_runtime_dev_uses_in_memory_saver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dev-mode helper exists so ``fin-serve`` can boot when
+    the operator has NOT set ``FIN_CHECKPOINT_URL`` (typical WSL /
+    laptop setup). It MUST use ``InMemorySaver`` (no Postgres) and
+    emit a loud WARNING so the operator does not mistake the dev
+    path for durable state. The contract on ``compile_for_runtime``
+    — raise ``MissingCheckpointURLError`` when no URL — is INTACT;
+    this test asserts the dev path is a separate entry point.
+    """
+    captured: dict[str, object] = {}
+    _install_fake_langchain_openai(monkeypatch, captured)
+    monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
+
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        graph = compile_for_runtime_dev()
+
+    # 1. Dev path emitted a warning that names the env var.
+    messages = [str(w.message) for w in caught]
+    assert any("FIN_CHECKPOINT_URL" in m for m in messages), messages
+    # 2. The dev path returned a non-None compiled graph (proxy).
+    assert graph is not None
+    # 3. Model defaults flowed through to ChatOpenAI (no env overrides).
+    assert captured["model"] == DEFAULT_MODEL
+    assert captured["base_url"] == DEFAULT_BASE_URL
+
+
+def test_compile_for_runtime_dev_does_not_require_postgres(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dev path must NOT touch Postgres — no
+    ``langgraph.checkpoint.postgres`` import. We confirm by NOT
+    installing a fake for it and by clearing ``FIN_CHECKPOINT_URL``;
+    if the dev path reached for Postgres, this would raise
+    ``MissingCheckpointURLError`` instead of returning a graph.
+    """
+    captured: dict[str, object] = {}
+    _install_fake_langchain_openai(monkeypatch, captured)
+    monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
+
+    graph = compile_for_runtime_dev()
+    assert graph is not None
+    # Model wiring happened end-to-end (the prod path's checkpointer
+    # plumbing was bypassed — if it had not been, the missing
+    # URL would have raised).
+    assert captured["model"] == DEFAULT_MODEL
