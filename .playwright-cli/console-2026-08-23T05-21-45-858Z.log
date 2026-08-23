@@ -1,2 +1,0 @@
-[   64292ms] [ERROR] Failed to load resource: net::ERR_INCOMPLETE_CHUNKED_ENCODING @ http://localhost:8000/api/threads/a2668975-849f-4068-9146-84d698eb0a6f/messages:0
-[   64306ms] network error
