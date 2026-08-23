@@ -33,3 +33,6 @@ markers = [
 
 [dependency-groups]
 dev = ["pytest>=8"]
+
+[project.scripts]
+fin-serve = "fin.host.http:serve"

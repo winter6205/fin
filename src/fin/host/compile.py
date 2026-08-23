@@ -161,6 +161,55 @@ def _read_env(
     return value
 
 
+# ----- shared model factory -----
+
+
+def _build_default_model(
+    *,
+    model_name: str | None,
+    base_url: str | None,
+    env: Mapping[str, str] | None,
+) -> Any:
+    """Construct the production ``ChatOpenAI`` instance.
+
+    Used by both :func:`compile_for_runtime` (production Postgres
+    path) and :func:`compile_for_runtime_dev` (local-dev InMemorySaver
+    path) so model defaults stay single-sourced. Lazy-imports
+    ``ChatOpenAI`` so the module stays importable without the heavy
+    runtime dep.
+
+    Reads ``FIN_MODEL`` / ``FIN_BASE_URL`` / ``ANTHROPIC_AUTH_TOKEN``
+    when the corresponding arg is ``None``; otherwise uses the
+    caller-supplied value verbatim. The ``extra_body`` /
+    ``reasoning_split`` block is required by ADR 0022 + ADR 0026;
+    keeping it here avoids drift between prod and dev.
+    """
+    from langchain_openai import ChatOpenAI
+
+    if model_name is None:
+        model_name = _read_env(env, "FIN_MODEL") or DEFAULT_MODEL
+    if base_url is None:
+        base_url = _read_env(env, "FIN_BASE_URL") or DEFAULT_BASE_URL
+    api_key = _read_env(env, "ANTHROPIC_AUTH_TOKEN") or "sk-no-key-required"
+    return ChatOpenAI(
+        model=model_name,
+        base_url=base_url,
+        api_key=api_key,
+        # Nested ``model_kwargs={"extra_body": ...}`` is rejected by
+        # ChatOpenAI ("specify extra_body explicitly"). Without the
+        # split channel MiniMax inlines ``<think>`` into content and
+        # the workspace turn looks like a failed chat.
+        extra_body={
+            "thinking": {"type": "adaptive"},
+            "reasoning_split": True,
+        },
+        # A hung completion holds the per-thread lock and disables
+        # the composer for that research thread. Bound the wait.
+        timeout=120.0,
+        max_retries=1,
+    )
+
+
 # ----- the helper -----
 
 
@@ -174,6 +223,7 @@ def compile_for_runtime(
     """Build the durable v1 host graph for CLI / HTTP boot.
 
     Parameters
+    ----------
     ----------
     checkpointer_url
         Postgres connection string. Defaults to
@@ -228,33 +278,18 @@ def compile_for_runtime(
     else:
         url = checkpointer_url
 
-    # Step 2: resolve the model spec + base_url. Both are
-    # optional with sensible defaults; ADR 0022 fixes the
-    # model, the local-proxy URL is a deployment knob. We
-    # resolve BEFORE the saver so a bad model name fails fast
-    # without touching Postgres.
-    if model_name is None:
-        model_name = _read_env(env, "FIN_MODEL") or DEFAULT_MODEL
-    if base_url is None:
-        base_url = _read_env(env, "FIN_BASE_URL") or DEFAULT_BASE_URL
-
-    # Step 3: lazy import the runtime deps. Module import stays
-    # cheap when the heavy packages are absent; tests inject
-    # fakes into ``sys.modules``.
-    from langchain_openai import ChatOpenAI
-    from langgraph.checkpoint.postgres import PostgresSaver
-
-    # ``ANTHROPIC_AUTH_TOKEN`` is the operator credential in
-    # this environment; ``ChatOpenAI`` forwards it as the
-    # ``Authorization: Bearer <key>`` header. The local 9router
-    # proxy passes the header through; we never log the value.
-    api_key = _read_env(env, "ANTHROPIC_AUTH_TOKEN") or "sk-no-key-required"
-
-    model = ChatOpenAI(
-        model=model_name,
-        base_url=base_url,
-        api_key=api_key,
+    # Step 2: resolve the model spec + base_url via the shared
+    # factory. ADR 0022 fixes the model, the local-proxy URL is a
+    # deployment knob. We resolve BEFORE the saver so a bad model
+    # name fails fast without touching Postgres.
+    model = _build_default_model(
+        model_name=model_name, base_url=base_url, env=env
     )
+
+    # Step 3: lazy import the PostgresSaver. Module import stays
+    # cheap when the heavy runtime dep is absent; tests inject
+    # fakes into ``sys.modules``.
+    from langgraph.checkpoint.postgres import PostgresSaver
 
     # Step 4: open the Postgres connection via the context
     # manager and run ``setup()`` once (idempotent — creates
@@ -294,6 +329,65 @@ def compile_for_runtime(
     return compiled
 
 
+# ----- local-dev (in-memory) path -----
+
+
+def compile_for_runtime_dev(
+    *,
+    model_name: str | None = None,
+    base_url: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> Any:
+    """Build the local-dev host graph with ``InMemorySaver``.
+
+    Used by ``fin-serve`` (``compile_for_http``) when the operator
+    has NOT set ``FIN_CHECKPOINT_URL`` — typical for WSL / laptop
+    boots where Postgres is not configured. Differs from
+    :func:`compile_for_runtime` in two ways:
+
+    * **No Postgres.** ``InMemorySaver`` keeps state in process
+      memory. Threads and runs are lost on restart. The warning
+      below surfaces this loudly so an operator in prod does not
+      mistake the dev path for durable state.
+    * **No model-name URL plumbing.** Same defaults as the prod
+      path (``_build_default_model``), so behavior is consistent
+      apart from the checkpointer.
+
+    The contract kept on :func:`compile_for_runtime` — raise
+    ``MissingCheckpointURLError`` when no URL — is INTACT. The dev
+    path is a separate, opt-in (by absence) entry so tests asserting
+    the prod contract stay green.
+
+    The model side is **NOT** auto-faked here. If
+    ``FIN_BASE_URL`` is unset, the prod default (``DEFAULT_BASE_URL``
+    = ``http://localhost:20128/v1``) is used and the model call
+    will surface a real ``OpenAIConnectionError`` if no proxy is
+    listening there — better a loud failure than a hidden scripted
+    substitute masquerading as a real conversation.
+    """
+    import logging
+    import warnings
+
+    message = (
+        "FIN_CHECKPOINT_URL is not set; using InMemorySaver. Threads and "
+        "runs will NOT persist across restarts. Set FIN_CHECKPOINT_URL "
+        "to enable durable Postgres-backed state."
+    )
+    # Two channels: ``warnings.warn`` so the operator sees it at the
+    # console on every dev-mode import, and ``logging.warning`` so the
+    # boot log captures it for postmortem. Tests suppress both.
+    warnings.warn(message, stacklevel=2)
+    logging.getLogger("fin.host.compile").warning(message)
+
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    model = _build_default_model(
+        model_name=model_name, base_url=base_url, env=env
+    )
+    saver = InMemorySaver()
+    return compile_graph(checkpointer=saver, model=model)
+
+
 __all__ = [
     "DEFAULT_BASE_URL",
     "DEFAULT_MODEL",
@@ -302,4 +396,5 @@ __all__ = [
     "HostCompileError",
     "MissingCheckpointURLError",
     "compile_for_runtime",
+    "compile_for_runtime_dev",
 ]

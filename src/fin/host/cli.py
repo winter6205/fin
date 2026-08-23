@@ -54,6 +54,9 @@ from langchain_core.messages import AIMessage, HumanMessage
 from fin.corpus.errors import IngestMissingError
 from fin.host import ConcurrentRunError
 from fin.host.citation_gate import strip_hidden_bounce_marker
+from fin.host.operator_env import apply_dotenv
+from fin.host.run_payload import ordinary_person_copy
+from fin.host.state import EVIDENCE_RESET, reset_input_state
 
 
 # ----- typed errors -----
@@ -130,7 +133,14 @@ def render_result(state: dict[str, Any]) -> str:
     """
     status = state.get("status", "")
     answer = _derive_answer(state)
-    citations: Iterable = state.get("citations") or ()
+    # The ``reset_input_state`` helper at invoke time clears
+    # ``citations`` (along with ``answer`` / ``status`` / evidence /
+    # caps) so a follow-up refusal cannot surface the prior run's
+    # citation lines. The ``citations:`` header stays in the
+    # schema for stability; entries appear only when
+    # ``status == "done"``.
+    raw_citations = state.get("citations") or ()
+    citations = raw_citations if status == "done" else ()
     lines = [
         f"status: {status}",
         f"answer: {answer}",
@@ -178,16 +188,22 @@ def run(question: str, *, graph: Any, thread_id: str | None = None) -> None:
     print(f"thread_id: {thread_id}", file=sys.stderr)
 
     config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
-    input_state: dict[str, Any] = {
-        "messages": [HumanMessage(content=question)],
-        "evidence": [],
-        "repair_count": 0,
-        "step_count": 0,
-    }
-    result = graph.invoke(input_state, config=config)
+    # T2: explicit reset via the ``reset_input_state`` helper. The
+    # previous ``evidence: []`` literal was a no-op under the old
+    # ``operator.add`` reducer (``[1,2,3] + [] == [1,2,3]``), so a
+    # CLI follow-up on the same thread inherited the prior run's
+    # evidence and could ``done`` on stale pages. The helper clears
+    # all six run-scoped fields per ADR 0016 / spec line 34.
+    result = graph.invoke(reset_input_state(question), config=config)
     print(render_result(result))
 
     status = result.get("status")
+    # T2: refuse / step_cap carry their ordinary-person copy on the
+    # ``assistant_message`` field of the persisted turn row (the
+    # SPA renders it). The CLI stdout schema is frozen; stderr
+    # surfaces only ``refuse reason: ...`` for operational
+    # diagnosis. No additional ``suggestion:`` line is printed
+    # (T2 fix: that drift was out of scope).
     if status == "refuse":
         reason = result.get("status_reason", "")
         if reason:
@@ -241,8 +257,10 @@ def _default_graph_factory() -> Any:
     The import is LAZY — neither LLM-provider nor Postgres-checkpointer
     modules are touched unless this function is actually called. The
     ``--help`` path therefore never instantiates an LLM, a graph, or a
-    checkpointer (ADR 0013 + ADR 0015).
+    checkpointer (ADR 0013 + ADR 0015). A local ``.env`` is applied
+    here (not at argparse) so ``--help`` stays import-light.
     """
+    apply_dotenv()
     try:
         from fin.host.compile import compile_for_runtime  # type: ignore[import-not-found]
     except ModuleNotFoundError as exc:

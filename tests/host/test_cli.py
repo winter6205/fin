@@ -309,10 +309,12 @@ def test_two_runs_on_same_thread_real_spans(aapl_page1_text, capsys):
     assert captured.out.count("status: done") == 2
     # The explicit thread id is echoed on stderr for BOTH runs.
     assert captured.err.count("thread_id: t-acc") == 2
-    # Run 1 saw [1, 3] messages; run 2 continues the checkpointed
-    # history: strictly larger at every subsequent model call.
+    # Run 1 saw [2, 4] messages: host SystemMessage is prepended
+    # at each model call (not checkpointed), then Human, then
+    # AI+Tool. Run 2 continues the checkpointed history: strictly
+    # larger at every subsequent model call.
     lengths = model.seen_lengths
-    assert lengths[:2] == [1, 3]
+    assert lengths[:2] == [2, 4]
     assert len(lengths) >= 4
     assert lengths[2] > lengths[1]
     assert lengths[3] > lengths[2]
@@ -533,3 +535,58 @@ def test_cli_sources_import_no_pdfplumber_or_provider_deps() -> None:
     assert not offending, (
         f"CLI sources must not import {sorted(_BANNED_ROOTS)}; found: {offending}"
     )
+
+
+
+# ===== T2: CLI follow-up resets run-scoped fields (ADR 0016 / SC62) =====
+
+
+def test_cli_follow_up_resets_evidence(aapl_page1_text, capsys):
+    """Binding SC62 mirror for the CLI runner: two ``run`` calls on
+    the same ``--thread-id``. Run 1 reads the page and ends done;
+    run 2 quotes the same span without re-fetching. With the
+    ``EVIDENCE_RESET`` sentinel the second run's gate has no
+    evidence to match -> refuse citation_repair_cap. The old
+    ``evidence: []`` literal was a no-op under operator.add, so
+    this exact scenario used to end ``done`` on stale pages.
+
+    Also asserts the ordinary-person suggestion rides stderr on
+    the refusal (T2 copy contract) while stdout keeps the frozen
+    three-section schema.
+    """
+    span = aapl_page1_text[:80]
+    model = ScriptedChatModel(script=[])
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+
+    # Run 1: read_file + grounded answer -> done.
+    model._index = 0
+    model.script = _scripted_read_file_then_answer("First: " + span)
+    rc1 = main(["q1", "--thread-id", "t-cli-t2"], graph_factory=lambda: g)
+    assert rc1 == 0
+    captured1 = capsys.readouterr()
+    assert "status: done" in captured1.out
+
+    # Run 2: prose-only answer quoting run 1's span.
+    model._index = 0
+    model.script = [AIMessage(content="Second: " + span)]
+    rc2 = main(["q2", "--thread-id", "t-cli-t2"], graph_factory=lambda: g)
+    assert rc2 == 0
+    captured2 = capsys.readouterr()
+
+    out2 = captured2.out
+    err2 = captured2.err
+    assert "status: refuse" in out2, out2
+    assert "refuse reason: citation_repair_cap" in err2
+    # T2 fix: the ``suggestion:`` stderr line was out of CLI
+    # scope (spec plan) and is no longer emitted. Ordinary-person
+    # copy rides on the persisted turn row for the SPA only.
+    assert "suggestion:" not in err2
+    # Citations block stays empty (schema stable, no entries).
+    tail_after_header = out2[
+        out2.index("citations:") + len("citations:") :
+    ]
+    assert "  - " not in tail_after_header

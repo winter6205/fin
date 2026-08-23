@@ -1,0 +1,134 @@
+// Sidebar: 280px, thread list, New thread button, delete with a
+// Radix confirmation dialog. Active thread highlighted with the
+// single blue accent.
+
+import * as Dialog from "@radix-ui/react-dialog";
+import { useState } from "react";
+import { NavLink, useNavigate } from "react-router-dom";
+import { useWorkspaceStore } from "../store";
+
+export function truncateTitle(title: string, max = 50): string {
+  if (title.length <= max) return title;
+  return title.slice(0, max) + "…";
+}
+
+function DeleteThreadDialog({
+  threadId,
+  threadTitle,
+}: {
+  threadId: string;
+  threadTitle: string;
+}) {
+  const removeThread = useWorkspaceStore((s) => s.removeThread);
+  const navigate = useNavigate();
+
+  return (
+    <Dialog.Root>
+      <Dialog.Trigger asChild>
+        <button
+          aria-label={`Delete ${truncateTitle(threadTitle)}`}
+          className="border border-black px-1 text-xs leading-none hover:bg-black hover:text-white"
+        >
+          x
+        </button>
+      </Dialog.Trigger>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 bg-black/40" />
+        <Dialog.Content className="fixed left-1/2 top-1/2 w-[min(90vw,24rem)] -translate-x-1/2 -translate-y-1/2 border border-black bg-card p-5">
+          <Dialog.Title className="text-base font-semibold mb-2">
+            Delete this thread?
+          </Dialog.Title>
+          <Dialog.Description className="text-sm text-gray-600 mb-4">
+            "{truncateTitle(threadTitle)}" and its turns will be removed.
+            This cannot be undone.
+          </Dialog.Description>
+          <div className="flex justify-end gap-2">
+            <Dialog.Close asChild>
+              <button className="border border-black px-3 py-1 text-sm hover:bg-tool">
+                Cancel
+              </button>
+            </Dialog.Close>
+            <Dialog.Close asChild>
+              <button
+                onClick={async () => {
+                  await removeThread(threadId);
+                  navigate("/");
+                }}
+                className="border border-black bg-accent px-3 py-1 text-sm text-white hover:opacity-90"
+              >
+                Delete
+              </button>
+            </Dialog.Close>
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
+
+export default function Sidebar() {
+  const threads = useWorkspaceStore((s) => s.threads);
+  const createThread = useWorkspaceStore((s) => s.createThread);
+
+  return (
+    <aside className="w-[280px] shrink-0 border-r border-black bg-page flex flex-col h-full">
+      <div className="p-4 border-b border-black">
+        <h1 className="text-lg font-bold tracking-tight">fin</h1>
+        <p className="text-xs text-gray-600">10-Q research workspace</p>
+      </div>
+      <div className="p-3">
+        <NewThreadButton onCreate={() => createThread(null)} />
+      </div>
+      <nav aria-label="Research threads" className="flex-1 overflow-y-auto">
+        <ul>
+          {threads.map((t) => (
+            <li key={t.id} className="group flex items-center px-3 py-1">
+              <NavLink
+                to={`/t/${t.id}`}
+                className={({ isActive }) =>
+                  `flex-1 truncate border px-2 py-1.5 text-sm ${
+                    isActive
+                      ? "border-accent bg-accent text-white"
+                      : "border-transparent hover:border-black"
+                  }`
+                }
+                title={t.title}
+              >
+                {truncateTitle(t.title)}
+              </NavLink>
+              <span className="ml-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100">
+                <DeleteThreadDialog threadId={t.id} threadTitle={t.title} />
+              </span>
+            </li>
+          ))}
+        </ul>
+      </nav>
+    </aside>
+  );
+}
+
+function NewThreadButton({
+  onCreate,
+}: {
+  onCreate: () => Promise<string | void>;
+}) {
+  const navigate = useNavigate();
+  const [busy, setBusy] = useState(false);
+  return (
+    <button
+      disabled={busy}
+      onClick={async () => {
+        setBusy(true);
+        try {
+          const id = await onCreate();
+          if (typeof id === "string" && id) navigate(`/t/${id}`);
+        } finally {
+          setBusy(false);
+        }
+      }}
+      className="w-full border border-black bg-card px-3 py-2 text-sm font-medium hover:bg-accent hover:text-white"
+    >
+      + New thread
+    </button>
+  );
+}
