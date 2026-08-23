@@ -100,8 +100,10 @@ export default function ThreadPage() {
         ) : null}
         {isResuming ? <InterruptedRunBanner threadId={thread_id} /> : null}
 
-        {activeThread.turns.map((turn) => (
-          <TurnView key={turn.run_id} turn={turn} />
+        {activeThread.turns.map((turn, index) => (
+          // Turn rows are append-only; a stable index key avoids
+          // remounting when the server-minted ``run_id`` reconciles.
+          <TurnView key={index} turn={turn} />
         ))}
 
         {/* Spec #2: a freshly-created (zero-turn) thread must still
@@ -169,6 +171,9 @@ function TurnView({ turn }: { turn: Turn }) {
   // lock-held latest row) the tool rows stay open and the thinking
   // region line-clamps; after the run both collapse.
   const live = turn.in_flight === true;
+  const hasTrace =
+    Boolean(turn.thinking_text) ||
+    (turn.tool_summaries != null && turn.tool_summaries.length > 0);
   return (
     <article className="max-w-3xl mx-auto space-y-2">
       <div className="flex justify-end">
@@ -176,58 +181,73 @@ function TurnView({ turn }: { turn: Turn }) {
           {turn.question}
         </div>
       </div>
-      <div className="border border-black bg-card p-3">
-        {/* T4 (#37): while THIS turn streams, the optimistic status
-            placeholder would read "done" (the wire carries no
-            running status per spec line 30) — hide the status line
-            until the run actually ends. */}
-        {!live ? (
-          <StatusLine status={turn.status} reason={turn.status_reason ?? ""} />
-        ) : null}
-        {/* T4 (spec line 31): thinking is unframed; while the run is
-            live it line-clamps to a few lines; after the run it
-            collapses to a one-line duration label that expands the
-            full text. Region exists only when thinking streamed. */}
-        {turn.thinking_text ? (
-          <ThinkingAccordion
-            text={turn.thinking_text}
-            durationMs={turn.thinking_duration_ms}
-            live={live}
-          />
-        ) : null}
-        {/* T4 (spec line 32): tool rows are separate light-gray
-            (#F5F5F4) details — visible while that call runs, then
-            collapse after the run. Correlated by tool_call_id. */}
-        {turn.tool_summaries && turn.tool_summaries.length > 0 ? (
-          <div className="mb-2 space-y-1">
-            {turn.tool_summaries.map((s, i) => (
-              <details
-                key={`${s.tool_call_id}-${i}`}
-                className="bg-tool px-2 py-1 text-xs"
-                open={live}
-              >
-                <summary className="cursor-pointer select-none font-mono">
-                  {s.name}: {s.summary}
-                </summary>
-              </details>
-            ))}
-          </div>
-        ) : null}
-        {turn.answer ? (
-          <AnswerWithCitations
-            answer={turn.answer}
-            citations={turn.citations}
-          />
-        ) : null}
-        {/* T2 spec SC67: refuse / step_cap turns show the
-            ordinary-person copy in the answer-bubble slot with an
-            empty sources list underneath - not a blank crash. */}
-        {!turn.answer && turn.assistant_message ? (
-          <p className="text-sm whitespace-pre-wrap text-gray-700 italic">
-            {turn.assistant_message}
-          </p>
-        ) : null}
-      </div>
+      {/* Trace (spec lines 31–32, SC66): thinking + tools grouped
+          unframed on page bg between user bubble and answer card —
+          assistant-ui chain-of-thought style; not inside bg-card. */}
+      {hasTrace ? (
+        <div data-testid="turn-trace" className="space-y-1">
+          {/* T4 (spec line 31): thinking is unframed; while the run is
+              live it line-clamps to a few lines; after the run it
+              collapses to a one-line duration label that expands the
+              full text. Region exists only when thinking streamed. */}
+          {turn.thinking_text ? (
+            <ThinkingAccordion
+              text={turn.thinking_text}
+              durationMs={turn.thinking_duration_ms}
+              live={live}
+            />
+          ) : null}
+          {/* T4 (spec line 32): tool rows are separate light-gray
+              (#F5F5F4) details — visible while that call runs, then
+              collapse after the run. Correlated by tool_call_id. */}
+          {turn.tool_summaries && turn.tool_summaries.length > 0 ? (
+            <div className="space-y-1">
+              {turn.tool_summaries.map((s, i) => (
+                <details
+                  key={`${s.tool_call_id}-${i}`}
+                  className="bg-tool px-2 py-1 text-xs"
+                  open={live}
+                >
+                  <summary className="cursor-pointer select-none font-mono">
+                    {s.name}: {s.summary}
+                  </summary>
+                </details>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {live && !turn.answer && !turn.assistant_message ? null : (
+        <div
+          data-testid="turn-answer-card"
+          className="border border-black bg-card p-3"
+        >
+          {/* T4 (#37): while THIS turn streams, the optimistic status
+              placeholder would read "done" (the wire carries no
+              running status per spec line 30) — hide the status line
+              until the run actually ends. */}
+          {!live ? (
+            <StatusLine
+              status={turn.status}
+              reason={turn.status_reason ?? ""}
+            />
+          ) : null}
+          {turn.answer ? (
+            <AnswerWithCitations
+              answer={turn.answer}
+              citations={turn.citations}
+            />
+          ) : null}
+          {/* T2 spec SC67: refuse / step_cap turns show the
+              ordinary-person copy in the answer-bubble slot with an
+              empty sources list underneath - not a blank crash. */}
+          {!turn.answer && turn.assistant_message ? (
+            <p className="text-sm whitespace-pre-wrap text-gray-700 italic">
+              {turn.assistant_message}
+            </p>
+          ) : null}
+        </div>
+      )}
     </article>
   );
 }
