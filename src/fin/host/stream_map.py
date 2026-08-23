@@ -21,6 +21,12 @@ into the shapes downstream code renders:
   answer prose so the citation gate and the user-visible
   ``answer`` event never see the model's private scratchpad
   (SC60 binding).
+* :func:`reasoning_delta_from_chunk` /
+  :func:`split_stream_delta` - the T1 (#33) token-delta mapping:
+  the first pulls a thinking delta off a chunk's
+  ``reasoning_details``; the second classifies streamed content
+  deltas into thinking vs answer with an inline-block filter that
+  survives tags split across chunk boundaries.
 * :func:`summarize_list_files` / :func:`summarize_retrieve` /
   :func:`summarize_read_file` / :func:`format_tool_summary` - the
   human-readable one-liners the SPA renders in the tools region
@@ -43,6 +49,7 @@ converter, turn persistence, and graph nodes stay separate modules"
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any, Iterable
 
 from langchain_core.messages import AIMessage, AIMessageChunk
@@ -136,6 +143,142 @@ def strip_thinking_from_answer(answer: str) -> str:
     stripped = re.sub(r"\n[ \t]+", "\n", stripped)
     stripped = re.sub(r"\n{3,}", "\n\n", stripped)
     return stripped
+
+
+# ----- token-delta mapping (T1, #33) -----
+
+
+@dataclass(frozen=True)
+class InlineFilterState:
+    """Carry state for :func:`split_stream_delta`.
+
+    ``buffer`` holds characters not yet classified because they may
+    be part of a tag split across chunk boundaries (a suffix like
+    ``"</thin"``); ``inside`` records whether the delta stream is
+    currently between an opening and a closing ``<thinking>`` tag.
+    Frozen dataclass so the route treats it as plain data threading
+    through the stream loop — no hidden mutable state.
+    """
+
+    buffer: str = ""
+    inside: bool = False
+
+
+@dataclass(frozen=True)
+class DeltaSplit:
+    """Result of classifying one content delta.
+
+    ``thinking`` / ``answer`` are the prose pieces to emit NOW
+    (either may be empty — the caller skips the SSE frame); ``state``
+    is the carry for the next delta.
+    """
+
+    state: InlineFilterState
+    thinking: str
+    answer: str
+
+
+# Streaming-tag variants of the strip patterns above: searched one
+# at a time inside the running buffer so a tag that spans chunk
+# boundaries resolves on the delta that completes it.
+_OPEN_TAG_RE: re.Pattern[str] = re.compile(r"<thinking\b[^>]*>", re.IGNORECASE)
+_CLOSE_TAG_RE: re.Pattern[str] = re.compile(r"</thinking\s*>", re.IGNORECASE)
+_OPEN_TAG_STEM: str = "<thinking"
+_CLOSE_TAG_STEM: str = "</thinking"
+
+
+def _holdback_len(buffer: str, stem: str) -> int:
+    """Longest suffix of ``buffer`` that is a proper prefix of ``stem``.
+
+    Keeps at most ``len(stem) - 1`` characters buffered: if the next
+    delta continues the tag the matcher still sees the whole thing;
+    if it does not, the held characters flush as ordinary prose at
+    the next delta (or at ``final=True``). Case-insensitive to match
+    the tag regexes.
+    """
+    lower = buffer.lower()
+    for k in range(min(len(lower), len(stem) - 1), 0, -1):
+        if lower.endswith(stem[:k]):
+            return k
+    return 0
+
+
+def split_stream_delta(
+    state: InlineFilterState, delta: str, *, final: bool = False
+) -> DeltaSplit:
+    """Classify one streamed content ``delta`` into thinking / answer.
+
+    Handles the proxy's inline fallback shape (ADR 0022): a
+    ``<thinking>...</thinking>`` block inlined into ``content`` and
+    split across arbitrary chunk boundaries. The split-channel shape
+    (``reasoning_details``) never inlines blocks, so for those chunks
+    this function passes the content through unchanged.
+
+    ``final=True`` (stream end) releases any held-back characters:
+    outside a block they flush as answer, inside as thinking —
+    nothing is silently dropped.
+    """
+    buffer = state.buffer + delta
+    inside = state.inside
+    thinking_parts: list[str] = []
+    answer_parts: list[str] = []
+
+    while buffer:
+        pattern = _CLOSE_TAG_RE if inside else _OPEN_TAG_RE
+        match = pattern.search(buffer)
+        if match is not None:
+            (thinking_parts if inside else answer_parts).append(
+                buffer[: match.start()]
+            )
+            buffer = buffer[match.end() :]
+            inside = not inside
+            continue
+        stem = _CLOSE_TAG_STEM if inside else _OPEN_TAG_STEM
+        keep = 0 if final else _holdback_len(buffer, stem)
+        if keep >= len(buffer):
+            # The whole buffer is a potential tag fragment (e.g. a
+            # delta that ended mid-tag). Nothing is emittable; wait
+            # for more input (or the ``final`` flush). Breaking is
+            # what keeps this loop productive — re-scanning the
+            # same buffer would never progress.
+            break
+        emit = buffer[: len(buffer) - keep] if keep else buffer
+        if emit:
+            (thinking_parts if inside else answer_parts).append(emit)
+        buffer = buffer[len(buffer) - keep :] if keep else ""
+
+    if final:
+        # The loop already flushed everything (``keep=0`` on final);
+        # normalize the inside flag so the returned state cannot
+        # carry a dangling open block past end of stream.
+        inside = False
+
+    return DeltaSplit(
+        state=InlineFilterState(buffer=buffer, inside=inside),
+        thinking="".join(thinking_parts),
+        answer="".join(answer_parts),
+    )
+
+
+def reasoning_delta_from_chunk(chunk: AIMessageChunk) -> str:
+    """Extract THIS chunk's thinking prose delta.
+
+    Reads ``additional_kwargs.reasoning_details`` — the
+    ``reasoning_split=true`` channel (ADR 0022) — concatenating each
+    dict entry's ``text`` field in order. Malformed entries (non-dict
+    entries, non-string ``text``) contribute nothing: the caller
+    skips the SSE frame when the result is empty.
+    """
+    details = chunk.additional_kwargs.get("reasoning_details")
+    if not isinstance(details, list):
+        return ""
+    pieces: list[str] = []
+    for entry in details:
+        if isinstance(entry, dict):
+            text = entry.get("text")
+            if isinstance(text, str) and text:
+                pieces.append(text)
+    return "".join(pieces)
 
 
 # ----- tool summary formatters (spec line 32) -----
@@ -290,8 +433,12 @@ def format_tool_summary(
 
 
 __all__ = [
+    "DeltaSplit",
+    "InlineFilterState",
     "assemble_final_ai_message",
     "format_tool_summary",
+    "reasoning_delta_from_chunk",
+    "split_stream_delta",
     "strip_thinking_from_answer",
     "summarize_list_files",
     "summarize_read_file",

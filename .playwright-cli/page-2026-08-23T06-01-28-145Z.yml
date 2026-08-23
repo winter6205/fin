@@ -1,0 +1,35 @@
+- generic [ref=f3e3]:
+  - complementary [ref=f3e4]:
+    - generic [ref=f3e5]:
+      - heading "fin" [level=1] [ref=f3e6]
+      - paragraph [ref=f3e7]: 10-Q research workspace
+    - button "+ New thread" [ref=f3e9] [cursor=pointer]
+    - navigation "Research threads" [ref=f3e10]:
+      - list [ref=f3e72]:
+        - listitem [ref=f3e73]:
+          - link "New thread" [ref=f3e74] [cursor=pointer]:
+            - /url: /t/66a47ea3-da87-47de-ac5c-f4f39259fc58
+          - button "Delete New thread" [ref=f3e76] [cursor=pointer]: x
+  - main [ref=f3e77]:
+    - generic [ref=f3e78]:
+      - heading "New thread" [level=2] [ref=f3e79]
+      - paragraph [ref=f3e80]: Created 8/23/2026, 2:01:07 PM
+    - article [ref=f3e140]:
+      - generic [ref=f3e141]: What was Apple's revenue in Q3 2022?
+      - generic [ref=f3e143]:
+        - paragraph [ref=f3e144]: done
+        - generic [ref=f3e145]:
+          - group [ref=f3e146]:
+            - 'generic "list_files: list_files" [ref=f3e147] [cursor=pointer]'
+          - group [ref=f3e148]:
+            - 'generic "list_files: list_files" [ref=f3e149] [cursor=pointer]'
+          - group [ref=f3e150]:
+            - 'generic "list_files: list_files" [ref=f3e151] [cursor=pointer]'
+    - generic [ref=f3e133]:
+      - textbox "Ask about the frozen 10-Qs…" [disabled] [ref=f3e134]
+      - generic [ref=f3e135]:
+        - generic [ref=f3e136]:
+          - checkbox "Think step by step" [ref=f3e137]
+          - text: Think step by step
+        - generic [ref=f3e138]: Enter to send · Shift+Enter for newline
+        - button "Running…" [disabled] [ref=f3e152]

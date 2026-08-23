@@ -324,11 +324,14 @@ def test_send_message_done_emits_status_then_citations_then_answer_events(
     assert "status" in event_types
     assert "citations" in event_types
     assert "answer" in event_types
-    # Wire order per spec line 30: status -> answer -> citations,
-    # with citations TERMINAL so the client can close its reader.
+    # Wire order per spec line 30 + T1 (#33): token deltas (answer)
+    # stream BEFORE ``status``; the TERMINAL frames keep the fixed
+    # ``status`` -> ``answer`` -> ``citations`` order with citations
+    # TERMINAL so the client can close its reader.
     status_index = event_types.index("status")
-    citations_index = event_types.index("citations")
-    answer_index = event_types.index("answer")
+    citations_index = len(event_types) - 1 - event_types[::-1].index("citations")
+    answer_index = len(event_types) - 1 - event_types[::-1].index("answer")
+    assert event_types[-1] == "citations"
     assert status_index < answer_index < citations_index
 
     status_event = events[status_index][1]
@@ -373,11 +376,19 @@ def test_send_message_refuse_unknown_locator_emits_status_refuse_and_empty_citat
 
     events = _parse_sse_events(body)
     event_types = [name for name, _ in events]
-    # Spec line 30 order: status -> answer (empty) -> citations ([]).
-    assert event_types == ["status", "answer", "citations"]
-    assert events[0][1]["status"] == "refuse"
-    assert events[1][1] == {"text": ""}
-    assert events[2][1] == []
+    # T1 (#33) wire contract: the refused attempt's prose streams as
+    # ``answer`` DELTAS while the run is live; the TERMINAL frames
+    # after ``status`` are the fixed ``status`` -> ``answer`` ("") ->
+    # ``citations`` ([]) with citations terminal. A refuse therefore
+    # shows [answer-delta, ..., status, answer(""), citations([])].
+    assert event_types[0] == "answer"
+    assert event_types[-1] == "citations"
+    status_i = event_types.index("status")
+    assert event_types[status_i + 1] == "answer"
+    assert event_types[status_i + 2] == "citations"
+    assert events[status_i][1]["status"] == "refuse"
+    assert events[status_i + 1][1] == {"text": ""}
+    assert events[status_i + 2][1] == []
 
 
 def test_send_message_step_cap_emits_status_step_cap_and_empty_citations(
@@ -1379,15 +1390,19 @@ def test_send_message_refuse_emits_status_with_ordinary_person_copy(
 
     events = _post_message(client, created["id"], "q")
 
-    status_event = events[0][1]
+    # T1 (#33): the refused attempt's prose streams as an answer
+    # delta BEFORE status; look the terminal frames up by name.
+    status_event = next(d for n, d in events if n == "status")
     assert status_event["status"] == "refuse"
     assert status_event["reason"] == "unknown_locator"
     assert "can't ground" in status_event["assistant_message"]
     assert status_event["assistant_message"] != ""
 
-    # Answer empty, citations [].
-    assert events[1][1] == {"text": ""}
-    assert events[2][1] == []
+    # Answer empty, citations [] (terminal frames after status).
+    names = [n for n, _ in events]
+    status_i = names.index("status")
+    assert events[status_i + 1][1] == {"text": ""}
+    assert events[status_i + 2][1] == []
 
     # GET turn table mirrors the SSE: empty sources list, ordinary
     # copy on the persisted turn row.
@@ -1913,3 +1928,196 @@ def test_switching_threads_does_not_paint_deltas_to_other_thread(
     assert marker_a in body_a          # A kept its own content
     assert marker_a not in body_b_final  # B never received A's content
 
+
+
+# ----- T1 (#33): token deltas reach the live turn -----
+
+
+def _two_step_streaming_model(answer: str) -> "ScriptedChatModel":
+    """Script TWO streamed model calls (``stream_responses``):
+
+    * call 1: two ``reasoning_details`` thinking deltas + a
+      ``read_file`` tool call split across chunks;
+    * call 2: one thinking delta + the answer split into two
+      content chunks.
+    """
+    from langchain_core.messages import AIMessageChunk
+
+    return ScriptedChatModel(
+        stream_responses=[
+            [
+                AIMessageChunk(
+                    content="",
+                    additional_kwargs={
+                        "reasoning_details": [{"text": "plan: read "}]
+                    },
+                ),
+                AIMessageChunk(
+                    content="",
+                    additional_kwargs={
+                        "reasoning_details": [{"text": "the filing"}]
+                    },
+                    tool_call_chunks=[
+                        {"name": "read_file", "args": "", "id": "c-read", "index": 0}
+                    ],
+                ),
+                AIMessageChunk(
+                    content="",
+                    tool_call_chunks=[
+                        {
+                            "name": None,
+                            "args": '{"document_id": "%s", "version": "%s", "page": 1, "page_limit": 1}'
+                            % (AAPL_2022Q3, AAPL_2022Q3_VERSION),
+                            "id": None,
+                            "index": 0,
+                        }
+                    ],
+                ),
+            ],
+            [
+                AIMessageChunk(
+                    content="",
+                    additional_kwargs={
+                        "reasoning_details": [{"text": "now answer"}]
+                    },
+                ),
+                AIMessageChunk(content=answer[: len(answer) // 2]),
+                AIMessageChunk(content=answer[len(answer) // 2 :]),
+            ],
+        ],
+    )
+
+
+def test_send_message_token_deltas_stream_before_node_completion(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """T1 (#33) binding acceptance: thinking and answer deltas reach
+    the wire as MULTIPLE frames per channel, DURING the model step —
+    before that step's node-complete values frame (whose checkpoint
+    holds the assembled ``AIMessage``) and before terminal status.
+    """
+    from fin.host.http import get_graph
+
+    answer = f"Per the filing: {aapl_page1_text[:80]}"
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=_two_step_streaming_model(answer),
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    tid = created["id"]
+    events = _post_message(client, tid, "q")
+
+    names = [n for n, _ in events]
+    status_i = names.index("status")
+    tool_call_i = names.index("tool_call")
+    thinking_idx = [i for i, n in enumerate(names) if n == "thinking"]
+    answer_idx = [i for i, n in enumerate(names) if n == "answer"]
+
+    # Step 1's thinking deltas (2+) precede that step's node-complete
+    # frame (``tool_call`` is synthesized from the values frame that
+    # exists only after the checkpoint write).
+    assert len([i for i in thinking_idx if i < tool_call_i]) >= 2
+    # Step 2's answer deltas (2+) precede terminal ``status``.
+    deltas = [i for i in answer_idx if i < status_i]
+    assert len(deltas) >= 2
+    # Citations stays terminal.
+    assert names[-1] == "citations"
+
+    # Delta concatenation == the terminal authoritative answer.
+    joined = "".join(events[i][1]["text"] for i in deltas)
+    terminal_answer = events[answer_idx[-1]][1]["text"]
+    assert joined == terminal_answer == answer
+
+    # SC60: no thinking prose inside ANY answer event.
+    for i in answer_idx:
+        assert "plan: read" not in events[i][1]["text"]
+        assert "now answer" not in events[i][1]["text"]
+    # The thinking prose surfaced on thinking frames.
+    joined_thinking = "".join(events[i][1]["text"] for i in thinking_idx)
+    assert "plan: read the filing" in joined_thinking
+    assert "now answer" in joined_thinking
+
+    # Node-complete checkpoint holds after the streamed model step:
+    # the tool-call AIMessage is complete (parsed tool_calls, one
+    # instance) and the run reached done.
+    assert events[status_i][1]["status"] == "done"
+    snap = g._graph.get_state({"configurable": {"thread_id": tid}})
+    ai_tools = [
+        m for m in snap.values["messages"] if getattr(m, "tool_calls", None)
+    ]
+    assert len(ai_tools) == 1
+    assert ai_tools[0].tool_calls[0]["name"] == "read_file"
+    assert ai_tools[0].tool_calls[0]["args"]["document_id"] == AAPL_2022Q3
+
+
+def test_send_message_inline_thinking_stream_never_reaches_answer_frames(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """Inline ``<thinking>`` fallback while STREAMING: the block is
+    split across arbitrary chunk boundaries; no answer frame ever
+    contains the scratchpad prose, the visible deltas concatenate to
+    the grounded span, and ``verify_citations`` still ``done``s on
+    the thinking-stripped prose (SC60 binding)."""
+    from langchain_core.messages import AIMessageChunk
+
+    from fin.host.http import get_graph
+
+    span = aapl_page1_text[:80]
+    raw = f"<thinking>private reasoning here</thinking>{span}"
+    model = ScriptedChatModel(
+        stream_responses=[
+            [
+                # call 1: tool call via streamed chunks
+                AIMessageChunk(
+                    content="",
+                    tool_call_chunks=[
+                        {
+                            "name": "read_file",
+                            "args": '{"document_id": "%s", "version": "%s", "page": 1, "page_limit": 1}'
+                            % (AAPL_2022Q3, AAPL_2022Q3_VERSION),
+                            "id": "c-read",
+                            "index": 0,
+                        }
+                    ],
+                ),
+            ],
+            [
+                # call 2: inline block + answer split mid-tag boundaries
+                AIMessageChunk(content=raw[:33]),
+                AIMessageChunk(content=raw[33:66]),
+                AIMessageChunk(content=raw[66:]),
+            ],
+        ],
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    events = _post_message(client, created["id"], "q")
+
+    names = [n for n, _ in events]
+    status_i = names.index("status")
+    answer_idx = [i for i, n in enumerate(names) if n == "answer"]
+
+    # The gate saw thinking-stripped prose and reached done.
+    assert events[status_i][1]["status"] == "done"
+
+    # No scratchpad prose in any answer frame.
+    for i in answer_idx:
+        assert "private reasoning" not in events[i][1]["text"]
+    # Visible deltas concatenate to exactly the grounded span.
+    deltas = [i for i in answer_idx if i < status_i]
+    joined = "".join(events[i][1]["text"] for i in deltas)
+    assert joined == span
+    # The scratchpad surfaced on thinking frames instead.
+    thinking_joined = "".join(
+        events[i][1]["text"] for i, n in enumerate(names) if n == "thinking"
+    )
+    assert "private reasoning here" in thinking_joined

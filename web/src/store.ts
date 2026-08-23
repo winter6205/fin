@@ -141,6 +141,12 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
 
     try {
+      // T1 (#33): the wire emits answer DELTAS while the model
+      // streams and one authoritative full-text ``answer`` frame
+      // AFTER ``status`` (fixed server order). Deltas append; the
+      // post-status frame replaces (it also drops prose from a
+      // bounced attempt the gate later refused).
+      let statusSeen = false;
       const result = await api.sendMessage(
         threadId,
         { question, thinking: thinkingOn },
@@ -149,17 +155,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           case "thinking":
             patchTurn((t) => ({
               ...t,
-              thinking_text: t.thinking_text
-                ? `${t.thinking_text}\n${event.text}`
-                : event.text,
+              thinking_text: t.thinking_text + event.text,
             }));
             break;
           case "tool_call": {
             // Append a placeholder row so the operator sees a
             // running indicator while the tool executes. The
-            // matching ``tool_result`` either fills the summary
-            // (when the tool returns a structured payload) or
-            // leaves it as a "running" placeholder.
+            // matching ``tool_result`` replaces it with the
+            // server-formatted one-liner.
             const placeholder: ToolSummary = {
               name: event.name,
               summary: "running…",
@@ -172,25 +175,20 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
             break;
           }
           case "tool_result": {
-            // Replace the matching "running…" placeholder with
-            // the formatted one-liner. The server already
-            // formatted it (spec line 32) so the SPA does not
-            // duplicate the formatter.
-            const formatted = formatToolResultSummary(
-              event.name,
-              event.result,
-            );
+            // The server already formatted the summary (spec line
+            // 32); replace the "running…" placeholder with it.
             patchTurn((t) => ({
               ...t,
               tool_summaries: (t.tool_summaries ?? []).map((s) =>
                 s.tool_call_id === event.tool_call_id
-                  ? { ...s, summary: formatted }
-                  : s,
+                  ? { ...s, summary: event.summary }
+                  : s
               ),
             }));
             break;
           }
           case "status":
+            statusSeen = true;
             // Server-minted run id wins over the local placeholder.
             optimisticRunId = event.run_id;
             patchTurn((t) => ({
@@ -202,7 +200,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
             }));
             break;
           case "answer":
-            patchTurn((t) => ({ ...t, answer: event.text }));
+            patchTurn((t) => ({
+              ...t,
+              answer: statusSeen ? event.text : t.answer + event.text,
+            }));
             break;
           case "citations":
             patchTurn((t) => ({ ...t, citations: event.citations }));
@@ -249,6 +250,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
 
     try {
+      // Same delta semantics as sendQuestion (T1 #33): append
+      // thinking / answer fragments; the post-status answer frame
+      // replaces with the authoritative text.
+      let statusSeen = false;
       const result = await api.resumeThread(threadId, (event) => {
         // Switch-thread guard: if the operator navigated away
         // mid-resume, drop the patches rather than painting them
@@ -261,9 +266,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           case "thinking":
             patchLatestTurn(threadId, (t) => ({
               ...t,
-              thinking_text: t.thinking_text
-                ? `${t.thinking_text}\n${event.text}`
-                : event.text,
+              thinking_text: t.thinking_text + event.text,
             }));
             break;
           case "tool_call": {
@@ -279,21 +282,18 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
             break;
           }
           case "tool_result": {
-            const formatted = formatToolResultSummary(
-              event.name,
-              event.result,
-            );
             patchLatestTurn(threadId, (t) => ({
               ...t,
               tool_summaries: (t.tool_summaries ?? []).map((s) =>
                 s.tool_call_id === event.tool_call_id
-                  ? { ...s, summary: formatted }
+                  ? { ...s, summary: event.summary }
                   : s
               ),
             }));
             break;
           }
           case "status":
+            statusSeen = true;
             patchLatestTurn(threadId, (t) => ({
               ...t,
               status: event.status,
@@ -303,7 +303,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
             }));
             break;
           case "answer":
-            patchLatestTurn(threadId, (t) => ({ ...t, answer: event.text }));
+            patchLatestTurn(threadId, (t) => ({
+              ...t,
+              answer: statusSeen ? event.text : t.answer + event.text,
+            }));
             break;
           case "citations":
             patchLatestTurn(threadId, (t) => ({
@@ -347,40 +350,4 @@ function patchLatestTurn(
   useWorkspaceStore.setState({
     activeThread: { ...current, turns: nextTurns },
   });
-}
-
-// Format a tool_result event into the same one-liner the server
-// would have produced via ``format_tool_summary`` (defensive: the
-// server already shipped ``tool_summaries`` on the persisted row
-// after the run, but the LIVE tool_result frame carries the raw
-// JSON; this lets the optimistic row flip from "running…" to a
-// stable label WITHOUT waiting for the persisted re-GET).
-function formatToolResultSummary(
-  name: string,
-  result: unknown,
-): string {
-  if (result && typeof result === "object") {
-    const r = result as Record<string, unknown>;
-    if (name === "list_files") {
-      const filings = Array.isArray(r.filings) ? r.filings : [];
-      return `${filings.length} filing${filings.length === 1 ? "" : "s"}`;
-    }
-    if (name === "retrieve") {
-      const chunks = Array.isArray(r.chunks) ? r.chunks : [];
-      const query = typeof r.query === "string" ? r.query : "";
-      return `${query ? `'${query}'` : ""} -> ${chunks.length} hit${
-        chunks.length === 1 ? "" : "s"
-      }`;
-    }
-    if (name === "read_file") {
-      const doc = typeof r.document_id === "string" ? r.document_id : "";
-      const page = typeof r.page === "number" ? r.page : 1;
-      return `${doc} p.${page}`;
-    }
-  }
-  if (typeof result === "object" && result !== null) {
-    const err = (result as Record<string, unknown>).error;
-    if (typeof err === "string") return `error: ${err}`;
-  }
-  return name || "tool";
 }

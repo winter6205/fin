@@ -1,0 +1,31 @@
+- generic [ref=f1e3]:
+  - complementary [ref=f1e4]:
+    - generic [ref=f1e5]:
+      - heading "fin" [level=1] [ref=f1e6]
+      - paragraph [ref=f1e7]: 10-Q research workspace
+    - button "+ New thread" [ref=f1e9] [cursor=pointer]
+    - navigation "Research threads" [ref=f1e10]:
+      - list [ref=f1e71]:
+        - listitem [ref=f1e139]:
+          - link "What does AAPL report in its 2022 Q3 10-Q?" [ref=f1e140] [cursor=pointer]:
+            - /url: /t/a2668975-849f-4068-9146-84d698eb0a6f
+          - button "Delete What does AAPL report in its 2022 Q3 10-Q?" [ref=f1e142] [cursor=pointer]: x
+        - listitem [ref=f1e72]:
+          - link "New thread" [ref=f1e73] [cursor=pointer]:
+            - /url: /t/ddcff67a-068e-495d-9470-326ae676086f
+          - button "Delete New thread" [ref=f1e75] [cursor=pointer]: x
+  - main [ref=f1e143]:
+    - generic [ref=f1e144]:
+      - heading "What does AAPL report in its 2022 Q3 10-Q?" [level=2] [ref=f1e145]
+      - paragraph [ref=f1e146]: Created 8/23/2026, 1:22:19 PM
+    - article [ref=f1e206]:
+      - generic [ref=f1e207]: Summarize AAPL-2022Q3 (2022 Q3).
+      - paragraph [ref=f1e210]: done
+    - generic [ref=f1e199]:
+      - textbox "Ask about the frozen 10-Qs…" [ref=f1e200]
+      - generic [ref=f1e201]:
+        - generic [ref=f1e202]:
+          - checkbox "Think step by step" [ref=f1e203]
+          - text: Think step by step
+        - generic [ref=f1e204]: Enter to send · Shift+Enter for newline
+        - button "Send" [disabled] [ref=f1e205]

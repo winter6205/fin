@@ -27,8 +27,12 @@ import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk
 
 from fin.host.stream_map import (
+    DeltaSplit,
+    InlineFilterState,
     assemble_final_ai_message,
     format_tool_summary,
+    reasoning_delta_from_chunk,
+    split_stream_delta,
     strip_thinking_from_answer,
     summarize_list_files,
     summarize_read_file,
@@ -367,3 +371,162 @@ def test_format_tool_summary_handles_non_dict_result() -> None:
     formatter (tests sometimes pass raw ``list`` or ``str``)."""
     out = format_tool_summary("list_files", result=["raw list"], args=None)
     assert "0 filings" in out
+
+
+# ----- T1 (#33): token-delta mapping (thinking / answer split) -----
+
+
+def test_reasoning_delta_from_chunk_joins_reasoning_details_texts() -> None:
+    """The ``reasoning_split=true`` channel (ADR 0022) lands each
+    streamed thinking delta on ``additional_kwargs.reasoning_details``
+    as one entry; the mapper concatenates the entries' ``text``
+    fields for THIS chunk in order."""
+    chunk = AIMessageChunk(
+        content="",
+        additional_kwargs={
+            "reasoning_details": [{"text": "plan "}, {"text": "read"}]
+        },
+    )
+    assert reasoning_delta_from_chunk(chunk) == "plan read"
+
+
+def test_reasoning_delta_from_chunk_empty_when_no_reasoning() -> None:
+    """Plain content chunks (no reasoning_details) yield an empty
+    thinking delta so the caller skips the SSE frame."""
+    assert reasoning_delta_from_chunk(AIMessageChunk(content="x")) == ""
+
+
+def test_reasoning_delta_from_chunk_ignores_malformed_entries() -> None:
+    """Defensive: non-dict entries and entries without a string
+    ``text`` contribute nothing; a valid entry still passes."""
+    chunk = AIMessageChunk(
+        content="",
+        additional_kwargs={
+            "reasoning_details": [{"foo": 1}, "junk", {"text": "ok"}]
+        },
+    )
+    assert reasoning_delta_from_chunk(chunk) == "ok"
+
+
+def test_split_plain_delta_passes_through_as_answer() -> None:
+    """No inline block -> the whole delta is answer prose."""
+    split = split_stream_delta(InlineFilterState(), "hello")
+    assert split.answer == "hello"
+    assert split.thinking == ""
+    assert split.state.buffer == "" and split.state.inside is False
+
+
+def test_split_complete_inline_block_in_one_delta() -> None:
+    """A whole ``<thinking>...</thinking>`` block inside one delta
+    splits into thinking prose + visible answer in one pass."""
+    split = split_stream_delta(
+        InlineFilterState(), "<thinking>secret</thinking>visible"
+    )
+    assert split.thinking == "secret"
+    assert split.answer == "visible"
+
+
+def test_split_open_block_emits_answer_prefix_then_thinking_live() -> None:
+    """Text before the opening tag is answer; thinking prose INSIDE
+    an open block streams out immediately (only a potential partial
+    close tag is held back)."""
+    a = split_stream_delta(InlineFilterState(), "pre <thinking>par")
+    assert a.answer == "pre "
+    assert a.thinking == "par"
+    assert a.state.inside is True
+    b = split_stream_delta(a.state, "tial</thinking>post")
+    assert b.thinking == "tial"
+    assert b.answer == "post"
+    assert b.state.inside is False and b.state.buffer == ""
+
+
+def test_split_opening_tag_fragment_split_across_deltas() -> None:
+    """``<thi`` + ``nking>x</thinking>tail``: the tag fragment is
+    held back (NOT emitted as answer), then resolved on the next
+    delta."""
+    a = split_stream_delta(InlineFilterState(), "ans<thi")
+    assert a.answer == "ans"
+    assert a.state.buffer == "<thi"
+    b = split_stream_delta(a.state, "nking>x</thinking>tail")
+    assert b.thinking == "x"
+    assert b.answer == "tail"
+
+
+def test_split_closing_tag_fragment_split_across_deltas() -> None:
+    """A close-tag fragment spanning deltas is held back as thinking
+    (never leaked into answer) and resolved when the tag completes."""
+    a = split_stream_delta(InlineFilterState(), "<thinking>think</thin")
+    assert a.thinking == "think"
+    assert a.state.inside is True
+    assert a.state.buffer == "</thin"
+    b = split_stream_delta(a.state, "king>out")
+    assert b.answer == "out"
+    assert b.thinking == ""
+
+
+def test_split_is_case_insensitive_on_tags() -> None:
+    """Proxy implementations disagree on tag casing; both open and
+    close tags match case-insensitively."""
+    split = split_stream_delta(
+        InlineFilterState(), "<THINKING>x</ThInkIng >rest"
+    )
+    assert split.thinking == "x"
+    assert split.answer == "rest"
+
+
+def test_split_final_flush_releases_pending_fragments() -> None:
+    """``final=True`` (stream end) releases any held buffer: a
+    dangling fragment outside a block flushes as answer; a partial
+    close tag inside a block flushes as thinking. Nothing is
+    dropped."""
+    held = split_stream_delta(InlineFilterState(), "tail<th")
+    assert held.answer == "tail"
+    flushed = split_stream_delta(held.state, "", final=True)
+    assert flushed.answer == "<th"
+    assert flushed.thinking == ""
+
+    inside = split_stream_delta(InlineFilterState(), "<thinking>x</thin")
+    assert inside.thinking == "x"
+    closed = split_stream_delta(inside.state, "", final=True)
+    assert closed.thinking == "</thin"
+    assert closed.answer == ""
+
+
+def test_split_multiple_blocks_in_one_delta() -> None:
+    """Two complete blocks in a single delta resolve in one pass."""
+    split = split_stream_delta(
+        InlineFilterState(),
+        "<thinking>a</thinking>mid<thinking>b</thinking>end",
+    )
+    assert split.thinking == "ab"
+    assert split.answer == "midend"
+
+
+def test_split_state_is_plain_data() -> None:
+    """``DeltaSplit`` / ``InlineFilterState`` are frozen dataclasses
+    so the route thread can carry them as local variables (no
+    hidden mutable state across requests)."""
+    split = split_stream_delta(InlineFilterState(), "x")
+    assert isinstance(split, DeltaSplit)
+    assert isinstance(split.state, InlineFilterState)
+
+
+def test_split_partial_tag_only_delta_waits_without_looping() -> None:
+    """A delta that is ENTIRELY a potential tag fragment (``"<thi"``)
+    holds everything and emits nothing — and MUST terminate: the
+    whole-buffer holdback case once spun the scan loop forever
+    because no character was emittable and the buffer never shrank.
+    Regression guard for the infinite loop."""
+    a = split_stream_delta(InlineFilterState(), "<thi")
+    assert a.answer == ""
+    assert a.thinking == ""
+    assert a.state.buffer == "<thi"
+    # A subsequent empty delta still makes no progress — also must
+    # terminate, holding the same fragment.
+    b = split_stream_delta(a.state, "")
+    assert b.answer == ""
+    assert b.state.buffer == "<thi"
+    # The next real delta resolves the tag.
+    c = split_stream_delta(a.state, "nking>x</thinking>ok")
+    assert c.thinking == "x"
+    assert c.answer == "ok"

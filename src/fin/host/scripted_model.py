@@ -67,6 +67,12 @@ class ScriptedChatModel(BaseChatModel):
 
     script: list[AIMessage] = Field(default_factory=list)
     stream_script: list[AIMessageChunk] = Field(default_factory=list)
+    # T1 (#33): one entry per ``stream()`` call, each entry a FULL
+    # response as a list of chunks. Lets a test script two distinct
+    # streamed model calls (tool-call response, then thinking +
+    # answer deltas) which the flat ``stream_script`` cannot express.
+    # Takes precedence over ``stream_script`` on the streamed path.
+    stream_responses: list[list[AIMessageChunk]] = Field(default_factory=list)
     bound_tools: list[Any] = Field(default_factory=list)
     _index: int = 0  # mutated across calls; underscore-prefixed to dodge Pydantic field validation
     _stream_index: int = 0  # mutated across stream() calls
@@ -148,25 +154,40 @@ class ScriptedChatModel(BaseChatModel):
         that response. ``_stream`` therefore yields the entire
         current response on each invocation, not a single chunk.
 
-        The ``stream_script`` list represents ONE response (a flat
-        sequence of chunks the model would emit for one turn).
-        On the first ``stream()`` call the entire script is
-        yielded in order; every subsequent call yields ONLY the
-        LAST chunk so a step-cap test (the model keeps wanting to
-        call a tool forever) loops deterministically without the
-        model raising. This mirrors the sync ``_generate``
-        contract (``script[-1]`` replays forever) on the streaming
-        surface.
+        Response selection, in priority order:
 
-        ``stream_script`` empty -> ``_generate`` result wrapped in
-        one chunk. The same scripted model works for sync and
-        streaming tests with no extra setup.
+        * ``stream_responses`` (T1 #33) — one entry per call; the
+          entry's chunks are yielded in full. Once exhausted the
+          LAST entry replays (the step-cap loop contract).
+        * ``stream_script`` — the first ``stream()`` call walks the
+          entire script in order; subsequent calls delegate to the
+          sync ``script`` when set (mixed models), else replay the
+          whole script.
+        * neither set — ``_generate`` result wrapped in one chunk.
 
         A parallel ``_stream_index`` (vs. sharing ``_index`` with
         ``_generate``) keeps the two surfaces independent; a test
-        that exercises both paths can mutate one without
-        disturbing the other.
+        that exercises both paths can mutate one without disturbing
+        the other.
         """
+        if self.stream_responses:
+            templates = (
+                self.stream_responses[self._stream_index]
+                if self._stream_index < len(self.stream_responses)
+                else self.stream_responses[-1]
+            )
+            if self._stream_index < len(self.stream_responses):
+                self._stream_index += 1
+            for template in templates:
+                yield ChatGenerationChunk(
+                    message=AIMessageChunk(
+                        content=template.content,
+                        tool_call_chunks=list(template.tool_call_chunks),
+                        additional_kwargs=dict(template.additional_kwargs),
+                    )
+                )
+            return
+
         if not self.stream_script:
             result = self._generate(
                 messages, stop=stop, run_manager=run_manager, **kwargs
