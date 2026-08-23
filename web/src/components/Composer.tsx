@@ -30,15 +30,15 @@ export default function Composer({
     (s) => s.resumingThreadId === threadId
   );
   const busy = sending || threadInFlight || resumingThis;
-  // T3: per-thread "ask for reasoning" toggle. Persisted in
-  // localStorage so a reload keeps the operator's preference; the
-  // request body carries ``thinking`` so the backend can pass it
-  // through to the model (MiniMax ``reasoning_split``).
+  // T3 (#34): the operator's GLOBAL thinking preference. Defaults
+  // ON (spec line 28: default is on / `adaptive`); persisted in
+  // localStorage so a reload keeps the choice. This is a thinking
+  // on/off preference, NOT a step-by-step instruction to the model.
   const [thinkingOn, setThinkingOn] = useState<boolean>(() => {
     try {
-      return window.localStorage.getItem("fin.thinking") === "on";
+      return window.localStorage.getItem("fin.thinking") !== "off";
     } catch {
-      return false;
+      return true;
     }
   });
   const [draft, setDraft] = useState("");
@@ -103,7 +103,7 @@ export default function Composer({
             onChange={toggleThinking}
             className="accent-[#2563EB]"
           />
-          Think step by step
+          Thinking
         </label>
         <span className="text-xs text-gray-500">
           Enter to send · Shift+Enter for newline

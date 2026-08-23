@@ -694,8 +694,16 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
         # not a continuation. ``messages`` keeps accumulating via
         # ``add_messages``; the helper clears the six run-scoped
         # fields per ADR 0016 / spec line 34.
-        config = {"configurable": {"thread_id": thread_id}}
+        config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
         thinking_type = "adaptive" if body.thinking else "disabled"
+        if not body.thinking:
+            # T3 (#34): the operator's thinking preference rides the
+            # run config — ``model_node`` swaps to the pre-built
+            # no-thinking binding (``extra_body`` thinking.type=
+            # disabled, reasoning_split stays on). Only the OFF
+            # preference is stamped; the default (on) keeps the boot
+            # binding untouched.
+            config["configurable"]["thinking_type"] = thinking_type
 
         def event_stream() -> Iterator[str]:
             """Yield the delta wire for this run, then persist + close.
