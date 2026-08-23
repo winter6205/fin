@@ -491,3 +491,64 @@ def test_ask_error_bodies_have_no_sensitive_leakage(client: TestClient) -> None:
     assert body == {"error": "ingest_missing"}
     assert "sha256" not in r.text
     assert "secret" not in r.text
+
+
+
+# ===== T2: /ask follow-up resets run-scoped fields (ADR 0016 / SC62) =====
+
+
+def test_ask_follow_up_resets_evidence(client: TestClient, aapl_page1_text: str) -> None:
+    """Binding SC62 mirror for ``POST /ask``: two sequential asks on
+    the SAME ``thread_id``. Run 1 reads AAPL-2022Q3 page 1 and ends
+    ``done``; run 2 answers with the same span WITHOUT re-fetching.
+    With the T2 reset, evidence is empty in run 2 so the gate cannot
+    match -> refuse. Without it, the stale evidence leaks in and the
+    gate ``done``s (the bug).
+    """
+    answer = f"Per the filing: {aapl_page1_text[:80]}"
+    model_script_holder: dict[str, list[AIMessage]] = {}
+
+    from fin.host.http import get_graph
+
+    # A scripted model whose script can be swapped between runs.
+    class _SwappableModel(ScriptedChatModel):
+        @property
+        def script(self):  # type: ignore[override]
+            return model_script_holder.get("script", [])
+
+        @script.setter
+        def script(self, value):
+            model_script_holder["script"] = value
+
+    model = _SwappableModel(script=_scripted_read_then_answer(answer))
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    client.app.dependency_overrides[get_graph] = lambda: g
+
+    thread_id = str(uuid.uuid4())
+
+    r1 = client.post(
+        "/ask",
+        json={"question": "q1", "thread_id": thread_id},
+    )
+    assert r1.status_code == 200
+    assert r1.json()["status"] == "done"
+    assert len(r1.json()["citations"]) >= 1
+
+    # Run 2: same span, no tool call. Must NOT inherit run-1 evidence.
+    model.script = [AIMessage(content=answer)]
+
+    r2 = client.post(
+        "/ask",
+        json={"question": "q2", "thread_id": thread_id},
+    )
+    assert r2.status_code == 200
+    body = r2.json()
+    assert body["status"] == "refuse", (
+        f"SC62: /ask follow-up must not inherit prior-run evidence; got {body}"
+    )
+    assert body["reason"] == "citation_repair_cap"
+    assert body["citations"] == []

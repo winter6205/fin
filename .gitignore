@@ -11,6 +11,13 @@ dist/
 build/
 *.egg-info/
 
+# Node / JS (workspace prototype frontend)
+node_modules/
+.vite/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+
 # Secrets and local env
 .env
 .env.*
@@ -32,3 +39,7 @@ build/
 # Serena: local overlay and index cache (keep .serena/project.yml)
 .serena/cache/
 .serena/project.local.yml
+
+# Machine-local debug residue (browser tests, hook artifacts)
+.playwright-cli/
+.claude/scratchpad/post-push.*
