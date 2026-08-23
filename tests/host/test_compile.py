@@ -345,6 +345,9 @@ def _install_fake_langchain_openai(
             captured["model"] = model
             captured["base_url"] = base_url
             captured["api_key"] = api_key
+            captured["extra_body"] = _kwargs.get("extra_body")
+            captured["model_kwargs"] = _kwargs.get("model_kwargs")
+            captured["timeout"] = _kwargs.get("timeout")
 
         # ``compile_graph`` calls ``model.bind_tools([...])`` to wire
         # the LangChain tool binding. The fake returns ``self`` so the
@@ -444,6 +447,35 @@ def test_compile_for_runtime_reads_fin_model_from_env(
 
     compile_for_runtime()
     assert captured["model"] == "fake:custom-model-x"
+
+
+def test_compile_passes_minimax_extra_body_as_chatopenai_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ChatOpenAI warns and drops ``extra_body`` when it is nested
+    under ``model_kwargs``. MiniMax then inlines ``<think>`` into
+    ``content`` instead of ``reasoning_details``, and the live
+    turn looks like a broken chat. The field must be a top-level
+    constructor argument (ADR 0022)."""
+    monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
+    captured: dict[str, object] = {}
+    _install_fake_langchain_openai(monkeypatch, captured)
+    _install_fake_postgres_saver(monkeypatch, _FakePostgresSaver)
+    monkeypatch.setattr(
+        "fin.host.compile.compile_graph", lambda **kw: "compiled-graph"
+    )
+
+    compile_for_runtime()
+    extra = captured["extra_body"]
+    assert isinstance(extra, dict)
+    assert extra.get("reasoning_split") is True
+    thinking = extra.get("thinking")
+    assert isinstance(thinking, dict)
+    assert thinking.get("type") == "adaptive"
+    model_kwargs = captured["model_kwargs"]
+    if isinstance(model_kwargs, dict):
+        assert "extra_body" not in model_kwargs
+    assert captured["timeout"] is not None
 
 
 def test_compile_for_runtime_reads_fin_base_url_from_env(
@@ -596,6 +628,8 @@ def test_compile_for_runtime_dev_uses_in_memory_saver(
     captured: dict[str, object] = {}
     _install_fake_langchain_openai(monkeypatch, captured)
     monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
+    monkeypatch.delenv("FIN_BASE_URL", raising=False)
+    monkeypatch.delenv("FIN_MODEL", raising=False)
 
     import warnings
 
@@ -625,6 +659,8 @@ def test_compile_for_runtime_dev_does_not_require_postgres(
     captured: dict[str, object] = {}
     _install_fake_langchain_openai(monkeypatch, captured)
     monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
+    monkeypatch.delenv("FIN_BASE_URL", raising=False)
+    monkeypatch.delenv("FIN_MODEL", raising=False)
 
     graph = compile_for_runtime_dev()
     assert graph is not None

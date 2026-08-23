@@ -182,6 +182,17 @@ def test_strip_does_not_eat_lone_literal_thinking_token() -> None:
     assert out == answer
 
 
+def test_strip_removes_minimax_think_block() -> None:
+    """MiniMax-M3 inlines ``<think>...</think>`` (not ``<thinking>``)
+    when reasoning_split is missing. That scratchpad must not reach
+    the citation gate as answer prose."""
+    answer = "<think>The user asked about Apple net sales.</think>\nNet sales were $81.8 billion."
+    out = strip_thinking_from_answer(answer)
+    assert "<think" not in out.lower()
+    assert "Apple net sales" not in out
+    assert "Net sales were $81.8 billion." in out
+
+
 # ----- summarize_list_files -----
 
 
@@ -529,7 +540,27 @@ def test_split_partial_tag_only_delta_waits_without_looping() -> None:
     # The next real delta resolves the tag.
     c = split_stream_delta(a.state, "nking>x</thinking>ok")
     assert c.thinking == "x"
-    assert c.answer == "ok"
+
+
+def test_split_minimax_think_block_is_thinking_not_answer() -> None:
+    """Live SSE must route MiniMax ``<think>`` deltas to thinking,
+    otherwise the operator sees the scratchpad as the answer and
+    the gate bounces on ungrounded prose."""
+    split = split_stream_delta(
+        InlineFilterState(), "<think>secret plan</think>visible span"
+    )
+    assert split.thinking == "secret plan"
+    assert split.answer == "visible span"
+
+
+def test_split_minimax_think_tag_can_span_chunks() -> None:
+    """``<thi`` + ``nk>x</think>tail`` across deltas."""
+    a = split_stream_delta(InlineFilterState(), "<thi")
+    assert a.thinking == ""
+    assert a.answer == ""
+    b = split_stream_delta(a.state, "nk>x</think>tail")
+    assert b.thinking == "x"
+    assert b.answer == "tail"
 
 
 # ----- T4 (#37): thinking duration clock -----

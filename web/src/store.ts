@@ -23,6 +23,7 @@ interface WorkspaceState {
   // starts the fetch) from "loaded and genuinely empty" — otherwise
   // the one-shot restore treats a valid marker as stale.
   threadsLoaded: boolean;
+  corpusLoaded: boolean;
   sendingQuestion: boolean;
   // T4: ``resumeThread(threadId)`` sets this while the resume SSE
   // stream is active so the Composer can disable itself and so a
@@ -39,7 +40,7 @@ interface WorkspaceState {
   sendQuestion: (
     threadId: string,
     question: string,
-    thinkingOn?: boolean
+    thinkingOn?: boolean,
   ) => Promise<api.SendResult | null>;
   // T4 (spec line 39): resume an interrupted run from the last
   // complete node. Mirrors ``sendQuestion``'s streaming-event
@@ -81,6 +82,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   activeThread: null,
   loadingThreads: false,
   threadsLoaded: false,
+  corpusLoaded: false,
   sendingQuestion: false,
   resumingThreadId: null,
 
@@ -95,8 +97,12 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   async loadCorpus() {
-    const corpus = await api.getCorpus();
-    set({ corpus });
+    try {
+      const corpus = await api.getCorpus();
+      set({ corpus, corpusLoaded: true });
+    } catch {
+      set({ corpus: [], corpusLoaded: true });
+    }
   },
 
   async openThread(threadId: string) {
@@ -169,7 +175,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       const current = get().activeThread;
       if (!current || current.id !== threadId) return;
       const nextTurns = current.turns.map((t) =>
-        t.run_id === optimisticRunId ? patcher(t) : t
+        t.run_id === optimisticRunId ? patcher(t) : t,
       );
       set({ activeThread: { ...current, turns: nextTurns } });
     };
@@ -192,70 +198,72 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         threadId,
         { question, thinking: thinkingOn },
         (event) => {
-        switch (event.type) {
-          case "thinking":
-            patchTurn((t) => ({
-              ...t,
-              thinking_text: t.thinking_text + event.text,
-            }));
-            break;
-          case "tool_call": {
-            // Append a placeholder row so the operator sees a
-            // running indicator while the tool executes. The
-            // matching ``tool_result`` replaces it with the
-            // server-formatted one-liner.
-            const placeholder: ToolSummary = {
-              name: event.name,
-              summary: "running…",
-              tool_call_id: event.tool_call_id,
-            };
-            patchTurn((t) => ({
-              ...t,
-              tool_summaries: [...(t.tool_summaries ?? []), placeholder],
-            }));
-            break;
+          switch (event.type) {
+            case "thinking":
+              patchTurn((t) => ({
+                ...t,
+                thinking_text: t.thinking_text + event.text,
+              }));
+              break;
+            case "tool_call": {
+              // Append a placeholder row so the operator sees a
+              // running indicator while the tool executes. The
+              // matching ``tool_result`` replaces it with the
+              // server-formatted one-liner.
+              const placeholder: ToolSummary = {
+                name: event.name,
+                summary: "running…",
+                tool_call_id: event.tool_call_id,
+              };
+              patchTurn((t) => ({
+                ...t,
+                tool_summaries: [...(t.tool_summaries ?? []), placeholder],
+              }));
+              break;
+            }
+            case "tool_result": {
+              // The server already formatted the summary (spec line
+              // 32); replace the "running…" placeholder with it.
+              patchTurn((t) => ({
+                ...t,
+                tool_summaries: (t.tool_summaries ?? []).map((s) =>
+                  s.tool_call_id === event.tool_call_id
+                    ? { ...s, summary: event.summary }
+                    : s,
+                ),
+              }));
+              break;
+            }
+            case "status":
+              statusSeen = true;
+              // Server-minted run id wins over the local placeholder.
+              optimisticRunId = event.run_id;
+              patchTurn((t) => ({
+                ...t,
+                run_id: event.run_id,
+                status: event.status,
+                status_reason: event.reason ?? "",
+                assistant_message: event.assistant_message,
+                // T4 (#37): the run ended — thinking collapses to the
+                // duration label, tool rows collapse.
+                in_flight: false,
+                thinking_duration_ms:
+                  event.thinking_ms ?? t.thinking_duration_ms,
+              }));
+              break;
+            case "answer":
+              patchTurn((t) => ({
+                ...t,
+                answer:
+                  statusSeen || event.reset
+                    ? event.text
+                    : t.answer + event.text,
+              }));
+              break;
+            case "citations":
+              patchTurn((t) => ({ ...t, citations: event.citations }));
+              break;
           }
-          case "tool_result": {
-            // The server already formatted the summary (spec line
-            // 32); replace the "running…" placeholder with it.
-            patchTurn((t) => ({
-              ...t,
-              tool_summaries: (t.tool_summaries ?? []).map((s) =>
-                s.tool_call_id === event.tool_call_id
-                  ? { ...s, summary: event.summary }
-                  : s
-              ),
-            }));
-            break;
-          }
-          case "status":
-            statusSeen = true;
-            // Server-minted run id wins over the local placeholder.
-            optimisticRunId = event.run_id;
-            patchTurn((t) => ({
-              ...t,
-              run_id: event.run_id,
-              status: event.status,
-              status_reason: event.reason ?? "",
-              assistant_message: event.assistant_message,
-              // T4 (#37): the run ended — thinking collapses to the
-              // duration label, tool rows collapse.
-              in_flight: false,
-              thinking_duration_ms: event.thinking_ms ?? t.thinking_duration_ms,
-            }));
-            break;
-          case "answer":
-            patchTurn((t) => ({
-              ...t,
-              answer: (statusSeen || event.reset)
-                ? event.text
-                : t.answer + event.text,
-            }));
-            break;
-          case "citations":
-            patchTurn((t) => ({ ...t, citations: event.citations }));
-            break;
-        }
         },
       );
       // Reconcile by re-GET'ing the thread: the SSE body carries
@@ -289,7 +297,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     if (before && before.id === threadId && before.turns.length > 0) {
       const last = before.turns.length - 1;
       const nextTurns = before.turns.map((t, i) =>
-        i === last ? { ...t, in_flight: true } : t
+        i === last ? { ...t, in_flight: true } : t,
       );
       set({
         activeThread: { ...before, in_flight: true, turns: nextTurns },
@@ -334,7 +342,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
               tool_summaries: (t.tool_summaries ?? []).map((s) =>
                 s.tool_call_id === event.tool_call_id
                   ? { ...s, summary: event.summary }
-                  : s
+                  : s,
               ),
             }));
             break;
@@ -353,9 +361,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           case "answer":
             patchLatestTurn(threadId, (t) => ({
               ...t,
-              answer: (statusSeen || event.reset)
-                ? event.text
-                : t.answer + event.text,
+              answer:
+                statusSeen || event.reset ? event.text : t.answer + event.text,
             }));
             break;
           case "citations":
@@ -386,17 +393,12 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 // T4 helper: patch the most-recent turn on ``threadId`` (the one
 // the resume is working on). No-op when the operator has navigated
 // away so the resume cannot paint onto the wrong thread.
-function patchLatestTurn(
-  threadId: string,
-  patcher: (t: Turn) => Turn,
-): void {
+function patchLatestTurn(threadId: string, patcher: (t: Turn) => Turn): void {
   const current = useWorkspaceStore.getState().activeThread;
   if (!current || current.id !== threadId) return;
   if (current.turns.length === 0) return;
   const idx = current.turns.length - 1;
-  const nextTurns = current.turns.map((t, i) =>
-    i === idx ? patcher(t) : t
-  );
+  const nextTurns = current.turns.map((t, i) => (i === idx ? patcher(t) : t));
   useWorkspaceStore.setState({
     activeThread: { ...current, turns: nextTurns },
   });

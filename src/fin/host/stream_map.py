@@ -111,10 +111,20 @@ def assemble_final_ai_message(
 # one pass; case-insensitive because proxy implementations disagree
 # on casing. SC60 binds: thinking prose must not pass the citation
 # gate as the answer, and must never appear inside ``answer`` events.
+# MiniMax-M3 inlines ``<think>...</think>`` when the split channel
+# is missing; some proxies use ``<thinking>``. ``\b`` after ``think``
+# keeps ``<thinking>`` from matching the short tag.
 _THINKING_BLOCK_RE: re.Pattern[str] = re.compile(
-    r"<thinking\b[^>]*>.*?</thinking\s*>",
+    r"<(thinking|think)\b[^>]*>(.*?)</\1\s*>",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+def inline_thinking_segments(content: str) -> list[str]:
+    """Inner prose of every closed ``<think>`` / ``<thinking>`` block."""
+    if not content:
+        return []
+    return [match.group(2) for match in _THINKING_BLOCK_RE.finditer(content)]
 
 
 def strip_thinking_from_answer(answer: str) -> str:
@@ -181,26 +191,31 @@ class DeltaSplit:
 # Streaming-tag variants of the strip patterns above: searched one
 # at a time inside the running buffer so a tag that spans chunk
 # boundaries resolves on the delta that completes it.
-_OPEN_TAG_RE: re.Pattern[str] = re.compile(r"<thinking\b[^>]*>", re.IGNORECASE)
-_CLOSE_TAG_RE: re.Pattern[str] = re.compile(r"</thinking\s*>", re.IGNORECASE)
-_OPEN_TAG_STEM: str = "<thinking"
-_CLOSE_TAG_STEM: str = "</thinking"
+_OPEN_TAG_RE: re.Pattern[str] = re.compile(
+    r"<(thinking|think)\b[^>]*>", re.IGNORECASE
+)
+_CLOSE_TAG_RE: re.Pattern[str] = re.compile(
+    r"</(thinking|think)\s*>", re.IGNORECASE
+)
+_OPEN_TAG_STEMS: tuple[str, ...] = ("<thinking", "<think")
+_CLOSE_TAG_STEMS: tuple[str, ...] = ("</thinking", "</think")
 
 
-def _holdback_len(buffer: str, stem: str) -> int:
-    """Longest suffix of ``buffer`` that is a proper prefix of ``stem``.
+def _holdback_len(buffer: str, stems: tuple[str, ...]) -> int:
+    """Longest suffix of ``buffer`` that is a proper prefix of any stem.
 
-    Keeps at most ``len(stem) - 1`` characters buffered: if the next
-    delta continues the tag the matcher still sees the whole thing;
-    if it does not, the held characters flush as ordinary prose at
-    the next delta (or at ``final=True``). Case-insensitive to match
-    the tag regexes.
+    Keeps at most ``max(len(stem)) - 1`` characters buffered so a tag
+    split across deltas (``<thi`` + ``nk>`` or ``<thi`` + ``nking>``)
+    still matches. Case-insensitive to match the tag regexes.
     """
     lower = buffer.lower()
-    for k in range(min(len(lower), len(stem) - 1), 0, -1):
-        if lower.endswith(stem[:k]):
-            return k
-    return 0
+    kept = 0
+    for stem in stems:
+        for k in range(min(len(lower), len(stem) - 1), 0, -1):
+            if lower.endswith(stem[:k]):
+                kept = max(kept, k)
+                break
+    return kept
 
 
 def split_stream_delta(
@@ -233,8 +248,8 @@ def split_stream_delta(
             buffer = buffer[match.end() :]
             inside = not inside
             continue
-        stem = _CLOSE_TAG_STEM if inside else _OPEN_TAG_STEM
-        keep = 0 if final else _holdback_len(buffer, stem)
+        stems = _CLOSE_TAG_STEMS if inside else _OPEN_TAG_STEMS
+        keep = 0 if final else _holdback_len(buffer, stems)
         if keep >= len(buffer):
             # The whole buffer is a potential tag fragment (e.g. a
             # delta that ended mid-tag). Nothing is emittable; wait
@@ -487,6 +502,7 @@ __all__ = [
     "ThinkingClock",
     "assemble_final_ai_message",
     "format_tool_summary",
+    "inline_thinking_segments",
     "reasoning_delta_from_chunk",
     "split_stream_delta",
     "strip_thinking_from_answer",
