@@ -2503,3 +2503,73 @@ def test_bounce_retry_emits_answer_reset_between_attempts(
         i for i in answer_idx if "Per the filing" in events[i][1]["text"]
     )
     assert ungrounded_delta < reset_i < grounded_delta
+
+
+# ----- mid-stream exception boundary (code-review M1/M2) -----
+
+
+class _RaisingModel(ScriptedChatModel):
+    """Model whose ``_stream`` raises immediately — simulates a
+    provider crash mid-run (network drop, 500 from the proxy)."""
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
+        raise RuntimeError("boom")
+
+
+def test_scripted_model_raises_emits_terminal_status(
+    client: TestClient, fresh_store, http_app: FastAPI
+) -> None:
+    """When the model raises MID-STREAM, the SSE body must still end
+    with the fixed-order terminal frames — status(refuse) -> answer("")
+    -> citations([]) — instead of truncating. Without the exception
+    boundary in ``_stream_run_frames`` the generator dies before any
+    terminal frame; FastAPI closes the body early and the SPA's
+    ``consumeSseStream`` never sees a terminal event, hanging the live
+    view in ``running`` forever (spec line 30 order / line 96: no
+    swallowed blanks)."""
+    from fin.host.http import get_graph
+
+    model = _RaisingModel(script=[AIMessage(content="never reached")])
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+
+    with client.stream(
+        "POST",
+        f"/api/threads/{created['id']}/messages",
+        json={"question": "q"},
+    ) as r:
+        assert r.status_code == 200, r.status_code
+        body = "".join(r.iter_text())
+
+    events = _parse_sse_events(body)
+    names = [n for n, _ in events]
+
+    # The stream ENDS with exactly the three terminal frames, in the
+    # spec-line-30 order: status -> answer -> citations.
+    assert names[-3:] == ["status", "answer", "citations"], names
+
+    status_event = events[-3][1]
+    assert status_event["status"] == "refuse"
+    assert "RuntimeError" in status_event["reason"]
+    assert "stream raised mid-flight" in status_event["reason"]
+    # Server-minted run_id rides the frame so the SPA can reconcile.
+    assert isinstance(status_event["run_id"], str) and status_event["run_id"]
+
+    # Refuse keeps the answer empty (status != done) and citations [].
+    assert events[-2] == ("answer", {"text": ""})
+    assert events[-1] == ("citations", [])
+
+    # No trailing unclosed/partial frame: the body terminates right
+    # after the citations frame's blank-line separator.
+    assert body.endswith("event: citations\ndata: []\n\n")
+
+    # The half-run state must NOT be persisted: final_state was None,
+    # so the caller skipped append_run entirely.
+    detail = client.get(f"/api/threads/{created['id']}").json()
+    assert detail["turns"] == []
