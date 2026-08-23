@@ -19,7 +19,7 @@ Quoted from `docs/CONTEXT.md`:
 
 - **Does:**
   - One FastAPI process: existing `POST /ask` (sync `invoke`) plus workspace routes and the built SPA. Same compiled host graph object as CLI (ADR 0013).
-  - Frontend at repo-root `web/`: React 18 + TypeScript + Vite + TailwindCSS + Radix Primitives + Zustand. FastAPI serves `web/dist` same-origin. Vite dev proxies `/api` and `/ask`. Throwaway `src/fin/prototype_workspace` is not product code and is not copied into `web/`.
+  - Frontend at repo-root `web/`: React 18 + TypeScript + Vite + TailwindCSS + Radix Primitives + Zustand. FastAPI serves `web/dist` same-origin. Vite dev proxies `/api` and `/ask`. Archived under `docs/design-references/prototype-workspace/`, the prototype variants are not product code and are not copied into `web/`.
   - Look: Soft Brutalism (`#FAFAF7`, 1px black border, single `#2563EB` accent). Left sidebar ~280px; active thread highlighted with the blue accent. Title from the first user question, max 50 characters + ellipsis. Cassette Futurism stays archive-only under `docs/design-references/cassette-futurism/`.
   - Chrome only: create, list, open, resume, delete. Path-addressable `/t/{thread_id}`. Catch-all after `/api` and `/ask` returns `index.html`. No rename, folders, search, Stop, or extra navigation chrome. Delete asks for confirmation (dialog, not a new surface).
   - Thread metadata (id, title, created_at) in a Postgres side table on `FIN_CHECKPOINT_URL`. Graph state stays in `PostgresSaver`. Delete removes the side row and `PostgresSaver.delete_thread` for that `thread_id`. Tests use `InMemorySaver` plus an in-process metadata stand-in.
@@ -80,7 +80,7 @@ Quoted from `docs/CONTEXT.md`:
 
 ## Planned files (ACR input, not a filename freeze)
 
-Host surface: `src/fin/host/http.py`, `src/fin/host/graph.py`, `src/fin/host/state.py`, `src/fin/host/compile.py`, `src/fin/host/scripted_model.py`, plus new host-owned modules for thread metadata / turn rows / SSE mapping / thinking converter as the implementer splits them. Tests under `tests/host/`. SPA under `web/`. No copy of `src/fin/prototype_workspace` into product paths.
+Host surface: `src/fin/host/http.py`, `src/fin/host/graph.py`, `src/fin/host/state.py`, `src/fin/host/compile.py`, `src/fin/host/scripted_model.py`, plus new host-owned modules for thread metadata / turn rows / SSE mapping / thinking converter as the implementer splits them. Tests under `tests/host/`. SPA under `web/`. No copy of `docs/design-references/prototype-workspace/` into product paths.
 
 ## 待写入 (persist after ACR)
 
