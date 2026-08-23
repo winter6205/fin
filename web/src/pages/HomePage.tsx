@@ -5,6 +5,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import CorpusCard from "../components/CorpusCard";
+import { CORPUS_HOME_GATE_KEY } from "../sessionKeys";
 import { useWorkspaceStore } from "../store";
 
 export default function HomePage() {
@@ -25,6 +26,13 @@ export default function HomePage() {
   useEffect(() => {
     if (restoreAttempted.current || !threadsLoaded) return;
     restoreAttempted.current = true;
+    try {
+      if (window.sessionStorage.getItem(CORPUS_HOME_GATE_KEY) === "1") {
+        return;
+      }
+    } catch {
+      /* storage unavailable */
+    }
     let lastId: string | null = null;
     try {
       lastId = window.localStorage.getItem("fin.lastThread");
@@ -47,15 +55,15 @@ export default function HomePage() {
 
   return (
     <main className="p-6">
-      <h2 className="text-xl font-bold mb-1">Research threads</h2>
+      <h2 className="text-xl font-bold mb-1">研究对话</h2>
       <p className="text-sm text-gray-600 mb-4">
-        Ask about the frozen AAPL / MSFT / AMZN 10-Qs.
+        就冻结的 AAPL / MSFT / AMZN 10-Q 提问。
       </p>
 
-      <section aria-label="Thread list" className="mb-8">
+      <section aria-label="对话列表" className="mb-8">
         {threads.length === 0 ? (
           <p className="text-sm text-gray-500 border border-dashed border-black p-4 bg-card">
-            No threads yet — start with a question below, or pick a filing.
+            尚无对话 — 在下方提问，或选择一份 filing。
           </p>
         ) : (
           <ul className="grid gap-2 md:grid-cols-2">
@@ -75,37 +83,43 @@ export default function HomePage() {
           </ul>
         )}
         {loadingThreads && (
-          <p className="text-xs text-gray-400 mt-2">Loading…</p>
+          <p className="text-xs text-gray-400 mt-2">加载中…</p>
         )}
       </section>
 
       <section aria-label="Corpus">
-        <h3 className="text-base font-semibold mb-2">Corpus (frozen 12)</h3>
-        {corpus.length === 0 ? (
-          <div className="border border-black bg-card p-4 max-w-md">
-            <p className="text-sm font-medium mb-1">
-              {corpusLoaded ? "Corpus is empty" : "Loading corpus…"}
+        {!corpusLoaded ? (
+          <>
+            <h3 className="text-base font-semibold mb-1">正在加载 Corpus…</h3>
+            <p className="text-sm text-gray-600 mb-3">
+              从服务读取已冻结的 12 份 10-Q 索引
             </p>
-            {corpusLoaded ? (
-              <>
-                <p className="text-sm text-gray-600 mb-3">
-                  The frozen filings are not ingested yet — run the ingest step
-                  to populate the extracted tree.
-                </p>
-                <StartEmptyThreadButton />
-              </>
-            ) : (
-              <p className="text-sm text-gray-600">
-                Fetching the frozen 12 filings.
-              </p>
-            )}
+            <div
+              className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
+              aria-busy="true"
+            >
+              <CorpusSkeletonCard />
+              <CorpusSkeletonCard />
+              <CorpusSkeletonCard />
+            </div>
+          </>
+        ) : corpus.length === 0 ? (
+          <div className="border border-black bg-card p-4 max-w-md">
+            <h3 className="text-base font-semibold mb-1">Corpus 尚未 ingest</h3>
+            <p className="text-sm text-gray-600 mb-3">
+              索引已就绪，但提取树为空。请运行 ingest 后再提问。
+            </p>
+            <StartEmptyThreadButton />
           </div>
         ) : (
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-            {corpus.map((f) => (
-              <CorpusCard key={f.document_id} filing={f} />
-            ))}
-          </div>
+          <>
+            <h3 className="text-base font-semibold mb-2">Corpus（冻结 12）</h3>
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+              {corpus.map((f) => (
+                <CorpusCard key={f.document_id} filing={f} />
+              ))}
+            </div>
+          </>
         )}
       </section>
     </main>
@@ -130,7 +144,20 @@ function StartEmptyThreadButton() {
       }}
       className="border border-black px-3 py-1.5 text-sm hover:bg-accent hover:text-white"
     >
-      + New thread
+      新建对话（Corpus 为空也可试）
     </button>
+  );
+}
+
+function CorpusSkeletonCard() {
+  return (
+    <div
+      aria-hidden="true"
+      className="border border-black bg-card p-3 animate-pulse"
+    >
+      <div className="h-4 bg-gray-200 border border-gray-300 mb-2 w-3/4" />
+      <div className="h-3 bg-gray-200 border border-gray-300 mb-1 w-1/2" />
+      <div className="h-3 bg-gray-200 border border-gray-300 w-1/4" />
+    </div>
   );
 }

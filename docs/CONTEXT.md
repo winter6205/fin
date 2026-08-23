@@ -53,6 +53,10 @@ _Avoid_: chunk_id, char offset, bbox, page-less citation
 A code gate on the path to END: a supporting span is a contiguous substring of the answer (v1 minimum 32 characters) that appears on a page this run retrieved or read. Passed spans become the user-visible citations; unknown locators refuse immediately; missing or unmatched spans bounce with a hidden template until the citation-repair cap, then refuse.
 _Avoid_: faithfulness prompt, LLM-as-judge as the only gate, model-authored citation block, `verify` as a tool
 
+**citation span**:
+One user-visible citation row from the verifier: a ≥32-character contiguous substring of the answer that matched on a retrieved or read page. The workspace sources list may show many spans per page (sliding-window overlap); that granularity is expected, not a send failure.
+_Avoid_: treating each span as a full sentence, hiding overlap as a bug, conflating span count with page count
+
 **citation-repair cap**:
 v1 limit of 3 recoverable citation-verifier failures (span not on the page, or a non-refuse final answer with no cites) before the run must refuse.
 _Avoid_: retry budget, max repairs, using step cap as the cite-fail rule
@@ -86,6 +90,10 @@ _Avoid_: chatbot, Q&A session, demo ask, one-shot invoke as the product UX
 **workspace**:
 A local web UI server: create, list, open, resume, and delete a research thread; thinking streams unframed then collapses; tool calls stream then collapse as human-readable traces; citations sit on the assistant turn (inline chips plus a sources list). Streaming HTTP is that UI's transport on the same compiled graph; GET history is turn rows; thinking on/off is the model `extra_body.thinking` knob; crash resume continues the in-flight run from the last complete host-graph node.
 _Avoid_: chatbot, CLI REPL as the product, hosted accounts this increment, raw tool JSON as the UI, always-expanded traces, Studio, POST /ask as the conversation surface, rolling back a user turn on crash
+
+**Corpus 首页**:
+The workspace home route (`/`): frozen-12 corpus cards and the empty-thread entry points. Distinct from cold-start restore of the last `/t/{thread_id}` — the operator may navigate here deliberately in the same session without being bounced back to that thread.
+_Avoid_: conflating home with "last thread", auto-send from a corpus card, treating fetch of `GET /api/corpus` as ingest
 
 **v1 surface**:
 The first ship binary is a CLI that compiles the host graph; v1 HTTP exposes that same compiled graph and must call sync `invoke` (not `ainvoke`) so the sync `PostgresSaver` stays valid. HITL / interrupt UX is not a v1 product surface; crash resume continues the in-flight run on that `thread_id`.
