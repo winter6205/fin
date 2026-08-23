@@ -2587,3 +2587,11 @@ def test_scripted_model_raises_emits_terminal_status(
     assert row["citations"] == []
     assert row["assistant_message"]
     assert row["in_flight"] is False
+
+    # the tracked change: mid-flight refuse must NOT leave a pending checkpoint
+    # — the CrashResume banner keys off ``pending_checkpoint``, not
+    # ``in_flight``, and a terminal refuse turn must not show it.
+    assert detail["pending_checkpoint"] is False
+
+    resume_resp = _resume(client, created["id"])
+    assert resume_resp.status_code == 204

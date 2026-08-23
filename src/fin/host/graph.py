@@ -1050,6 +1050,38 @@ class _LockedGraph:
         finally:
             self._release_thread(lock)
 
+    def finalize_abandoned_run(
+        self, thread_id: str, *, status: str, status_reason: str
+    ) -> None:
+        """Clear pending checkpoint after a mid-flight terminal outcome.
+
+        When a run dies mid-graph (model raise, empty stream with
+        refuse frames, etc.) the HTTP layer persists a terminal
+        ``RunRecord`` but LangGraph's checkpoint may still list
+        pending ``next`` nodes. ``GET /threads/{id}`` then reports
+        ``pending_checkpoint: true`` and the Resume banner appears
+        above an already-terminal turn.
+
+        Uses ``update_state(..., as_node="citation_gate")`` with the
+        terminal ``status`` / ``status_reason`` so ``from_gate``
+        routes to END. Messages are preserved — unlike
+        ``delete_thread``. No-op when ``pending_nodes()`` is already
+        empty (normal gate refuse / done paths). Acquires the
+        per-thread lock (mirrors ``delete_thread``).
+        """
+        lock = self._acquire_thread(thread_id)
+        try:
+            if not self.pending_nodes(thread_id):
+                return
+            config = {"configurable": {"thread_id": thread_id}}
+            self._graph.update_state(
+                config,
+                {"status": status, "status_reason": status_reason},
+                as_node="citation_gate",
+            )
+        finally:
+            self._release_thread(lock)
+
     def delete_thread(self, thread_id: str) -> None:
         """Forward ``thread_id`` to the inner graph's
         ``checkpointer.delete_thread`` under the SAME per-thread
