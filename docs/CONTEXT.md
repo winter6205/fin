@@ -129,14 +129,30 @@ _Avoid_: gpt-researcher, open_deep_research, blank-file StateGraph as the requir
 
 ### Corpus and eval
 
+**product corpus**:
+The operator-selected local extracted tree of official 10-Q and 10-K primary HTML. `fin-serve` retrieve, `read_file`, and the citation verifier read this tree under the live locator contract.
+_Avoid_: private fixture source 12 as product SSOT, unofficial PDF as live identity, S&P 500 backfill as the ingest default, a second PDF-page product path
+
+**eval fixture**:
+A git-pinned snapshot of **ingest** output, same locator contract as **product corpus**. Default CI contract eval reads only this tree.
+_Avoid_: pdfplumber-only test ingest, live EDGAR in default pytest, treating the private fixture source 12 PDFs as eval SSOT
+
 **v1 corpus**:
-The frozen private fixture source SEC 10-Q slice at `/home/winner/projects/fin`: AAPL, MSFT, AMZN; periods 2022 Q3 and 2023 Q1–Q3 (12 PDFs). Upstream commit `547f132`. Cross-period questions use 2023 Q1–Q3 only.
-_Avoid_: demo FAQ (pressure pack only later)
+Historical private fixture source 12-PDF freeze (ADR 0004, superseded by 0029). Not the product or eval SSOT.
+_Avoid_: current catalog, gold SSOT, demo FAQ
 
 **ingest**:
-A command that writes frozen page text and page-passage chunks from those PDFs into `data/corpus/extracted/`. `read_file`, retrieve, and the citation verifier read only that tree; the ask path does not open a PDF.
-_Avoid_: extract-on-query, putting page text in the checkpointer database
+A CLI that writes frozen locator-unit text and retrieve chunks from official EDGAR primary HTML into an extracted tree. The ask path does not fetch EDGAR or open source filings.
+_Avoid_: extract-on-query, host-graph ingest node, putting filing bytes in the checkpointer database
+
+**contract eval**:
+Default CI harness: scripted model, **eval fixture** only. Required classes: HTML-unit citation pass, unknown locator refuse, catalog miss, cross-period on the fixture. Nine v1 gold cases are not the ceiling.
+_Avoid_: live LLM in default pytest, FinanceBench in default pytest
+
+**capability eval**:
+Opt-in or nightly harness on **product corpus** plus a live model; records coverage, abstain, and citation quality. Not a per-commit gate.
+_Avoid_: web-search text as citations, making this the only eval
 
 **v1 eval slice**:
-Nine hand-authored gold cases after tools exist: three fact, three thin cross-period (2023 Q1–Q3 only), three refuse. Not imported wholesale from `qna_data.csv`; allowlist and broader retrieval evaluations stay out of v1.
-_Avoid_: 40-question matrix, permission leak tests, 195-question commitment, corpus view
+Historical nine hand-authored cases against the private fixture source 12 (ADR 0012, superseded by 0029).
+_Avoid_: 40-question matrix as a v1 commitment, treating nine cases as the current ceiling
