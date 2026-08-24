@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from fin.corpus.errors import IngestMissingError
 from fin.corpus.extracted import load_extracted_tree
 
 
@@ -56,6 +57,10 @@ def list_filings(
     company: str | None = None,
     period: str | None = None,
     *,
+    cik: str | None = None,
+    form: str | None = None,
+    ticker: str | None = None,
+    filing_date: str | None = None,
     manifest_path: Path | None = None,
     extracted_root: Path | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
@@ -65,19 +70,31 @@ def list_filings(
     Filings are sorted by ``document_id`` for deterministic output.
     Unknown filters yield ``{"filings": []}``.
 
-    The optional EDGAR-shaped fields (``cik``, ``accession``,
-    ``filing_date``, ``ticker``, ``form``) are read off the manifest
-    and passed through to the output dict **only when present** —
-    v1 callers still receive the v1 hit shape. T2 owns the additive
-    optional kwargs that surface these fields via filter args.
+    Additive EDGAR-shaped optional filters per ADR 0031: ``cik``,
+    ``form``, ``ticker``, exact ``filing_date``. Filters are
+    AND-combined. Empty filter values (``cik=""`` etc.) behave as
+    empty hits — NOT "match anything" and NOT an exception, per
+    spec "empty hits not exceptions". The new fields are filter
+    inputs only; the v1 output hit shape is preserved until a
+    later ticket extends the output keys.
     """
     if manifest_path is None:
         manifest_path = _DEFAULT_MANIFEST_PATH
     if extracted_root is None:
         extracted_root = _DEFAULT_EXTRACTED_ROOT
 
-    payload = json.loads(manifest_path.read_text())
-    documents = payload["documents"]
+    # Missing / unreadable manifest is the same family of "the
+    # committed corpus is in a known-bad state" failure as a missing
+    # extracted tree (ADR 0020). Translate the low-level I/O error
+    # to the typed ``IngestMissingError`` so the host graph can
+    # fail fast at boot rather than see ``FileNotFoundError``.
+    try:
+        manifest_payload = json.loads(manifest_path.read_text())
+    except FileNotFoundError as exc:
+        raise IngestMissingError(
+            f"manifest not found at {manifest_path}"
+        ) from exc
+    documents = manifest_payload["documents"]
 
     pages_by_doc = load_extracted_tree(manifest_path, extracted_root)
 
@@ -87,6 +104,21 @@ def list_filings(
             continue
         if period is not None and doc["period"] != period:
             continue
+        # EDGAR-shaped optional filters (ADR 0031). Empty-string
+        # filter values behave as empty hits — short-circuit before
+        # any row passes the row loop.
+        if cik is not None:
+            if cik == "" or doc.get("cik") != cik:
+                continue
+        if form is not None:
+            if form == "" or doc.get("form") != form:
+                continue
+        if ticker is not None:
+            if ticker == "" or doc.get("ticker") != ticker:
+                continue
+        if filing_date is not None:
+            if filing_date == "" or doc.get("filing_date") != filing_date:
+                continue
         doc_id = doc["document_id"]
         hit: dict[str, Any] = {
             "document_id": doc_id,
@@ -95,12 +127,10 @@ def list_filings(
             "version": doc["sha256"],
             "page_count": len(pages_by_doc[doc_id]),
         }
-        # T1: do NOT emit the new fields in the catalog hit; the
-        # manifest reader exercises them, but the v1 output shape
-        # stays stable for the ask path until T2 lands additive
-        # optional filters. Reading them here also makes any drift in
-        # the JSON shape surface as a KeyError at catalog boot rather
-        # than at a deeper lookup site.
+        # T2: the new EDGAR-shaped fields are filter inputs only;
+        # the v1 hit shape stays stable. ``_read_edgar_fields`` is
+        # called to validate the manifest shape at boot — drift in
+        # the optional fields surfaces here, not at a deeper site.
         _read_edgar_fields(doc)
         filings.append(hit)
     return {"filings": filings}
