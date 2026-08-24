@@ -41,6 +41,16 @@ Filter semantics
   loader's typed error is reserved for missing/malformed artifacts,
   not "no such document".
 
+The additive EDGAR-shaped filters (``cik`` / ``form`` / ``ticker``
+/ ``filing_date``) per ADR 0031 are evaluated against a manifest
+metadata table passed in at construction time via ``manifest_docs``
+(a ``{document_id: {cik, form, ticker, filing_date, ...}}`` map).
+Empty filter values, unknown values, and conflicting filters all
+return ``{"chunks": []}`` — NOT an exception. When ``manifest_docs``
+is ``None`` (default), the metadata filters are no-ops and only
+``document_id`` is consulted; this preserves the v1 construction
+shape for callers that have not wired the catalog in.
+
 Limit cap
 ---------
 Per ADR 0009: default ``limit`` is 8, hard cap is 20. ``limit <= 0``
@@ -108,6 +118,8 @@ class BM25Adapter:
     def __init__(
         self,
         extracted_tree: dict[str, tuple[ExtractedPage, ...]],
+        *,
+        manifest_docs: dict[str, dict[str, object]] | None = None,
     ) -> None:
         # Flatten the tree into a parallel list of indexed chunks and a
         # parallel list of tokenized passage texts. The two lists must
@@ -129,6 +141,15 @@ class BM25Adapter:
                         )
                     )
                     tokenized_corpus.append(_tokenize(passage.text))
+
+        # EDGAR-shaped optional metadata (ADR 0031). ``None`` keeps
+        # the v1 behavior — metadata filters in ``retrieve`` become
+        # no-ops when the catalog hasn't wired the adapter. A non-
+        # None mapping enables the ``cik`` / ``form`` / ``ticker`` /
+        # ``filing_date`` filters at retrieve time.
+        self._manifest_docs: dict[str, dict[str, object]] | None = (
+            dict(manifest_docs) if manifest_docs is not None else None
+        )
 
         # Build the index once. An empty corpus is valid: the loader
         # may legitimately return ``{}`` (e.g. empty manifest before
@@ -168,12 +189,45 @@ class BM25Adapter:
         """
         return frozenset(ic.document_id for ic in self._indexed)
 
+    def _passes_metadata(self, document_id: str, cik: str | None, form: str | None,
+                         ticker: str | None, filing_date: str | None) -> bool:
+        """AND-evaluate the EDGAR-shaped metadata filters for one doc.
+
+        When ``_manifest_docs`` is ``None`` (the adapter was constructed
+        without catalog wiring), the metadata filters are no-ops and
+        the row passes unconditionally. When ``_manifest_docs`` is
+        present but the row has no entry (unknown document), the
+        row passes too — only ``document_id`` is the hard membership
+        test. Empty filter values (``cik=""`` etc.) are treated as
+        empty hits at the call site before this helper is reached,
+        so they do not appear here.
+        """
+        if self._manifest_docs is None:
+            return True
+        meta = self._manifest_docs.get(document_id)
+        if meta is None:
+            return True
+        if cik is not None and meta.get("cik") != cik:
+            return False
+        if form is not None and meta.get("form") != form:
+            return False
+        if ticker is not None and meta.get("ticker") != ticker:
+            return False
+        if filing_date is not None and meta.get("filing_date") != filing_date:
+            return False
+        return True
+
     # ----- RetrievePort -----
 
     def retrieve(
         self,
         query: str,
+        *,
         document_id: str | None = None,
+        cik: str | None = None,
+        form: str | None = None,
+        ticker: str | None = None,
+        filing_date: str | None = None,
         limit: int = 8,
     ) -> dict[str, list[Chunk]]:
         """Return ``{"chunks": [...]}`` ranked descending by BM25 score.
@@ -186,6 +240,14 @@ class BM25Adapter:
         document_id
             Optional corpus filter. Unknown document_id returns
             ``{"chunks": []}`` without raising.
+        cik / form / ticker / filing_date
+            Additive EDGAR-shaped optional filters (ADR 0031).
+            Empty filter values, unknown values, and conflicting
+            filters all return ``{"chunks": []}`` — NOT an exception.
+            The adapter consults the manifest metadata passed in at
+            construction time (``manifest_docs``) to evaluate these
+            filters; when ``manifest_docs`` is ``None`` the filters
+            are no-ops.
         limit
             Default 8, hard cap 20 (see ``_resolve_limit``).
 
@@ -198,6 +260,18 @@ class BM25Adapter:
         # or BM25 lookup. The model can pass ``""`` or whitespace during
         # abuse; we must NOT treat that as an error.
         if not query or not query.strip():
+            return {"chunks": []}
+
+        # Empty filter values behave as empty hits (ADR 0031 /
+        # spec "empty hits not exceptions"). Catch them early —
+        # before the empty-corpus short-circuit so that the caller
+        # sees the empty contract regardless of corpus state.
+        if (
+            cik == ""
+            or form == ""
+            or ticker == ""
+            or filing_date == ""
+        ):
             return {"chunks": []}
 
         # Empty corpus: nothing to score against. Return the empty
@@ -221,14 +295,19 @@ class BM25Adapter:
         raw_scores = self._bm25.get_scores(query_tokens)
 
         # Enumerate (index, score) pairs, drop the document_id filter
-        # case, and sort descending. ``rank_bm25`` returns 0-or-negative
-        # scores for non-matches; that ordering is preserved naturally
+        # case, AND-evaluate the EDGAR-shaped metadata filters, and
+        # sort descending. ``rank_bm25`` returns 0-or-negative scores
+        # for non-matches; that ordering is preserved naturally
         # because we sort high-to-low.
         scored: list[tuple[int, float]] = []
         for idx, indexed in enumerate(self._indexed):
             if (
                 document_id is not None
                 and indexed.document_id != document_id
+            ):
+                continue
+            if not self._passes_metadata(
+                indexed.document_id, cik, form, ticker, filing_date
             ):
                 continue
             scored.append((idx, float(raw_scores[idx])))

@@ -23,21 +23,33 @@ def list_files(
     company: str | None = None,
     period: str | None = None,
     *,
+    cik: str | None = None,
+    form: str | None = None,
+    ticker: str | None = None,
+    filing_date: str | None = None,
     manifest_path: Path | None = None,
     extracted_root: Path | None = None,
 ) -> dict[str, Any]:
     """ADR 0009 ``list_files`` host tool.
 
     Optional ``company`` / ``period`` filters match the manifest's
-    ``company`` / ``period`` fields exactly (case-sensitive). Unknown
-    filters yield ``{"filings": []}`` (no exception). ``page_count``
-    per filing comes from the committed extracted tree; if that tree
-    is missing, ``IngestMissingError`` propagates so the host graph
-    can fail fast at boot (T6, ADR 0020).
+    ``company`` / ``period`` fields exactly (case-sensitive). The
+    additive EDGAR-shaped optional filters (``cik``, ``form``,
+    ``ticker``, exact ``filing_date``) per ADR 0031 are forwarded
+    through to the catalog. Empty filter values, unknown values,
+    and conflicting filters all yield ``{"filings": []}`` (no
+    exception). ``page_count`` per filing comes from the committed
+    extracted tree; if that tree is missing, ``IngestMissingError``
+    propagates so the host graph can fail fast at boot (T6,
+    ADR 0020).
     """
     return list_filings(
         company=company,
         period=period,
+        cik=cik,
+        form=form,
+        ticker=ticker,
+        filing_date=filing_date,
         manifest_path=manifest_path,
         extracted_root=extracted_root,
     )

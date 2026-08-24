@@ -25,9 +25,13 @@ from fin.retrieve.port import Chunk
 
 def retrieve(
     query: str,
-    document_id: str | None = None,
-    limit: int = 8,
     *,
+    document_id: str | None = None,
+    cik: str | None = None,
+    form: str | None = None,
+    ticker: str | None = None,
+    filing_date: str | None = None,
+    limit: int = 8,
     adapter: BM25Adapter | None = None,
 ) -> dict[str, list[Chunk]]:
     """Adapter-bound retrieve: returns the ADR 0009 contract shape.
@@ -38,8 +42,13 @@ def retrieve(
         Lexical query. Empty / whitespace-only queries yield
         ``{"chunks": []}`` without touching the index.
     document_id
-        Optional filter. Unknown document_id yields
+        Optional corpus filter. Unknown document_id yields
         ``{"chunks": []}``.
+    cik / form / ticker / filing_date
+        Additive EDGAR-shaped optional filters (ADR 0031), forwarded
+        to the adapter. Empty filter values, unknown values, and
+        conflicting filters all yield ``{"chunks": []}`` — NOT an
+        exception.
     limit
         Default 8, hard cap 20 (ADR 0009). The BM25Adapter resolves
         the cap internally; we just pass through.
@@ -66,6 +75,10 @@ def retrieve(
     return adapter.retrieve(
         query=query,
         document_id=document_id,
+        cik=cik,
+        form=form,
+        ticker=ticker,
+        filing_date=filing_date,
         limit=limit,
     )
 
