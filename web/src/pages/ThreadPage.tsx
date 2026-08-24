@@ -7,6 +7,7 @@ import AnswerWithCitations from "../components/CitationChips";
 import Composer from "../components/Composer";
 import CorpusCard from "../components/CorpusCard";
 import type { Turn } from "../types";
+import { resolveTurnTrack, showResearchTrackHint } from "../softTrack";
 import { useWorkspaceStore } from "../store";
 
 // T4 (spec line 38-39): the interrupted-run banner. Shown when
@@ -230,6 +231,7 @@ function TurnView({ turn }: { turn: Turn }) {
             <StatusLine
               status={turn.status}
               reason={turn.status_reason ?? ""}
+              track={resolveTurnTrack(turn)}
             />
           ) : null}
           {turn.answer ? (
@@ -306,13 +308,30 @@ function ThinkingAccordion({
 function StatusLine({
   status,
   reason: _reason,
+  track,
 }: {
   status: Turn["status"];
   reason: string;
+  track?: Turn["track"];
 }) {
+  // Soft-Track T5: light research-only hint on the status line.
+  // No Chat|Research mode picker; non-research / missing track = no hint.
+  const researchHint = showResearchTrackHint(track);
+  const hint = researchHint ? (
+    <span
+      data-testid="research-track-hint"
+      className="ml-1.5 normal-case tracking-normal font-normal text-gray-400"
+    >
+      · 研究
+    </span>
+  ) : null;
+
   if (status === "done") {
     return (
-      <p className="text-xs uppercase tracking-wide text-gray-400 mb-1">完成</p>
+      <p className="text-xs uppercase tracking-wide text-gray-400 mb-1">
+        完成
+        {hint}
+      </p>
     );
   }
   // T2 fix: refuse / step_cap ordinary-person copy is the server's
@@ -323,6 +342,7 @@ function StatusLine({
   return (
     <p className="text-xs uppercase tracking-wide text-gray-400 mb-1">
       {label}
+      {hint}
     </p>
   );
 }
