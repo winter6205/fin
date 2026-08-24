@@ -50,8 +50,8 @@ On the **research track**, the model repeatedly picks `list_files`, `retrieve`, 
 _Avoid_: pipeline, chain, fixed graph of retrieve-then-generate, requiring the citation verifier on dialogue/clarify/off_topic
 
 **list_files**:
-v1 catalog tool over filings in the extracted tree. Optional `company` / `period`; S1 also optional `form` and `ticker` (`ticker` means the same issuer code as `company`; conflict → `filings: []`). Each hit is `{document_id, company, period, version, page_count}` until an output-key change is specified; unknown filters yield `filings: []`.
-_Avoid_: list_filings, list_documents, glob, renaming `company` to `ticker` as a breaking change
+Catalog tool over **filings** in the extracted tree, keyed like EDGAR submissions: CIK, form, accession, filing_date always exist on a live row; ticker and fiscal period are optional. v1 callers still pass `company` / `period`; additive optional `cik` / `form` / `ticker` / `filing_date`; hits stay `{document_id, company, period, version, page_count}` until output keys are extended; unknown or conflicting filters yield `filings: []`.
+_Avoid_: list_filings, list_documents, glob, requiring ticker, treating company as forever equal to ticker, a generic CMS file browser
 
 **get_xbrl_fact**:
 Research-track tool that reads a tagged financial fact from ingested iXBRL (or companyfacts derived from it). XBRL is the reporting format, not a website. A numeric citation gate matches the claimed value to that fact; the model does not invent the arithmetic.
