@@ -9,7 +9,7 @@ This repository is the SSOT. Do not keep parallel copies under `projects/test`.
 | Path                                                     | What                                                                                 |
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------ |
 | `docs/CONTEXT.md`                                        | Domain terms                                                                         |
-| `docs/adr/`                                              | Accepted decisions (0001–0022)                                                       |
+| `docs/adr/`                                              | Accepted decisions (0001–0027)                                                       |
 | `docs/research/002-demo-corpus-and-evidence-contract.md` | Inherited corpus/evidence contract (snapshot from iknow wayfinder)                   |
 | `data/corpus/pdf/`                                       | Frozen 12 SEC 10-Q PDFs (AAPL, MSFT, AMZN)                                           |
 | `data/corpus/manifest.json`                              | document_id, periods, sha256, upstream commit                                        |
@@ -19,7 +19,7 @@ Upstream freeze: [docugami/private fixture source](https://github.com/docugami/p
 
 ## Status
 
-v1 host-agent ships: ingest artifacts are in git; CLI (`python -m fin`) and HTTP `POST /ask` share one compiled host graph. Default model is `fin/MiniMax-M3` via `FIN_MODEL` + `FIN_BASE_URL` (ADR 0022).
+v1 host-agent ships: ingest artifacts are in git; CLI (`python -m fin`) and HTTP `POST /ask` share one compiled host graph. Default model is `fin/MiniMax-M3` via `FIN_MODEL` + `FIN_BASE_URL` (ADR 0022). Soft-Track (ADR 0027, that pull request) routes each turn to `dialogue` / `clarify` / `off_topic` / `research`; only research binds tools and the citation verifier. Opt-in contracts: `uv run pytest -q -m soft_track`.
 
 ## Running the workspace server (T1)
 
