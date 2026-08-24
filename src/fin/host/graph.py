@@ -471,6 +471,7 @@ def compile_graph(
     known_document_ids: set[str] | None = None,
     step_cap: int = STEP_CAP,
     recursion_limit: int = RECURSION_LIMIT,
+    classify_model: Any | None = None,
 ) -> "_LockedGraph":
     """Build the v1 host graph (T6).
 
@@ -513,6 +514,11 @@ def compile_graph(
         from ``fin.host.state`` (currently ``2 * STEP_CAP + 6 = 70``).
         Strictly greater than ``step_cap`` so the agent-loop fuse
         fires first (spec success criteria item 5).
+    classify_model
+        Soft-Track T4: optional model for ambiguous LLM classify.
+        When ``None`` (default), the LLM tier is skipped so
+        ScriptedChatModel research suites keep the rules /
+        conditional_policy path for bare ``q``.
 
     Returns
     -------
@@ -583,15 +589,19 @@ def compile_graph(
     # ----- node functions -----
 
     def classify_node(state: AgentState) -> dict[str, Any]:
-        """Soft-Track: rules + snapshot inherit before leaves.
+        """Soft-Track: tiered track decision before leaves.
 
-        Does not call a model. T4 may pass ``classify_model`` into
-        ``decide_track``. Appends ``status_snapshots`` when the
-        utterance sets or changes research context.
+        Passes ``status_snapshots`` and optional ``classify_model``
+        into ``decide_track``. Appends snapshots when the utterance
+        sets or changes research context.
         """
         messages = list(state.get("messages") or [])
         prior_snapshots = list(state.get("status_snapshots") or [])
-        decision = decide_track(messages, snapshots=prior_snapshots)
+        decision = decide_track(
+            messages,
+            snapshots=prior_snapshots,
+            classify_model=classify_model,
+        )
         update: dict[str, Any] = {
             "track": decision.track,
             "track_decision": {
@@ -928,6 +938,7 @@ def compile_graph(
     return _make_locked_graph(
         checkpointer=checkpointer,
         model=model,
+        classify_model=classify_model,
         step_cap=step_cap,
         recursion_limit=recursion_limit,
         compiled_graph=compiled,
@@ -960,10 +971,12 @@ def _make_locked_graph(
     checkpointer: Any,
     model: Any,
     step_cap: int,
+    classify_model: Any | None = None,
 ) -> "_LockedGraph":
     key = (
         id(checkpointer),
         id(model),
+        id(classify_model) if classify_model is not None else 0,
         int(step_cap),
         int(recursion_limit),
     )

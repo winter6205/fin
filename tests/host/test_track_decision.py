@@ -41,10 +41,10 @@ def test_filing_ask_decides_research() -> None:
 
 
 def test_underspecified_metric_ask_decides_clarify() -> None:
-    """Filing-shaped ask missing company and/or period → clarify (T2)."""
+    """Filing-shaped ask missing company and/or period → clarify."""
     decision = decide_track([HumanMessage(content="What was revenue?")])
     assert decision.track == "clarify"
-    assert decision.decision_tier == "rules"
+    assert decision.decision_tier == "clarify"
     assert decision.signals.get("missing_slots")
 
 
@@ -53,6 +53,7 @@ def test_metric_with_company_missing_period_decides_clarify() -> None:
         [HumanMessage(content="What was AAPL net sales?")]
     )
     assert decision.track == "clarify"
+    assert decision.decision_tier == "clarify"
     assert "period" in (decision.signals.get("missing_slots") or [])
 
 
@@ -61,6 +62,7 @@ def test_metric_with_period_missing_company_decides_clarify() -> None:
         [HumanMessage(content="What was net sales in 2023 Q3?")]
     )
     assert decision.track == "clarify"
+    assert decision.decision_tier == "clarify"
     assert "company" in (decision.signals.get("missing_slots") or [])
 
 
