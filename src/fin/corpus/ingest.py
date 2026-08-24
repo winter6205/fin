@@ -42,6 +42,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +50,12 @@ from pathlib import Path
 import pdfplumber
 
 from fin.corpus.errors import ManifestShaMismatchError
+from fin.corpus.ocr import (
+    OCREngine,
+    OCRError,
+    OcrRequiredUnavailableError,
+    detect_ocr_required,
+)
 
 
 _PASSAGE_SIZE = 512
@@ -166,7 +173,12 @@ def _chunk_page_text(text: str) -> list[_RawPassage]:
 
 
 def _page_payload(
-    document_id: str, version: str, page: int, text: str
+    document_id: str,
+    version: str,
+    page: int,
+    text: str,
+    *,
+    ocr_applied: bool = False,
 ) -> bytes:
     return json.dumps(
         {
@@ -174,11 +186,176 @@ def _page_payload(
             "version": version,
             "page": page,
             "text": text,
+            "ocr_applied": ocr_applied,
         },
         ensure_ascii=False,
         indent=2,
         sort_keys=True,
     ).encode("utf-8")
+
+
+def _run_ocr_engine(
+    *,
+    engine: OCREngine,
+    pdf_path: Path,
+    page_num: int,
+    document_id: str,
+) -> str:
+    """Invoke ``engine.recognize`` and coerce every failure shape into
+    the typed ``OcrRequiredUnavailableError``.
+
+    EXIT: empty OCR text or ``OCRError`` from the engine -> typed EXIT.
+    """
+    try:
+        text = engine.recognize(source=pdf_path, page=page_num)
+    except OcrRequiredUnavailableError:
+        # Re-raise verbatim — must not be re-wrapped.
+        raise
+    except OCRError as exc:
+        raise OcrRequiredUnavailableError(
+            f"OCR failed for {document_id} page {page_num}: {exc}"
+        ) from exc
+    if not text or not text.strip():
+        # Spec: OCR-required units must not succeed with empty
+        # frozen text.
+        raise OcrRequiredUnavailableError(
+            f"OCR returned empty text for {document_id} page {page_num}"
+        )
+    return text
+
+
+def _process_page_with_ocr(
+    *,
+    page: object,
+    page_num: int,
+    document_id: str,
+    pdf_path: Path,
+    ocr_engine: OCREngine | None,
+    ocr_required_marker: str | None,
+) -> tuple[str, bool]:
+    """Run one page through pdfplumber + optional OCR.
+
+    Returns ``(text, ocr_applied)`` for the page. The text is the
+    pdfplumber extraction unless OCR was required and succeeded, in
+    which case the OCR text replaces it. Raises the typed
+    ``OcrRequiredUnavailableError`` on every OCR failure shape
+    (no engine / engine raised / empty text); the caller is
+    responsible for cleanup.
+    """
+    text = page.extract_text() or ""
+    if ocr_required_marker is None and not detect_ocr_required(
+        text=text,
+        image_count=len(getattr(page, "images", []) or []),
+    ):
+        return text, False
+    if ocr_engine is None:
+        # EXIT: OCR-required unit + no engine -> typed EXIT; caller
+        # cleans up partial doc_dir and re-raises.
+        raise OcrRequiredUnavailableError(
+            f"{document_id} page {page_num} needs OCR but no "
+            "ocr_engine was supplied; pass an OCREngine or install "
+            "the [ocr] extra"
+        )
+    text = _run_ocr_engine(
+        engine=ocr_engine,
+        pdf_path=pdf_path,
+        page_num=page_num,
+        document_id=document_id,
+    )
+    return text, True
+
+
+def _ingest_one_page(
+    *,
+    page: object,
+    page_num: int,
+    document_id: str,
+    pdf_path: Path,
+    doc_dir: Path,
+    version: str,
+    ocr_engine: OCREngine | None,
+    ocr_required_marker: str | None,
+) -> tuple[str, bool, bool]:
+    """Run one page through OCR (if required) and write its
+    artifacts. Returns ``(text, ocr_applied, page_was_written)`` —
+    the last flag mirrors ``_write_if_drifted``'s True/False so the
+    caller can split the cumulative write/skip counters. Raises
+    ``OcrRequiredUnavailableError`` for OCR-required failure shapes;
+    the caller owns the partial-doc_dir cleanup.
+    """
+    text, ocr_applied = _process_page_with_ocr(
+        page=page,
+        page_num=page_num,
+        document_id=document_id,
+        pdf_path=pdf_path,
+        ocr_engine=ocr_engine,
+        ocr_required_marker=ocr_required_marker,
+    )
+    page_bytes = _page_payload(
+        document_id=document_id,
+        version=version,
+        page=page_num,
+        text=text,
+        ocr_applied=ocr_applied,
+    )
+    passages_bytes = _passages_payload(
+        document_id=document_id,
+        version=version,
+        page=page_num,
+        passages=_chunk_page_text(text),
+    )
+    page_filename = f"page-{page_num:0{_PAGE_NUM_WIDTH}d}.json"
+    passages_filename = f"passages-{page_num:0{_PAGE_NUM_WIDTH}d}.json"
+    wrote_page = _write_if_drifted(doc_dir / page_filename, page_bytes)
+    _write_if_drifted(doc_dir / passages_filename, passages_bytes)
+    return text, ocr_applied, wrote_page
+
+
+def _ingest_all_pages(
+    *,
+    pdf_path: Path,
+    document_id: str,
+    doc_dir: Path,
+    version: str,
+    ocr_engine: OCREngine | None,
+    ocr_required_marker: str | None,
+) -> tuple[int, list[int], int, int]:
+    """Walk every page of ``pdf_path`` through ingest + optional OCR.
+
+    Returns ``(pages_this_doc, ocr_applied_pages, written_delta,
+    skipped_delta)``. Raises ``OcrRequiredUnavailableError`` for
+    OCR-required failure shapes; the caller owns the partial-doc_dir
+    cleanup.
+    """
+    pages_this_doc = 0
+    ocr_applied_pages: list[int] = []
+    written_delta = 0
+    skipped_delta = 0
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for page_idx, page in enumerate(pdf.pages, start=1):
+            _text, ocr_applied, wrote_page = _ingest_one_page(
+                page=page,
+                page_num=page_idx,
+                document_id=document_id,
+                pdf_path=pdf_path,
+                doc_dir=doc_dir,
+                version=version,
+                ocr_engine=ocr_engine,
+                ocr_required_marker=ocr_required_marker,
+            )
+            pages_this_doc += 1
+            if wrote_page:
+                written_delta += 1
+            else:
+                skipped_delta += 1
+            if ocr_applied:
+                ocr_applied_pages.append(page_idx)
+    return (
+        pages_this_doc,
+        ocr_applied_pages,
+        written_delta,
+        skipped_delta,
+    )
 
 
 def _passages_payload(
@@ -210,6 +387,8 @@ def run_ingest(
     pdf_dir: Path,
     extracted_root: Path,
     facts_root: Path | None = None,
+    ocr_engine: OCREngine | None = None,
+    ocr_required_marker: str | None = None,
 ) -> IngestResult:
     """Run the idempotent ingest command.
 
@@ -228,12 +407,32 @@ def run_ingest(
         ``None``, defaults to ``<data/corpus>/facts``. ``write_facts``
         is called for every document the manifest lists, populating
         the seed facts the later ``get_xbrl_fact`` lookup will read.
+    ocr_engine:
+        Optional OCR engine (``fin.corpus.ocr.OCREngine``). When
+        ``None`` (default), OCR-required units raise the typed
+        ``OcrRequiredUnavailableError`` and the unit is not
+        written — per spec § Boundaries: "OCR is required (collapsed
+        text-layer + images) AND engine/extra is missing OR OCR
+        fails -> ingest does NOT succeed that unit with empty
+        frozen text; typed non-zero / error, not silent skip."
+    ocr_required_marker:
+        Force OCR on every page regardless of the
+        ``detect_ocr_required`` heuristic. Used by tests to drive
+        the OCR path without a real scanned-PDF fixture. When
+        truthy, the page is treated as OCR-required even if the
+        text-layer extraction is rich.
 
     Raises
     ------
     ManifestShaMismatchError
         If the PDF file referenced by a manifest entry is missing, or
         if its sha256 does not match the manifest entry.
+    OcrRequiredUnavailableError
+        If an OCR-required unit is hit (collapsed text-layer +
+        images, or ``ocr_required_marker`` is set) and no engine is
+        supplied, or the engine raises / returns empty text. Per
+        spec, the unit is not marked complete and no frozen text
+        is written.
 
     IngestMissingError
         Not raised here — see ``fin.corpus.extracted.load_extracted_tree``
@@ -310,40 +509,40 @@ def run_ingest(
             continue
 
         pages_this_doc = 0
-        with pdfplumber.open(str(pdf_path)) as pdf:
-            for one_based_page_idx, page in enumerate(pdf.pages, start=1):
-                text = page.extract_text() or ""
-                page_bytes = _page_payload(
-                    document_id=document_id,
-                    version=expected_sha,
-                    page=one_based_page_idx,
-                    text=text,
-                )
-                passages_bytes = _passages_payload(
-                    document_id=document_id,
-                    version=expected_sha,
-                    page=one_based_page_idx,
-                    passages=_chunk_page_text(text),
-                )
-                page_filename = f"page-{one_based_page_idx:0{_PAGE_NUM_WIDTH}d}.json"
-                passages_filename = (
-                    f"passages-{one_based_page_idx:0{_PAGE_NUM_WIDTH}d}.json"
-                )
-                if _write_if_drifted(doc_dir / page_filename, page_bytes):
-                    pages_written += 1
-                else:
-                    pages_skipped += 1
-                # The passages file is written with the same predicate,
-                # so its bytes match the page file's drift state — both
-                # files are either present-and-correct or absent-and-new.
-                _write_if_drifted(doc_dir / passages_filename, passages_bytes)
-                pages_total += 1
-                pages_this_doc += 1
+        ocr_applied_pages: list[int] = []
+        try:
+            (
+                pages_this_doc,
+                ocr_applied_pages,
+                pages_written_delta,
+                pages_skipped_delta,
+            ) = _ingest_all_pages(
+                pdf_path=pdf_path,
+                document_id=document_id,
+                doc_dir=doc_dir,
+                version=expected_sha,
+                ocr_engine=ocr_engine,
+                ocr_required_marker=ocr_required_marker,
+            )
+        except OcrRequiredUnavailableError:
+            # EXIT: OCR failure on any page -> clean partial doc_dir,
+            # propagate typed EXIT so the CLI exits non-zero.
+            if doc_dir.exists():
+                shutil.rmtree(doc_dir)
+            raise
 
-        index[document_id] = {
+        pages_written += pages_written_delta
+        pages_skipped += pages_skipped_delta
+        pages_total += pages_this_doc
+
+        doc_index_entry: dict[str, object] = {
             "version": expected_sha,
             "page_count": pages_this_doc,
         }
+        if ocr_applied_pages:
+            doc_index_entry["ocr_applied"] = True
+            doc_index_entry["ocr_applied_pages"] = sorted(ocr_applied_pages)
+        index[document_id] = doc_index_entry
 
     # Rewrite the index deterministically (sorted by document_id).
     index_payload = json.dumps(
@@ -400,6 +599,44 @@ def _default_paths() -> tuple[Path, Path, Path, Path]:
     )
 
 
+def _resolve_ocr_engine(name: str) -> OCREngine | None:
+    """Resolve the ``--ocr-engine`` CLI choice.
+
+    * ``tesseract`` — use ``TesseractEngine`` if the optional
+      ``pytesseract`` extra is installed; fall back to ``None`` with
+      a clear stderr message otherwise. OCR-required units will then
+      fail with the typed ``OcrRequiredUnavailableError`` (spec
+      contract: no silent skip).
+    * ``none`` — always ``None``; OCR-required units fail typed.
+
+    Returns ``None`` when OCR is disabled (no engine). The mock
+    engine lives in ``tests/corpus/test_ocr.py``; tests construct
+    ``MockOCREngine`` directly and pass it via ``run_ingest``,
+    bypassing this helper entirely.
+    """
+    if name == "none":
+        return None
+    if name == "tesseract":
+        try:
+            import pytesseract  # noqa: F401
+        except Exception as exc:
+            # EXIT: pytesseract missing (optional [ocr] extra not
+            # installed OR tesseract binary absent) -> OCR disabled;
+            # OCR-required units will fail typed via
+            # OcrRequiredUnavailableError, no silent skip.
+            print(
+                "pytesseract is not installed; install with "
+                "`uv sync --extra ocr` (requires the tesseract "
+                f"system binary). OCR will be disabled: {exc}",
+                file=sys.stderr,
+            )
+            return None
+        from fin.corpus.ocr import TesseractEngine
+
+        return TesseractEngine()
+    raise ValueError(f"unknown --ocr-engine choice: {name!r}")
+
+
 def main(argv: list[str] | None = None) -> int:
     default_manifest, default_pdf_dir, default_extracted, default_facts = (
         _default_paths()
@@ -418,12 +655,28 @@ def main(argv: list[str] | None = None) -> int:
         "--extracted-root", type=Path, default=default_extracted
     )
     parser.add_argument("--facts-root", type=Path, default=default_facts)
+    parser.add_argument(
+        "--ocr-engine",
+        choices=("tesseract", "none"),
+        default="tesseract",
+        help=(
+            "OCR backend. ``tesseract`` (default) requires the "
+            "[ocr] extra + tesseract binary; falls back to no "
+            "engine with a stderr message if either is missing. "
+            "``none`` disables OCR (OCR-required units fail typed). "
+            "Test doubles are constructed in-process and passed "
+            "to ``run_ingest`` directly — they do not go through "
+            "this CLI."
+        ),
+    )
     args = parser.parse_args(argv)
+    ocr_engine = _resolve_ocr_engine(args.ocr_engine)
     result = run_ingest(
         manifest_path=args.manifest,
         pdf_dir=args.pdf_dir,
         extracted_root=args.extracted_root,
         facts_root=args.facts_root,
+        ocr_engine=ocr_engine,
     )
     print(
         f"ingest: documents={result.documents} "
@@ -434,7 +687,7 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-__all__ = ["IngestResult", "run_ingest", "main"]
+__all__ = ["IngestResult", "run_ingest", "main", "_resolve_ocr_engine"]
 
 
 if __name__ == "__main__":

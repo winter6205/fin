@@ -17,6 +17,9 @@ dependencies = [
     "uvicorn>=0.30.0",
 ]
 
+[project.optional-dependencies]
+ocr = ["pytesseract>=0.3.10"]  # requires system tesseract binary
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
