@@ -84,16 +84,18 @@ _TRACK_PROMPTS: dict[str, tuple[str, str]] = {
 
 def messages_for_model(
     messages: list[BaseMessage],
-    track: Track | Literal["research"] = "research",
+    track: Track | Literal["research"] = "dialogue",
 ) -> list[BaseMessage]:
     """Return the model-facing list with the track prompt first.
 
-    Research is the default so existing callers keep the citation /
-    tool contract. Call-scoped only: do not write the SystemMessage
-    into checkpointed ``messages``.
+    Default is ``"dialogue"`` — there is no single global default
+    track (specs/soft-track.md); a call here is call-scoped and
+    must never pin the host onto a single branch by virtue of
+    missing input. Call-scoped only: do not write the
+    SystemMessage into checkpointed ``messages``.
     """
     marker, prompt = _TRACK_PROMPTS.get(
-        track, (HOST_INSTRUCTIONS_MARKER, HOST_SYSTEM_PROMPT)
+        track, (DIALOGUE_INSTRUCTIONS_MARKER, DIALOGUE_SYSTEM_PROMPT)
     )
     if (
         messages

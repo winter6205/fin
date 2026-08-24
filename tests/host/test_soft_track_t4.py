@@ -138,7 +138,10 @@ def test_graph_classify_exit_does_not_crash_or_enter_gate():
 
 
 def test_scripted_research_q_still_rules_path_without_classify_model():
-    """Default compile (no classify_model): bare q stays conditional_policy."""
+    """Default compile (no classify_model): bare q stays conditional_policy.
+
+    No single global default track: the residual cascade lands on
+    dialogue, not research (specs/soft-track.md)."""
     decision = decide_track([HumanMessage(content="q")])
-    assert decision.track == "research"
+    assert decision.track == "dialogue"
     assert decision.decision_tier == "conditional_policy"

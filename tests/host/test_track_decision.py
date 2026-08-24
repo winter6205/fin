@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from langchain_core.messages import HumanMessage
 
 from fin.host.track_decision import TrackDecision, decide_track
@@ -26,11 +27,15 @@ def test_off_domain_decides_off_topic_rules_tier() -> None:
     assert decision.signals.get("off_domain") is True
 
 
-def test_short_ambiguous_q_defaults_to_research() -> None:
-    """CRITICAL: existing ScriptedChatModel bounce suites use HumanMessage('q')."""
+def test_short_ambiguous_q_defaults_to_dialogue() -> None:
+    """CRITICAL: no single global default track — the residual
+    branch resolves bare ``q`` to dialogue, not research
+    (specs/soft-track.md). ScriptedChatModel bounce suites that
+    send HumanMessage('q') now exercise the dialogue leaf."""
     decision = decide_track([HumanMessage(content="q")])
-    assert decision.track == "research"
-    assert decision.decision_tier in ("rules", "conditional_policy")
+    assert decision.track == "dialogue"
+    assert decision.decision_tier == "conditional_policy"
+    assert decision.signals.get("fallback") == "dialogue"
 
 
 def test_filing_ask_decides_research() -> None:
@@ -71,3 +76,17 @@ def test_fully_specified_filing_ask_stays_research() -> None:
         [HumanMessage(content="What was AAPL net sales in 2023 Q3?")]
     )
     assert decision.track == "research"
+
+
+@pytest.mark.soft_track
+@pytest.mark.parametrize("text", ["hmm", "ok thanks"])
+def test_no_signal_residual_decides_dialogue_conditional_policy(text) -> None:
+    """No single global default track (specs/soft-track.md): an
+    utterance that matches no greeting, no off-domain, no filing ask,
+    no research signal, and has no snapshot must resolve the residual
+    conditional_policy branch to ``dialogue``, not ``research``."""
+    decision = decide_track([HumanMessage(content=text)], classify_model=None)
+    assert isinstance(decision, TrackDecision)
+    assert decision.track == "dialogue"
+    assert decision.decision_tier == "conditional_policy"
+    assert decision.signals.get("fallback") == "dialogue"

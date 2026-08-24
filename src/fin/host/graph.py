@@ -516,9 +516,10 @@ def compile_graph(
         fires first (spec success criteria item 5).
     classify_model
         Soft-Track T4: optional model for ambiguous LLM classify.
-        When ``None`` (default), the LLM tier is skipped so
-        ScriptedChatModel research suites keep the rules /
-        conditional_policy path for bare ``q``.
+        When ``None`` (default), the LLM tier is skipped. The
+        residual branch in ``decide_track`` then resolves the
+        bare-``q`` cascade to ``track="dialogue"`` (not research),
+        so the model leaf is not the silent global default.
 
     Returns
     -------
@@ -872,7 +873,11 @@ def compile_graph(
         state: AgentState,
     ) -> Literal["dialogue", "clarify", "off_topic", "model"]:
         """Route Soft-Track leaves after classify."""
-        track = state.get("track", "research")
+        # No single global default track (specs/soft-track.md):
+        # missing track defaults to the dialogue leaf rather than
+        # the research model so the conditional edge mirrors the
+        # residual branch in ``decide_track``.
+        track = state.get("track", "dialogue")
         if track == "dialogue":
             return "dialogue"
         if track == "clarify":

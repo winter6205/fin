@@ -348,8 +348,9 @@ def test_must_research_tools_span_done_with_citation(aapl_page1_text: str) -> No
     _assert_track_decision(out["track_decision"], track="research")
 
 
-def test_must_research_boundary_bare_q_is_research(aapl_page1_text: str) -> None:
-    """Boundary: bare ``q`` → research via conditional_policy."""
+def test_must_research_boundary_bare_q_is_dialogue(aapl_page1_text: str) -> None:
+    """Boundary (no single global default track): bare ``q`` → dialogue
+    via the residual conditional_policy branch, NOT research."""
     span = aapl_page1_text[:80]
     model = ScriptedChatModel(
         script=[
@@ -381,9 +382,8 @@ def test_must_research_boundary_bare_q_is_research(aapl_page1_text: str) -> None
         {**reset_input_state("q"), "evidence": []},
         config=_cfg("ship-research-q"),
     )
-    assert out["track"] == "research"
+    assert out["track"] == "dialogue"
     assert out["status"] == "done"
-    assert len(out["citations"]) >= 1
 
 
 def test_must_research_boundary_workspace_sse_track_and_history(
