@@ -1,19 +1,22 @@
-"""Call-scoped host instructions for the agent loop.
+"""Call-scoped host instructions for Soft-Track model leaves.
 
-The compiled graph historically forwarded ``state["messages"]``
-straight to the model: HumanMessage + tool results + the gate's
-hidden bounce SystemMessage. MiniMax then answers from parametric
-memory, the citation gate bounces three times, and the workspace
-run refuses. These instructions are prepended at ``model_node``
-call time and are NOT written back to the checkpoint, so follow-ups
-do not stack copies and GET history never dumps them as a turn.
+Per-track system prompts are prepended at model call time and are
+NOT written back to the checkpoint, so follow-ups do not stack
+copies and GET history never dumps them as a turn.
 """
 
 from __future__ import annotations
 
+from typing import Literal
+
 from langchain_core.messages import BaseMessage, SystemMessage
 
+from fin.host.track_decision import Track
+
 HOST_INSTRUCTIONS_MARKER: str = "[FIN_HOST_INSTRUCTIONS]"
+DIALOGUE_INSTRUCTIONS_MARKER: str = "[FIN_DIALOGUE_INSTRUCTIONS]"
+OFF_TOPIC_INSTRUCTIONS_MARKER: str = "[FIN_OFF_TOPIC_INSTRUCTIONS]"
+# T2 will add CLARIFY_INSTRUCTIONS_MARKER.
 
 HOST_SYSTEM_PROMPT: str = (
     f"{HOST_INSTRUCTIONS_MARKER}\n"
@@ -39,24 +42,70 @@ HOST_SYSTEM_PROMPT: str = (
     "spans, then stop calling tools."
 )
 
+DIALOGUE_SYSTEM_PROMPT: str = (
+    f"{DIALOGUE_INSTRUCTIONS_MARKER}\n"
+    "You are fin, a conversational research assistant for a frozen "
+    "SEC 10-Q corpus (AAPL, MSFT, AMZN; 2022 Q3 and 2023 Q1–Q3).\n"
+    "Respond warmly and briefly to greetings and social small-talk. "
+    "Do not invent filing facts. Do not claim you retrieved documents. "
+    "Invite the operator to ask about a company, period, or metric "
+    "when appropriate."
+)
 
-def messages_for_model(messages: list[BaseMessage]) -> list[BaseMessage]:
-    """Return the model-facing list with host instructions first.
+OFF_TOPIC_SYSTEM_PROMPT: str = (
+    f"{OFF_TOPIC_INSTRUCTIONS_MARKER}\n"
+    "You are fin. Your capability is SEC 10-Q research over a frozen "
+    "12-filing corpus (AAPL, MSFT, AMZN; 2022 Q3 and 2023 Q1–Q3).\n"
+    "The operator's ask is outside that scope. Reply with a soft, "
+    "polite capability-bound refusal in ordinary prose. Do not invent "
+    "filing facts. Do not use a fixed redirect string as the only "
+    "reply — write a natural soft decline and briefly name what you "
+    "can help with instead."
+)
 
-    If the checkpoint already starts with this SystemMessage (should
-    not happen on the call-scoped path), do not prepend a second copy.
+_TRACK_PROMPTS: dict[str, tuple[str, str]] = {
+    "research": (HOST_INSTRUCTIONS_MARKER, HOST_SYSTEM_PROMPT),
+    "dialogue": (DIALOGUE_INSTRUCTIONS_MARKER, DIALOGUE_SYSTEM_PROMPT),
+    "off_topic": (OFF_TOPIC_INSTRUCTIONS_MARKER, OFF_TOPIC_SYSTEM_PROMPT),
+    # clarify deferred to T2 — fall back to research instructions if
+    # somehow requested early.
+    "clarify": (HOST_INSTRUCTIONS_MARKER, HOST_SYSTEM_PROMPT),
+}
+
+
+def messages_for_model(
+    messages: list[BaseMessage],
+    track: Track | Literal["research"] = "research",
+) -> list[BaseMessage]:
+    """Return the model-facing list with the track prompt first.
+
+    Research is the default so existing callers keep the citation /
+    tool contract. Call-scoped only: do not write the SystemMessage
+    into checkpointed ``messages``.
     """
+    marker, prompt = _TRACK_PROMPTS.get(
+        track, (HOST_INSTRUCTIONS_MARKER, HOST_SYSTEM_PROMPT)
+    )
     if (
         messages
         and isinstance(messages[0], SystemMessage)
-        and HOST_INSTRUCTIONS_MARKER in str(messages[0].content)
+        and marker in str(messages[0].content)
     ):
         return list(messages)
-    return [SystemMessage(content=HOST_SYSTEM_PROMPT), *messages]
+    return [SystemMessage(content=prompt), *messages]
+
+
+# Architecture alias used by Soft-Track leaves.
+messages_for_track = messages_for_model
 
 
 __all__ = [
+    "DIALOGUE_INSTRUCTIONS_MARKER",
+    "DIALOGUE_SYSTEM_PROMPT",
     "HOST_INSTRUCTIONS_MARKER",
     "HOST_SYSTEM_PROMPT",
+    "OFF_TOPIC_INSTRUCTIONS_MARKER",
+    "OFF_TOPIC_SYSTEM_PROMPT",
     "messages_for_model",
+    "messages_for_track",
 ]
