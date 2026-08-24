@@ -54,8 +54,8 @@ Catalog tool over **filings** in the extracted tree, keyed like EDGAR submission
 _Avoid_: list_filings, list_documents, glob, requiring ticker, treating company as forever equal to ticker, a generic CMS file browser
 
 **get_xbrl_fact**:
-Research-track tool that reads a tagged financial fact from ingested iXBRL (or companyfacts derived from it). XBRL is the reporting format, not a website. A numeric citation gate matches the claimed value to that fact; the model does not invent the arithmetic.
-_Avoid_: treating XBRL as a site name, OCR or vision as the number SSOT, a `verify` tool
+Research-track **lookup** of one tagged financial fact from an ingest-built fact table (concept, period, issuer/document). XBRL is the reporting format, not a website. A numeric citation gate matches the claimed value to that row; the model does not invent the arithmetic. Embeddings may later resolve concept aliases; they do not author the number.
+_Avoid_: treating XBRL as a site name, OCR or vision as the number SSOT, a `verify` tool, using retrieve/embeddings as the fact SSOT
 
 **XBRL**:
 The tagged-numbers format inside official 10-Q/10-K iXBRL. Not a website; SEC.gov is the filing host.
