@@ -2451,11 +2451,10 @@ def test_bounce_retry_emits_answer_reset_between_attempts(
     client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
 ) -> None:
     """When the citation gate BOUNCES an attempt (hidden
-    SystemMessage), the wire must signal the retry boundary with an
-    ``answer`` reset frame — otherwise the SPA's live view
-    concatenates every failed attempt's prose into one growing
-    answer. The reset frame carries ``{"text": "", "reset": true}``
-    between attempt N's deltas and attempt N+1's deltas."""
+    SystemMessage), the wire signals the retry boundary by attaching
+    ``reset: true`` to the NEXT non-empty answer delta — not a
+    standalone empty ``{"text": "", "reset": true}`` (that blanked
+    the SPA between draft and tool_call / retry prose)."""
     from langchain_core.messages import AIMessageChunk
 
     from fin.host.http import get_graph
@@ -2500,10 +2499,17 @@ def test_bounce_retry_emits_answer_reset_between_attempts(
     ]
     assert len(resets) == 1, names
     reset_i, reset_d = resets[0]
-    assert reset_d["text"] == ""
+    # Reset rides the first retry chunk — never a mid-run empty frame.
+    assert reset_d["text"] == grounded[:40]
+    assert reset_d.get("reset") is True
 
-    # The reset sits AFTER the failed attempt's deltas and BEFORE
-    # the grounded attempt's deltas.
+    empty_resets = [
+        d
+        for n, d in events
+        if n == "answer" and d.get("reset") is True and d.get("text") == ""
+    ]
+    assert empty_resets == [], names
+
     answer_idx = [i for i, n in enumerate(names) if n == "answer"]
     ungrounded_delta = next(
         i for i in answer_idx if "handwaving" in events[i][1]["text"]
@@ -2511,7 +2517,180 @@ def test_bounce_retry_emits_answer_reset_between_attempts(
     grounded_delta = next(
         i for i in answer_idx if "Per the filing" in events[i][1]["text"]
     )
-    assert ungrounded_delta < reset_i < grounded_delta
+    assert ungrounded_delta < grounded_delta
+    assert reset_i == grounded_delta
+
+
+def test_bounce_then_tools_then_answer_has_no_empty_reset(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """Bounce → tool_call → grounded answer: the draft must stay on
+    the wire until the first retry answer chunk (with ``reset``).
+    An immediate empty reset after the bounce SystemMessage is what
+    operators read as "tools cleared my answer"."""
+    from langchain_core.messages import AIMessageChunk
+
+    from fin.host.http import get_graph
+
+    grounded = f"Per the filing: {aapl_page1_text[:80]}"
+    read_call = [
+        {
+            "name": "read_file",
+            "args": '{"document_id": "%s", "version": "%s", "page": 1, "page_limit": 1}'
+            % (AAPL_2022Q3, AAPL_2022Q3_VERSION),
+            "id": "c-read-after-bounce",
+            "index": 0,
+        }
+    ]
+    model = ScriptedChatModel(
+        stream_responses=[
+            # attempt 1: ungrounded prose -> bounce
+            [AIMessageChunk(content="Totally ungrounded handwaving here.")],
+            # attempt 2: tools first (no answer deltas yet)
+            [AIMessageChunk(content="", tool_call_chunks=read_call)],
+            # attempt 3: grounded prose
+            [AIMessageChunk(content=grounded[:40]), AIMessageChunk(content=grounded[40:])],
+        ],
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    events = _post_message(client, created["id"], "q")
+    names = [n for n, _ in events]
+
+    assert next(d for n, d in events if n == "status")["status"] == "done"
+
+    ungrounded_i = next(
+        i
+        for i, (n, d) in enumerate(events)
+        if n == "answer" and "handwaving" in d.get("text", "")
+    )
+    tool_call_i = next(i for i, n in enumerate(names) if n == "tool_call")
+    grounded_i = next(
+        i
+        for i, (n, d) in enumerate(events)
+        if n == "answer" and "Per the filing" in d.get("text", "")
+    )
+    assert ungrounded_i < tool_call_i < grounded_i, names
+
+    # No answer frame (empty or otherwise) between draft and tool_call.
+    mid_answers = [
+        (i, events[i][1])
+        for i in range(ungrounded_i + 1, tool_call_i)
+        if names[i] == "answer"
+    ]
+    assert mid_answers == [], mid_answers
+
+    assert events[grounded_i][1] == {"text": grounded[:40], "reset": True}
+    empty_resets = [
+        d
+        for n, d in events
+        if n == "answer" and d.get("reset") is True and d.get("text") == ""
+    ]
+    assert empty_resets == []
+
+
+def test_multi_bounce_attaches_reset_to_each_retry_first_chunk(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """Two recoverable bounces then a grounded answer: each retry's
+    first non-empty answer delta carries ``reset: true``."""
+    from langchain_core.messages import AIMessageChunk
+
+    from fin.host.http import get_graph
+
+    grounded = f"Per the filing: {aapl_page1_text[:80]}"
+    read_call = [
+        {
+            "name": "read_file",
+            "args": '{"document_id": "%s", "version": "%s", "page": 1, "page_limit": 1}'
+            % (AAPL_2022Q3, AAPL_2022Q3_VERSION),
+            "id": "c-read-multi",
+            "index": 0,
+        }
+    ]
+    model = ScriptedChatModel(
+        stream_responses=[
+            [AIMessageChunk(content="", tool_call_chunks=read_call)],
+            [AIMessageChunk(content="First ungrounded attempt prose.")],
+            [AIMessageChunk(content="Second ungrounded attempt prose.")],
+            [AIMessageChunk(content=grounded[:40]), AIMessageChunk(content=grounded[40:])],
+        ],
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    events = _post_message(client, created["id"], "q")
+
+    assert next(d for n, d in events if n == "status")["status"] == "done"
+    resets = [
+        d
+        for n, d in events
+        if n == "answer" and d.get("reset") is True
+    ]
+    assert len(resets) == 2, resets
+    assert resets[0]["text"] == "Second ungrounded attempt prose."
+    assert resets[1]["text"] == grounded[:40]
+    assert all(d.get("text") for d in resets)
+
+
+def test_bounce_pending_reset_flushes_on_terminal_empty_refuse(
+    client: TestClient, fresh_store, http_app: FastAPI
+) -> None:
+    """After a bounce, if no non-empty retry answer arrives before
+    terminal refuse, the terminal empty answer carries ``reset: true``
+    so the SPA still clears the stale draft (only allowed empty+reset
+    case on the wire)."""
+    from langchain_core.messages import AIMessageChunk
+
+    from fin.host.http import get_graph
+
+    # Draft once, then empty model turns: bounce SystemMessages set
+    # pending reset, but empty chunks never consume it. Cap refuse
+    # flushes pending on the terminal empty answer frame.
+    model = ScriptedChatModel(
+        stream_responses=[
+            [AIMessageChunk(content="Stale draft that will bounce.")],
+            [AIMessageChunk(content="")],
+            [AIMessageChunk(content="")],
+            [AIMessageChunk(content="")],
+        ],
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    events = _post_message(client, created["id"], "q")
+    names = [n for n, _ in events]
+
+    status_event = next(d for n, d in events if n == "status")
+    assert status_event["status"] == "refuse"
+    assert status_event["reason"] == "citation_repair_cap"
+
+    # Mid-run must not blank the draft with an empty reset.
+    mid_empty_resets = [
+        (i, d)
+        for i, (n, d) in enumerate(events[:-3])
+        if n == "answer" and d.get("reset") is True and d.get("text") == ""
+    ]
+    assert mid_empty_resets == [], mid_empty_resets
+
+    assert names[-3:] == ["status", "answer", "citations"], names
+    assert events[-2] == ("answer", {"text": "", "reset": True})
 
 
 # ----- mid-stream exception boundary (code-review M1/M2) -----
