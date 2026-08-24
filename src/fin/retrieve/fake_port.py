@@ -87,15 +87,30 @@ class FakeRetrievePort:
     def retrieve(
         self,
         query: str,
+        *,
         document_id: str | None = None,
+        cik: str | None = None,
+        form: str | None = None,
+        ticker: str | None = None,
+        filing_date: str | None = None,
         limit: int = 8,
     ) -> dict[str, list[Chunk]]:
         """Return ``{"chunks": [...]}`` or ``{"chunks": []}``.
 
-        Empty / whitespace queries short-circuit before the
-        dict lookup. Unknown ``document_id`` filters yield the
-        empty contract without raising. ``limit`` is clamped
-        per ADR 0009.
+        Mirrors the ``RetrievePort`` protocol:
+
+        * empty / whitespace ``query`` → ``{"chunks": []}``
+        * unknown ``document_id`` (when ``known_document_ids`` is
+          set) → ``{"chunks": []}``
+        * empty EDGAR-shaped filter values
+          (``cik="" / form="" / ticker="" / filing_date=""``)
+          → ``{"chunks": []}`` per spec "empty filter values
+          behave as empty hits"
+        * the four additive filters are NO-OPs on the fake
+          (no manifest metadata table); callers that need
+          manifest-aware filtering use ``BM25Adapter`` (legacy)
+          or ``MCPRetrieveAdapter`` (production)
+        * ``limit`` defaults to 8, hard cap 20 (ADR 0009)
         """
         # Empty / whitespace query: short-circuit before the
         # dict lookup. The model may pass ``""`` while
@@ -112,6 +127,12 @@ class FakeRetrievePort:
             and self._known_doc_ids is not None
             and document_id not in self._known_doc_ids
         ):
+            return {"chunks": []}
+
+        # EDGAR-shaped empty filter values → miss shape per spec.
+        # Non-None values are NO-OPs on the fake (no manifest
+        # metadata table) — the dict lookup proceeds unchanged.
+        if any(v == "" for v in (cik, form, ticker, filing_date)):
             return {"chunks": []}
 
         effective_limit = _resolve_limit(limit)

@@ -178,3 +178,58 @@ def test_chunks_carry_locator_as_source_ref() -> None:
         assert chunk.source_ref.document_id == "DOC-2023Q1"
         assert chunk.source_ref.page == 3
         assert chunk.score == 2.5
+
+# ----- EDGAR-shaped filter parity (T2 / T3 hand-off) -----
+
+
+def test_empty_cik_filter_returns_empty_chunks() -> None:
+    """Empty EDGAR-shaped filter values are miss shapes per spec."""
+    port = FakeRetrievePort(
+        hits_by_query={"foo": [_mk_chunk("DOC-1", 1, "hit")]},
+        known_document_ids={"DOC-1"},
+    )
+    assert port.retrieve("foo", cik="") == {"chunks": []}
+
+
+def test_empty_form_filter_returns_empty_chunks() -> None:
+    port = FakeRetrievePort(hits_by_query={"foo": [_mk_chunk("DOC-1", 1, "hit")]})
+    assert port.retrieve("foo", form="") == {"chunks": []}
+
+
+def test_empty_ticker_filter_returns_empty_chunks() -> None:
+    port = FakeRetrievePort(hits_by_query={"foo": [_mk_chunk("DOC-1", 1, "hit")]})
+    assert port.retrieve("foo", ticker="") == {"chunks": []}
+
+
+def test_empty_filing_date_filter_returns_empty_chunks() -> None:
+    port = FakeRetrievePort(hits_by_query={"foo": [_mk_chunk("DOC-1", 1, "hit")]})
+    assert port.retrieve("foo", filing_date="") == {"chunks": []}
+
+
+def test_nonempty_edgar_filters_are_noops_on_fake() -> None:
+    """The fake has no manifest metadata table — non-empty filters pass
+    through to the dict lookup (parity with BM25/MCP when no manifest
+    metadata is wired)."""
+    chunks = [_mk_chunk("DOC-1", 1, "hit")]
+    port = FakeRetrievePort(hits_by_query={"foo": chunks})
+    out = port.retrieve(
+        "foo",
+        cik="0000320193",
+        form="10-Q",
+        ticker="AAPL",
+        filing_date="2023-08-04",
+    )
+    assert out == {"chunks": chunks}
+
+
+def _mk_chunk(document_id: str, page: int, text: str):
+    from fin.retrieve.port import Chunk
+    return Chunk(
+        text=text,
+        source_ref=Locator(
+            document_id=document_id,
+            version="v-" + "a" * 60,
+            page=page,
+        ),
+        score=1.0,
+    )
