@@ -46,12 +46,20 @@ _Avoid_: shipping BM25 as the product path, hybrid/RRF implemented in this repo,
 ### Agent
 
 **agent loop**:
-On the **research track**, the model repeatedly picks `list_files`, `retrieve`, or `read_file` until it stops calling tools, or hits refuse (unknown locator or citation-repair cap) or step cap. Research `done` is only after the citation verifier passes; non-research tracks may `done` without tools or citations. Step order is not hardcoded.
+On the **research track**, the model repeatedly picks `list_files`, `retrieve`, `read_file`, or `get_xbrl_fact` until it stops calling tools, or hits refuse (unknown locator or citation-repair cap) or step cap. Research `done` is only after the citation verifier (and numeric fact gate when a fact is claimed) passes; non-research tracks may `done` without tools or citations. Step order is not hardcoded.
 _Avoid_: pipeline, chain, fixed graph of retrieve-then-generate, requiring the citation verifier on dialogue/clarify/off_topic
 
 **list_files**:
-v1 catalog tool over the frozen 10-Qs. Optional `company` / `period` filters; each hit is `{document_id, company, period, version, page_count}`; unknown filters yield `filings: []`.
-_Avoid_: list_filings, list_documents, glob
+v1 catalog tool over filings in the extracted tree. Optional `company` / `period`; S1 also optional `form` and `ticker` (`ticker` means the same issuer code as `company`; conflict → `filings: []`). Each hit is `{document_id, company, period, version, page_count}` until an output-key change is specified; unknown filters yield `filings: []`.
+_Avoid_: list_filings, list_documents, glob, renaming `company` to `ticker` as a breaking change
+
+**get_xbrl_fact**:
+Research-track tool that reads a tagged financial fact from ingested iXBRL (or companyfacts derived from it). XBRL is the reporting format, not a website. A numeric citation gate matches the claimed value to that fact; the model does not invent the arithmetic.
+_Avoid_: treating XBRL as a site name, OCR or vision as the number SSOT, a `verify` tool
+
+**XBRL**:
+The tagged-numbers format inside official 10-Q/10-K iXBRL. Not a website; SEC.gov is the filing host.
+_Avoid_: using XBRL as a product or hostname, conflating it with iknow-memory retrieve
 
 **read_file**:
 v1 read of a frozen filing by `document_id` and `version`, with 1-based `page` (default 1) and `page_limit` (default 1, cap 3). Misses return `{ error: "unknown_locator" }`; the citation verifier still checks one page per cite.
