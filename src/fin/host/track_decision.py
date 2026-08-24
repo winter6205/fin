@@ -13,7 +13,7 @@ Tier order (no single global default track):
 3. **inherit** — short / underspec follow-up with latest status snapshot
    research context (not across company change).
 4. **clarify** — filing-shaped ask missing company and/or period.
-5. **conditional_policy** — residual (bare ``q`` → research).
+5. **conditional_policy** — residual (no signal → ``dialogue``).
 
 ``snapshot_delta_for_utterance`` builds the append-only
 ``status_snapshots`` delta for classify (company change clears
@@ -466,9 +466,13 @@ def decide_track(
     if clarify_hit is not None:
         return clarify_hit
 
-    signals["fallback"] = "research"
+    # No single global default track (specs/soft-track.md): when the
+    # cascade exhausts rules + (optional) LLM + inherit + clarify,
+    # resolve to "dialogue" so the residual branch never silently
+    # pins every ambiguous utterance onto a single track.
+    signals["fallback"] = "dialogue"
     return TrackDecision(
-        track="research",
+        track="dialogue",
         confidence=0.4,
         decision_tier="conditional_policy",
         signals=signals,

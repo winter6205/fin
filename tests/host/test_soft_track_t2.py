@@ -145,8 +145,11 @@ def test_company_without_period_metric_ask_is_clarify():
     assert out["status"] == "done"
 
 
-def test_bare_q_still_research_not_clarify():
-    """Regression: HumanMessage('q') stays research (default graph suites)."""
+def test_bare_q_dialogue_not_clarify():
+    """Regression: HumanMessage('q') stays dialogue (no single global
+    default track — bare ``q`` falls past rules / inherit /
+    clarify, so the residual branch lands on dialogue, NOT
+    research and NOT clarify). Specs/soft-track.md."""
     model = ScriptedChatModel(script=[AIMessage(content="need tools")])
     g = compile_graph(
         checkpointer=InMemorySaver(),
@@ -162,4 +165,4 @@ def test_bare_q_still_research_not_clarify():
         },
         config=_thread_config("t-soft-clarify-q"),
     )
-    assert out["track"] == "research"
+    assert out["track"] == "dialogue"
