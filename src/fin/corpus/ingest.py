@@ -209,6 +209,7 @@ def run_ingest(
     manifest_path: Path,
     pdf_dir: Path,
     extracted_root: Path,
+    facts_root: Path | None = None,
 ) -> IngestResult:
     """Run the idempotent ingest command.
 
@@ -222,6 +223,11 @@ def run_ingest(
     extracted_root:
         Output directory for the extracted tree. Will be created if
         missing.
+    facts_root:
+        Output directory for the fact table (S1 / ADR 0031). When
+        ``None``, defaults to ``<data/corpus>/facts``. ``write_facts``
+        is called for every document the manifest lists, populating
+        the seed facts the later ``get_xbrl_fact`` lookup will read.
 
     Raises
     ------
@@ -233,6 +239,15 @@ def run_ingest(
         Not raised here — see ``fin.corpus.extracted.load_extracted_tree``
         for the read-side check.
     """
+    if facts_root is None:
+        facts_root = Path(__file__).resolve().parents[3] / "data" / "corpus" / "facts"
+
+    # Import here so this module's pdfplumber dep does not transitively
+    # leak into the ask path if the facts module is reached via
+    # ``fin.corpus.facts.read_facts`` (the lookup side).
+    from fin.corpus.facts import write_facts
+    from fin.corpus.facts_seed import seed_facts_for_document
+
     manifest = json.loads(manifest_path.read_text())
     documents = manifest["documents"]
     extracted_root.mkdir(parents=True, exist_ok=True)
@@ -342,6 +357,23 @@ def run_ingest(
     ).encode("utf-8")
     _write_if_drifted(extracted_root / "_index.json", index_payload)
 
+    # Seed the fact table for every document. The seed list is a
+    # per-document static mapping in ``facts_seed`` — T1 only ships
+    # the AAPL-2023Q3 row (the v1 gold span); other documents get an
+    # empty fact list, which is a valid "no facts yet" catalog state.
+    # ``write_facts`` is byte-idempotent, so a re-run that hits the
+    # fast-skip path above still writes the same fact table.
+    for doc in sorted(documents, key=lambda d: d["document_id"]):
+        document_id: str = doc["document_id"]
+        expected_sha: str = doc["sha256"]
+        seed = seed_facts_for_document(
+            document_id=document_id, version=expected_sha
+        )
+        if seed is not None:
+            write_facts(
+                document_id=document_id, facts=seed, facts_root=facts_root
+            )
+
     return IngestResult(
         documents=len(documents),
         pages=pages_total,
@@ -350,8 +382,9 @@ def run_ingest(
     )
 
 
-def _default_paths() -> tuple[Path, Path, Path]:
-    """Compute default (manifest, pdf_dir, extracted_root) for the CLI.
+def _default_paths() -> tuple[Path, Path, Path, Path]:
+    """Compute default (manifest, pdf_dir, extracted_root, facts_root)
+    for the CLI.
 
     The CLI is invoked as ``python -m fin.corpus.ingest`` from the
     worktree root, so the defaults resolve to ``data/corpus/...`` under
@@ -363,16 +396,20 @@ def _default_paths() -> tuple[Path, Path, Path]:
         corpus_dir / "manifest.json",
         corpus_dir / "pdf",
         corpus_dir / "extracted",
+        corpus_dir / "facts",
     )
 
 
 def main(argv: list[str] | None = None) -> int:
-    default_manifest, default_pdf_dir, default_extracted = _default_paths()
+    default_manifest, default_pdf_dir, default_extracted, default_facts = (
+        _default_paths()
+    )
     parser = argparse.ArgumentParser(
         prog="python -m fin.corpus.ingest",
         description=(
             "fin v1 ingest: extract frozen PDFs into the committed "
-            "data/corpus/extracted/ tree (ADR 0020)."
+            "data/corpus/extracted/ tree (ADR 0020) and seed the "
+            "fact table for `get_xbrl_fact` (ADR 0031)."
         ),
     )
     parser.add_argument("--manifest", type=Path, default=default_manifest)
@@ -380,11 +417,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--extracted-root", type=Path, default=default_extracted
     )
+    parser.add_argument("--facts-root", type=Path, default=default_facts)
     args = parser.parse_args(argv)
     result = run_ingest(
         manifest_path=args.manifest,
         pdf_dir=args.pdf_dir,
         extracted_root=args.extracted_root,
+        facts_root=args.facts_root,
     )
     print(
         f"ingest: documents={result.documents} "
