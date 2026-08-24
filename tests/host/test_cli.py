@@ -413,7 +413,16 @@ def test_empty_question_fails_fast_without_building_graph(capsys):
 def test_bootstrap_ingest_missing_reports_typed_error(monkeypatch, capsys):
     """When ``load_extracted_tree`` fails during graph construction the
     CLI reports ``error: ingest artifacts missing`` on stderr, exits 1,
-    and never silently re-extracts (ADR 0020)."""
+    and never silently re-extracts (ADR 0020).
+
+    T3 (#76): the production auto-build path (non-``InMemorySaver``
+    checkpointer) resolves the tree to derive ``known_document_ids``;
+    the test path (``InMemorySaver``) auto-builds a
+    ``FakeRetrievePort`` and skips the loader. To exercise the
+    production path the test passes a fake non-``InMemorySaver``
+    checkpointer so the loader runs and the patched
+    ``IngestMissingError`` propagates.
+    """
     import fin.host.graph as graph_module
 
     def _missing(manifest_path, extracted_root):
@@ -421,11 +430,17 @@ def test_bootstrap_ingest_missing_reports_typed_error(monkeypatch, capsys):
 
     monkeypatch.setattr(graph_module, "load_extracted_tree", _missing)
 
+    class _FakeProdSaver:
+        """Stand-in for ``PostgresSaver`` so the production
+        auto-build path runs (NOT the ``InMemorySaver`` test
+        path which would short-circuit)."""
+
     def factory():
-        # Real production shape: compile_graph resolves the tree itself
-        # when no adapter is supplied — the patched loader raises.
+        # Real production shape: compile_graph resolves the tree
+        # itself when no adapter is supplied and the checkpointer
+        # is NOT ``InMemorySaver`` — the patched loader raises.
         return compile_graph(
-            checkpointer=InMemorySaver(),
+            checkpointer=_FakeProdSaver(),
             model=ScriptedChatModel(script=[]),
         )
 
