@@ -16,7 +16,7 @@ from fin.host.track_decision import Track
 HOST_INSTRUCTIONS_MARKER: str = "[FIN_HOST_INSTRUCTIONS]"
 DIALOGUE_INSTRUCTIONS_MARKER: str = "[FIN_DIALOGUE_INSTRUCTIONS]"
 OFF_TOPIC_INSTRUCTIONS_MARKER: str = "[FIN_OFF_TOPIC_INSTRUCTIONS]"
-# T2 will add CLARIFY_INSTRUCTIONS_MARKER.
+CLARIFY_INSTRUCTIONS_MARKER: str = "[FIN_CLARIFY_INSTRUCTIONS]"
 
 HOST_SYSTEM_PROMPT: str = (
     f"{HOST_INSTRUCTIONS_MARKER}\n"
@@ -63,13 +63,22 @@ OFF_TOPIC_SYSTEM_PROMPT: str = (
     "can help with instead."
 )
 
+CLARIFY_SYSTEM_PROMPT: str = (
+    f"{CLARIFY_INSTRUCTIONS_MARKER}\n"
+    "You are fin. The operator asked about a 10-Q metric or filing "
+    "but company and/or period is missing.\n"
+    "Ask briefly which slots are still needed. Ground options ONLY in "
+    "the frozen corpus: companies AAPL, MSFT, AMZN; periods 2022 Q3, "
+    "2023 Q1, 2023 Q2, 2023 Q3. Do not invent tickers or periods "
+    "outside that set. Do not invent filing facts. Do not claim you "
+    "retrieved documents."
+)
+
 _TRACK_PROMPTS: dict[str, tuple[str, str]] = {
     "research": (HOST_INSTRUCTIONS_MARKER, HOST_SYSTEM_PROMPT),
     "dialogue": (DIALOGUE_INSTRUCTIONS_MARKER, DIALOGUE_SYSTEM_PROMPT),
     "off_topic": (OFF_TOPIC_INSTRUCTIONS_MARKER, OFF_TOPIC_SYSTEM_PROMPT),
-    # clarify deferred to T2 — fall back to research instructions if
-    # somehow requested early.
-    "clarify": (HOST_INSTRUCTIONS_MARKER, HOST_SYSTEM_PROMPT),
+    "clarify": (CLARIFY_INSTRUCTIONS_MARKER, CLARIFY_SYSTEM_PROMPT),
 }
 
 
@@ -100,6 +109,8 @@ messages_for_track = messages_for_model
 
 
 __all__ = [
+    "CLARIFY_INSTRUCTIONS_MARKER",
+    "CLARIFY_SYSTEM_PROMPT",
     "DIALOGUE_INSTRUCTIONS_MARKER",
     "DIALOGUE_SYSTEM_PROMPT",
     "HOST_INSTRUCTIONS_MARKER",

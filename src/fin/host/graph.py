@@ -582,11 +582,10 @@ def compile_graph(
     # ----- node functions -----
 
     def classify_node(state: AgentState) -> dict[str, Any]:
-        """Soft-Track T1: rules-primary track decision before leaves.
+        """Soft-Track: rules-primary track decision before leaves.
 
         Does not call a model. T4 may pass ``classify_model`` into
-        ``decide_track``; T3 may pass ``snapshots``. Clarify routing
-        is deferred to T2 (decide_track never emits clarify in T1).
+        ``decide_track``; T3 may pass ``snapshots``.
         """
         decision = decide_track(list(state.get("messages") or []))
         return {
@@ -609,7 +608,7 @@ def compile_graph(
         state: AgentState,
         config: RunnableConfig,
         *,
-        track: Literal["dialogue", "off_topic"],
+        track: Literal["dialogue", "clarify", "off_topic"],
     ) -> dict[str, Any]:
         """Call unbound model with track prompt; done + empty citations."""
         selected = _select_unbound_model(config)
@@ -640,6 +639,11 @@ def compile_graph(
         state: AgentState, config: RunnableConfig
     ) -> dict[str, Any]:
         return _non_research_leaf(state, config, track="dialogue")
+
+    def clarify_node(
+        state: AgentState, config: RunnableConfig
+    ) -> dict[str, Any]:
+        return _non_research_leaf(state, config, track="clarify")
 
     def off_topic_node(
         state: AgentState, config: RunnableConfig
@@ -840,14 +844,15 @@ def compile_graph(
 
     def from_classify(
         state: AgentState,
-    ) -> Literal["dialogue", "off_topic", "model"]:
-        """Route Soft-Track leaves. Clarify is T2 — treat as research."""
+    ) -> Literal["dialogue", "clarify", "off_topic", "model"]:
+        """Route Soft-Track leaves after classify."""
         track = state.get("track", "research")
         if track == "dialogue":
             return "dialogue"
+        if track == "clarify":
+            return "clarify"
         if track == "off_topic":
             return "off_topic"
-        # research (and deferred clarify) → research model node
         return "model"
 
     def from_model(state: AgentState) -> Literal["tools", "citation_gate", "__end__"]:
@@ -882,6 +887,7 @@ def compile_graph(
     graph = StateGraph(AgentState)
     graph.add_node("classify", classify_node)
     graph.add_node("dialogue", dialogue_node)
+    graph.add_node("clarify", clarify_node)
     graph.add_node("off_topic", off_topic_node)
     graph.add_node("model", model_node)
     # ``tool_node_with_summaries`` wraps ``tool_dispatcher`` so the
@@ -895,6 +901,7 @@ def compile_graph(
     graph.add_edge(START, "classify")
     graph.add_conditional_edges("classify", from_classify)
     graph.add_edge("dialogue", END)
+    graph.add_edge("clarify", END)
     graph.add_edge("off_topic", END)
     graph.add_conditional_edges("model", from_model)
     graph.add_edge("tools", "model")
