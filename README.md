@@ -11,6 +11,7 @@ This repository is the SSOT. Do not keep parallel copies under `projects/test`.
 | `docs/CONTEXT.md`                                        | Domain terms                                                                         |
 | `docs/adr/`                                              | Accepted decisions (0001–0027)                                                       |
 | `docs/research/002-demo-corpus-and-evidence-contract.md` | Inherited corpus/evidence contract (snapshot from iknow wayfinder)                   |
+| `docs/research/003-enterprise-product-research-index.md` | Enterprise-product research index (004–009; not CONTEXT/ADR SSOT)                    |
 | `data/corpus/pdf/`                                       | Frozen 12 SEC 10-Q PDFs (AAPL, MSFT, AMZN)                                           |
 | `data/corpus/manifest.json`                              | document_id, periods, sha256, upstream commit                                        |
 | `data/upstream/`                                         | private fixture source LICENSE, sec-10-q README, `qna_data.csv` (upstream QA; not the v1 gold set) |
