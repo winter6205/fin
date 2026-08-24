@@ -37,6 +37,7 @@ from langchain_core.messages import BaseMessage, HumanMessage
 from langgraph.graph.message import add_messages
 
 from fin.host.citation_gate import Citation, EvidenceItem
+from fin.host.track_decision import Track
 
 
 # ----- evidence reducer + reset sentinel (ADR 0016 / spec SC62) -----
@@ -228,6 +229,14 @@ class AgentState(TypedDict, total=False):
         bookkeeping so a follow-up send starts from a clean
         ``False`` rather than inheriting whatever the prior run
         wrote. Overwrite semantics; defaults ``False``.
+    track
+        Soft-Track T1: the per-run track chosen by ``classify``
+        (``dialogue`` / ``clarify`` / ``off_topic`` / ``research``).
+    track_decision
+        Soft-Track T1: auditable dict with ``track``, ``confidence``,
+        ``decision_tier``, and structured ``signals``. Cleared by
+        ``reset_input_state`` for each new run. status_snapshots
+        arrive in T3 — do not invent them here.
     """
 
     messages: Annotated[list[BaseMessage], add_messages]
@@ -264,6 +273,8 @@ class AgentState(TypedDict, total=False):
     # See docstring above. Cleared on every fresh send by
     # :func:`reset_input_state`.
     in_flight: bool
+    track: Track
+    track_decision: dict[str, Any]
 
 
 def reset_input_state(question: str) -> dict[str, Any]:
@@ -299,6 +310,9 @@ def reset_input_state(question: str) -> dict[str, Any]:
         # reset it for state-schema completeness so a follow-up
         # send starts from a clean ``False`` (T4 acceptance).
         "in_flight": False,
+        # Soft-Track T1: clear run-scoped track decision; classify
+        # rewrites track + track_decision on the new run.
+        "track_decision": {},
     }
 
 
@@ -312,6 +326,7 @@ __all__ = [
     "STEP_CAP",
     "Status",
     "TERMINAL_STATUSES",
+    "Track",
     "_evidence_reducer",
     "reset_input_state",
 ]

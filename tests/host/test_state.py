@@ -258,3 +258,13 @@ def test_reset_input_state_clears_in_flight() -> None:
 
     reset = reset_input_state("hello")
     assert reset["in_flight"] is False
+
+
+def test_reset_input_state_clears_run_scoped_track_fields() -> None:
+    """Soft-Track T1: each new run clears track_decision so classify
+    owns the fresh decision. Does NOT invent status_snapshots (T3)."""
+    from fin.host.state import reset_input_state
+
+    reset = reset_input_state("hello")
+    assert reset["track_decision"] == {}
+    assert "status_snapshots" not in reset
