@@ -10,12 +10,24 @@
 ### Product identity
 
 **fin**:
-A bounded 10-Q research agent: the model chooses tools in a loop; code verifies citations; LangGraph is the host graph (loop, code gates, checkpoint/resume). Retrieve ranking stays off-graph behind the retrieve port.
-_Avoid_: chatbot, Q&A API, memory backend, retrieval graph
+A normal conversational agent whose durable runtime is a LangGraph host graph: each turn is routed to a **track**; only the **research track** specializes in the frozen 10-Q corpus with tools and the citation verifier. Retrieve ranking stays off-graph behind the retrieve port.
+_Avoid_: Q&A API, memory backend, retrieval graph, treating research-track contracts as the whole product personality
 
 **host agent**:
 fin's role relative to iknow-memory: the caller of `retrieve`, not the search engine.
-_Avoid_: client, chatbot
+_Avoid_: client, treating fin as only a FAQ bot
+
+**track**:
+The per-turn contract on the host graph: `dialogue`, `clarify`, `off_topic`, or `research`. Chosen in-graph before execution; tools and the citation verifier bind only to `research`.
+_Avoid_: Chat|Research UI mode, HTTP-only router, single global research contract for every utterance
+
+**Soft-Track**:
+The v1 turn-orchestration shape: one compiled host graph, multi-track routing, tiered track decision (rules → ambiguous LLM → inherit → grounded clarify → conditional policy), flat graph until upgrade triggers in ADR 0027.
+_Avoid_: supervisor handoff as v1, dual product shells, treating flat topology as permanent
+
+**status snapshot**:
+One append-only per-turn record of research working context (e.g. company, period, document ids, active track cues) stored on `AgentState` in the checkpointer. History is retained; the latest snapshot is the active view for routing; dependent fields may be empty on a new snapshot.
+_Avoid_: overwriting away prior snapshots, dual-writing into thread_store as SSOT, replacing full message history with snapshots
 
 **iknow-memory**:
 The existing TypeScript MCP memory server (separate repo). It owns vector ingest and cosine / hybrid / RRF ranking. fin v1 is an independent system with its own retrieve adapter; a later adapter may call iknow-memory over MCP without changing the host graph.
@@ -34,8 +46,8 @@ _Avoid_: mock retriever, empty adapter, whole-page-only as the only chunk grain,
 ### Agent
 
 **agent loop**:
-The model repeatedly picks `list_files`, `retrieve`, or `read_file` until it stops calling tools, or hits refuse (unknown locator or citation-repair cap) or step cap. `done` is only after the citation verifier passes; step order is not hardcoded.
-_Avoid_: pipeline, chain, fixed graph of retrieve-then-generate
+On the **research track**, the model repeatedly picks `list_files`, `retrieve`, or `read_file` until it stops calling tools, or hits refuse (unknown locator or citation-repair cap) or step cap. Research `done` is only after the citation verifier passes; non-research tracks may `done` without tools or citations. Step order is not hardcoded.
+_Avoid_: pipeline, chain, fixed graph of retrieve-then-generate, requiring the citation verifier on dialogue/clarify/off_topic
 
 **list_files**:
 v1 catalog tool over the frozen 10-Qs. Optional `company` / `period` filters; each hit is `{document_id, company, period, version, page_count}`; unknown filters yield `filings: []`.
@@ -50,8 +62,8 @@ v1 cite identity: `document_id`, `version` (that PDF's sha256 in the corpus mani
 _Avoid_: chunk_id, char offset, bbox, page-less citation
 
 **citation verifier**:
-A code gate on the path to END: a supporting span is a contiguous substring of the answer (v1 minimum 32 characters) that appears on a page this run retrieved or read. Passed spans become the user-visible citations; unknown locators refuse immediately; missing or unmatched spans bounce with a hidden template until the citation-repair cap, then refuse.
-_Avoid_: faithfulness prompt, LLM-as-judge as the only gate, model-authored citation block, `verify` as a tool
+A code gate on the **research track** path to END: a supporting span is a contiguous substring of the answer (v1 minimum 32 characters) that appears on a page this run retrieved or read. Passed spans become the user-visible citations; unknown locators refuse immediately; missing or unmatched spans bounce with a hidden template until the citation-repair cap, then refuse. Non-research tracks skip this gate.
+_Avoid_: faithfulness prompt, LLM-as-judge as the only gate, model-authored citation block, `verify` as a tool, running the gate on greetings or soft off-topic replies
 
 **citation span**:
 One user-visible citation row from the verifier: a ≥32-character contiguous substring of the answer that matched on a retrieved or read page. The workspace sources list may show many spans per page (sliding-window overlap); that granularity is expected, not a send failure.
@@ -84,12 +96,12 @@ One graph `invoke` or `stream` on a thread (`run_id`): `done` / `refuse` / `step
 _Avoid_: collapsing run into thread_id, concurrent invokes on one thread, deleting the user turn to “sanitize” a crash
 
 **research thread**:
-The product conversation: one `thread_id` the operator talks in; each question is a run; follow-ups keep messages and citations. This is how fin is used after v1; it is not a chatbot identity and not a one-shot `/ask` demo.
-_Avoid_: chatbot, Q&A session, demo ask, one-shot invoke as the product UX
+The product conversation: one `thread_id` the operator talks in; each question is a run that may be any **track**; follow-ups keep full messages, citations when present, and status-snapshot history. This is how fin is used after v1; it is not a one-shot `/ask` demo.
+_Avoid_: Q&A session, demo ask, one-shot invoke as the product UX, forbidding greetings or clarification on the thread
 
 **workspace**:
-A local web UI server: create, list, open, resume, and delete a research thread; thinking streams unframed then collapses; tool calls stream then collapse as human-readable traces; citations sit on the assistant turn (inline chips plus a sources list). Streaming HTTP is that UI's transport on the same compiled graph; GET history is turn rows; thinking on/off is the model `extra_body.thinking` knob; crash resume continues the in-flight run from the last complete host-graph node.
-_Avoid_: chatbot, CLI REPL as the product, hosted accounts this increment, raw tool JSON as the UI, always-expanded traces, Studio, POST /ask as the conversation surface, rolling back a user turn on crash
+A local web UI server: create, list, open, resume, and delete a research thread; thinking streams unframed then collapses; tool calls stream then collapse as human-readable traces; citations sit on the assistant turn (inline chips plus a sources list); research turns may show a light track hint without a mode picker. Streaming HTTP is that UI's transport on the same compiled graph; GET history is turn rows; thinking on/off is the model `extra_body.thinking` knob; crash resume continues the in-flight run from the last complete host-graph node.
+_Avoid_: CLI REPL as the product, hosted accounts this increment, raw tool JSON as the UI, always-expanded traces, Studio, POST /ask as the conversation surface, rolling back a user turn on crash, Chat|Research dual chrome
 
 **Corpus 首页**:
 The workspace home route (`/`): frozen-12 corpus cards and the empty-thread entry points. Distinct from cold-start restore of the last `/t/{thread_id}` — the operator may navigate here deliberately in the same session without being bounced back to that thread.
