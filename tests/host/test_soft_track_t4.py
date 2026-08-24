@@ -38,7 +38,7 @@ def test_invalid_track_enum_exits_llm_and_finishes_defined():
     """Invalid/missing track from classify → EXIT → cascade continues."""
     stub = _ClassifyStub(content='{"track": "supervisor"}')
     decision = decide_track(
-        [HumanMessage(content="hmm maybe filings?")],
+        [HumanMessage(content="hmm maybe this?")],
         classify_model=stub,
     )
     assert stub.calls == 1
@@ -55,7 +55,7 @@ def test_invalid_track_enum_exits_llm_and_finishes_defined():
 def test_schema_parse_fail_exits_llm_and_finishes_defined():
     stub = _ClassifyStub(content="not-json{{{")
     decision = decide_track(
-        [HumanMessage(content="hmm maybe filings?")],
+        [HumanMessage(content="hmm maybe this?")],
         classify_model=stub,
     )
     assert stub.calls == 1
@@ -67,7 +67,7 @@ def test_schema_parse_fail_exits_llm_and_finishes_defined():
 def test_classify_model_error_exits_and_finishes_defined():
     stub = _ClassifyStub(error=RuntimeError("classify down"))
     decision = decide_track(
-        [HumanMessage(content="hmm maybe filings?")],
+        [HumanMessage(content="hmm maybe this?")],
         classify_model=stub,
     )
     assert stub.calls == 1
@@ -98,7 +98,7 @@ def test_high_confidence_rules_skip_llm():
 def test_llm_valid_track_used_when_ambiguous():
     stub = _ClassifyStub(content='{"track": "dialogue", "confidence": 0.7}')
     decision = decide_track(
-        [HumanMessage(content="hmm maybe filings?")],
+        [HumanMessage(content="hmm maybe this?")],
         classify_model=stub,
     )
     assert stub.calls == 1
@@ -122,7 +122,7 @@ def test_graph_classify_exit_does_not_crash_or_enter_gate():
     )
     out = g.invoke(
         {
-            "messages": [HumanMessage(content="hmm maybe filings?")],
+            "messages": [HumanMessage(content="hmm maybe this?")],
             "evidence": [],
             "repair_count": 0,
             "step_count": 0,
