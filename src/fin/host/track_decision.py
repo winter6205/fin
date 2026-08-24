@@ -1,21 +1,22 @@
-"""Soft-Track track decision (rules primary; clarify slots in T2).
+"""Soft-Track track decision (rules + snapshot inherit).
 
 ``decide_track`` chooses ``dialogue`` / ``clarify`` / ``off_topic`` /
 ``research`` before the host graph executes a leaf.
 
-T1 + T2 rules primary:
+Cascade so far (T1–T3; T4 adds LLM EXITs):
 
-* high-confidence greeting → ``dialogue`` (``decision_tier=rules``)
+* high-confidence greeting → ``dialogue`` (``rules``)
+* high-confidence off-domain → ``off_topic`` (``rules``)
+* fully slotted filing ask / strong research cues → ``research``
+  (``rules``)
+* short follow-up with latest status snapshot research context →
+  ``research`` (``inherit``) — does not inherit across company change
 * filing-shaped ask missing company and/or period → ``clarify``
-* clear research cues (company+period or strong corpus signals) →
-  ``research``
-* high-confidence off-domain → ``off_topic``
-* else → ``research`` (``conditional_policy`` for short/ambiguous
-  utterances like ``q`` — must stay research for default graph suites)
+* else → ``research`` (``conditional_policy`` for bare ``q``)
 
-T3 will wire snapshot inherit. T4 will add the LLM / EXIT cascade.
-``classify_model`` and ``snapshots`` are accepted as stub hooks so
-later tickets can wire them without signature churn.
+``snapshot_delta_for_utterance`` builds the append-only
+``status_snapshots`` delta for classify (company change clears
+dependents).
 """
 
 from __future__ import annotations
@@ -35,6 +36,16 @@ DecisionTier = Literal[
     "clarify",
     "conditional_policy",
 ]
+
+# Canonical ticker spellings for snapshot storage.
+_COMPANY_CANON: dict[str, str] = {
+    "aapl": "AAPL",
+    "apple": "AAPL",
+    "msft": "MSFT",
+    "microsoft": "MSFT",
+    "amzn": "AMZN",
+    "amazon": "AMZN",
+}
 
 
 @dataclass(frozen=True)
@@ -78,6 +89,12 @@ _PERIOD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Prefer the most specific period token when normalizing.
+_PERIOD_SPECIFIC_RE = re.compile(
+    r"\b(2022\s*Q3|2023\s*Q[1-3]|Q[1-4]\s*202[23])\b",
+    re.IGNORECASE,
+)
+
 # Metric / filing-shaped asks that need grounded company+period slots.
 # Deliberately excludes bare "what was" so off-domain questions are
 # not mis-routed to clarify.
@@ -90,8 +107,6 @@ _FILING_ASK_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Tickers / corpus / period / tool cues that keep a turn on research
-# when slots are complete (or the ask is catalog/tool shaped).
 _RESEARCH_SIGNAL_RE = re.compile(
     r"\b("
     r"AAPL|MSFT|AMZN|Apple|Microsoft|Amazon|"
@@ -129,13 +144,112 @@ def _research_signal_hits(text: str) -> list[str]:
     return [m.group(0) for m in _RESEARCH_SIGNAL_RE.finditer(text)]
 
 
+def _normalize_company(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    return _COMPANY_CANON.get(raw.strip().lower(), raw.strip().upper())
+
+
+def _extract_company(text: str) -> str | None:
+    match = _COMPANY_RE.search(text or "")
+    if not match:
+        return None
+    return _normalize_company(match.group(1))
+
+
+def _extract_period(text: str) -> str | None:
+    specific = _PERIOD_SPECIFIC_RE.search(text or "")
+    if specific:
+        token = re.sub(r"\s+", " ", specific.group(1)).strip().upper()
+        # Normalize "Q3 2023" → "2023 Q3"
+        swapped = re.match(r"^(Q[1-4])\s+(202[23])$", token, re.IGNORECASE)
+        if swapped:
+            return f"{swapped.group(2)} {swapped.group(1).upper()}"
+        return token
+    match = _PERIOD_RE.search(text or "")
+    if not match:
+        return None
+    return re.sub(r"\s+", " ", match.group(1)).strip().upper()
+
+
 def _missing_slots(text: str) -> list[str]:
     missing: list[str] = []
-    if not _COMPANY_RE.search(text):
+    if not _extract_company(text):
         missing.append("company")
-    if not _PERIOD_RE.search(text):
+    if not _extract_period(text):
         missing.append("period")
     return missing
+
+
+def _latest_snapshot(snapshots: list[Any] | None) -> dict[str, Any] | None:
+    if not snapshots:
+        return None
+    latest = snapshots[-1]
+    if not isinstance(latest, dict):
+        return None
+    return latest
+
+
+def _snapshot_has_research_context(snapshot: dict[str, Any] | None) -> bool:
+    if not snapshot:
+        return False
+    if snapshot.get("company") or snapshot.get("period"):
+        return True
+    docs = snapshot.get("document_ids") or []
+    return bool(docs)
+
+
+def _company_changed(text: str, snapshot: dict[str, Any] | None) -> bool:
+    new_company = _extract_company(text)
+    if not new_company or not snapshot:
+        return False
+    prior = _normalize_company(str(snapshot.get("company") or "") or None)
+    return bool(prior) and new_company != prior
+
+
+def snapshot_delta_for_utterance(
+    text: str,
+    prior_snapshots: list[Any] | None,
+) -> list[dict[str, Any]]:
+    """Return 0–1 snapshot dicts to append for this utterance.
+
+    Appends when company and/or period appear. Company change yields a
+    new snapshot with dependent fields cleared (period only if stated
+    in this utterance; ``document_ids`` empty).
+    """
+    company = _extract_company(text)
+    period = _extract_period(text)
+    if not company and not period:
+        return []
+
+    latest = _latest_snapshot(prior_snapshots) or {}
+    prior_company = _normalize_company(
+        str(latest.get("company") or "") or None
+    )
+
+    if company and prior_company and company != prior_company:
+        snap: dict[str, Any] = {
+            "company": company,
+            "period": period or "",
+            "document_ids": [],
+        }
+        return [snap]
+
+    snap = {
+        "company": company or prior_company or "",
+        "period": period or str(latest.get("period") or ""),
+        "document_ids": list(latest.get("document_ids") or []),
+    }
+    # Skip no-op append when identical to latest.
+    if (
+        latest
+        and snap.get("company") == latest.get("company")
+        and snap.get("period") == latest.get("period")
+        and list(snap.get("document_ids") or [])
+        == list(latest.get("document_ids") or [])
+    ):
+        return []
+    return [snap]
 
 
 def decide_track(
@@ -144,18 +258,15 @@ def decide_track(
     snapshots: list[Any] | None = None,
     classify_model: Any | None = None,
 ) -> TrackDecision:
-    """Return the Soft-Track decision for this turn (rules primary).
+    """Return the Soft-Track decision for this turn.
 
-    Stub hooks (unused until T3/T4; documented for later wiring):
-
-    * ``snapshots`` — latest status-snapshot view (T3 inherit).
-    * ``classify_model`` — ambiguous LLM classify (T4 cascade).
+    ``classify_model`` is accepted for T4 wiring; unused until then.
     """
-    _ = snapshots
     _ = classify_model
 
     text = _last_human_text(messages)
     signals: dict[str, Any] = {"utterance_len": len(text)}
+    latest = _latest_snapshot(snapshots)
 
     if text and _GREETING_RE.match(text):
         signals["greeting"] = True
@@ -166,7 +277,6 @@ def decide_track(
             signals=signals,
         )
 
-    # Off-domain before clarify so weather/etc. never become clarify.
     if text and _OFF_DOMAIN_RE.search(text):
         signals["off_domain"] = True
         return TrackDecision(
@@ -176,9 +286,42 @@ def decide_track(
             signals=signals,
         )
 
-    # Filing-shaped ask missing company and/or period → clarify
-    # BEFORE generic research-signal promotion, so underspecified
-    # metric asks do not bind tools.
+    # Fully slotted filing ask → research (rules) before inherit/clarify.
+    if text and _FILING_ASK_RE.search(text) and not _missing_slots(text):
+        signals["filing_ask"] = True
+        signals["research_signals"] = _research_signal_hits(text)
+        return TrackDecision(
+            track="research",
+            confidence=0.9,
+            decision_tier="rules",
+            signals=signals,
+        )
+
+    # Inherit: short / underspec follow-up with prior research context.
+    # Do not inherit across an explicit company change.
+    if (
+        text
+        and _snapshot_has_research_context(latest)
+        and not _company_changed(text, latest)
+    ):
+        missing = _missing_slots(text) if _FILING_ASK_RE.search(text) else []
+        short = len(text) <= 48
+        follow_up = bool(missing) or (
+            short
+            and not _FILING_ASK_RE.search(text)
+            and not _research_signal_hits(text)
+        )
+        if follow_up:
+            signals["inherit"] = True
+            signals["snapshot_company"] = latest.get("company") if latest else None
+            signals["snapshot_period"] = latest.get("period") if latest else None
+            return TrackDecision(
+                track="research",
+                confidence=0.75,
+                decision_tier="inherit",
+                signals=signals,
+            )
+
     if text and _FILING_ASK_RE.search(text):
         missing = _missing_slots(text)
         if missing:
@@ -217,4 +360,5 @@ __all__ = [
     "Track",
     "TrackDecision",
     "decide_track",
+    "snapshot_delta_for_utterance",
 ]

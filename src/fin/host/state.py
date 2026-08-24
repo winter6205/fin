@@ -162,6 +162,21 @@ MIN_SPAN_LEN: Final[int] = 32
 RECURSION_LIMIT: Final[int] = 2 * STEP_CAP + 6  # = 70
 
 
+# ----- Soft-Track status snapshot (T3) -----
+
+
+class StatusSnapshot(TypedDict, total=False):
+    """One append-only research working-context record.
+
+    Latest snapshot is the active routing view. On company change,
+    dependent fields (``period``, ``document_ids``) may be empty.
+    """
+
+    company: str
+    period: str
+    document_ids: list[str]
+
+
 # ----- AgentState -----
 
 # ``total=False`` so the state is tolerant of fresh threads that
@@ -235,8 +250,12 @@ class AgentState(TypedDict, total=False):
     track_decision
         Soft-Track T1: auditable dict with ``track``, ``confidence``,
         ``decision_tier``, and structured ``signals``. Cleared by
-        ``reset_input_state`` for each new run. status_snapshots
-        arrive in T3 — do not invent them here.
+        ``reset_input_state`` for each new run.
+    status_snapshots
+        Soft-Track T3: append-only research working-context history
+        (``company``, ``period``, ``document_ids``). Latest entry is
+        the active routing view. ``reset_input_state`` must NOT wipe
+        this channel.
     """
 
     messages: Annotated[list[BaseMessage], add_messages]
@@ -275,6 +294,7 @@ class AgentState(TypedDict, total=False):
     in_flight: bool
     track: Track
     track_decision: dict[str, Any]
+    status_snapshots: Annotated[list[StatusSnapshot], operator.add]
 
 
 def reset_input_state(question: str) -> dict[str, Any]:
@@ -312,6 +332,7 @@ def reset_input_state(question: str) -> dict[str, Any]:
         "in_flight": False,
         # Soft-Track T1: clear run-scoped track decision; classify
         # rewrites track + track_decision on the new run.
+        # status_snapshots are durable thread history (T3) — omit.
         "track_decision": {},
     }
 
@@ -325,6 +346,7 @@ __all__ = [
     "RECURSION_LIMIT",
     "STEP_CAP",
     "Status",
+    "StatusSnapshot",
     "TERMINAL_STATUSES",
     "Track",
     "_evidence_reducer",
