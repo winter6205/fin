@@ -90,8 +90,9 @@ from fin.host.stream_map import (
 )
 from fin.host.tools import list_files, read_file
 from fin.host.track_decision import decide_track, snapshot_delta_for_utterance
-from fin.retrieve import BM25Adapter
+from fin.retrieve import MCPRetrieveAdapter, FakeRetrievePort
 from fin.retrieve.tool import retrieve
+from fin.retrieve.port import RetrievePort
 
 
 # ----- typed errors -----
@@ -131,6 +132,23 @@ def _resolve_path(value: Path | str | None, default: Path) -> Path:
     if value is None:
         return default
     return Path(value)
+
+
+def _is_in_memory_saver(checkpointer: Any) -> bool:
+    """Return ``True`` when ``checkpointer`` is a LangGraph
+    ``InMemorySaver`` (the canonical test signal).
+
+    Used by ``compile_graph`` to decide whether to auto-build
+    a ``FakeRetrievePort`` (test path) or an
+    ``MCPRetrieveAdapter`` (production path) when ``adapter``
+    is ``None``. We avoid importing ``langgraph.checkpoint.memory``
+    at module top — callers may not have it installed — and
+    instead duck-type on the class name.
+    """
+    cls = type(checkpointer)
+    module = getattr(cls, "__module__", "")
+    name = cls.__name__
+    return module == "langgraph.checkpoint.memory" and name == "InMemorySaver"
 
 
 def _last_ai_text(messages: list[BaseMessage]) -> str:
@@ -279,13 +297,16 @@ def _make_read_file_tool():
     return read_file_tool
 
 
-def _make_retrieve_tool(adapter: BM25Adapter):
+def _make_retrieve_tool(adapter: RetrievePort):
     """Build the ``retrieve`` host tool.
 
-    The tool wraps T4's ``retrieve`` (which is the port-seam) with
-    the factory's shared ``BM25Adapter``. On a hit, each chunk
+    The tool wraps T4's ``retrieve`` (which is the port-seam)
+    with the factory's shared adapter. On a hit, each chunk
     contributes one ``EvidenceItem`` to ``AgentState``. An empty
-    contract (``{"chunks": []}``) contributes nothing.
+    contract (``{"chunks": []}``) contributes nothing. An
+    ``{"error": "retrieve_unavailable"}`` contract (T3, ADR
+    0030) also contributes nothing — the model can retry the
+    call or fall through to the citation gate.
 
     The tool's registered name is ``retrieve`` so the model can
     call it by name.
@@ -465,13 +486,15 @@ def compile_graph(
     *,
     checkpointer: Any,
     model: Any,
-    adapter: BM25Adapter | None = None,
+    adapter: RetrievePort | None = None,
     manifest_path: Path | str | None = None,
     extracted_root: Path | str | None = None,
     known_document_ids: set[str] | None = None,
     step_cap: int = STEP_CAP,
     recursion_limit: int = RECURSION_LIMIT,
     classify_model: Any | None = None,
+    mcp_command: list[str] | None = None,
+    locator_map: dict[str, "Locator"] | None = None,
 ) -> "_LockedGraph":
     """Build the v1 host graph (T6).
 
@@ -491,10 +514,21 @@ def compile_graph(
         The factory calls ``bind_tools`` on it to register the
         three host tools.
     adapter
-        An already-built ``BM25Adapter`` (T4). If ``None``, the
-        factory builds one from ``manifest_path`` + ``extracted_root``
-        so tests do not need to construct it manually. Production
-        (T7) builds one at boot and passes it in.
+        An already-built retrieve adapter (``FakeRetrievePort`` /
+        ``MCPRetrieveAdapter`` / ``BM25Adapter``). If ``None``,
+        the factory auto-builds one:
+
+        * ``InMemorySaver`` checkpointer → ``FakeRetrievePort``
+          (test path; hermetic, no MCP, no BM25).
+        * Other checkpointers (``PostgresSaver`` etc.) →
+          ``MCPRetrieveAdapter`` with ``mcp_command`` (or
+          ``["iknow-memory", "serve"]``) and the configured
+          ``locator_map``. Production (T7 / T8) passes one
+          in or relies on this auto-build.
+
+        ``BM25Adapter`` is no longer the product default
+        (ADR 0030); it remains importable for legacy / offline
+        tests but the factory does not auto-build it.
     manifest_path
         Path to ``data/corpus/manifest.json``. Defaults to the
         repo's canonical location.
@@ -520,6 +554,18 @@ def compile_graph(
         residual branch in ``decide_track`` then resolves the
         bare-``q`` cascade to ``track="dialogue"`` (not research),
         so the model leaf is not the silent global default.
+    mcp_command
+        T3 (#76): launch command for the MCP server used when
+        ``adapter`` is ``None`` and the checkpointer is NOT
+        ``InMemorySaver``. Defaults to ``["iknow-memory",
+        "serve"]``. Tests pass an explicit ``adapter`` instead
+        so this parameter is unused.
+    locator_map
+        T3 (#76): iknow-memory id → ``fin.Locator`` map passed
+        to the auto-built ``MCPRetrieveAdapter``. ``None`` (the
+        default) means "no map configured" — every MCP hit
+        would be dropped (the operator must wire this from
+        corpus metadata before going live).
 
     Returns
     -------
@@ -535,20 +581,44 @@ def compile_graph(
         does NOT swallow this — the operator must restore the
         tree and re-run ingest.
     """
-    # Build adapter if not supplied. We propagate IngestMissingError
-    # explicitly (the loader raises it; we let it propagate instead
-    # of swallowing as a miss dict).
+    # Build adapter if not supplied. The path branches on
+    # whether the caller is in test mode (InMemorySaver) or
+    # production mode (PostgresSaver etc.):
+    #
+    # * Test mode: build ``FakeRetrievePort`` (hermetic, no
+    #   MCP subprocess, no live data — ADR 0030 / spec
+    #   success-criteria item 1).
+    # * Production mode: build ``MCPRetrieveAdapter`` (the
+    #   product default per ADR 0030; BM25 is archived).
     if adapter is None:
-        mpath = _resolve_path(manifest_path, _DEFAULT_MANIFEST_PATH)
-        rpath = _resolve_path(extracted_root, _DEFAULT_EXTRACTED_ROOT)
-        tree = load_extracted_tree(mpath, rpath)
-        adapter = BM25Adapter(tree)
-        if known_document_ids is None:
-            known_document_ids = set(tree.keys())
+        if _is_in_memory_saver(checkpointer):
+            # Test path: hermetic fake port.
+            if known_document_ids is None:
+                known_document_ids = set()
+            adapter = FakeRetrievePort(known_document_ids=known_document_ids)
+        else:
+            mpath = _resolve_path(manifest_path, _DEFAULT_MANIFEST_PATH)
+            rpath = _resolve_path(extracted_root, _DEFAULT_EXTRACTED_ROOT)
+            # Derive ``known_document_ids`` from the manifest
+            # even when the adapter does not need it — the
+            # ``MCPRetrieveAdapter`` uses it for the
+            # client-side membership test (T3).
+            if known_document_ids is None:
+                tree = load_extracted_tree(mpath, rpath)
+                known_document_ids = set(tree.keys())
+            adapter = MCPRetrieveAdapter(
+                command=mcp_command or ["iknow-memory", "serve"],
+                locator_map=locator_map,
+                known_document_ids=known_document_ids,
+                timeout_seconds=5.0,
+            )
 
     if known_document_ids is None:
         # Defensive: a caller passing an external adapter but no
         # known_document_ids set must declare the set explicitly.
+        # The auto-build path always sets this above, so a None
+        # reaching this branch means the caller passed an external
+        # adapter without declaring the corpus.
         raise ValueError(
             "compile_graph requires either `adapter` or "
             "`known_document_ids` (or `manifest_path` + "
