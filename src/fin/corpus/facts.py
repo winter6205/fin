@@ -205,11 +205,133 @@ def list_fact_documents(*, facts_root: Path) -> list[str]:
     return sorted(p.stem for p in facts_root.glob("*.json") if p.is_file())
 
 
+# ----- T5: lookup_fact (get_xbrl_fact) -----
+
+
+@dataclass(frozen=True)
+class FactLookupError:
+    """Structured miss shape returned by ``lookup_fact`` on no-hit.
+
+    Per CONTEXT ``get_xbrl_fact`` ("unknown fact → error dict") and
+    spec § Boundaries ("empty hits not exceptions"), the lookup
+    surfaces a miss as a typed dict-shaped value, never as a raise.
+    The host tool wrapper translates this into the
+    ``{"error": "fact_not_found", ...}`` dict the research track
+    consumes.
+    """
+
+    error: str  # always "fact_not_found" for T5
+    concept: str
+    period: str
+    document_id: str | None  # when provided by the caller
+
+
+FactResult = Fact | FactLookupError
+
+
+def lookup_fact(
+    *,
+    concept: str,
+    period: str,
+    document_id: str | None = None,
+    issuer: str | None = None,  # future: ticker/CIK alias; T5 ignores unless present
+    facts_root: Path | None = None,
+    tolerance: float = 0.005,
+) -> FactResult:
+    """Look up one tagged fact. Returns ``Fact`` on hit,
+    ``FactLookupError`` on miss.
+
+    Read-only; safe to call concurrently from multiple
+    coroutines / threads (each call opens/reads/closes its own
+    file via ``read_facts``).
+
+    Empty ``concept`` / empty ``period`` returns
+    ``FactLookupError`` (NEVER raises) so the model-facing contract
+    holds: empty key → error dict, not an uncaught ``KeyError``.
+
+    The ``issuer`` kwarg is reserved for a later concept-alias
+    resolver (per ADR 0031: "Embeddings may later resolve concept
+    aliases; they do not author the number"); for T5 it is unused.
+    """
+    root = facts_root if facts_root is not None else _DEFAULT_FACTS_ROOT
+
+    if not concept or not period:
+        return FactLookupError(
+            error="fact_not_found",
+            concept=concept,
+            period=period,
+            document_id=document_id,
+        )
+
+    # If ``document_id`` is supplied, scope the lookup to that one
+    # file (single O(1) read). Otherwise walk every fact file in
+    # ``facts_root`` in sorted order so the result is deterministic
+    # across runs.
+    if document_id is not None:
+        candidate_documents = [document_id]
+    else:
+        candidate_documents = list_fact_documents(facts_root=root)
+
+    for doc_id in candidate_documents:
+        for fact in read_facts(document_id=doc_id, facts_root=root):
+            if fact.concept == concept and fact.period == period:
+                return fact
+
+    return FactLookupError(
+        error="fact_not_found",
+        concept=concept,
+        period=period,
+        document_id=document_id,
+    )
+
+
+def fact_matches_value(
+    fact: Fact, claimed: float | int | str, *, tolerance: float = 0.005
+) -> bool:
+    """True iff ``claimed`` matches ``fact.value`` within ``tolerance``.
+
+    Per ADR 0031 / spec § Boundaries ("Numeric gate compares claimed
+    value to fact row value with tolerance (e.g. relative 0.5% OR
+    exact match for ints), not fuzzy match"):
+
+    * ``int`` and ``float`` ``fact.value`` — relative error
+      ``|claimed - value| / |value| <= tolerance``; default 0.5%.
+      The "exact match for ints" branch in the spec describes the
+      degenerate ``tolerance == 0`` case; the default 0.5% lets the
+      spec's ``$383,300,000,000`` slightly-off claim pass against
+      the seeded ``383285000000`` int fact (T5 acceptance).
+    * ``str`` ``fact.value`` — never matches a numeric claim; the
+      numeric gate is numeric, and a stringly-typed fact is a
+      malformed-tag case the ingest pipeline rejects upstream.
+
+    Zero-valued ``fact.value`` compares exactly (relative error is
+    undefined at 0). ``bool`` ``fact.value`` / ``claimed`` is
+    rejected defensively (bool is an ``int`` subclass but never a
+    legitimate fact value).
+    """
+    value = fact.value
+    if isinstance(value, str) or isinstance(claimed, str):
+        return False
+    if not isinstance(claimed, (int, float)):
+        return False
+    if isinstance(value, bool) or isinstance(claimed, bool):
+        # Booleans are an ``int`` subclass but never a legitimate
+        # fact value; defensive: do not pretend True equals 1.
+        return False
+    if value == 0:
+        return claimed == 0
+    return abs(claimed - value) / abs(value) <= tolerance
+
+
 __all__ = [
     "Fact",
+    "FactLookupError",
+    "FactResult",
     "FactValueError",
     "_DEFAULT_FACTS_ROOT",
+    "fact_matches_value",
     "list_fact_documents",
+    "lookup_fact",
     "read_facts",
     "write_facts",
 ]

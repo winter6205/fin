@@ -119,6 +119,7 @@ class ConcurrentRunError(HostGraphError):
 _DEFAULT_DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "corpus"
 _DEFAULT_MANIFEST_PATH = _DEFAULT_DATA_DIR / "manifest.json"
 _DEFAULT_EXTRACTED_ROOT = _DEFAULT_DATA_DIR / "extracted"
+_DEFAULT_FACTS_ROOT = _DEFAULT_DATA_DIR / "facts"
 
 # Marker the gate uses on the next pass to recognize a bounce
 # template in the message history. The marker is data; CLI / HTTP
@@ -384,6 +385,69 @@ def _make_retrieve_tool(adapter: RetrievePort):
     return retrieve_tool
 
 
+def _make_get_xbrl_fact_tool(facts_root: Path):
+    """Build the ``get_xbrl_fact`` host tool (T5 / ADR 0031).
+
+    Returns a LangChain ``BaseTool`` whose function calls T5's
+    ``get_xbrl_fact`` wrapper with the factory's resolved
+    ``facts_root``. The tool does NOT contribute ``EvidenceItem``s:
+    ``get_xbrl_fact`` returns ToolMessage JSON carrying the
+    fact-row dict (or the typed ``fact_not_found`` miss shape),
+    but those rows are NOT page text — the citation verifier's
+    evidence match is a separate concern. The numeric gate
+    (T5 / ADR 0031) consumes the ToolMessage JSON directly when
+    verifying the model's claimed values.
+
+    The tool's registered name is ``get_xbrl_fact`` so the model
+    can call it by name (matches the ADR 0031 contract). Misses
+    return the typed ``{"error": "fact_not_found", ...}`` dict so
+    the agent loop never sees a typed exception out of the
+    ToolNode (spec § Boundaries: "empty hits not exceptions").
+    """
+
+    @tool("get_xbrl_fact")
+    def get_xbrl_fact_tool(
+        concept: str,
+        period: str,
+        document_id: str | None = None,
+        issuer: str | None = None,
+        tool_call_id: Annotated[str, InjectedToolCallId] = "",
+    ) -> dict:
+        """Look up one tagged XBRL fact from the ingest-built fact table.
+
+        ``concept`` is the XBRL tag (e.g., ``us-gaap:Revenues``).
+        ``period`` is the reporting period (e.g., ``2023-Q3-YTD``).
+        ``document_id`` is the optional locator filter (e.g.,
+        ``AAPL-2023Q3``). Returns the hit dict on success or the
+        typed ``{"error": "fact_not_found"}`` dict on miss. Never
+        raises.
+        """
+        from fin.host.tools.get_xbrl_fact import get_xbrl_fact
+
+        result = get_xbrl_fact(
+            concept=concept,
+            period=period,
+            document_id=document_id,
+            issuer=issuer,
+            facts_root=facts_root,
+        )
+        tool_message = ToolMessage(
+            content=json.dumps(result, default=str),
+            tool_call_id=tool_call_id,
+            name="get_xbrl_fact",
+        )
+        # We return a ``Command`` with the new ToolMessage; the
+        # numeric gate (T5) consumes this JSON to extract the
+        # claimed (concept, period) -> fact-value mapping on the
+        # ``done`` path. No ``EvidenceItem`` is contributed because
+        # the fact row is NOT page text — the citation gate's
+        # evidence shape is reserved for ``read_file`` /
+        # ``retrieve`` page / chunk content.
+        return Command(update={"messages": [tool_message]})
+
+    return get_xbrl_fact_tool
+
+
 # ----- T3 helpers: tool-summary + thinking extraction -----
 
 
@@ -497,6 +561,109 @@ def _extract_thinking_text(message: AIMessage) -> str:
 # ----- the graph factory -----
 
 
+def _collect_fact_tool_calls(
+    messages: list[BaseMessage],
+) -> tuple[list[tuple[str, str]], list[Fact]]:
+    """Walk ``messages`` for ``get_xbrl_fact`` tool calls and the
+    corresponding fact rows.
+
+    Each ``AIMessage`` may carry one or more ``get_xbrl_fact``
+    tool calls. The matching ``ToolMessage`` (same ``tool_call_id``)
+    carries the JSON content with the fact row, or the
+    ``fact_not_found`` miss shape. We pair them up so the numeric
+    gate sees ``(concept, period)`` claims alongside the available
+    fact rows.
+
+    Returns
+    -------
+    claimed_concepts
+        The ``(concept, period)`` tuples from each
+        ``get_xbrl_fact`` tool call's args.
+    available_facts
+        The ``Fact`` rows whose ``ToolMessage`` content decoded to
+        a hit dict (no ``error`` key). Miss shapes are dropped —
+        the model's claim was already a no-hit, so the numeric
+        gate's "no matching fact row" branch will fire.
+    """
+    from fin.corpus.facts import Fact, Locator
+
+    claimed: list[tuple[str, str]] = []
+    facts: list[Fact] = []
+    for message in messages:
+        if not isinstance(message, AIMessage) or not message.tool_calls:
+            continue
+        for call in message.tool_calls:
+            if call.get("name") != "get_xbrl_fact":
+                continue
+            args = call.get("args") or {}
+            concept = args.get("concept", "")
+            period = args.get("period", "")
+            if not isinstance(concept, str) or not isinstance(period, str):
+                continue
+            if not concept or not period:
+                continue
+            claimed.append((concept, period))
+            call_id = call.get("id", "")
+            for tm in messages:
+                if not isinstance(tm, ToolMessage):
+                    continue
+                if getattr(tm, "tool_call_id", "") != call_id:
+                    continue
+                try:
+                    payload = json.loads(tm.content)
+                except (TypeError, ValueError):
+                    payload = None
+                if not isinstance(payload, dict) or "error" in payload:
+                    continue
+                locator_payload = payload.get("source_locator")
+                if not isinstance(locator_payload, dict):
+                    continue
+                try:
+                    locator = Locator(
+                        document_id=locator_payload["document_id"],
+                        version=locator_payload["version"],
+                        page=int(locator_payload["page"]),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+                facts.append(
+                    Fact(
+                        concept=payload.get("concept", concept),
+                        value=payload.get("value"),
+                        period=payload.get("period", period),
+                        unit=payload.get("unit", ""),
+                        scale=payload.get("scale", ""),
+                        source_locator=locator,
+                    )
+                )
+                break
+    return claimed, facts
+
+
+def _evaluate_numeric_gate_in_node(messages: list[BaseMessage]):
+    """Run the numeric gate on the run's accumulated messages.
+
+    Returns the ``NumericGateResult`` from
+    :func:`evaluate_numeric_gate`, or ``None`` if the model made no
+    ``get_xbrl_fact`` call this run (the gate is skipped per T5
+    spec acceptance).
+    """
+    from fin.host.numeric_gate import evaluate_numeric_gate
+
+    claimed, facts = _collect_fact_tool_calls(messages)
+    if not claimed:
+        # No ``get_xbrl_fact`` call -> gate is skipped. We return
+        # ``None`` so the caller can distinguish "no claim" from
+        # "claim, gate passed" (which would be ``outcome="pass"``).
+        return None
+    answer = _last_ai_text(messages)
+    return evaluate_numeric_gate(
+        answer=answer,
+        claimed_concepts=claimed,
+        available_facts=facts,
+    )
+
+
 def compile_graph(
     *,
     checkpointer: Any,
@@ -504,6 +671,7 @@ def compile_graph(
     adapter: RetrievePort | None = None,
     manifest_path: Path | str | None = None,
     extracted_root: Path | str | None = None,
+    facts_root: Path | str | None = None,
     known_document_ids: set[str] | None = None,
     step_cap: int = STEP_CAP,
     recursion_limit: int = RECURSION_LIMIT,
@@ -527,7 +695,9 @@ def compile_graph(
         ``ChatOpenAI`` instance built by T8's
         ``compile_for_runtime`` from ``FIN_MODEL`` + ``FIN_BASE_URL``.
         The factory calls ``bind_tools`` on it to register the
-        three host tools.
+        host tools (T5: ``get_xbrl_fact`` is the fourth tool,
+        bound AFTER ``retrieve`` to preserve insertion order;
+        LangChain's tool binding is order-sensitive).
     adapter
         An already-built retrieve adapter (``FakeRetrievePort`` /
         ``MCPRetrieveAdapter`` / ``BM25Adapter``). If ``None``,
@@ -563,6 +733,11 @@ def compile_graph(
         from ``fin.host.state`` (currently ``2 * STEP_CAP + 6 = 70``).
         Strictly greater than ``step_cap`` so the agent-loop fuse
         fires first (spec success criteria item 5).
+    facts_root
+        Path to ``data/corpus/facts/`` (T5). Defaults to the repo's
+        canonical location. The factory wires the
+        ``get_xbrl_fact`` host tool to read from this root.
+        Tests inject a synthetic ``tmp_path``-rooted tree.
     classify_model
         Soft-Track T4: optional model for ambiguous LLM classify.
         When ``None`` (default), the LLM tier is skipped. The
@@ -642,13 +817,15 @@ def compile_graph(
 
     mpath = _resolve_path(manifest_path, _DEFAULT_MANIFEST_PATH)
     rpath = _resolve_path(extracted_root, _DEFAULT_EXTRACTED_ROOT)
+    fpath = _resolve_path(facts_root, _DEFAULT_FACTS_ROOT)
 
     list_files_tool = _make_list_files_tool(mpath, rpath)
     read_file_tool = _make_read_file_tool()
     retrieve_tool = _make_retrieve_tool(adapter)
+    get_xbrl_fact_tool = _make_get_xbrl_fact_tool(fpath)
 
     bound_model = model.bind_tools(
-        [list_files_tool, read_file_tool, retrieve_tool]
+        [list_files_tool, read_file_tool, retrieve_tool, get_xbrl_fact_tool]
     )
     # T3 (#34): the off-preference binding layers the MiniMax
     # ``extra_body`` (``thinking.type=disabled``) on top of the same
@@ -667,7 +844,7 @@ def compile_graph(
     unbound_model_no_thinking = model.bind(extra_body=_thinking_off_body)
 
     tool_dispatcher = ToolNode(
-        [list_files_tool, read_file_tool, retrieve_tool],
+        [list_files_tool, read_file_tool, retrieve_tool, get_xbrl_fact_tool],
         name="tool_node",
         handle_tool_errors=True,
     )
@@ -921,6 +1098,27 @@ def compile_graph(
         )
 
         if gate_result.outcome == "done":
+            # T5: numeric gate. Walk the AIMessage history for
+            # ``get_xbrl_fact`` tool calls this run; each call is
+            # an implicit (concept, period) claim. The matching
+            # ToolMessage JSON carries the fact value (or the
+            # ``fact_not_found`` miss shape). If the model claimed
+            # a number that doesn't match an evidenced fact row,
+            # the run refuses immediately — T5 spec ("research
+            # done does not pass when a claimed numeric fact has
+            # no matching evidenced row"). The numeric gate is
+            # SKIPPED when the model made no ``get_xbrl_fact`` call
+            # (CONTEXT ``get_xbrl_fact``: "non-research skips the
+            # fact gate"; here, research without a fact call also
+            # skips).
+            numeric_outcome = _evaluate_numeric_gate_in_node(messages)
+            if numeric_outcome is not None and numeric_outcome.outcome == "fail":
+                return {
+                    "messages": [],
+                    "status": "refuse",
+                    "status_reason": "numeric_gate_fail",
+                    "repair_count": repair_count,
+                }
             return {
                 "messages": [],
                 "answer": gate_result.answer,

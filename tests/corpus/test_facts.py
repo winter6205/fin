@@ -8,13 +8,17 @@ overflow, concurrent, exception) come from the defensive-contract
 validator axis.
 
 * empty  — ``read_facts`` on a missing document returns ``[]`` (no
-  raise); ``list_fact_documents`` on an empty root returns ``[]``.
+  raise); ``list_fact_documents`` on an empty root returns ``[]``;
+  ``lookup_fact`` with empty concept / period returns the typed
+  ``FactLookupError`` (does not raise) so the model-facing contract
+  holds.
 * negative — ``read_facts`` on a malformed JSON returns ``[]`` and does
   NOT raise (catalog-miss shape, per spec: "Empty hits not
-  exceptions").
+  exceptions"); ``lookup_fact`` on an unknown fact returns the
+  ``FactLookupError`` shape.
 * overflow — a 1000+ row fact list round-trips byte-identical.
-* concurrent — **N/A single-writer** for ingest (per spec); the lookup
-  side is documented but not asserted here because that lands with T5.
+* concurrent — ``lookup_fact`` is read-only; two overlapping calls do
+  not raise. The ingest write side is N/A single-writer (per spec).
 * exception — invalid ``value`` type raises a typed error at write
   time so the catalog can fail fast on a malformed tag.
 """
@@ -23,6 +27,7 @@ from __future__ import annotations
 
 from fin.corpus._private_fixtures import load_private_fixture
 
+import concurrent.futures
 import json
 from pathlib import Path
 
@@ -31,8 +36,12 @@ import pytest
 from fin.corpus.extracted import Locator
 from fin.corpus.facts import (
     Fact,
+    FactLookupError,
+    FactResult,
     FactValueError,
+    fact_matches_value,
     list_fact_documents,
+    lookup_fact,
     read_facts,
     write_facts,
 )
@@ -256,3 +265,172 @@ def test_write_facts_payload_shape(tmp_path: Path) -> None:
     assert entry["value"] == 383285000000
     assert entry["source_locator"]["document_id"] == "AAPL-2023Q3"
     assert entry["source_locator"]["page"] == 4
+
+
+# ---------- T5: lookup_fact + fact_matches_value (get_xbrl_fact) ----------
+
+
+def test_lookup_fact_hit_returns_seeded_fact(tmp_path: Path) -> None:
+    """Empty class: ``lookup_fact`` against the seeded row returns the
+    ``Fact`` (NOT the miss shape) — the happy-path round trip from
+    the seed writer through the lookup."""
+    facts_root = tmp_path / "facts"
+    write_facts(
+        document_id="AAPL-2023Q3",
+        facts=[_sample_fact()],
+        facts_root=facts_root,
+    )
+
+    result: FactResult = lookup_fact(
+        concept="us-gaap:Revenues",
+        period="2023-Q3-YTD",
+        document_id="AAPL-2023Q3",
+        facts_root=facts_root,
+    )
+    assert isinstance(result, Fact)
+    assert result.concept == "us-gaap:Revenues"
+    assert result.period == "2023-Q3-YTD"
+    assert result.value == 383285000000
+    assert result.source_locator.page == 4
+
+
+def test_lookup_fact_miss_returns_error_dict(tmp_path: Path) -> None:
+    """Negative class: an unknown concept returns the
+    ``FactLookupError`` shape (NOT a raise) so the research track can
+    convert it to the typed ``{error: "fact_not_found"}`` dict the
+    spec contract requires (spec § Boundaries, "empty hits not
+    exceptions" / "unknown fact → error dict")."""
+    facts_root = tmp_path / "facts"
+    write_facts(
+        document_id="AAPL-2023Q3",
+        facts=[_sample_fact()],
+        facts_root=facts_root,
+    )
+
+    result = lookup_fact(
+        concept="us-gaap:DoesNotExist",
+        period="2023-Q3-YTD",
+        document_id="AAPL-2023Q3",
+        facts_root=facts_root,
+    )
+    assert isinstance(result, FactLookupError)
+    assert result.error == "fact_not_found"
+    assert result.concept == "us-gaap:DoesNotExist"
+    assert result.period == "2023-Q3-YTD"
+    assert result.document_id == "AAPL-2023Q3"
+
+
+def test_lookup_fact_empty_concept_returns_error(tmp_path: Path) -> None:
+    """Empty class: empty ``concept`` returns the typed miss shape,
+    not a raise (defensive-contract empty input branch)."""
+    facts_root = tmp_path / "facts"
+    write_facts(
+        document_id="AAPL-2023Q3",
+        facts=[_sample_fact()],
+        facts_root=facts_root,
+    )
+
+    result = lookup_fact(
+        concept="",
+        period="2023-Q3-YTD",
+        document_id="AAPL-2023Q3",
+        facts_root=facts_root,
+    )
+    assert isinstance(result, FactLookupError)
+    assert result.error == "fact_not_found"
+
+
+def test_lookup_fact_empty_period_returns_error(tmp_path: Path) -> None:
+    """Empty class: empty ``period`` returns the typed miss shape."""
+    facts_root = tmp_path / "facts"
+    write_facts(
+        document_id="AAPL-2023Q3",
+        facts=[_sample_fact()],
+        facts_root=facts_root,
+    )
+
+    result = lookup_fact(
+        concept="us-gaap:Revenues",
+        period="",
+        document_id="AAPL-2023Q3",
+        facts_root=facts_root,
+    )
+    assert isinstance(result, FactLookupError)
+    assert result.error == "fact_not_found"
+
+
+def test_lookup_fact_concurrent_calls_independent(tmp_path: Path) -> None:
+    """Concurrent class (T5 acceptance: "two overlapping lookups do
+    not raise"): two threads call ``lookup_fact`` against overlapping
+    (concept, period) args; both return their respective results
+    without raising. The lookup is read-only (each call opens/reads/
+    closes its own file), so concurrency is just safe."""
+    facts_root = tmp_path / "facts"
+    write_facts(
+        document_id="AAPL-2023Q3",
+        facts=[_sample_fact()],
+        facts_root=facts_root,
+    )
+
+    def call(args: tuple[str, str]) -> FactResult:
+        return lookup_fact(
+            concept=args[0],
+            period=args[1],
+            document_id="AAPL-2023Q3",
+            facts_root=facts_root,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        f_hit = ex.submit(call, ("us-gaap:Revenues", "2023-Q3-YTD"))
+        f_miss = ex.submit(call, ("us-gaap:Missing", "2023-Q3-YTD"))
+        hit_result = f_hit.result(timeout=5.0)
+        miss_result = f_miss.result(timeout=5.0)
+
+    assert isinstance(hit_result, Fact)
+    assert isinstance(miss_result, FactLookupError)
+
+
+def test_fact_matches_value_int_within_tolerance() -> None:
+    """``fact_matches_value`` applies relative tolerance to int values too
+    (T5 spec test: ``$383,300,000,000`` slightly off the seeded
+    ``383285000000`` int fact → pass within 0.5%)."""
+    fact = _sample_fact()  # value=383285000000 (int)
+    # Exact match: pass.
+    assert fact_matches_value(fact, 383285000000) is True
+    # Within 0.5% tolerance: pass (T5 acceptance: ``383,300,000,000``
+    # is ~0.004% off, well within 0.5%).
+    assert fact_matches_value(fact, 383300000000) is True
+    # Far off: fail.
+    assert fact_matches_value(fact, 999) is False
+
+
+def test_fact_matches_value_float_within_tolerance() -> None:
+    """Float ``value`` matches within the default 0.5% relative tolerance."""
+    fact = Fact(
+        concept="us-gaap:Revenues",
+        value=100.0,  # float
+        period="2023-Q3-YTD",
+        unit="USD",
+        scale="thousands",
+        source_locator=_locator(),
+    )
+    assert fact_matches_value(fact, 100.0) is True
+    # 0.4% off — within 0.5% tolerance.
+    assert fact_matches_value(fact, 100.4) is True
+    # 1% off — outside 0.5% tolerance.
+    assert fact_matches_value(fact, 101.0) is False
+
+
+def test_fact_matches_value_string_returns_false() -> None:
+    """A string ``value`` cannot match a numeric claim — the numeric
+    gate never authors strings; embedding a string number into the
+    answer is the model's bug, not the lookup's."""
+    fact = Fact(
+        concept="us-gaap:Revenues",
+        value="383285000000",  # str, not numeric
+        period="2023-Q3-YTD",
+        unit="USD",
+        scale="thousands",
+        source_locator=_locator(),
+    )
+    assert fact_matches_value(fact, 383285000000) is False
