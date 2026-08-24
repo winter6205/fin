@@ -1,18 +1,19 @@
-"""Soft-Track track decision (rules + snapshot inherit).
+"""Soft-Track track decision cascade (rules → LLM → inherit → clarify → policy).
 
 ``decide_track`` chooses ``dialogue`` / ``clarify`` / ``off_topic`` /
 ``research`` before the host graph executes a leaf.
 
-Cascade so far (T1–T3; T4 adds LLM EXITs):
+Tier order (no single global default track):
 
-* high-confidence greeting → ``dialogue`` (``rules``)
-* high-confidence off-domain → ``off_topic`` (``rules``)
-* fully slotted filing ask / strong research cues → ``research``
-  (``rules``)
-* short follow-up with latest status snapshot research context →
-  ``research`` (``inherit``) — does not inherit across company change
-* filing-shaped ask missing company and/or period → ``clarify``
-* else → ``research`` (``conditional_policy`` for bare ``q``)
+1. **rules** — high-confidence greeting / off-domain / fully slotted
+   research / strong research cues (never replaced by LLM).
+2. **llm** — only when ambiguous and ``classify_model`` is provided;
+   structured ``{"track": ...}``; typed EXITs
+   (``invalid_track`` / ``schema_parse`` / ``model_error``) fall through.
+3. **inherit** — short / underspec follow-up with latest status snapshot
+   research context (not across company change).
+4. **clarify** — filing-shaped ask missing company and/or period.
+5. **conditional_policy** — residual (bare ``q`` → research).
 
 ``snapshot_delta_for_utterance`` builds the append-only
 ``status_snapshots`` delta for classify (company change clears
@@ -21,11 +22,12 @@ dependents).
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 Track = Literal["dialogue", "clarify", "off_topic", "research"]
 
@@ -37,6 +39,10 @@ DecisionTier = Literal[
     "conditional_policy",
 ]
 
+_VALID_TRACKS: frozenset[str] = frozenset(
+    {"dialogue", "clarify", "off_topic", "research"}
+)
+
 # Canonical ticker spellings for snapshot storage.
 _COMPANY_CANON: dict[str, str] = {
     "aapl": "AAPL",
@@ -46,6 +52,12 @@ _COMPANY_CANON: dict[str, str] = {
     "amzn": "AMZN",
     "amazon": "AMZN",
 }
+
+_CLASSIFY_SYSTEM = (
+    "Classify the operator utterance into exactly one Soft-Track track. "
+    "Reply with JSON only: {\"track\": \"dialogue\"|\"clarify\"|"
+    "\"off_topic\"|\"research\"}."
+)
 
 
 @dataclass(frozen=True)
@@ -89,15 +101,11 @@ _PERIOD_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Prefer the most specific period token when normalizing.
 _PERIOD_SPECIFIC_RE = re.compile(
     r"\b(2022\s*Q3|2023\s*Q[1-3]|Q[1-4]\s*202[23])\b",
     re.IGNORECASE,
 )
 
-# Metric / filing-shaped asks that need grounded company+period slots.
-# Deliberately excludes bare "what was" so off-domain questions are
-# not mis-routed to clarify.
 _FILING_ASK_RE = re.compile(
     r"\b("
     r"revenue|net\s+sales|operating\s+income|EPS|earnings|"
@@ -161,7 +169,6 @@ def _extract_period(text: str) -> str | None:
     specific = _PERIOD_SPECIFIC_RE.search(text or "")
     if specific:
         token = re.sub(r"\s+", " ", specific.group(1)).strip().upper()
-        # Normalize "Q3 2023" → "2023 Q3"
         swapped = re.match(r"^(Q[1-4])\s+(202[23])$", token, re.IGNORECASE)
         if swapped:
             return f"{swapped.group(2)} {swapped.group(1).upper()}"
@@ -211,12 +218,7 @@ def snapshot_delta_for_utterance(
     text: str,
     prior_snapshots: list[Any] | None,
 ) -> list[dict[str, Any]]:
-    """Return 0–1 snapshot dicts to append for this utterance.
-
-    Appends when company and/or period appear. Company change yields a
-    new snapshot with dependent fields cleared (period only if stated
-    in this utterance; ``document_ids`` empty).
-    """
+    """Return 0–1 snapshot dicts to append for this utterance."""
     company = _extract_company(text)
     period = _extract_period(text)
     if not company and not period:
@@ -228,19 +230,19 @@ def snapshot_delta_for_utterance(
     )
 
     if company and prior_company and company != prior_company:
-        snap: dict[str, Any] = {
-            "company": company,
-            "period": period or "",
-            "document_ids": [],
-        }
-        return [snap]
+        return [
+            {
+                "company": company,
+                "period": period or "",
+                "document_ids": [],
+            }
+        ]
 
     snap = {
         "company": company or prior_company or "",
         "period": period or str(latest.get("period") or ""),
         "document_ids": list(latest.get("document_ids") or []),
     }
-    # Skip no-op append when identical to latest.
     if (
         latest
         and snap.get("company") == latest.get("company")
@@ -252,22 +254,8 @@ def snapshot_delta_for_utterance(
     return [snap]
 
 
-def decide_track(
-    messages: list[BaseMessage],
-    *,
-    snapshots: list[Any] | None = None,
-    classify_model: Any | None = None,
-) -> TrackDecision:
-    """Return the Soft-Track decision for this turn.
-
-    ``classify_model`` is accepted for T4 wiring; unused until then.
-    """
-    _ = classify_model
-
-    text = _last_human_text(messages)
-    signals: dict[str, Any] = {"utterance_len": len(text)}
-    latest = _latest_snapshot(snapshots)
-
+def _rules_decision(text: str, signals: dict[str, Any]) -> TrackDecision | None:
+    """High-confidence rules only. ``None`` means ambiguous."""
     if text and _GREETING_RE.match(text):
         signals["greeting"] = True
         return TrackDecision(
@@ -286,7 +274,6 @@ def decide_track(
             signals=signals,
         )
 
-    # Fully slotted filing ask → research (rules) before inherit/clarify.
     if text and _FILING_ASK_RE.search(text) and not _missing_slots(text):
         signals["filing_ask"] = True
         signals["research_signals"] = _research_signal_hits(text)
@@ -297,55 +284,188 @@ def decide_track(
             signals=signals,
         )
 
-    # Inherit: short / underspec follow-up with prior research context.
-    # Do not inherit across an explicit company change.
-    if (
-        text
-        and _snapshot_has_research_context(latest)
-        and not _company_changed(text, latest)
+    # Strong research cues without being an underspec filing ask:
+    # company+period, or tool/document_id mentions.
+    research_hits = _research_signal_hits(text)
+    if research_hits and not (
+        text and _FILING_ASK_RE.search(text) and _missing_slots(text)
     ):
-        missing = _missing_slots(text) if _FILING_ASK_RE.search(text) else []
-        short = len(text) <= 48
-        follow_up = bool(missing) or (
-            short
-            and not _FILING_ASK_RE.search(text)
-            and not _research_signal_hits(text)
-        )
-        if follow_up:
-            signals["inherit"] = True
-            signals["snapshot_company"] = latest.get("company") if latest else None
-            signals["snapshot_period"] = latest.get("period") if latest else None
+        # Underspec filing asks are ambiguous (LLM → inherit → clarify).
+        # Bare ticker/period/tool cues remain high-confidence research.
+        if _extract_company(text) and _extract_period(text):
+            signals["research_signals"] = research_hits
             return TrackDecision(
                 track="research",
-                confidence=0.75,
-                decision_tier="inherit",
+                confidence=0.9,
+                decision_tier="rules",
                 signals=signals,
             )
-
-    if text and _FILING_ASK_RE.search(text):
-        missing = _missing_slots(text)
-        if missing:
-            signals["filing_ask"] = True
-            signals["missing_slots"] = missing
+        if re.search(
+            r"\b(document_id|retrieve|read_file|list_files)\b",
+            text or "",
+            re.IGNORECASE,
+        ):
+            signals["research_signals"] = research_hits
             return TrackDecision(
-                track="clarify",
-                confidence=0.85,
+                track="research",
+                confidence=0.9,
+                decision_tier="rules",
+                signals=signals,
+            )
+        # Company or period alone without metric → research rules
+        # (catalog-shaped), not clarify.
+        if not _FILING_ASK_RE.search(text or ""):
+            signals["research_signals"] = research_hits
+            return TrackDecision(
+                track="research",
+                confidence=0.9,
                 decision_tier="rules",
                 signals=signals,
             )
 
-    research_hits = _research_signal_hits(text)
-    if research_hits:
-        signals["research_signals"] = research_hits
-        return TrackDecision(
-            track="research",
-            confidence=0.9,
-            decision_tier="rules",
-            signals=signals,
-        )
+    return None
 
-    # Ambiguous / short (e.g. HumanMessage("q")) → research so
-    # existing citation-gate bounce suites keep working.
+
+def _message_text(message: Any) -> str:
+    if isinstance(message, AIMessage):
+        content = message.content
+        if isinstance(content, str):
+            return content
+        return str(content)
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+    return str(message)
+
+
+def _try_llm_classify(
+    text: str,
+    classify_model: Any,
+    signals: dict[str, Any],
+) -> TrackDecision | None:
+    """Attempt LLM classify. On EXIT, record ``classify_exit`` and return None."""
+    try:
+        raw = classify_model.invoke(
+            [
+                SystemMessage(content=_CLASSIFY_SYSTEM),
+                HumanMessage(content=text),
+            ]
+        )
+    except Exception as exc:  # noqa: BLE001 — typed EXIT, must not crash
+        signals["classify_exit"] = "model_error"
+        signals["classify_error_type"] = type(exc).__name__
+        return None
+
+    payload_text = _message_text(raw).strip()
+    # Allow optional fenced JSON.
+    if payload_text.startswith("```"):
+        payload_text = re.sub(r"^```(?:json)?\s*", "", payload_text)
+        payload_text = re.sub(r"\s*```$", "", payload_text)
+    try:
+        data = json.loads(payload_text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        signals["classify_exit"] = "schema_parse"
+        return None
+
+    if not isinstance(data, dict):
+        signals["classify_exit"] = "schema_parse"
+        return None
+
+    track = data.get("track")
+    if track not in _VALID_TRACKS:
+        signals["classify_exit"] = "invalid_track"
+        signals["invalid_track"] = track
+        return None
+
+    confidence = data.get("confidence", 0.7)
+    try:
+        confidence_f = float(confidence)
+    except (TypeError, ValueError):
+        confidence_f = 0.7
+
+    signals["llm_track"] = track
+    return TrackDecision(
+        track=track,  # type: ignore[arg-type]
+        confidence=confidence_f,
+        decision_tier="llm",
+        signals=signals,
+    )
+
+
+def _inherit_decision(
+    text: str,
+    latest: dict[str, Any] | None,
+    signals: dict[str, Any],
+) -> TrackDecision | None:
+    if not text or not _snapshot_has_research_context(latest):
+        return None
+    if _company_changed(text, latest):
+        return None
+    missing = _missing_slots(text) if _FILING_ASK_RE.search(text) else []
+    short = len(text) <= 48
+    follow_up = bool(missing) or (
+        short
+        and not _FILING_ASK_RE.search(text)
+        and not _research_signal_hits(text)
+    )
+    if not follow_up:
+        return None
+    signals["inherit"] = True
+    signals["snapshot_company"] = latest.get("company") if latest else None
+    signals["snapshot_period"] = latest.get("period") if latest else None
+    return TrackDecision(
+        track="research",
+        confidence=0.75,
+        decision_tier="inherit",
+        signals=signals,
+    )
+
+
+def _clarify_decision(text: str, signals: dict[str, Any]) -> TrackDecision | None:
+    if not text or not _FILING_ASK_RE.search(text):
+        return None
+    missing = _missing_slots(text)
+    if not missing:
+        return None
+    signals["filing_ask"] = True
+    signals["missing_slots"] = missing
+    return TrackDecision(
+        track="clarify",
+        confidence=0.85,
+        decision_tier="clarify",
+        signals=signals,
+    )
+
+
+def decide_track(
+    messages: list[BaseMessage],
+    *,
+    snapshots: list[Any] | None = None,
+    classify_model: Any | None = None,
+) -> TrackDecision:
+    """Return the Soft-Track decision for this turn (tiered cascade)."""
+    text = _last_human_text(messages)
+    signals: dict[str, Any] = {"utterance_len": len(text)}
+    latest = _latest_snapshot(snapshots)
+
+    rules_hit = _rules_decision(text, signals)
+    if rules_hit is not None:
+        return rules_hit
+
+    # Ambiguous: LLM only when a classify_model is injected.
+    if classify_model is not None and text:
+        llm_hit = _try_llm_classify(text, classify_model, signals)
+        if llm_hit is not None:
+            return llm_hit
+
+    inherit_hit = _inherit_decision(text, latest, signals)
+    if inherit_hit is not None:
+        return inherit_hit
+
+    clarify_hit = _clarify_decision(text, signals)
+    if clarify_hit is not None:
+        return clarify_hit
+
     signals["fallback"] = "research"
     return TrackDecision(
         track="research",
