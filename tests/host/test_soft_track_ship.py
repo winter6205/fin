@@ -529,10 +529,10 @@ def test_matrix_empty_blank_underspec_or_empty_snapshot() -> None:
         {**reset_input_state("revenue"), "evidence": []},
         config=_cfg("ship-empty"),
     )
-    assert out["track"] in ("clarify", "dialogue", "research", "off_topic")
-    # Empty-snapshot inherit already covered; blank greeting edge:
+    assert out["track"] == "clarify"
+    # Empty-snapshot inherit already covered; blank residual → dialogue:
     blank = decide_track([HumanMessage(content="   ")], snapshots=[])
-    assert blank.track in ("dialogue", "clarify", "off_topic", "research")
+    assert blank.track == "dialogue"
 
 
 def test_matrix_negative_off_domain_wrong_track() -> None:
@@ -684,7 +684,7 @@ def test_matrix_exception_classify_exit_defined_track() -> None:
 
     stub = _Stub()
     decision = decide_track(
-        [HumanMessage(content="hmm maybe filings?")],
+        [HumanMessage(content="hmm maybe this?")],
         classify_model=stub,
     )
     assert stub.calls == 1
@@ -703,7 +703,7 @@ def test_matrix_exception_classify_exit_defined_track() -> None:
     )
     out = g.invoke(
         {
-            **reset_input_state("hmm maybe filings?"),
+            **reset_input_state("hmm maybe this?"),
             "evidence": [],
         },
         config=_cfg("ship-exc"),

@@ -166,3 +166,44 @@ def test_bare_q_dialogue_not_clarify():
         config=_thread_config("t-soft-clarify-q"),
     )
     assert out["track"] == "dialogue"
+
+
+def test_filled_slots_follow_up_after_clarify_enters_research():
+    """T2: next run with company+period filled can enter research."""
+    from fin.host.state import reset_input_state
+
+    model = ScriptedChatModel(
+        script=[
+            AIMessage(
+                content=(
+                    "Which company and period? Options include AAPL, MSFT, "
+                    "AMZN and periods 2022 Q3, 2023 Q1–Q3."
+                )
+            ),
+            AIMessage(content="need evidence"),
+        ]
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    tid = "t-soft-clarify-then-research"
+    first = g.invoke(
+        {
+            "messages": [HumanMessage(content="What was revenue?")],
+            "evidence": [],
+            "repair_count": 0,
+            "step_count": 0,
+        },
+        config=_thread_config(tid),
+    )
+    assert first["track"] == "clarify"
+    second = g.invoke(
+        {
+            **reset_input_state("What was AAPL net sales in 2023 Q3?"),
+            "evidence": [],
+        },
+        config=_thread_config(tid),
+    )
+    assert second["track"] == "research"

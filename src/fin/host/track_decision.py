@@ -7,9 +7,10 @@ Tier order (no single global default track):
 
 1. **rules** — high-confidence greeting / off-domain / fully slotted
    research / strong research cues (never replaced by LLM).
-2. **llm** — only when ambiguous and ``classify_model`` is provided;
-   structured ``{"track": ...}``; typed EXITs
-   (``invalid_track`` / ``schema_parse`` / ``model_error``) fall through.
+2. **llm** — only when ambiguous (inherit/clarify would not already
+   decide) and ``classify_model`` is provided; structured
+   ``{"track": ...}``; typed EXITs (``invalid_track`` /
+   ``schema_parse`` / ``model_error``) fall through.
 3. **inherit** — short / underspec follow-up with latest status snapshot
    research context (not across company change).
 4. **clarify** — filing-shaped ask missing company and/or period.
@@ -452,17 +453,23 @@ def decide_track(
     if rules_hit is not None:
         return rules_hit
 
-    # Ambiguous: LLM only when a classify_model is injected.
-    if classify_model is not None and text:
+    # Peek inherit/clarify once: if either would decide, skip LLM so a
+    # production classify_model cannot steal MUST (2)/(5).
+    inherit_hit = _inherit_decision(text, latest, dict(signals))
+    clarify_hit = _clarify_decision(text, dict(signals))
+    if (
+        classify_model is not None
+        and text
+        and inherit_hit is None
+        and clarify_hit is None
+    ):
         llm_hit = _try_llm_classify(text, classify_model, signals)
         if llm_hit is not None:
             return llm_hit
 
-    inherit_hit = _inherit_decision(text, latest, signals)
     if inherit_hit is not None:
         return inherit_hit
 
-    clarify_hit = _clarify_decision(text, signals)
     if clarify_hit is not None:
         return clarify_hit
 

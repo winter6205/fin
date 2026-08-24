@@ -42,6 +42,7 @@ vite.config.d.ts
 
 # Machine-local debug residue (browser tests, hook artifacts)
 .playwright-cli/
+.playwright-cli-e2e/
 .claude/scratchpad/post-push.*
 
 # Git worktrees live under .claude/worktrees; never track a checkout
