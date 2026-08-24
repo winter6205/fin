@@ -6,6 +6,7 @@
 // carry JSON. This matches spec ADR 0026.
 
 import type { Citation, Filing, ThreadDetail, ThreadListItem } from "./types";
+import { foldSendResultAnswer } from "./turnStream";
 
 async function jsonOrThrow<T>(res: Response): Promise<T> {
   if (!res.ok) {
@@ -30,7 +31,7 @@ export async function listThreads(): Promise<ThreadListItem[]> {
 }
 
 export async function createThread(
-  firstMessage: string | null
+  firstMessage: string | null,
 ): Promise<ThreadListItem> {
   const res = await fetch("/api/threads", {
     method: "POST",
@@ -129,7 +130,7 @@ export interface SendRequest {
 export async function sendMessage(
   threadId: string,
   request: SendRequest,
-  onEvent?: (e: SendEvent) => void
+  onEvent?: (e: SendEvent) => void,
 ): Promise<SendResult> {
   const res = await fetch(
     `/api/threads/${encodeURIComponent(threadId)}/messages`,
@@ -137,7 +138,7 @@ export async function sendMessage(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(request),
-    }
+    },
   );
 
   // Error paths happen BEFORE any SSE frame per spec.
@@ -178,7 +179,7 @@ export async function sendMessage(
  */
 async function consumeSseStream(
   body: ReadableStream<Uint8Array>,
-  onEvent?: (e: SendEvent) => void
+  onEvent?: (e: SendEvent) => void,
 ): Promise<SendResult> {
   const result: SendResult = {
     // Run id starts as a local placeholder; the ``status`` SSE
@@ -196,7 +197,8 @@ async function consumeSseStream(
   let buffer = "";
   // T1 (#33): answer frames are DELTAS while the run streams; the
   // post-``status`` frame is the authoritative full text (replace);
-  // a ``reset`` frame (bounce retry boundary) clears the attempt.
+  // ``reset:true`` replaces with accompanying ``text`` (bounce retry
+  // first delta, or empty clear for terminal refuse flush).
   let sawStatus = false;
 
   for (;;) {
@@ -304,13 +306,11 @@ async function consumeSseStream(
           break;
         case "answer": {
           const a = payload as { text: string; reset?: boolean };
-          if (sawStatus) {
-            result.answerText = a.text ?? "";
-          } else if (a.reset) {
-            result.answerText = "";
-          } else {
-            result.answerText += a.text ?? "";
-          }
+          result.answerText = foldSendResultAnswer(
+            result.answerText,
+            a.text ?? "",
+            { statusSeen: sawStatus, reset: a.reset },
+          );
           onEvent?.({
             type: "answer",
             text: a.text ?? "",
@@ -345,14 +345,14 @@ async function consumeSseStream(
  */
 export async function resumeThread(
   threadId: string,
-  onEvent?: (e: SendEvent) => void
+  onEvent?: (e: SendEvent) => void,
 ): Promise<SendResult> {
   const res = await fetch(
     `/api/threads/${encodeURIComponent(threadId)}/resume`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-    }
+    },
   );
 
   // Rejection order matches the route definition: every failure

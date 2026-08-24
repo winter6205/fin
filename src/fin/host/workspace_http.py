@@ -77,7 +77,7 @@ from langchain_core.messages import (
 from pydantic import BaseModel, Field
 
 from fin.corpus.catalog import list_filings
-from fin.host.citation_gate import strip_hidden_bounce_marker
+from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER, strip_hidden_bounce_marker
 from fin.host.graph import ConcurrentRunError
 from fin.host.run_payload import RunResponsePayload, _run_to_response_payload
 from fin.host.stream_map import (
@@ -117,12 +117,19 @@ class RunStreamOutcome:
     (spec line 67: GET history shows empty sources plus non-empty
     assistant copy) instead of being wiped by the SPA's
     openThread reconcile.
+
+    ``answer_reset`` is True when a bounce-marker SystemMessage set
+    a pending live-view reset that was never consumed by a
+    non-empty answer delta — callers attach ``reset: true`` to the
+    terminal answer frame so a refuse / empty terminal still clears
+    the stale draft.
     """
 
     final_state: dict[str, Any] | None
     thinking_ms: int
     refuse_reason: str | None = None
     refuse_copy: str | None = None
+    answer_reset: bool = False
 
 
 # Maximum characters of the first message used as the thread title.
@@ -426,6 +433,22 @@ def _stream_run_frames(
 
     filter_state = InlineFilterState()
     final_state: dict[str, Any] | None = None
+    # Bounce-marker SystemMessage arms a pending reset; the NEXT
+    # non-empty answer delta carries ``reset: true`` in the same
+    # frame as its text. Do NOT emit a standalone empty reset (that
+    # blanks the SPA before tool_call / retry prose). tool_call does
+    # not clear pending. If the run ends with pending still armed,
+    # the terminal empty answer flushes it (refuse / no retry prose).
+    pending_answer_reset = False
+
+    def _answer_payload(text: str) -> dict[str, Any]:
+        nonlocal pending_answer_reset
+        data: dict[str, Any] = {"text": text}
+        if pending_answer_reset:
+            data["reset"] = True
+            pending_answer_reset = False
+        return data
+
     try:
         for mode, payload in graph.stream(
             input_value,
@@ -453,7 +476,7 @@ def _stream_run_frames(
                     if split.thinking:
                         yield _frame("thinking", {"text": split.thinking})
                     if split.answer:
-                        yield _frame("answer", {"text": split.answer})
+                        yield _frame("answer", _answer_payload(split.answer))
             else:
                 final_state = payload
                 for message in payload.get("messages", []) or []:
@@ -463,16 +486,16 @@ def _stream_run_frames(
                     if mid:
                         seen_message_ids.add(mid)
                     if isinstance(message, SystemMessage):
-                        # The gate's hidden bounce template: the previous
-                        # attempt failed verification and the model is
-                        # about to retry. Signal the retry boundary so
-                        # the live view RESETS its answer accumulator
-                        # instead of concatenating every failed
-                        # attempt's prose (spec line 30 keeps the event
-                        # TYPE ``answer``; ``reset`` is an additive
-                        # payload key). The template itself never
-                        # reaches the wire (ADR 0021).
-                        yield _frame("answer", {"text": "", "reset": True})
+                        # Only the gate's hidden bounce template (ADR
+                        # 0021 marker) arms pending reset. Other
+                        # SystemMessages are ignored. The template
+                        # itself never reaches the wire.
+                        raw = message.content
+                        if (
+                            isinstance(raw, str)
+                            and HIDDEN_BOUNCE_MARKER in raw
+                        ):
+                            pending_answer_reset = True
                         continue
                     for event, data in _node_frame_payloads(message):
                         yield _frame(event, data)
@@ -483,7 +506,7 @@ def _stream_run_frames(
         if tail.thinking:
             yield _frame("thinking", {"text": tail.thinking})
         if tail.answer:
-            yield _frame("answer", {"text": tail.answer})
+            yield _frame("answer", _answer_payload(tail.answer))
     except Exception as exc:
         # Mid-flight failure (model raise, node crash): without this
         # boundary the exception escapes the generator, FastAPI kills
@@ -515,8 +538,10 @@ def _stream_run_frames(
                 "thinking_ms": clock.total_ms,
             },
         )
+        # Flush pending bounce reset on the terminal empty answer
+        # when the raise happened before any retry prose.
         yield _format_sse(
-            "answer", {"text": strip_thinking_from_answer("")}
+            "answer", _answer_payload(strip_thinking_from_answer(""))
         )
         yield _format_sse("citations", _citations_wire_payload([]))
         clock.close()
@@ -527,7 +552,11 @@ def _stream_run_frames(
             refuse_copy=copy,
         )
     clock.close()
-    return RunStreamOutcome(final_state=final_state, thinking_ms=clock.total_ms)
+    return RunStreamOutcome(
+        final_state=final_state,
+        thinking_ms=clock.total_ms,
+        answer_reset=pending_answer_reset,
+    )
 
 
 def _citations_wire_payload(citations: list[Any]) -> list[dict[str, Any]]:
@@ -568,6 +597,7 @@ def _terminal_sse_frames(
     payload: RunResponsePayload,
     thinking_type: str | None = None,
     thinking_ms: int | None = None,
+    answer_reset: bool = False,
 ) -> Iterator[str]:
     """Yield the fixed-order terminal frames: ``status`` -> ``answer``
     -> ``citations`` (spec line 30; citations is TERMINAL so the SPA
@@ -578,6 +608,12 @@ def _terminal_sse_frames(
     extras on the status frame: ``thinking_type`` (send route echo)
     and ``thinking_ms`` (T4, #37 — the collapse label's duration,
     known by stream end).
+
+    ``answer_reset`` attaches ``reset: true`` to the terminal answer
+    when a bounce left pending reset unconsumed (typical: refuse
+    with empty text and no retry prose). Mid-run empty
+    ``{text:"", reset:true}`` is forbidden; this terminal flush is
+    the sole empty+reset exception.
     """
     safe_answer = strip_thinking_from_answer(
         payload["answer"] if payload["status"] == "done" else ""
@@ -592,8 +628,11 @@ def _terminal_sse_frames(
         status_body["thinking_type"] = thinking_type
     if thinking_ms is not None:
         status_body["thinking_ms"] = thinking_ms
+    answer_body: dict[str, Any] = {"text": safe_answer}
+    if answer_reset:
+        answer_body["reset"] = True
     yield _format_sse("status", status_body)
-    yield _format_sse("answer", {"text": safe_answer})
+    yield _format_sse("answer", answer_body)
     yield _format_sse("citations", _citations_wire_payload(payload["citations"]))
 
 
@@ -942,6 +981,7 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                 payload=payload,
                 thinking_type=thinking_type,
                 thinking_ms=outcome.thinking_ms,
+                answer_reset=outcome.answer_reset,
             )
 
         return StreamingResponse(
@@ -1081,6 +1121,7 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                 run_id=run_id,
                 payload=payload,
                 thinking_ms=outcome.thinking_ms,
+                answer_reset=outcome.answer_reset,
             )
 
         return StreamingResponse(
