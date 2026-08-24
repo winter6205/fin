@@ -28,32 +28,34 @@ minimal-change-verifier: yes — one logical remainder of the workspace conversa
    - **Inherits:** spec: `model_node` calls `model.stream()` (not blocking `invoke`); FastAPI wraps sync graph `stream()` in `StreamingResponse`; SSE types on the wire are `thinking` | `tool_call` | `tool_result` | `answer` | `citations` | `status`; citation verifier and user-visible `answer` events use thinking-stripped prose only; hidden bounce never appears in SSE; a node is complete only after it has finished writing — `model_node` complete ⇒ one full `AIMessage` including complete `tool_calls` is checkpointed; 409 `{error: concurrent_run}` is decided **before** SSE headers; thinking UI is unframed, not in the answer bubble, and appears only after the first `thinking` event; MiniMax `extra_body` uses `reasoning_split: true` and `thinking.type` adaptive|disabled
    - **Surface:** `host` (send path + stream mapping) + `web/` transcript
    - **Acceptance:** a scripted model that emits thinking then answer in multiple chunks yields multiple `thinking` frames and multiple `answer` frames on `POST /api/threads/{id}/messages` **before** that model step finishes writing the checkpointed `AIMessage`; no thinking prose appears inside any `answer` event; `verify_citations` is called with thinking-stripped prose and can still `done` on a ≥32-char evidenced span; the SPA grows unframed thinking after the first thinking event and grows the answer as answer events arrive (citations remain terminal on that run); `POST /ask` still `invoke`; `uv run pytest -q` and `web/` `tsc --noEmit` stay green
-   - Status: [ ] pending
+   - Status: [x] done — merged PR (T1 #33)
 
 2. **Crash resume streams the remainder on the same delta wire** — tag: `[implementation]`
    - **Inherits:** spec / ADR 0026: process died → open/resume with `stream(None)` (no new HumanMessage) on the same `thread_id` / `run_id` from the last complete node; process still running + refresh does **not** reconnect token-by-token (GET shows running, POST → 409); switching research threads is allowed and deltas stay bound to that `thread_id`; this increment’s UI does not start a second in-flight run
    - **Surface:** `host` stream/open path + `web/` running/resume
    - **Acceptance:** a scripted checkpoint after a complete `AIMessage` with `tool_calls` and before tool results: `stream(None)` does not append a HumanMessage, does not regenerate that model message, and the resume SSE carries later `thinking` / `answer` deltas with the same live-turn behaviour as T1 (not one dump after the remainder finishes); switching threads does not paint those deltas onto another `thread_id`
-   - Status: [ ] pending
+   - Status: [x] done — merged PR (T2 #36)
    - [blocks: T1]
 
 3. **[parallel] Global thinking preference defaults on** — tag: `[implementation]`
    - **Inherits:** spec: a global UI preference maps off → `thinking.type=disabled`; default is on (omit / `adaptive`); official GPT Chat Completions expose no thinking text — if `FIN_BASE_URL` is OpenAI, the UI draws no thinking region; converter replay of `reasoning_details` on the next model call stays on (`reasoning_split` does not turn off with the preference)
    - **Surface:** `web/` chrome/composer + `host` send `extra_body`
    - **Acceptance:** a first-time visitor has thinking on; turning the preference off makes the next send use `disabled` and that run draws no thinking region; the control is a thinking on/off preference, not a step-by-step instruction to the model; reload keeps the preference
-   - Status: [ ] pending
+   - Status: [x] done — merged PR (T3 #34)
    - [parallel]
 
 4. **After the run, thinking and tools collapse** — tag: `[implementation]`
    - **Inherits:** spec: while collapsed during the run, line-clamp a few lines; expand shows the full thinking text; after the run, collapse to a one-line duration label; reload restores that collapsed thinking text from the turn row; tools are separate light-gray (`#F5F5F4`) details, visible while that call runs, collapse after the run; GET after `done` includes collapsed thinking and tool summaries without bounce marker or retrieve JSON
    - **Surface:** `host` turn table + `web/` transcript
    - **Acceptance:** after a terminal `status`, thinking is a one-line duration that expands to the full thinking text; tool rows are collapsed; GET `/api/threads/{id}` still returns the thinking text and human-readable tool summaries; the body contains neither `HIDDEN_BOUNCE_MARKER` nor raw retrieve/read_file JSON
-   - Status: [ ] pending
+   - Status: [x] done — merged PR (T4 #37)
    - [blocks: T1]
 
 5. **[parallel] Returning visit restores the last research thread** — tag: `[implementation]`
    - **Inherits:** spec: returning visit restores last `/t/{id}` when that id still exists; first visit: no threads, corpus in main, New thread and cards as starts; unknown `/t/{id}` is 404 + back to the list
    - **Surface:** `web/` shell / router
    - **Acceptance:** after opening a thread, a later visit to the workspace lands on that `/t/{id}` if the thread still exists; after delete (or unknown id), the visit is home/corpus, not a blank chat
-   - Status: [ ] pending
+   - Status: [x] done — merged PR (T5 #35)
    - [parallel]
+
+**Shipped:** 2026-08-23 on `main` via that pull request. Tracker #33–#37 closed 2026-08-25. Do not reopen these bullets.

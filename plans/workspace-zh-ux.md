@@ -31,7 +31,7 @@ minimal-change-verifier: yes — 五条 tracer bullet，每条一 commit；无 l
 
 **开放（由子弹闭合）：**
 
-- T4：Corpus 首页跳过 restore 用 `sessionStorage` 门闩还是 `location.state.skipRestore`（implementer 二选一，Acceptance 固定行为）。
+- T4：已决 — `sessionStorage` 门闩 `fin.corpusHome`（`web/src/sessionKeys.ts`），不是 `location.state.skipRestore`。
 
 ## UI 文案表（T1 SSOT，T2–T5 inherits）
 
@@ -64,20 +64,20 @@ minimal-change-verifier: yes — 五条 tracer bullet，每条一 commit；无 l
    - **Inherits:** 用户确认：界面主语言中文；专业名词与报错逻辑可英文；spec Soft Brutalism chrome 不变
    - **Surface:** `docs/CONTEXT.md` + 本 plan「UI 文案表」
    - **Acceptance:** CONTEXT 含 **Corpus 首页** 与 **citation span**；本 plan「UI 文案表」完整；无 `web/` 产品代码变更
-   - Status: [ ] pending → the tracked change
+   - Status: [x] done — CONTEXT 词条 + 本文案表；tracker the tracked change closed 2026-08-25
 
 2. **Corpus 三态首屏** — tag: `[implementation]`
    - **Inherits:** spec 空 corpus bound + `GET /api/corpus` 冻结 12；T1 文案表：`corpusLoaded=false` →「正在加载 Corpus…」；`corpusLoaded=true && length===0` →「Corpus 尚未 ingest」+ 说明 ingest 非网络 fetch；`length>0` → 卡片网格
    - **Surface:** `web/`（home / corpus 展示）
    - **Acceptance:** 三种状态互斥、文案符合 T1；加载中显示 skeleton 卡片（≥3）而非仅虚线框；未 ingest CTA 为「新建对话（Corpus 为空也可试）」；`web/` `tsc --noEmit` 通过
-   - Status: [ ] pending → the tracked change
+   - Status: [x] done — merged PR (the tracked change)
    - [blocks: T1]
 
 3. **Sources 按文档·页分组与默认折叠** — tag: `[implementation]`
    - **Inherits:** spec SC citations sources list；CONTEXT **citation span**；gate ≥32 字滑窗粒度不变（非 send 失败）
    - **Surface:** `web/`（citation / sources 展示）
    - **Acceptance:** sources 默认展示汇总行「Sources（出处）· {去重页数} 页 · {条数} spans」；按 `document_id` → `page` 二级折叠；总 span 数 >10 时默认折叠；展开后可见完整 quote；有简短消歧（citation gate 匹配片段，可有半句重叠）；正文内联 chip 行为不变；`tsc --noEmit` 通过
-   - Status: [ ] pending → the tracked change
+   - Status: [x] done — merged PR (the tracked change)
    - [parallel]
    - [blocks: T1]
 
@@ -85,12 +85,14 @@ minimal-change-verifier: yes — 五条 tracer bullet，每条一 commit；无 l
    - **Inherits:** spec line 42 回访恢复；CONTEXT **Corpus 首页**；修正 per-mount 反复 bounce
    - **Surface:** `web/`（路由 / 侧栏 / home restore）
    - **Acceptance:** 冷启动（新 browser tab / session）且 `fin.lastThread` 有效时仍自动 `replace` 到 `/t/{id}`；同 session 内操作者经侧栏「Corpus 首页」进入 `/` 时不再被 restore 弹走；侧栏存在显式 Corpus 首页入口；`tsc --noEmit` 通过
-   - Status: [ ] pending → the tracked change
+   - Status: [x] done — merged PR (the tracked change)
    - [blocks: T1]
 
 5. **全局中文化与 Thinking 开关美化** — tag: `[implementation]`
    - **Inherits:** T1 文案表；spec Thinking 全局偏好 off → `thinking.type=disabled`；无 `thinking_text` 时不预留 Thinking 区
    - **Surface:** `web/`（sidebar、thread、composer、dialog、404）
    - **Acceptance:** 操作壳层（侧栏、对话页、Composer、删除确认、404、状态标签 done/refuse/step_cap、Resume 横幅）为中文，术语按 T1 保留英文；Composer 的 Thinking 由 checkbox 改为符合 Soft Brutalism 的 toggle（1px 黑边、`#2563EB` accent、关/开状态可辨）；关时副文案「本轮将跳过推理轨迹」；`tsc --noEmit` 通过
-   - Status: [ ] pending → the tracked change
+   - Status: [x] done — merged PR (the tracked change)
    - [blocks: T2, T3, T4]
+
+**Shipped:** 2026-08-23 on `main` via that pull request. Tracker the tracked change through the tracked change closed 2026-08-25. Do not reopen these bullets.
