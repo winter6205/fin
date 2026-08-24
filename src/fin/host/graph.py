@@ -184,17 +184,32 @@ def _make_list_files_tool(manifest_path: Path, extracted_root: Path):
     """
 
     @tool("list_files")
-    def list_files_tool(company: str | None = None, period: str | None = None) -> dict:
+    def list_files_tool(
+        company: str | None = None,
+        period: str | None = None,
+        *,
+        cik: str | None = None,
+        form: str | None = None,
+        ticker: str | None = None,
+        filing_date: str | None = None,
+    ) -> dict:
         """List available 10-Q filings in the corpus.
 
         Optional ``company`` and ``period`` filters match the
         manifest's ``company`` and ``period`` fields exactly.
-        Returns ``{"filings": [...]}``; unknown filters return
-        ``{"filings": []}``.
+        Additive EDGAR-shaped filters (``cik``, ``form``,
+        ``ticker``, exact ``filing_date``) per ADR 0031 are
+        forwarded through. Returns ``{"filings": [...]}`; unknown
+        filters, conflicting filters, and empty filter values
+        all return ``{"filings": []}``.
         """
         return list_files(
             company=company,
             period=period,
+            cik=cik,
+            form=form,
+            ticker=ticker,
+            filing_date=filing_date,
             manifest_path=manifest_path,
             extracted_root=extracted_root,
         )
