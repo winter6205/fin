@@ -27,6 +27,22 @@ export function mergeAnswerDelta(
   return currentAnswer + delta;
 }
 
+/** Fold one ``answer`` SSE into ``SendResult.answerText`` (non-live).
+ *
+ * Unlike ``mergeAnswerDelta`` (live bubble keeps draft after status),
+ * post-status frames replace so the returned result matches the wire.
+ * ``reset`` always replaces with ``text`` (empty = clear).
+ */
+export function foldSendResultAnswer(
+  currentAnswer: string,
+  text: string,
+  opts: { statusSeen: boolean; reset?: boolean },
+): string {
+  if (opts.reset) return text;
+  if (opts.statusSeen) return text;
+  return currentAnswer + text;
+}
+
 /** After GET reconcile, prefer the streamed row's visible prose when
  * the operator already watched it arrive token-by-token. Persisted
  * fields (citations with quotes, ids) still come from the server row.

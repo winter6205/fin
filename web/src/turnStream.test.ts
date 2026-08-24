@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { mergeAnswerDelta, mergeReconciledTurn } from "./turnStream";
+import {
+  foldSendResultAnswer,
+  mergeAnswerDelta,
+  mergeReconciledTurn,
+} from "./turnStream";
 import type { Turn } from "./types";
 
 describe("mergeAnswerDelta", () => {
@@ -21,10 +25,51 @@ describe("mergeAnswerDelta", () => {
     );
   });
 
-  it("clears on bounce retry reset", () => {
+  it("clears on bounce retry reset with empty text", () => {
     expect(
       mergeAnswerDelta("failed attempt", "", { statusSeen: true, reset: true }),
     ).toBe("");
+  });
+
+  it("replaces with non-empty text on bounce retry reset", () => {
+    expect(
+      mergeAnswerDelta("failed attempt", "retry chunk", {
+        statusSeen: false,
+        reset: true,
+      }),
+    ).toBe("retry chunk");
+  });
+});
+
+describe("foldSendResultAnswer", () => {
+  it("appends while streaming without reset", () => {
+    expect(foldSendResultAnswer("hel", "lo", { statusSeen: false })).toBe(
+      "hello",
+    );
+  });
+
+  it("replaces with non-empty text on reset", () => {
+    expect(
+      foldSendResultAnswer("failed attempt", "retry chunk", {
+        statusSeen: false,
+        reset: true,
+      }),
+    ).toBe("retry chunk");
+  });
+
+  it("clears on reset with empty text", () => {
+    expect(
+      foldSendResultAnswer("failed attempt", "", {
+        statusSeen: false,
+        reset: true,
+      }),
+    ).toBe("");
+  });
+
+  it("replaces after status (authoritative SendResult frame)", () => {
+    expect(
+      foldSendResultAnswer("draft", "full answer", { statusSeen: true }),
+    ).toBe("full answer");
   });
 });
 
