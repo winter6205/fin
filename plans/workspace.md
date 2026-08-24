@@ -27,25 +27,27 @@ minimal-change-verifier: yes — one logical conversation increment; implementat
    - **Inherits:** spec: one FastAPI process, same compiled graph as CLI/`POST /ask`; `POST /ask` still sync `invoke`; POST `fetch` SSE on `/api/threads/{id}/messages`; turn rows for GET history; `web/` SPA at `/` and `/t/{thread_id}`; Soft Brutalism tokens; chrome create/list/open/resume/delete; `GET /api/corpus` is the frozen 12 `{document_id, company, period, version, page_count}`; empty submit is a no-op; bind `0.0.0.0:8000` no auth; `uv run pytest -q` and `web/` `tsc --noEmit`; do not copy `prototype_workspace`
    - **Surface:** `host` HTTP + `web/`
    - **Acceptance:** operator can create a thread, send a scripted question, watch `answer`/`status` (and terminal `citations`) SSE into the SPA, reload `/t/{id}` and see the same turns without re-invoking; unknown id is 404 + back to list; delete then GET is 404; corpus endpoint returns the real 12; `/ask` still `invoke` on the same graph object
-   - Status: [ ] pending
+   - Status: [x] done — on `main` (T1 #28; later stream remainder [PR #38](https://github.com/winter6205/fin/pull/38); tracker closed 2026-08-25)
 
 2. **Follow-up is a new run** — tag: `[implementation]` (#29)
    - **Inherits:** CONTEXT **run**: follow-up resets run-scoped evidence and caps; spec: title from first question (50 chars + ellipsis); concurrent send on the same thread is 409 `{error: concurrent_run}` before SSE headers; composer disabled while that thread’s run is in flight (no queue, no Stop); `refuse` / `step_cap` are normal turns with empty citations plus ordinary-person copy
    - **Surface:** `host` (state/graph send path) + `web/` composer/sidebar
    - **Acceptance:** second send on the same `thread_id` starts `step_count`/`repair_count` at 0 and does not treat the previous run’s pages as this run’s evidence; a scripted answer that only quotes last run’s pages is not `done`; overlapping POST returns 409 with no event-stream body; sidebar title is the first question, truncated
-   - Status: [ ] pending
+   - Status: [x] done — on `main` (T2 #29; tracker closed 2026-08-25)
    - [blocks: T1]
 
 3. **Thinking and tools stream then collapse** — tag: `[implementation]` (#30)
    - **Inherits:** ADR 0025/0026; spec: `model.stream()` token deltas; MiniMax `extra_body` thinking + `reasoning_split` with converter replay; thinking-stripped prose for the citation gate and `answer` events; thinking UI unframed + line-clamp until expand; tools are `#F5F5F4` details with human-readable summaries (not raw JSON); citations = inline chips at verified spans **and** a sources list; global thinking preference off → `thinking.type=disabled`; hidden bounce never on SSE/GET/SPA
    - **Surface:** `host` (model stream + thinking transport) + `web/` transcript
    - **Acceptance:** scripted thinking deltas never appear inside `answer`; `verify_citations` sees stripped prose and can still `done` on a ≥32-char evidenced span; GET after `done` includes collapsed thinking and tool summaries without bounce marker or retrieve JSON; SPA shows unframed thinking only after the first thinking event, tools collapse after the run, chips and sources list both present
-   - Status: [ ] pending
+   - Status: [x] done — on `main` (T3 #30; remainder in [PR #38](https://github.com/winter6205/fin/pull/38); tracker closed 2026-08-25)
    - [blocks: T2]
 
 4. **Crash resume from the last complete node** — tag: `[implementation]` (#31)
    - **Inherits:** CONTEXT **run** / ADR 0018 / ADR 0026: crash resume continues the same `run_id` from the last complete host-graph node; user HumanMessage is never deleted; process-alive refresh does not reconnect token-by-token (GET shows running, POST → 409); process-died open uses `stream(None)` with no new HumanMessage; ingest-missing workspace send is 503; UI may switch threads but must not paint deltas onto another `thread_id`; this increment does not start a second in-flight run from the UI
    - **Surface:** `host` stream/open path + `web/` running/resume
    - **Acceptance:** a scripted checkpoint after a complete `AIMessage` with `tool_calls` and before tool results: `stream(None)` does not append a HumanMessage, does not regenerate that model message, runs the tool node, and reaches a terminal status; GET while a lock is held reports running; ingest-missing send is 503 `{error: ingest_missing}`; switching threads does not attach the live SSE to the wrong thread
-   - Status: [ ] pending
+   - Status: [x] done — on `main` (T4 #31; tracker closed 2026-08-25)
    - [blocks: T3]
+
+**Shipped:** conversation slice on `main`. Tracker issues #27–#31 closed 2026-08-25 (stale OPEN after merge). Do not reopen these bullets.

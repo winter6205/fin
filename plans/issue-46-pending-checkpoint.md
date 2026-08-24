@@ -24,7 +24,9 @@ After persisting mid-flight refuse `RunRecord`, finalize checkpoint via new `_Lo
 
 ## Tasks
 
-1. [implementation] Add `finalize_abandoned_run` to `_LockedGraph`
-2. [implementation] Call after mid-flight refuse `store.append_run` in send path
-3. [implementation] Extend `test_scripted_model_raises_emits_terminal_status` + add resume 204 assertion
-4. [implementation] Regression: crash resume test still has `pending_checkpoint: true`
+1. [x] done — Add `finalize_abandoned_run` to `_LockedGraph`
+2. [x] done — Call after mid-flight refuse `store.append_run` in send path
+3. [x] done — Extend `test_scripted_model_raises_emits_terminal_status` + add resume 204 assertion
+4. [x] done — Regression: crash resume test still has `pending_checkpoint: true`
+
+**Shipped:** [PR #47](https://github.com/winter6205/fin/pull/47) on `main`.
