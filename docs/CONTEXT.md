@@ -40,8 +40,8 @@ The only retrieve dependency fin is allowed to have: `query` (+ optional filters
 _Avoid_: search API, vector store
 
 **retrieve adapter**:
-v1's real in-process retrieve: lexical BM25 over page-passage chunks, each carrying a locator as `source_ref`. Not a stub. Swappable later (for example an MCP client to iknow-memory) without changing the host graph.
-_Avoid_: mock retriever, empty adapter, whole-page-only as the only chunk grain, cosine as v1's ranking
+The product retrieve implementation behind the retrieve port: an MCP client to **iknow-memory**. Hits map back to fin locators as `source_ref`. In-process BM25 is archived (ADR 0007 superseded by 0030). Retrieve chunking upgrades land in iknow-memory, not a second splitter in fin.
+_Avoid_: shipping BM25 as the product path, hybrid/RRF implemented in this repo, moving the extracted cite tree into iknow-memory, compile-time coupling of the two repos
 
 ### Agent
 
@@ -142,7 +142,7 @@ Historical private fixture source 12-PDF freeze (ADR 0004, superseded by 0029). 
 _Avoid_: current catalog, gold SSOT, demo FAQ
 
 **ingest**:
-A CLI that writes frozen locator-unit text and retrieve chunks from official EDGAR primary HTML into an extracted tree. The ask path does not fetch EDGAR or open source filings.
+A CLI that writes frozen locator-unit text from official filings (or the existing extracted tree) into an extracted tree. Retrieve sliding windows are not fin's ranking stack (ADR 0030). The ask path does not fetch EDGAR or open source filings.
 _Avoid_: extract-on-query, host-graph ingest node, putting filing bytes in the checkpointer database
 
 **contract eval**:
