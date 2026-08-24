@@ -5,7 +5,15 @@
 // EventSource — because EventSource cannot POST a body and cannot
 // carry JSON. This matches spec ADR 0026.
 
-import type { Citation, Filing, ThreadDetail, ThreadListItem } from "./types";
+import type {
+  Citation,
+  Filing,
+  SoftTrack,
+  ThreadDetail,
+  ThreadListItem,
+  TrackDecision,
+} from "./types";
+import { parseSoftTrack, parseTrackDecision } from "./softTrack";
 import { foldSendResultAnswer } from "./turnStream";
 
 async function jsonOrThrow<T>(res: Response): Promise<T> {
@@ -74,6 +82,9 @@ export interface SendResult {
   // T2: ordinary-person copy from the SSE ``status`` frame
   // (non-empty only on refuse / step_cap).
   assistantMessage: string;
+  // Soft-Track: optional until the host peer lands SSE ``track``.
+  track?: SoftTrack;
+  track_decision?: TrackDecision;
 }
 
 // T3 streaming events surfaced to the caller as they arrive.
@@ -105,6 +116,9 @@ export type SendEvent =
       // T4 (#37): the run's total thinking duration in ms, known
       // by stream end; drives the live turn's collapse label.
       thinking_ms?: number;
+      // Soft-Track: optional until host SSE includes ``track``.
+      track?: SoftTrack;
+      track_decision?: TrackDecision;
     }
   | { type: "answer"; text: string; reset?: boolean }
   | { type: "citations"; citations: Citation[] };
@@ -275,7 +289,8 @@ async function consumeSseStream(
           // so the optimistic turn the store renders can match
           // the persisted RunRecord BEFORE any re-GET. T2 adds
           // ``assistant_message`` (ordinary-person copy on
-          // refuse / step_cap).
+          // refuse / step_cap). Soft-Track may add ``track`` /
+          // ``track_decision``; both are optional until the peer lands.
           sawStatus = true;
           const s = payload as {
             run_id?: string;
@@ -283,10 +298,17 @@ async function consumeSseStream(
             reason?: string;
             assistant_message?: string;
             thinking_ms?: number;
+            track?: unknown;
+            track_decision?: unknown;
           };
           result.status = s.status;
           result.reason = s.reason ?? null;
           result.assistantMessage = s.assistant_message ?? "";
+          const trackDecision = parseTrackDecision(s.track_decision);
+          const track = parseSoftTrack(s.track) ?? trackDecision?.track;
+          if (track !== undefined) result.track = track;
+          if (trackDecision !== undefined)
+            result.track_decision = trackDecision;
           if (typeof s.run_id === "string" && s.run_id.length > 0) {
             result.run_id = s.run_id;
           }
@@ -297,6 +319,8 @@ async function consumeSseStream(
             reason: s.reason ?? null,
             assistant_message: s.assistant_message ?? "",
             thinking_ms: s.thinking_ms,
+            track: result.track,
+            track_decision: result.track_decision,
           });
           break;
         }

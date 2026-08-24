@@ -251,6 +251,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
                 status: event.status,
                 status_reason: event.reason ?? "",
                 assistant_message: event.assistant_message,
+                // Soft-Track: optional until host SSE includes track.
+                track: event.track ?? t.track,
+                track_decision: event.track_decision ?? t.track_decision,
                 // T4 (#37): the run ended — thinking collapses to the
                 // duration label, tool rows collapse.
                 in_flight: false,
@@ -287,6 +290,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           in_flight: false,
           citations:
             result.citations.length > 0 ? result.citations : t.citations,
+          track: result.track ?? t.track,
+          track_decision: result.track_decision ?? t.track_decision,
         }));
       }
       await get().refreshThreads();
@@ -368,6 +373,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
               status: event.status,
               status_reason: event.reason ?? "",
               assistant_message: event.assistant_message,
+              track: event.track ?? t.track,
+              track_decision: event.track_decision ?? t.track_decision,
               in_flight: false,
               thinking_duration_ms: event.thinking_ms ?? t.thinking_duration_ms,
             }));
@@ -398,6 +405,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           in_flight: false,
           citations:
             result.citations.length > 0 ? result.citations : t.citations,
+          track: result.track ?? t.track,
+          track_decision: result.track_decision ?? t.track_decision,
         }));
       }
       await get().refreshThreads();

@@ -311,7 +311,7 @@ def test_send_message_done_emits_status_then_citations_then_answer_events(
     with client.stream(
         "POST",
         f"/api/threads/{created['id']}/messages",
-        json={"question": "q"},
+        json={"question": "What was AAPL net sales in 2023 Q3?"},
     ) as r:
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("text/event-stream")
@@ -370,7 +370,7 @@ def test_send_message_refuse_unknown_locator_emits_status_refuse_and_empty_citat
     with client.stream(
         "POST",
         f"/api/threads/{created['id']}/messages",
-        json={"question": "q"},
+        json={"question": "What was AAPL net sales in 2023 Q3?"},
     ) as r:
         body = "".join(r.iter_text())
 
@@ -411,7 +411,7 @@ def test_send_message_step_cap_emits_status_step_cap_and_empty_citations(
     with client.stream(
         "POST",
         f"/api/threads/{created['id']}/messages",
-        json={"question": "q"},
+        json={"question": "What was AAPL net sales in 2023 Q3?"},
     ) as r:
         body = "".join(r.iter_text())
 
@@ -620,7 +620,7 @@ def test_send_message_streaming_emits_thinking_and_tool_call_frames(
     http_app.dependency_overrides[get_graph] = lambda: g
 
     created = client.post("/api/threads", json={"first_message": "q"}).json()
-    events = _post_message(client, created["id"], "q")
+    events = _post_message(client, created["id"], "What was AAPL net sales in 2023 Q3?")
     types = [name for name, _ in events]
     assert types.index("thinking") < types.index("status")
     assert types.index("tool_call") < types.index("tool_result") < types.index("status")
@@ -665,7 +665,7 @@ def test_send_message_turn_row_exposes_tool_summaries_as_dicts(
     _install_graph(http_app, _read_then_answer_script(answer))
 
     created = client.post("/api/threads", json={"first_message": "q"}).json()
-    _post_message(client, created["id"], "q")
+    _post_message(client, created["id"], "What was AAPL net sales in 2023 Q3?")
 
     detail = client.get(f"/api/threads/{created['id']}").json()
     run = detail["turns"][0]
@@ -725,7 +725,7 @@ def test_send_message_thinking_frame_emitted_with_stripped_prose(
     http_app.dependency_overrides[get_graph] = lambda: g
 
     created = client.post("/api/threads", json={"first_message": "q"}).json()
-    events = _post_message(client, created["id"], "q")
+    events = _post_message(client, created["id"], "What was AAPL net sales in 2023 Q3?")
 
     # The answer frame must carry the post-strip span ONLY - no
     # inline ``<thinking>`` block (SC60 binding on the wire).
@@ -924,7 +924,7 @@ def test_post_message_persists_run_in_turn_table(
     with client.stream(
         "POST",
         f"/api/threads/{created['id']}/messages",
-        json={"question": "what was revenue?"},
+        json={"question": "what was AAPL revenue in 2022 Q3?"},
     ) as r:
         list(r.iter_text())
 
@@ -935,7 +935,7 @@ def test_post_message_persists_run_in_turn_table(
     assert turn["status"] == "done"
     assert turn["answer"] == answer
     assert len(turn["citations"]) >= 1
-    assert turn["question"] == "what was revenue?"
+    assert turn["question"] == "what was AAPL revenue in 2022 Q3?"
     assert isinstance(turn["run_id"], str) and len(turn["run_id"]) == 36
 
 
@@ -1388,7 +1388,7 @@ def test_send_message_refuse_emits_status_with_ordinary_person_copy(
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
-    events = _post_message(client, created["id"], "q")
+    events = _post_message(client, created["id"], "What was AAPL net sales in 2023 Q3?")
 
     # T1 (#33): the refused attempt's prose streams as an answer
     # delta BEFORE status; look the terminal frames up by name.
@@ -1447,7 +1447,7 @@ def test_send_message_step_cap_emits_status_with_ordinary_person_copy(
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
-    events = _post_message(client, created["id"], "q")
+    events = _post_message(client, created["id"], "What was AAPL net sales in 2023 Q3?")
 
     # T3: the looping tool-call script emits tool_call /
     # tool_result frames BEFORE the terminal status frame; look
@@ -2017,7 +2017,7 @@ def test_send_message_token_deltas_stream_before_node_completion(
 
     created = client.post("/api/threads", json={"first_message": "q"}).json()
     tid = created["id"]
-    events = _post_message(client, tid, "q")
+    events = _post_message(client, tid, "What was AAPL net sales in 2023 Q3?")
 
     names = [n for n, _ in events]
     status_i = names.index("status")
@@ -2109,7 +2109,7 @@ def test_send_message_inline_thinking_stream_never_reaches_answer_frames(
     http_app.dependency_overrides[get_graph] = lambda: g
 
     created = client.post("/api/threads", json={"first_message": "q"}).json()
-    events = _post_message(client, created["id"], "q")
+    events = _post_message(client, created["id"], "What was AAPL net sales in 2023 Q3?")
 
     names = [n for n, _ in events]
     status_i = names.index("status")
@@ -2486,7 +2486,7 @@ def test_bounce_retry_emits_answer_reset_between_attempts(
     http_app.dependency_overrides[get_graph] = lambda: g
 
     created = client.post("/api/threads", json={"first_message": "q"}).json()
-    events = _post_message(client, created["id"], "q")
+    events = _post_message(client, created["id"], "What was AAPL net sales in 2023 Q3?")
     names = [n for n, _ in events]
 
     status_event = next(d for n, d in events if n == "status")
@@ -2560,7 +2560,7 @@ def test_bounce_then_tools_then_answer_has_no_empty_reset(
     http_app.dependency_overrides[get_graph] = lambda: g
 
     created = client.post("/api/threads", json={"first_message": "q"}).json()
-    events = _post_message(client, created["id"], "q")
+    events = _post_message(client, created["id"], "What was AAPL net sales in 2023 Q3?")
     names = [n for n, _ in events]
 
     assert next(d for n, d in events if n == "status")["status"] == "done"
@@ -2630,7 +2630,7 @@ def test_multi_bounce_attaches_reset_to_each_retry_first_chunk(
     http_app.dependency_overrides[get_graph] = lambda: g
 
     created = client.post("/api/threads", json={"first_message": "q"}).json()
-    events = _post_message(client, created["id"], "q")
+    events = _post_message(client, created["id"], "What was AAPL net sales in 2023 Q3?")
 
     assert next(d for n, d in events if n == "status")["status"] == "done"
     resets = [
@@ -2674,7 +2674,7 @@ def test_bounce_pending_reset_flushes_on_terminal_empty_refuse(
     http_app.dependency_overrides[get_graph] = lambda: g
 
     created = client.post("/api/threads", json={"first_message": "q"}).json()
-    events = _post_message(client, created["id"], "q")
+    events = _post_message(client, created["id"], "What was AAPL net sales in 2023 Q3?")
     names = [n for n, _ in events]
 
     status_event = next(d for n, d in events if n == "status")

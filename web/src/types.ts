@@ -16,6 +16,19 @@ export interface Citation {
 
 export type RunStatus = "done" | "refuse" | "step_cap";
 
+// Soft-Track (specs/soft-track.md): per-turn host contract. Optional
+// on the wire until the host peer exposes SSE/GET ``track``.
+export type SoftTrack = "dialogue" | "clarify" | "off_topic" | "research";
+
+// Soft-Track RunRecord audit blob. Fields beyond ``track`` stay
+// optional so older rows / partial peers still typecheck.
+export interface TrackDecision {
+  track: SoftTrack;
+  confidence?: number;
+  decision_tier?: string;
+  signals?: Record<string, unknown>;
+}
+
 // T3 (spec line 32): one human-readable row per tool call observed
 // in the run; the SPA renders `summary` in the tools region and
 // correlates with the live SSE frames by `tool_call_id`. Mirrors
@@ -47,6 +60,11 @@ export interface Turn {
   // Mirrored on the SSE status frame and the persisted turn row so
   // reload keeps the copy.
   assistant_message?: string;
+  // Soft-Track: optional run track from SSE status / GET turn row.
+  // Missing is OK (no hint) until the host peer populates the wire.
+  track?: SoftTrack;
+  // Soft-Track: optional audit blob from GET history / RunRecord.
+  track_decision?: TrackDecision;
   // T4 (spec line 38): GET-while-running signal on the turn row.
   // Mirrors ``fin.host.workspace_http.TurnRow.in_flight``. True
   // only on the most-recent row of a thread whose lock is held,

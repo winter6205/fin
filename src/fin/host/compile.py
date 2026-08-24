@@ -320,7 +320,15 @@ def compile_for_runtime(
     # ``PostgresSaver`` instance return the SAME proxy object.
     # That identity is what T9 will assert between the CLI
     # helper's graph and the HTTP handler's graph.
-    compiled = compile_graph(checkpointer=saver, model=model)
+    # Soft-Track T4: thread the SAME model object as
+    # ``classify_model`` so the LLM tier is reachable in
+    # production — the default of ``None`` would silently skip
+    # it and force every ambiguous utterance onto the residual
+    # ``track="research"`` branch (specs/soft-track.md — "no
+    # single global default track").
+    compiled = compile_graph(
+        checkpointer=saver, model=model, classify_model=model
+    )
 
     # Step 6: keep the stack alive for process lifetime. We do
     # this AFTER a successful ``compile_graph`` so a factory
@@ -385,7 +393,14 @@ def compile_for_runtime_dev(
         model_name=model_name, base_url=base_url, env=env
     )
     saver = InMemorySaver()
-    return compile_graph(checkpointer=saver, model=model)
+    # Soft-Track T4: mirror the durable path's contract — pass
+    # the SAME model object as ``classify_model`` so the dev
+    # compile exercises the same LLM tier as production
+    # (specs/soft-track.md — "classify_model must reuse
+    # FIN_MODEL").
+    return compile_graph(
+        checkpointer=saver, model=model, classify_model=model
+    )
 
 
 __all__ = [

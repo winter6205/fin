@@ -146,6 +146,35 @@ def test_in_memory_thread_store_append_run_then_list_runs() -> None:
     assert [r.answer for r in runs] == ["a1", "a2"]
 
 
+def test_run_record_track_decision_roundtrip() -> None:
+    """Soft-Track T5: track_decision four fields survive append + list."""
+    from fin.host.thread_store import InMemoryThreadStore, RunRecord
+
+    store = InMemoryThreadStore()
+    store.create_thread(id="t-td", title="x")
+    td = {
+        "track": "research",
+        "confidence": 0.9,
+        "decision_tier": "rules",
+        "signals": {"cue": "filing"},
+    }
+    store.append_run(
+        RunRecord(
+            id="r-td",
+            thread_id="t-td",
+            question="q",
+            status="done",
+            answer="a",
+            track_decision=td,
+        )
+    )
+    runs = store.list_runs("t-td")
+    assert runs[0].track_decision == td
+    # Isolation: mutating the returned dict must not corrupt store.
+    runs[0].track_decision["signals"]["cue"] = "mutated"
+    assert store.list_runs("t-td")[0].track_decision["signals"]["cue"] == "filing"
+
+
 def test_run_record_tool_summaries_roundtrip_as_dicts() -> None:
     """T3 (spec line 32): ``RunRecord.tool_summaries`` carries one
     ``{name, summary, tool_call_id}`` dict per tool call; the
