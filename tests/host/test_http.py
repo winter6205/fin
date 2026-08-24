@@ -177,7 +177,7 @@ def test_ask_done_includes_citations(client: TestClient, aapl_page1_text: str) -
     answer = f"Per the filing: {aapl_page1_text[:80]}"
     _install_graph(client.app, _scripted_read_then_answer(answer))
 
-    r = client.post("/ask", json={"question": "q"})
+    r = client.post("/ask", json={"question": "What was AAPL net sales in 2023 Q3?"})
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "done"
@@ -201,7 +201,7 @@ def test_ask_step_cap_returns_status_step_cap_with_empty_citations(client: TestC
     )
     _install_graph(client.app, [loop_call])
 
-    r = client.post("/ask", json={"question": "q"})
+    r = client.post("/ask", json={"question": "What was AAPL net sales in 2023 Q3?"})
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "step_cap"
@@ -228,7 +228,7 @@ def test_ask_refuse_unknown_locator_status_refuse_with_reason(client: TestClient
     )
     _install_graph(client.app, model.script)
 
-    r = client.post("/ask", json={"question": "q"})
+    r = client.post("/ask", json={"question": "What was AAPL net sales in 2023 Q3?"})
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "refuse"
@@ -247,7 +247,7 @@ def test_ask_refuse_citation_repair_cap_reason(client: TestClient, aapl_page1_te
             answer="vague answer with no evidence",
         ),
     )
-    r = client.post("/ask", json={"question": "q"})
+    r = client.post("/ask", json={"question": "What was AAPL net sales in 2023 Q3?"})
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "refuse"

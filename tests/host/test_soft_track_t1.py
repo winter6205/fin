@@ -161,7 +161,7 @@ def test_research_fact_script_still_done_with_citation(aapl_page1_text):
     )
     out = g.invoke(
         {
-            "messages": [HumanMessage(content="q")],
+            "messages": [HumanMessage(content="What was AAPL net sales in 2023 Q3?")],
             "evidence": [],
             "repair_count": 0,
             "step_count": 0,
