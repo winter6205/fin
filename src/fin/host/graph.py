@@ -57,6 +57,7 @@ from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
     BaseMessage,
+    HumanMessage,
     SystemMessage,
     ToolMessage,
 )
@@ -88,6 +89,7 @@ from fin.host.stream_map import (
     strip_thinking_from_answer,
 )
 from fin.host.tools import list_files, read_file
+from fin.host.track_decision import decide_track, snapshot_delta_for_utterance
 from fin.retrieve import BM25Adapter
 from fin.retrieve.tool import retrieve
 
@@ -469,6 +471,7 @@ def compile_graph(
     known_document_ids: set[str] | None = None,
     step_cap: int = STEP_CAP,
     recursion_limit: int = RECURSION_LIMIT,
+    classify_model: Any | None = None,
 ) -> "_LockedGraph":
     """Build the v1 host graph (T6).
 
@@ -511,6 +514,12 @@ def compile_graph(
         from ``fin.host.state`` (currently ``2 * STEP_CAP + 6 = 70``).
         Strictly greater than ``step_cap`` so the agent-loop fuse
         fires first (spec success criteria item 5).
+    classify_model
+        Soft-Track T4: optional model for ambiguous LLM classify.
+        When ``None`` (default), the LLM tier is skipped. The
+        residual branch in ``decide_track`` then resolves the
+        bare-``q`` cascade to ``track="dialogue"`` (not research),
+        so the model leaf is not the silent global default.
 
     Returns
     -------
@@ -563,9 +572,14 @@ def compile_graph(
     # preference (spec line 28). ``model_node`` selects per run via
     # ``configurable.thinking_type`` — no shared model mutation, so
     # concurrent runs on other threads cannot leak the preference.
-    bound_model_no_thinking = bound_model.bind(
-        extra_body={"thinking": {"type": "disabled"}, "reasoning_split": True}
-    )
+    _thinking_off_body = {
+        "thinking": {"type": "disabled"},
+        "reasoning_split": True,
+    }
+    bound_model_no_thinking = bound_model.bind(extra_body=_thinking_off_body)
+    # Soft-Track T1: non-research leaves call the UNBOUND model
+    # (no bind_tools) with call-scoped per-track prompts.
+    unbound_model_no_thinking = model.bind(extra_body=_thinking_off_body)
 
     tool_dispatcher = ToolNode(
         [list_files_tool, read_file_tool, retrieve_tool],
@@ -574,6 +588,94 @@ def compile_graph(
     )
 
     # ----- node functions -----
+
+    def classify_node(state: AgentState) -> dict[str, Any]:
+        """Soft-Track: tiered track decision before leaves.
+
+        Passes ``status_snapshots`` and optional ``classify_model``
+        into ``decide_track``. Appends snapshots when the utterance
+        sets or changes research context.
+        """
+        messages = list(state.get("messages") or [])
+        prior_snapshots = list(state.get("status_snapshots") or [])
+        decision = decide_track(
+            messages,
+            snapshots=prior_snapshots,
+            classify_model=classify_model,
+        )
+        update: dict[str, Any] = {
+            "track": decision.track,
+            "track_decision": {
+                "track": decision.track,
+                "confidence": decision.confidence,
+                "decision_tier": decision.decision_tier,
+                "signals": dict(decision.signals),
+            },
+        }
+        # Dialogue / off_topic need not append every turn; only when
+        # the utterance carries research-context slots.
+        text = ""
+        for message in reversed(messages):
+            if isinstance(message, HumanMessage):
+                content = message.content
+                text = content.strip() if isinstance(content, str) else str(content)
+                break
+        delta = snapshot_delta_for_utterance(text, prior_snapshots)
+        if delta and decision.track not in ("dialogue", "off_topic"):
+            update["status_snapshots"] = delta
+        return update
+
+    def _select_unbound_model(config: RunnableConfig) -> Any:
+        configurable = dict((config or {}).get("configurable") or {})
+        if configurable.get("thinking_type") == "disabled":
+            return unbound_model_no_thinking
+        return model
+
+    def _non_research_leaf(
+        state: AgentState,
+        config: RunnableConfig,
+        *,
+        track: Literal["dialogue", "clarify", "off_topic"],
+    ) -> dict[str, Any]:
+        """Call unbound model with track prompt; done + empty citations."""
+        selected = _select_unbound_model(config)
+        stream = selected.stream(
+            messages_for_model(state["messages"], track=track)
+        )
+        answer_message = assemble_final_ai_message(stream)
+        this_call_thinking = _extract_thinking_text(answer_message)
+        prior_thinking = str(state.get("thinking_text", "") or "")
+        if prior_thinking and this_call_thinking:
+            thinking_text = prior_thinking + "\n" + this_call_thinking
+        else:
+            thinking_text = prior_thinking or this_call_thinking
+        answer = _last_ai_text([answer_message])
+        previous = int(state.get("step_count", 0))
+        return {
+            "messages": [answer_message],
+            "step_count": previous + 1,
+            "answer": answer,
+            "citations": (),
+            "status": "done",
+            "status_reason": "done",
+            "thinking_text": thinking_text,
+            "track": track,
+        }
+
+    def dialogue_node(
+        state: AgentState, config: RunnableConfig
+    ) -> dict[str, Any]:
+        return _non_research_leaf(state, config, track="dialogue")
+
+    def clarify_node(
+        state: AgentState, config: RunnableConfig
+    ) -> dict[str, Any]:
+        return _non_research_leaf(state, config, track="clarify")
+
+    def off_topic_node(
+        state: AgentState, config: RunnableConfig
+    ) -> dict[str, Any]:
+        return _non_research_leaf(state, config, track="off_topic")
 
     def model_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         # Step 1: step-cap fuse. Increment ``step_count`` and check
@@ -625,7 +727,9 @@ def compile_graph(
         # inline ``<thinking>`` block stripped out of content. It is
         # stored on state for the turn row; it NEVER merges into the
         # answer content (SC60).
-        stream = selected_model.stream(messages_for_model(state["messages"]))
+        stream = selected_model.stream(
+            messages_for_model(state["messages"], track="research")
+        )
         answer_message = assemble_final_ai_message(stream)
         # T4 (#37): ``thinking_text`` ACCUMULATES across this run's
         # model calls (each call's prose joined with a newline) so
@@ -650,6 +754,7 @@ def compile_graph(
             "status": "running",
             "repair_count": int(state.get("repair_count", 0)),
             "thinking_text": thinking_text,
+            "track": "research",
         }
 
     def tool_node_with_summaries(state: AgentState) -> dict[str, Any]:
@@ -764,6 +869,23 @@ def compile_graph(
 
     # ----- conditional edges -----
 
+    def from_classify(
+        state: AgentState,
+    ) -> Literal["dialogue", "clarify", "off_topic", "model"]:
+        """Route Soft-Track leaves after classify."""
+        # No single global default track (specs/soft-track.md):
+        # missing track defaults to the dialogue leaf rather than
+        # the research model so the conditional edge mirrors the
+        # residual branch in ``decide_track``.
+        track = state.get("track", "dialogue")
+        if track == "dialogue":
+            return "dialogue"
+        if track == "clarify":
+            return "clarify"
+        if track == "off_topic":
+            return "off_topic"
+        return "model"
+
     def from_model(state: AgentState) -> Literal["tools", "citation_gate", "__end__"]:
         # Step-cap fires here: the node already set ``status`` to
         # ``step_cap`` and we route to END. Status-vs-tool_call
@@ -776,7 +898,10 @@ def compile_graph(
         last = messages[-1]
         if isinstance(last, AIMessage) and last.tool_calls:
             return "tools"
-        return "citation_gate"
+        # Soft-Track: citation verifier is research-only.
+        if state.get("track") == "research":
+            return "citation_gate"
+        return END
 
     def from_gate(state: AgentState) -> Literal["model", "__end__"]:
         # Status-based routing out of the citation gate. Done /
@@ -791,6 +916,10 @@ def compile_graph(
     # ----- assemble the graph -----
 
     graph = StateGraph(AgentState)
+    graph.add_node("classify", classify_node)
+    graph.add_node("dialogue", dialogue_node)
+    graph.add_node("clarify", clarify_node)
+    graph.add_node("off_topic", off_topic_node)
     graph.add_node("model", model_node)
     # ``tool_node_with_summaries`` wraps ``tool_dispatcher`` so the
     # graph executor still emits ``ToolMessage``s unchanged; the
@@ -800,7 +929,11 @@ def compile_graph(
     graph.add_node("tools", tool_node_with_summaries)
     graph.add_node("citation_gate", citation_gate_node)
 
-    graph.add_edge(START, "model")
+    graph.add_edge(START, "classify")
+    graph.add_conditional_edges("classify", from_classify)
+    graph.add_edge("dialogue", END)
+    graph.add_edge("clarify", END)
+    graph.add_edge("off_topic", END)
     graph.add_conditional_edges("model", from_model)
     graph.add_edge("tools", "model")
     graph.add_conditional_edges("citation_gate", from_gate)
@@ -810,6 +943,7 @@ def compile_graph(
     return _make_locked_graph(
         checkpointer=checkpointer,
         model=model,
+        classify_model=classify_model,
         step_cap=step_cap,
         recursion_limit=recursion_limit,
         compiled_graph=compiled,
@@ -842,10 +976,12 @@ def _make_locked_graph(
     checkpointer: Any,
     model: Any,
     step_cap: int,
+    classify_model: Any | None = None,
 ) -> "_LockedGraph":
     key = (
         id(checkpointer),
         id(model),
+        id(classify_model) if classify_model is not None else 0,
         int(step_cap),
         int(recursion_limit),
     )

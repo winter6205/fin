@@ -107,6 +107,13 @@ class RunRecord:
     ``fin.host.workspace_http``); this dataclass field exists so
     that seam has an explicit, typed slot to fill instead of the
     HTTP layer bolting an untyped key onto the dict.
+
+    Soft-Track (T5): ``track_decision`` is the auditable classify
+    outcome for this ``run_id`` — at least ``track``, ``confidence``,
+    ``decision_tier``, and structured ``signals``. GET history
+    reads it as the presentation SSOT for past turns; empty when
+    the run never reached classify (e.g. mid-flight refuse before
+    a values frame).
     """
 
     id: str
@@ -134,6 +141,8 @@ class RunRecord:
     # serialization time from ``graph.is_locked(thread_id)``,
     # never persisted. Defaults ``False``.
     in_flight: bool = False
+    # Soft-Track: {track, confidence, decision_tier, signals}.
+    track_decision: dict[str, Any] = field(default_factory=dict)
 
 
 # ----- enum + validation -----
@@ -444,7 +453,9 @@ CREATE TABLE IF NOT EXISTS fin_run (
     -- T4 (spec line 38): persisted rows are by definition terminal;
     -- the column exists so the storage shape matches RunRecord. The
     -- LIVE running signal is the per-thread lock probe, never this.
-    in_flight         BOOLEAN NOT NULL DEFAULT FALSE
+    in_flight         BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Soft-Track T5: auditable track decision for this run_id.
+    track_decision    JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
 -- T2 column migration: add ``assistant_message`` to existing
@@ -468,6 +479,9 @@ ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS in_flight BOOLEAN NOT NULL DEFAULT 
 -- T4 (#37) column migration: thinking duration for the post-run
 -- collapse label. 0 = no thinking streamed.
 ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS thinking_duration_ms INTEGER NOT NULL DEFAULT 0;
+
+-- Soft-Track T5: track_decision on existing tables.
+ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS track_decision JSONB NOT NULL DEFAULT '{}'::jsonb;
 """
 
 
@@ -530,9 +544,19 @@ class PostgresThreadStore:
             created_at=row[10],
             # T4: coerce a pre-migration NULL to False defensively.
             in_flight=bool(row[11]) if len(row) > 11 else False,
-            # T4 (#37): duration column rides last; 0 when the row
+            # T4 (#37): duration column; 0 when the row
             # predates the migration (no measurable thinking).
             thinking_duration_ms=int(row[12] or 0) if len(row) > 12 else 0,
+            # Soft-Track T5: empty dict when pre-migration / unset.
+            track_decision=copy.deepcopy(
+                (
+                    json.loads(row[13])
+                    if isinstance(row[13], str)
+                    else dict(row[13] or {})
+                )
+                if len(row) > 13
+                else {}
+            ),
         )
 
     # -- threads --
@@ -645,8 +669,8 @@ class PostgresThreadStore:
                     "INSERT INTO fin_run (id, thread_id, question, status, "
                     "status_reason, answer, citations, thinking_text, "
                     "tool_summaries, assistant_message, created_at, in_flight, "
-                    "thinking_duration_ms) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    "thinking_duration_ms, track_decision) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (
                         record.id,
                         record.thread_id,
@@ -662,6 +686,7 @@ class PostgresThreadStore:
                         # Persisted rows are terminal; always False.
                         False,
                         record.thinking_duration_ms,
+                        json.dumps(record.track_decision),
                     ),
                 )
                 conn.commit()
@@ -693,7 +718,7 @@ class PostgresThreadStore:
                 "SELECT id, thread_id, question, status, status_reason, "
                 "answer, citations, thinking_text, tool_summaries, "
                 "assistant_message, created_at, in_flight, "
-                "thinking_duration_ms "
+                "thinking_duration_ms, track_decision "
                 "FROM fin_run WHERE thread_id = %s ORDER BY created_at ASC",
                 (thread_id,),
             ).fetchall()

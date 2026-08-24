@@ -258,3 +258,22 @@ def test_reset_input_state_clears_in_flight() -> None:
 
     reset = reset_input_state("hello")
     assert reset["in_flight"] is False
+
+
+def test_reset_input_state_clears_run_scoped_track_fields() -> None:
+    """Soft-Track: each new run clears track_decision so classify
+    owns the fresh decision. status_snapshots are durable — omit."""
+    from fin.host.state import reset_input_state
+
+    reset = reset_input_state("hello")
+    assert reset["track_decision"] == {}
+    assert "status_snapshots" not in reset
+
+
+def test_agent_state_has_status_snapshots_channel() -> None:
+    """Soft-Track T3: status_snapshots is an append-only state channel."""
+    import typing
+
+    annotations = typing.get_type_hints(AgentState)
+    assert "status_snapshots" in annotations
+
