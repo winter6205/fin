@@ -924,7 +924,7 @@ def test_post_message_persists_run_in_turn_table(
     with client.stream(
         "POST",
         f"/api/threads/{created['id']}/messages",
-        json={"question": "what was revenue?"},
+        json={"question": "what was AAPL revenue in 2022 Q3?"},
     ) as r:
         list(r.iter_text())
 
@@ -935,7 +935,7 @@ def test_post_message_persists_run_in_turn_table(
     assert turn["status"] == "done"
     assert turn["answer"] == answer
     assert len(turn["citations"]) >= 1
-    assert turn["question"] == "what was revenue?"
+    assert turn["question"] == "what was AAPL revenue in 2022 Q3?"
     assert isinstance(turn["run_id"], str) and len(turn["run_id"]) == 36
 
 
