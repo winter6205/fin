@@ -57,6 +57,7 @@ from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
     BaseMessage,
+    HumanMessage,
     SystemMessage,
     ToolMessage,
 )
@@ -88,7 +89,7 @@ from fin.host.stream_map import (
     strip_thinking_from_answer,
 )
 from fin.host.tools import list_files, read_file
-from fin.host.track_decision import decide_track
+from fin.host.track_decision import decide_track, snapshot_delta_for_utterance
 from fin.retrieve import BM25Adapter
 from fin.retrieve.tool import retrieve
 
@@ -582,13 +583,16 @@ def compile_graph(
     # ----- node functions -----
 
     def classify_node(state: AgentState) -> dict[str, Any]:
-        """Soft-Track: rules-primary track decision before leaves.
+        """Soft-Track: rules + snapshot inherit before leaves.
 
         Does not call a model. T4 may pass ``classify_model`` into
-        ``decide_track``; T3 may pass ``snapshots``.
+        ``decide_track``. Appends ``status_snapshots`` when the
+        utterance sets or changes research context.
         """
-        decision = decide_track(list(state.get("messages") or []))
-        return {
+        messages = list(state.get("messages") or [])
+        prior_snapshots = list(state.get("status_snapshots") or [])
+        decision = decide_track(messages, snapshots=prior_snapshots)
+        update: dict[str, Any] = {
             "track": decision.track,
             "track_decision": {
                 "track": decision.track,
@@ -597,6 +601,18 @@ def compile_graph(
                 "signals": dict(decision.signals),
             },
         }
+        # Dialogue / off_topic need not append every turn; only when
+        # the utterance carries research-context slots.
+        text = ""
+        for message in reversed(messages):
+            if isinstance(message, HumanMessage):
+                content = message.content
+                text = content.strip() if isinstance(content, str) else str(content)
+                break
+        delta = snapshot_delta_for_utterance(text, prior_snapshots)
+        if delta and decision.track not in ("dialogue", "off_topic"):
+            update["status_snapshots"] = delta
+        return update
 
     def _select_unbound_model(config: RunnableConfig) -> Any:
         configurable = dict((config or {}).get("configurable") or {})
