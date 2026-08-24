@@ -164,7 +164,7 @@ def _invoke_done(
     )
     return g.invoke(
         {
-            "messages": [HumanMessage("q")],
+            "messages": [HumanMessage("What was AAPL net sales in 2023 Q3?")],
             "evidence": [],
             "repair_count": 0,
             "step_count": 0,
@@ -221,7 +221,7 @@ def test_bounce_loop_ends_at_repair_cap_refuse(aapl_page1_text):
     )
     out = g.invoke(
         {
-            "messages": [HumanMessage("q")],
+            "messages": [HumanMessage("What was AAPL net sales in 2023 Q3?")],
             "evidence": [],
             "repair_count": 0,
             "step_count": 0,
@@ -266,7 +266,7 @@ def test_step_cap_fires_at_32_iterations():
     )
     out = g.invoke(
         {
-            "messages": [HumanMessage("q")],
+            "messages": [HumanMessage("What was AAPL net sales in 2023 Q3?")],
             "evidence": [],
             "repair_count": 0,
             "step_count": 0,
@@ -307,7 +307,7 @@ def test_unknown_locator_refuses_on_first_failure():
     )
     out = g.invoke(
         {
-            "messages": [HumanMessage("q")],
+            "messages": [HumanMessage("What was AAPL net sales in 2023 Q3?")],
             "evidence": [],
             "repair_count": 0,
             "step_count": 0,
@@ -347,7 +347,7 @@ def test_step_cap_wins_over_pending_bounce():
     )
     out = g.invoke(
         {
-            "messages": [HumanMessage("q")],
+            "messages": [HumanMessage("What was AAPL net sales in 2023 Q3?")],
             "evidence": [],
             "repair_count": 0,
             "step_count": 0,
@@ -386,7 +386,7 @@ def test_step_cap_wins_when_both_fuses_would_fire_same_iteration():
     )
     out = g.invoke(
         {
-            "messages": [HumanMessage("q")],
+            "messages": [HumanMessage("What was AAPL net sales in 2023 Q3?")],
             "evidence": [],
             "repair_count": REPAIR_CAP,
             "step_count": 0,
@@ -441,7 +441,7 @@ def test_concurrent_run_on_same_thread_raises():
         try:
             r = g.invoke(
                 {
-                    "messages": [HumanMessage("q")],
+                    "messages": [HumanMessage("What was AAPL net sales in 2023 Q3?")],
                     "evidence": [],
                     "repair_count": 0,
                     "step_count": 0,
@@ -496,7 +496,7 @@ def test_concurrent_runs_on_different_threads_serialize_independently():
     def runner(label: str, thread_id: str) -> None:
         r = g.invoke(
             {
-                "messages": [HumanMessage("q")],
+                "messages": [HumanMessage("What was AAPL net sales in 2023 Q3?")],
                 "evidence": [],
                 "repair_count": 0,
                 "step_count": 0,
@@ -611,7 +611,7 @@ def test_read_file_tool_appends_evidence(aapl_page1_text):
     )
     out = g.invoke(
         {
-            "messages": [HumanMessage("q")],
+            "messages": [HumanMessage("What was AAPL net sales in 2023 Q3?")],
             "evidence": [],
             "repair_count": 0,
             "step_count": 0,
@@ -653,7 +653,7 @@ def test_list_files_tool_does_not_contribute_evidence():
     )
     out = g.invoke(
         {
-            "messages": [HumanMessage("q")],
+            "messages": [HumanMessage("What was AAPL net sales in 2023 Q3?")],
             "evidence": [],
             "repair_count": 0,
             "step_count": 0,
@@ -697,7 +697,7 @@ def test_unknown_tool_name_becomes_error_tool_message():
     )
     out = g.invoke(
         {
-            "messages": [HumanMessage("q")],
+            "messages": [HumanMessage("What was AAPL net sales in 2023 Q3?")],
             "evidence": [],
             "repair_count": 0,
             "step_count": 0,
@@ -735,7 +735,7 @@ def test_malformed_evidence_raises_typed_error(aapl_page1_text):
     with pytest.raises(MalformedEvidenceError):
         g.invoke(
             {
-                "messages": [HumanMessage("q")],
+                "messages": [HumanMessage("What was AAPL net sales in 2023 Q3?")],
                 "evidence": [EvidenceItem(locator=bad_locator, page_text="")],
                 "repair_count": 0,
                 "step_count": 0,
@@ -759,7 +759,7 @@ def test_compile_graph_propagates_missing_thread_id():
     with pytest.raises(ConcurrentRunError):
         g.invoke(
             {
-                "messages": [HumanMessage("q")],
+                "messages": [HumanMessage("What was AAPL net sales in 2023 Q3?")],
                 "evidence": [],
                 "repair_count": 0,
                 "step_count": 0,
@@ -809,7 +809,7 @@ def test_model_node_streams_not_invokes(aapl_page1_text):
     )
     out = g.invoke(
         {
-            "messages": [HumanMessage("q")],
+            "messages": [HumanMessage("What was AAPL net sales in 2023 Q3?")],
             "evidence": [
                 EvidenceItem(
                     locator=Locator(AAPL_2022Q3, AAPL_2022Q3_VERSION, 1),
@@ -1037,7 +1037,7 @@ def test_tool_summaries_appended_by_tool_node(aapl_page1_text):
         known_document_ids=KNOWN_IDS,
     )
     out = g.invoke(
-        reset_input_state_for_test("q"),
+        reset_input_state_for_test("What was AAPL net sales in 2023 Q3?"),
         config=_thread_config("t-tool-summary"),
     )
     summaries = out.get("tool_summaries") or []

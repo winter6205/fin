@@ -187,7 +187,7 @@ def test_done_run_prints_status_answer_citations_in_order(aapl_page1_text, capsy
         known_document_ids=KNOWN_IDS,
     )
     rc = main(
-        ["What was Apples liquidity position?", "--thread-id", "t-cli-done"],
+        ["What was AAPL net sales in 2023 Q3?", "--thread-id", "t-cli-done"],
         graph_factory=lambda: g,
     )
     assert rc == 0
@@ -229,7 +229,7 @@ def test_step_cap_run_prints_status_and_answer_without_citations(capsys):
         model=model,
         known_document_ids=KNOWN_IDS,
     )
-    rc = main(["keep listing files"], graph_factory=lambda: g)
+    rc = main(["What was AAPL net sales in 2023 Q3?"], graph_factory=lambda: g)
     assert rc == 0
     out = capsys.readouterr().out
     assert "status: step_cap" in out
@@ -265,7 +265,7 @@ def test_refuse_unknown_locator_prints_reason_on_stderr(capsys):
         model=model,
         known_document_ids=KNOWN_IDS,
     )
-    rc = main(["what did ZZZZ report?"], graph_factory=lambda: g)
+    rc = main(["What was AAPL net sales in 2023 Q3?"], graph_factory=lambda: g)
     assert rc == 0
     captured = capsys.readouterr()
     assert "status: refuse" in captured.out
