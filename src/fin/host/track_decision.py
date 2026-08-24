@@ -1,18 +1,21 @@
-"""Soft-Track track decision (rules primary for T1).
+"""Soft-Track track decision (rules primary; clarify slots in T2).
 
-``decide_track`` chooses ``dialogue`` / ``off_topic`` / ``research``
-before the host graph executes a leaf. T1 implements RULES PRIMARY
-only:
+``decide_track`` chooses ``dialogue`` / ``clarify`` / ``off_topic`` /
+``research`` before the host graph executes a leaf.
+
+T1 + T2 rules primary:
 
 * high-confidence greeting → ``dialogue`` (``decision_tier=rules``)
-* high-confidence off-domain (no 10-Q / corpus / company / period
-  cues) → ``off_topic`` (``decision_tier=rules``)
-* else → ``research`` (``rules`` when research cues hit;
-  ``conditional_policy`` for short/ambiguous utterances like ``q``)
+* filing-shaped ask missing company and/or period → ``clarify``
+* clear research cues (company+period or strong corpus signals) →
+  ``research``
+* high-confidence off-domain → ``off_topic``
+* else → ``research`` (``conditional_policy`` for short/ambiguous
+  utterances like ``q`` — must stay research for default graph suites)
 
-T2 will add ``clarify`` routing. T4 will add the LLM / inherit /
-EXIT cascade. ``classify_model`` and ``snapshots`` are accepted as
-stub hooks so later tickets can wire them without signature churn.
+T3 will wire snapshot inherit. T4 will add the LLM / EXIT cascade.
+``classify_model`` and ``snapshots`` are accepted as stub hooks so
+later tickets can wire them without signature churn.
 """
 
 from __future__ import annotations
@@ -47,7 +50,7 @@ class TrackDecision:
     signals: dict[str, Any] = field(default_factory=dict)
 
 
-# ----- rules patterns (T1) -----
+# ----- rules patterns -----
 
 _GREETING_RE = re.compile(
     r"^\s*("
@@ -60,7 +63,35 @@ _GREETING_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Tickers / corpus / period cues that keep a turn on research.
+_COMPANY_RE = re.compile(
+    r"\b(AAPL|MSFT|AMZN|Apple|Microsoft|Amazon)\b",
+    re.IGNORECASE,
+)
+
+_PERIOD_RE = re.compile(
+    r"\b("
+    r"2022\s*Q3|2023\s*Q[1-3]|"
+    r"Q[1-4]\s*202[23]|"
+    r"2022|2023|"
+    r"Q[1-4]"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Metric / filing-shaped asks that need grounded company+period slots.
+# Deliberately excludes bare "what was" so off-domain questions are
+# not mis-routed to clarify.
+_FILING_ASK_RE = re.compile(
+    r"\b("
+    r"revenue|net\s+sales|operating\s+income|EPS|earnings|"
+    r"gross\s+margin|cost\s+of\s+sales|"
+    r"10-?Q|filing|filings"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Tickers / corpus / period / tool cues that keep a turn on research
+# when slots are complete (or the ask is catalog/tool shaped).
 _RESEARCH_SIGNAL_RE = re.compile(
     r"\b("
     r"AAPL|MSFT|AMZN|Apple|Microsoft|Amazon|"
@@ -98,6 +129,15 @@ def _research_signal_hits(text: str) -> list[str]:
     return [m.group(0) for m in _RESEARCH_SIGNAL_RE.finditer(text)]
 
 
+def _missing_slots(text: str) -> list[str]:
+    missing: list[str] = []
+    if not _COMPANY_RE.search(text):
+        missing.append("company")
+    if not _PERIOD_RE.search(text):
+        missing.append("period")
+    return missing
+
+
 def decide_track(
     messages: list[BaseMessage],
     *,
@@ -106,12 +146,11 @@ def decide_track(
 ) -> TrackDecision:
     """Return the Soft-Track decision for this turn (rules primary).
 
-    Stub hooks (unused in T1; documented for T3/T4):
+    Stub hooks (unused until T3/T4; documented for later wiring):
 
     * ``snapshots`` — latest status-snapshot view (T3 inherit).
     * ``classify_model`` — ambiguous LLM classify (T4 cascade).
     """
-    # T3/T4 hooks: accepted so call sites can pass them early.
     _ = snapshots
     _ = classify_model
 
@@ -127,6 +166,31 @@ def decide_track(
             signals=signals,
         )
 
+    # Off-domain before clarify so weather/etc. never become clarify.
+    if text and _OFF_DOMAIN_RE.search(text):
+        signals["off_domain"] = True
+        return TrackDecision(
+            track="off_topic",
+            confidence=0.9,
+            decision_tier="rules",
+            signals=signals,
+        )
+
+    # Filing-shaped ask missing company and/or period → clarify
+    # BEFORE generic research-signal promotion, so underspecified
+    # metric asks do not bind tools.
+    if text and _FILING_ASK_RE.search(text):
+        missing = _missing_slots(text)
+        if missing:
+            signals["filing_ask"] = True
+            signals["missing_slots"] = missing
+            return TrackDecision(
+                track="clarify",
+                confidence=0.85,
+                decision_tier="rules",
+                signals=signals,
+            )
+
     research_hits = _research_signal_hits(text)
     if research_hits:
         signals["research_signals"] = research_hits
@@ -137,19 +201,8 @@ def decide_track(
             signals=signals,
         )
 
-    if text and _OFF_DOMAIN_RE.search(text):
-        signals["off_domain"] = True
-        return TrackDecision(
-            track="off_topic",
-            confidence=0.9,
-            decision_tier="rules",
-            signals=signals,
-        )
-
     # Ambiguous / short (e.g. HumanMessage("q")) → research so
-    # existing citation-gate bounce suites keep working. T2 may
-    # route underspecified filing asks to clarify; T4 may EXIT
-    # through LLM → inherit → clarify → conditional_policy.
+    # existing citation-gate bounce suites keep working.
     signals["fallback"] = "research"
     return TrackDecision(
         track="research",

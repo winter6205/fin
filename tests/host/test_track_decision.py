@@ -40,9 +40,32 @@ def test_filing_ask_decides_research() -> None:
     assert decision.track == "research"
 
 
-def test_decide_track_does_not_route_clarify_yet() -> None:
-    """T2 owns clarify; T1 must not emit track=clarify."""
+def test_underspecified_metric_ask_decides_clarify() -> None:
+    """Filing-shaped ask missing company and/or period → clarify (T2)."""
+    decision = decide_track([HumanMessage(content="What was revenue?")])
+    assert decision.track == "clarify"
+    assert decision.decision_tier == "rules"
+    assert decision.signals.get("missing_slots")
+
+
+def test_metric_with_company_missing_period_decides_clarify() -> None:
     decision = decide_track(
-        [HumanMessage(content="What was revenue?")]  # underspecified filing cue
+        [HumanMessage(content="What was AAPL net sales?")]
     )
-    assert decision.track != "clarify"
+    assert decision.track == "clarify"
+    assert "period" in (decision.signals.get("missing_slots") or [])
+
+
+def test_metric_with_period_missing_company_decides_clarify() -> None:
+    decision = decide_track(
+        [HumanMessage(content="What was net sales in 2023 Q3?")]
+    )
+    assert decision.track == "clarify"
+    assert "company" in (decision.signals.get("missing_slots") or [])
+
+
+def test_fully_specified_filing_ask_stays_research() -> None:
+    decision = decide_track(
+        [HumanMessage(content="What was AAPL net sales in 2023 Q3?")]
+    )
+    assert decision.track == "research"

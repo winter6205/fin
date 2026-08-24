@@ -982,7 +982,7 @@ def test_model_node_sends_host_instructions_before_user_turn(aapl_page1_text):
     )
     out = g.invoke(
         {
-            "messages": [HumanMessage("What was Apple net sales?")],
+            "messages": [HumanMessage("What was Apple net sales in 2022 Q3?")],
             "evidence": [
                 EvidenceItem(
                     locator=Locator(AAPL_2022Q3, AAPL_2022Q3_VERSION, 1),
