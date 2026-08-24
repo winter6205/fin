@@ -44,6 +44,10 @@ class RunResponsePayload(TypedDict):
     workspace SSE + RunRecord persistence reach the SSOT helper.
     ``/ask`` ignores both — the AskResponse wire shape is frozen
     (the streaming shapes live only on the workspace surface).
+
+    Soft-Track T5: ``track`` mirrors the graph decision for the
+    SSE status frame; ``track_decision`` is the full auditable
+    dict persisted on ``RunRecord`` / GET history.
     """
 
     status: RunStatus
@@ -53,6 +57,8 @@ class RunResponsePayload(TypedDict):
     assistant_message: str
     thinking_text: str
     tool_summaries: list[dict[str, str]]
+    track: str
+    track_decision: dict[str, Any]
 
 
 # Ordinary-person copy the SPA renders when a run ended
@@ -157,6 +163,16 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
                 }
             )
 
+    raw_td = raw.get("track_decision") or {}
+    track_decision_value: dict[str, Any] = (
+        dict(raw_td) if isinstance(raw_td, dict) else {}
+    )
+    track_value = str(
+        raw.get("track")
+        or track_decision_value.get("track")
+        or ""
+    )
+
     if status_value == "done":
         citations_payload: list[dict[str, Any]] = [
             {
@@ -178,6 +194,8 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
             assistant_message="",
             thinking_text=thinking_value,
             tool_summaries=summaries_value,
+            track=track_value,
+            track_decision=track_decision_value,
         )
 
     # ``refuse`` / ``step_cap`` keep their status + reason; anything
@@ -204,6 +222,8 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
         # the run ended before any model call.
         thinking_text=thinking_value,
         tool_summaries=summaries_value,
+        track=track_value,
+        track_decision=track_decision_value,
     )
 
 

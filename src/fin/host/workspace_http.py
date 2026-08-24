@@ -218,6 +218,8 @@ class TurnRow(BaseModel):
     # the LATEST turn row; older rows always serialize ``False``
     # because a stored RunRecord is by definition terminal.
     in_flight: bool = False
+    # Soft-Track T5: auditable classify outcome for this run_id.
+    track_decision: dict[str, Any] = Field(default_factory=dict)
 
 
 class ThreadDetailResponse(BaseModel):
@@ -294,6 +296,8 @@ def _serialize_run(run: RunRecord, *, in_flight: bool = False) -> dict[str, Any]
         "assistant_message": run.assistant_message,
         "created_at": run.created_at.isoformat(),
         "in_flight": in_flight,
+        # Soft-Track: deep-copied so callers cannot mutate the store.
+        "track_decision": dict(run.track_decision or {}),
     }
 
 
@@ -624,6 +628,10 @@ def _terminal_sse_frames(
         "reason": payload["reason"] or None,
         "assistant_message": payload["assistant_message"],
     }
+    # Soft-Track: expose the graph track so the SPA can render a
+    # light research hint without Chat|Research chrome.
+    if payload.get("track"):
+        status_body["track"] = payload["track"]
     if thinking_type is not None:
         status_body["thinking_type"] = thinking_type
     if thinking_ms is not None:
@@ -958,6 +966,7 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                         thinking_duration_ms=outcome.thinking_ms,
                         tool_summaries=payload["tool_summaries"],
                         assistant_message=payload["assistant_message"],
+                        track_decision=dict(payload.get("track_decision") or {}),
                     )
                 )
             except ThreadNotFoundError:
@@ -1104,6 +1113,7 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                         thinking_duration_ms=outcome.thinking_ms,
                         tool_summaries=payload["tool_summaries"],
                         assistant_message=payload["assistant_message"],
+                        track_decision=dict(payload.get("track_decision") or {}),
                     )
                 )
             except ThreadNotFoundError:
