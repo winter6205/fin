@@ -2,7 +2,7 @@
 
 This module is the **only** module in ``src/fin/host/`` that knows
 the host graph's topology. It is built from scratch here — no
-``deer_flow`` import, no ``langgraph.prebuilt.create_react_agent``,
+``langgraph.prebuilt.create_react_agent``,
 no vendored external agent tree (ADR 0019). The graph wires the
 three nodes the v1 spec requires:
 
