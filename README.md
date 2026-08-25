@@ -22,6 +22,8 @@ Upstream freeze: [docugami/private fixture source](https://github.com/docugami/p
 
 v1 host-agent ships: ingest artifacts are in git; CLI (`python -m fin`) and HTTP `POST /ask` share one compiled host graph. Default model is `fin/MiniMax-M3` via `FIN_MODEL` + `FIN_BASE_URL` (ADR 0022). Soft-Track (ADR 0027, PR #57) routes each turn to `dialogue` / `clarify` / `off_topic` / `research`; only research binds tools and the citation verifier. Opt-in contracts: `uv run pytest -q -m soft_track`.
 
+**NOW (2026-08-25):** harden the research vertical slice — ask filings → evidence → cited answer → reliable workspace UX. S1 corpus-retrieve landed in PR #79. Execution map: [fin agent wayfinder #91](https://github.com/winter6205/fin/issues/91). Recommended path memo: [`docs/research/009-optimized-agent-first-path.md`](docs/research/009-optimized-agent-first-path.md). Institutional memory / enterprise KB is later optional ([#92](https://github.com/winter6205/fin/issues/92)); filing research does not wait on it.
+
 ## Running the workspace server (T1)
 
 `fin-serve` binds `0.0.0.0:8000` and serves both the API routes and the built SPA same-origin. The SPA is NOT committed — it is a build artifact:

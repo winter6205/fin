@@ -14,8 +14,8 @@ A normal conversational agent whose durable runtime is a LangGraph host graph: e
 _Avoid_: Q&A API, memory backend, retrieval graph, treating research-track contracts as the whole product personality
 
 **host agent**:
-fin's role relative to iknow-memory: the caller of `retrieve`, not the search engine.
-_Avoid_: client, treating fin as only a FAQ bot
+fin as the LangGraph runtime that routes tracks and calls research tools behind the **retrieve port**; it is not the ranking or vector store.
+_Avoid_: client, treating fin as only a FAQ bot, treating fin as the long-term memory server
 
 **track**:
 The per-turn contract on the host graph: `dialogue`, `clarify`, `off_topic`, or `research`. Chosen in-graph before execution; tools and the citation verifier bind only to `research`.
@@ -30,18 +30,18 @@ One append-only per-turn record of research working context (e.g. company, perio
 _Avoid_: overwriting away prior snapshots, dual-writing into thread_store as SSOT, replacing full message history with snapshots
 
 **iknow-memory**:
-The existing TypeScript MCP memory server (separate repo). It owns vector ingest and cosine / hybrid / RRF ranking. fin v1 is an independent system with its own retrieve adapter; a later adapter may call iknow-memory over MCP without changing the host graph.
-_Avoid_: treating fin as the long-term vector backend, pausing fin until iknow-memory ships
+A separate TypeScript MCP memory server (own repo and release train). It may later supply institutional or cross-session memory behind fin's retrieve adapter; fin's filing vertical slice does not wait on it.
+_Avoid_: treating fin as the long-term vector backend, lockstep releases with fin, mirroring fin consumer ADRs into that repo
 
 ### Seams
 
 **retrieve port**:
-The only retrieve dependency fin is allowed to have: `query` (+ optional filters) in, ranked chunks with `source_ref` out. Same shape as iknow-memory `retrieve`, regardless of transport.
+The only retrieve dependency fin is allowed to have: `query` (+ optional filters) in, ranked chunks with `source_ref` out — MCP-shaped, transport-agnostic.
 _Avoid_: search API, vector store
 
 **retrieve adapter**:
-The product retrieve implementation behind the retrieve port: an MCP client to **iknow-memory**. Hits map back to fin locators as `source_ref`. In-process BM25 is archived (ADR 0007 superseded by 0030). Retrieve chunking upgrades land in iknow-memory, not a second splitter in fin.
-_Avoid_: shipping BM25 as the product path, hybrid/RRF implemented in this repo, moving the extracted cite tree into iknow-memory, compile-time coupling of the two repos
+The implementation behind the retrieve port. Default pytest uses a Fake port. When configured, product retrieve is an MCP 2.0 client (protocol-testable against a compliant public or fixture server); hits map to fin locators as `source_ref`. In-process BM25 is archived (ADR 0007; ADR 0030 superseded by 0032). Ranking and chunking for remote memory stay outside fin; the extracted cite tree stays in fin.
+_Avoid_: shipping BM25 as the product path, hybrid/RRF implemented in this repo, moving the cite tree into a memory server, compile-time coupling to one memory repo
 
 ### Agent
 
