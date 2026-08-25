@@ -96,3 +96,24 @@ Each criterion is binary and maps to a command or a named test. "NEW" marks test
 ## 待写入 (persist after ACR)
 
 empty — no new CONTEXT term is introduced (all terms quoted verbatim above), and ADR 0032 already covers the MCP 2.0 initialize → tools/call handshake, so no new one-way-door ADR is proposed. The stale BM25 mention in `HOST_SYSTEM_PROMPT` is a prompt-text fix, not a glossary change.
+
+## architecture-change-reviewer
+
+Pre-impl 5-verdict（对 spec 声明结构的判定，非对未写代码的测量；证据为 file:line 或 spec 章节）:
+
+bounded-context-guardian: yes — 全部改动落在既有能力切片 `src/fin/retrieve/`、`src/fin/host/`、`web/src/` 及对应 tests/，无新技术分层目录、无新 bounded context；SC8 反而收紧一处已核实的边界泄漏（`src/fin/retrieve/tool.py:35` 现以具体 `BM25Adapter` 而非 port 作类型），跨切片依赖仍经 **retrieve port** 接口声明。
+defensive-contract-validator: yes — Does + Success Criteria 五类边界均有具名测试分配：empty（SC3 空命中信封 → `{chunks: []}`）、negative（SC5 malformed envelope → `retrieve_unavailable`；SC8 签名一致性）、overflow（SC2 收紧 `tests/host/test_soft_track_ship.py:582` 的 `("refuse", "step_cap", "done")` 断言泄漏；SC16 >10 spans 折叠）、concurrent（SC17 409 `concurrent_run` 显式呈现）、exception（SC4 无传输 EXIT、SC10 `numeric_gate_fail` 文案、SC14 boot WARNING）。
+error-handling-enforcer: yes — 每条失败路径在 spec 中具名且有类型：`retrieve_unavailable` / `unknown_locator` / 409 `{error: concurrent_run}` / 503 `{error: ingest_missing}` 继承自 `specs/s1-corpus-retrieve.md` 与 `specs/workspace.md` 的 typed EXITs；空命中被显式定义为 miss（`{chunks: []}`）而非错误或 raise；composer 不再吞掉 409/503；不可达 MCP 有 boot WARNING 出口，无空 catch / null-on-failure 意图。
+complexity-anti-drift: yes — 声明结构为四焦点各自的小粒度改动（断言收紧、prompt 文本修正、`format_tool_summary` 分支文案、契约测试补齐、opt-in mark + fixture server、web 纯函数抽取以可测），每处停留在单一抽象层；host graph 明确不改，无 god-function / god-file / 横切 handler 意图 —— 按声明结构判定，未使用任何行数估计。
+minimal-change-verifier: yes — 单一逻辑增量（收口 009 NOW 四焦点遗留），Does 未混入无关 epic：S2+、重开 S1、host-graph 重写、BM25 复活、live memory 集成均在 Out；FinanceBench 与 Postgres 硬化已由操作者确认 park；tracer-bullet 拆分归 writing-plans。
+
+**OVERALL: PASS — hand to writing-plans**（下游产物为本地 `plans/vertical-slice-hardening.md`，见 Inherits 的 tracker note）。
+
+Affected surfaces（仅列 spec 已具名者）:
+
+- `src/fin/retrieve/`: `mcp_adapter.py`（信封变体、无传输 EXIT、`document_id` keyword-only）、`tool.py`（去 `BM25Adapter` 类型、依 port 类型）
+- `src/fin/host/`: `agent_instructions.py`（工具清单修正）、`stream_map.py`（`format_tool_summary`）、clarify 提示注入与 `numeric_gate_fail` 终局文案所属模块、`fin-serve` 启动 WARNING（`workspace_http.py` / `operator_env.py` 一侧）
+- `tests/retrieve/`: `test_mcp_adapter.py`、`test_compile_graph_adapter_swap.py`、`test_product_retrieve_wiring.py`、新签名一致性测试
+- `tests/host/`: `test_soft_track_ship.py`（overflow 断言）、`test_agent_instructions.py`、`test_stream_map.py`、`test_workspace_http.py` / `test_operator_env.py`、新 clarify / numeric-gate 测试
+- `web/src/`: composer 409/503 错误态、新 vitest（sources 折叠、last-thread restore）
+- 配置/文档面: 新 opt-in pytest mark `mcp`（marker 配置）、README 与 `.env.example` 的 `FIN_RETRIEVE_ADAPTER`、SPA catch-all 测试去 `web/dist` 硬依赖
