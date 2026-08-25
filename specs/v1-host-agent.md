@@ -68,14 +68,14 @@ CONTEXT / ADR only. Spec body does not author those files.
 1. **citation verifier** (update): gate on the path to END; evidence = this run's tool results; extractive span ≥ 32 on evidenced pages; code fills user-visible citations from passed checks; recoverable fail = hidden template bounce; not an LLM judge; not a model-facing tool.
 2. **agent loop** (update): stop = no tool calls; `done` only after the citation gate passes; refuse / `step_cap` unchanged in kind (ADR 0008).
 3. **loop skeleton** (update): host graph is authored in fin; do not name an upstream template as the source of the graph.
-4. **reference checkout** (update): do not name an external checkout; drop `react-agent`.
+4. **reference checkout** (update): reference implementation sibling only; drop `react-agent`.
 5. **ingest** (new term): command that writes extracted page text + passages from frozen PDFs; query SSOT; not a tool.
 6. ADR **0010** → `superseded by 0019`: host graph authored in fin (model / tools / citation gate / caps), not adapted from an external agent tree.
-7. ADR **0017** body: no template-adapt language.
+7. ADR **0017** body: reference implementation sibling only; no template-adapt language.
 8. New ADR **0019**: write the host graph in-repo.
 9. New ADR **0020**: extracted ingest artifacts are the query SSOT; BM25 in RAM at process start; no PDF on the ask path.
 10. New ADR **0021**: citations are filled from gate-passed extractive spans against this run's tool evidence; bounce templates are hidden from the user surface.
-11. `CLAUDE.md` 按需查阅: do not copy an external tree into `src/fin`.
+11. `CLAUDE.md` 按需查阅: reference implementation sibling is read-only; do not copy its tree into `src/fin`.
 12. Reword ADR 0005 / 0013 / 0018 so they do not name an upstream template as the loop source.
 
 ## Architecture change reviewer
