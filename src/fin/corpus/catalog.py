@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from fin.corpus.errors import IngestMissingError
 from fin.corpus.extracted import load_extracted_tree
 
 
@@ -25,10 +26,41 @@ _DEFAULT_MANIFEST_PATH = _DEFAULT_DATA_DIR / "manifest.json"
 _DEFAULT_EXTRACTED_ROOT = _DEFAULT_DATA_DIR / "extracted"
 
 
+# EDGAR-shaped optional fields per ADR 0031. T1 only reads them off
+# the manifest so the live ingest path can use them; the additive
+# filter kwargs land in T2 (catalog shape stays v1 for now).
+_EDGAR_OPTIONAL_FIELDS = (
+    "cik",
+    "accession",
+    "filing_date",
+    "ticker",
+    "form",
+)
+
+
+def _read_edgar_fields(doc: dict[str, Any]) -> dict[str, Any]:
+    """Read the optional EDGAR-shaped fields off a manifest entry.
+
+    Returns a dict containing only the fields that are actually
+    present in the manifest entry (the demo corpus may leave them
+    null, and a future live-edited row is allowed to omit some). The
+    caller decides whether / how to merge them into the output shape.
+    """
+    return {
+        key: doc[key]
+        for key in _EDGAR_OPTIONAL_FIELDS
+        if key in doc and doc[key] is not None
+    }
+
+
 def list_filings(
     company: str | None = None,
     period: str | None = None,
     *,
+    cik: str | None = None,
+    form: str | None = None,
+    ticker: str | None = None,
+    filing_date: str | None = None,
     manifest_path: Path | None = None,
     extracted_root: Path | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
@@ -37,14 +69,32 @@ def list_filings(
     Each hit is ``{document_id, company, period, version, page_count}``.
     Filings are sorted by ``document_id`` for deterministic output.
     Unknown filters yield ``{"filings": []}``.
+
+    Additive EDGAR-shaped optional filters per ADR 0031: ``cik``,
+    ``form``, ``ticker``, exact ``filing_date``. Filters are
+    AND-combined. Empty filter values (``cik=""`` etc.) behave as
+    empty hits — NOT "match anything" and NOT an exception, per
+    spec "empty hits not exceptions". The new fields are filter
+    inputs only; the v1 output hit shape is preserved until a
+    later ticket extends the output keys.
     """
     if manifest_path is None:
         manifest_path = _DEFAULT_MANIFEST_PATH
     if extracted_root is None:
         extracted_root = _DEFAULT_EXTRACTED_ROOT
 
-    payload = json.loads(manifest_path.read_text())
-    documents = payload["documents"]
+    # Missing / unreadable manifest is the same family of "the
+    # committed corpus is in a known-bad state" failure as a missing
+    # extracted tree (ADR 0020). Translate the low-level I/O error
+    # to the typed ``IngestMissingError`` so the host graph can
+    # fail fast at boot rather than see ``FileNotFoundError``.
+    try:
+        manifest_payload = json.loads(manifest_path.read_text())
+    except FileNotFoundError as exc:
+        raise IngestMissingError(
+            f"manifest not found at {manifest_path}"
+        ) from exc
+    documents = manifest_payload["documents"]
 
     pages_by_doc = load_extracted_tree(manifest_path, extracted_root)
 
@@ -54,16 +104,35 @@ def list_filings(
             continue
         if period is not None and doc["period"] != period:
             continue
+        # EDGAR-shaped optional filters (ADR 0031). Empty-string
+        # filter values behave as empty hits — short-circuit before
+        # any row passes the row loop.
+        if cik is not None:
+            if cik == "" or doc.get("cik") != cik:
+                continue
+        if form is not None:
+            if form == "" or doc.get("form") != form:
+                continue
+        if ticker is not None:
+            if ticker == "" or doc.get("ticker") != ticker:
+                continue
+        if filing_date is not None:
+            if filing_date == "" or doc.get("filing_date") != filing_date:
+                continue
         doc_id = doc["document_id"]
-        filings.append(
-            {
-                "document_id": doc_id,
-                "company": doc["company"],
-                "period": doc["period"],
-                "version": doc["sha256"],
-                "page_count": len(pages_by_doc[doc_id]),
-            }
-        )
+        hit: dict[str, Any] = {
+            "document_id": doc_id,
+            "company": doc["company"],
+            "period": doc["period"],
+            "version": doc["sha256"],
+            "page_count": len(pages_by_doc[doc_id]),
+        }
+        # T2: the new EDGAR-shaped fields are filter inputs only;
+        # the v1 hit shape stays stable. ``_read_edgar_fields`` is
+        # called to validate the manifest shape at boot — drift in
+        # the optional fields surfaces here, not at a deeper site.
+        _read_edgar_fields(doc)
+        filings.append(hit)
     return {"filings": filings}
 
 

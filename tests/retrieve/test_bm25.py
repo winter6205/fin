@@ -813,3 +813,201 @@ def test_small_tree_index_is_built_once_and_reusable(tmp_path: Path) -> None:
     assert [c.text for c in first["chunks"]] == [
         c.text for c in second["chunks"]
     ]
+
+
+# ---------- T2 EDGAR-shaped filter kwargs (ADR 0031) ----------
+
+
+@pytest.fixture
+def small_tree_with_manifest_docs(small_tree: tuple[Path, Path]) -> tuple[Path, Path]:
+    """``small_tree`` extended with EDGAR-shaped metadata per document.
+
+    DOC-2023Q1 gets AAPL-style fields; DOC-2023Q2 gets MSFT-style
+    fields. The fixture is the smallest corpus where ``cik`` /
+    ``form`` / ``ticker`` / ``filing_date`` filters can produce
+    distinct results for the same query.
+    """
+    manifest_path, extracted_root = small_tree
+
+    # Rewrite the manifest to add EDGAR-shaped optional fields. The
+    # loader only needs ``document_id`` / ``sha256`` to build the
+    # tree, so we don't disturb the extracted artifacts.
+    payload = json.loads(manifest_path.read_text())
+    by_doc: dict[str, dict] = {
+        "DOC-2023Q1": {
+            "cik": "0000320193",
+            "form": "10-Q",
+            "ticker": "AAPL",
+            "filing_date": "2023-02-03",
+        },
+        "DOC-2023Q2": {
+            "cik": "0000789019",
+            "form": "10-Q",
+            "ticker": "MSFT",
+            "filing_date": "2023-04-25",
+        },
+    }
+    for doc in payload["documents"]:
+        doc.update(by_doc[doc["document_id"]])
+    manifest_path.write_text(json.dumps(payload))
+
+    return manifest_path, extracted_root
+
+
+def _build_manifest_docs(manifest_path: Path) -> dict[str, dict[str, object]]:
+    """Build the ``{document_id: {cik, form, ticker, filing_date}}`` map
+    the BM25 adapter consumes for EDGAR-shaped filters."""
+    payload = json.loads(manifest_path.read_text())
+    keys = ("cik", "form", "ticker", "filing_date")
+    return {
+        doc["document_id"]: {k: doc[k] for k in keys if k in doc}
+        for doc in payload["documents"]
+    }
+
+
+# ===== boundary 1: empty =====
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["cik", "form", "ticker", "filing_date"],
+)
+def test_bm25_empty_filter_value_returns_empty_chunks(
+    small_tree_with_manifest_docs: tuple[Path, Path],
+    field: str,
+) -> None:
+    """Empty filter value (``cik=""`` etc.) MUST return ``{"chunks": []}``
+    without raising — NOT "match anything" and NOT an exception
+    (ADR 0031 / spec "empty hits not exceptions").
+    """
+    manifest_path, extracted_root = small_tree_with_manifest_docs
+    tree = load_extracted_tree(
+        manifest_path=manifest_path, extracted_root=extracted_root
+    )
+    adapter = BM25Adapter(tree, manifest_docs=_build_manifest_docs(manifest_path))
+
+    result = adapter.retrieve("revenue", **{field: ""}, limit=20)
+    assert result == {"chunks": []}, (
+        f"empty {field}='' must yield empty chunks; got {result!r}"
+    )
+
+
+# ===== boundary 2: negative =====
+
+
+def test_bm25_unknown_cik_returns_empty_chunks(
+    small_tree_with_manifest_docs: tuple[Path, Path],
+) -> None:
+    """Unknown ``cik`` returns ``{"chunks": []}`` — NOT an error."""
+    manifest_path, extracted_root = small_tree_with_manifest_docs
+    tree = load_extracted_tree(
+        manifest_path=manifest_path, extracted_root=extracted_root
+    )
+    adapter = BM25Adapter(tree, manifest_docs=_build_manifest_docs(manifest_path))
+
+    result = adapter.retrieve("revenue", cik="9999999999", limit=20)
+    assert result == {"chunks": []}
+
+
+def test_bm25_unknown_ticker_returns_empty_chunks(
+    small_tree_with_manifest_docs: tuple[Path, Path],
+) -> None:
+    """Unknown ``ticker`` returns ``{"chunks": []}``."""
+    manifest_path, extracted_root = small_tree_with_manifest_docs
+    tree = load_extracted_tree(
+        manifest_path=manifest_path, extracted_root=extracted_root
+    )
+    adapter = BM25Adapter(tree, manifest_docs=_build_manifest_docs(manifest_path))
+
+    result = adapter.retrieve("revenue", ticker="ZZZZ", limit=20)
+    assert result == {"chunks": []}
+
+
+def test_bm25_unknown_form_returns_empty_chunks(
+    small_tree_with_manifest_docs: tuple[Path, Path],
+) -> None:
+    """Unknown ``form`` returns ``{"chunks": []}``."""
+    manifest_path, extracted_root = small_tree_with_manifest_docs
+    tree = load_extracted_tree(
+        manifest_path=manifest_path, extracted_root=extracted_root
+    )
+    adapter = BM25Adapter(tree, manifest_docs=_build_manifest_docs(manifest_path))
+
+    result = adapter.retrieve("revenue", form="10-K", limit=20)
+    assert result == {"chunks": []}
+
+
+def test_bm25_conflicting_ticker_and_cik_returns_empty_chunks(
+    small_tree_with_manifest_docs: tuple[Path, Path],
+) -> None:
+    """Conflicting ``ticker`` + ``cik`` returns ``{"chunks": []}``.
+
+    AAPL's ticker (``AAPL``) paired with MSFT's CIK
+    (``0000789019``) — no doc satisfies both. AND-combined
+    filters drop all rows; the empty chunks path is the contract.
+    """
+    manifest_path, extracted_root = small_tree_with_manifest_docs
+    tree = load_extracted_tree(
+        manifest_path=manifest_path, extracted_root=extracted_root
+    )
+    adapter = BM25Adapter(tree, manifest_docs=_build_manifest_docs(manifest_path))
+
+    result = adapter.retrieve(
+        "revenue", ticker="AAPL", cik="0000789019", limit=20
+    )
+    assert result == {"chunks": []}
+
+
+def test_bm25_matching_cik_returns_hits_from_matching_doc_only(
+    small_tree_with_manifest_docs: tuple[Path, Path],
+) -> None:
+    """Matching ``cik`` filters hits to docs that match.
+
+    AAPL's CIK (``0000320193``) returns only DOC-2023Q1 chunks; MSFT's
+    CIK (``0000789019``) returns only DOC-2023Q2 chunks.
+    """
+    manifest_path, extracted_root = small_tree_with_manifest_docs
+    tree = load_extracted_tree(
+        manifest_path=manifest_path, extracted_root=extracted_root
+    )
+    adapter = BM25Adapter(tree, manifest_docs=_build_manifest_docs(manifest_path))
+
+    aapl_only = adapter.retrieve("revenue", cik="0000320193", limit=20)
+    msft_only = adapter.retrieve("revenue", cik="0000789019", limit=20)
+
+    assert aapl_only["chunks"], "expected AAPL chunks"
+    assert msft_only["chunks"], "expected MSFT chunks"
+    assert all(
+        c.source_ref.document_id == "DOC-2023Q1"
+        for c in aapl_only["chunks"]
+    ), f"cik=AAPL filter leaked non-AAPL chunks: {aapl_only['chunks']!r}"
+    assert all(
+        c.source_ref.document_id == "DOC-2023Q2"
+        for c in msft_only["chunks"]
+    ), f"cik=MSFT filter leaked non-MSFT chunks: {msft_only['chunks']!r}"
+
+
+def test_bm25_metadata_filter_is_noop_when_manifest_docs_unset(
+    small_tree: tuple[Path, Path],
+) -> None:
+    """When the adapter is built without ``manifest_docs``, the EDGAR-
+    shaped filters are no-ops (v1 behavior preserved).
+
+    Callers that haven't wired the catalog in (e.g. the host graph
+    before T3) keep working: BM25 ranks the corpus purely on lexical
+    match + ``document_id`` membership.
+    """
+    manifest_path, extracted_root = small_tree
+    tree = load_extracted_tree(
+        manifest_path=manifest_path, extracted_root=extracted_root
+    )
+    adapter = BM25Adapter(tree)  # no manifest_docs
+
+    baseline = adapter.retrieve("revenue", limit=20)
+    filtered = adapter.retrieve(
+        "revenue", cik="0000320193", ticker="AAPL", limit=20
+    )
+
+    assert [c.text for c in filtered["chunks"]] == [
+        c.text for c in baseline["chunks"]
+    ]

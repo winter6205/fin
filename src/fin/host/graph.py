@@ -90,8 +90,9 @@ from fin.host.stream_map import (
 )
 from fin.host.tools import list_files, read_file
 from fin.host.track_decision import decide_track, snapshot_delta_for_utterance
-from fin.retrieve import BM25Adapter
+from fin.retrieve import MCPRetrieveAdapter, FakeRetrievePort
 from fin.retrieve.tool import retrieve
+from fin.retrieve.port import RetrievePort
 
 
 # ----- typed errors -----
@@ -112,12 +113,33 @@ class ConcurrentRunError(HostGraphError):
     """
 
 
+class RetrieveAdapterConfigError(HostGraphError):
+    """The requested retrieve adapter cannot be built as configured.
+
+    Raised for an unknown ``retrieve_adapter`` kind, and for a
+    product MCP adapter that would be built with no usable
+    ``locator_map`` — a map-less MCP adapter drops every hit
+    (ADR 0030 mapper-drop), so it would answer every query with
+    ``{"chunks": []}`` while looking perfectly healthy. Refusing
+    to build it turns a silent always-empty retrieve into a boot
+    failure the operator can act on.
+    """
+
+
 # ----- helpers -----
 
 
 _DEFAULT_DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "corpus"
 _DEFAULT_MANIFEST_PATH = _DEFAULT_DATA_DIR / "manifest.json"
 _DEFAULT_EXTRACTED_ROOT = _DEFAULT_DATA_DIR / "extracted"
+_DEFAULT_FACTS_ROOT = _DEFAULT_DATA_DIR / "facts"
+
+# The two retrieve adapter kinds ``compile_graph`` can auto-build.
+# ``BM25Adapter`` is deliberately absent: ADR 0030 archived it from
+# the product path, and offline tests pass it in as ``adapter=``.
+RETRIEVE_ADAPTER_FAKE = "fake"
+RETRIEVE_ADAPTER_MCP = "mcp"
+RETRIEVE_ADAPTER_KINDS = (RETRIEVE_ADAPTER_FAKE, RETRIEVE_ADAPTER_MCP)
 
 # Marker the gate uses on the next pass to recognize a bounce
 # template in the message history. The marker is data; CLI / HTTP
@@ -131,6 +153,32 @@ def _resolve_path(value: Path | str | None, default: Path) -> Path:
     if value is None:
         return default
     return Path(value)
+
+
+def _locator_map_from_tree(
+    tree: dict[str, tuple[Any, ...]],
+) -> dict[str, Locator]:
+    """Publish one ``iknow-memory id -> fin Locator`` entry per
+    frozen locator unit in the extracted ``tree``.
+
+    ``MCPRetrieveAdapter`` maps each hit's ``source_ref`` through
+    this dict and DROPS whatever is missing, so the map is the
+    only thing standing between a healthy MCP server and a
+    retrieve path that returns nothing.
+
+    The published id spelling is ``"{document_id}#{page}"``: the
+    identity fin can address without reading iknow-memory's
+    storage. An operator whose iknow-memory corpus was ingested
+    under different ids passes an explicit ``locator_map`` to
+    ``compile_graph``; a stale mapping degrades safely because the
+    citation verifier still matches the claimed span against the
+    frozen unit's text.
+    """
+    return {
+        f"{document_id}#{page.locator.page}": page.locator
+        for document_id, pages in tree.items()
+        for page in pages
+    }
 
 
 def _last_ai_text(messages: list[BaseMessage]) -> str:
@@ -184,17 +232,32 @@ def _make_list_files_tool(manifest_path: Path, extracted_root: Path):
     """
 
     @tool("list_files")
-    def list_files_tool(company: str | None = None, period: str | None = None) -> dict:
+    def list_files_tool(
+        company: str | None = None,
+        period: str | None = None,
+        *,
+        cik: str | None = None,
+        form: str | None = None,
+        ticker: str | None = None,
+        filing_date: str | None = None,
+    ) -> dict:
         """List available 10-Q filings in the corpus.
 
         Optional ``company`` and ``period`` filters match the
         manifest's ``company`` and ``period`` fields exactly.
-        Returns ``{"filings": [...]}``; unknown filters return
-        ``{"filings": []}``.
+        Additive EDGAR-shaped filters (``cik``, ``form``,
+        ``ticker``, exact ``filing_date``) per ADR 0031 are
+        forwarded through. Returns ``{"filings": [...]}`; unknown
+        filters, conflicting filters, and empty filter values
+        all return ``{"filings": []}``.
         """
         return list_files(
             company=company,
             period=period,
+            cik=cik,
+            form=form,
+            ticker=ticker,
+            filing_date=filing_date,
             manifest_path=manifest_path,
             extracted_root=extracted_root,
         )
@@ -279,13 +342,22 @@ def _make_read_file_tool():
     return read_file_tool
 
 
-def _make_retrieve_tool(adapter: BM25Adapter):
+def _make_retrieve_tool(adapter: RetrievePort):
     """Build the ``retrieve`` host tool.
 
-    The tool wraps T4's ``retrieve`` (which is the port-seam) with
-    the factory's shared ``BM25Adapter``. On a hit, each chunk
+    The tool wraps T4's ``retrieve`` (which is the port-seam)
+    with the factory's shared adapter. On a hit, each chunk
     contributes one ``EvidenceItem`` to ``AgentState``. An empty
     contract (``{"chunks": []}``) contributes nothing.
+
+    Typed EXIT (spec s1-corpus-retrieve § Boundaries): when the
+    port returns ``{"error": "retrieve_unavailable"}`` (product
+    MCP transport / process down, ADR 0030) the tool serializes
+    THAT dict as the ``ToolMessage`` content. It must not be
+    rewritten as ``{"chunks": []}`` — the miss shape would tell
+    the model the corpus has nothing when retrieval never ran.
+    The error contributes no evidence and triggers no BM25
+    fallback; the model can retry or say retrieval is down.
 
     The tool's registered name is ``retrieve`` so the model can
     call it by name.
@@ -296,21 +368,50 @@ def _make_retrieve_tool(adapter: BM25Adapter):
         query: str,
         document_id: str | None = None,
         limit: int = 8,
+        *,
+        cik: str | None = None,
+        form: str | None = None,
+        ticker: str | None = None,
+        filing_date: str | None = None,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
     ) -> Command:
-        """Lexical BM25 retrieval over page-passage chunks.
+        """Narrative retrieval over page-passage chunks.
 
         ``query`` is the lexical query. ``document_id`` is an
-        optional corpus filter; unknown ids return empty. ``limit``
-        defaults to 8 (ADR 0009 cap = 20). On a hit, each chunk
-        contributes one ``EvidenceItem``; misses contribute none.
+        optional corpus filter; unknown ids return empty.
+        Additive EDGAR-shaped filters (``cik``, ``form``,
+        ``ticker``, exact ``filing_date``) per ADR 0031 are
+        forwarded to the port. ``limit`` defaults to 8 (ADR 0009
+        cap = 20). On a hit, each chunk contributes one
+        ``EvidenceItem``; misses contribute none. When retrieval
+        is unavailable the tool returns
+        ``{"error": "retrieve_unavailable"}``.
         """
         result = retrieve(
             query=query,
             document_id=document_id,
+            cik=cik,
+            form=form,
+            ticker=ticker,
+            filing_date=filing_date,
             limit=limit,
             adapter=adapter,
         )
+        if isinstance(result, dict) and "error" in result:
+            # Typed EXIT: surface the port's error dict verbatim.
+            # Building evidence / a chunks envelope here would
+            # destroy the distinction the spec requires.
+            return Command(
+                update={
+                    "messages": [
+                        ToolMessage(
+                            content=json.dumps(result, default=str),
+                            tool_call_id=tool_call_id,
+                            name="retrieve",
+                        )
+                    ]
+                }
+            )
         new_evidence: list[EvidenceItem] = []
         chunks = result.get("chunks", []) if isinstance(result, dict) else []
         for chunk in chunks:
@@ -346,6 +447,69 @@ def _make_retrieve_tool(adapter: BM25Adapter):
         )
 
     return retrieve_tool
+
+
+def _make_get_xbrl_fact_tool(facts_root: Path):
+    """Build the ``get_xbrl_fact`` host tool (T5 / ADR 0031).
+
+    Returns a LangChain ``BaseTool`` whose function calls T5's
+    ``get_xbrl_fact`` wrapper with the factory's resolved
+    ``facts_root``. The tool does NOT contribute ``EvidenceItem``s:
+    ``get_xbrl_fact`` returns ToolMessage JSON carrying the
+    fact-row dict (or the typed ``fact_not_found`` miss shape),
+    but those rows are NOT page text — the citation verifier's
+    evidence match is a separate concern. The numeric gate
+    (T5 / ADR 0031) consumes the ToolMessage JSON directly when
+    verifying the model's claimed values.
+
+    The tool's registered name is ``get_xbrl_fact`` so the model
+    can call it by name (matches the ADR 0031 contract). Misses
+    return the typed ``{"error": "fact_not_found", ...}`` dict so
+    the agent loop never sees a typed exception out of the
+    ToolNode (spec § Boundaries: "empty hits not exceptions").
+    """
+
+    @tool("get_xbrl_fact")
+    def get_xbrl_fact_tool(
+        concept: str,
+        period: str,
+        document_id: str | None = None,
+        issuer: str | None = None,
+        tool_call_id: Annotated[str, InjectedToolCallId] = "",
+    ) -> dict:
+        """Look up one tagged XBRL fact from the ingest-built fact table.
+
+        ``concept`` is the XBRL tag (e.g., ``us-gaap:Revenues``).
+        ``period`` is the reporting period (e.g., ``2023-Q3-YTD``).
+        ``document_id`` is the optional locator filter (e.g.,
+        ``AAPL-2023Q3``). Returns the hit dict on success or the
+        typed ``{"error": "fact_not_found"}`` dict on miss. Never
+        raises.
+        """
+        from fin.host.tools.get_xbrl_fact import get_xbrl_fact
+
+        result = get_xbrl_fact(
+            concept=concept,
+            period=period,
+            document_id=document_id,
+            issuer=issuer,
+            facts_root=facts_root,
+        )
+        tool_message = ToolMessage(
+            content=json.dumps(result, default=str),
+            tool_call_id=tool_call_id,
+            name="get_xbrl_fact",
+        )
+        # We return a ``Command`` with the new ToolMessage; the
+        # numeric gate (T5) consumes this JSON to extract the
+        # claimed (concept, period) -> fact-value mapping on the
+        # ``done`` path. No ``EvidenceItem`` is contributed because
+        # the fact row is NOT page text — the citation gate's
+        # evidence shape is reserved for ``read_file`` /
+        # ``retrieve`` page / chunk content.
+        return Command(update={"messages": [tool_message]})
+
+    return get_xbrl_fact_tool
 
 
 # ----- T3 helpers: tool-summary + thinking extraction -----
@@ -461,17 +625,124 @@ def _extract_thinking_text(message: AIMessage) -> str:
 # ----- the graph factory -----
 
 
+def _collect_fact_tool_calls(
+    messages: list[BaseMessage],
+) -> tuple[list[tuple[str, str]], list[Fact]]:
+    """Walk ``messages`` for ``get_xbrl_fact`` tool calls and the
+    corresponding fact rows.
+
+    Each ``AIMessage`` may carry one or more ``get_xbrl_fact``
+    tool calls. The matching ``ToolMessage`` (same ``tool_call_id``)
+    carries the JSON content with the fact row, or the
+    ``fact_not_found`` miss shape. We pair them up so the numeric
+    gate sees ``(concept, period)`` claims alongside the available
+    fact rows.
+
+    Returns
+    -------
+    claimed_concepts
+        The ``(concept, period)`` tuples from each
+        ``get_xbrl_fact`` tool call's args.
+    available_facts
+        The ``Fact`` rows whose ``ToolMessage`` content decoded to
+        a hit dict (no ``error`` key). Miss shapes are dropped —
+        the model's claim was already a no-hit, so the numeric
+        gate's "no matching fact row" branch will fire.
+    """
+    from fin.corpus.facts import Fact, Locator
+
+    claimed: list[tuple[str, str]] = []
+    facts: list[Fact] = []
+    for message in messages:
+        if not isinstance(message, AIMessage) or not message.tool_calls:
+            continue
+        for call in message.tool_calls:
+            if call.get("name") != "get_xbrl_fact":
+                continue
+            args = call.get("args") or {}
+            concept = args.get("concept", "")
+            period = args.get("period", "")
+            if not isinstance(concept, str) or not isinstance(period, str):
+                continue
+            if not concept or not period:
+                continue
+            claimed.append((concept, period))
+            call_id = call.get("id", "")
+            for tm in messages:
+                if not isinstance(tm, ToolMessage):
+                    continue
+                if getattr(tm, "tool_call_id", "") != call_id:
+                    continue
+                try:
+                    payload = json.loads(tm.content)
+                except (TypeError, ValueError):
+                    payload = None
+                if not isinstance(payload, dict) or "error" in payload:
+                    continue
+                locator_payload = payload.get("source_locator")
+                if not isinstance(locator_payload, dict):
+                    continue
+                try:
+                    locator = Locator(
+                        document_id=locator_payload["document_id"],
+                        version=locator_payload["version"],
+                        page=int(locator_payload["page"]),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+                facts.append(
+                    Fact(
+                        concept=payload.get("concept", concept),
+                        value=payload.get("value"),
+                        period=payload.get("period", period),
+                        unit=payload.get("unit", ""),
+                        scale=payload.get("scale", ""),
+                        source_locator=locator,
+                    )
+                )
+                break
+    return claimed, facts
+
+
+def _evaluate_numeric_gate_in_node(messages: list[BaseMessage]):
+    """Run the numeric gate on the run's accumulated messages.
+
+    Returns the ``NumericGateResult`` from
+    :func:`evaluate_numeric_gate`, or ``None`` if the model made no
+    ``get_xbrl_fact`` call this run (the gate is skipped per T5
+    spec acceptance).
+    """
+    from fin.host.numeric_gate import evaluate_numeric_gate
+
+    claimed, facts = _collect_fact_tool_calls(messages)
+    if not claimed:
+        # No ``get_xbrl_fact`` call -> gate is skipped. We return
+        # ``None`` so the caller can distinguish "no claim" from
+        # "claim, gate passed" (which would be ``outcome="pass"``).
+        return None
+    answer = _last_ai_text(messages)
+    return evaluate_numeric_gate(
+        answer=answer,
+        claimed_concepts=claimed,
+        available_facts=facts,
+    )
+
+
 def compile_graph(
     *,
     checkpointer: Any,
     model: Any,
-    adapter: BM25Adapter | None = None,
+    adapter: RetrievePort | None = None,
     manifest_path: Path | str | None = None,
     extracted_root: Path | str | None = None,
+    facts_root: Path | str | None = None,
     known_document_ids: set[str] | None = None,
     step_cap: int = STEP_CAP,
     recursion_limit: int = RECURSION_LIMIT,
     classify_model: Any | None = None,
+    retrieve_adapter: str = RETRIEVE_ADAPTER_FAKE,
+    mcp_command: list[str] | None = None,
+    locator_map: dict[str, "Locator"] | None = None,
 ) -> "_LockedGraph":
     """Build the v1 host graph (T6).
 
@@ -489,12 +760,19 @@ def compile_graph(
         ``ChatOpenAI`` instance built by T8's
         ``compile_for_runtime`` from ``FIN_MODEL`` + ``FIN_BASE_URL``.
         The factory calls ``bind_tools`` on it to register the
-        three host tools.
+        host tools (T5: ``get_xbrl_fact`` is the fourth tool,
+        bound AFTER ``retrieve`` to preserve insertion order;
+        LangChain's tool binding is order-sensitive).
     adapter
-        An already-built ``BM25Adapter`` (T4). If ``None``, the
-        factory builds one from ``manifest_path`` + ``extracted_root``
-        so tests do not need to construct it manually. Production
-        (T7) builds one at boot and passes it in.
+        An already-built retrieve adapter (``FakeRetrievePort`` /
+        ``MCPRetrieveAdapter`` / ``BM25Adapter``). This is the
+        most explicit configuration there is, so it wins over
+        ``retrieve_adapter``. If ``None``, the factory
+        auto-builds the kind named by ``retrieve_adapter``.
+
+        ``BM25Adapter`` is no longer the product default
+        (ADR 0030); it remains importable for legacy / offline
+        tests but the factory does not auto-build it.
     manifest_path
         Path to ``data/corpus/manifest.json``. Defaults to the
         repo's canonical location.
@@ -514,12 +792,40 @@ def compile_graph(
         from ``fin.host.state`` (currently ``2 * STEP_CAP + 6 = 70``).
         Strictly greater than ``step_cap`` so the agent-loop fuse
         fires first (spec success criteria item 5).
+    facts_root
+        Path to ``data/corpus/facts/`` (T5). Defaults to the repo's
+        canonical location. The factory wires the
+        ``get_xbrl_fact`` host tool to read from this root.
+        Tests inject a synthetic ``tmp_path``-rooted tree.
     classify_model
         Soft-Track T4: optional model for ambiguous LLM classify.
         When ``None`` (default), the LLM tier is skipped. The
         residual branch in ``decide_track`` then resolves the
         bare-``q`` cascade to ``track="dialogue"`` (not research),
         so the model leaf is not the silent global default.
+    retrieve_adapter
+        T3 (#76): which adapter to auto-build when ``adapter`` is
+        ``None`` — ``"fake"`` (the factory default: hermetic
+        ``FakeRetrievePort``, no MCP subprocess, no live data) or
+        ``"mcp"`` (the product ``MCPRetrieveAdapter``, ADR 0030).
+        The production entry points in ``fin.host.compile``
+        resolve this from ``FIN_RETRIEVE_ADAPTER`` and pass it
+        explicitly. The choice is NEVER inferred from the
+        checkpointer type: which saver holds state says nothing
+        about where retrieve comes from, and inferring it meant
+        ``fin-serve`` without ``FIN_CHECKPOINT_URL`` silently
+        served an always-empty fake port.
+    mcp_command
+        T3 (#76): launch command for the MCP server used when
+        ``retrieve_adapter`` is ``"mcp"`` and no ``adapter`` was
+        supplied. Defaults to ``["iknow-memory", "serve"]``.
+    locator_map
+        T3 (#76): iknow-memory id → ``fin.Locator`` map passed
+        to the auto-built ``MCPRetrieveAdapter``. ``None`` (the
+        default) derives the map from the extracted tree via
+        :func:`_locator_map_from_tree`; an explicit map overrides
+        that derivation. An empty effective map is refused —
+        see ``RetrieveAdapterConfigError``.
 
     Returns
     -------
@@ -530,25 +836,65 @@ def compile_graph(
     Raises
     ------
     IngestMissingError
-        If ``adapter`` is ``None`` and ``load_extracted_tree``
-        cannot find the committed extracted tree. The factory
-        does NOT swallow this — the operator must restore the
-        tree and re-run ingest.
+        If the ``"mcp"`` auto-build needs the extracted tree and
+        ``load_extracted_tree`` cannot find it. The factory does
+        NOT swallow this — the operator must restore the tree and
+        re-run ingest.
+    RetrieveAdapterConfigError
+        If ``retrieve_adapter`` names an unknown kind, or the
+        ``"mcp"`` auto-build would produce an adapter with an
+        empty ``locator_map``.
     """
-    # Build adapter if not supplied. We propagate IngestMissingError
-    # explicitly (the loader raises it; we let it propagate instead
-    # of swallowing as a miss dict).
+    # Build the adapter if the caller did not inject one. The kind
+    # comes from configuration only (``retrieve_adapter``), so a
+    # test checkpointer cannot force a fake port on a production
+    # boot and a Postgres saver cannot force MCP on a test.
     if adapter is None:
-        mpath = _resolve_path(manifest_path, _DEFAULT_MANIFEST_PATH)
-        rpath = _resolve_path(extracted_root, _DEFAULT_EXTRACTED_ROOT)
-        tree = load_extracted_tree(mpath, rpath)
-        adapter = BM25Adapter(tree)
-        if known_document_ids is None:
-            known_document_ids = set(tree.keys())
+        if retrieve_adapter not in RETRIEVE_ADAPTER_KINDS:
+            raise RetrieveAdapterConfigError(
+                f"unknown retrieve adapter kind {retrieve_adapter!r}; "
+                f"expected one of {list(RETRIEVE_ADAPTER_KINDS)}"
+            )
+        if retrieve_adapter == RETRIEVE_ADAPTER_FAKE:
+            # Hermetic fake port (ADR 0030 / spec success-criteria
+            # item 1: default pytest talks to no MCP process).
+            if known_document_ids is None:
+                known_document_ids = set()
+            adapter = FakeRetrievePort(known_document_ids=known_document_ids)
+        else:
+            mpath = _resolve_path(manifest_path, _DEFAULT_MANIFEST_PATH)
+            rpath = _resolve_path(extracted_root, _DEFAULT_EXTRACTED_ROOT)
+            # The tree is the SSOT for BOTH the client-side
+            # document membership test and the iknow-id → locator
+            # map; load it once when either is missing.
+            if known_document_ids is None or locator_map is None:
+                tree = load_extracted_tree(mpath, rpath)
+                if known_document_ids is None:
+                    known_document_ids = set(tree.keys())
+                if locator_map is None:
+                    locator_map = _locator_map_from_tree(tree)
+            if not locator_map:
+                raise RetrieveAdapterConfigError(
+                    "the product MCP retrieve adapter needs a non-empty "
+                    "locator_map: unmapped hits are dropped, so a "
+                    "map-less adapter answers every query with no "
+                    "chunks. Pass locator_map= or point "
+                    "manifest_path / extracted_root at an ingested "
+                    "corpus."
+                )
+            adapter = MCPRetrieveAdapter(
+                command=mcp_command or ["iknow-memory", "serve"],
+                locator_map=locator_map,
+                known_document_ids=known_document_ids,
+                timeout_seconds=5.0,
+            )
 
     if known_document_ids is None:
         # Defensive: a caller passing an external adapter but no
         # known_document_ids set must declare the set explicitly.
+        # The auto-build path always sets this above, so a None
+        # reaching this branch means the caller passed an external
+        # adapter without declaring the corpus.
         raise ValueError(
             "compile_graph requires either `adapter` or "
             "`known_document_ids` (or `manifest_path` + "
@@ -557,13 +903,15 @@ def compile_graph(
 
     mpath = _resolve_path(manifest_path, _DEFAULT_MANIFEST_PATH)
     rpath = _resolve_path(extracted_root, _DEFAULT_EXTRACTED_ROOT)
+    fpath = _resolve_path(facts_root, _DEFAULT_FACTS_ROOT)
 
     list_files_tool = _make_list_files_tool(mpath, rpath)
     read_file_tool = _make_read_file_tool()
     retrieve_tool = _make_retrieve_tool(adapter)
+    get_xbrl_fact_tool = _make_get_xbrl_fact_tool(fpath)
 
     bound_model = model.bind_tools(
-        [list_files_tool, read_file_tool, retrieve_tool]
+        [list_files_tool, read_file_tool, retrieve_tool, get_xbrl_fact_tool]
     )
     # T3 (#34): the off-preference binding layers the MiniMax
     # ``extra_body`` (``thinking.type=disabled``) on top of the same
@@ -582,7 +930,7 @@ def compile_graph(
     unbound_model_no_thinking = model.bind(extra_body=_thinking_off_body)
 
     tool_dispatcher = ToolNode(
-        [list_files_tool, read_file_tool, retrieve_tool],
+        [list_files_tool, read_file_tool, retrieve_tool, get_xbrl_fact_tool],
         name="tool_node",
         handle_tool_errors=True,
     )
@@ -836,6 +1184,27 @@ def compile_graph(
         )
 
         if gate_result.outcome == "done":
+            # T5: numeric gate. Walk the AIMessage history for
+            # ``get_xbrl_fact`` tool calls this run; each call is
+            # an implicit (concept, period) claim. The matching
+            # ToolMessage JSON carries the fact value (or the
+            # ``fact_not_found`` miss shape). If the model claimed
+            # a number that doesn't match an evidenced fact row,
+            # the run refuses immediately — T5 spec ("research
+            # done does not pass when a claimed numeric fact has
+            # no matching evidenced row"). The numeric gate is
+            # SKIPPED when the model made no ``get_xbrl_fact`` call
+            # (CONTEXT ``get_xbrl_fact``: "non-research skips the
+            # fact gate"; here, research without a fact call also
+            # skips).
+            numeric_outcome = _evaluate_numeric_gate_in_node(messages)
+            if numeric_outcome is not None and numeric_outcome.outcome == "fail":
+                return {
+                    "messages": [],
+                    "status": "refuse",
+                    "status_reason": "numeric_gate_fail",
+                    "repair_count": repair_count,
+                }
             return {
                 "messages": [],
                 "answer": gate_result.answer,
@@ -1260,7 +1629,11 @@ class _LockedGraph:
 
 
 __all__ = [
+    "RETRIEVE_ADAPTER_FAKE",
+    "RETRIEVE_ADAPTER_KINDS",
+    "RETRIEVE_ADAPTER_MCP",
     "ConcurrentRunError",
     "HostGraphError",
+    "RetrieveAdapterConfigError",
     "compile_graph",
 ]
