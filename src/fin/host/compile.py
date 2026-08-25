@@ -95,6 +95,13 @@ EXPECTED_CHECKPOINT_URL = (
     "postgresql://fin:fin@localhost:5432/fin?sslmode=disable"
 )
 
+# ADR 0030: product retrieve is the iknow-memory MCP client. Both
+# boot paths below select it explicitly — the fake port is the
+# default pytest surface (``compile_graph``'s own default), never a
+# shipping default. An operator without a live iknow-memory server
+# opts out by name with ``FIN_RETRIEVE_ADAPTER=fake``.
+DEFAULT_RETRIEVE_ADAPTER = "mcp"
+
 
 # ----- typed errors -----
 
@@ -159,6 +166,17 @@ def _read_env(
     if value is None or value.strip() == "":
         return None
     return value
+
+
+def _resolve_retrieve_adapter(env: Mapping[str, str] | None) -> str:
+    """Return the retrieve adapter kind for a production boot.
+
+    ``FIN_RETRIEVE_ADAPTER`` when set, otherwise
+    ``DEFAULT_RETRIEVE_ADAPTER``. ``compile_graph`` validates the
+    value and raises ``RetrieveAdapterConfigError`` on a typo, so a
+    misspelled kind stops the boot instead of falling back.
+    """
+    return _read_env(env, "FIN_RETRIEVE_ADAPTER") or DEFAULT_RETRIEVE_ADAPTER
 
 
 # ----- shared model factory -----
@@ -327,7 +345,10 @@ def compile_for_runtime(
     # ``track="research"`` branch (specs/soft-track.md — "no
     # single global default track").
     compiled = compile_graph(
-        checkpointer=saver, model=model, classify_model=model
+        checkpointer=saver,
+        model=model,
+        classify_model=model,
+        retrieve_adapter=_resolve_retrieve_adapter(env),
     )
 
     # Step 6: keep the stack alive for process lifetime. We do
@@ -360,6 +381,13 @@ def compile_for_runtime_dev(
     * **No model-name URL plumbing.** Same defaults as the prod
       path (``_build_default_model``), so behavior is consistent
       apart from the checkpointer.
+
+    Retrieve is NOT downgraded here. ``fin-serve`` on this path
+    still reads the product corpus over MCP (spec line 14), the
+    same as the durable path: the checkpointer decides where
+    threads persist, not where evidence comes from. Selecting the
+    adapter from the saver class is what previously bound the
+    always-empty ``FakeRetrievePort`` to every laptop boot.
 
     The contract kept on :func:`compile_for_runtime` — raise
     ``MissingCheckpointURLError`` when no URL — is INTACT. The dev
@@ -399,13 +427,17 @@ def compile_for_runtime_dev(
     # (specs/soft-track.md — "classify_model must reuse
     # FIN_MODEL").
     return compile_graph(
-        checkpointer=saver, model=model, classify_model=model
+        checkpointer=saver,
+        model=model,
+        classify_model=model,
+        retrieve_adapter=_resolve_retrieve_adapter(env),
     )
 
 
 __all__ = [
     "DEFAULT_BASE_URL",
     "DEFAULT_MODEL",
+    "DEFAULT_RETRIEVE_ADAPTER",
     "EXPECTED_CHECKPOINT_URL",
     "CheckpointSetupError",
     "HostCompileError",

@@ -1,24 +1,4 @@
-"""Seed facts for the corpus fact table.
-
-T1 ships a single hand-authored seed row so the later
-``get_xbrl_fact`` lookup (T5) has at least one tagged fact to
-return on the demo AAPL-2023Q3 corpus. Real XBRL tag parsing of the
-iXBRL ``.htm`` lands with a later ADR; T1 only needs the typed
-catalog to be queryable.
-
-The seed row is the verbatim v1 gold span from
-``tests/eval/test_gold.py:98`` — Apple's "Products $ 60,584 $ 63,355
-$ 230,901 $ 245,241" on page 4 of the Q3 2023 10-Q. The numeric
-value ``383285000000`` (USD 383.285 B, total net sales nine months
-ended July 1, 2023) is the row the research-track numeric gate (T5)
-will match against a claimed answer.
-
-``seed_facts_for_document`` returns ``None`` for documents that have
-no seed yet — the ingest CLI treats ``None`` as "do not write a fact
-file", which keeps the tree aligned with the demo's one-fact
-catalog. When more tags land, this module is the single place to add
-them.
-"""
+"""[private source excerpt removed]"""
 
 from __future__ import annotations
 
@@ -48,10 +28,10 @@ def seed_facts_for_document(
         return [
             Fact(
                 concept="us-gaap:Revenues",
-                value=383285000000,
+                value=load_private_fixture("e8e6fa2502cf2441d4f1862bbbb7d147b7dbd57a3911be363417fe4342e69b94"),
                 period="2023-Q3-YTD",
                 unit="USD",
-                scale="thousands",
+                scale="millions",
                 source_locator=Locator(
                     document_id=document_id,
                     version=version,

@@ -415,33 +415,31 @@ def test_bootstrap_ingest_missing_reports_typed_error(monkeypatch, capsys):
     CLI reports ``error: ingest artifacts missing`` on stderr, exits 1,
     and never silently re-extracts (ADR 0020).
 
-    T3 (#76): the production auto-build path (non-``InMemorySaver``
-    checkpointer) resolves the tree to derive ``known_document_ids``;
-    the test path (``InMemorySaver``) auto-builds a
-    ``FakeRetrievePort`` and skips the loader. To exercise the
-    production path the test passes a fake non-``InMemorySaver``
-    checkpointer so the loader runs and the patched
+    T3 (#76): the product auto-build path
+    (``retrieve_adapter="mcp"``) resolves the tree to derive
+    ``known_document_ids`` and the iknow-id → locator map; the
+    default kind (``"fake"``) auto-builds a ``FakeRetrievePort``
+    and skips the loader. To exercise the product path the test
+    asks for the MCP kind explicitly — the same way
+    ``fin.host.compile`` does — so the loader runs and the patched
     ``IngestMissingError`` propagates.
     """
     import fin.host.graph as graph_module
+    from langgraph.checkpoint.memory import InMemorySaver
 
     def _missing(manifest_path, extracted_root):
         raise IngestMissingError("extracted tree absent")
 
     monkeypatch.setattr(graph_module, "load_extracted_tree", _missing)
 
-    class _FakeProdSaver:
-        """Stand-in for ``PostgresSaver`` so the production
-        auto-build path runs (NOT the ``InMemorySaver`` test
-        path which would short-circuit)."""
-
     def factory():
         # Real production shape: compile_graph resolves the tree
-        # itself when no adapter is supplied and the checkpointer
-        # is NOT ``InMemorySaver`` — the patched loader raises.
+        # itself when no adapter is supplied and the product MCP
+        # kind is selected — the patched loader raises.
         return compile_graph(
-            checkpointer=_FakeProdSaver(),
+            checkpointer=InMemorySaver(),
             model=ScriptedChatModel(script=[]),
+            retrieve_adapter="mcp",
         )
 
     rc = main(["q"], graph_factory=factory)

@@ -56,12 +56,13 @@ def _locator() -> Locator:
 
 
 def _sample_fact() -> Fact:
+    """[private source excerpt removed]"""
     return Fact(
         concept="us-gaap:Revenues",
-        value=383285000000,
+        value=load_private_fixture("e8e6fa2502cf2441d4f1862bbbb7d147b7dbd57a3911be363417fe4342e69b94"),
         period="2023-Q3-YTD",
         unit="USD",
-        scale="thousands",
+        scale="millions",
         source_locator=_locator(),
     )
 
@@ -262,7 +263,7 @@ def test_write_facts_payload_shape(tmp_path: Path) -> None:
     assert isinstance(payload["facts"], list)
     entry = payload["facts"][0]
     assert entry["concept"] == "us-gaap:Revenues"
-    assert entry["value"] == 383285000000
+    assert entry["value"] == load_private_fixture("e8e6fa2502cf2441d4f1862bbbb7d147b7dbd57a3911be363417fe4342e69b94")
     assert entry["source_locator"]["document_id"] == "AAPL-2023Q3"
     assert entry["source_locator"]["page"] == 4
 
@@ -290,7 +291,7 @@ def test_lookup_fact_hit_returns_seeded_fact(tmp_path: Path) -> None:
     assert isinstance(result, Fact)
     assert result.concept == "us-gaap:Revenues"
     assert result.period == "2023-Q3-YTD"
-    assert result.value == 383285000000
+    assert result.value == load_private_fixture("e8e6fa2502cf2441d4f1862bbbb7d147b7dbd57a3911be363417fe4342e69b94")
     assert result.source_locator.page == 4
 
 
@@ -392,16 +393,18 @@ def test_lookup_fact_concurrent_calls_independent(tmp_path: Path) -> None:
 
 def test_fact_matches_value_int_within_tolerance() -> None:
     """``fact_matches_value`` applies relative tolerance to int values too
-    (T5 spec test: ``$383,300,000,000`` slightly off the seeded
-    ``383285000000`` int fact → pass within 0.5%)."""
-    fact = _sample_fact()  # value=383285000000 (int)
+    (T5 spec test: a claim slightly off the seeded int fact → pass
+    within 0.5%)."""
+    fact = _sample_fact()  # value=[private source value removed] (int)
     # Exact match: pass.
-    assert fact_matches_value(fact, 383285000000) is True
-    # Within 0.5% tolerance: pass (T5 acceptance: ``383,300,000,000``
-    # is ~0.004% off, well within 0.5%).
-    assert fact_matches_value(fact, 383300000000) is True
-    # Far off: fail.
+    assert fact_matches_value(fact, load_private_fixture("e8e6fa2502cf2441d4f1862bbbb7d147b7dbd57a3911be363417fe4342e69b94")) is True
+    # Within 0.5% tolerance: pass (``293,800`` is ~0.004% off, well
+    # within 0.5%).
+    assert fact_matches_value(fact, 293800) is True
+    # Far off: fail. The FY2023 full-year total net sales the seed used
+    # to carry must NOT match the nine-month row.
     assert fact_matches_value(fact, 999) is False
+    assert fact_matches_value(fact, 383285000000) is False
 
 
 def test_fact_matches_value_float_within_tolerance() -> None:
@@ -427,10 +430,10 @@ def test_fact_matches_value_string_returns_false() -> None:
     answer is the model's bug, not the lookup's."""
     fact = Fact(
         concept="us-gaap:Revenues",
-        value="383285000000",  # str, not numeric
+        value=load_private_fixture("509c1153a3b3b8c6a1b9bb0e0c1609c78a397ac93d7f6185fa6d9880c56e72a4"),  # str, not numeric
         period="2023-Q3-YTD",
         unit="USD",
-        scale="thousands",
+        scale="millions",
         source_locator=_locator(),
     )
-    assert fact_matches_value(fact, 383285000000) is False
+    assert fact_matches_value(fact, load_private_fixture("e8e6fa2502cf2441d4f1862bbbb7d147b7dbd57a3911be363417fe4342e69b94")) is False

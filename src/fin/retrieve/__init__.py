@@ -12,13 +12,14 @@ Public surface (T3 — ADR 0030: MCP is product, BM25 archived):
   dict's ``"chunks"`` list: ``{text, source_ref: Locator,
   score}``.
 * ``MCPRetrieveAdapter`` — stdio JSON-RPC client to
-  **iknow-memory**. Default ``compile_graph`` (non-test) builds
-  one. ``RetrieveUnavailableError`` is the typed EXIT on MCP
-  failure (mapped to ``{"error": "retrieve_unavailable"}`` by
-  ``retrieve``).
-* ``FakeRetrievePort`` — in-memory dict-backed adapter. The
-  default pytest ``compile_graph`` (with ``InMemorySaver``)
-  builds one; tests can also pass one explicitly.
+  **iknow-memory**. ``compile_graph(retrieve_adapter="mcp")``
+  builds one; that is what ``fin.host.compile`` selects for both
+  production boots. ``RetrieveUnavailableError`` is the typed
+  EXIT on MCP failure (mapped to
+  ``{"error": "retrieve_unavailable"}`` by ``retrieve``).
+* ``FakeRetrievePort`` — in-memory dict-backed adapter and
+  ``compile_graph``'s default kind, so the default pytest run
+  never touches MCP; tests can also pass one explicitly.
 * ``BM25Adapter`` — in-process lexical ranker. RETAINED for
   offline tests (``tests/retrieve/test_bm25.py``); NOT bound
   in the product compile path.
