@@ -413,8 +413,19 @@ def test_empty_question_fails_fast_without_building_graph(capsys):
 def test_bootstrap_ingest_missing_reports_typed_error(monkeypatch, capsys):
     """When ``load_extracted_tree`` fails during graph construction the
     CLI reports ``error: ingest artifacts missing`` on stderr, exits 1,
-    and never silently re-extracts (ADR 0020)."""
+    and never silently re-extracts (ADR 0020).
+
+    T3 (#76): the product auto-build path
+    (``retrieve_adapter="mcp"``) resolves the tree to derive
+    ``known_document_ids`` and the iknow-id → locator map; the
+    default kind (``"fake"``) auto-builds a ``FakeRetrievePort``
+    and skips the loader. To exercise the product path the test
+    asks for the MCP kind explicitly — the same way
+    ``fin.host.compile`` does — so the loader runs and the patched
+    ``IngestMissingError`` propagates.
+    """
     import fin.host.graph as graph_module
+    from langgraph.checkpoint.memory import InMemorySaver
 
     def _missing(manifest_path, extracted_root):
         raise IngestMissingError("extracted tree absent")
@@ -422,11 +433,13 @@ def test_bootstrap_ingest_missing_reports_typed_error(monkeypatch, capsys):
     monkeypatch.setattr(graph_module, "load_extracted_tree", _missing)
 
     def factory():
-        # Real production shape: compile_graph resolves the tree itself
-        # when no adapter is supplied — the patched loader raises.
+        # Real production shape: compile_graph resolves the tree
+        # itself when no adapter is supplied and the product MCP
+        # kind is selected — the patched loader raises.
         return compile_graph(
             checkpointer=InMemorySaver(),
             model=ScriptedChatModel(script=[]),
+            retrieve_adapter="mcp",
         )
 
     rc = main(["q"], graph_factory=factory)
