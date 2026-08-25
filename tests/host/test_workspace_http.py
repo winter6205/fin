@@ -1007,7 +1007,10 @@ def test_spa_catchall_blocks_deep_traversal_and_still_serves_spa():
 
     spa = client.get("/some/spa/route")
     assert spa.status_code == 200
-    assert "fin workspace" in spa.text
+    # The SPA shell, not a repo file. Assert on the mount point rather
+    # than the title: `web/dist/index.html` is a Vite artifact whose
+    # head is rewritten on every build.
+    assert '<div id="root">' in spa.text
 
 
 
