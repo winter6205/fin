@@ -579,9 +579,13 @@ def test_matrix_overflow_caps_research_only_snapshots_retained(
         config=_cfg(tid),
     )
     assert out["track"] == "research"
-    assert out["status"] in ("refuse", "step_cap", "done")
+    # Overflow terminals only: ``done`` is not an overflow outcome and
+    # must stay out of the accepted set (spec SC2).
+    assert out["status"] in ("refuse", "step_cap"), out["status"]
     if out["status"] == "refuse":
         assert out["status_reason"] == "citation_repair_cap"
+    else:
+        assert out["status_reason"] == "step_cap"
 
     # Snapshot history not wiped by reset_input_state / follow-up.
     model2 = ScriptedChatModel(

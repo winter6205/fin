@@ -984,32 +984,120 @@ def test_send_message_run_id_carry_through_status_frame_matches_persisted_turn(
     assert persisted["turns"][0]["run_id"] == wire_run_id
 
 
-def test_spa_catchall_blocks_path_traversal():
+REAL_DIST = Path(__file__).resolve().parents[2] / "web" / "dist"
+
+SPA_SHELL = (
+    "<!doctype html>\n<html><head><title>fin</title></head>"
+    '<body><div id="root"></div></body></html>\n'
+)
+
+
+def _build_fake_checkout(root: Path) -> Path:
+    """Lay out a throwaway checkout that mirrors the repo shape the
+    catch-all guards: ``<root>/web/dist`` next to sibling files an
+    escape would reach (``<root>/pyproject.toml``,
+    ``<root>/web/README.md``).
+
+    Every escape target is written for real, so a 404 in these tests
+    means containment refused an existing file rather than the file
+    merely being absent — which is what the assertions against the
+    real repo could only prove for ``pyproject.toml``.
+    """
+    dist = root / "web" / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text(SPA_SHELL, encoding="utf-8")
+    (dist / "favicon.svg").write_text("<svg/>\n", encoding="utf-8")
+    (root / "pyproject.toml").write_text(
+        '[project]\nname = "leaked-pyproject"\n', encoding="utf-8"
+    )
+    (root / "web" / "README.md").write_text(
+        "leaked-readme\n", encoding="utf-8"
+    )
+    return dist
+
+
+@pytest.fixture
+def spa_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """A client over a fresh app whose SPA is mounted from a
+    ``tmp_path`` dist.
+
+    WHY not the module-level ``app``: ``web/dist`` is a Vite build
+    artifact and is gitignored, so a clean checkout has no dist,
+    ``mount_spa`` logs its WARNING and registers no catch-all, and
+    any test asserting the SPA still serves fails for reasons that
+    have nothing to do with the code under test (spec SC15). A
+    ``tmp_path`` dist makes these cases depend only on
+    ``mount_spa``.
+
+    ``_spa_mounted`` is the module-level once-guard that makes the
+    import-time mount idempotent; resetting it for the duration of
+    the test is what lets a second mount register on our own app.
+    ``monkeypatch`` restores it afterwards, so the real app's mount
+    state is untouched.
+    """
+    from fin.host import http as http_module
+
+    dist = _build_fake_checkout(tmp_path)
+    monkeypatch.setattr(http_module, "_spa_mounted", False)
+    app = FastAPI()
+    http_module.mount_spa(app, dist_path=str(dist))
+    return TestClient(app)
+
+
+def test_spa_catchall_blocks_path_traversal(spa_client: TestClient) -> None:
     """The reviewer-empirical exploit: URL-encoded ../ escapes
-    web/dist on the catch-all. Must be 404 with no repo-file
+    the dist root on the catch-all. Must be 404 with no repo-file
     leakage. Regression for Standards #1 / Spec #1."""
-    from fin.host.http import app
-
-    client = TestClient(app)
-    r = client.get("/..%2f..%2fpyproject.toml")
+    r = spa_client.get("/..%2f..%2fpyproject.toml")
     assert r.status_code == 404
-    assert "pyproject" not in r.text  # no leakage of repo file content
+    assert "leaked-pyproject" not in r.text  # no leakage of repo file content
 
 
-def test_spa_catchall_blocks_deep_traversal_and_still_serves_spa():
+def test_spa_catchall_blocks_deep_traversal_and_still_serves_spa(
+    spa_client: TestClient,
+) -> None:
     """Deeper escapes stay contained; legitimate SPA routes still
     fall back to index.html."""
-    from fin.host.http import app
+    assert spa_client.get("/..%2f..%2f..%2fetc%2fpasswd").status_code == 404
 
-    client = TestClient(app)
-    assert client.get("/..%2f..%2f..%2fetc%2fpasswd").status_code == 404
-    assert client.get("/..%2fREADME.md").status_code == 404
+    readme = spa_client.get("/..%2fREADME.md")
+    assert readme.status_code == 404
+    assert "leaked-readme" not in readme.text
 
-    spa = client.get("/some/spa/route")
+    spa = spa_client.get("/some/spa/route")
     assert spa.status_code == 200
     # The SPA shell, not a repo file. Assert on the mount point rather
     # than the title: `web/dist/index.html` is a Vite artifact whose
     # head is rewritten on every build.
+    assert '<div id="root">' in spa.text
+
+
+def test_spa_catchall_serves_files_inside_dist(spa_client: TestClient) -> None:
+    """Containment refuses escapes without refusing everything: a real
+    file under dist is still served as itself, not as the shell. Pins
+    that the 404s above come from the guard rather than from a mount
+    that never took effect."""
+    r = spa_client.get("/favicon.svg")
+    assert r.status_code == 200
+    assert r.text.strip() == "<svg/>"
+
+
+@pytest.mark.skipif(
+    not REAL_DIST.is_dir(),
+    reason="web/dist is a gitignored Vite artifact; run `cd web && npm run build`",
+)
+def test_spa_catchall_on_real_app_blocks_traversal_when_dist_is_built() -> None:
+    """The same containment on the import-time mount of the real
+    ``web/dist``, which is what an operator's ``fin-serve`` exposes.
+    Skipped (not failed) in a checkout that has not run the SPA
+    build — the guard itself is covered dist-free above."""
+    from fin.host.http import app
+
+    client = TestClient(app)
+    assert client.get("/..%2f..%2fpyproject.toml").status_code == 404
+
+    spa = client.get("/some/spa/route")
+    assert spa.status_code == 200
     assert '<div id="root">' in spa.text
 
 

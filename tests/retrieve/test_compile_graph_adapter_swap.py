@@ -33,6 +33,8 @@ from langchain_core.messages import AIMessage
 
 from fin.corpus.extracted import Locator, load_extracted_tree
 from fin.host import ScriptedChatModel, compile_graph
+from fin.host import graph as graph_module
+from fin.host.compile import DEFAULT_RETRIEVE_ADAPTER
 from fin.host.graph import RetrieveAdapterConfigError
 from fin.retrieve import BM25Adapter, FakeRetrievePort, MCPRetrieveAdapter
 
@@ -71,13 +73,40 @@ class _CapturingFake(FakeRetrievePort):
         return {"chunks": []}
 
 
-def test_compile_graph_default_builds_fake_port_for_tests() -> None:
+def _record_bound_adapter(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Record the adapter ``compile_graph`` binds to the ``retrieve``
+    tool.
+
+    The compiled graph closes over its adapter, so the binding is
+    only observable where the factory hands it to the tool builder.
+    The real builder still runs, so the graph under test is the one
+    the factory would have produced.
+    """
+    bound: list[Any] = []
+    real_builder = graph_module._make_retrieve_tool
+
+    def _recording(adapter: Any):
+        bound.append(adapter)
+        return real_builder(adapter)
+
+    monkeypatch.setattr(graph_module, "_make_retrieve_tool", _recording)
+    return bound
+
+
+def test_compile_graph_default_builds_fake_port_for_tests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """When ``adapter`` is ``None`` and no ``retrieve_adapter``
     kind is configured, the factory auto-builds a
     ``FakeRetrievePort`` — not BM25, not MCP.
 
-    ADR 0030 + T3 acceptance: "fake-port in default pytest".
+    ADR 0032 + T3 acceptance: "fake-port in default pytest". The
+    companion half of that contract — product default
+    ``DEFAULT_RETRIEVE_ADAPTER == "mcp"`` — is asserted here too,
+    so a change that made the fake port the shipping default could
+    not pass by flipping one constant.
     """
+    bound = _record_bound_adapter(monkeypatch)
     model = ScriptedChatModel(script=[])
     graph = compile_graph(
         checkpointer=InMemorySaver(),
@@ -86,20 +115,23 @@ def test_compile_graph_default_builds_fake_port_for_tests() -> None:
         known_document_ids={"DOC-2023Q1"},
     )
     assert graph is not None
-    # The auto-built adapter is a FakeRetrievePort (hermetic).
-    # The compiled graph's tool bind is opaque; we assert the
-    # factory returned a valid compiled graph.
+    assert len(bound) == 1
+    assert isinstance(bound[0], FakeRetrievePort), bound[0]
+    assert DEFAULT_RETRIEVE_ADAPTER == "mcp"
 
 
-def test_compile_graph_with_explicit_fake_port_does_not_build_mcp() -> None:
-    """When ``adapter=FakeRetrievePort(...)``, the factory uses
-    it directly. No MCP subprocess is launched (the adapter is
-    pure in-process). The factory call must NOT raise.
+def test_compile_graph_with_explicit_fake_port_does_not_build_mcp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``adapter=FakeRetrievePort(...)``, the factory binds
+    THAT object — not a fresh fake, not MCP. No MCP subprocess is
+    launched (the adapter is pure in-process).
 
     Negative boundary: this is the most common test pattern —
     many tests pass a pre-built ``FakeRetrievePort`` to keep
     the suite hermetic.
     """
+    bound = _record_bound_adapter(monkeypatch)
     fake = FakeRetrievePort()
     model = ScriptedChatModel(script=[])
     graph = compile_graph(
@@ -109,6 +141,7 @@ def test_compile_graph_with_explicit_fake_port_does_not_build_mcp() -> None:
         known_document_ids={"DOC-2023Q1"},
     )
     assert graph is not None
+    assert bound == [fake]
 
 
 # ----- 2. legacy / offline: BM25 still supported -----

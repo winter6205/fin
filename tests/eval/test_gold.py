@@ -408,18 +408,30 @@ def test_xperiod_03_amzn_total_net_sales_q1_to_q3_2023(scripted_graph_factory):
 
 def test_refuse_01_unknown_locator_no_repair(scripted_graph_factory):
     """``unknown_locator`` (no repair): the model answer cites a
-    well-formed document_id (``FOO-2023Q1``) that is not in the
+    well-formed document_id (``AAPL-2099Q4``) that is not in the
     frozen 12-PDF corpus. The gate refuses immediately on the
     first failure — ``repair_count`` stays at 0 and the run
     status is ``refuse`` with reason ``unknown_locator``.
 
     No tool call is needed: ``unknown_locator`` is a regex
     pre-check on the answer text (``[A-Z]{2,5}-NNNNQ[N]`` shape),
-    so it fires before span matching (citation_gate.py step 1)."""
+    so it fires before span matching (citation_gate.py step 1).
+
+    Why ``AAPL-2099Q4`` and not a fully fictional ticker like
+    ``FOO-2023Q1`` (the original wording pre-Soft-Track):
+    Soft-Track classifier (``fin.host.track_decision``) routes a
+    filing-ask with no recognized company (``_COMPANY_CANON`` knows
+    only AAPL/MSFT/AMZN) to ``clarify`` instead of ``research``, so
+    the citation gate never runs. The spec intent — ``unknown_locator``
+    fires on a model-fabricated locator — is preserved by keeping
+    ``AAPL`` (a recognized company, so the question routes to
+    research) and shifting the fabrication into the period slot
+    (``2099Q4``: well-formed but not in the 12-PDF manifest),
+    which the locator regex still flags."""
     script = [
         AIMessage(
             content=(
-                "Per the FOO-2023Q1 filing, revenue grew strongly "
+                "Per the AAPL-2099Q4 filing, revenue grew strongly "
                 "across every segment this quarter and operating "
                 "margin improved materially."
             )
@@ -428,7 +440,7 @@ def test_refuse_01_unknown_locator_no_repair(scripted_graph_factory):
     out = _invoke(
         scripted_graph_factory(script),
         thread_id="eval-refuse-01-unknown",
-        question="What was revenue at the fictional FOO-2023Q1?",
+        question="What was AAPL's revenue in Q1 2023?",
     )
 
     assert out["status"] == "refuse"

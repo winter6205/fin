@@ -78,6 +78,12 @@ ORDINARY_PERSON_COPY: Final[dict[str, str]] = {
         "I couldn't match the answer to the cited pages after a "
         "few tries - try rephrasing or narrower scope."
     ),
+    # Numeric gate (ADR 0031): the answer's figure did not match
+    # any XBRL fact row the model looked up this run.
+    "numeric_gate_fail": (
+        "I couldn't match the figures in that answer to the numbers "
+        "reported in the filing. Try asking for one figure at a time."
+    ),
     # Fin-owned step-cap fuse fired before a terminal decision.
     "step_cap": (
         f"Hit the {STEP_CAP}-step fuse. Try breaking this into a "
@@ -91,7 +97,7 @@ def ordinary_person_copy(status: str, reason: str) -> str:
 
     ``done`` -> ``""`` (the run produced a real ``answer``).
     ``refuse`` -> keyed by ``reason`` (``unknown_locator`` /
-    ``citation_repair_cap``).
+    ``citation_repair_cap`` / ``numeric_gate_fail``).
     ``step_cap`` -> the step-cap string regardless of ``reason``.
     Unknown terminal -> ``""`` (defensive; the gate never
     produces one).

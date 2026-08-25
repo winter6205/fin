@@ -512,6 +512,32 @@ def _make_get_xbrl_fact_tool(facts_root: Path):
     return get_xbrl_fact_tool
 
 
+def _clarify_missing_slots(state: AgentState) -> list[str]:
+    """Return the slots the clarify leaf must still ask for.
+
+    First source is this turn's ``track_decision.signals``, which
+    the clarify tier fills from the utterance. When clarify was
+    reached some other way (the LLM tier records no slots), fall
+    back to the gaps in the latest status snapshot — the active
+    routing view, whose dependent fields may be empty (CONTEXT
+    *status snapshot*).
+    """
+    signals = dict((state.get("track_decision") or {}).get("signals") or {})
+    recorded = signals.get("missing_slots")
+    if isinstance(recorded, (list, tuple)):
+        named = [str(slot) for slot in recorded if slot]
+        if named:
+            return named
+
+    snapshots = list(state.get("status_snapshots") or [])
+    latest = snapshots[-1] if snapshots else {}
+    if not isinstance(latest, dict):
+        latest = {}
+    return [
+        slot for slot in ("company", "period") if not latest.get(slot)
+    ]
+
+
 # ----- T3 helpers: tool-summary + thinking extraction -----
 
 
@@ -987,8 +1013,13 @@ def compile_graph(
     ) -> dict[str, Any]:
         """Call unbound model with track prompt; done + empty citations."""
         selected = _select_unbound_model(config)
+        missing_slots = (
+            _clarify_missing_slots(state) if track == "clarify" else None
+        )
         stream = selected.stream(
-            messages_for_model(state["messages"], track=track)
+            messages_for_model(
+                state["messages"], track=track, missing_slots=missing_slots
+            )
         )
         answer_message = assemble_final_ai_message(stream)
         this_call_thinking = _extract_thinking_text(answer_message)

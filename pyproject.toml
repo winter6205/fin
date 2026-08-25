@@ -33,6 +33,7 @@ addopts = "-ra"
 markers = [
     "eval: opt-in eval cases (default `pytest -q` does NOT run these)",
     "soft_track: Soft-Track opt-in contracts (deselected by default)",
+    "mcp: opt-in MCP 2.0 protocol smoke against a fixture server (deselected by default)",
 ]
 
 [dependency-groups]

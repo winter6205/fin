@@ -34,3 +34,14 @@ uv run fin-serve                          # serves API + SPA on :8000
 ```
 
 Without a built `web/dist/`, only the API routes serve and boot logs a WARNING (`SPA dist directory ... not found`) — that warning is the signal to run the build step.
+
+### Retrieve adapter (`FIN_RETRIEVE_ADAPTER`)
+
+Retrieve sits behind the retrieve port (ADR 0032) and the adapter is chosen by `FIN_RETRIEVE_ADAPTER`, never inferred from the checkpointer:
+
+| Value          | What it binds                                                                              |
+| -------------- | ------------------------------------------------------------------------------------------ |
+| `mcp` (default) | MCP client to the **iknow-memory** server, launched as `iknow-memory serve`                |
+| `fake`         | In-memory `FakeRetrievePort` — boots without a corpus, answers every query with empty hits |
+
+`fin-serve` preflights the default: with `iknow-memory` absent from `PATH`, boot logs a WARNING (`FIN_RETRIEVE_ADAPTER=mcp but the MCP server command ... is not on PATH`) and keeps serving — research turns then return the typed `retrieve_unavailable` EXIT instead of evidence. Install the server, or set `FIN_RETRIEVE_ADAPTER=fake` in `.env` to acknowledge a corpus-free boot.

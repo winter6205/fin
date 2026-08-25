@@ -142,7 +142,8 @@ class MCPRetrieveAdapter:
     ----------
     command
         The MCP server launch command (e.g. ``["iknow-memory",
-        "serve"]``). When ``None``, ``_call_mcp`` raises
+        "serve"]``). When unset (``None`` or empty),
+        ``_call_mcp`` raises
         ``OSError("no MCP command configured")`` so the caller
         sees a typed ``retrieve_unavailable`` rather than a
         silent fall-through.
@@ -188,8 +189,8 @@ class MCPRetrieveAdapter:
     def retrieve(
         self,
         query: str,
-        document_id: str | None = None,
         *,
+        document_id: str | None = None,
         cik: str | None = None,
         form: str | None = None,
         ticker: str | None = None,
@@ -224,8 +225,8 @@ class MCPRetrieveAdapter:
     async def aretrieve(
         self,
         query: str,
-        document_id: str | None = None,
         *,
+        document_id: str | None = None,
         cik: str | None = None,
         form: str | None = None,
         ticker: str | None = None,
@@ -415,7 +416,11 @@ class MCPRetrieveAdapter:
         (return dict on success; raise ``OSError`` /
         ``TimeoutError`` on failure).
         """
-        if self._command is None:
+        if not self._command:
+            # ``None`` (unset) and ``[]`` (configured to nothing)
+            # are the same no-transport condition: there is no
+            # program to exec, so spawning would raise TypeError
+            # instead of the typed EXIT the caller contracts on.
             raise OSError("no MCP command configured")
         try:
             proc = await asyncio.create_subprocess_exec(

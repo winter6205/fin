@@ -4,13 +4,26 @@
 of that helper stay hermetic. The loader is what ``fin-serve`` and
 ``python -m fin`` call before compile, so a local ``.env`` is part
 of boot rather than an extra shell step.
+
+The same entry point runs the retrieve-adapter boot probe (T9 /
+spec SC14): ``FIN_RETRIEVE_ADAPTER`` defaults to ``mcp``, so a
+laptop without the ``iknow-memory`` server on ``PATH`` boots a
+graph whose every retrieve call returns the typed
+``retrieve_unavailable`` EXIT. That is a WARNING — never a boot
+failure, same class as the missing-``web/dist`` warning.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
-from fin.host.operator_env import apply_dotenv, find_env_file, parse_env_file
+from fin.host.operator_env import (
+    apply_dotenv,
+    find_env_file,
+    parse_env_file,
+    warn_if_mcp_retrieve_unreachable,
+)
 
 
 def test_parse_env_file_empty_text_returns_empty() -> None:
@@ -104,6 +117,103 @@ def test_serve_applies_dotenv_before_uvicorn(monkeypatch) -> None:
 
     serve()
     assert order == ["dotenv", "uvicorn"]
+
+
+def _path_without_mcp(tmp_path: Path) -> dict[str, str]:
+    """An environ whose ``PATH`` holds no ``iknow-memory`` binary."""
+    empty = tmp_path / "bin-empty"
+    empty.mkdir()
+    return {"PATH": str(empty)}
+
+
+def _path_with_mcp(tmp_path: Path) -> dict[str, str]:
+    """An environ whose ``PATH`` holds an executable ``iknow-memory``."""
+    bindir = tmp_path / "bin-with-mcp"
+    bindir.mkdir()
+    binary = bindir / "iknow-memory"
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    return {"PATH": str(bindir)}
+
+
+def test_boot_probe_warns_when_mcp_default_and_command_missing(
+    tmp_path: Path, caplog
+) -> None:
+    """Adapter defaults to ``mcp`` + no reachable command → WARNING.
+
+    Spec SC14: the boot must still proceed (the probe returns a
+    flag, it does not raise), and the operator must be told that
+    retrieve calls will answer ``retrieve_unavailable``.
+    """
+    with caplog.at_level(logging.WARNING, logger="fin.host.operator_env"):
+        unreachable = warn_if_mcp_retrieve_unreachable(
+            environ=_path_without_mcp(tmp_path)
+        )
+
+    assert unreachable is True
+    records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(records) == 1, records
+    message = records[0].getMessage()
+    assert "FIN_RETRIEVE_ADAPTER" in message
+    assert "iknow-memory" in message
+    # Same typed EXIT the adapter returns with no transport, so the
+    # boot log and the run-time error read as one story.
+    assert "retrieve_unavailable" in message
+
+
+def test_boot_probe_silent_when_command_is_on_path(
+    tmp_path: Path, caplog
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="fin.host.operator_env"):
+        unreachable = warn_if_mcp_retrieve_unreachable(
+            environ=_path_with_mcp(tmp_path)
+        )
+
+    assert unreachable is False
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+def test_boot_probe_silent_when_adapter_is_not_mcp(
+    tmp_path: Path, caplog
+) -> None:
+    """``FIN_RETRIEVE_ADAPTER=fake`` is the documented opt-out."""
+    environ = _path_without_mcp(tmp_path) | {"FIN_RETRIEVE_ADAPTER": "fake"}
+    with caplog.at_level(logging.WARNING, logger="fin.host.operator_env"):
+        unreachable = warn_if_mcp_retrieve_unreachable(environ=environ)
+
+    assert unreachable is False
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+def test_serve_warns_about_unreachable_mcp_and_still_serves(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """``fin-serve`` boot logs the WARNING and keeps booting.
+
+    The WARNING is informational: uvicorn must still start, exactly
+    like the missing-``web/dist`` case.
+    """
+    served: list[str] = []
+
+    monkeypatch.setattr("fin.host.http.apply_dotenv", lambda: None)
+    import uvicorn
+
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: served.append("uvicorn"))
+    monkeypatch.setenv("PATH", str(_path_without_mcp(tmp_path)["PATH"]))
+    monkeypatch.delenv("FIN_RETRIEVE_ADAPTER", raising=False)
+
+    from fin.host.http import serve
+
+    with caplog.at_level(logging.WARNING, logger="fin.host.operator_env"):
+        serve()
+
+    assert served == ["uvicorn"], "the WARNING must not stop the boot"
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and r.name == "fin.host.operator_env"
+    ]
+    assert any("FIN_RETRIEVE_ADAPTER" in m for m in warnings), warnings
 
 
 def test_default_graph_factory_applies_dotenv_before_compile(

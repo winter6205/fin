@@ -3,6 +3,7 @@
 // enforces 204).
 
 import { useRef, useState } from "react";
+import { describeSendFailure, type SendFailureNotice } from "../sendFailure";
 import { useWorkspaceStore } from "../store";
 
 interface ComposerProps {
@@ -42,6 +43,9 @@ export default function Composer({
     }
   });
   const [draft, setDraft] = useState("");
+  // Last send that never produced a run (409 / 503 / transport).
+  // Rendered above the textarea until the next submit clears it.
+  const [failure, setFailure] = useState<SendFailureNotice | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const toggleThinking = () => {
@@ -69,7 +73,17 @@ export default function Composer({
     const q = draft.trim();
     if (!q) return; // Empty submit no-op.
     setDraft("");
-    await sendQuestion(threadId, q, thinkingOn);
+    setFailure(null);
+    try {
+      await sendQuestion(threadId, q, thinkingOn);
+    } catch (error) {
+      // The draft was cleared optimistically and the textarea held
+      // the only copy of the question — put it back so the operator
+      // can retry once the 409 / 503 cause clears.
+      setFailure(describeSendFailure(error));
+      setDraft((current) => (current === "" ? q : current));
+      textareaRef.current?.focus();
+    }
   };
 
   return (
@@ -80,6 +94,24 @@ export default function Composer({
         void submit();
       }}
     >
+      {failure ? (
+        <div
+          role="alert"
+          data-testid="send-failure"
+          data-failure-kind={failure.kind}
+          className="mb-2 flex items-start justify-between gap-3 border border-black bg-tool px-2 py-1.5 text-sm text-gray-800"
+        >
+          <span>{failure.message}</span>
+          <button
+            type="button"
+            aria-label="关闭提示"
+            onClick={() => setFailure(null)}
+            className="shrink-0 text-xs text-gray-500 hover:text-black"
+          >
+            ✕
+          </button>
+        </div>
+      ) : null}
       <textarea
         ref={textareaRef}
         value={draft}
