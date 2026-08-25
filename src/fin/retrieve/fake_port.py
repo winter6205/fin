@@ -1,10 +1,13 @@
 """In-process fake retrieve port for tests (T3, ADR 0030).
 
 The fake port fills the seam between the host graph and the
-retrieve capability. It is the **default pytest adapter** —
-production ``compile_graph`` auto-builds an ``MCPRetrieveAdapter``;
-``InMemorySaver`` callers (tests, ``compile_for_runtime_dev``)
-auto-build a ``FakeRetrievePort`` so the suite stays hermetic.
+retrieve capability. It is the **default pytest adapter**:
+``compile_graph`` auto-builds one unless the caller asks for
+another kind, so the suite stays hermetic. The production entry
+points in ``fin.host.compile`` ask for ``retrieve_adapter="mcp"``
+and get an ``MCPRetrieveAdapter``. The choice is configuration —
+it is NOT inferred from the checkpointer, so ``fin-serve`` on
+``InMemorySaver`` still serves the product corpus.
 
 The fake port mirrors the public ``RetrievePort`` semantics on
 its ``retrieve()`` method:
