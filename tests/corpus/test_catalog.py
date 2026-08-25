@@ -197,9 +197,10 @@ def test_form_filter_alone_returns_all_10Q_hits() -> None:
 
 def test_filing_date_filter_alone_returns_single_hit() -> None:
     """Exact ``filing_date`` returns exactly the one matching row."""
-    # AAPL-2022Q3's filing_date is 2022-08-05 per the manifest.
+    # AAPL-2022Q3's filing_date is 2022-07-29 per the manifest — the
+    # EDGAR filing date of the 10-Q for the quarter ended 2022-06-25.
     result = list_files(
-        filing_date="2022-08-05",
+        filing_date="2022-07-29",
         manifest_path=_manifest_path(),
         extracted_root=_extracted_root(),
     )

@@ -144,12 +144,12 @@ def test_research_done_passes_when_fact_matches_answer() -> None:
     value verbatim. The numeric gate matches the answer's number
     against the fact row; the citation gate has a page-text span
     via ``read_file``. End state: ``status == "done"``."""
-    # We use the seeded value (383,285,000,000) so the numeric
-    # gate passes via ``fact_matches_value`` within the default
-    # 0.5% tolerance.
+    # We use the seeded value ([private source value removed] -- Apple's total net sales in
+    # millions for the nine months ended July 1, 2023, as printed on
+    # the cited page) so the numeric gate passes via
+    # ``fact_matches_value`` within the default 0.5% tolerance.
     answer = (
-        f"Revenue was $383,285,000,000 in 2023 Q3. "
-        f"Per the filing: extracted evidence from AAPL-2022Q3 page 1."
+        f"{load_private_fixture('47327bf5ae5bba4ea85f3f21ef20249ac3814e914b49905b180353c5f444b608')}"
     )
     model = ScriptedChatModel(
         script=_invocation_script(
@@ -306,7 +306,8 @@ def test_get_xbrl_fact_tool_returns_seeded_value() -> None:
         facts_root=_facts_root(),
     )
     assert "error" not in result
-    assert result["value"] == 383285000000
+    assert result["value"] == load_private_fixture("e8e6fa2502cf2441d4f1862bbbb7d147b7dbd57a3911be363417fe4342e69b94")
+    assert result["scale"] == "millions"
 
 
 # ===== soft-track pytest -m still exits 0 (T5 acceptance) =====

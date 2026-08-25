@@ -14,15 +14,37 @@ The only environment signal is ``FIN_EDGAR_USER_AGENT``. Per spec
 
 * **Unset or empty** → ``SecUaUnsetError`` is raised, NO HTTP call is
   made. The ask path / default pytest MUST NOT touch SEC hosts.
-* **Set + HTTP success** → the response bytes are hashed as the
-  ``version`` and a stub extracted tree + manifest entry are
-  written. (Full HTML partitioning into ``unit`` is deferred — ADR
-  0028 leaves that decision to a later ADR; T1 ships the typed-EXIT
-  scaffolding, not the partitioner.)
+* **Set + HTTP success** → the accession's primary document is
+  resolved first, then fetched; those bytes are hashed as the
+  ``version`` and the unit + catalog artifacts are written.
 * **Set + HTTP failure (non-2xx)** → ``SecHttpFailError`` is raised,
   the manifest is NOT updated, the extracted tree for that accession
   is NOT created. This is the ``sec_http_fail`` typed EXIT (spec §
   Boundaries).
+
+Which bytes are the filing
+--------------------------
+
+An EDGAR accession is a directory of dozens of files: the primary
+iXBRL document, its XBRL sidecars, exhibits, and the rendered
+``R*.htm`` fragments. Only the primary document is the filing, and
+spec § **locator** pins ``version`` to *its* bytes — so this module
+resolves the primary document **before** the GET whose response it
+hashes. Resolution reads the accession's ``index.json`` listing and
+applies ``_pick_primary_document``; ``--primary-doc`` skips it when
+the operator already knows the filename.
+
+The frozen unit
+---------------
+
+Spec § **locator**: the live unit is "a deterministic frozen partition
+of that HTML's stripped text". ``_strip_html`` does the stripping with
+stdlib ``html.parser``. The partition itself is still the trivial
+one — the whole document is unit 1 — because how HTML splits into
+multiple units is explicitly left open by ADR 0028. What the unit is
+*made of* is not open, so the text is stripped rather than raw markup:
+a citation gate matching a quote against ``<span>``-laden source would
+refuse every real span.
 
 Imports kept minimal
 --------------------
@@ -30,14 +52,19 @@ Imports kept minimal
 We use stdlib ``urllib.request`` only — no new dep. ``pdfplumber``
 does not appear on this path; if it did, the ask-path contract (ADR
 0020) would be violated the moment ``fin.corpus.live_fetch`` was
-imported.
+imported. That is also why the passage window below is spelled out
+here instead of imported from ``fin.corpus.ingest``: importing that
+module would pull ``pdfplumber`` onto this path. The rule (512-char
+window, 64-char overlap) is the same one, and must stay the same.
 """
 
 from __future__ import annotations
 
 import hashlib
+import html.parser
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -57,6 +84,42 @@ urlopen = urllib.request.urlopen
 _UA_ENV = "FIN_EDGAR_USER_AGENT"
 
 _EDGAR_ARCHIVES_HOST = "www.sec.gov"
+
+# Passage window — must match ``fin.corpus.ingest`` (see module
+# docstring for why it is not imported from there).
+_PASSAGE_SIZE = 512
+_PASSAGE_OVERLAP = 64
+
+# Inline-XBRL filings name their primary document ``<slug>-YYYYMMDD.htm``
+# (``aapl-20230701.htm``). Nothing else in an accession matches, so
+# this is the high-confidence pick.
+_IXBRL_PRIMARY_NAME = re.compile(r"^[a-z0-9]+-\d{8}\.html?$", re.IGNORECASE)
+
+# Rendered report fragments EDGAR generates from the XBRL — never the
+# filing itself.
+_RENDERED_FRAGMENT_NAME = re.compile(r"^R\d+\.html?$", re.IGNORECASE)
+
+# HTML elements whose character data is not filing text. ``ix:header``
+# is the inline-XBRL header block: tens of kilobytes of hidden tagged
+# facts and context definitions that no reader sees and no citation
+# can quote.
+_NON_TEXT_ELEMENTS = frozenset({"ix:header", "script", "style", "title"})
+
+# Elements that end a line of visible text. Keeping the break makes
+# the stripped text stable and readable instead of one long run-on
+# paragraph.
+_BLOCK_ELEMENTS = frozenset(
+    {
+        "br", "div", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "li", "ol",
+        "p", "table", "tbody", "thead", "tr", "ul",
+    }
+)
+
+# Table cells separate with a space, not a line break, so one row of a
+# financial statement freezes as one line — "Products $ 60,584 $
+# 63,355" is the shape a claimed span is quoted in. Breaking per cell
+# would make every table figure unquotable.
+_CELL_ELEMENTS = frozenset({"td", "th"})
 
 
 class SecUaUnsetError(IngestMissingError):
@@ -82,6 +145,19 @@ class SecHttpFailError(IngestMissingError):
     def __init__(self, message: str, *, status_code: int, accession: str) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.accession = accession
+
+
+class SecPrimaryDocUnresolvedError(IngestMissingError):
+    """Typed EXIT: the accession listing names no primary document.
+
+    Guessing here would pin a cite identity to an exhibit or to a
+    rendered ``R*.htm`` fragment, so the run stops with the accession
+    unmarked and the operator re-runs with ``--primary-doc``.
+    """
+
+    def __init__(self, message: str, *, accession: str) -> None:
+        super().__init__(message)
         self.accession = accession
 
 
@@ -124,6 +200,174 @@ def _sec_get(url: str, ua: str, *, accession: str) -> bytes:
         ) from exc
 
 
+def _accession_base_url(cik: str, accession: str) -> str:
+    """Archive directory URL for one accession.
+
+    EDGAR keys the archive path on the CIK with leading zeros stripped
+    and the accession with its dashes removed; the zero-padded form
+    answers 301 to this one.
+    """
+    return (
+        f"https://{_EDGAR_ARCHIVES_HOST}/Archives/edgar/data/"
+        f"{cik.strip().lstrip('0') or '0'}/{accession.replace('-', '')}/"
+    )
+
+
+def _listing_documents(listing: bytes, *, accession: str) -> list[tuple[str, int]]:
+    """Parse an accession ``index.json`` into ``(name, size)`` pairs.
+
+    A listing we cannot parse is the same EXIT as a listing with no
+    primary document: either way this run has no defensible way to
+    choose the filing's bytes.
+    """
+    try:
+        payload = json.loads(listing)
+        items = payload["directory"]["item"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise SecPrimaryDocUnresolvedError(
+            f"accession {accession} listing is not an EDGAR index.json",
+            accession=accession,
+        ) from exc
+    out: list[tuple[str, int]] = []
+    for item in items:
+        name = str(item.get("name", ""))
+        try:
+            size = int(item.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        out.append((name, size))
+    return out
+
+
+def _pick_primary_document(
+    documents: list[tuple[str, int]], *, accession: str
+) -> str:
+    """Choose the accession's primary iXBRL document.
+
+    Candidates are the ``.htm`` / ``.html`` entries that are not the
+    ``-index`` wrappers and not rendered ``R*.htm`` fragments. Among
+    them the inline-XBRL naming convention wins outright; filings that
+    predate it (``msft-10q_20220930.htm``) fall back to the largest
+    candidate, which is the filing body by a wide margin — exhibits
+    are a few kilobytes against the document's megabytes.
+
+    Ties break on the name so two runs over one accession resolve to
+    the same bytes.
+    """
+    candidates = [
+        (name, size)
+        for name, size in documents
+        if name.lower().endswith((".htm", ".html"))
+        and "-index" not in name.lower()
+        and not _RENDERED_FRAGMENT_NAME.match(name)
+    ]
+    if not candidates:
+        raise SecPrimaryDocUnresolvedError(
+            f"accession {accession} listing has no candidate primary "
+            "document; re-run with --primary-doc",
+            accession=accession,
+        )
+    ixbrl = sorted(
+        name for name, _ in candidates if _IXBRL_PRIMARY_NAME.match(name)
+    )
+    if ixbrl:
+        return ixbrl[0]
+    return sorted(candidates, key=lambda pair: (-pair[1], pair[0]))[0][0]
+
+
+def _resolve_primary_url(
+    *, base_url: str, ua: str, accession: str, primary_doc: str | None
+) -> str:
+    """Return the URL of the accession's primary document.
+
+    Costs one extra GET (the listing) unless ``primary_doc`` is given.
+    That GET's bytes are never hashed — only the document it points
+    at is.
+    """
+    if primary_doc:
+        return base_url + primary_doc.lstrip("/")
+    listing = _sec_get(base_url + "index.json", ua, accession=accession)
+    name = _pick_primary_document(
+        _listing_documents(listing, accession=accession), accession=accession
+    )
+    return base_url + name
+
+
+class _TextExtractor(html.parser.HTMLParser):
+    """Collect the visible character data of an HTML document."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+        self._suppress = 0
+
+    def handle_starttag(self, tag: str, attrs: object) -> None:
+        if tag in _NON_TEXT_ELEMENTS:
+            self._suppress += 1
+        elif not self._suppress:
+            self._parts.append(self._separator(tag))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in _NON_TEXT_ELEMENTS:
+            self._suppress = max(0, self._suppress - 1)
+        elif not self._suppress:
+            self._parts.append(self._separator(tag))
+
+    @staticmethod
+    def _separator(tag: str) -> str:
+        if tag in _BLOCK_ELEMENTS:
+            return "\n"
+        if tag in _CELL_ELEMENTS:
+            return " "
+        return ""
+
+    def handle_data(self, data: str) -> None:
+        if not self._suppress:
+            self._parts.append(data)
+
+    def text(self) -> str:
+        return "".join(self._parts)
+
+
+def _strip_html(body: bytes) -> str:
+    """Render the official HTML down to its visible text.
+
+    Deterministic by construction: decoding errors are replaced rather
+    than guessed at, non-breaking spaces collapse to ordinary ones,
+    and blank lines are dropped — so the same bytes always freeze to
+    the same unit text, which is what the citation verifier's
+    substring check depends on.
+    """
+    parser = _TextExtractor()
+    parser.feed(body.decode("utf-8", errors="replace"))
+    parser.close()
+    lines = (
+        re.sub(r"[^\S\n]+", " ", line).strip()
+        for line in parser.text().replace("\xa0", " ").split("\n")
+    )
+    return "\n".join(line for line in lines if line)
+
+
+def _chunk_unit_text(text: str) -> list[dict[str, object]]:
+    """Fixed 512/64 sliding window over the unit text.
+
+    Same rule as ``fin.corpus.ingest`` — see the module docstring for
+    why it is restated instead of imported.
+    """
+    chunks: list[dict[str, object]] = []
+    step = _PASSAGE_SIZE - _PASSAGE_OVERLAP
+    start = 0
+    while start < len(text):
+        end = min(start + _PASSAGE_SIZE, len(text))
+        chunks.append(
+            {"text": text[start:end], "char_start": start, "char_end": end}
+        )
+        if end >= len(text):
+            break
+        start += step
+    return chunks
+
+
 def _sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
@@ -134,55 +378,102 @@ def _atomic_write(path: Path, payload: bytes) -> None:
     os.replace(tmp, path)
 
 
-def _write_live_stub(
+def _dump(payload: object) -> bytes:
+    return json.dumps(
+        payload, ensure_ascii=False, indent=2, sort_keys=True
+    ).encode("utf-8")
+
+
+def _read_index_documents(index_path: Path) -> dict[str, dict[str, object]]:
+    """Read the per-document records out of an existing ``_index.json``.
+
+    A missing index is an empty catalog. A present-but-unreadable one
+    is an EXIT: overwriting it would turn a damaged index into a
+    single-entry index and quietly drop every other document from the
+    query SSOT (ADR 0020).
+    """
+    if not index_path.is_file():
+        return {}
+    try:
+        payload = json.loads(index_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        raise IngestMissingError(
+            f"refusing to merge into an unreadable index: {index_path}"
+        ) from exc
+    documents = payload.get("documents") if isinstance(payload, dict) else None
+    if not isinstance(documents, dict):
+        raise IngestMissingError(
+            f"refusing to merge into an index with no 'documents' object: "
+            f"{index_path}"
+        )
+    return documents
+
+
+def _write_live_unit(
     *,
     accession: str,
     body: bytes,
+    source_url: str,
     extracted_root: Path,
     facts_root: Path,
-) -> None:
-    """Persist the live-fetched HTML bytes into the extracted tree.
+) -> str:
+    """Freeze the primary document into the extracted tree.
 
-    T1 ships only the typed-EXIT scaffolding for the live path; the
-    HTML partitioning into ``unit`` is deferred (ADR 0028 leaves that
-    decision to a later ADR). For T1 we hash the bytes, write a single
-    stub ``page-001.json`` carrying the raw HTML as ``text``, and a
-    stub fact file with the live locator (no XBRL tag facts yet — T5
-    owns the parser that emits ``us-gaap:Revenues`` rows from iXBRL).
+    Writes the unit text, its passages, and a merged ``_index.json``
+    entry, then returns the ``version``. The index is read-merged so a
+    live fetch adds one document to the tree rather than becoming the
+    tree.
     """
     version = _sha256_bytes(body)
+    text = _strip_html(body)
+
+    index_path = extracted_root / "_index.json"
+    extracted_root.mkdir(parents=True, exist_ok=True)
+    documents = _read_index_documents(index_path)
+
     doc_dir = extracted_root / accession
     doc_dir.mkdir(parents=True, exist_ok=True)
-    page_payload = json.dumps(
-        {
-            "document_id": accession,
-            "version": version,
-            "page": 1,
-            "text": body.decode("utf-8", errors="replace"),
-        },
-        ensure_ascii=False,
-        indent=2,
-        sort_keys=True,
-    ).encode("utf-8")
-    _atomic_write(doc_dir / "page-001.json", page_payload)
-    index_payload = json.dumps(
-        {
-            "schema_version": 1,
-            "documents": {accession: {"version": version, "page_count": 1}},
-        },
-        ensure_ascii=False,
-        indent=2,
-        sort_keys=True,
-    ).encode("utf-8")
-    _atomic_write(extracted_root / "_index.json", index_payload)
+    _atomic_write(
+        doc_dir / "page-001.json",
+        _dump(
+            {
+                "document_id": accession,
+                "version": version,
+                "page": 1,
+                "text": text,
+                "ocr_applied": False,
+                "source_url": source_url,
+            }
+        ),
+    )
+    _atomic_write(
+        doc_dir / "passages-001.json",
+        _dump(
+            {
+                "document_id": accession,
+                "version": version,
+                "page": 1,
+                "passages": _chunk_unit_text(text),
+            }
+        ),
+    )
+
+    documents[accession] = {
+        "version": version,
+        "page_count": 1,
+        "source_url": source_url,
+    }
+    _atomic_write(
+        index_path,
+        _dump({"schema_version": 1, "documents": dict(sorted(documents.items()))}),
+    )
+
     # No facts emitted for live path in T1: iXBRL tag parsing is
     # deferred to a later ADR (T5 owns the get_xbrl_fact lookup and
     # the XBRL parser that feeds it).
     facts_root.mkdir(parents=True, exist_ok=True)
-    facts_payload = json.dumps(
-        {"facts": []}, ensure_ascii=False, indent=2, sort_keys=True
-    ).encode("utf-8")
-    _atomic_write(facts_root / f"{accession}.json", facts_payload)
+    _atomic_write(facts_root / f"{accession}.json", _dump({"facts": []}))
+    return version
 
 
 def fetch_and_ingest(
@@ -192,10 +483,13 @@ def fetch_and_ingest(
     manifest_path: Path,
     extracted_root: Path,
     facts_root: Path,
+    primary_doc: str | None = None,
 ) -> bytes:
     """Run the UA-gated live fetch + write.
 
-    Returns the response body so the caller (CLI) can log a digest.
+    Resolves the accession's primary iXBRL document, fetches it, and
+    freezes its stripped text as unit 1 under ``accession``. Returns
+    the primary document's bytes so the caller (CLI) can log a digest.
 
     Raises
     ------
@@ -203,27 +497,30 @@ def fetch_and_ingest(
         ``FIN_EDGAR_USER_AGENT`` is unset or empty. NO HTTP request
         was made.
     SecHttpFailError
-        The SEC HTTP call returned non-2xx. The catalog/extracted
-        tree for ``accession`` was NOT created.
+        A SEC HTTP call returned non-2xx. The catalog/extracted tree
+        for ``accession`` was NOT created.
+    SecPrimaryDocUnresolvedError
+        The accession listing names no primary document. Nothing was
+        written; re-run with ``primary_doc``.
     """
     ua = _read_ua()
-    padded = cik.zfill(10)
-    url = (
-        f"https://{_EDGAR_ARCHIVES_HOST}/Archives/edgar/data/"
-        f"{padded}/{accession.replace('-', '')}/"
+    base_url = _accession_base_url(cik, accession)
+    primary_url = _resolve_primary_url(
+        base_url=base_url, ua=ua, accession=accession, primary_doc=primary_doc
     )
-    body = _sec_get(url, ua, accession=accession)
-    _write_live_stub(
+    body = _sec_get(primary_url, ua, accession=accession)
+    _write_live_unit(
         accession=accession,
         body=body,
+        source_url=primary_url,
         extracted_root=extracted_root,
         facts_root=facts_root,
     )
     # The ``manifest_path`` argument is part of the public API; the
-    # full manifest update (write a row keyed by ``accession``) lands
-    # when the live partitioner (deferred ADR) is in. For T1 we only
-    # need the typed-EXIT scaffolding, so the manifest stays
-    # untouched here.
+    # full manifest update (a catalog row keyed by ``accession``) lands
+    # when the live path can supply the row's company / period fields
+    # the frozen-12 rows carry. Until then the live tree is
+    # reachable by locator but not listed by ``list_files``.
     _ = manifest_path
     return body
 
@@ -244,7 +541,8 @@ def main(argv: list[str] | None = None) -> int:
     Parses ``--cik`` and ``--accession``, reads ``FIN_EDGAR_USER_AGENT``
     from the environment, and exits non-zero with a typed message on
     any of the spec's EXITs (UA-unset → ``SecUaUnsetError``; HTTP fail
-    → ``SecHttpFailError``).
+    → ``SecHttpFailError``; unresolvable primary document →
+    ``SecPrimaryDocUnresolvedError``).
     """
     import argparse
 
@@ -261,7 +559,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--accession",
         required=True,
-        help="EDGAR accession number, e.g. 0000320193-23-000106",
+        help="EDGAR accession number, e.g. 0000320193-23-000077",
+    )
+    parser.add_argument(
+        "--primary-doc",
+        default=None,
+        help=(
+            "Filename of the primary iXBRL document within the "
+            "accession, e.g. aapl-20230701.htm. Skips the index.json "
+            "lookup; required when that lookup cannot resolve one."
+        ),
     )
     parser.add_argument("--manifest", type=Path, default=default_manifest)
     parser.add_argument(
@@ -270,29 +577,40 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--facts-root", type=Path, default=default_facts)
     args = parser.parse_args(argv)
 
+    import sys
+
     try:
-        fetch_and_ingest(
+        body = fetch_and_ingest(
             cik=args.cik,
             accession=args.accession,
             manifest_path=args.manifest,
             extracted_root=args.extracted_root,
             facts_root=args.facts_root,
+            primary_doc=args.primary_doc,
         )
     except SecUaUnsetError as exc:
-        print(f"live_fetch: {exc}", file=__import__("sys").stderr)
+        print(f"live_fetch: {exc}", file=sys.stderr)
         return 2
     except SecHttpFailError as exc:
         print(
             f"live_fetch: sec_http_fail status={exc.status_code} "
             f"accession={exc.accession}: {exc}",
-            file=__import__("sys").stderr,
+            file=sys.stderr,
         )
         return 3
+    except SecPrimaryDocUnresolvedError as exc:
+        print(f"live_fetch: primary_doc_unresolved: {exc}", file=sys.stderr)
+        return 4
+    print(
+        f"live_fetch: accession={args.accession} "
+        f"version={_sha256_bytes(body)} bytes={len(body)}"
+    )
     return 0
 
 
 __all__ = [
     "SecHttpFailError",
+    "SecPrimaryDocUnresolvedError",
     "SecUaUnsetError",
     "fetch_and_ingest",
     "main",
