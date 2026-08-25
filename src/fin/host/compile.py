@@ -41,11 +41,13 @@ HTTP process. Tests append fakes, so no real resource is held.
 
 Lazy imports
 ------------
-``ChatOpenAI`` and ``PostgresSaver`` are imported inside the
-function — not at module top — so the module is importable even
-when those heavy runtime deps are missing or have been replaced
-in ``sys.modules`` by a test fixture. Production boot pulls the
-real symbols; tests inject fakes.
+``PostgresSaver`` is imported inside the function — not at module
+top — so the module stays importable when the heavy runtime dep
+is missing or replaced in ``sys.modules`` by a test fixture. The
+chat-model wiring moved to :mod:`fin.host.model_router`
+(ADR 0033); ``ChatOpenAI`` and ``ChatAnthropic`` are imported
+inside the router so each branch's heavy dep stays lazy.
+Production boot pulls the real symbols; tests inject fakes.
 
 URL contract (OpenAI SDK)
 --------------------------
@@ -53,9 +55,19 @@ URL contract (OpenAI SDK)
 SDK appends ``/chat/completions`` to whatever ``base_url`` you
 give it. So ``FIN_BASE_URL`` SHOULD include ``/v1`` — passing
 ``http://localhost:20128`` (without ``/v1``) would result in
-requests to ``http://localhost:20128/chat/completions`` (404 at
+requests to ``http://localhost:20128/chat/completions` (404 at
 the proxy). The default below is ``http://localhost:20128/v1``;
 the proxy receives ``POST /v1/chat/completions`` as expected.
+
+URL contract (Anthropic SDK)
+----------------------------
+``ChatAnthropic`` (the Token Plan 订阅-key path, ADR 0033)
+appends ``/v1/messages`` to its base URL. ``FIN_BASE_URL`` for
+the Anthropic path SHOULD end in ``/anthropic`` — the router
+detects that suffix to dispatch. The MiniMax Anthropic-compatible
+endpoint (``https://api.minimaxi.com/anthropic`` or overseas
+``https://api.minimax.io/anthropic``) receives
+``POST /anthropic/v1/messages`` as expected.
 """
 
 from __future__ import annotations
@@ -195,44 +207,37 @@ def _build_default_model(
     base_url: str | None,
     env: Mapping[str, str] | None,
 ) -> Any:
-    """Construct the production ``ChatOpenAI`` instance.
+    """Construct the production chat-model instance.
 
     Used by both :func:`compile_for_runtime` (production Postgres
     path) and :func:`compile_for_runtime_dev` (local-dev InMemorySaver
-    path) so model defaults stay single-sourced. Lazy-imports
-    ``ChatOpenAI`` so the module stays importable without the heavy
-    runtime dep.
+    path) so model defaults stay single-sourced. Delegates to
+    :func:`fin.host.model_router.resolve_chat_model` so the dispatch
+    rule (URL-shape → ``ChatOpenAI`` or ``ChatAnthropic``) lives in
+    one place (ADR 0033); this wrapper exists to keep callers
+    hermetic against the new module.
 
-    Reads ``FIN_MODEL`` / ``FIN_BASE_URL`` / ``ANTHROPIC_AUTH_TOKEN``
-    when the corresponding arg is ``None``; otherwise uses the
-    caller-supplied value verbatim. The ``extra_body`` /
-    ``reasoning_split`` block is required by ADR 0022 + ADR 0026;
-    keeping it here avoids drift between prod and dev.
+    When the caller passes ``model_name`` / ``base_url`` explicitly
+    we still feed those overrides through the router by seeding the
+    supplied ``env`` mapping — the router respects whatever values
+    win the last-write in the mapping, so an explicit override on
+    the function call overrides the process env. Tests that need to
+    pin the URL still inject ``env={"FIN_BASE_URL": ...}``.
     """
-    from langchain_openai import ChatOpenAI
+    from fin.host.model_router import resolve_chat_model
 
-    if model_name is None:
-        model_name = _read_env(env, "FIN_MODEL") or DEFAULT_MODEL
-    if base_url is None:
-        base_url = _read_env(env, "FIN_BASE_URL") or DEFAULT_BASE_URL
-    api_key = _read_env(env, "ANTHROPIC_AUTH_TOKEN") or "sk-no-key-required"
-    return ChatOpenAI(
-        model=model_name,
-        base_url=base_url,
-        api_key=api_key,
-        # Nested ``model_kwargs={"extra_body": ...}`` is rejected by
-        # ChatOpenAI ("specify extra_body explicitly"). Without the
-        # split channel MiniMax inlines ``<think>`` into content and
-        # the workspace turn looks like a failed chat.
-        extra_body={
-            "thinking": {"type": "adaptive"},
-            "reasoning_split": True,
-        },
-        # A hung completion holds the per-thread lock and disables
-        # the composer for that research thread. Bound the wait.
-        timeout=120.0,
-        max_retries=1,
-    )
+    if env is None:
+        env = __import__("os").environ
+    override: dict[str, str] = {}
+    if model_name is not None:
+        override["FIN_MODEL"] = model_name
+    if base_url is not None:
+        override["FIN_BASE_URL"] = base_url
+    if override:
+        merged: dict[str, str] = dict(env)
+        merged.update(override)
+        env = merged
+    return resolve_chat_model(env)
 
 
 # ----- the helper -----
