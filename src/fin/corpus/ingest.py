@@ -12,6 +12,13 @@ under ``data/corpus/extracted/<document_id>/``:
 A top-level ``_index.json`` lists every document and its expected page
 count so the loader can fail fast on partial extractions.
 
+The run also refreshes the EDGAR-shaped catalog fields (``cik`` /
+``accession`` / ``filing_date`` / ``form`` / ``ticker``, ADR 0031) on
+every manifest row — see ``update_catalog_fields``. That step reads
+only local metadata plus an optional operator seed file; it never
+opens a SEC host. The gated live path lives in
+``fin.corpus.live_fetch``.
+
 Idempotency (ADR 0020): a second ``run_ingest()`` against the same
 source tree must produce byte-identical artifacts. We achieve this by
 computing the desired JSON payload first, hashing it with sha256, and
@@ -44,12 +51,13 @@ import json
 import os
 import shutil
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 import pdfplumber
 
-from fin.corpus.errors import ManifestShaMismatchError
+from fin.corpus.errors import IngestMissingError, ManifestShaMismatchError
 from fin.corpus.ocr import (
     OCREngine,
     OCRError,
@@ -61,6 +69,31 @@ from fin.corpus.ocr import (
 _PASSAGE_SIZE = 512
 _PASSAGE_OVERLAP = 64
 _PAGE_NUM_WIDTH = 3
+
+# The EDGAR-shaped catalog fields ``list_filings`` filters on (ADR
+# 0031). Ingest owns writing them onto the manifest rows; the catalog
+# only reads them.
+_EDGAR_CATALOG_FIELDS = ("cik", "accession", "filing_date", "form", "ticker")
+
+# Local seed for the frozen-12 demo corpus. EDGAR assigns one CIK per
+# registrant for the life of the issuer, so the mapping is stable
+# enough to carry in-repo and lets the CLI fill ``cik`` with no SEC
+# GET. ``accession`` / ``filing_date`` are per-filing and cannot be
+# derived from local metadata — they come from ``--catalog-seed``.
+_ISSUER_CIK: dict[str, str] = {
+    "AAPL": "0000320193",
+    "MSFT": "0000789019",
+    "AMZN": "0001018724",
+}
+
+
+class CatalogSeedError(IngestMissingError):
+    """Typed EXIT: the ``--catalog-seed`` file is missing or malformed.
+
+    Refusing beats guessing: a seed the operator meant to apply but
+    that cannot be parsed must not silently degrade into "catalog
+    fields stay as they were".
+    """
 
 
 @dataclass(frozen=True)
@@ -80,6 +113,7 @@ class IngestResult:
     pages: int
     pages_written: int
     pages_skipped: int
+    catalog_updated: int = 0
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -381,6 +415,115 @@ def _passages_payload(
     ).encode("utf-8")
 
 
+def load_catalog_seed(seed_path: Path) -> dict[str, dict[str, str]]:
+    """Read an operator ``--catalog-seed`` JSON file.
+
+    Shape: ``{"documents": {"<document_id>": {"accession": ..., ...}}}``.
+    Only the five EDGAR-shaped keys are read; anything else in a seed
+    row is ignored so an operator can keep notes alongside the values.
+
+    Raises
+    ------
+    CatalogSeedError
+        The file is absent, is not JSON, or has no ``documents``
+        mapping. A seed that cannot be applied is an EXIT, not a
+        silent no-op.
+    """
+    try:
+        payload = json.loads(seed_path.read_text())
+    except OSError as exc:
+        raise CatalogSeedError(f"catalog seed not readable: {seed_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise CatalogSeedError(
+            f"catalog seed is not valid JSON: {seed_path} ({exc.msg})"
+        ) from exc
+    documents = payload.get("documents") if isinstance(payload, dict) else None
+    if not isinstance(documents, dict):
+        raise CatalogSeedError(
+            f"catalog seed {seed_path} has no 'documents' object mapping "
+            "document_id -> EDGAR fields"
+        )
+    return {
+        str(document_id): {
+            key: str(value)
+            for key, value in row.items()
+            if key in _EDGAR_CATALOG_FIELDS and value is not None
+        }
+        for document_id, row in documents.items()
+        if isinstance(row, dict)
+    }
+
+
+def _catalog_fields_for(
+    doc: Mapping[str, object], seed_row: Mapping[str, str]
+) -> dict[str, object | None]:
+    """Resolve the five EDGAR-shaped fields for one manifest row.
+
+    Precedence is seed → value already on the row → local metadata the
+    manifest already carries. ``accession`` and ``filing_date`` have no
+    local fallback: when neither the seed nor the row supplies them the
+    field resolves to ``None`` and is written as an explicit null, so
+    the gap is visible in the catalog instead of silently absent.
+    """
+    ticker = (
+        seed_row.get("ticker")
+        or doc.get("ticker")
+        or doc.get("source_id")
+        or doc.get("company")
+    )
+    return {
+        "cik": seed_row.get("cik")
+        or doc.get("cik")
+        or _ISSUER_CIK.get(str(ticker)),
+        "accession": seed_row.get("accession") or doc.get("accession"),
+        "filing_date": seed_row.get("filing_date") or doc.get("filing_date"),
+        "form": seed_row.get("form") or doc.get("form") or doc.get("doc_type"),
+        "ticker": ticker,
+    }
+
+
+def update_catalog_fields(
+    *,
+    manifest_path: Path,
+    catalog_seed: Mapping[str, Mapping[str, str]] | None = None,
+) -> int:
+    """Emit / update the EDGAR-shaped catalog fields on every manifest
+    row and return the number of rows that changed.
+
+    This is the local ingest path's catalog step (spec § Success
+    Criteria: "Ingest CLI over existing corpus can emit/update catalog
+    fields for ``AAPL-2023Q3`` without SEC GET"). It reads only the
+    manifest's own local metadata plus ``catalog_seed`` — no SEC host
+    is opened here, and no other module on this path imports
+    ``urllib``.
+
+    The drift check is semantic, not byte-level: when no row's fields
+    change the file is not rewritten at all, so an ingest run over an
+    already-complete manifest leaves its bytes (and its hand-authored
+    formatting) untouched.
+    """
+    payload = json.loads(manifest_path.read_text())
+    seed = catalog_seed or {}
+    changed_rows = 0
+    for doc in payload["documents"]:
+        resolved = _catalog_fields_for(doc, seed.get(doc["document_id"], {}))
+        row_changed = False
+        for key in _EDGAR_CATALOG_FIELDS:
+            value = resolved[key]
+            if key not in doc or doc[key] != value:
+                doc[key] = value
+                row_changed = True
+        if row_changed:
+            changed_rows += 1
+    if changed_rows:
+        _atomic_write(
+            manifest_path,
+            json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+            + b"\n",
+        )
+    return changed_rows
+
+
 def run_ingest(
     *,
     manifest_path: Path,
@@ -389,6 +532,8 @@ def run_ingest(
     facts_root: Path | None = None,
     ocr_engine: OCREngine | None = None,
     ocr_required_marker: str | None = None,
+    catalog_seed: Mapping[str, Mapping[str, str]] | None = None,
+    catalog_seed_path: Path | None = None,
 ) -> IngestResult:
     """Run the idempotent ingest command.
 
@@ -421,6 +566,13 @@ def run_ingest(
         the OCR path without a real scanned-PDF fixture. When
         truthy, the page is treated as OCR-required even if the
         text-layer extraction is rich.
+    catalog_seed:
+        In-process ``{document_id: {edgar_field: value}}`` seed for
+        the catalog step (see ``update_catalog_fields``). Mutually
+        exclusive with ``catalog_seed_path``.
+    catalog_seed_path:
+        Path to the operator's ``--catalog-seed`` JSON file. Mutually
+        exclusive with ``catalog_seed``.
 
     Raises
     ------
@@ -433,13 +585,23 @@ def run_ingest(
         supplied, or the engine raises / returns empty text. Per
         spec, the unit is not marked complete and no frozen text
         is written.
+    CatalogSeedError
+        If ``catalog_seed_path`` names a file that cannot be read or
+        parsed as a seed.
 
     IngestMissingError
-        Not raised here — see ``fin.corpus.extracted.load_extracted_tree``
-        for the read-side check.
+        Otherwise not raised here — see
+        ``fin.corpus.extracted.load_extracted_tree`` for the read-side
+        check.
     """
     if facts_root is None:
         facts_root = Path(__file__).resolve().parents[3] / "data" / "corpus" / "facts"
+    if catalog_seed is not None and catalog_seed_path is not None:
+        raise ValueError(
+            "pass either catalog_seed or catalog_seed_path, not both"
+        )
+    if catalog_seed_path is not None:
+        catalog_seed = load_catalog_seed(catalog_seed_path)
 
     # Import here so this module's pdfplumber dep does not transitively
     # leak into the ask path if the facts module is reached via
@@ -463,7 +625,16 @@ def run_ingest(
     pages_total = 0
     pages_written = 0
     pages_skipped = 0
-    index: dict[str, dict[str, object]] = {}
+    # Start from the entries this run has no authority over. The
+    # manifest is the SSOT for the frozen PDFs only; documents the
+    # gated live path froze into the same tree (keyed by accession)
+    # must survive a local re-ingest, or the two writers take turns
+    # deleting each other's catalog.
+    index: dict[str, dict[str, object]] = {
+        document_id: entry
+        for document_id, entry in (existing_index or {}).items()
+        if document_id not in {doc["document_id"] for doc in documents}
+    }
 
     # Sort by document_id so on-disk ordering is deterministic across
     # runs and machines.
@@ -556,6 +727,13 @@ def run_ingest(
     ).encode("utf-8")
     _write_if_drifted(extracted_root / "_index.json", index_payload)
 
+    # Catalog step: only after every document extracted cleanly, so a
+    # run that dies on a sha mismatch or an OCR-required unit does not
+    # leave a catalog row claiming a filing this run never wrote.
+    catalog_updated = update_catalog_fields(
+        manifest_path=manifest_path, catalog_seed=catalog_seed
+    )
+
     # Seed the fact table for every document. The seed list is a
     # per-document static mapping in ``facts_seed`` — T1 only ships
     # the AAPL-2023Q3 row (the v1 gold span); other documents get an
@@ -578,6 +756,7 @@ def run_ingest(
         pages=pages_total,
         pages_written=pages_written,
         pages_skipped=pages_skipped,
+        catalog_updated=catalog_updated,
     )
 
 
@@ -656,6 +835,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--facts-root", type=Path, default=default_facts)
     parser.add_argument(
+        "--catalog-seed",
+        type=Path,
+        default=None,
+        help=(
+            "JSON file of EDGAR-shaped catalog values to write onto "
+            "the manifest rows, shaped "
+            '{"documents": {"<document_id>": {"accession": ..., '
+            '"filing_date": ..., "cik": ..., "form": ..., '
+            '"ticker": ...}}}. Read locally — this CLI never opens a '
+            "SEC host; the gated live fetch is "
+            "`python -m fin.corpus.live_fetch`."
+        ),
+    )
+    parser.add_argument(
         "--ocr-engine",
         choices=("tesseract", "none"),
         default="tesseract",
@@ -677,17 +870,27 @@ def main(argv: list[str] | None = None) -> int:
         extracted_root=args.extracted_root,
         facts_root=args.facts_root,
         ocr_engine=ocr_engine,
+        catalog_seed_path=args.catalog_seed,
     )
     print(
         f"ingest: documents={result.documents} "
         f"pages={result.pages} "
         f"written={result.pages_written} "
-        f"skipped={result.pages_skipped}"
+        f"skipped={result.pages_skipped} "
+        f"catalog_updated={result.catalog_updated}"
     )
     return 0
 
 
-__all__ = ["IngestResult", "run_ingest", "main", "_resolve_ocr_engine"]
+__all__ = [
+    "CatalogSeedError",
+    "IngestResult",
+    "load_catalog_seed",
+    "run_ingest",
+    "update_catalog_fields",
+    "main",
+    "_resolve_ocr_engine",
+]
 
 
 if __name__ == "__main__":

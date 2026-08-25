@@ -369,6 +369,47 @@ def test_mcp_adapter_satisfies_retrieve_port() -> None:
     assert isinstance(adapter, RetrievePort)
 
 
+# ----- JSON-RPC arguments -----
+
+
+class _CapturingAdapter(_ScriptedAdapter):
+    """Records the JSON-RPC payload the adapter would send."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(scripted_response={"hits": []}, **kwargs)  # type: ignore[arg-type]
+        self.payloads: list[dict] = []
+
+    async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
+        self.payloads.append(payload)
+        return await super()._call_mcp(payload)
+
+
+def test_omitted_filters_are_absent_from_the_request() -> None:
+    """A caller that passes no EDGAR filters must not produce a
+    ``filter`` block at all.
+
+    ``_is_blank(None)`` is ``False`` — ``None`` means "the caller did
+    not pass this filter" — so testing ``not _is_blank(v)`` let every
+    unset filter through as an explicit ``null``. iknow-memory then
+    received ``{"cik": null, "form": null, ...}``: at best noise, at
+    worst a filter that matches no document, which reads back as an
+    ordinary empty result.
+    """
+    adapter = _CapturingAdapter()
+    adapter.retrieve("revenue")
+    arguments = adapter.payloads[0]["params"]["arguments"]
+    assert "filter" not in arguments, arguments
+
+
+def test_supplied_filters_are_forwarded_in_the_request() -> None:
+    """The filters the caller DID pass still reach the server, and
+    only those."""
+    adapter = _CapturingAdapter()
+    adapter.retrieve("revenue", cik="0000320193", form="10-Q")
+    arguments = adapter.payloads[0]["params"]["arguments"]
+    assert arguments["filter"] == {"cik": "0000320193", "form": "10-Q"}
+
+
 # ----- locator_map injection -----
 
 

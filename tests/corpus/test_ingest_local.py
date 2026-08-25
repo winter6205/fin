@@ -26,6 +26,8 @@ connection (default pytest contract per spec § Success Criteria).
 from __future__ import annotations
 
 import json
+import shutil
+import socket
 import urllib.error
 from pathlib import Path
 from unittest import mock
@@ -34,6 +36,7 @@ import pytest
 
 from fin.corpus.facts import read_facts
 from fin.corpus.facts_seed import seed_facts_for_document
+from fin.corpus.ingest import run_ingest, update_catalog_fields
 from fin.corpus.live_fetch import (
     SecHttpFailError,
     SecUaUnsetError,
@@ -66,6 +69,79 @@ def test_manifest_entries_carry_optional_edgar_fields() -> None:
         assert required_optional_keys.issubset(doc.keys()), (
             f"{doc['document_id']} missing one of {required_optional_keys}"
         )
+
+
+# The four frozen AAPL 10-Qs, keyed to the EDGAR submissions JSON for
+# CIK 0000320193 (`data.sec.gov/submissions/CIK0000320193.json`). Each
+# pair is the 10-Q whose EDGAR ``reportDate`` equals the quarterly
+# period end printed on that document's frozen cover page — see
+# ``test_manifest_filing_dates_match_the_frozen_signature_pages`` for
+# the in-repo half of the evidence.
+_AAPL_EDGAR_ROWS = {
+    "AAPL-2022Q3": ("0000320193-22-000070", "2022-07-29"),
+    "AAPL-2023Q1": ("0000320193-23-000006", "2023-02-03"),
+    "AAPL-2023Q2": ("0000320193-23-000064", "2023-05-05"),
+    "AAPL-2023Q3": ("0000320193-23-000077", "2023-08-04"),
+}
+
+
+def test_aapl_manifest_rows_carry_the_10q_accession_not_the_10k() -> None:
+    """Regression: the AAPL rows had been shifted onto neighbouring
+    filings — ``AAPL-2023Q3`` carried ``0000320193-23-000106``, which
+    is Apple's FY2023 **10-K** (filed 2023-11-03), and ``AAPL-2022Q3``
+    carried the FY2022 10-K. A catalog row must point at the filing
+    whose bytes are frozen under that ``document_id``.
+    """
+    documents = json.loads(
+        (_project_data_dir() / "manifest.json").read_text()
+    )["documents"]
+    rows = {doc["document_id"]: doc for doc in documents}
+
+    for document_id, (accession, filing_date) in _AAPL_EDGAR_ROWS.items():
+        assert rows[document_id]["accession"] == accession
+        assert rows[document_id]["filing_date"] == filing_date
+        assert rows[document_id]["form"] == "10-Q"
+
+
+def test_manifest_filing_dates_match_the_frozen_signature_pages() -> None:
+    """Every manifest ``filing_date`` must sit within five days of the
+    signature date printed on that document's own frozen pages.
+
+    This is the in-repo half of the catalog evidence: the frozen text
+    is committed, so a row shifted onto a different filing (the AAPL
+    10-K rows were 92 days out) fails without any SEC call. Documents
+    whose frozen text carries no parseable signature date — the MSFT
+    PDFs render theirs differently — have no local evidence to check
+    and are skipped.
+    """
+    import datetime
+    import re
+
+    data_dir = _project_data_dir()
+    documents = json.loads((data_dir / "manifest.json").read_text())["documents"]
+    checked = 0
+    for doc in documents:
+        document_id = doc["document_id"]
+        pages = sorted((data_dir / "extracted" / document_id).glob("page-*.json"))
+        signature_date: datetime.date | None = None
+        for page_path in pages[-4:]:
+            text = json.loads(page_path.read_text())["text"]
+            match = re.search(
+                r"(?i)\bdated?\s*:?\s*([A-Z][a-z]+ \d{1,2}, \d{4})", text
+            )
+            if match:
+                signature_date = datetime.datetime.strptime(
+                    match.group(1), "%B %d, %Y"
+                ).date()
+        if signature_date is None:
+            continue
+        checked += 1
+        filed = datetime.date.fromisoformat(doc["filing_date"])
+        assert 0 <= (filed - signature_date).days <= 5, (
+            f"{document_id} filing_date={doc['filing_date']} is not "
+            f"consistent with its frozen signature date {signature_date}"
+        )
+    assert checked >= 8, "signature-date evidence went missing from the corpus"
 
 
 # ---------- facts: local ingest writes the fact table ----------
@@ -254,6 +330,200 @@ def test_ua_unset_empty_string_also_raises_typed_error(
             )
 
     assert urlopen_spy.call_count == 0
+
+
+# ---------- catalog: local ingest emits/updates the EDGAR fields ----------
+
+
+def _stage_aapl_2023q3(
+    tmp_path: Path, *, strip_edgar_fields: bool = True
+) -> tuple[Path, Path]:
+    """Stage a one-document ``AAPL-2023Q3`` corpus under ``tmp_path``.
+
+    Returns ``(manifest_path, pdf_dir)``. The manifest row keeps the
+    local metadata the ingest CLI is allowed to read (``source_id`` /
+    ``company`` / ``doc_type`` / ``period`` / ``sha256``) and, by
+    default, drops every EDGAR-shaped catalog field so the test can
+    prove the ingest CLI is the thing that puts them back.
+    """
+    _, real_pdf_dir, documents = _project_manifest()
+    row = next(d for d in documents if d["document_id"] == "AAPL-2023Q3")
+    if strip_edgar_fields:
+        row = {
+            key: value
+            for key, value in row.items()
+            if key not in {"cik", "accession", "filing_date", "form", "ticker"}
+        }
+    pdf_dir = tmp_path / "pdf"
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(real_pdf_dir / row["filename"], pdf_dir / row["filename"])
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "upstream": {"repo": "test"},
+                "tickers": ["AAPL"],
+                "periods": ["2023 Q3"],
+                "note": "catalog-write fixture",
+                "documents": [row],
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return manifest_path, pdf_dir
+
+
+_AAPL_2023Q3_SEED = {
+    "AAPL-2023Q3": {
+        "accession": "0000320193-23-000077",
+        "filing_date": "2023-08-04",
+    }
+}
+
+
+def test_update_catalog_fields_writes_edgar_shape_from_local_metadata(
+    tmp_path: Path,
+) -> None:
+    """``update_catalog_fields`` fills ``cik`` / ``ticker`` / ``form``
+    from the manifest's own local metadata and ``accession`` /
+    ``filing_date`` from the operator seed — no SEC GET.
+
+    Spec § Success Criteria: "Ingest CLI over existing corpus can
+    emit/update catalog fields for ``AAPL-2023Q3`` without SEC GET".
+    """
+    manifest_path, _ = _stage_aapl_2023q3(tmp_path)
+
+    updated = update_catalog_fields(
+        manifest_path=manifest_path, catalog_seed=_AAPL_2023Q3_SEED
+    )
+
+    assert updated == 1
+    row = json.loads(manifest_path.read_text())["documents"][0]
+    assert row["cik"] == "0000320193"
+    assert row["ticker"] == "AAPL"
+    assert row["form"] == "10-Q"
+    assert row["accession"] == "0000320193-23-000077"
+    assert row["filing_date"] == "2023-08-04"
+
+
+def test_update_catalog_fields_is_byte_idempotent(tmp_path: Path) -> None:
+    """A second ``update_catalog_fields`` over an already-complete
+    catalog reports zero updates and leaves the file bytes alone
+    (ADR 0020 idempotency)."""
+    manifest_path, _ = _stage_aapl_2023q3(tmp_path)
+    update_catalog_fields(
+        manifest_path=manifest_path, catalog_seed=_AAPL_2023Q3_SEED
+    )
+    first = manifest_path.read_bytes()
+
+    updated = update_catalog_fields(
+        manifest_path=manifest_path, catalog_seed=_AAPL_2023Q3_SEED
+    )
+
+    assert updated == 0
+    assert manifest_path.read_bytes() == first
+
+
+def test_update_catalog_fields_seed_corrects_a_drifted_row(
+    tmp_path: Path,
+) -> None:
+    """The seed is authoritative: a row already carrying a wrong
+    ``accession`` / ``filing_date`` is corrected, not left alone."""
+    manifest_path, _ = _stage_aapl_2023q3(
+        tmp_path, strip_edgar_fields=False
+    )
+    payload = json.loads(manifest_path.read_text())
+    payload["documents"][0]["accession"] = "0000320193-23-000106"
+    payload["documents"][0]["filing_date"] = "2023-11-03"
+    manifest_path.write_text(json.dumps(payload, indent=2) + "\n")
+
+    updated = update_catalog_fields(
+        manifest_path=manifest_path, catalog_seed=_AAPL_2023Q3_SEED
+    )
+
+    assert updated == 1
+    row = json.loads(manifest_path.read_text())["documents"][0]
+    assert row["accession"] == "0000320193-23-000077"
+    assert row["filing_date"] == "2023-08-04"
+
+
+def test_committed_manifest_needs_no_catalog_update(tmp_path: Path) -> None:
+    """The committed corpus manifest is already catalog-complete, so
+    an ingest run over it never rewrites the repo's manifest.
+
+    This is the guard that keeps ``run_ingest`` — which several test
+    modules point at the committed ``data/corpus/manifest.json`` —
+    from dirtying the working tree as a side effect.
+    """
+    committed = _project_data_dir() / "manifest.json"
+    copy = tmp_path / "manifest.json"
+    shutil.copyfile(committed, copy)
+
+    assert update_catalog_fields(manifest_path=copy) == 0
+    assert copy.read_bytes() == committed.read_bytes()
+
+
+def test_local_ingest_emits_catalog_fields_without_opening_a_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The full local ingest CLI path over the existing ``AAPL-2023Q3``
+    corpus writes the EDGAR-shaped catalog fields, and opens no socket
+    while doing it.
+
+    ``socket.socket.connect`` is patched to raise, so any attempt to
+    reach ``www.sec.gov`` / ``data.sec.gov`` (or anything else) during
+    ingest fails the test rather than silently succeeding.
+    """
+    manifest_path, pdf_dir = _stage_aapl_2023q3(tmp_path)
+    seed_path = tmp_path / "catalog-seed.json"
+    seed_path.write_text(json.dumps({"documents": _AAPL_2023Q3_SEED}))
+
+    def _no_network(*args: object, **kwargs: object) -> None:
+        raise AssertionError("local ingest opened a network socket")
+
+    monkeypatch.setattr(socket.socket, "connect", _no_network)
+    result = run_ingest(
+        manifest_path=manifest_path,
+        pdf_dir=pdf_dir,
+        extracted_root=tmp_path / "extracted",
+        facts_root=tmp_path / "facts",
+        catalog_seed_path=seed_path,
+    )
+
+    assert result.catalog_updated == 1
+    row = json.loads(manifest_path.read_text())["documents"][0]
+    assert row["cik"] == "0000320193"
+    assert row["accession"] == "0000320193-23-000077"
+    assert row["filing_date"] == "2023-08-04"
+    assert row["form"] == "10-Q"
+    assert row["ticker"] == "AAPL"
+
+
+def test_catalog_fields_land_in_list_filings_filters(tmp_path: Path) -> None:
+    """The fields ingest writes are the ones ``list_filings`` filters
+    on — the catalog reads the manifest ingest just updated."""
+    from fin.corpus.catalog import list_filings
+
+    manifest_path, pdf_dir = _stage_aapl_2023q3(tmp_path)
+    extracted_root = tmp_path / "extracted"
+    run_ingest(
+        manifest_path=manifest_path,
+        pdf_dir=pdf_dir,
+        extracted_root=extracted_root,
+        facts_root=tmp_path / "facts",
+        catalog_seed=_AAPL_2023Q3_SEED,
+    )
+
+    hits = list_filings(
+        cik="0000320193",
+        form="10-Q",
+        filing_date="2023-08-04",
+        manifest_path=manifest_path,
+        extracted_root=extracted_root,
+    )
+
+    assert [hit["document_id"] for hit in hits["filings"]] == ["AAPL-2023Q3"]
 
 
 # ---------- helpers ----------

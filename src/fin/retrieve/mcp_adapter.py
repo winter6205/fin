@@ -33,6 +33,14 @@ whose ``source_ref`` is not in the map are **dropped** — the
 adapter never passes an iknow-memory id to the citation gate
 (ADR 0030 + spec success-criteria item 7).
 
+Because mapper-drop is silent by design, an adapter built with
+an empty map answers every query with ``{"chunks": []}`` and
+looks perfectly healthy. Wiring the map is therefore the
+caller's job, and ``fin.host.compile_graph`` refuses to build a
+product adapter without one: it derives
+``"{document_id}#{page}"`` keys from the extracted tree unless
+the operator supplies an explicit map.
+
 Error contract
 --------------
 
@@ -139,10 +147,11 @@ class MCPRetrieveAdapter:
         sees a typed ``retrieve_unavailable`` rather than a
         silent fall-through.
     locator_map
-        Map from iknow-memory ``source_ref`` id (typically a
-        UUID) to a fin ``Locator``. Hits whose id is not in
-        the map are dropped (never passed through to the
-        citation gate).
+        Map from iknow-memory ``source_ref`` id to a fin
+        ``Locator``. Hits whose id is not in the map are dropped
+        (never passed through to the citation gate). An empty
+        map drops everything; ``compile_graph`` treats that as a
+        configuration error rather than a retrieve result.
     timeout_seconds
         Per-call timeout on the JSON-RPC exchange. Default 5s
         (operator override via constructor).
@@ -266,14 +275,19 @@ class MCPRetrieveAdapter:
         }
         if document_id is not None:
             arguments["document_id"] = document_id
-        if not _is_blank(cik):
-            arguments.setdefault("filter", {})["cik"] = cik
-        if not _is_blank(form):
-            arguments.setdefault("filter", {})["form"] = form
-        if not _is_blank(ticker):
-            arguments.setdefault("filter", {})["ticker"] = ticker
-        if not _is_blank(filing_date):
-            arguments.setdefault("filter", {})["filing_date"] = filing_date
+        # Only filters the caller actually passed. Blank values
+        # already short-circuited above, so a non-``None`` value
+        # here is a real filter; a ``None`` means "unset" and must
+        # NOT be sent as an explicit ``null`` the server would try
+        # to match on.
+        for key, value in (
+            ("cik", cik),
+            ("form", form),
+            ("ticker", ticker),
+            ("filing_date", filing_date),
+        ):
+            if value is not None:
+                arguments.setdefault("filter", {})[key] = value
 
         payload = {
             "jsonrpc": "2.0",
