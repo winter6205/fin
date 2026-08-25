@@ -12,17 +12,10 @@ cd "$REPO_ROOT"
 log() { printf '\n=== cursor-start: %s ===\n' "$*"; }
 
 # --------------------------------------------------------------------
-# Git identity (every boot)
+# Git attribution (every boot: overwrite if the platform rewrote identity/hooks)
 # --------------------------------------------------------------------
-# install may only run when a snapshot is built; start runs on every pod.
-# Re-pin so fresh checkouts / older snapshots still get winter6205.
-FIN_GIT_NAME="winter6205"
-FIN_GIT_EMAIL="136674824+winter6205@users.noreply.github.com"
-log "git author identity"
-git config --global user.name "$FIN_GIT_NAME"
-git config --global user.email "$FIN_GIT_EMAIL"
-git config --local user.name "$FIN_GIT_NAME"
-git config --local user.email "$FIN_GIT_EMAIL"
+log "git attribution"
+bash "$REPO_ROOT/scripts/cursor-git-attribution.sh"
 
 log "dockerd"
 bash "$REPO_ROOT/scripts/cursor-dockerd.sh" start

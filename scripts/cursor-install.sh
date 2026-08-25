@@ -13,22 +13,6 @@ cd "$REPO_ROOT"
 log() { printf '\n=== cursor-install: %s ===\n' "$*"; }
 
 # --------------------------------------------------------------------
-# Git identity (Cloud Agent commits)
-# --------------------------------------------------------------------
-# Hosted Cloud Agents default global identity to
-# "Cursor Agent <cursoragent@cursor.com>". Pin both global and repo-local
-# so plain `git commit` attributes to the repo owner. Idempotent.
-# Note: platform tooling may still add Co-authored-by / override author;
-# this only covers git-config-based commits (no history rewrite / force).
-FIN_GIT_NAME="winter6205"
-FIN_GIT_EMAIL="136674824+winter6205@users.noreply.github.com"
-log "git author identity"
-git config --global user.name "$FIN_GIT_NAME"
-git config --global user.email "$FIN_GIT_EMAIL"
-git config --local user.name "$FIN_GIT_NAME"
-git config --local user.email "$FIN_GIT_EMAIL"
-
-# --------------------------------------------------------------------
 # PATH
 # --------------------------------------------------------------------
 # nvm's node only lands on PATH for shells that source ~/.bashrc, and the
@@ -148,5 +132,8 @@ playwright-cli --version
 
 log "chromium for playwright"
 npx --yes playwright install --with-deps chromium
+
+log "git attribution (overwrite platform identity/hooks)"
+bash "$REPO_ROOT/scripts/cursor-git-attribution.sh"
 
 log "done"
