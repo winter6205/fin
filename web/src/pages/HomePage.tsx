@@ -5,8 +5,21 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import CorpusCard from "../components/CorpusCard";
+import {
+  decideLastThreadRestore,
+  forgetLastThread,
+  readLastThread,
+} from "../lastThread";
 import { CORPUS_HOME_GATE_KEY } from "../sessionKeys";
 import { useWorkspaceStore } from "../store";
+
+function readCorpusHomeGate(): boolean {
+  try {
+    return window.sessionStorage.getItem(CORPUS_HOME_GATE_KEY) === "1";
+  } catch {
+    return false; /* storage unavailable - no gate. */
+  }
+}
 
 export default function HomePage() {
   const threads = useWorkspaceStore((s) => s.threads);
@@ -24,32 +37,19 @@ export default function HomePage() {
   const threadsLoaded = useWorkspaceStore((s) => s.threadsLoaded);
   const restoreAttempted = useRef(false);
   useEffect(() => {
-    if (restoreAttempted.current || !threadsLoaded) return;
+    if (restoreAttempted.current) return;
+    const decision = decideLastThreadRestore({
+      threadsLoaded,
+      lastThreadId: readLastThread(),
+      threadIds: threads.map((t) => t.id),
+      homeGateActive: readCorpusHomeGate(),
+    });
+    if (decision.action === "wait") return;
     restoreAttempted.current = true;
-    try {
-      if (window.sessionStorage.getItem(CORPUS_HOME_GATE_KEY) === "1") {
-        return;
-      }
-    } catch {
-      /* storage unavailable */
-    }
-    let lastId: string | null = null;
-    try {
-      lastId = window.localStorage.getItem("fin.lastThread");
-    } catch {
-      return;
-    }
-    if (!lastId) return;
-    if (threads.some((t) => t.id === lastId)) {
-      navigate(`/t/${lastId}`, { replace: true });
-    } else {
-      // Stale marker (thread deleted elsewhere / unknown id):
-      // drop it so future visits do not re-check a dead id.
-      try {
-        window.localStorage.removeItem("fin.lastThread");
-      } catch {
-        /* storage unavailable. */
-      }
+    if (decision.action === "restore") {
+      navigate(`/t/${decision.threadId}`, { replace: true });
+    } else if (decision.action === "forget") {
+      forgetLastThread();
     }
   }, [threadsLoaded, threads, navigate]);
 

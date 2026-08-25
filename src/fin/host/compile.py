@@ -102,6 +102,13 @@ EXPECTED_CHECKPOINT_URL = (
 # opts out by name with ``FIN_RETRIEVE_ADAPTER=fake``.
 DEFAULT_RETRIEVE_ADAPTER = "mcp"
 
+# The launch command ``compile_graph`` uses when it auto-builds the
+# product ``MCPRetrieveAdapter`` (``fin.host.graph``'s own default).
+# Named here so the boot-time reachability probe in
+# ``fin.host.operator_env`` checks the exact argv the graph would
+# spawn instead of re-spelling the binary name.
+DEFAULT_MCP_COMMAND: tuple[str, ...] = ("iknow-memory", "serve")
+
 
 # ----- typed errors -----
 
@@ -436,6 +443,7 @@ def compile_for_runtime_dev(
 
 __all__ = [
     "DEFAULT_BASE_URL",
+    "DEFAULT_MCP_COMMAND",
     "DEFAULT_MODEL",
     "DEFAULT_RETRIEVE_ADAPTER",
     "EXPECTED_CHECKPOINT_URL",

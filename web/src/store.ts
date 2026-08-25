@@ -4,6 +4,9 @@
 
 import { create } from "zustand";
 import * as api from "./api";
+// T5 (#35): the last opened thread id, persisted so a returning
+// visit lands back on that thread.
+import { forgetLastThreadIf, rememberLastThread } from "./lastThread";
 import type {
   Filing,
   ThreadDetail,
@@ -52,29 +55,6 @@ interface WorkspaceState {
   // by re-checking ``get().activeThread?.id`` against ``threadId``
   // on every patch.
   resumeThread: (threadId: string) => Promise<api.SendResult | null>;
-}
-
-// T5 (#35): the last opened thread id, persisted so a returning
-// visit lands back on that thread. Plain-string localStorage I/O —
-// storage failures degrade to "no restore" (wrapped by callers).
-const LAST_THREAD_KEY = "fin.lastThread";
-
-function rememberLastThread(threadId: string): void {
-  try {
-    window.localStorage.setItem(LAST_THREAD_KEY, threadId);
-  } catch {
-    /* storage unavailable - no restore on next visit. */
-  }
-}
-
-function clearLastThread(threadId: string): void {
-  try {
-    if (window.localStorage.getItem(LAST_THREAD_KEY) === threadId) {
-      window.localStorage.removeItem(LAST_THREAD_KEY);
-    }
-  } catch {
-    /* storage unavailable - nothing to clear. */
-  }
 }
 
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
@@ -127,7 +107,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     await api.deleteThread(threadId);
     // T5 (#35): a deleted thread must never be restored on the next
     // visit — drop the marker when it pointed here.
-    clearLastThread(threadId);
+    forgetLastThreadIf(threadId);
     set((s) => ({
       threads: s.threads.filter((t) => t.id !== threadId),
       activeThread:
@@ -193,12 +173,12 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       });
     }
 
+    // T1 (#33): answer frames are DELTAS while the model streams; after
+    // ``status`` the wire may emit one authoritative frame — on ``done``
+    // runs we keep a non-empty draft; on refuse/step_cap an empty frame
+    // clears the draft so SC67 copy renders from ``assistant_message``.
+    let statusSeen = false;
     try {
-      // T1 (#33): answer frames are DELTAS while the model streams; after
-      // ``status`` the wire may emit one authoritative frame — on ``done``
-      // runs we keep a non-empty draft; on refuse/step_cap an empty frame
-      // clears the draft so SC67 copy renders from ``assistant_message``.
-      let statusSeen = false;
       const result = await api.sendMessage(
         threadId,
         { question, thinking: thinkingOn },
@@ -296,6 +276,20 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       }
       await get().refreshThreads();
       return result;
+    } catch (error) {
+      // The send failed (409 concurrent_run / 503 ingest_missing /
+      // transport). Before this the rejection escaped into a
+      // floating promise and the optimistic row stayed ``in_flight``
+      // forever — a ghost turn with no question answered. Drop the
+      // row when no frame ever landed on it; keep (but un-live) a
+      // row the stream had already started painting, then rethrow so
+      // the composer can show the failure.
+      if (statusSeen) {
+        patchTurn((t) => ({ ...t, in_flight: false }));
+      } else {
+        dropTurnByRunId(threadId, optimisticRunId);
+      }
+      throw error;
     } finally {
       set({ sendingQuestion: false });
     }
@@ -420,6 +414,20 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
   },
 }));
+
+// Remove an optimistic turn that never received a single SSE frame.
+// No-op when the operator has navigated away, so a failed send on
+// thread A cannot delete a row on thread B.
+function dropTurnByRunId(threadId: string, runId: Turn["run_id"]): void {
+  const current = useWorkspaceStore.getState().activeThread;
+  if (!current || current.id !== threadId) return;
+  useWorkspaceStore.setState({
+    activeThread: {
+      ...current,
+      turns: current.turns.filter((t) => t.run_id !== runId),
+    },
+  });
+}
 
 // T4 helper: patch the most-recent turn on ``threadId`` (the one
 // the resume is working on). No-op when the operator has navigated

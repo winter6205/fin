@@ -11,6 +11,10 @@
 // shows the locator + a tap-to-reveal quote.
 
 import { useId, useState } from "react";
+import {
+  countUniqueSourcePages,
+  shouldCollapseSourcesList,
+} from "../sourcesList";
 import type { Citation } from "../types";
 
 type AnswerPart = string | { quote: string; index: number };
@@ -95,10 +99,6 @@ function groupCitationsByDocumentAndPage(
         citations: pageCitations,
       })),
   }));
-}
-
-function countUniquePages(citations: Citation[]): number {
-  return new Set(citations.map((c) => `${c.document_id}:${c.page}`)).size;
 }
 
 const focusRingClass =
@@ -214,8 +214,8 @@ function DocumentSourcesGroup({
 
 function SourcesList({ citations }: { citations: Citation[] }) {
   const spanCount = citations?.length ?? 0;
-  const pageCount = countUniquePages(citations ?? []);
-  const defaultCollapsed = spanCount > 10;
+  const pageCount = countUniqueSourcePages(citations ?? []);
+  const defaultCollapsed = shouldCollapseSourcesList(spanCount);
   const [open, setOpen] = useState(!defaultCollapsed);
   const panelId = useId();
   if (!citations || citations.length === 0) return null;

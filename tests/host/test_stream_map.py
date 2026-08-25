@@ -21,6 +21,8 @@ test pins one contract; if any test breaks the surface breaks.
 
 from __future__ import annotations
 
+from fin.corpus._private_fixtures import load_private_fixture
+
 from typing import Any
 
 import pytest
@@ -34,6 +36,7 @@ from fin.host.stream_map import (
     reasoning_delta_from_chunk,
     split_stream_delta,
     strip_thinking_from_answer,
+    summarize_get_xbrl_fact,
     summarize_list_files,
     summarize_read_file,
     summarize_retrieve,
@@ -296,6 +299,18 @@ def test_summarize_retrieve_accepts_locator_objects() -> None:
     assert "AAPL-2023Q1 p.4" in out
 
 
+def test_summarize_retrieve_skips_chunk_without_locator() -> None:
+    """A chunk carrying no usable ``source_ref`` still counts as a hit
+    but contributes no locator the operator cannot open."""
+    chunks = [
+        {"text": "no source_ref here"},
+        {"source_ref": {"document_id": "AAPL-2023Q1", "page": 4}},
+    ]
+    out = summarize_retrieve(chunks=chunks, args={"query": "q"})
+    assert "2 hits" in out
+    assert out.endswith(" -> AAPL-2023Q1 p.4")
+
+
 # ----- summarize_read_file -----
 
 
@@ -382,6 +397,227 @@ def test_format_tool_summary_handles_non_dict_result() -> None:
     formatter (tests sometimes pass raw ``list`` or ``str``)."""
     out = format_tool_summary("list_files", result=["raw list"], args=None)
     assert "0 filings" in out
+
+
+# ----- T8 / SC11: retrieve_unavailable is not a 0-hit miss -----
+
+
+def test_summarize_retrieve_error_reads_as_backend_unavailable() -> None:
+    """The typed EXIT gets prose, not a hit count.
+
+    ``{"error": "retrieve_unavailable"}`` means retrieval never ran;
+    rendering it as ``0 hits`` would tell the operator the corpus has
+    nothing (``specs/s1-corpus-retrieve.md`` typed EXITs)."""
+    out = summarize_retrieve(
+        chunks=None, args={"query": "growth"}, error="retrieve_unavailable"
+    )
+    assert "unavailable" in out
+    assert "0 hit" not in out
+    assert "growth" in out
+
+
+def test_summarize_retrieve_unknown_error_token_still_surfaces() -> None:
+    """A token with no copy entry still renders readably (and never
+    as a hit count) so a future typed EXIT is not silently blank."""
+    out = summarize_retrieve(chunks=None, args={"query": "q"}, error="boom")
+    assert "boom" in out
+    assert "0 hit" not in out
+
+
+def test_format_tool_summary_retrieve_unavailable_differs_from_zero_hits() -> (
+    None
+):
+    """SC11: the two summaries must not be the same string."""
+    unavailable = format_tool_summary(
+        "retrieve",
+        result={"error": "retrieve_unavailable"},
+        args={"query": "growth"},
+    )
+    zero_hits = format_tool_summary(
+        "retrieve", result={"chunks": []}, args={"query": "growth"}
+    )
+    assert unavailable != zero_hits
+    assert "0 hits" in zero_hits
+    assert "0 hits" not in unavailable
+    assert "unavailable" in unavailable
+
+
+# ----- T8 / SC11: get_xbrl_fact one-liner -----
+
+
+def test_summarize_get_xbrl_fact_renders_concept_period_and_value() -> None:
+    """A hit reads as ``concept period = value (unit, scale)`` plus
+    the source locator — the fact row in one line (ADR 0031)."""
+    out = summarize_get_xbrl_fact(
+        result={
+            "concept": "us-gaap:Revenues",
+            "value": load_private_fixture("e8e6fa2502cf2441d4f1862bbbb7d147b7dbd57a3911be363417fe4342e69b94"),
+            "period": "2023-Q3-YTD",
+            "unit": "USD",
+            "scale": "millions",
+            "source_locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "v" * 64,
+                "page": 4,
+            },
+        },
+        args={"concept": "us-gaap:Revenues", "period": "2023-Q3-YTD"},
+    )
+    assert "us-gaap:Revenues" in out
+    assert "2023-Q3-YTD" in out
+    assert load_private_fixture("c18591bcf0070a92596e8fa66285e8cb7eafe482710c7f278506d2292ef3c207") in out
+    assert "USD" in out
+    assert "millions" in out
+    assert "AAPL-2023Q3 p.4" in out
+
+
+def test_summarize_get_xbrl_fact_renders_float_value() -> None:
+    """A non-integral value keeps its decimals."""
+    out = summarize_get_xbrl_fact(
+        result={"concept": "c", "period": "p", "value": 1.25},
+        args=None,
+    )
+    assert "1.25" in out
+
+
+def test_summarize_get_xbrl_fact_appends_miss_token() -> None:
+    """The typed miss (``fact_not_found``) surfaces its token the
+    same way ``summarize_read_file`` surfaces ``unknown_locator``."""
+    out = summarize_get_xbrl_fact(
+        result={
+            "error": "fact_not_found",
+            "concept": "us-gaap:Revenues",
+            "period": "2099-Q1",
+            "document_id": "AAPL-2023Q3",
+        },
+        args={"concept": "us-gaap:Revenues", "period": "2099-Q1"},
+    )
+    assert "(fact_not_found)" in out
+    assert "us-gaap:Revenues" in out
+
+
+def test_summarize_get_xbrl_fact_falls_back_to_args_without_result() -> None:
+    """No ``ToolMessage`` for the call (result ``None``): the
+    arguments still describe what was looked up."""
+    out = summarize_get_xbrl_fact(
+        result=None,
+        args={"concept": "us-gaap:Revenues", "period": "2023-Q3-YTD"},
+    )
+    assert out == "us-gaap:Revenues 2023-Q3-YTD"
+
+
+def test_format_tool_summary_get_xbrl_fact_is_not_the_bare_name() -> None:
+    """SC11: ``get_xbrl_fact`` no longer falls through to the bare
+    tool name in the tools region."""
+    out = format_tool_summary(
+        "get_xbrl_fact",
+        result={
+            "concept": "us-gaap:Revenues",
+            "value": load_private_fixture("e8e6fa2502cf2441d4f1862bbbb7d147b7dbd57a3911be363417fe4342e69b94"),
+            "period": "2023-Q3-YTD",
+            "unit": "USD",
+            "scale": "millions",
+            "source_locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "v" * 64,
+                "page": 4,
+            },
+        },
+        args={"concept": "us-gaap:Revenues", "period": "2023-Q3-YTD"},
+    )
+    assert out != "get_xbrl_fact"
+    assert "us-gaap:Revenues" in out
+    assert load_private_fixture("c18591bcf0070a92596e8fa66285e8cb7eafe482710c7f278506d2292ef3c207") in out
+
+
+def test_format_tool_summary_get_xbrl_fact_survives_empty_call() -> None:
+    """Defensive: neither result nor args (a malformed call) still
+    yields a readable row instead of an empty cell."""
+    out = format_tool_summary("get_xbrl_fact", result=None, args=None)
+    assert out.strip()
+    assert out != "get_xbrl_fact"
+
+
+def test_summarize_get_xbrl_fact_head_prefers_result_over_args() -> None:
+    """The tool echoes the concept it actually resolved; that wins over
+    the alias the model asked for."""
+    out = summarize_get_xbrl_fact(
+        result={
+            "concept": "us-gaap:Revenues",
+            "period": "2023-Q3",
+            "value": 1,
+        },
+        args={"concept": "revenue", "period": "Q3"},
+    )
+    assert out.startswith("us-gaap:Revenues 2023-Q3 =")
+
+
+def test_summarize_get_xbrl_fact_head_falls_back_to_placeholder() -> None:
+    """Neither side names the fact: a placeholder keeps the row
+    readable instead of leaving a bare ``= value``."""
+    out = summarize_get_xbrl_fact(result={"value": 7}, args={})
+    assert out == "xbrl fact = 7"
+
+
+def test_summarize_get_xbrl_fact_single_qualifier_no_comma() -> None:
+    """A unit without a scale renders one qualifier, not ``(USD, )``."""
+    out = summarize_get_xbrl_fact(
+        result={"concept": "c", "period": "p", "value": 1, "unit": "USD"},
+        args=None,
+    )
+    assert out == "c p = 1 (USD)"
+
+
+def test_summarize_get_xbrl_fact_no_qualifiers_omits_parens() -> None:
+    """Neither unit nor scale: no empty ``()`` after the value."""
+    out = summarize_get_xbrl_fact(
+        result={"concept": "c", "period": "p", "value": 1},
+        args=None,
+    )
+    assert out == "c p = 1"
+
+
+def test_summarize_get_xbrl_fact_locator_without_page_names_document() -> None:
+    """A page-less locator still names the document it came from."""
+    out = summarize_get_xbrl_fact(
+        result={
+            "concept": "c",
+            "period": "p",
+            "value": 1,
+            "source_locator": {"document_id": "AAPL-2023Q3"},
+        },
+        args=None,
+    )
+    assert out.endswith(" -> AAPL-2023Q3")
+
+
+def test_summarize_get_xbrl_fact_locator_without_doc_id_dropped() -> None:
+    """A locator the operator cannot open renders as nothing rather
+    than a dangling arrow."""
+    out = summarize_get_xbrl_fact(
+        result={
+            "concept": "c",
+            "period": "p",
+            "value": 1,
+            "source_locator": {"page": 4},
+        },
+        args=None,
+    )
+    assert out == "c p = 1"
+
+
+def test_summarize_get_xbrl_fact_non_dict_locator_is_dropped() -> None:
+    """A malformed ``source_locator`` (not a mapping) must not raise."""
+    out = summarize_get_xbrl_fact(
+        result={
+            "concept": "c",
+            "period": "p",
+            "value": 1,
+            "source_locator": "AAPL",
+        },
+        args=None,
+    )
+    assert out == "c p = 1"
 
 
 # ----- T1 (#33): token-delta mapping (thinking / answer split) -----

@@ -28,7 +28,8 @@ into the shapes downstream code renders:
   deltas into thinking vs answer with an inline-block filter that
   survives tags split across chunk boundaries.
 * :func:`summarize_list_files` / :func:`summarize_retrieve` /
-  :func:`summarize_read_file` / :func:`format_tool_summary` - the
+  :func:`summarize_read_file` / :func:`summarize_get_xbrl_fact` /
+  :func:`format_tool_summary` - the
   human-readable one-liners the SPA renders in the tools region
   (spec line 32). Raw ``ToolMessage`` JSON never reaches the wire;
   events carry name + short summary, correlated by tool call id.
@@ -377,10 +378,68 @@ def summarize_list_files(
     return f"{count} {noun}{suffix}"
 
 
+# Prose for the retrieve port's typed EXITs
+# (``specs/s1-corpus-retrieve.md``). A typed EXIT means retrieval
+# never ran, so it must NOT read like a miss: "0 hits" would tell
+# the operator the corpus has nothing.
+_RETRIEVE_ERROR_COPY: dict[str, str] = {
+    "retrieve_unavailable": "retrieve backend unavailable",
+}
+
+
+def _locator_fields(chunk: Any) -> tuple[str, int] | None:
+    """Pull ``(document_id, page)`` off a retrieved chunk's ``source_ref``.
+
+    Both shapes occur: the live adapter returns ``Locator`` objects, the
+    serialized ToolMessage JSON carries dicts. A chunk missing either
+    field yields ``None`` so the caller can skip it rather than render a
+    half locator the operator cannot open.
+    """
+    ref = getattr(chunk, "source_ref", None)
+    if ref is None and isinstance(chunk, dict):
+        ref = chunk.get("source_ref")
+    if ref is None:
+        return None
+    doc_id = getattr(ref, "document_id", None)
+    page = getattr(ref, "page", None)
+    if doc_id is None and isinstance(ref, dict):
+        doc_id = ref.get("document_id")
+        page = ref.get("page")
+    if doc_id is None or page is None:
+        return None
+    return str(doc_id), int(page)
+
+
+def _retrieve_locator_suffix(chunks: list[Any] | None) -> str:
+    """Render ``" -> doc p.N, doc p.M"`` for up to three retrieved chunks.
+
+    Three is the scan budget: enough for the operator to see which pages
+    were touched, short enough to stay on one line.
+    """
+    locators: list[str] = []
+    for chunk in (chunks or [])[:3]:
+        fields = _locator_fields(chunk)
+        if fields is not None:
+            locators.append(f"{fields[0]} p.{fields[1]}")
+    return " -> " + ", ".join(locators) if locators else ""
+
+
+def _retrieve_error_line(args: dict[str, Any], error: str) -> str:
+    """Render a typed EXIT as prose, keeping the query prefix if present."""
+    query_text = args.get("query")
+    prefix = (
+        f"{query_text!r}: " if isinstance(query_text, str) and query_text else ""
+    )
+    return prefix + _RETRIEVE_ERROR_COPY.get(
+        error, f"retrieve failed ({error})"
+    )
+
+
 def summarize_retrieve(
     *,
     chunks: list[Any] | None = None,
     args: dict[str, Any] | None = None,
+    error: str | None = None,
 ) -> str:
     """Human-readable one-liner for ``retrieve`` calls.
 
@@ -391,33 +450,18 @@ def summarize_retrieve(
     the serialized ToolMessage JSON carries dicts). We render the
     query, the hit count, and up to three locators so the operator
     can scan which pages were touched without reading raw JSON.
+
+    ``error`` is the tool's typed EXIT token (``retrieve_unavailable``);
+    when set it replaces the hit count with prose, and an unmapped
+    token still renders readably rather than blank.
     """
-    hits = len(chunks) if chunks else 0
     args = args or {}
+    if error:
+        return _retrieve_error_line(args, error)
+
+    hits = len(chunks) if chunks else 0
     query_value = args.get("query")
     query = query_value if isinstance(query_value, str) else ""
-
-    def _locator_fields(chunk: Any) -> tuple[str, int] | None:
-        ref = getattr(chunk, "source_ref", None)
-        if ref is None and isinstance(chunk, dict):
-            ref = chunk.get("source_ref")
-        if ref is None:
-            return None
-        doc_id = getattr(ref, "document_id", None)
-        page = getattr(ref, "page", None)
-        if doc_id is None and isinstance(ref, dict):
-            doc_id = ref.get("document_id")
-            page = ref.get("page")
-        if doc_id is None or page is None:
-            return None
-        return str(doc_id), int(page)
-
-    locators: list[str] = []
-    if chunks:
-        for chunk in chunks[:3]:
-            fields = _locator_fields(chunk)
-            if fields is not None:
-                locators.append(f"{fields[0]} p.{fields[1]}")
 
     doc_filter_value = args.get("document_id")
     doc_filter = (
@@ -425,7 +469,7 @@ def summarize_retrieve(
         if isinstance(doc_filter_value, str) and doc_filter_value
         else ""
     )
-    locator_suffix = " -> " + ", ".join(locators) if locators else ""
+    locator_suffix = _retrieve_locator_suffix(chunks)
     hits_noun = "hit" if hits == 1 else "hits"
     head = f"{query!r}: {hits} {hits_noun}" if query else f"{hits} {hits_noun}"
     return f"{head}{doc_filter}{locator_suffix}"
@@ -467,6 +511,114 @@ def summarize_read_file(
     return head
 
 
+def _format_fact_value(value: Any) -> str:
+    """Render a fact row's value with thousands separators.
+
+    Integral floats print without a trailing ``.0`` so a value the
+    JSON round-trip widened (``[private source value removed]`` -> ``[private source value removed].0``) still reads
+    the way the filing prints it.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return str(value)
+    if float(value).is_integer():
+        return f"{int(value):,}"
+    return f"{value:,}"
+
+
+def _fact_head(result: dict[str, Any], args: dict[str, Any]) -> str:
+    """Render the ``concept period`` head shared by hit and miss rows.
+
+    The result wins over the arguments (the tool echoes the resolved
+    concept, which may differ from the alias the model asked for), and
+    the arguments still describe the lookup when no ToolMessage landed.
+    Neither side present leaves a readable placeholder rather than an
+    empty cell.
+    """
+    concept = str(result.get("concept") or args.get("concept") or "")
+    period = str(result.get("period") or args.get("period") or "")
+    return " ".join(part for part in (concept, period) if part) or "xbrl fact"
+
+
+def _fact_qualifiers(result: dict[str, Any]) -> str:
+    """Render ``" (unit, scale)"`` for a hit, ``""`` when neither is set."""
+    qualifiers = ", ".join(
+        str(field)
+        for field in (result.get("unit"), result.get("scale"))
+        if field
+    )
+    return f" ({qualifiers})" if qualifiers else ""
+
+
+def _fact_locator_suffix(result: dict[str, Any]) -> str:
+    """Render ``" -> document_id p.N"`` for a hit's ``source_locator``.
+
+    A locator without a ``document_id`` cannot be opened, so it renders
+    as nothing; a page-less locator still names the document.
+    """
+    locator = result.get("source_locator")
+    if not isinstance(locator, dict) or not locator.get("document_id"):
+        return ""
+    suffix = f" -> {locator['document_id']}"
+    page = locator.get("page")
+    return f"{suffix} p.{page}" if page is not None else suffix
+
+
+def summarize_get_xbrl_fact(
+    *,
+    result: dict[str, Any] | None = None,
+    args: dict[str, Any] | None = None,
+) -> str:
+    """Human-readable one-liner for ``get_xbrl_fact`` calls.
+
+    ADR 0031 shapes: a hit carries ``concept`` / ``value`` /
+    ``period`` / ``unit`` / ``scale`` / ``source_locator``; a miss
+    carries ``{"error": "fact_not_found", ...}``. The hit renders as
+    ``concept period = value (unit, scale) -> document_id p.N``; the
+    miss appends the error token the same way
+    :func:`summarize_read_file` does, so the operator can see why the
+    numeric gate had nothing to verify against.
+    """
+    src_args = args or {}
+    src_result = result if isinstance(result, dict) else {}
+    head = _fact_head(src_result, src_args)
+
+    error = src_result.get("error")
+    if error:
+        return f"{head} ({error})"
+    if "value" not in src_result:
+        # No ToolMessage for this call (the run ended before the
+        # tool returned): the arguments still say what was looked up.
+        return head
+
+    value = _format_fact_value(src_result.get("value"))
+    qualifiers = _fact_qualifiers(src_result)
+    return f"{head} = {value}{qualifiers}{_fact_locator_suffix(src_result)}"
+
+
+def _list_files_filings(result: dict[str, Any] | None) -> list[Any] | None:
+    """Pull the ``filings`` list off a ``list_files`` result, else ``None``."""
+    if result is not None and isinstance(result.get("filings"), list):
+        return result["filings"]
+    return None
+
+
+def _retrieve_chunks_error(
+    result: dict[str, Any] | None,
+) -> tuple[list[Any] | None, str | None]:
+    """Split a ``retrieve`` result into ``(chunks, error token)``.
+
+    Either half may be absent: a typed EXIT carries no chunks, and a hit
+    carries no error.
+    """
+    if result is None:
+        return None, None
+    chunks = (
+        result["chunks"] if isinstance(result.get("chunks"), list) else None
+    )
+    raw_error = result.get("error")
+    return chunks, str(raw_error) if raw_error else None
+
+
 def format_tool_summary(
     name: str,
     *,
@@ -475,24 +627,22 @@ def format_tool_summary(
 ) -> str:
     """Dispatch to the correct ``summarize_*`` based on tool ``name``.
 
-    Exhaustive over the host graph's three tools (ADR 0009). An
-    unknown name falls back to the bare tool name so a future tool
-    still surfaces a readable row in the tools region instead of an
-    empty cell - never raw JSON.
+    Exhaustive over the host graph's four tools (ADR 0009 +
+    ``get_xbrl_fact`` from ADR 0031). An unknown name falls back to
+    the bare tool name so a future tool still surfaces a readable row
+    in the tools region instead of an empty cell - never raw JSON.
     """
     result_dict = result if isinstance(result, dict) else None
     if name == "list_files":
-        filings = None
-        if result_dict is not None and isinstance(result_dict.get("filings"), list):
-            filings = result_dict["filings"]
+        filings = _list_files_filings(result_dict)
         return summarize_list_files(filings=filings, args=args)
     if name == "retrieve":
-        chunks = None
-        if result_dict is not None and isinstance(result_dict.get("chunks"), list):
-            chunks = result_dict["chunks"]
-        return summarize_retrieve(chunks=chunks, args=args)
+        chunks, error = _retrieve_chunks_error(result_dict)
+        return summarize_retrieve(chunks=chunks, args=args, error=error)
     if name == "read_file":
         return summarize_read_file(result=result_dict, args=args)
+    if name == "get_xbrl_fact":
+        return summarize_get_xbrl_fact(result=result_dict, args=args)
     return name or "tool"
 
 
@@ -506,6 +656,7 @@ __all__ = [
     "reasoning_delta_from_chunk",
     "split_stream_delta",
     "strip_thinking_from_answer",
+    "summarize_get_xbrl_fact",
     "summarize_list_files",
     "summarize_read_file",
     "summarize_retrieve",

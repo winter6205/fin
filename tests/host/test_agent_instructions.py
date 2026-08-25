@@ -60,3 +60,21 @@ def test_messages_for_model_off_topic_selects_off_topic_prompt() -> None:
     out = messages_for_model(msgs, track="off_topic")
     assert OFF_TOPIC_INSTRUCTIONS_MARKER in str(out[0].content)
     assert out[0].content == OFF_TOPIC_SYSTEM_PROMPT
+
+
+def test_host_prompt_names_every_research_tool() -> None:
+    """The research track can call four tools; the prompt must name
+    all four, ``get_xbrl_fact`` included (spec SC12)."""
+    for tool_name in ("list_files", "retrieve", "read_file", "get_xbrl_fact"):
+        assert tool_name in HOST_SYSTEM_PROMPT
+
+
+def test_host_prompt_drops_stale_bm25_mention() -> None:
+    """BM25 is archived (ADR 0032) — the prompt must not advertise it
+    as the retrieve implementation (spec SC12)."""
+    assert "BM25" not in HOST_SYSTEM_PROMPT
+
+
+def test_host_prompt_describes_retrieve_as_the_retrieve_port() -> None:
+    """The seam wording stays ``retrieve port`` (ADR 0032)."""
+    assert "retrieve port" in HOST_SYSTEM_PROMPT

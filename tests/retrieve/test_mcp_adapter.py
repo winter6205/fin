@@ -21,7 +21,9 @@ stdio JSON-RPC path is exercised separately (manually / opt-in).
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
+import json
 
 import pytest
 
@@ -428,3 +430,172 @@ def test_default_locator_map_is_empty() -> None:
     )
     result = adapter.retrieve("foo")
     assert result == {"chunks": []}
+
+
+# ----- empty-hit envelope: a miss, never an error, never a raise -----
+
+
+def _content_block(payload: dict) -> dict:
+    """Wrap ``payload`` in the canonical MCP ``tools/call``
+    content-block envelope."""
+    return {
+        "result": {
+            "content": [{"type": "text", "text": json.dumps(payload)}]
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        pytest.param({"result": {"hits": []}}, id="result.hits"),
+        pytest.param({"hits": []}, id="top-level-hits"),
+        pytest.param(_content_block({"hits": []}), id="content-block"),
+    ],
+)
+def test_empty_hit_envelope_maps_to_empty_chunks(envelope: dict) -> None:
+    """A server that ran the search and found nothing returns an
+    empty hit list. That is the MISS shape ``{"chunks": []}`` —
+    never ``{"error": "retrieve_unavailable"}`` and never a raise.
+
+    Conflating "searched, found nothing" with "search never ran"
+    is exactly the distinction ``tests/host/test_retrieve_typed_exit.py``
+    relies on, so every envelope variant has to land on the miss
+    shape.
+    """
+    adapter = _ScriptedAdapter(
+        scripted_response=envelope,
+        locator_map={"id-A": _loc("DOC-2023Q1")},
+    )
+    assert adapter.retrieve("foo") == {"chunks": []}
+
+
+def test_empty_hit_envelope_does_not_raise_on_the_async_path() -> None:
+    """The async seam agrees with the sync one: an empty hit list
+    resolves, it does not raise ``RetrieveUnavailableError``."""
+    adapter = _ScriptedAdapter(scripted_response={"result": {"hits": []}})
+    assert asyncio.run(adapter.aretrieve("foo")) == {"chunks": []}
+
+
+# ----- no configured transport: typed EXIT, not a crash -----
+
+
+@pytest.mark.parametrize(
+    "command",
+    [pytest.param(None, id="unset"), pytest.param([], id="empty-list")],
+)
+def test_no_configured_command_returns_retrieve_unavailable(
+    command: list[str] | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The REAL ``MCPRetrieveAdapter`` (default ``_call_mcp``, no
+    scripted transport) with no usable launch command answers the
+    typed EXIT ``{"error": "retrieve_unavailable"}``.
+
+    An unconfigured adapter must not crash the run, and must not
+    answer ``{"chunks": []}`` either: reporting a miss would tell
+    the model the corpus has nothing when retrieval never ran.
+    """
+
+    async def _forbid_spawn(*args: object, **kwargs: object) -> None:
+        raise AssertionError(
+            f"the adapter tried to spawn a subprocess: {args!r}"
+        )
+
+    monkeypatch.setattr(
+        "asyncio.create_subprocess_exec", _forbid_spawn
+    )
+    adapter = MCPRetrieveAdapter(
+        command=command,
+        locator_map={"id-A": _loc("DOC-2023Q1")},
+    )
+    assert adapter.retrieve("foo") == {"error": "retrieve_unavailable"}
+
+
+def test_no_configured_command_raises_typed_error_on_async_path() -> None:
+    """The async seam raises the typed exception the sync seam
+    translates — no bare ``OSError`` / ``TypeError`` escapes."""
+    adapter = MCPRetrieveAdapter(command=None)
+    with pytest.raises(RetrieveUnavailableError):
+        asyncio.run(adapter.aretrieve("foo"))
+
+
+# ----- envelope variants: chunks or a typed error, no partial parse -----
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        pytest.param(
+            {
+                "result": {
+                    "hits": [
+                        {"text": "hit", "source_ref": "id-A", "score": 2.5}
+                    ]
+                }
+            },
+            id="result.hits",
+        ),
+        pytest.param(
+            {"hits": [{"text": "hit", "source_ref": "id-A", "score": 2.5}]},
+            id="top-level-hits",
+        ),
+        pytest.param(
+            _content_block(
+                {"hits": [{"text": "hit", "source_ref": "id-A", "score": 2.5}]}
+            ),
+            id="content-block",
+        ),
+    ],
+)
+def test_populated_envelope_variants_map_to_chunks(envelope: dict) -> None:
+    """All three envelope shapes an MCP server may use produce the
+    SAME chunks — a variant the adapter does not understand must
+    not degrade into a silent partial parse."""
+    adapter = _ScriptedAdapter(
+        scripted_response=envelope,
+        locator_map={"id-A": _loc("DOC-2023Q1")},
+    )
+    assert adapter.retrieve("foo") == {
+        "chunks": [_chunk("hit", "DOC-2023Q1", score=2.5)]
+    }
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        pytest.param({}, id="no-result-no-hits"),
+        pytest.param({"result": None}, id="null-result"),
+        pytest.param({"result": []}, id="list-result"),
+        pytest.param({"hits": "not-a-list"}, id="top-level-hits-not-a-list"),
+        pytest.param({"result": {"hits": {}}}, id="result-hits-not-a-list"),
+        pytest.param(
+            {"result": {"content": [{"type": "text", "text": "not json"}]}},
+            id="content-text-not-json",
+        ),
+        pytest.param(
+            _content_block({"results": []}), id="content-json-without-hits"
+        ),
+        pytest.param({"result": {"content": []}}, id="empty-content-list"),
+    ],
+)
+def test_malformed_envelope_maps_to_retrieve_unavailable(
+    envelope: dict,
+) -> None:
+    """A server whose reply the adapter cannot read is a broken
+    transport, not a miss: every malformed envelope returns the
+    typed EXIT rather than raising or inventing empty chunks."""
+    adapter = _ScriptedAdapter(
+        scripted_response=envelope,
+        locator_map={"id-A": _loc("DOC-2023Q1")},
+    )
+    assert adapter.retrieve("foo") == {"error": "retrieve_unavailable"}
+
+
+def test_non_dict_response_maps_to_retrieve_unavailable() -> None:
+    """A reply that is not even a JSON object (a bare list) is the
+    same typed EXIT."""
+    adapter = _ScriptedAdapter(
+        scripted_response=["hits"],  # type: ignore[arg-type]
+    )
+    assert adapter.retrieve("foo") == {"error": "retrieve_unavailable"}

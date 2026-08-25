@@ -7,6 +7,7 @@ copies and GET history never dumps them as a turn.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Literal
 
 from langchain_core.messages import BaseMessage, SystemMessage
@@ -28,10 +29,17 @@ HOST_SYSTEM_PROMPT: str = (
     "- list_files: catalog. Optional company (AAPL, MSFT, AMZN) and "
     "period (example: \"2023 Q3\") filters. Later read_file calls "
     "need both document_id and version (the sha256 from this catalog).\n"
-    "- retrieve: BM25 over page passages. Prefer this to locate a "
-    "figure. Pass document_id when you already know the filing.\n"
+    "- retrieve: the retrieve port's search over page passages. "
+    "Prefer this to locate a figure. Pass document_id when you "
+    "already know the filing.\n"
     "- read_file: page text. document_id + version required; page is "
     "1-based; page_limit is capped at 3.\n"
+    "- get_xbrl_fact: one tagged XBRL fact from the filing's fact "
+    "table. concept is the XBRL tag (example: \"us-gaap:Revenues\") "
+    "and period the reporting period (example: \"2023-Q3-YTD\"); "
+    "document_id narrows it to one filing. A miss returns "
+    "{\"error\": \"fact_not_found\"}. The fact row carries its own "
+    "source_locator — read that page when you need a citable span.\n"
     "\n"
     "Finish only after a tool this run returned page or chunk text. "
     "The citation gate accepts the answer only if it contains at least "
@@ -74,6 +82,43 @@ CLARIFY_SYSTEM_PROMPT: str = (
     "retrieved documents."
 )
 
+# Operator-facing ask per slot the clarify track can be missing.
+# A slot absent from this map is never named in the prompt: the
+# corpus only has company and period as routing slots, and an
+# unknown label would put a term we cannot ground in front of the
+# operator.
+_CLARIFY_SLOT_ASKS: dict[str, str] = {
+    "company": "which company (AAPL, MSFT, or AMZN)",
+    "period": "which period (2022 Q3, 2023 Q1, 2023 Q2, or 2023 Q3)",
+}
+
+
+def clarify_prompt(missing_slots: Sequence[str] | None = None) -> str:
+    """Return the clarify prompt naming THIS turn's missing slots.
+
+    ``missing_slots`` comes from the turn's track decision or the
+    latest status snapshot. With no recognized slot the static
+    ``CLARIFY_SYSTEM_PROMPT`` stands — a snapshot's dependent
+    fields may legitimately be empty (CONTEXT *status snapshot*),
+    and a guess about which slot is missing is worse than the
+    generic ask.
+    """
+    named = [
+        slot
+        for slot in dict.fromkeys(missing_slots or ())
+        if slot in _CLARIFY_SLOT_ASKS
+    ]
+    if not named:
+        return CLARIFY_SYSTEM_PROMPT
+    asks = " and ".join(_CLARIFY_SLOT_ASKS[slot] for slot in named)
+    return (
+        f"{CLARIFY_SYSTEM_PROMPT}\n"
+        f"Still missing on this turn: {', '.join(named)}. Ask for "
+        f"{asks} — and do not re-ask for anything the operator "
+        "already gave."
+    )
+
+
 _TRACK_PROMPTS: dict[str, tuple[str, str]] = {
     "research": (HOST_INSTRUCTIONS_MARKER, HOST_SYSTEM_PROMPT),
     "dialogue": (DIALOGUE_INSTRUCTIONS_MARKER, DIALOGUE_SYSTEM_PROMPT),
@@ -85,6 +130,8 @@ _TRACK_PROMPTS: dict[str, tuple[str, str]] = {
 def messages_for_model(
     messages: list[BaseMessage],
     track: Track | Literal["research"] = "dialogue",
+    *,
+    missing_slots: Sequence[str] | None = None,
 ) -> list[BaseMessage]:
     """Return the model-facing list with the track prompt first.
 
@@ -93,10 +140,16 @@ def messages_for_model(
     must never pin the host onto a single branch by virtue of
     missing input. Call-scoped only: do not write the
     SystemMessage into checkpointed ``messages``.
+
+    ``missing_slots`` applies to the clarify track only: it names
+    the slots this turn still needs so the ask is specific rather
+    than static.
     """
     marker, prompt = _TRACK_PROMPTS.get(
         track, (DIALOGUE_INSTRUCTIONS_MARKER, DIALOGUE_SYSTEM_PROMPT)
     )
+    if track == "clarify":
+        prompt = clarify_prompt(missing_slots)
     if (
         messages
         and isinstance(messages[0], SystemMessage)
@@ -119,6 +172,7 @@ __all__ = [
     "HOST_SYSTEM_PROMPT",
     "OFF_TOPIC_INSTRUCTIONS_MARKER",
     "OFF_TOPIC_SYSTEM_PROMPT",
+    "clarify_prompt",
     "messages_for_model",
     "messages_for_track",
 ]
