@@ -28,6 +28,7 @@ vite.config.d.ts
 *.sqlite3
 .langgraph_api/
 .ipynb_checkpoints/
+*.log
 
 # OS / copy artifacts
 .DS_Store
