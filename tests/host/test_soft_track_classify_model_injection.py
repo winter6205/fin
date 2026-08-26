@@ -121,7 +121,7 @@ def test_compile_for_runtime_injects_classify_model(
     """
     monkeypatch.delenv("FIN_MODEL", raising=False)
     monkeypatch.delenv("FIN_BASE_URL", raising=False)
-    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("FIN_API_KEY", raising=False)
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
 
     captured: dict[str, object] = {}
@@ -169,7 +169,7 @@ def test_compile_for_runtime_dev_injects_classify_model(
     """
     monkeypatch.delenv("FIN_MODEL", raising=False)
     monkeypatch.delenv("FIN_BASE_URL", raising=False)
-    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("FIN_API_KEY", raising=False)
     monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
 
     captured: dict[str, object] = {}

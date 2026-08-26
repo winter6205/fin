@@ -38,7 +38,7 @@ pg_isready -h 127.0.0.1 -p 5432 -U fin -d fin
 # LLM boot defaults (official MiniMax Chat Completions)
 # --------------------------------------------------------------------
 # Process env / Cloud secrets win. These exports only fill gaps so a
-# pod that injects ANTHROPIC_AUTH_TOKEN still hits official chat
+# pod that injects FIN_API_KEY still hits official chat
 # instead of localhost:20128. Never assign the key here.
 log "llm env defaults"
 export FIN_BASE_URL="${FIN_BASE_URL:-https://api.minimaxi.com/v1}"

@@ -242,14 +242,17 @@ def test_bounce_scenario_cycles_like_the_grounded_one() -> None:
 
 def test_scripted_boot_builds_no_provider_client(monkeypatch) -> None:
     """No network LLM and no credential read on this path: the shared
-    provider factory must never be called."""
+    provider factory must never be called. The hard-switch contract
+    for the project-owned key is pinned by ``tests/host/test_compile_env.py``;
+    this test only asserts the scripted path itself stays away from
+    the factory."""
     import fin.host.compile as compile_module
 
     def explode(**_kwargs: Any) -> Any:
         raise AssertionError("scripted boot must not build a provider client")
 
     monkeypatch.setattr(compile_module, "_build_default_model", explode)
-    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-should-never-be-read")
+    monkeypatch.setenv("FIN_API_KEY", "sk-should-never-be-read")
 
     state = _run(compile_for_scripted_e2e(env=NO_PACING), "scripted-no-provider")
     assert state["status"] == "done"

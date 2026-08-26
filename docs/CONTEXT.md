@@ -128,8 +128,12 @@ Read-only sibling clone of the reference implementation (workspace folder, not f
 _Avoid_: vendoring under fin/, copying that tree into src/fin
 
 **v1 model**:
-The agent-loop LLM is `ChatOpenAI` selected at runtime by `FIN_MODEL` (default `MiniMax-M3`) and `FIN_BASE_URL` (default official MiniMax CN Chat Completions `https://api.minimaxi.com/v1`; the URL includes `/v1`). Keys stay in environment variables (`ANTHROPIC_AUTH_TOKEN`); slash ids do not go through `init_chat_model`.
+The agent-loop LLM is `ChatOpenAI` selected at runtime by `FIN_MODEL` (default `MiniMax-M3`) and `FIN_BASE_URL` (default official MiniMax CN Chat Completions `https://api.minimaxi.com/v1`; the URL includes `/v1`). Keys stay in environment variables (`FIN_API_KEY`); slash ids do not go through `init_chat_model`.
 _Avoid_: compiled-in model name as the only option, `init_chat_model` for slash ids, `minimax-cn/MiniMax-M3` as the v1 default, LLM-as-judge as the citation gate
+
+**FIN_API_KEY**:
+项目自有的 LLM API key 环境变量名（2026-08-27 由 `ANTHROPIC_AUTH_TOKEN` 硬切而来，无 fallback）
+_Avoid_: vendor-prefixed legacy names (`ANTHROPIC_AUTH_TOKEN`), a fallback to the legacy name, hard-coding the key, shipping a baked-in default key, treating an unset key as a working credential
 
 **model client**:
 LangChain `ChatModel` (`ChatOpenAI` in v1) plus the messages and tool-calling protocol (`bind_tools` / tool schema). LangGraph orchestrates the run; it does not replace this layer.

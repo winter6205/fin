@@ -173,9 +173,10 @@ def test_env_example_has_required_keys() -> None:
         ".env.example must define FIN_BASE_URL (ADR 0022 — "
         "official MiniMax Chat Completions endpoint)"
     )
-    assert "ANTHROPIC_AUTH_TOKEN" in env, (
-        ".env.example must define ANTHROPIC_AUTH_TOKEN "
-        "(Bearer token for official MiniMax Chat Completions)"
+    assert "FIN_API_KEY" in env, (
+        ".env.example must define FIN_API_KEY "
+        "(Bearer token for official MiniMax Chat Completions — "
+        "ADR 0022 update 2026-08-27 hard switch)"
     )
 
 
@@ -391,7 +392,7 @@ def test_compile_for_runtime_uses_default_model_when_unset(
     """
     monkeypatch.delenv("FIN_MODEL", raising=False)
     monkeypatch.delenv("FIN_BASE_URL", raising=False)
-    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("FIN_API_KEY", raising=False)
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
 
     captured: dict[str, object] = {}
@@ -418,7 +419,7 @@ def test_compile_for_runtime_uses_default_model_when_unset(
     assert captured["base_url"] == "https://api.minimaxi.com/v1"
     assert captured["api_key"] == "sk-no-key-required", (
         "api_key must fall back to the no-key placeholder when "
-        "ANTHROPIC_AUTH_TOKEN is unset"
+        "FIN_API_KEY is unset"
     )
     assert len(graph_calls) == 1, (
         "compile_for_runtime must call compile_graph exactly once"
@@ -502,16 +503,16 @@ def test_compile_for_runtime_reads_fin_base_url_from_env(
     assert captured["model"] == DEFAULT_MODEL
 
 
-def test_compile_for_runtime_passes_anthropic_auth_token_as_api_key(
+def test_compile_for_runtime_passes_fin_api_key_as_api_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``ANTHROPIC_AUTH_TOKEN`` from the env is forwarded to
+    """``FIN_API_KEY`` from the env is forwarded to
     ``ChatOpenAI`` as ``api_key=`` (official Chat Completions
     uses ``Authorization: Bearer``). The user's
     secret value must reach ChatOpenAI without ever being
     logged or echoed."""
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
-    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-test-fake-key")
+    monkeypatch.setenv("FIN_API_KEY", "sk-test-fake-key")
 
     captured: dict[str, object] = {}
     _install_fake_langchain_openai(monkeypatch, captured)
@@ -673,7 +674,7 @@ def test_compile_for_runtime_dev_does_not_require_postgres(
 
 def test_cursor_start_exports_official_chat_defaults() -> None:
     """Cloud Agent ``start`` must setdefault official Chat Completions
-    so a pod that only injects ``ANTHROPIC_AUTH_TOKEN`` still
+    so a pod that only injects ``FIN_API_KEY`` still
     talks to MiniMax, not localhost:20128.
     """
     text = (_project_root() / "scripts" / "cursor-start.sh").read_text()
@@ -685,7 +686,7 @@ def test_cursor_start_exports_official_chat_defaults() -> None:
     assigned = [
         line
         for line in text.splitlines()
-        if line.lstrip().startswith("ANTHROPIC_AUTH_TOKEN=")
-        or line.lstrip().startswith("export ANTHROPIC_AUTH_TOKEN=")
+        if line.lstrip().startswith("FIN_API_KEY=")
+        or line.lstrip().startswith("export FIN_API_KEY=")
     ]
     assert assigned == []

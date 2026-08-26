@@ -82,6 +82,18 @@ from fin.host.stream_map import reasoning_preserving_chat_openai
 # Completions uses the vendor model id (no ``fin/`` proxy prefix).
 DEFAULT_MODEL = "MiniMax-M3"
 
+# Project-owned env var name for the LLM API key (ADR 0022
+# update 2026-08-27). Provider-agnostic by design — the previous
+# name, ``ANTHROPIC_AUTH_TOKEN``, was a leftover from before the
+# MiniMax cutover and confused operators who configured a MiniMax
+# key while a legacy local-gateway key sat in their shell. Hard
+# switch: there is NO fallback to the legacy name. A missing
+# ``FIN_API_KEY`` falls through to the placeholder
+# ``sk-no-key-required`` and the provider call returns 401 — a
+# loud error signal rather than a silent use of an unexpected
+# credential.
+FIN_API_KEY_ENV = "FIN_API_KEY"
+
 # Official MiniMax CN Chat Completions URL (the official ``openai``
 # SDK appends ``/chat/completions`` to ``base_url``). The
 # default INCLUDES ``/v1``. Overseas operators override with
@@ -204,8 +216,8 @@ def _build_default_model(
     ``ChatOpenAI`` so the module stays importable without the heavy
     runtime dep.
 
-    Reads ``FIN_MODEL`` / ``FIN_BASE_URL`` / ``ANTHROPIC_AUTH_TOKEN``
-    when the corresponding arg is ``None``; otherwise uses the
+    Reads ``FIN_MODEL`` / ``FIN_BASE_URL`` / ``FIN_API_KEY`` when
+    the corresponding arg is ``None``; otherwise uses the
     caller-supplied value verbatim. The ``extra_body`` /
     ``reasoning_split`` block is required by ADR 0022 + ADR 0026;
     keeping it here avoids drift between prod and dev.
@@ -224,7 +236,14 @@ def _build_default_model(
         model_name = _read_env(env, "FIN_MODEL") or DEFAULT_MODEL
     if base_url is None:
         base_url = _read_env(env, "FIN_BASE_URL") or DEFAULT_BASE_URL
-    api_key = _read_env(env, "ANTHROPIC_AUTH_TOKEN") or "sk-no-key-required"
+    # Hard switch: only ``FIN_API_KEY`` is read. The legacy
+    # ``ANTHROPIC_AUTH_TOKEN`` env var is intentionally NOT
+    # honoured — a stale shell value with the old name used to
+    # masquerade as the active credential (ADR 0022 update
+    # 2026-08-27). A missing key falls through to the
+    # placeholder so the provider returns 401 instead of
+    # silently answering with an unexpected key.
+    api_key = _read_env(env, FIN_API_KEY_ENV) or "sk-no-key-required"
     return chat_openai(
         model=model_name,
         base_url=base_url,
@@ -456,6 +475,7 @@ __all__ = [
     "DEFAULT_RETRIEVE_ADAPTER",
     "EXPECTED_CHECKPOINT_URL",
     "CheckpointSetupError",
+    "FIN_API_KEY_ENV",
     "HostCompileError",
     "MissingCheckpointURLError",
     "compile_for_runtime",
