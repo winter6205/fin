@@ -21,8 +21,8 @@ suite stays hermetic.
 
 Reference: ADR 0015 (``PostgresSaver`` + ``FIN_CHECKPOINT_URL``,
 ``InMemorySaver`` only in tests), ADR 0022 (``FIN_MODEL`` default
-``fin/MiniMax-M3`` served by OpenAI-compatible proxy at
-``FIN_BASE_URL`` default ``http://localhost:20128/v1``), spec
+``MiniMax-M3`` on official MiniMax Chat Completions at
+``FIN_BASE_URL`` default ``https://api.minimaxi.com/v1``), spec
 success-criteria item 7 (``docker compose config`` exits 0 and
 the example URL matches the service).
 """
@@ -75,8 +75,8 @@ def _load_env_example() -> dict[str, str]:
 
     Comments and blank lines are ignored. Values are shell-
     expanded in two narrow ways so a template like
-    ``${FIN_MODEL:-fin/MiniMax-M3}`` resolves to the
-    fallback (``fin/MiniMax-M3``) — i.e. what the operator
+    ``${FIN_MODEL:-MiniMax-M3}`` resolves to the
+    fallback (``MiniMax-M3``) — i.e. what the operator
     sees when they have not set the variable. This matches the
     contract that ``.env.example`` is a self-documenting template
     AND that the resolved defaults match the production
@@ -171,11 +171,11 @@ def test_env_example_has_required_keys() -> None:
     )
     assert "FIN_BASE_URL" in env, (
         ".env.example must define FIN_BASE_URL (ADR 0022 — "
-        "OpenAI-compatible proxy endpoint)"
+        "official MiniMax Chat Completions endpoint)"
     )
     assert "ANTHROPIC_AUTH_TOKEN" in env, (
         ".env.example must define ANTHROPIC_AUTH_TOKEN "
-        "(Bearer token for the OpenAI-compatible proxy)"
+        "(Bearer token for official MiniMax Chat Completions)"
     )
 
 
@@ -199,7 +199,7 @@ def test_env_example_url_is_well_formed_postgres() -> None:
 def test_env_example_default_model_matches_adr_0013() -> None:
     env = _load_env_example()
     assert env["FIN_MODEL"] == DEFAULT_MODEL
-    assert env["FIN_MODEL"] == "fin/MiniMax-M3"
+    assert env["FIN_MODEL"] == "MiniMax-M3"
 
 
 def test_env_example_default_base_url_matches_default_constant() -> None:
@@ -207,8 +207,8 @@ def test_env_example_default_base_url_matches_default_constant() -> None:
     assert env["FIN_BASE_URL"] == DEFAULT_BASE_URL
     # The default SHOULD include /v1 — the official OpenAI SDK
     # appends /chat/completions itself. Without /v1 the SDK
-    # would hit /chat/completions (404 at the proxy).
-    assert env["FIN_BASE_URL"] == "http://localhost:20128/v1"
+    # would hit /chat/completions (404).
+    assert env["FIN_BASE_URL"] == "https://api.minimaxi.com/v1"
     assert env["FIN_BASE_URL"].endswith("/v1"), (
         ".env.example FIN_BASE_URL must end with /v1; the "
         "OpenAI SDK appends /chat/completions"
@@ -382,7 +382,7 @@ def test_compile_for_runtime_uses_default_model_when_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``FIN_MODEL`` and ``FIN_BASE_URL`` fall back to the
-    ADR 0022 defaults when env is unset.
+    official MiniMax Chat Completions defaults when env is unset.
 
     The model-construction step is stubbed via a fake
     ``ChatOpenAI``. PostgresSaver is stubbed too, so we reach
@@ -411,11 +411,11 @@ def test_compile_for_runtime_uses_default_model_when_unset(
     result = compile_for_runtime()
     assert result == "compiled-graph"
     assert captured["model"] == DEFAULT_MODEL
-    assert captured["model"] == "fin/MiniMax-M3"
+    assert captured["model"] == "MiniMax-M3"
     assert captured["base_url"] == DEFAULT_BASE_URL
     # The OpenAI SDK appends /chat/completions; base_url must
     # include /v1 so the SDK hits /v1/chat/completions.
-    assert captured["base_url"] == "http://localhost:20128/v1"
+    assert captured["base_url"] == "https://api.minimaxi.com/v1"
     assert captured["api_key"] == "sk-no-key-required", (
         "api_key must fall back to the no-key placeholder when "
         "ANTHROPIC_AUTH_TOKEN is unset"
@@ -483,7 +483,8 @@ def test_compile_for_runtime_reads_fin_base_url_from_env(
 ) -> None:
     """``FIN_BASE_URL`` from the env is forwarded to
     ``ChatOpenAI`` as ``base_url=``. Operators override the
-    default proxy URL via env (e.g. WSL2 gateway IP)."""
+    official Chat Completions URL via env (e.g. overseas
+    ``https://api.minimax.io/v1``)."""
     monkeypatch.setenv("FIN_BASE_URL", "https://api.example.com/v1")
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
 
@@ -505,8 +506,8 @@ def test_compile_for_runtime_passes_anthropic_auth_token_as_api_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``ANTHROPIC_AUTH_TOKEN`` from the env is forwarded to
-    ``ChatOpenAI`` as ``api_key=`` (the proxy accepts any
-    non-empty ``Authorization: Bearer`` token). The user's
+    ``ChatOpenAI`` as ``api_key=`` (official Chat Completions
+    uses ``Authorization: Bearer``). The user's
     secret value must reach ChatOpenAI without ever being
     logged or echoed."""
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
@@ -668,3 +669,23 @@ def test_compile_for_runtime_dev_does_not_require_postgres(
     # plumbing was bypassed — if it had not been, the missing
     # URL would have raised).
     assert captured["model"] == DEFAULT_MODEL
+
+
+def test_cursor_start_exports_official_chat_defaults() -> None:
+    """Cloud Agent ``start`` must setdefault official Chat Completions
+    so a pod that only injects ``ANTHROPIC_AUTH_TOKEN`` still
+    talks to MiniMax, not localhost:20128.
+    """
+    text = (_project_root() / "scripts" / "cursor-start.sh").read_text()
+    assert (
+        f'FIN_BASE_URL="${{FIN_BASE_URL:-{DEFAULT_BASE_URL}}}"' in text
+    )
+    assert f'FIN_MODEL="${{FIN_MODEL:-{DEFAULT_MODEL}}}"' in text
+    # Must not bake a key. Comments may name the variable.
+    assigned = [
+        line
+        for line in text.splitlines()
+        if line.lstrip().startswith("ANTHROPIC_AUTH_TOKEN=")
+        or line.lstrip().startswith("export ANTHROPIC_AUTH_TOKEN=")
+    ]
+    assert assigned == []

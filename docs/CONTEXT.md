@@ -128,7 +128,7 @@ Read-only sibling clone of the reference implementation (workspace folder, not f
 _Avoid_: vendoring under fin/, copying that tree into src/fin
 
 **v1 model**:
-The agent-loop LLM is `ChatOpenAI` selected at runtime by `FIN_MODEL` (default `fin/MiniMax-M3`) and `FIN_BASE_URL` (OpenAI-compatible Chat Completions; the URL includes `/v1`). Keys stay in environment variables; slash ids do not go through `init_chat_model`.
+The agent-loop LLM is `ChatOpenAI` selected at runtime by `FIN_MODEL` (default `MiniMax-M3`) and `FIN_BASE_URL` (default official MiniMax CN Chat Completions `https://api.minimaxi.com/v1`; the URL includes `/v1`). Keys stay in environment variables (`ANTHROPIC_AUTH_TOKEN`); slash ids do not go through `init_chat_model`.
 _Avoid_: compiled-in model name as the only option, `init_chat_model` for slash ids, `minimax-cn/MiniMax-M3` as the v1 default, LLM-as-judge as the citation gate
 
 **model client**:

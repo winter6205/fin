@@ -20,7 +20,7 @@ Upstream freeze: [docugami/private fixture source](https://github.com/docugami/p
 
 ## Status
 
-v1 host-agent ships: ingest artifacts are in git; CLI (`python -m fin`) and HTTP `POST /ask` share one compiled host graph. Default model is `fin/MiniMax-M3` via `FIN_MODEL` + `FIN_BASE_URL` (ADR 0022). Soft-Track (ADR 0027, PR #57) routes each turn to `dialogue` / `clarify` / `off_topic` / `research`; only research binds tools and the citation verifier. Opt-in contracts: `uv run pytest -q -m soft_track`.
+v1 host-agent ships: ingest artifacts are in git; CLI (`python -m fin`) and HTTP `POST /ask` share one compiled host graph. Default model is `MiniMax-M3` via `FIN_MODEL` + official MiniMax Chat Completions `FIN_BASE_URL` (ADR 0022). Soft-Track (ADR 0027, PR #57) routes each turn to `dialogue` / `clarify` / `off_topic` / `research`; only research binds tools and the citation verifier. Opt-in contracts: `uv run pytest -q -m soft_track`.
 
 **NOW (2026-08-25):** harden the research vertical slice — ask filings → evidence → cited answer → reliable workspace UX. S1 corpus-retrieve landed in PR #79. Execution map: [fin agent wayfinder #91](https://github.com/winter6205/fin/issues/91). Recommended path memo: [`docs/research/009-optimized-agent-first-path.md`](docs/research/009-optimized-agent-first-path.md). Institutional memory / enterprise KB is later optional ([#92](https://github.com/winter6205/fin/issues/92)); filing research does not wait on it.
 
@@ -39,9 +39,9 @@ Without a built `web/dist/`, only the API routes serve and boot logs a WARNING (
 
 Retrieve sits behind the retrieve port (ADR 0032) and the adapter is chosen by `FIN_RETRIEVE_ADAPTER`, never inferred from the checkpointer:
 
-| Value          | What it binds                                                                              |
-| -------------- | ------------------------------------------------------------------------------------------ |
+| Value           | What it binds                                                                              |
+| --------------- | ------------------------------------------------------------------------------------------ |
 | `mcp` (default) | MCP client to the **iknow-memory** server, launched as `iknow-memory serve`                |
-| `fake`         | In-memory `FakeRetrievePort` — boots without a corpus, answers every query with empty hits |
+| `fake`          | In-memory `FakeRetrievePort` — boots without a corpus, answers every query with empty hits |
 
 `fin-serve` preflights the default: with `iknow-memory` absent from `PATH`, boot logs a WARNING (`FIN_RETRIEVE_ADAPTER=mcp but the MCP server command ... is not on PATH`) and keeps serving — research turns then return the typed `retrieve_unavailable` EXIT instead of evidence. Install the server, or set `FIN_RETRIEVE_ADAPTER=fake` in `.env` to acknowledge a corpus-free boot.
