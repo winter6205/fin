@@ -49,7 +49,7 @@ Quoted from `docs/CONTEXT.md`:
   - Long-thread compaction / token budget; operator-owned filings / ingest-as-product.
   - HITL plan-approval or tool-approval UX; host-graph rewrite; MCP client to iknow-memory.
   - Rename, folders, thread search, Stop button, queued follow-up.
-  - Playwright; merging `prototype_workspace` into `main` as the product.
+  - Playwright — except the two browser e2e lanes named in the Amendment 2026-08-26 below; everything else the original Playwright exclusion covered stays out. Merging `prototype_workspace` into `main` as the product stays out.
   - `AsyncPostgresSaver` / `ainvoke` as the durable path.
 
 ## Success Criteria
@@ -77,6 +77,17 @@ Quoted from `docs/CONTEXT.md`:
 **Confirmed stack (assumption gate):** Python 3.12, uv, pytest; FastAPI one process; React 18 + TypeScript + Vite + TailwindCSS + Radix + Zustand; POST `fetch` SSE; `0.0.0.0:8000` no auth; MiniMax `extra_body` thinking + `reasoning_split`; node-level checkpoint resume; turn table for GET history.
 
 **Changes this spec adds:** workspace routes + SPA; `model_node` token stream; thinking transport converter; run-scoped state reset; thread metadata + turn rows; node-level `stream(None)` resume on the workspace send/open path; Soft Brutalism UI contract above. `/ask` JSON contract stays. v1 spec sentence that HTTP has “no streaming” is superseded for **workspace routes only**.
+
+## Amendment 2026-08-26: browser e2e lanes (plans/workspace-stream-fidelity.md T5)
+
+This amendment is the outcome of `plans/workspace-stream-fidelity.md` T5 (`[decision]`, gates T6–T8). It supersedes the "Playwright" line under **Out of this spec** for exactly two named lanes; it does not touch checkpoint grain, SSE event types, or any other shipped contract, and the default test contract above (`uv run pytest -q` = scripted model + `InMemorySaver`, no network LLM) is unchanged.
+
+**In scope (new):**
+
+- **Scripted-provider browser e2e lane** — a browser is driven against a locally served workspace booted on the scripted model + `InMemorySaver`: no network LLM, no credentials, deterministic. It runs only via its explicit opt-in command (and any CI lane wired to that same command); default `uv run pytest -q` never invokes a browser.
+- **Live-provider smoke lane** — a browser (or the same runner) sends at least one real question through the configured provider. It runs only via its explicit opt-in command and is **never** part of default `uv run pytest -q`. When `ANTHROPIC_AUTH_TOKEN` is unset, the lane aborts non-zero with an explicit message naming the missing variable and runs nothing — never a silent skip that reads as a pass.
+
+**Still out (unchanged from the original exclusion):** Playwright (or any browser harness) as a dependency or collection target of default `uv run pytest -q`; browser tests replacing the scripted-model pytest contract above; any browser lane beyond the two named here. Runner filenames, harness library choice, and per-check assertion lists are not fixed by this amendment — the implementation bullets (`plans/workspace-stream-fidelity.md` T6–T8) own those.
 
 ## Planned files (ACR input, not a filename freeze)
 

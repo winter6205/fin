@@ -4,33 +4,77 @@
 
 import type { Turn } from "./types";
 
-/** Apply one ``answer`` SSE fragment to the turn's accumulated text.
+/** One ``answer`` SSE frame as the live fold sees it. */
+export interface AnswerFrame {
+  text: string;
+  reset?: boolean;
+  statusSeen: boolean;
+}
+
+/** Live-bubble answer state.
  *
- * While the run streams, fragments append. After ``status``, the wire
- * may emit one authoritative full-text frame — but when the live view
- * already accumulated the prose, keeping the draft avoids a visible
- * retract-and-repop flicker (the draft IS the final answer).
+ * ``visible`` is the prose on screen. ``retry`` is the answer being
+ * re-authored after a hidden-bounce reset armed on the wire; it is
+ * ``null`` on runs that never bounced. Keeping the two apart is what
+ * lets the retry accumulate BEHIND the stale draft: replacing the
+ * bubble with the bounce's first fragment blanks a paragraph down to
+ * a few characters mid-stream (R3).
  */
-export function mergeAnswerDelta(
-  currentAnswer: string,
-  delta: string,
-  opts: { statusSeen: boolean; reset?: boolean },
-): string {
-  if (opts.reset) return delta;
-  if (opts.statusSeen) {
-    // Authoritative post-status empty frame clears refuse/step_cap draft
-    // (SC67: ordinary-person copy lives in assistant_message, not answer).
-    if (delta.length === 0) return "";
-    // Done run: keep streamed draft to avoid retract/repop flicker.
-    return currentAnswer.length > 0 ? currentAnswer : delta;
+export interface LiveAnswerState {
+  visible: string;
+  retry: string | null;
+}
+
+export const EMPTY_LIVE_ANSWER: LiveAnswerState = { visible: "", retry: null };
+
+/** Fold one ``answer`` SSE frame into the live bubble.
+ *
+ * Invariant across a bounce: the visible prose never shrinks between
+ * the reset frame and the terminal one. The retry text takes over the
+ * bubble the moment it is at least as long as the draft it replaces,
+ * so the operator sees a convergence, not a retract.
+ *
+ * The terminal frame is the one convergence point that may shorten the
+ * bubble: an empty post-``status`` frame (with or without ``reset``)
+ * clears a refuse / step_cap draft per SC67, and a run whose retry
+ * prose never caught up to the bounced draft takes the authoritative
+ * text rather than keeping prose the citation gate rejected.
+ */
+export function foldLiveAnswer(
+  state: LiveAnswerState,
+  frame: AnswerFrame,
+): LiveAnswerState {
+  if (frame.statusSeen) {
+    if (frame.reset || frame.text.length === 0) {
+      return { visible: frame.text, retry: null };
+    }
+    const staleDraft = state.retry !== null && state.retry !== state.visible;
+    if (staleDraft) return { visible: frame.text, retry: null };
+    // Done run: keep the streamed draft to avoid retract/repop flicker.
+    return {
+      visible: state.visible.length > 0 ? state.visible : frame.text,
+      retry: null,
+    };
   }
-  return currentAnswer + delta;
+  if (frame.reset) return converge(state.visible, frame.text);
+  if (state.retry !== null) {
+    return converge(state.visible, state.retry + frame.text);
+  }
+  return { visible: state.visible + frame.text, retry: null };
+}
+
+/** Show the retry prose once it is at least as long as the draft it
+ * supersedes; until then the draft stays put so no frame is shorter
+ * than the one before it. */
+function converge(visible: string, retry: string): LiveAnswerState {
+  return { visible: retry.length >= visible.length ? retry : visible, retry };
 }
 
 /** Fold one ``answer`` SSE into ``SendResult.answerText`` (non-live).
  *
- * Unlike ``mergeAnswerDelta`` (live bubble keeps draft after status),
- * post-status frames replace so the returned result matches the wire.
+ * Unlike ``foldLiveAnswer`` (which trades wire fidelity for a bubble
+ * that never retracts), post-status and ``reset`` frames replace so
+ * the returned result matches the wire exactly.
  * ``reset`` always replaces with ``text`` (empty = clear).
  */
 export function foldSendResultAnswer(
@@ -46,7 +90,9 @@ export function foldSendResultAnswer(
 /** After GET reconcile, prefer the streamed row's visible prose when
  * the operator already watched it arrive token-by-token. Persisted
  * fields (citations with quotes, ids) still come from the server row.
- * Tested helper for the openThread GET-reconcile path (not wired yet).
+ * Wired into ``openThread``'s GET reconcile (store.ts): the persisted
+ * row is folded into the streamed one row-by-row rather than replacing
+ * the turn table.
  */
 export function mergeReconciledTurn(streamed: Turn, persisted: Turn): Turn {
   const keepStreamedAnswer =

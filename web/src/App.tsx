@@ -81,11 +81,15 @@ function NotFoundThread() {
 export default function App() {
   const refreshThreads = useWorkspaceStore((s) => s.refreshThreads);
   const loadCorpus = useWorkspaceStore((s) => s.loadCorpus);
+  // T10 (ADR 0033): the status fields are boot-scoped, so the strip
+  // fetches on open rather than polling.
+  const loadStatus = useWorkspaceStore((s) => s.loadStatus);
 
   useEffect(() => {
     void refreshThreads();
     void loadCorpus();
-  }, [refreshThreads, loadCorpus]);
+    void loadStatus();
+  }, [refreshThreads, loadCorpus, loadStatus]);
 
   return (
     <div className="flex h-screen">

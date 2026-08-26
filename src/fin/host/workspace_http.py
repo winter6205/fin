@@ -34,6 +34,15 @@ Routes
                                           delta wire (T2, #36).
 * ``GET    /api/corpus``                - real ``list_filings()`` over
                                           the frozen manifest.
+* ``GET    /api/status``                - the boot-scoped status
+                                          surface the Sidebar strip
+                                          renders (T10 / ADR 0033):
+                                          retrieve reachability +
+                                          adapter kind + model slug +
+                                          corpus filing count. Its own
+                                          handler with no dependencies
+                                          — never a branch inside send
+                                          or GET-thread.
 
 Why one module, not per-route modules? Each route is small, they
 share the request schema (``thread_id`` resolution, empty-question
@@ -79,6 +88,10 @@ from pydantic import BaseModel, Field
 from fin.corpus.catalog import list_filings
 from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER, strip_hidden_bounce_marker
 from fin.host.graph import ConcurrentRunError
+from fin.host.operator_env import (
+    probe_retrieve_reachability,
+    resolve_retrieve_adapter_kind,
+)
 from fin.host.run_payload import RunResponsePayload, _run_to_response_payload
 from fin.host.stream_map import (
     InlineFilterState,
@@ -130,6 +143,17 @@ class RunStreamOutcome:
     refuse_reason: str | None = None
     refuse_copy: str | None = None
     answer_reset: bool = False
+
+
+# Graph nodes whose model deltas are the operator-visible reply.
+# ``model`` is the research leaf; the three Soft-Track leaves
+# (specs/soft-track.md / ADR 0027) author their reply the same way,
+# so their tokens paint the live turn too. Every other node stays
+# off the wire — notably ``classify``, whose LLM tier streams
+# routing JSON that is not prose.
+_ANSWER_AUTHORING_NODES: frozenset[str] = frozenset(
+    {"model", "dialogue", "clarify", "off_topic"}
+)
 
 
 # Maximum characters of the first message used as the thread title.
@@ -220,6 +244,37 @@ class TurnRow(BaseModel):
     in_flight: bool = False
     # Soft-Track T5: auditable classify outcome for this run_id.
     track_decision: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkspaceStatusResponse(BaseModel):
+    """The boot-scoped workspace status surface (T10, ADR 0033).
+
+    Exactly four fields, and the ADR fixes each one:
+
+    * ``retrieve_reachability`` — ``unreachable`` says every retrieve
+      call answers with the typed ``retrieve_unavailable`` EXIT. It
+      is payload DATA with degraded copy behind it, never an HTTP
+      500 and never an empty body: a blank strip tells the operator
+      nothing.
+    * ``retrieve_adapter_kind`` — which port is behind the seam, so a
+      healthy ``fake`` boot is distinguishable from a healthy
+      product boot.
+    * ``model_identity`` — the resolved ``FIN_MODEL`` slug ONLY.
+      ``FIN_BASE_URL`` and key material stay off this wire.
+    * ``corpus_filing_count`` — from the same in-process catalog that
+      serves ``GET /api/corpus``. Zero is a valid rendered value.
+
+    Deliberately absent (ADR 0033 OUT): ``step_budget_live``,
+    ``token_usage_absolute``, ``soft_track_confidence`` — run- and
+    turn-scoped values belong to the SSE contract, not to a boot
+    surface — plus any "% of context window" figure and any skill
+    list (plan exclusion).
+    """
+
+    retrieve_reachability: Literal["reachable", "unreachable"]
+    retrieve_adapter_kind: Literal["mcp", "fake"]
+    model_identity: str
+    corpus_filing_count: int
 
 
 class ThreadDetailResponse(BaseModel):
@@ -402,13 +457,15 @@ def _stream_run_frames(
     Consumes ``graph.stream`` with
     ``stream_mode=["messages", "values"]``:
 
-    * ``messages`` items arrive DURING ``model_node`` execution —
-      each ``AIMessageChunk`` maps to zero or more ``thinking`` /
-      ``answer`` delta frames (SC60: reasoning deltas go to
-      ``thinking``, inline ``<thinking>`` prose is filtered out of
-      ``answer`` even when a tag spans chunk boundaries). The
-      aggregated end-of-call ``AIMessage`` (not a chunk) and chunks
-      from other nodes are skipped — their content already streamed.
+    * ``messages`` items arrive DURING an answer-authoring node's
+      execution (``_ANSWER_AUTHORING_NODES``: the research leaf and
+      the three Soft-Track leaves) — each ``AIMessageChunk`` maps to
+      zero or more ``thinking`` / ``answer`` delta frames (SC60:
+      reasoning deltas go to ``thinking``, inline ``<thinking>``
+      prose is filtered out of ``answer`` even when a tag spans
+      chunk boundaries). The aggregated end-of-call ``AIMessage``
+      (not a chunk) and chunks from every other node — the
+      ``classify`` tier above all — are skipped.
     * ``values`` items arrive after each node completes (post
       checkpoint) — new messages map to ``tool_call`` /
       ``tool_result`` frames, deduplicated by message id through
@@ -465,7 +522,7 @@ def _stream_run_frames(
                 # only per-token AIMessageChunks carry new deltas.
                 if not isinstance(chunk, AIMessageChunk):
                     continue
-                if meta.get("langgraph_node") != "model":
+                if meta.get("langgraph_node") not in _ANSWER_AUTHORING_NODES:
                     continue
                 reasoning = reasoning_delta_from_chunk(chunk)
                 if reasoning:
@@ -642,6 +699,44 @@ def _terminal_sse_frames(
     yield _format_sse("status", status_body)
     yield _format_sse("answer", answer_body)
     yield _format_sse("citations", _citations_wire_payload(payload["citations"]))
+
+
+def _model_identity() -> str:
+    """The resolved ``FIN_MODEL`` slug, or the ADR 0022 default.
+
+    Same resolution ``fin.host.compile._build_default_model``
+    performs, minus everything else it reads: the endpoint and the
+    auth token never reach this payload (ADR 0033).
+    """
+    import os
+
+    from fin.host.compile import DEFAULT_MODEL
+
+    return (os.environ.get("FIN_MODEL") or "").strip() or DEFAULT_MODEL
+
+
+def _corpus_filing_count() -> int:
+    """Filing count from the catalog that serves ``GET /api/corpus``.
+
+    A corpus that was never ingested raises ``IngestMissingError``
+    here. On this route that is a zero count, not a failure: ADR
+    0033 makes zero a valid rendered value, and a 500 would blank a
+    strip whose other three fields are still true. The warning keeps
+    the state out of the silent-swallow class — ``GET /api/corpus``
+    itself still surfaces the typed error to whoever asks for the
+    filings.
+    """
+    from fin.corpus.errors import IngestMissingError
+
+    try:
+        return len(list_filings()["filings"])
+    except IngestMissingError:
+        logger.warning(
+            "status: the corpus catalog is unreadable; reporting "
+            "corpus_filing_count=0",
+            exc_info=True,
+        )
+        return 0
 
 
 # ----- route factory -----
@@ -1144,6 +1239,27 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
     def corpus() -> dict:
         """List the frozen 12 filings from the real catalog."""
         return list_filings()
+
+    @router.get("/status", response_model=WorkspaceStatusResponse)
+    def workspace_status() -> dict:
+        """The Sidebar strip's boot-scoped surface (T10, ADR 0033).
+
+        No ``Depends``: the read seam is fin-local config plus the
+        in-process catalog, so the handler needs neither the
+        compiled graph nor the thread store. It builds no MCP
+        client, issues no health-check RPC, and makes no cross-repo
+        call — the reachability value comes from the same probe the
+        boot warning logs (``fin.host.operator_env``).
+
+        Every state is a 200 with all four fields populated. The
+        route has no failure branch to hide a blank strip behind.
+        """
+        return {
+            "retrieve_reachability": probe_retrieve_reachability(),
+            "retrieve_adapter_kind": resolve_retrieve_adapter_kind(),
+            "model_identity": _model_identity(),
+            "corpus_filing_count": _corpus_filing_count(),
+        }
 
     return router
 

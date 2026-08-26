@@ -92,6 +92,32 @@ export interface ThreadDetail extends ThreadListItem {
   pending_checkpoint?: boolean;
 }
 
+// T10 (ADR 0033): the boot-scoped workspace status surface behind
+// ``GET /api/status``. Boot-scoped means configuration plus
+// dependency reachability — nothing run- or turn-scoped rides here
+// (no step budget, no token usage, no soft-track confidence, no
+// "% of context window"). Mirrors
+// fin.host.workspace_http.WorkspaceStatusResponse.
+
+// ``unreachable`` means every retrieve call answers with the typed
+// ``retrieve_unavailable`` EXIT — a value to render, never an error.
+export type RetrieveReachability = "reachable" | "unreachable";
+
+// Which port is behind the retrieve seam: the product iknow-memory
+// client, or the hermetic fake that answers with no corpus.
+export type RetrieveAdapterKind = "mcp" | "fake";
+
+export interface WorkspaceStatus {
+  retrieve_reachability: RetrieveReachability;
+  retrieve_adapter_kind: RetrieveAdapterKind;
+  // The resolved ``FIN_MODEL`` slug only — the host never puts the
+  // endpoint or key material on this wire.
+  model_identity: string;
+  // From the same catalog that serves ``GET /api/corpus``; zero is a
+  // valid value, not an error.
+  corpus_filing_count: number;
+}
+
 export interface Filing {
   document_id: string;
   company: string;

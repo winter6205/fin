@@ -45,3 +45,51 @@ Retrieve sits behind the retrieve port (ADR 0032) and the adapter is chosen by `
 | `fake`          | In-memory `FakeRetrievePort` — boots without a corpus, answers every query with empty hits |
 
 `fin-serve` preflights the default: with `iknow-memory` absent from `PATH`, boot logs a WARNING (`FIN_RETRIEVE_ADAPTER=mcp but the MCP server command ... is not on PATH`) and keeps serving — research turns then return the typed `retrieve_unavailable` EXIT instead of evidence. Install the server, or set `FIN_RETRIEVE_ADAPTER=fake` in `.env` to acknowledge a corpus-free boot.
+
+### Browser e2e: scripted-provider lane (opt-in, credential-free)
+
+The scripted-provider lane from the `specs/workspace.md` Amendment 2026-08-26. One command boots the workspace on a scripted transcript, drives a browser through send → stream → collapse → reload, tears the server down and exits on the verdict:
+
+```bash
+node scripts/run-scripted-e2e.mjs
+```
+
+Deterministic and offline: the server child is started with `FIN_SCRIPTED_MODEL=1` (the explicit opt-in read by `fin.host.scripted_boot`) and with `ANTHROPIC_AUTH_TOKEN` / `FIN_MODEL` / `FIN_BASE_URL` / `FIN_CHECKPOINT_URL` / `FIN_RETRIEVE_ADAPTER` removed from its environment, so no network LLM is reachable and no credential is read. The transcript quotes the frozen `AAPL-2022Q3` page it reads, so the run ends `done` with real citations; `FIN_SCRIPTED_DELTA_MS` (default 200) paces the deltas so the browser can watch the answer grow.
+
+Exit codes: `0` every check passed, `1` a fidelity observable regressed (for example the answer arriving as one post-hoc dump instead of deltas), `2` the lane could not run (no SPA build, the server never came up, the harness is missing). Flags: `--port`, `--delta-ms`, `--boot-timeout`, `--keep-server`, plus `--poll-count` / `--poll-interval-ms` / `--browser` / `--json` / `--keep-open` forwarded to the runner. `web/dist` is built automatically when it is missing.
+
+`FIN_SCRIPTED_MODEL` is never a fallback: `fin-serve` without it boots the configured provider, and a value that is neither truthy nor falsy stops the boot with a typed error rather than silently restoring the real model. Default `uv run pytest -q` invokes no browser — the lane lives in `scripts/`, not in `tests/`.
+
+### Live-provider smoke lane (opt-in, requires a real credential)
+
+The live-provider lane from the `specs/workspace.md` Amendment 2026-08-26. One command boots the workspace on the **configured** provider, sends one real question, reads the SSE wire the SPA reads, and reports the fidelity observables:
+
+```bash
+node scripts/run-live-smoke.mjs
+```
+
+`ANTHROPIC_AUTH_TOKEN` is required. Without it the lane prints which variable is missing and exits `3` having started nothing — no server, no browser, no provider call. That check lives in the lane rather than in the server on purpose: `fin.host.compile` resolves the key as `ANTHROPIC_AUTH_TOKEN or "sk-no-key-required"`, so an unset token would otherwise reach the provider as a placeholder and come back as a 401 indistinguishable from a revoked key or a wrong base URL. The token is read from the environment or from `./.env` (the file the server itself loads at boot) and its value is never printed. `FIN_SCRIPTED_MODEL` is removed from the server's environment, so a stray scripted opt-in cannot turn this lane into a fake pass.
+
+Observables, each reported PASS / FAIL on its own line: answer deltas reach the wire before the terminal status (`1-answer-streamed`); exactly one typed terminal `status` frame, closed by `citations` (`2-terminal-status`); no `<think>` markup inside the answer (`3-answer-free-of-reasoning-markup`); citations that match the outcome — a finished research turn owes code-filled evidence, a `refuse` / `step_cap` / Soft-Track turn owes an empty list (`4-citations-match-outcome`); and the reasoning channel (`5-reasoning-channel`). A provider that emits no reasoning at all reports `NONE` rather than `PASS`, and `--require-thinking` turns that into a failure.
+
+Exit codes: `0` every observable held, `1` a fidelity observable regressed, `2` the lane could not run, `3` `ANTHROPIC_AUTH_TOKEN` is missing. Flags: `--question`, `--model`, `--base-url`, `--port`, `--boot-timeout`, `--run-timeout`, `--require-thinking`, `--require-done`, `--browser-checks`, `--keep-server`, `--json` (`--help` lists them). `--browser-checks` additionally runs the browser lane below against the same live workspace; it expects a provider that actually calls tools, since the trace-collapse check reads tool rows.
+
+Default `uv run pytest -q` never invokes this lane: it lives in `scripts/`, is reached only by the command above, and boots its own server on a free port.
+
+### Browser e2e: workspace stream checks against a running workspace (opt-in)
+
+The same checks against a workspace you started yourself (any provider). One command drives a browser over the served workspace and prints one PASS/FAIL line per check:
+
+```bash
+node scripts/run-stream-checks.mjs
+```
+
+Prerequisites:
+
+- a workspace served at the target URL — `cd web && npm run build`, then `uv run fin-serve` (default target `http://127.0.0.1:8000`; `--base-url=URL` or `FIN_E2E_BASE_URL` points elsewhere).
+- a global `playwright-cli` on `PATH` (`npm install -g @playwright/cli@latest`), or `PLAYWRIGHT_CLI=/path/to/playwright-cli`. `npx playwright-cli` is not used.
+- no provider credentials are needed for the runner to start. With the workspace down or the model unreachable the checks report FAIL with the reason — they never skip and never read as a pass.
+
+Exit codes: `0` every check passed, `1` a check failed or produced no verdict, `2` the harness itself could not run (binary missing, browser refused to open, snippet crashed, wall-clock timeout). `node scripts/run-stream-checks.mjs --help` lists the flags (`--poll-count`, `--poll-interval-ms`, `--require-stream-growth`, `--timeout-ms`, `--session`, `--browser`, `--keep-open`, `--json`).
+
+Assertions live in `scripts/playwright-stream-checks.mjs`; the driver imports that ES module and evaluates the check function through `playwright-cli run-code`, so the function stays self-contained (no imports, no module-scope references).

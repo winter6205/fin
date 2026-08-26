@@ -19,9 +19,13 @@ import logging
 from pathlib import Path
 
 from fin.host.operator_env import (
+    RETRIEVE_REACHABLE,
+    RETRIEVE_UNREACHABLE,
     apply_dotenv,
     find_env_file,
     parse_env_file,
+    probe_retrieve_reachability,
+    resolve_retrieve_adapter_kind,
     warn_if_mcp_retrieve_unreachable,
 )
 
@@ -214,6 +218,99 @@ def test_serve_warns_about_unreachable_mcp_and_still_serves(
         if r.levelno == logging.WARNING and r.name == "fin.host.operator_env"
     ]
     assert any("FIN_RETRIEVE_ADAPTER" in m for m in warnings), warnings
+
+
+# ----- shared reachability probe (T10, ADR 0033) -----
+#
+# The boot WARNING above and the workspace status surface answer the
+# same question — "will every retrieve call return the typed
+# retrieve_unavailable EXIT?" — so they read one probe instead of two
+# copies of the PATH lookup.
+
+
+def test_probe_reports_unreachable_for_mcp_default_without_the_command(
+    tmp_path: Path,
+) -> None:
+    assert (
+        probe_retrieve_reachability(environ=_path_without_mcp(tmp_path))
+        == RETRIEVE_UNREACHABLE
+    )
+
+
+def test_probe_reports_reachable_when_the_command_is_on_path(
+    tmp_path: Path,
+) -> None:
+    assert (
+        probe_retrieve_reachability(environ=_path_with_mcp(tmp_path))
+        == RETRIEVE_REACHABLE
+    )
+
+
+def test_probe_reports_reachable_for_the_fake_adapter(tmp_path: Path) -> None:
+    """The fake port answers every call — it is a healthy boot.
+
+    ADR 0033 keeps the two states about the PORT, not about the
+    corpus: ``retrieve_adapter_kind`` is what says the answers carry
+    no real evidence.
+    """
+    environ = _path_without_mcp(tmp_path) | {"FIN_RETRIEVE_ADAPTER": "fake"}
+    assert probe_retrieve_reachability(environ=environ) == RETRIEVE_REACHABLE
+
+
+def test_probe_does_not_spawn_the_mcp_server(tmp_path: Path, monkeypatch) -> None:
+    """PATH lookup only — no subprocess, no health-check RPC.
+
+    ADR 0033 keeps the MCP client out of the status read seam; a
+    probe spawn per request would also cost a subprocess on every
+    Sidebar poll.
+    """
+    import subprocess
+
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("the reachability probe must not spawn a process")
+
+    monkeypatch.setattr(subprocess, "Popen", _forbidden)
+    monkeypatch.setattr(subprocess, "run", _forbidden)
+
+    assert (
+        probe_retrieve_reachability(environ=_path_with_mcp(tmp_path))
+        == RETRIEVE_REACHABLE
+    )
+
+
+def test_resolve_adapter_kind_defaults_to_the_product_adapter() -> None:
+    from fin.host.compile import DEFAULT_RETRIEVE_ADAPTER
+
+    assert resolve_retrieve_adapter_kind(environ={}) == DEFAULT_RETRIEVE_ADAPTER
+    assert resolve_retrieve_adapter_kind(environ={"FIN_RETRIEVE_ADAPTER": ""}) == (
+        DEFAULT_RETRIEVE_ADAPTER
+    )
+
+
+def test_resolve_adapter_kind_reads_the_configured_kind() -> None:
+    assert (
+        resolve_retrieve_adapter_kind(environ={"FIN_RETRIEVE_ADAPTER": " fake "})
+        == "fake"
+    )
+
+
+def test_resolve_adapter_kind_clamps_an_unknown_kind_and_warns(caplog) -> None:
+    """A typo can never be a third reported kind.
+
+    ``compile_graph`` refuses an unknown kind, so a serving process
+    cannot actually be on one — but the status surface must still
+    answer with one of the two typed kinds rather than echo the typo
+    or raise.
+    """
+    from fin.host.compile import DEFAULT_RETRIEVE_ADAPTER
+
+    with caplog.at_level(logging.WARNING, logger="fin.host.operator_env"):
+        kind = resolve_retrieve_adapter_kind(
+            environ={"FIN_RETRIEVE_ADAPTER": "bm25"}
+        )
+
+    assert kind == DEFAULT_RETRIEVE_ADAPTER
+    assert any("bm25" in r.getMessage() for r in caplog.records)
 
 
 def test_default_graph_factory_applies_dotenv_before_compile(

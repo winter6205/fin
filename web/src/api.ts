@@ -12,8 +12,10 @@ import type {
   ThreadDetail,
   ThreadListItem,
   TrackDecision,
+  WorkspaceStatus,
 } from "./types";
 import { parseSoftTrack, parseTrackDecision } from "./softTrack";
+import { parseWorkspaceStatus } from "./statusStrip";
 import { foldSendResultAnswer } from "./turnStream";
 
 async function jsonOrThrow<T>(res: Response): Promise<T> {
@@ -65,6 +67,21 @@ export async function getCorpus(): Promise<Filing[]> {
   const res = await fetch("/api/corpus");
   const body = await jsonOrThrow<{ filings: Filing[] }>(res);
   return body.filings;
+}
+
+/**
+ * T10 (ADR 0033): the boot-scoped status surface. The host answers
+ * 200 in both retrieve states — ``unreachable`` is a field value, not
+ * an HTTP error — so a rejection here means the route itself is
+ * unreachable or malformed, which the store renders as its own
+ * degraded strip state.
+ */
+export async function getStatus(): Promise<WorkspaceStatus> {
+  const res = await fetch("/api/status");
+  const body = await jsonOrThrow<unknown>(res);
+  const parsed = parseWorkspaceStatus(body);
+  if (parsed === null) throw new Error("malformed /api/status payload");
+  return parsed;
 }
 
 export interface SendResult {

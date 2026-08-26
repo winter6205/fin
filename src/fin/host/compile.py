@@ -72,6 +72,7 @@ import psycopg
 # it via ``monkeypatch.setattr("fin.host.compile.compile_graph",
 # ...)``. Lazy imports below cover the runtime deps.
 from fin.host.graph import compile_graph
+from fin.host.stream_map import reasoning_preserving_chat_openai
 
 
 # ----- public constants -----
@@ -208,15 +209,23 @@ def _build_default_model(
     caller-supplied value verbatim. The ``extra_body`` /
     ``reasoning_split`` block is required by ADR 0022 + ADR 0026;
     keeping it here avoids drift between prod and dev.
+
+    The class is ``stream_map``'s reasoning-preserving ``ChatOpenAI``
+    subclass, not the stock one: asking for ``reasoning_split`` is
+    only half the contract, because ``langchain-openai`` drops the
+    provider's split channel before the chunk reaches the host.
+    Building the model is the one place that choice can be made, so
+    the wiring lives here and the converter itself lives beside the
+    rest of the stream mapping.
     """
-    from langchain_openai import ChatOpenAI
+    chat_openai = reasoning_preserving_chat_openai()
 
     if model_name is None:
         model_name = _read_env(env, "FIN_MODEL") or DEFAULT_MODEL
     if base_url is None:
         base_url = _read_env(env, "FIN_BASE_URL") or DEFAULT_BASE_URL
     api_key = _read_env(env, "ANTHROPIC_AUTH_TOKEN") or "sk-no-key-required"
-    return ChatOpenAI(
+    return chat_openai(
         model=model_name,
         base_url=base_url,
         api_key=api_key,

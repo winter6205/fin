@@ -2223,6 +2223,158 @@ def test_send_message_inline_thinking_stream_never_reaches_answer_frames(
     assert "private reasoning here" in thinking_joined
 
 
+# ----- F3: streamed answer == persisted answer, byte for byte -----
+
+
+def _parity_answer(grounded_span: str) -> str:
+    """A markdown answer whose whitespace the fold used to rewrite.
+
+    Nested bullet indentation, a trailing-space line, and a 3-newline
+    run — the three shapes ``strip_thinking_from_answer``'s fold
+    collapsed on the persisted side only. The grounded span keeps the
+    citation gate on the ``done`` path.
+    """
+    return (
+        "Summary:\n\n"
+        "- Point one\n"
+        "    - nested detail\n\n\n"
+        "Trailing space line   \n"
+        f"Verbatim: {grounded_span}\n"
+    )
+
+
+def _streamed_and_persisted(
+    client: TestClient, thread_id: str, question: str
+) -> tuple[str, str, str]:
+    """Send one message; return (streamed deltas, terminal, persisted)."""
+    events = _post_message(client, thread_id, question)
+    names = [n for n, _ in events]
+    status_i = names.index("status")
+    answer_idx = [i for i, n in enumerate(names) if n == "answer"]
+    streamed = "".join(
+        events[i][1]["text"] for i in answer_idx if i < status_i
+    )
+    terminal = events[answer_idx[-1]][1]["text"]
+    detail = client.get(f"/api/threads/{thread_id}").json()
+    return streamed, terminal, detail["turns"][-1]["answer"]
+
+
+def test_research_answer_deltas_match_the_persisted_row(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """Research shape: concatenated deltas == the persisted answer.
+
+    ``mergeReconciledTurn`` keeps the streamed prose when the
+    persisted status is ``done``; if the two texts differ the reload
+    (or the reconcile) silently rewrites the answer the operator
+    already read.
+    """
+    from fin.host.http import get_graph
+
+    answer = _parity_answer(aapl_page1_text[:80])
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=_two_step_streaming_model(answer),
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    streamed, terminal, persisted = _streamed_and_persisted(
+        client, created["id"], "What was AAPL net sales in 2023 Q3?"
+    )
+
+    assert streamed == answer
+    assert streamed == terminal
+    assert streamed == persisted
+
+
+def test_research_answer_with_inline_thinking_matches_persisted_row(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """Same parity when an inline ``<think>`` block is stripped.
+
+    The block removal leaves a whitespace seam; both sides must
+    leave that seam identical, so the filtered deltas still
+    concatenate to the persisted prose.
+    """
+    from langchain_core.messages import AIMessageChunk
+
+    from fin.host.http import get_graph
+
+    visible = _parity_answer(aapl_page1_text[:80])
+    raw = f"<think>private scratch</think>\n\n{visible}"
+    model = ScriptedChatModel(
+        stream_responses=[
+            [
+                AIMessageChunk(
+                    content="",
+                    tool_call_chunks=[
+                        {
+                            "name": "read_file",
+                            "args": '{"document_id": "%s", "version": "%s", "page": 1, "page_limit": 1}'
+                            % (AAPL_2022Q3, AAPL_2022Q3_VERSION),
+                            "id": "c-read",
+                            "index": 0,
+                        }
+                    ],
+                ),
+            ],
+            [AIMessageChunk(content=raw[i : i + 9]) for i in range(0, len(raw), 9)],
+        ],
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    streamed, terminal, persisted = _streamed_and_persisted(
+        client, created["id"], "What was AAPL net sales in 2023 Q3?"
+    )
+
+    assert "private scratch" not in streamed
+    assert "private scratch" not in persisted
+    assert streamed == terminal
+    assert streamed == persisted
+
+
+def test_soft_track_answer_deltas_match_the_persisted_row(
+    client: TestClient, fresh_store, http_app: FastAPI
+) -> None:
+    """Soft-Track shape: the dialogue leaf keeps the same parity.
+
+    The leaf skips the citation gate, so its answer reaches the
+    store straight off ``_last_ai_text`` — the fold used to rewrite
+    it there too.
+    """
+    from fin.host.http import get_graph
+
+    answer = (
+        "Here is what I can do:\n\n"
+        "- Pull figures from the loaded 10-Qs\n"
+        "    - one filing at a time\n\n\n"
+        "Ask away.   \n"
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=_soft_track_streaming_model(answer),
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    streamed, terminal, persisted = _streamed_and_persisted(
+        client, created["id"], "Hi!"
+    )
+
+    assert streamed == answer
+    assert streamed == terminal
+    assert streamed == persisted
+
+
 # ----- T2 (#36): resume streams the remainder on the same delta wire -----
 
 
@@ -2874,3 +3026,382 @@ def test_scripted_model_raises_emits_terminal_status(
 
     resume_resp = _resume(client, created["id"])
     assert resume_resp.status_code == 204
+
+
+# ----- Soft-Track leaves stream their reply (fidelity T1) -----
+
+
+def _soft_track_streaming_model(answer: str) -> "ScriptedChatModel":
+    """One streamed model call whose answer arrives in two chunks."""
+    from langchain_core.messages import AIMessageChunk
+
+    return ScriptedChatModel(
+        stream_responses=[
+            [
+                AIMessageChunk(content=answer[: len(answer) // 2]),
+                AIMessageChunk(content=answer[len(answer) // 2 :]),
+            ]
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("question", "track", "answer"),
+    [
+        (
+            "Hi!",
+            "dialogue",
+            "Hello! Ask me about the 10-Q filings in this workspace.",
+        ),
+        (
+            "What was revenue?",
+            "clarify",
+            "Which company and which quarter should I look at?",
+        ),
+        (
+            "What's the weather in Seattle today?",
+            "off_topic",
+            "I only cover the SEC 10-Q filings loaded here.",
+        ),
+    ],
+)
+def test_send_message_soft_track_reply_streams_deltas_before_status(
+    client: TestClient,
+    fresh_store,
+    http_app: FastAPI,
+    question: str,
+    track: str,
+    answer: str,
+) -> None:
+    """Soft-Track leaves (``dialogue`` / ``clarify`` / ``off_topic``)
+    stream onto the live turn like the research leaf does.
+
+    The send generator used to paint deltas from the ``model`` node
+    only, so a non-research reply reached the SPA as one post-hoc
+    dump on the terminal answer frame. The observable this fixes:
+    MULTIPLE ``answer`` delta frames arrive BEFORE the terminal
+    ``status``, and they concatenate to the authoritative answer.
+    """
+    from fin.host.http import get_graph
+
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=_soft_track_streaming_model(answer),
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    events = _post_message(client, created["id"], question)
+
+    names = [n for n, _ in events]
+    status_i = names.index("status")
+    answer_idx = [i for i, n in enumerate(names) if n == "answer"]
+
+    status_body = events[status_i][1]
+    assert status_body["status"] == "done"
+    assert status_body["track"] == track
+
+    deltas = [i for i in answer_idx if i < status_i]
+    assert len(deltas) >= 2, names
+    joined = "".join(events[i][1]["text"] for i in deltas)
+    terminal_answer = events[answer_idx[-1]][1]["text"]
+    assert joined == terminal_answer == answer
+    # Soft-Track leaves skip the citation gate; citations stays the
+    # terminal frame and carries nothing.
+    assert names[-1] == "citations"
+    assert events[-1][1] == []
+
+
+class _StreamingClassifyModel(ScriptedChatModel):
+    """Classify tier that genuinely emits token chunks.
+
+    ``decide_track`` calls ``classify_model.invoke``; assembling the
+    reply from ``self.stream`` routes those chunks through the same
+    LangGraph callback the leaves use, so the chunks carry
+    ``langgraph_node="classify"`` onto the messages stream. That is
+    the boundary the send generator must keep off the wire.
+    """
+
+    def invoke(self, input, config=None, **kwargs):  # type: ignore[override]
+        merged = None
+        for chunk in self.stream(input, config=config, **kwargs):
+            merged = chunk if merged is None else merged + chunk
+        return merged
+
+
+def test_send_message_classify_deltas_never_reach_the_wire(
+    client: TestClient, fresh_store, http_app: FastAPI
+) -> None:
+    """The classify tier authors no answer: its chunks paint nothing.
+
+    Widening the delta predicate to the Soft-Track leaves must not
+    widen it to every node — the LLM classify tier streams its
+    routing JSON (and may stream reasoning) inside the ``classify``
+    node, and none of that is operator-visible prose.
+    """
+    from langchain_core.messages import AIMessageChunk
+
+    from fin.host.http import get_graph
+
+    reply = "I can pull numbers out of the 10-Q filings loaded here."
+    classify_model = _StreamingClassifyModel(
+        stream_responses=[
+            [
+                AIMessageChunk(
+                    content="",
+                    additional_kwargs={
+                        "reasoning_details": [
+                            {"text": "classify scratchpad: sounds chatty"}
+                        ]
+                    },
+                ),
+                AIMessageChunk(content='{"track": '),
+                AIMessageChunk(content='"dialogue"}'),
+            ]
+        ],
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=_soft_track_streaming_model(reply),
+        classify_model=classify_model,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    events = _post_message(
+        client, created["id"], "Can you walk me through what you handle here?"
+    )
+
+    names = [n for n, _ in events]
+    status_i = names.index("status")
+    answer_idx = [i for i, n in enumerate(names) if n == "answer"]
+
+    # The LLM tier really did decide this turn (otherwise the test
+    # would pass without ever exercising a streaming classify node).
+    status_body = events[status_i][1]
+    assert status_body["track"] == "dialogue"
+    detail = client.get(f"/api/threads/{created['id']}").json()
+    assert detail["turns"][-1]["track_decision"]["decision_tier"] == "llm"
+
+    # The dialogue leaf still streamed.
+    deltas = [i for i in answer_idx if i < status_i]
+    assert len(deltas) >= 2, names
+    assert "".join(events[i][1]["text"] for i in deltas) == reply
+
+    # Nothing the classify node emitted reached the wire — not the
+    # routing JSON on ``answer``, not its reasoning on ``thinking``.
+    for i in answer_idx:
+        text = events[i][1]["text"]
+        assert "track" not in text
+        assert "classify scratchpad" not in text
+    assert [n for n in names if n == "thinking"] == []
+
+
+# ----- status surface (T10, ADR 0033) -----
+#
+# ``GET /api/status`` is the boot-scoped surface the Sidebar strip
+# renders. ADR 0033 fixes the field set exactly: retrieve
+# reachability, the resolved adapter kind, the model slug, and the
+# corpus filing count — nothing run- or turn-scoped, no "% of
+# context window", no skill list, no MCP client in the route.
+
+
+# ADR 0033's IN list. The route's payload keys must be exactly this
+# set: a missing key blanks part of the strip, an extra key smuggles
+# run telemetry onto a boot surface.
+STATUS_FIELDS = {
+    "retrieve_reachability",
+    "retrieve_adapter_kind",
+    "model_identity",
+    "corpus_filing_count",
+}
+
+# ADR 0033's OUT list plus the plan's explicit exclusions. Asserted
+# by name so a later ticket that wants one of them has to reopen the
+# decision instead of quietly widening the payload.
+STATUS_FORBIDDEN_FIELDS = (
+    "step_budget_live",
+    "token_usage_absolute",
+    "soft_track_confidence",
+    "context_window_pct",
+    "skills",
+    "base_url",
+    "api_key",
+)
+
+
+def _bin_dir_without_mcp(tmp_path: Path) -> str:
+    empty = tmp_path / "status-bin-empty"
+    empty.mkdir(exist_ok=True)
+    return str(empty)
+
+
+def _bin_dir_with_mcp(tmp_path: Path) -> str:
+    bindir = tmp_path / "status-bin-with-mcp"
+    bindir.mkdir(exist_ok=True)
+    binary = bindir / "iknow-memory"
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    return str(bindir)
+
+
+def test_status_reports_reachable_retrieve_on_a_fake_adapter_boot(
+    client: TestClient, fresh_store, tmp_path: Path, monkeypatch
+) -> None:
+    """``FIN_RETRIEVE_ADAPTER=fake`` is a healthy boot, not a failure.
+
+    ADR 0033: the adapter kind is what distinguishes a healthy fake
+    boot from a healthy product boot, so the fake port reports
+    ``reachable`` — it answers every call, just with no corpus behind
+    it — while ``retrieve_adapter_kind`` says ``fake``.
+    """
+    monkeypatch.setenv("FIN_RETRIEVE_ADAPTER", "fake")
+    monkeypatch.setenv("PATH", _bin_dir_without_mcp(tmp_path))
+
+    r = client.get("/api/status")
+
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body.keys()) == STATUS_FIELDS, body
+    assert body["retrieve_reachability"] == "reachable"
+    assert body["retrieve_adapter_kind"] == "fake"
+
+
+def test_status_reports_unreachable_retrieve_as_payload_not_500(
+    client: TestClient, fresh_store, tmp_path: Path, monkeypatch
+) -> None:
+    """The unreachable state is DATA (ADR 0033), never an error.
+
+    Default adapter (``mcp``) with no ``iknow-memory`` on ``PATH`` is
+    the laptop boot whose every retrieve call answers the typed
+    ``retrieve_unavailable`` EXIT. The route must answer 200 with a
+    typed field so the strip renders degraded copy — a 500 or an
+    empty body would blank the strip.
+    """
+    monkeypatch.delenv("FIN_RETRIEVE_ADAPTER", raising=False)
+    monkeypatch.setenv("PATH", _bin_dir_without_mcp(tmp_path))
+
+    r = client.get("/api/status")
+
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/json")
+    body = r.json()
+    assert set(body.keys()) == STATUS_FIELDS, body
+    assert body["retrieve_reachability"] == "unreachable"
+    assert body["retrieve_adapter_kind"] == "mcp"
+    # Still a full payload: the other three fields carry real values
+    # so the strip never renders a hole next to the degraded line.
+    assert body["model_identity"]
+    assert isinstance(body["corpus_filing_count"], int)
+
+
+def test_status_reports_reachable_when_mcp_command_is_on_path(
+    client: TestClient, fresh_store, tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("FIN_RETRIEVE_ADAPTER", raising=False)
+    monkeypatch.setenv("PATH", _bin_dir_with_mcp(tmp_path))
+
+    body = client.get("/api/status").json()
+
+    assert body["retrieve_reachability"] == "reachable"
+    assert body["retrieve_adapter_kind"] == "mcp"
+
+
+def test_status_model_identity_is_the_slug_only(
+    client: TestClient, fresh_store, monkeypatch
+) -> None:
+    """``FIN_MODEL`` only — never ``FIN_BASE_URL``, never key material."""
+    monkeypatch.setenv("FIN_MODEL", "fin/MiniMax-M3")
+    monkeypatch.setenv("FIN_BASE_URL", "http://operator-secret.invalid/v1")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-do-not-leak")
+
+    body = client.get("/api/status").json()
+
+    assert body["model_identity"] == "fin/MiniMax-M3"
+    serialized = json.dumps(body)
+    assert "operator-secret" not in serialized
+    assert "sk-do-not-leak" not in serialized
+
+
+def test_status_model_identity_falls_back_to_the_adr_0022_default(
+    client: TestClient, fresh_store, monkeypatch
+) -> None:
+    from fin.host.compile import DEFAULT_MODEL
+
+    monkeypatch.delenv("FIN_MODEL", raising=False)
+
+    assert client.get("/api/status").json()["model_identity"] == DEFAULT_MODEL
+
+
+def test_status_corpus_count_matches_the_corpus_route(
+    client: TestClient, fresh_store
+) -> None:
+    """Same in-process catalog as ``GET /api/corpus`` (ADR 0033)."""
+    filings = client.get("/api/corpus").json()["filings"]
+
+    assert client.get("/api/status").json()["corpus_filing_count"] == len(filings)
+
+
+def test_status_renders_zero_filings_instead_of_failing(
+    client: TestClient, fresh_store, monkeypatch
+) -> None:
+    """A missing extracted tree is a zero count, not a 500.
+
+    ADR 0033: "zero is a valid rendered value, not an error". The
+    strip stays readable on a machine whose corpus was never
+    ingested.
+    """
+    from fin.corpus.errors import IngestMissingError
+
+    def _boom(*_args, **_kwargs):
+        raise IngestMissingError("extracted tree missing")
+
+    monkeypatch.setattr("fin.host.workspace_http.list_filings", _boom)
+
+    r = client.get("/api/status")
+
+    assert r.status_code == 200
+    assert r.json()["corpus_filing_count"] == 0
+
+
+def test_status_never_exposes_run_scoped_telemetry(
+    client: TestClient, fresh_store
+) -> None:
+    body = client.get("/api/status").json()
+
+    for forbidden in STATUS_FORBIDDEN_FIELDS:
+        assert forbidden not in body, forbidden
+
+
+def test_status_route_is_separate_from_send_and_get_thread(
+    client: TestClient, fresh_store, http_app: FastAPI
+) -> None:
+    """The handler touches neither the graph nor the thread store.
+
+    Structure contract (plan T10 / ADR 0033): the status surface is
+    its own small route, not another branch in the send / GET-thread
+    handlers, and it constructs no MCP client. Both dependencies are
+    replaced with factories that fail loudly, so any coupling shows
+    up as a 500 here.
+    """
+    from fin.host.http import get_graph, get_thread_store
+
+    def _no_graph():
+        raise AssertionError("/api/status must not build the graph")
+
+    def _no_store():
+        raise AssertionError("/api/status must not touch the thread store")
+
+    http_app.dependency_overrides[get_graph] = _no_graph
+    http_app.dependency_overrides[get_thread_store] = _no_store
+
+    r = client.get("/api/status")
+
+    assert r.status_code == 200
+    # Asserted on the payload, not just the code: the SPA catch-all
+    # answers 200 with index.html for an unmounted path, so a
+    # code-only assertion would pass with no route at all.
+    assert r.headers["content-type"].startswith("application/json")
+    assert set(r.json().keys()) == STATUS_FIELDS

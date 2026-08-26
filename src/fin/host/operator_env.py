@@ -14,6 +14,11 @@ checks the one setting whose default silently disables research:
 ``FIN_RETRIEVE_ADAPTER`` defaults to ``mcp``, so a machine without
 the ``iknow-memory`` server serves a UI whose every retrieve call
 answers with the typed ``retrieve_unavailable`` EXIT.
+
+That boot warning and the workspace status surface
+(``GET /api/status``, ADR 0033) answer the same question, so the
+lookup lives once in :func:`probe_retrieve_reachability` and the
+warning is a thin logging wrapper over it.
 """
 
 from __future__ import annotations
@@ -23,6 +28,14 @@ from pathlib import Path
 from typing import Mapping, MutableMapping
 
 logger = logging.getLogger(__name__)
+
+
+# The two typed reachability values (ADR 0033). "Unreachable" means
+# every retrieve call this process makes will answer with the typed
+# ``retrieve_unavailable`` EXIT — it is a configuration statement
+# about the port, not a claim that a reachable server will succeed.
+RETRIEVE_REACHABLE = "reachable"
+RETRIEVE_UNREACHABLE = "unreachable"
 
 
 def parse_env_file(text: str) -> dict[str, str]:
@@ -93,6 +106,78 @@ def apply_dotenv(
     return path
 
 
+def resolve_retrieve_adapter_kind(
+    *, environ: Mapping[str, str] | None = None
+) -> str:
+    """Return the retrieve adapter kind this process is configured for.
+
+    ``FIN_RETRIEVE_ADAPTER`` when set, otherwise
+    ``DEFAULT_RETRIEVE_ADAPTER`` — the same resolution
+    ``fin.host.compile`` performs before it hands the kind to
+    ``compile_graph``.
+
+    A value naming no known kind is clamped to the product default
+    and logged. ``compile_graph`` raises
+    ``RetrieveAdapterConfigError`` on such a value, so no serving
+    process is actually on one; the clamp exists so the diagnostic
+    surfaces (the boot warning and ADR 0033's status route) keep
+    answering with one of the two typed kinds instead of echoing a
+    typo or raising on a read-only route.
+    """
+    import os
+
+    from fin.host.compile import DEFAULT_RETRIEVE_ADAPTER
+    from fin.host.graph import RETRIEVE_ADAPTER_KINDS
+
+    source: Mapping[str, str] = os.environ if environ is None else environ
+    configured = (source.get("FIN_RETRIEVE_ADAPTER") or "").strip()
+    kind = configured or DEFAULT_RETRIEVE_ADAPTER
+    if kind not in RETRIEVE_ADAPTER_KINDS:
+        logger.warning(
+            "FIN_RETRIEVE_ADAPTER=%r names no known retrieve adapter kind "
+            "(expected one of %s); reporting %r. compile_graph refuses this "
+            "value, so this process has no compiled graph.",
+            configured,
+            list(RETRIEVE_ADAPTER_KINDS),
+            DEFAULT_RETRIEVE_ADAPTER,
+        )
+        return DEFAULT_RETRIEVE_ADAPTER
+    return kind
+
+
+def probe_retrieve_reachability(
+    *, environ: Mapping[str, str] | None = None
+) -> str:
+    """Return ``RETRIEVE_REACHABLE`` / ``RETRIEVE_UNREACHABLE``.
+
+    Unreachable is exactly one situation: the product ``mcp``
+    adapter is configured and the launch command ``compile_graph``
+    would spawn (``DEFAULT_MCP_COMMAND``) is not on ``PATH``, so
+    every retrieve call answers with the typed
+    ``retrieve_unavailable`` EXIT.
+
+    The ``fake`` port is reachable — it answers every call. What it
+    lacks is a corpus, and ``resolve_retrieve_adapter_kind`` is the
+    field that says so (ADR 0033).
+
+    ``PATH`` lookup only. No process is started and no health-check
+    RPC is issued: a probe spawn costs a subprocess per call and
+    still cannot prove the server answers ``tools/call``.
+    """
+    import os
+    import shutil
+
+    from fin.host.compile import DEFAULT_MCP_COMMAND
+    from fin.host.graph import RETRIEVE_ADAPTER_MCP
+
+    source: Mapping[str, str] = os.environ if environ is None else environ
+    if resolve_retrieve_adapter_kind(environ=source) != RETRIEVE_ADAPTER_MCP:
+        return RETRIEVE_REACHABLE
+    if shutil.which(DEFAULT_MCP_COMMAND[0], path=source.get("PATH")) is None:
+        return RETRIEVE_UNREACHABLE
+    return RETRIEVE_REACHABLE
+
+
 def warn_if_mcp_retrieve_unreachable(
     *, environ: Mapping[str, str] | None = None
 ) -> bool:
@@ -105,25 +190,18 @@ def warn_if_mcp_retrieve_unreachable(
     Failing the boot here would also make the ``fake`` adapter the
     only way to start on a laptop, which is the wrong default.
 
-    Reachability is decided by ``PATH`` lookup of the launch
-    command ``compile_graph`` would spawn
-    (``DEFAULT_MCP_COMMAND``). No process is started: a probe
-    spawn on every boot costs a subprocess and still cannot prove
-    the server answers ``tools/call``.
+    The reachability decision itself is
+    :func:`probe_retrieve_reachability` — the same value the
+    workspace status route reports, so the boot log and the Sidebar
+    strip cannot drift.
     """
     import os
-    import shutil
 
-    from fin.host.compile import DEFAULT_MCP_COMMAND, DEFAULT_RETRIEVE_ADAPTER
+    from fin.host.compile import DEFAULT_MCP_COMMAND
 
     source: Mapping[str, str] = os.environ if environ is None else environ
-    configured = (source.get("FIN_RETRIEVE_ADAPTER") or "").strip()
-    adapter = configured or DEFAULT_RETRIEVE_ADAPTER
-    if adapter != "mcp":
-        return False
-
-    program = DEFAULT_MCP_COMMAND[0]
-    if shutil.which(program, path=source.get("PATH")) is not None:
+    adapter = resolve_retrieve_adapter_kind(environ=source)
+    if probe_retrieve_reachability(environ=source) == RETRIEVE_REACHABLE:
         return False
 
     logger.warning(
@@ -138,8 +216,12 @@ def warn_if_mcp_retrieve_unreachable(
 
 
 __all__ = [
+    "RETRIEVE_REACHABLE",
+    "RETRIEVE_UNREACHABLE",
     "apply_dotenv",
     "find_env_file",
     "parse_env_file",
+    "probe_retrieve_reachability",
+    "resolve_retrieve_adapter_kind",
     "warn_if_mcp_retrieve_unreachable",
 ]

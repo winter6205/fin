@@ -131,6 +131,11 @@ def compile_for_http(
     one-way per process: a single dev-mode boot stays dev-mode
     for its lifetime. Tests pass explicit ``checkpointer`` +
     ``model`` args and bypass both paths entirely.
+
+    ``FIN_SCRIPTED_MODEL`` (T7) selects the scripted-provider boot
+    for the browser e2e lane instead. It is an explicit operator
+    opt-in checked BEFORE the provider paths — never a fallback
+    reached by a missing credential or an absent checkpoint URL.
     """
     if checkpointer is None and model is None:
         global _http_graph_singleton
@@ -141,7 +146,13 @@ def compile_for_http(
                     compile_for_runtime,
                     compile_for_runtime_dev,
                 )
+                from fin.host import scripted_boot
 
+                if scripted_boot.scripted_boot_requested():
+                    _http_graph_singleton = (
+                        scripted_boot.compile_for_scripted_e2e()
+                    )
+                    return _http_graph_singleton
                 try:
                     _http_graph_singleton = compile_for_runtime()
                 except MissingCheckpointURLError:

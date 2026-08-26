@@ -23,10 +23,26 @@ into the shapes downstream code renders:
   (SC60 binding).
 * :func:`reasoning_delta_from_chunk` /
   :func:`split_stream_delta` - the T1 (#33) token-delta mapping:
-  the first pulls a thinking delta off a chunk's
-  ``reasoning_details``; the second classifies streamed content
-  deltas into thinking vs answer with an inline-block filter that
-  survives tags split across chunk boundaries.
+  the first pulls a thinking delta off a chunk's reasoning
+  channel; the second classifies streamed content deltas into
+  thinking vs answer with an inline-block filter that survives
+  tags split across chunk boundaries.
+* :func:`reasoning_entries_from_delta` /
+  :func:`reasoning_entries_from_raw_chunk` /
+  :func:`reasoning_preserving_chat_openai` - the thinking
+  transport converter (spec line 28). Providers spell the split
+  channel three ways (``reasoning_details`` / ``reasoning_content``
+  / ``reasoning``) and ``langchain-openai`` targets the official
+  OpenAI spec only, so it drops all three before the chunk reaches
+  us. The first two normalise whichever shape arrived onto the
+  ``reasoning_details`` entry shape the rest of the host reads; the
+  third is the thin ``ChatOpenAI`` subclass that re-attaches the
+  channel during streaming and, via
+  :func:`replay_reasoning_into_payload`, puts the checkpointed
+  entries back into the next request so the provider's chain of
+  thought survives the turn. When the channel is absent entirely,
+  the inline ``<think>`` strip above stays the fallback - thinking
+  is surfaced or stripped, never swallowed into the answer.
 * :func:`summarize_list_files` / :func:`summarize_retrieve` /
   :func:`summarize_read_file` / :func:`summarize_get_xbrl_fact` /
   :func:`format_tool_summary` - the
@@ -51,9 +67,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 
 
 # ----- chunk assembly -----
@@ -84,7 +100,14 @@ def assemble_final_ai_message(
     messages on every replay.
     """
     accumulator: AIMessageChunk | None = None
+    # The per-chunk reasoning entries BEFORE the merge flattens them.
+    # ``_normalize_reasoning_details`` needs the originals to tell an
+    # entry's identity metadata from the prose the deltas split.
+    streamed_entries: list[dict[str, Any]] = []
     for chunk in chunks:
+        streamed_entries.extend(
+            reasoning_entries_from_delta(chunk.additional_kwargs)
+        )
         if accumulator is None:
             accumulator = chunk
             continue
@@ -97,11 +120,97 @@ def assemble_final_ai_message(
     # (which carries ``reasoning_details`` for replay) are the two
     # fields downstream code reads - both are copied by value so the
     # checkpoint holds its own instance.
+    additional_kwargs = dict(accumulator.additional_kwargs)
+    _normalize_reasoning_details(additional_kwargs, streamed_entries)
     return AIMessage(
         content=accumulator.content,
         tool_calls=list(accumulator.tool_calls),
-        additional_kwargs=dict(accumulator.additional_kwargs),
+        additional_kwargs=additional_kwargs,
     )
+
+
+def _repair_merged_reasoning_entries(
+    merged: list[Any], streamed: list[dict[str, Any]]
+) -> list[Any]:
+    """Undo the chunk merge's concatenation of identity metadata.
+
+    ``AIMessageChunk`` addition folds same-``index`` reasoning
+    entries together with ``merge_dicts``, which concatenates EVERY
+    string field it has no special case for. Only the prose is
+    genuinely split across deltas; the other string fields are the
+    entry's identity, repeated verbatim on every delta. Live
+    MiniMax-M3 repeats ``format`` that way, so a 37-delta scratchpad
+    checkpoints ``"MiniMax-response-v1"`` 37 times over - junk that
+    grows with the length of the model's thinking and rides every
+    subsequent checkpoint write.
+
+    The first delta carrying an ``index`` is authoritative for that
+    entry's metadata. An entry whose ``id`` disagrees with that
+    delta's is left untouched rather than repaired from the wrong
+    source: keeping a duplicated ``format`` is recoverable, writing
+    another entry's identity is not.
+    """
+    first_by_index: dict[Any, Mapping[str, Any]] = {}
+    for entry in streamed:
+        index = entry.get("index")
+        if index is not None and index not in first_by_index:
+            first_by_index[index] = entry
+
+    repaired: list[Any] = []
+    for entry in merged:
+        source = (
+            first_by_index.get(entry.get("index"))
+            if isinstance(entry, dict)
+            else None
+        )
+        source_id = source.get("id") if source is not None else None
+        entry_id = entry.get("id") if isinstance(entry, dict) else None
+        other_entry = bool(source_id and entry_id and source_id != entry_id)
+        if source is None or other_entry:
+            repaired.append(entry)
+            continue
+        repaired.append(
+            {
+                key: (
+                    source[key]
+                    if (
+                        key not in _REASONING_PROSE_FIELDS
+                        and isinstance(value, str)
+                        and isinstance(source.get(key), str)
+                    )
+                    else value
+                )
+                for key, value in entry.items()
+            }
+        )
+    return repaired
+
+
+def _normalize_reasoning_details(
+    additional_kwargs: dict[str, Any],
+    streamed_entries: list[dict[str, Any]],
+) -> None:
+    """Ensure a replayable ``reasoning_details`` list, in place.
+
+    ``graph._extract_thinking_text`` and the next model call both
+    read ``reasoning_details``. A provider that spells the split
+    channel ``reasoning_content`` (or ``reasoning``) would otherwise
+    stream thinking to the wire and then lose it at the checkpoint.
+
+    An existing non-empty list keeps the provider's own entries -
+    re-deriving it would drop replay fields they carry - but its
+    identity metadata is repaired against ``streamed_entries``, the
+    per-chunk originals from before the merge.
+    """
+    existing = additional_kwargs.get("reasoning_details")
+    if isinstance(existing, list) and existing:
+        additional_kwargs["reasoning_details"] = (
+            _repair_merged_reasoning_entries(existing, streamed_entries)
+        )
+        return
+    entries = reasoning_entries_from_delta(additional_kwargs)
+    if entries:
+        additional_kwargs["reasoning_details"] = entries
 
 
 # ----- thinking strip -----
@@ -142,18 +251,19 @@ def strip_thinking_from_answer(answer: str) -> str:
     Pure function: returns the input unchanged (same object semantics
     as ``str`` immutability allows) when no block is present, so the
     common no-thinking path costs one regex scan.
+
+    Block removal is the ONLY edit. This function is the persisted /
+    terminal-frame side of the same contract
+    :func:`split_stream_delta` implements delta by delta, and the SPA
+    keeps the streamed prose when the persisted status is ``done``
+    (``mergeReconciledTurn``). Any extra rewrite here — the
+    whitespace fold this used to apply over the whole answer —
+    reaches only this side, so the reconcile silently repaints
+    indentation and blank runs the operator already read.
     """
     if not answer:
         return answer
-    stripped = _THINKING_BLOCK_RE.sub("", answer)
-    # Fold the whitespace seams a removed block leaves behind so the
-    # citation gate's contiguous-substring match does not see a
-    # doubled newline where the block used to live. Leading/trailing
-    # whitespace belongs to the model's real answer and stays.
-    stripped = re.sub(r"[ \t]+\n", "\n", stripped)
-    stripped = re.sub(r"\n[ \t]+", "\n", stripped)
-    stripped = re.sub(r"\n{3,}", "\n\n", stripped)
-    return stripped
+    return _THINKING_BLOCK_RE.sub("", answer)
 
 
 # ----- token-delta mapping (T1, #33) -----
@@ -198,25 +308,42 @@ _OPEN_TAG_RE: re.Pattern[str] = re.compile(
 _CLOSE_TAG_RE: re.Pattern[str] = re.compile(
     r"</(thinking|think)\s*>", re.IGNORECASE
 )
-_OPEN_TAG_STEMS: tuple[str, ...] = ("<thinking", "<think")
-_CLOSE_TAG_STEMS: tuple[str, ...] = ("</thinking", "</think")
+# The trailing fragment of a buffer that could still grow into one
+# of the tags above once more deltas arrive. Two alternatives, both
+# anchored at end of buffer:
+#
+# * an incomplete stem (``<``, ``<thi``, and — the case a
+#   character-at-a-time provider hits — the COMPLETE ``<thinking``,
+#   whose ``>`` has not arrived yet);
+# * a complete stem plus the run the tag regex allows before ``>``
+#   (``<think attr='x'`` / ``</think ``).
+#
+# A stem-length hold-back cannot express the second case, and
+# capping the first at ``len(stem) - 1`` releases the full stem as
+# prose — after which the ``>`` arrives alone and the tag never
+# matches, so the whole block streams into the answer.
+_PARTIAL_OPEN_RE: re.Pattern[str] = re.compile(
+    r"(?:<(?:t(?:h(?:i(?:n(?:k(?:i(?:n(?:g)?)?)?)?)?)?)?)?"
+    r"|<(?:thinking|think)\b[^>]*)$",
+    re.IGNORECASE,
+)
+_PARTIAL_CLOSE_RE: re.Pattern[str] = re.compile(
+    r"(?:<(?:/(?:t(?:h(?:i(?:n(?:k(?:i(?:n(?:g)?)?)?)?)?)?)?)?)?"
+    r"|</(?:thinking|think)\s*)$",
+    re.IGNORECASE,
+)
 
 
-def _holdback_len(buffer: str, stems: tuple[str, ...]) -> int:
-    """Longest suffix of ``buffer`` that is a proper prefix of any stem.
+def _holdback_len(buffer: str, partial: re.Pattern[str]) -> int:
+    """Length of the trailing fragment that may still become a tag.
 
-    Keeps at most ``max(len(stem)) - 1`` characters buffered so a tag
-    split across deltas (``<thi`` + ``nk>`` or ``<thi`` + ``nking>``)
-    still matches. Case-insensitive to match the tag regexes.
+    ``search`` returns the leftmost match and both alternatives are
+    anchored at ``$``, so the result is the LONGEST such suffix.
+    Zero when the buffer cannot end mid-tag — the common case, where
+    every buffered character is emittable now.
     """
-    lower = buffer.lower()
-    kept = 0
-    for stem in stems:
-        for k in range(min(len(lower), len(stem) - 1), 0, -1):
-            if lower.endswith(stem[:k]):
-                kept = max(kept, k)
-                break
-    return kept
+    match = partial.search(buffer)
+    return len(match.group(0)) if match else 0
 
 
 def split_stream_delta(
@@ -249,8 +376,8 @@ def split_stream_delta(
             buffer = buffer[match.end() :]
             inside = not inside
             continue
-        stems = _CLOSE_TAG_STEMS if inside else _OPEN_TAG_STEMS
-        keep = 0 if final else _holdback_len(buffer, stems)
+        partial = _PARTIAL_CLOSE_RE if inside else _PARTIAL_OPEN_RE
+        keep = 0 if final else _holdback_len(buffer, partial)
         if keep >= len(buffer):
             # The whole buffer is a potential tag fragment (e.g. a
             # delta that ended mid-tag). Nothing is emittable; wait
@@ -276,25 +403,262 @@ def split_stream_delta(
     )
 
 
+# ----- the split reasoning channel (T2) -----
+
+
+# The keys a provider may use for the split reasoning channel, in
+# preference order. ``reasoning_details`` is the canonical shape
+# (ADR 0022 / OpenRouter); ``reasoning_content`` is what most
+# OpenAI-compatible proxies emit; ``reasoning`` is the third
+# spelling seen in the wild. Only the FIRST key that yields entries
+# is used — a provider that echoes the same prose under two keys
+# must not have it counted twice.
+_REASONING_KEYS: tuple[str, ...] = (
+    "reasoning_details",
+    "reasoning_content",
+    "reasoning",
+)
+
+# Fields an entry may carry its prose under. ``summary`` covers
+# ``reasoning.summary`` entries, which have no ``text``.
+_REASONING_PROSE_FIELDS: tuple[str, ...] = ("text", "summary", "content")
+
+
+def _entry_prose(entry: Any) -> str:
+    """Prose of one reasoning entry, ``""`` when it carries none.
+
+    Non-dict entries and entries whose prose fields are absent or
+    non-string contribute nothing rather than raising: a malformed
+    entry mid-stream must not kill the SSE body.
+    """
+    if not isinstance(entry, Mapping):
+        return ""
+    for field in _REASONING_PROSE_FIELDS:
+        value = entry.get(field)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _entries_from_value(value: Any) -> list[dict[str, Any]]:
+    """Normalise one reasoning-channel value into entries.
+
+    A list keeps its dict entries VERBATIM so replay-relevant fields
+    (``type`` / ``format`` / ``index`` / signatures) survive to the
+    checkpoint. A bare string or a single object is synthesised into
+    one ``reasoning.text`` entry so downstream code sees one shape.
+    """
+    if isinstance(value, str):
+        return [{"type": "reasoning.text", "text": value}] if value else []
+    if isinstance(value, list):
+        return [entry for entry in value if isinstance(entry, dict)]
+    prose = _entry_prose(value)
+    if not prose:
+        return []
+    entry_type = value.get("type") if isinstance(value, Mapping) else None
+    if not isinstance(entry_type, str):
+        entry_type = "reasoning.text"
+    return [{"type": entry_type, "text": prose}]
+
+
+def reasoning_entries_from_delta(
+    delta: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Normalise a reasoning channel into ``reasoning_details`` entries.
+
+    ``delta`` is either a raw provider delta dict or an
+    ``AIMessageChunk.additional_kwargs`` mapping — the same key
+    names appear on both sides of the converter, so one function
+    serves both readers.
+
+    Returns ``[]`` when no reasoning key carries usable prose. That
+    empty result is the fallback signal: the caller falls through to
+    the inline ``<think>`` strip rather than emitting a blank
+    thinking frame.
+    """
+    if not isinstance(delta, Mapping):
+        return []
+    for key in _REASONING_KEYS:
+        if key not in delta:
+            continue
+        value = delta[key]
+        if key == "reasoning_details" and not isinstance(value, list):
+            # The canonical key is a list by contract; a scalar there
+            # is a mistyped frame, not prose to render as thinking.
+            continue
+        entries = _entries_from_value(value)
+        if any(_entry_prose(entry) for entry in entries):
+            return entries
+    return []
+
+
+def reasoning_entries_from_raw_chunk(chunk: Any) -> list[dict[str, Any]]:
+    """Normalise one raw ``chat.completion.chunk`` payload's reasoning.
+
+    Digs the first choice's ``delta`` out of the provider frame
+    before delegating to :func:`reasoning_entries_from_delta`. Every
+    malformed shape (no ``choices``, an empty list, a ``None``
+    delta) yields ``[]`` — this runs inside the streaming loop, where
+    a raise would truncate the SSE body mid-run.
+    """
+    if not isinstance(chunk, Mapping):
+        return []
+    choices = chunk.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return []
+    first = choices[0]
+    if not isinstance(first, Mapping):
+        return []
+    return reasoning_entries_from_delta(first.get("delta"))
+
+
 def reasoning_delta_from_chunk(chunk: AIMessageChunk) -> str:
     """Extract THIS chunk's thinking prose delta.
 
-    Reads ``additional_kwargs.reasoning_details`` — the
-    ``reasoning_split=true`` channel (ADR 0022) — concatenating each
-    dict entry's ``text`` field in order. Malformed entries (non-dict
-    entries, non-string ``text``) contribute nothing: the caller
-    skips the SSE frame when the result is empty.
+    Reads whichever split-channel key the provider used (ADR 0022
+    ``reasoning_split=true``), concatenating the entries' prose in
+    order. Malformed entries contribute nothing: the caller skips
+    the SSE frame when the result is empty and the inline strip in
+    :func:`split_stream_delta` remains the fallback.
     """
-    details = chunk.additional_kwargs.get("reasoning_details")
-    if not isinstance(details, list):
-        return ""
-    pieces: list[str] = []
-    for entry in details:
-        if isinstance(entry, dict):
-            text = entry.get("text")
-            if isinstance(text, str) and text:
-                pieces.append(text)
-    return "".join(pieces)
+    return "".join(
+        _entry_prose(entry)
+        for entry in reasoning_entries_from_delta(chunk.additional_kwargs)
+    )
+
+
+def replay_reasoning_into_payload(
+    payload: dict[str, Any], messages: list[BaseMessage]
+) -> dict[str, Any]:
+    """Re-attach each assistant turn's reasoning to the request body.
+
+    ``langchain-openai``'s ``_convert_message_to_dict`` copies only
+    ``name`` / ``tool_calls`` / ``function_call`` / ``audio`` off an
+    ``AIMessage``'s ``additional_kwargs``; every other key — including
+    the ``reasoning_details`` the inbound converter worked to keep —
+    is dropped on the floor. So capture alone leaves the model's
+    prior-turn scratchpad stranded in the checkpoint, and the next
+    call reasons from scratch (spec line 28: the converter copies
+    ``reasoning_details`` onto the checkpointed ``AIMessage`` AND
+    replays it on the next model call).
+
+    Entries go out VERBATIM. The provider correlates them by ``id`` /
+    ``index`` and carries its own ``format`` tag; re-deriving the
+    prose would drop that identity, which is exactly what
+    :func:`_repair_merged_reasoning_entries` protects on the way in.
+    A turn checkpointed under one of the other spellings
+    (``reasoning_content`` / ``reasoning``) is normalised onto the
+    canonical key here rather than forwarded as-is, so the request
+    body stays one shape regardless of which provider wrote the
+    checkpoint.
+
+    Mutates and returns ``payload``. Nothing happens when the payload
+    is not a Chat Completions body (the Responses API keys its turns
+    under ``input``, a different contract this host does not use) or
+    when the two sides disagree on length — a silent misalignment
+    would attach one turn's reasoning to another's message, which is
+    worse than replaying none.
+    """
+    dicts = payload.get("messages")
+    if not isinstance(dicts, list) or len(dicts) != len(messages):
+        return payload
+    for message, message_dict in zip(messages, dicts):
+        if not isinstance(message, AIMessage) or not isinstance(
+            message_dict, dict
+        ):
+            continue
+        if message_dict.get("role") != "assistant":
+            continue
+        entries = reasoning_entries_from_delta(message.additional_kwargs)
+        if entries:
+            message_dict["reasoning_details"] = entries
+    return payload
+
+
+# One subclass per resolved base class. ``compile`` builds the model
+# once per process, but tests swap in a fake ``langchain_openai``;
+# keying on the base keeps each of them with its own subclass
+# instead of handing back a stale one.
+_REASONING_CONVERTERS: dict[type, type] = {}
+
+
+def reasoning_preserving_chat_openai() -> type:
+    """Return a ``ChatOpenAI`` subclass that keeps provider reasoning.
+
+    ``langchain-openai`` documents that it targets the official
+    OpenAI specification only: its delta converter builds
+    ``additional_kwargs`` from ``function_call`` alone, so
+    ``reasoning_details`` / ``reasoning_content`` / ``reasoning`` are
+    dropped before the chunk reaches the host. With the channel gone
+    the model's scratchpad either vanishes or (when the provider
+    falls back to inlining) rides in ``content``, which is exactly
+    what the inline strip then has to catch.
+
+    The inbound override re-attaches the normalised entries so the
+    SSE mapper emits ``thinking`` frames and the checkpoint holds the
+    channel; the outbound override then puts those entries back on
+    the wire, because ``langchain-openai`` drops arbitrary
+    ``additional_kwargs`` in BOTH directions. Together they are spec
+    line 28's thinking transport converter: reasoning rides
+    ``additional_kwargs.reasoning_details`` and is replayed on the
+    next model call.
+
+    ``ChatOpenAI`` is imported lazily (and the subclass built on
+    first use) so this module stays importable without the heavy
+    runtime dep and so tests can inject a stub via ``sys.modules``.
+    """
+    from langchain_openai import ChatOpenAI
+
+    cached = _REASONING_CONVERTERS.get(ChatOpenAI)
+    if cached is not None:
+        return cached
+
+    class ReasoningPreservingChatOpenAI(ChatOpenAI):  # type: ignore[misc]
+        """``ChatOpenAI`` plus the provider's split reasoning channel."""
+
+        def _convert_chunk_to_generation_chunk(
+            self,
+            chunk: dict,
+            default_chunk_class: type,
+            base_generation_info: dict | None,
+        ) -> Any:
+            generated = super()._convert_chunk_to_generation_chunk(
+                chunk, default_chunk_class, base_generation_info
+            )
+            # The base class returns ``None`` for frames it skips
+            # (e.g. beta-stream ``content.delta`` events).
+            if generated is None:
+                return None
+            entries = reasoning_entries_from_raw_chunk(chunk)
+            if entries:
+                kwargs = generated.message.additional_kwargs
+                existing = kwargs.get("reasoning_details")
+                kwargs["reasoning_details"] = (
+                    [*existing, *entries]
+                    if isinstance(existing, list)
+                    else entries
+                )
+            return generated
+
+        def _get_request_payload(
+            self,
+            input_: Any,
+            *,
+            stop: list[str] | None = None,
+            **kwargs: Any,
+        ) -> dict:
+            payload = super()._get_request_payload(
+                input_, stop=stop, **kwargs
+            )
+            # ``_convert_input`` is what the base class itself used to
+            # build the payload's message list, so calling it again is
+            # what makes the two sides line up index for index.
+            return replay_reasoning_into_payload(
+                payload, self._convert_input(input_).to_messages()
+            )
+
+    _REASONING_CONVERTERS[ChatOpenAI] = ReasoningPreservingChatOpenAI
+    return ReasoningPreservingChatOpenAI
 
 
 # ----- thinking duration clock (T4, #37) -----
@@ -654,6 +1018,10 @@ __all__ = [
     "format_tool_summary",
     "inline_thinking_segments",
     "reasoning_delta_from_chunk",
+    "reasoning_entries_from_delta",
+    "reasoning_entries_from_raw_chunk",
+    "reasoning_preserving_chat_openai",
+    "replay_reasoning_into_payload",
     "split_stream_delta",
     "strip_thinking_from_answer",
     "summarize_get_xbrl_fact",
