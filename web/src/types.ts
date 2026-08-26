@@ -16,6 +16,19 @@ export interface Citation {
 
 export type RunStatus = "done" | "refuse" | "step_cap";
 
+// Stream error taxonomy for mid-flight failures (model raise,
+// network drop, etc.). Maps to a small "原因" label the SPA
+// renders on refuse rows so an auth / rate_limit / timeout reads
+// distinctly instead of as one opaque English sentence.
+export type StreamErrorKind =
+  | "auth"
+  | "network"
+  | "timeout"
+  | "rate_limit"
+  | "not_found"
+  | "server"
+  | "unknown";
+
 // Soft-Track (specs/soft-track.md): per-turn host contract. Optional
 // on the wire until the host peer exposes SSE/GET ``track``.
 export type SoftTrack = "dialogue" | "clarify" | "off_topic" | "research";
@@ -71,6 +84,13 @@ export interface Turn {
   // which by construction can only be the latest turn. Drives the
   // T4 banner + Resume button in ThreadPage.
   in_flight?: boolean;
+  // Mid-flight stream error taxonomy on refuse rows. Mirrors
+  // ``fin.host.workspace_http.TurnRow.status_classified``. Empty
+  // string on rows whose refusal came from the gate rather than
+  // the stream engine; the SPA keys a small "原因" label off this
+  // field so a 401 / 429 / 504 reads distinctly instead of as one
+  // opaque English sentence.
+  status_classified?: StreamErrorKind | "";
   created_at: string;
 }
 

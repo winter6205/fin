@@ -143,6 +143,12 @@ class RunRecord:
     in_flight: bool = False
     # Soft-Track: {track, confidence, decision_tier, signals}.
     track_decision: dict[str, Any] = field(default_factory=dict)
+    # Mid-flight stream error taxonomy (auth / network / timeout
+    # / rate_limit / not_found / server / unknown). Empty on rows
+    # whose refusal came from the gate rather than the stream
+    # engine. Persisted so a reload restores the label the SPA
+    # rendered live.
+    status_classified: str = ""
 
 
 # ----- enum + validation -----
@@ -455,7 +461,12 @@ CREATE TABLE IF NOT EXISTS fin_run (
     -- LIVE running signal is the per-thread lock probe, never this.
     in_flight         BOOLEAN NOT NULL DEFAULT FALSE,
     -- Soft-Track T5: auditable track decision for this run_id.
-    track_decision    JSONB NOT NULL DEFAULT '{}'::jsonb
+    track_decision    JSONB NOT NULL DEFAULT '{}'::jsonb,
+    -- Mid-flight stream error taxonomy on refuse rows
+    -- (auth / network / timeout / rate_limit / not_found /
+    -- server / unknown). Empty on rows whose refusal came from
+    -- the gate rather than the stream engine.
+    status_classified TEXT NOT NULL DEFAULT ''
 );
 
 -- T2 column migration: add ``assistant_message`` to existing
@@ -482,6 +493,12 @@ ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS thinking_duration_ms INTEGER NOT NU
 
 -- Soft-Track T5: track_decision on existing tables.
 ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS track_decision JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+-- Stream error taxonomy: classify mid-flight failures (auth /
+-- network / timeout / rate_limit / not_found / server / unknown)
+-- so the SPA can render a precise label rather than one opaque
+-- English sentence. Empty on rows that did not fail mid-stream.
+ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS status_classified TEXT NOT NULL DEFAULT '';
 """
 
 
@@ -557,6 +574,10 @@ class PostgresThreadStore:
                 if len(row) > 13
                 else {}
             ),
+            # Stream error taxonomy (auth / network / ... / unknown).
+            # Empty when pre-migration; rows that did not fail
+            # mid-flight never set this column.
+            status_classified=(row[14] or "") if len(row) > 14 else "",
         )
 
     # -- threads --
@@ -669,8 +690,8 @@ class PostgresThreadStore:
                     "INSERT INTO fin_run (id, thread_id, question, status, "
                     "status_reason, answer, citations, thinking_text, "
                     "tool_summaries, assistant_message, created_at, in_flight, "
-                    "thinking_duration_ms, track_decision) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    "thinking_duration_ms, track_decision, status_classified) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (
                         record.id,
                         record.thread_id,
@@ -687,6 +708,7 @@ class PostgresThreadStore:
                         False,
                         record.thinking_duration_ms,
                         json.dumps(record.track_decision),
+                        record.status_classified,
                     ),
                 )
                 conn.commit()
@@ -718,7 +740,7 @@ class PostgresThreadStore:
                 "SELECT id, thread_id, question, status, status_reason, "
                 "answer, citations, thinking_text, tool_summaries, "
                 "assistant_message, created_at, in_flight, "
-                "thinking_duration_ms, track_decision "
+                "thinking_duration_ms, track_decision, status_classified "
                 "FROM fin_run WHERE thread_id = %s ORDER BY created_at ASC",
                 (thread_id,),
             ).fetchall()
