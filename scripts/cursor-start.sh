@@ -41,4 +41,15 @@ done
 # came up -- a silently missing checkpointer DB is worse than a red start.
 pg_isready -h 127.0.0.1 -p 5432 -U fin -d fin
 
+# --------------------------------------------------------------------
+# LLM boot defaults (official MiniMax Chat Completions)
+# --------------------------------------------------------------------
+# Process env / Cloud secrets win. These exports only fill gaps so a
+# pod that injects ANTHROPIC_AUTH_TOKEN still hits official chat
+# instead of localhost:20128. Never assign the key here.
+log "llm env defaults"
+export FIN_BASE_URL="${FIN_BASE_URL:-https://api.minimaxi.com/v1}"
+export FIN_MODEL="${FIN_MODEL:-MiniMax-M3}"
+export FIN_CHECKPOINT_URL="${FIN_CHECKPOINT_URL:-postgresql://fin:fin@localhost:5432/fin?sslmode=disable}"
+
 log "ready"

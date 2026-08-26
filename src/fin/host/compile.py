@@ -54,8 +54,11 @@ SDK appends ``/chat/completions`` to whatever ``base_url`` you
 give it. So ``FIN_BASE_URL`` SHOULD include ``/v1`` — passing
 ``http://localhost:20128`` (without ``/v1``) would result in
 requests to ``http://localhost:20128/chat/completions`` (404 at
-the proxy). The default below is ``http://localhost:20128/v1``;
-the proxy receives ``POST /v1/chat/completions`` as expected.
+the proxy). The default below is ``https://api.minimaxi.com/v1``;
+the official CN Chat Completions API receives
+``POST /v1/chat/completions``. Operators who still run a local
+9router override ``FIN_BASE_URL`` (for example WSL
+``http://172.31.128.1:20128/v1``).
 """
 
 from __future__ import annotations
@@ -74,19 +77,16 @@ from fin.host.graph import compile_graph
 # ----- public constants -----
 
 
-# ADR 0022 default for ``FIN_MODEL``. The local proxy at
-# ``DEFAULT_BASE_URL`` exposes a model whose id uses a slash
-# separator (``provider/model``); ``ChatOpenAI`` passes it
-# verbatim to the proxy.
-DEFAULT_MODEL = "fin/MiniMax-M3"
+# ADR 0022 default for ``FIN_MODEL``. Official MiniMax Chat
+# Completions uses the vendor model id (no ``fin/`` proxy prefix).
+DEFAULT_MODEL = "MiniMax-M3"
 
-# OpenAI Chat-Completions proxy URL (the official ``openai``
+# Official MiniMax CN Chat Completions URL (the official ``openai``
 # SDK appends ``/chat/completions`` to ``base_url``). The
-# default INCLUDES ``/v1`` — with this value the SDK will hit
-# ``http://localhost:20128/v1/chat/completions`` (verified
-# empirically). Operators running against OpenAI's hosted API
-# override via ``FIN_BASE_URL=https://api.openai.com/v1``.
-DEFAULT_BASE_URL = "http://localhost:20128/v1"
+# default INCLUDES ``/v1``. Overseas operators override with
+# ``https://api.minimax.io/v1``. A local 9router override is
+# still ``http://localhost:20128/v1``.
+DEFAULT_BASE_URL = "https://api.minimaxi.com/v1"
 
 # The exact ``FIN_CHECKPOINT_URL`` example shipped in
 # ``.env.example`` and asserted by the URL-match acceptance gate
@@ -256,18 +256,17 @@ def compile_for_runtime(
         no fallback — a missing value raises
         :class:`MissingCheckpointURLError`.
     model_name
-        Model id passed verbatim to the proxy (e.g.
-        ``"fin/MiniMax-M3"``). Defaults to
+        Model id passed verbatim to Chat Completions (e.g.
+        ``"MiniMax-M3"``). Defaults to
         ``os.environ.get("FIN_MODEL", DEFAULT_MODEL)``.
     base_url
         OpenAI-compatible chat-completions endpoint (the
         ``openai`` SDK appends ``/chat/completions``). Defaults
         to ``os.environ.get("FIN_BASE_URL", DEFAULT_BASE_URL)``.
-        The local v1 dev proxy listens on
-        ``http://localhost:20128/v1`` and receives
-        ``POST /v1/chat/completions``; WSL2 users override with
-        the Windows-host gateway IP, e.g.
-        ``http://172.31.128.1:20128/v1``.
+        The product default is official MiniMax CN
+        ``https://api.minimaxi.com/v1``. A local 9router
+        override is ``http://localhost:20128/v1``; WSL2 users
+        targeting Windows-side 9router use the gateway IP.
     env
         Mapping to read env-style keys from. Defaults to
         ``os.environ``. Tests inject a ``monkeypatch.setenv``
@@ -403,9 +402,9 @@ def compile_for_runtime_dev(
 
     The model side is **NOT** auto-faked here. If
     ``FIN_BASE_URL`` is unset, the prod default (``DEFAULT_BASE_URL``
-    = ``http://localhost:20128/v1``) is used and the model call
-    will surface a real ``OpenAIConnectionError`` if no proxy is
-    listening there — better a loud failure than a hidden scripted
+    = ``https://api.minimaxi.com/v1``) is used and the model call
+    will surface a real auth/network error if the key or network
+    is missing — better a loud failure than a hidden scripted
     substitute masquerading as a real conversation.
     """
     import logging
