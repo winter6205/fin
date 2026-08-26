@@ -6,6 +6,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { useState } from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import { markCorpusHomeVisit } from "../sessionKeys";
+import { describeStatusStrip, workspaceStatusView } from "../statusStrip";
 import { useWorkspaceStore } from "../store";
 
 export function truncateTitle(title: string, max = 50): string {
@@ -120,7 +121,48 @@ export default function Sidebar() {
           ))}
         </ul>
       </nav>
+      <StatusStrip />
     </aside>
+  );
+}
+
+// T10 (ADR 0033): boot-scoped workspace status, pinned under the
+// thread list. Every state renders four lines — an unreachable
+// retrieve is degraded copy here, never an empty panel and never an
+// error page.
+function StatusStrip() {
+  const status = useWorkspaceStore((s) => s.status);
+  const statusLoaded = useWorkspaceStore((s) => s.statusLoaded);
+  const copy = describeStatusStrip(workspaceStatusView(status, statusLoaded));
+  const degraded = copy.retrieveTone === "degraded";
+
+  return (
+    <section
+      aria-label="工作区状态"
+      className={`shrink-0 border-t border-black px-3 py-2 text-xs ${
+        degraded ? "bg-tool" : "bg-card"
+      }`}
+    >
+      <p data-testid="status-retrieve">
+        <span
+          className={`inline-block font-semibold ${
+            degraded
+              ? "border border-black bg-black px-1.5 py-0.5 text-white"
+              : "text-gray-700"
+          }`}
+        >
+          {copy.retrieveLabel}
+        </span>
+      </p>
+      <p className="mt-0.5 leading-snug text-gray-700">{copy.retrieveDetail}</p>
+      <ul className="mt-1.5 space-y-0.5 text-gray-600">
+        <li>{copy.adapterLabel}</li>
+        <li className="truncate" title={copy.modelLabel}>
+          {copy.modelLabel}
+        </li>
+        <li>{copy.corpusLabel}</li>
+      </ul>
+    </section>
   );
 }
 

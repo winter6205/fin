@@ -13,8 +13,14 @@ import type {
   ThreadListItem,
   ToolSummary,
   Turn,
+  WorkspaceStatus,
 } from "./types";
-import { mergeAnswerDelta } from "./turnStream";
+import {
+  EMPTY_LIVE_ANSWER,
+  foldLiveAnswer,
+  mergeReconciledTurn,
+  type LiveAnswerState,
+} from "./turnStream";
 
 interface WorkspaceState {
   threads: ThreadListItem[];
@@ -28,6 +34,11 @@ interface WorkspaceState {
   // the one-shot restore treats a valid marker as stale.
   threadsLoaded: boolean;
   corpusLoaded: boolean;
+  // T10 (ADR 0033): the Sidebar strip's slice. ``null`` after
+  // ``statusLoaded`` means the status route itself did not answer —
+  // the strip renders its unavailable copy rather than nothing.
+  status: WorkspaceStatus | null;
+  statusLoaded: boolean;
   sendingQuestion: boolean;
   // T4: ``resumeThread(threadId)`` sets this while the resume SSE
   // stream is active so the Composer can disable itself and so a
@@ -38,6 +49,9 @@ interface WorkspaceState {
 
   refreshThreads: () => Promise<void>;
   loadCorpus: () => Promise<void>;
+  // Fetched once when the workspace opens. Boot-scoped fields do not
+  // change mid-session, so there is no poll.
+  loadStatus: () => Promise<void>;
   openThread: (threadId: string) => Promise<void>;
   createThread: (firstMessage: string | null) => Promise<string>;
   removeThread: (threadId: string) => Promise<void>;
@@ -64,6 +78,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   loadingThreads: false,
   threadsLoaded: false,
   corpusLoaded: false,
+  status: null,
+  statusLoaded: false,
   sendingQuestion: false,
   resumingThreadId: null,
 
@@ -86,6 +102,18 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
   },
 
+  async loadStatus() {
+    // A failed or malformed status read is a strip state, not an
+    // error the operator has to act on: the workspace keeps working
+    // without it. ``statusLoaded`` still flips so the strip stops
+    // showing "读取中" and shows its unavailable copy instead.
+    try {
+      set({ status: await api.getStatus(), statusLoaded: true });
+    } catch {
+      set({ status: null, statusLoaded: true });
+    }
+  },
+
   async openThread(threadId: string) {
     // Unknown id -> 404 -> surface as empty active thread so the
     // route can render its not-found copy. We do NOT re-invoke the
@@ -94,7 +122,11 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // T5 (#35): a successfully opened thread becomes the one a
     // returning visit restores.
     rememberLastThread(threadId);
-    set({ activeThread: detail });
+    // T4 (plans/workspace-stream-fidelity.md): reconcile, do not
+    // replace. Replacing the turn table retracted prose the operator
+    // had already watched arrive token-by-token and repainted the
+    // persisted text over it.
+    set((s) => ({ activeThread: reconcileTurnTable(s.activeThread, detail) }));
   },
 
   async createThread(firstMessage: string | null) {
@@ -177,7 +209,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // ``status`` the wire may emit one authoritative frame — on ``done``
     // runs we keep a non-empty draft; on refuse/step_cap an empty frame
     // clears the draft so SC67 copy renders from ``assistant_message``.
+    // The fold state lives here rather than on the turn row because a
+    // bounce retry accumulates behind the visible draft.
     let statusSeen = false;
+    let answerFold: LiveAnswerState = EMPTY_LIVE_ANSWER;
     try {
       const result = await api.sendMessage(
         threadId,
@@ -244,13 +279,12 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
               break;
             }
             case "answer":
-              patchTurn((t) => ({
-                ...t,
-                answer: mergeAnswerDelta(t.answer, event.text, {
-                  statusSeen,
-                  reset: event.reset,
-                }),
-              }));
+              answerFold = foldLiveAnswer(answerFold, {
+                text: event.text,
+                reset: event.reset,
+                statusSeen,
+              });
+              patchTurn((t) => ({ ...t, answer: answerFold.visible }));
               break;
             case "citations":
               patchTurn((t) => ({ ...t, citations: event.citations }));
@@ -321,7 +355,13 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     try {
       // Same delta semantics as sendQuestion (T1 #33): append while
       // streaming; post-status empty frame clears refuse/step_cap draft.
+      // The fold starts from the prose already painted on the resumed
+      // row so the first delta extends it instead of replacing it.
       let statusSeen = false;
+      let answerFold: LiveAnswerState = {
+        ...EMPTY_LIVE_ANSWER,
+        visible: latestTurnAnswer(threadId),
+      };
       const result = await api.resumeThread(threadId, (event) => {
         // Switch-thread guard: if the operator navigated away
         // mid-resume, drop the patches rather than painting them
@@ -374,12 +414,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
             }));
             break;
           case "answer":
+            answerFold = foldLiveAnswer(answerFold, {
+              text: event.text,
+              reset: event.reset,
+              statusSeen,
+            });
             patchLatestTurn(threadId, (t) => ({
               ...t,
-              answer: mergeAnswerDelta(t.answer, event.text, {
-                statusSeen,
-                reset: event.reset,
-              }),
+              answer: answerFold.visible,
             }));
             break;
           case "citations":
@@ -415,6 +457,35 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 }));
 
+// T4 GET reconcile (plans/workspace-stream-fidelity.md): fold the
+// persisted turn table into the one on screen. The server row stays
+// authoritative for ids, status, citation quotes and thinking
+// duration; ``mergeReconciledTurn`` keeps the prose (and trace) the
+// operator already watched stream in so the bubble never retracts and
+// repaints. Rows this session never streamed come straight from the
+// server. The still-running row is the one exception the server cannot
+// send: a RunRecord is appended only once its stream completes, so a
+// mid-run reopen carries the live row over — dropping it would blank
+// the bubble AND orphan the patches the running stream still makes.
+function reconcileTurnTable(
+  streamed: ThreadDetail | null,
+  persisted: ThreadDetail,
+): ThreadDetail {
+  if (!streamed || streamed.id !== persisted.id) return persisted;
+  const streamedByRunId = new Map<string, Turn>(
+    streamed.turns.map((t) => [t.run_id, t]),
+  );
+  const persistedRunIds = new Set(persisted.turns.map((t) => t.run_id));
+  const reconciled = persisted.turns.map((row) => {
+    const live = streamedByRunId.get(row.run_id);
+    return live ? mergeReconciledTurn(live, row) : row;
+  });
+  const stillRunning = streamed.turns.filter(
+    (t) => t.in_flight === true && !persistedRunIds.has(t.run_id),
+  );
+  return { ...persisted, turns: [...reconciled, ...stillRunning] };
+}
+
 // Remove an optimistic turn that never received a single SSE frame.
 // No-op when the operator has navigated away, so a failed send on
 // thread A cannot delete a row on thread B.
@@ -427,6 +498,16 @@ function dropTurnByRunId(threadId: string, runId: Turn["run_id"]): void {
       turns: current.turns.filter((t) => t.run_id !== runId),
     },
   });
+}
+
+// Prose already on the resumed thread's most-recent turn — the live
+// fold's starting point. Empty when the operator has navigated away
+// or the thread has no turns yet.
+function latestTurnAnswer(threadId: string): string {
+  const current = useWorkspaceStore.getState().activeThread;
+  if (!current || current.id !== threadId) return "";
+  if (current.turns.length === 0) return "";
+  return current.turns[current.turns.length - 1].answer;
 }
 
 // T4 helper: patch the most-recent turn on ``threadId`` (the one

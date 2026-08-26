@@ -26,7 +26,12 @@ from fin.corpus._private_fixtures import load_private_fixture
 from typing import Any
 
 import pytest
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    HumanMessage,
+    ToolMessage,
+)
 
 from fin.host.stream_map import (
     DeltaSplit,
@@ -34,6 +39,9 @@ from fin.host.stream_map import (
     assemble_final_ai_message,
     format_tool_summary,
     reasoning_delta_from_chunk,
+    reasoning_entries_from_delta,
+    reasoning_entries_from_raw_chunk,
+    reasoning_preserving_chat_openai,
     split_stream_delta,
     strip_thinking_from_answer,
     summarize_get_xbrl_fact,
@@ -121,6 +129,130 @@ def test_assemble_preserves_reasoning_details_for_replay() -> None:
     assert any(d.get("text") == "thinking two" for d in details)
 
 
+def _minimax_reasoning_entry(text: str) -> dict[str, Any]:
+    """One entry in the shape live MiniMax-M3 streams (2026-08-26).
+
+    Every delta repeats the SAME ``id`` / ``format`` / ``index``
+    identity and carries only its own slice of ``text``. Captured
+    from ``POST https://api.minimaxi.com/v1/chat/completions`` with
+    ``reasoning_split: true``.
+    """
+    return {
+        "type": "reasoning.text",
+        "id": "reasoning-text-1",
+        "format": "MiniMax-response-v1",
+        "index": 0,
+        "text": text,
+    }
+
+
+def test_assemble_concatenates_only_the_prose_of_a_merged_entry() -> None:
+    """Merging a streamed entry must grow ``text`` and nothing else.
+
+    LangChain's ``merge_dicts`` concatenates every string field it
+    has no special case for, so a provider that repeats an identity
+    field on each delta (MiniMax repeats ``format``) ends up with
+    that field duplicated once per chunk in the checkpointed
+    message. The prose is the only field a delta actually splits.
+    """
+    chunks = [
+        AIMessageChunk(
+            content="",
+            additional_kwargs={
+                "reasoning_details": [_minimax_reasoning_entry(t)]
+            },
+        )
+        for t in ("Let me ", "compute ", "17*23.")
+    ]
+    msg = assemble_final_ai_message(chunks)
+    details = msg.additional_kwargs["reasoning_details"]
+    assert len(details) == 1
+    assert details[0]["text"] == "Let me compute 17*23."
+    assert details[0]["format"] == "MiniMax-response-v1"
+    assert details[0]["type"] == "reasoning.text"
+    assert details[0]["id"] == "reasoning-text-1"
+    assert details[0]["index"] == 0
+
+
+def test_assemble_keeps_distinct_reasoning_entries_apart() -> None:
+    """Two indexed entries stay two, each with its OWN identity.
+
+    A provider that opens a second reasoning block mid-stream sends
+    a new ``index``; repairing the first entry's metadata must not
+    bleed onto the second.
+    """
+    first = _minimax_reasoning_entry("block one ")
+    second = {
+        **_minimax_reasoning_entry("block two "),
+        "id": "reasoning-text-2",
+        "format": "MiniMax-response-v2",
+        "index": 1,
+    }
+    chunks = [
+        AIMessageChunk(
+            content="", additional_kwargs={"reasoning_details": [dict(first)]}
+        ),
+        AIMessageChunk(
+            content="",
+            additional_kwargs={
+                "reasoning_details": [{**first, "text": "continued"}]
+            },
+        ),
+        AIMessageChunk(
+            content="", additional_kwargs={"reasoning_details": [dict(second)]}
+        ),
+        AIMessageChunk(
+            content="",
+            additional_kwargs={
+                "reasoning_details": [{**second, "text": "also continued"}]
+            },
+        ),
+    ]
+    msg = assemble_final_ai_message(chunks)
+    details = msg.additional_kwargs["reasoning_details"]
+    assert [d["text"] for d in details] == [
+        "block one continued",
+        "block two also continued",
+    ]
+    assert [d["format"] for d in details] == [
+        "MiniMax-response-v1",
+        "MiniMax-response-v2",
+    ]
+    assert [d["id"] for d in details] == [
+        "reasoning-text-1",
+        "reasoning-text-2",
+    ]
+
+
+def test_assemble_concatenates_summary_prose_across_deltas() -> None:
+    """``summary`` is prose too — a split summary must still join.
+
+    ``reasoning.summary`` entries carry no ``text``; the repair must
+    not mistake their prose for identity metadata and drop half of it.
+    """
+    chunks = [
+        AIMessageChunk(
+            content="",
+            additional_kwargs={
+                "reasoning_details": [
+                    {
+                        "type": "reasoning.summary",
+                        "format": "openai-responses-v1",
+                        "index": 0,
+                        "summary": part,
+                    }
+                ]
+            },
+        )
+        for part in ("weighed ", "both options")
+    ]
+    msg = assemble_final_ai_message(chunks)
+    details = msg.additional_kwargs["reasoning_details"]
+    assert len(details) == 1
+    assert details[0]["summary"] == "weighed both options"
+    assert details[0]["format"] == "openai-responses-v1"
+
+
 def test_assemble_single_chunk_returns_ai_message_with_same_shape() -> None:
     """A one-chunk stream still produces an ``AIMessage`` (not a
     chunk) so the checkpoint write is uniform."""
@@ -196,7 +328,87 @@ def test_strip_removes_minimax_think_block() -> None:
     assert "Net sales were $81.8 billion." in out
 
 
-# ----- summarize_list_files -----
+def test_strip_keeps_markdown_indentation_and_blank_runs() -> None:
+    """A thinking-free answer must survive the strip byte-for-byte.
+
+    F3: the strip used to fold ``[ \\t]+\\n`` / ``\\n[ \\t]+`` /
+    ``\\n{3,}`` over the WHOLE answer, which flattened nested
+    markdown bullets and code-block indentation that the streamed
+    deltas had already painted verbatim.
+    """
+    answer = (
+        "Summary:\n\n"
+        "- Point one\n"
+        "    - nested detail\n\n\n"
+        "```python\ndef f():\n    return 1\n```\n"
+    )
+    assert strip_thinking_from_answer(answer) == answer
+
+
+# ----- streamed / persisted answer parity (F3) -----
+
+
+# Answer shapes whose whitespace or tag boundaries previously
+# diverged between the streamed deltas and the persisted row:
+# nested indentation, trailing spaces, 3+ newline runs, and inline
+# thinking blocks whose removal leaves a whitespace seam.
+_PARITY_ANSWER_SHAPES: tuple[str, ...] = (
+    "Summary:\n\n- Point one\n    - nested detail\n\nDone.",
+    "Line one   \nLine two\n\n\nLine three",
+    "<think>scratch</think>\n\nAnswer body.\n\n    indented tail\n",
+    "A paragraph.\n\n<thinking>notes\nmore notes</thinking>\n\nB paragraph.",
+    "<THINKING attr='x'>caps</THINKING >tail",
+    "```python\ndef f():\n    return 1\n```\n",
+)
+
+
+def _streamed_answer(full: str, *, width: int) -> str:
+    """Concatenate the ``answer`` pieces the delta split emits.
+
+    Mirrors what ``_stream_run_frames`` puts on the wire: one
+    ``split_stream_delta`` call per content chunk, then the
+    ``final=True`` tail flush.
+    """
+    state = InlineFilterState()
+    pieces: list[str] = []
+    for start in range(0, len(full), width):
+        split = split_stream_delta(state, full[start : start + width])
+        state = split.state
+        pieces.append(split.answer)
+    pieces.append(split_stream_delta(state, "", final=True).answer)
+    return "".join(pieces)
+
+
+@pytest.mark.parametrize("full", _PARITY_ANSWER_SHAPES)
+@pytest.mark.parametrize("width", [1, 3, 7, 4096])
+def test_streamed_deltas_concatenate_to_the_stripped_answer(
+    full: str, width: int
+) -> None:
+    """The two answer paths must agree byte-for-byte at any chunking.
+
+    ``split_stream_delta`` produces the streamed answer;
+    ``strip_thinking_from_answer`` produces the persisted one. The
+    SPA prefers the streamed prose when the persisted status is
+    ``done`` (``mergeReconciledTurn``), so any divergence is a
+    visible repaint after the run ends.
+    """
+    assert _streamed_answer(full, width=width) == strip_thinking_from_answer(
+        full
+    )
+
+
+def test_complete_tag_stem_at_a_delta_boundary_never_leaks(
+    full: str = "before<thinking>scratch</thinking>after",
+) -> None:
+    """A delta that ends exactly ON a tag stem must hold it back.
+
+    The hold-back used to keep at most ``len(stem) - 1`` characters,
+    so a buffer that WAS the whole stem (``<thinking`` — the ``>``
+    had not arrived yet) was released as answer prose and the tag
+    never matched again: the scratchpad then streamed straight into
+    the answer.
+    """
+    assert _streamed_answer(full, width=1) == "beforeafter"
 
 
 def test_summarize_list_files_plural_when_many() -> None:
@@ -849,3 +1061,614 @@ def test_thinking_clock_consecutive_thinking_ticks_do_not_restack() -> None:
     clock.tick_thinking()          # already open — no restart
     clock.close()
     assert clock.total_ms == 2000
+
+
+# ----- T2: reasoning captured in the shape the provider emits -----
+
+
+# The scratchpad prose every shape below carries. No ``answer``
+# frame and no gate-visible prose may contain it (SC60).
+SECRET = "INTERNAL the operator must never read as the answer"
+
+
+def _raw_chunk(delta: dict[str, Any]) -> dict[str, Any]:
+    """One OpenAI-compatible ``chat.completion.chunk`` payload.
+
+    The shape ``ChatOpenAI`` receives off the wire before its own
+    delta -> ``AIMessageChunk`` conversion runs.
+    """
+    return {
+        "id": "chatcmpl-fake",
+        "object": "chat.completion.chunk",
+        "model": "fin/MiniMax-M3",
+        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+    }
+
+
+def _map_chunks_to_frames(
+    chunks: list[AIMessageChunk],
+) -> list[tuple[str, str]]:
+    """Fake chunk mapper: chunks -> the ``(event, text)`` SSE frames.
+
+    Mirrors the send route's per-chunk mapping using ONLY the
+    ``stream_map`` primitives, so a shape that regresses here
+    regresses on the wire too — without booting FastAPI or a graph.
+    """
+    state = InlineFilterState()
+    frames: list[tuple[str, str]] = []
+    for chunk in chunks:
+        reasoning = reasoning_delta_from_chunk(chunk)
+        if reasoning:
+            frames.append(("thinking", reasoning))
+        content = chunk.content
+        if isinstance(content, str) and content:
+            split = split_stream_delta(state, content)
+            state = split.state
+            if split.thinking:
+                frames.append(("thinking", split.thinking))
+            if split.answer:
+                frames.append(("answer", split.answer))
+    tail = split_stream_delta(state, "", final=True)
+    if tail.thinking:
+        frames.append(("thinking", tail.thinking))
+    if tail.answer:
+        frames.append(("answer", tail.answer))
+    return frames
+
+
+def _text_of(frames: list[tuple[str, str]], event: str) -> str:
+    return "".join(text for name, text in frames if name == event)
+
+
+# --- raw provider delta -> normalized reasoning entries ---
+
+
+def test_raw_chunk_minimax_reasoning_details_normalizes_to_entries() -> None:
+    """The ``reasoning_split=true`` split channel: MiniMax puts the
+    scratchpad on ``delta.reasoning_details`` (ADR 0022). The
+    normalizer keeps the provider entry verbatim so replay-relevant
+    fields (``type`` / ``format`` / ``index``) survive."""
+    entries = reasoning_entries_from_raw_chunk(
+        _raw_chunk(
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_details": [
+                    {
+                        "type": "reasoning.text",
+                        "text": SECRET,
+                        "format": "unknown",
+                        "index": 0,
+                    }
+                ],
+            }
+        )
+    )
+    assert entries == [
+        {
+            "type": "reasoning.text",
+            "text": SECRET,
+            "format": "unknown",
+            "index": 0,
+        }
+    ]
+
+
+def test_raw_chunk_reasoning_content_normalizes_to_entries() -> None:
+    """The other shape OpenAI-compatible providers emit is a plain
+    ``delta.reasoning_content`` string. It normalizes onto the same
+    ``reasoning_details`` entry shape the rest of the host reads."""
+    entries = reasoning_entries_from_raw_chunk(
+        _raw_chunk({"content": "", "reasoning_content": "step one "})
+    )
+    assert entries == [{"type": "reasoning.text", "text": "step one "}]
+
+
+def test_raw_chunk_reasoning_string_and_dict_both_normalize() -> None:
+    """``delta.reasoning`` arrives as a bare string from some
+    proxies and as an object from others; both carry the same
+    prose."""
+    as_string = reasoning_entries_from_raw_chunk(
+        _raw_chunk({"content": "", "reasoning": "weighing the filing"})
+    )
+    as_object = reasoning_entries_from_raw_chunk(
+        _raw_chunk(
+            {"content": "", "reasoning": {"text": "weighing the filing"}}
+        )
+    )
+    assert as_string == [
+        {"type": "reasoning.text", "text": "weighing the filing"}
+    ]
+    assert as_object == as_string
+
+
+def test_raw_chunk_without_reasoning_yields_no_entries() -> None:
+    """A plain content delta carries no split channel — the caller
+    must fall through to the inline strip, not synthesize an empty
+    thinking frame."""
+    plain = _raw_chunk({"content": "hi"})
+    assert reasoning_entries_from_raw_chunk(plain) == []
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {},
+        {"choices": []},
+        {"choices": [{"index": 0, "delta": None}]},
+        {"choices": [{"index": 0, "delta": {"reasoning_details": "junk"}}]},
+        {"choices": "not-a-list"},
+    ],
+)
+def test_raw_chunk_malformed_shapes_yield_no_entries(raw: Any) -> None:
+    """Defensive (exception class): a truncated or mistyped provider
+    frame must not raise inside the stream loop — a raise there kills
+    the SSE body mid-run."""
+    assert reasoning_entries_from_raw_chunk(raw) == []
+
+
+def test_reasoning_entries_from_delta_prefers_the_split_list() -> None:
+    """A provider that sends BOTH shapes in one delta must not have
+    its scratchpad counted twice."""
+    entries = reasoning_entries_from_delta(
+        {
+            "reasoning_details": [{"type": "reasoning.text", "text": SECRET}],
+            "reasoning_content": SECRET,
+        }
+    )
+    assert entries == [{"type": "reasoning.text", "text": SECRET}]
+
+
+# --- chunk -> thinking delta (all provider shapes) ---
+
+
+def test_reasoning_delta_from_chunk_reads_reasoning_content() -> None:
+    """``reasoning_content`` on ``additional_kwargs`` is a thinking
+    delta, same as the ``reasoning_details`` list."""
+    chunk = AIMessageChunk(
+        content="", additional_kwargs={"reasoning_content": "step one "}
+    )
+    assert reasoning_delta_from_chunk(chunk) == "step one "
+
+
+def test_reasoning_delta_from_chunk_reads_reasoning_key() -> None:
+    """``reasoning`` (string or object) is a thinking delta too."""
+    as_string = AIMessageChunk(
+        content="", additional_kwargs={"reasoning": "weighing"}
+    )
+    as_object = AIMessageChunk(
+        content="", additional_kwargs={"reasoning": {"text": "weighing"}}
+    )
+    assert reasoning_delta_from_chunk(as_string) == "weighing"
+    assert reasoning_delta_from_chunk(as_object) == "weighing"
+
+
+def test_reasoning_delta_from_chunk_reads_summary_entries() -> None:
+    """A ``reasoning.summary`` entry carries its prose under
+    ``summary`` rather than ``text``; it is still thinking."""
+    chunk = AIMessageChunk(
+        content="",
+        additional_kwargs={
+            "reasoning_details": [
+                {"type": "reasoning.summary", "summary": "read the filing"}
+            ]
+        },
+    )
+    assert reasoning_delta_from_chunk(chunk) == "read the filing"
+
+
+def test_reasoning_delta_from_chunk_does_not_double_count() -> None:
+    """Both shapes on one chunk yield the prose ONCE."""
+    chunk = AIMessageChunk(
+        content="",
+        additional_kwargs={
+            "reasoning_details": [{"text": SECRET}],
+            "reasoning_content": SECRET,
+        },
+    )
+    assert reasoning_delta_from_chunk(chunk) == SECRET
+
+
+# --- the converter that keeps the channel alive past langchain-openai ---
+
+
+def test_stock_chat_openai_drops_the_provider_reasoning_channel() -> None:
+    """Why the converter exists (peer finding, pinned as a test).
+
+    ``langchain-openai`` targets the official OpenAI spec and its
+    delta converter builds ``additional_kwargs`` from
+    ``function_call`` only — ``reasoning_details`` /
+    ``reasoning_content`` are dropped on the floor. If this test ever
+    fails, upstream started preserving the channel and the subclass
+    below can go away.
+    """
+    from langchain_openai import ChatOpenAI
+
+    model = ChatOpenAI(
+        model="fin/MiniMax-M3",
+        base_url="http://localhost:20128/v1",
+        api_key="sk-no-key-required",
+    )
+    generated = model._convert_chunk_to_generation_chunk(
+        _raw_chunk(
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_details": [
+                    {"type": "reasoning.text", "text": SECRET, "index": 0}
+                ],
+            }
+        ),
+        AIMessageChunk,
+        None,
+    )
+    assert generated is not None
+    assert "reasoning_details" not in generated.message.additional_kwargs
+
+
+@pytest.mark.parametrize(
+    "delta",
+    [
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_details": [
+                {"type": "reasoning.text", "text": SECRET, "index": 0}
+            ],
+        },
+        {"role": "assistant", "content": "", "reasoning_content": SECRET},
+        {"role": "assistant", "content": "", "reasoning": SECRET},
+    ],
+)
+def test_converter_preserves_provider_reasoning_onto_the_chunk(
+    delta: dict[str, Any],
+) -> None:
+    """Every shape the configured provider may emit survives onto
+    ``additional_kwargs.reasoning_details`` — the channel the SSE
+    mapper and the checkpointed replay both read."""
+    model = reasoning_preserving_chat_openai()(
+        model="fin/MiniMax-M3",
+        base_url="http://localhost:20128/v1",
+        api_key="sk-no-key-required",
+    )
+    generated = model._convert_chunk_to_generation_chunk(
+        _raw_chunk(delta), AIMessageChunk, None
+    )
+    assert generated is not None
+    chunk = generated.message
+    assert reasoning_delta_from_chunk(chunk) == SECRET
+    assert SECRET not in chunk.content
+
+
+def test_converter_leaves_a_plain_content_chunk_alone() -> None:
+    """No split channel in the delta -> no synthesized reasoning; the
+    answer text passes through untouched so the inline-strip
+    fallback stays the only other thinking source."""
+    model = reasoning_preserving_chat_openai()(
+        model="fin/MiniMax-M3",
+        base_url="http://localhost:20128/v1",
+        api_key="sk-no-key-required",
+    )
+    generated = model._convert_chunk_to_generation_chunk(
+        _raw_chunk({"role": "assistant", "content": "Net sales rose."}),
+        AIMessageChunk,
+        None,
+    )
+    assert generated is not None
+    assert generated.message.content == "Net sales rose."
+    assert reasoning_delta_from_chunk(generated.message) == ""
+
+
+def test_converter_passes_through_a_none_generation_chunk() -> None:
+    """``_convert_chunk_to_generation_chunk`` returns ``None`` for
+    frames the base class skips; the override must not dereference
+    it."""
+    model = reasoning_preserving_chat_openai()(
+        model="fin/MiniMax-M3",
+        base_url="http://localhost:20128/v1",
+        api_key="sk-no-key-required",
+    )
+    assert (
+        model._convert_chunk_to_generation_chunk(
+            {"type": "content.delta"}, AIMessageChunk, None
+        )
+        is None
+    )
+
+
+# --- outbound: the checkpointed reasoning rides the next request ---
+
+
+# The entry shape official MiniMax Chat Completions emits under
+# ``reasoning_details`` and reads back off the assistant message.
+# Verified live against ``MiniMax-M3`` at
+# ``https://api.minimaxi.com/v1``: an instruction planted only in
+# this field changes the next turn's answer (3/3), while the same
+# thread without the field does not (0/3).
+MINIMAX_ENTRY: dict[str, Any] = {
+    "type": "reasoning.text",
+    "id": "reasoning-text-1",
+    "format": "MiniMax-response-v1",
+    "index": 0,
+    "text": "Read the 10-K cover page before quoting net sales.",
+}
+
+
+def _replay_thread(additional_kwargs: dict[str, Any]) -> list[Any]:
+    """A thread whose ONE prior assistant turn carries ``kwargs``.
+
+    Index 1 is that turn — the message whose reasoning the provider
+    needs back to keep the chain of thought unbroken across the
+    follow-up question at index 2.
+    """
+    return [
+        HumanMessage(content="What were net sales?"),
+        AIMessage(
+            content="Net sales rose 8%.",
+            additional_kwargs=additional_kwargs,
+        ),
+        HumanMessage(content="And operating margin?"),
+    ]
+
+
+def _configured_provider_model(cls: Any) -> Any:
+    """Build ``cls`` against the configured provider's coordinates."""
+    return cls(
+        model="MiniMax-M3",
+        base_url="https://api.minimaxi.com/v1",
+        api_key="sk-no-key-required",
+    )
+
+
+def test_stock_chat_openai_drops_prior_reasoning_from_the_request() -> None:
+    """Why the outbound override exists (pinned as a test).
+
+    ``_convert_message_to_dict`` copies only ``name`` / ``tool_calls``
+    / ``function_call`` / ``audio`` off ``additional_kwargs``, so the
+    reasoning captured on the inbound side never reaches the provider
+    on the next call. If this test ever fails, upstream started
+    forwarding the channel and the override below can go away.
+    """
+    from langchain_openai import ChatOpenAI
+
+    model = _configured_provider_model(ChatOpenAI)
+    payload = model._get_request_payload(
+        _replay_thread({"reasoning_details": [MINIMAX_ENTRY]})
+    )
+    assert "reasoning_details" not in payload["messages"][1]
+
+
+def test_outbound_request_replays_the_prior_turn_reasoning() -> None:
+    """The checkpointed ``AIMessage``'s reasoning rides the next
+    request on the key the configured provider reads."""
+    model = _configured_provider_model(reasoning_preserving_chat_openai())
+    payload = model._get_request_payload(
+        _replay_thread({"reasoning_details": [MINIMAX_ENTRY]})
+    )
+    assistant = payload["messages"][1]
+    assert assistant["role"] == "assistant"
+    assert assistant["reasoning_details"] == [MINIMAX_ENTRY]
+
+
+def test_outbound_request_keeps_reasoning_entry_identity_verbatim() -> None:
+    """Every replay field survives, not just the prose: the provider
+    correlates entries by ``id`` / ``index`` and rejects a rewritten
+    ``format``, so entries go out exactly as they were captured."""
+    second = {
+        "type": "reasoning.text",
+        "id": "reasoning-text-2",
+        "format": "MiniMax-response-v1",
+        "index": 1,
+        "text": "Cross-check the margin line.",
+    }
+    model = _configured_provider_model(reasoning_preserving_chat_openai())
+    payload = model._get_request_payload(
+        _replay_thread({"reasoning_details": [MINIMAX_ENTRY, second]})
+    )
+    assert payload["messages"][1]["reasoning_details"] == [
+        MINIMAX_ENTRY,
+        second,
+    ]
+
+
+def test_outbound_request_normalizes_reasoning_content_onto_the_key() -> None:
+    """A turn checkpointed by a provider that only spelled the channel
+    ``reasoning_content`` still replays as ``reasoning_details`` —
+    the one key the configured provider accepts."""
+    model = _configured_provider_model(reasoning_preserving_chat_openai())
+    payload = model._get_request_payload(
+        _replay_thread({"reasoning_content": "Read the cover page."})
+    )
+    assert payload["messages"][1]["reasoning_details"] == [
+        {"type": "reasoning.text", "text": "Read the cover page."}
+    ]
+
+
+def test_outbound_request_is_byte_identical_without_prior_reasoning() -> None:
+    """A thread whose turns carry no reasoning produces exactly the
+    stock request — the override adds a key, it never rewrites one."""
+    from langchain_openai import ChatOpenAI
+
+    thread = _replay_thread({})
+    stock = _configured_provider_model(ChatOpenAI)._get_request_payload(thread)
+    preserving = _configured_provider_model(
+        reasoning_preserving_chat_openai()
+    )._get_request_payload(thread)
+    assert preserving == stock
+    assert all("reasoning_details" not in m for m in preserving["messages"])
+
+
+def test_outbound_request_leaves_non_assistant_messages_alone() -> None:
+    """``reasoning_details`` is an assistant-message field. A human or
+    tool turn that happens to carry the key in its
+    ``additional_kwargs`` must not grow one in the request."""
+    model = _configured_provider_model(reasoning_preserving_chat_openai())
+    payload = model._get_request_payload(
+        [
+            HumanMessage(
+                content="What were net sales?",
+                additional_kwargs={"reasoning_details": [MINIMAX_ENTRY]},
+            ),
+            ToolMessage(
+                content='{"units": 12}',
+                tool_call_id="call_1",
+                additional_kwargs={"reasoning_details": [MINIMAX_ENTRY]},
+            ),
+        ]
+    )
+    assert all("reasoning_details" not in m for m in payload["messages"])
+
+
+def test_outbound_request_replays_reasoning_beside_tool_calls() -> None:
+    """The interleaved-thinking case: the assistant turn that opened a
+    tool call carries BOTH its ``tool_calls`` and the reasoning that
+    produced them into the next request."""
+    model = _configured_provider_model(reasoning_preserving_chat_openai())
+    payload = model._get_request_payload(
+        [
+            HumanMessage(content="How many units of QX-9?"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "get_inventory",
+                        "args": {"sku": "QX-9"},
+                        "id": "call_1",
+                        "type": "tool_call",
+                    }
+                ],
+                additional_kwargs={"reasoning_details": [MINIMAX_ENTRY]},
+            ),
+            ToolMessage(content='{"units": 12}', tool_call_id="call_1"),
+        ]
+    )
+    assistant = payload["messages"][1]
+    assert assistant["reasoning_details"] == [MINIMAX_ENTRY]
+    assert assistant["tool_calls"][0]["function"]["name"] == "get_inventory"
+
+
+# --- assembly: the checkpointed message replays the reasoning ---
+
+
+def test_assemble_normalizes_reasoning_content_for_replay() -> None:
+    """A provider that only speaks ``reasoning_content`` still lands
+    a replayable ``reasoning_details`` list on the checkpointed
+    ``AIMessage`` — that is the field ``graph._extract_thinking_text``
+    reads for the turn row and the next model call."""
+    chunks = [
+        AIMessageChunk(
+            content="", additional_kwargs={"reasoning_content": "step one "}
+        ),
+        AIMessageChunk(
+            content="", additional_kwargs={"reasoning_content": "step two"}
+        ),
+        AIMessageChunk(content="Net sales rose."),
+    ]
+    msg = assemble_final_ai_message(chunks)
+    details = msg.additional_kwargs.get("reasoning_details")
+    assert isinstance(details, list)
+    assert "".join(d["text"] for d in details) == "step one step two"
+    assert msg.content == "Net sales rose."
+
+
+def test_assemble_does_not_duplicate_an_existing_details_list() -> None:
+    """The canonical shape is already replayable; normalization must
+    leave it exactly as the provider streamed it."""
+    chunks = [
+        AIMessageChunk(
+            content="",
+            additional_kwargs={
+                "reasoning_details": [{"type": "reasoning.text", "text": "a"}]
+            },
+        ),
+        AIMessageChunk(content="body"),
+    ]
+    msg = assemble_final_ai_message(chunks)
+    assert msg.additional_kwargs["reasoning_details"] == [
+        {"type": "reasoning.text", "text": "a"}
+    ]
+
+
+# --- fallback: split channel absent, inline blocks present ---
+
+
+def test_inline_fallback_streams_thinking_when_split_channel_absent() -> None:
+    """Error contract: when the provider drops or renames the split
+    channel and inlines ``<think>`` instead, the strip path still
+    routes the scratchpad to ``thinking`` — reasoning is surfaced,
+    never swallowed into the answer."""
+    chunks = [
+        AIMessageChunk(content="<thi"),
+        AIMessageChunk(content=f"nk>{SECRET}</think>Net sales "),
+        AIMessageChunk(content="rose 8%."),
+    ]
+    frames = _map_chunks_to_frames(chunks)
+    assert _text_of(frames, "thinking") == SECRET
+    assert _text_of(frames, "answer") == "Net sales rose 8%."
+
+
+def test_inline_fallback_survives_assembly_and_the_citation_gate() -> None:
+    """The same absent-split-channel run: the assembled message keeps
+    the inline block for the turn row, and the gate-visible prose
+    (``strip_thinking_from_answer``) is thinking-free."""
+    from fin.host.stream_map import inline_thinking_segments
+
+    chunks = [
+        AIMessageChunk(content=f"<think>{SECRET}</think>"),
+        AIMessageChunk(content="Net sales rose 8%."),
+    ]
+    msg = assemble_final_ai_message(chunks)
+    assert inline_thinking_segments(str(msg.content)) == [SECRET]
+    gate_prose = strip_thinking_from_answer(str(msg.content))
+    assert SECRET not in gate_prose
+    assert "Net sales rose 8%." in gate_prose
+
+
+# --- SC60 across every shape: no thinking prose in any answer frame ---
+
+
+@pytest.mark.parametrize(
+    "reasoning_kwargs",
+    [
+        {"reasoning_details": [{"type": "reasoning.text", "text": SECRET}]},
+        {"reasoning_content": SECRET},
+        {"reasoning": SECRET},
+        {"reasoning": {"text": SECRET}},
+        {
+            "reasoning_details": [
+                {"type": "reasoning.summary", "summary": SECRET}
+            ]
+        },
+    ],
+)
+def test_every_split_shape_streams_thinking_and_never_the_answer(
+    reasoning_kwargs: dict[str, Any],
+) -> None:
+    """SC60 across the shapes the provider may emit: the scratchpad
+    reaches ``thinking`` frames and NO ``answer`` frame contains it."""
+    chunks = [
+        AIMessageChunk(content="", additional_kwargs=reasoning_kwargs),
+        AIMessageChunk(content="Net sales "),
+        AIMessageChunk(content="rose 8%."),
+    ]
+    frames = _map_chunks_to_frames(chunks)
+    assert _text_of(frames, "thinking") == SECRET
+    answer = _text_of(frames, "answer")
+    assert answer == "Net sales rose 8%."
+    assert SECRET not in answer
+    assert all(SECRET not in text for name, text in frames if name == "answer")
+
+
+def test_inline_block_inside_a_split_channel_run_still_never_leaks() -> None:
+    """Belt and braces: a provider that uses the split channel AND
+    inlines a block in the same run keeps both out of the answer."""
+    chunks = [
+        AIMessageChunk(
+            content="",
+            additional_kwargs={"reasoning_details": [{"text": "planning. "}]},
+        ),
+        AIMessageChunk(content=f"<think>{SECRET}</think>Net sales rose 8%."),
+    ]
+    frames = _map_chunks_to_frames(chunks)
+    assert _text_of(frames, "thinking") == f"planning. {SECRET}"
+    assert _text_of(frames, "answer") == "Net sales rose 8%."
