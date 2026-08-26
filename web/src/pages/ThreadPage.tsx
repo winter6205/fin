@@ -8,6 +8,10 @@ import Composer from "../components/Composer";
 import CorpusCard from "../components/CorpusCard";
 import type { Turn } from "../types";
 import { resolveTurnTrack, showResearchTrackHint } from "../softTrack";
+import {
+  shouldRenderStreamErrorKind,
+  streamErrorKindRowText,
+} from "../streamErrorKind";
 import { useWorkspaceStore } from "../store";
 
 // T4 (spec line 38-39): the interrupted-run banner. Shown when
@@ -246,6 +250,22 @@ function TurnView({ turn }: { turn: Turn }) {
           {!turn.answer && turn.assistant_message ? (
             <p className="text-sm whitespace-pre-wrap text-gray-700 italic">
               {turn.assistant_message}
+            </p>
+          ) : null}
+          {/* Mid-flight stream error taxonomy: on refuse rows whose
+              refusal came from the stream engine (not the citation
+              gate), render a small "原因: <label>" line so a 401 /
+              429 / 504 reads distinctly instead of as one opaque
+              English sentence. The conditional is a pure helper so
+              a unit test (no DOM) can pin both the gate and the
+              label text. */}
+          {shouldRenderStreamErrorKind(turn) ? (
+            <p
+              data-testid="stream-error-kind"
+              data-kind={turn.status_classified}
+              className="text-xs text-gray-500 mt-1"
+            >
+              {streamErrorKindRowText(turn)}
             </p>
           ) : null}
         </div>

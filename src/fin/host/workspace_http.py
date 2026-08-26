@@ -70,9 +70,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from dataclasses import dataclass
-from typing import Any, Iterator, Literal
+from typing import Any, Final, Iterator, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -113,6 +114,162 @@ from fin.host.thread_store import (
 logger = logging.getLogger(__name__)
 
 
+# ----- mid-flight stream exception classification + sanitization -----
+#
+# Why classify here: every model call ultimately routes through
+# ``openai``'s SDK error hierarchy (or ``langchain_openai``'s
+# re-exports of the same classes). Surfacing a single English
+# sentence to the operator hides which axis to act on — auth,
+# network, rate-limit, etc. — so the SPA cannot render actionable
+# guidance. We dispatch on the exception type and pair it with a
+# short Chinese ordinary-person copy the SPA can render verbatim.
+#
+# Why a sanitize step: the refuse ``reason`` rides the SSE wire
+# (server logs + persisted RunRecord) and historically embedded
+# ``str(exc)`` — which carries the provider's full error text,
+# often including the API base URL with the key, the raw
+# ``Authorization: Bearer ...`` header, or a long opaque token.
+# A single regex pass drops anything that looks sensitive before
+# the reason reaches the wire. Defense in depth: the operator
+# copy is hand-written, so even an unsanitized leak can only
+# land in the ``reason`` field, never in the user-facing bubble.
+
+
+# Classification → user-facing Chinese copy (ordinary-person, no
+# provider internals). Single source of truth so the SSE frame
+# and the persisted ``RunRecord.assistant_message`` always agree.
+_STREAM_FAILURE_USER_COPY: Final[dict[str, str]] = {
+    "auth": "鉴权失败：服务返回 401。请检查 .env 里的 FIN_API_KEY 是否设置且有效。",
+    "network": "网络错误：无法连接到模型服务。请检查网络或代理（FIN_BASE_URL）。",
+    "timeout": "模型调用超时（默认 120s）。可重试，或调高 ChatOpenAI timeout。",
+    "rate_limit": "模型服务限流（429）。请稍后重试。",
+    "not_found": "模型或接口路径不存在（404）。检查 FIN_MODEL 和 FIN_BASE_URL 是否拼写正确。",
+    "server": "模型服务内部错误（5xx）。请稍后重试。",
+    "unknown": "未预期的错误。请把 server 日志贴出来排查。",
+}
+
+
+def _classify_exception_type(exc: BaseException) -> str:
+    """Map an exception instance to a kind string.
+
+    Dispatch by exact ``openai`` SDK class first, then by class
+    name substring (defensive against ``langchain_openai``'s
+    wrappers that re-export the same exceptions). Returns one of
+    the keys in ``_STREAM_FAILURE_USER_COPY``; falls back to
+    ``"unknown"`` for anything that does not match.
+    """
+    # Local imports: ``openai`` is a runtime dep (langchain-openai
+    # pulls it in), but only the workspace stream loop needs the
+    # error hierarchy — module-import order stays clean.
+    try:
+        import openai
+    except ImportError:  # pragma: no cover - openai is a hard dep
+        openai = None  # type: ignore[assignment]
+
+    # Auth axis: bad / missing token. ``PermissionDeniedError``
+    # (403) is a sibling failure mode with the same operator
+    # action — surface it under ``auth`` so the copy still
+    # points at the key.
+    if openai is not None:
+        # WHY this ordering: ``openai.APITimeoutError`` subclasses
+        # ``APIConnectionError`` so a naive isinstance on
+        # ``APIConnectionError`` would swallow every timeout. The
+        # specific subclasses go first; the parent class last.
+        if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError)):
+            return "auth"
+        if isinstance(exc, openai.APITimeoutError):
+            return "timeout"
+        if isinstance(exc, openai.RateLimitError):
+            return "rate_limit"
+        if isinstance(exc, openai.NotFoundError):
+            return "not_found"
+        if isinstance(exc, openai.InternalServerError):
+            return "server"
+        if isinstance(exc, openai.APIConnectionError):
+            return "network"
+
+    # Defensive fallback for ``langchain_openai`` wrappers or any
+    # third-party SDK that re-exports an exception under a
+    # different module path. Class-name substring match is enough
+    # to disambiguate the seven kinds without overreaching.
+    cls_name = type(exc).__name__.lower()
+    cls_module = type(exc).__module__.lower()
+    combined = f"{cls_module}.{cls_name}"
+    if "authentication" in cls_name or "permissiondenied" in cls_name:
+        return "auth"
+    if "apitimeout" in cls_name or (
+        "timeout" in cls_name and "apiconnection" not in cls_name
+    ):
+        return "timeout"
+    if "ratelimit" in cls_name:
+        return "rate_limit"
+    if "notfound" in cls_name:
+        return "not_found"
+    if "internalserver" in cls_name:
+        return "server"
+    if "apiconnection" in cls_name or "connectionerror" in cls_name:
+        return "network"
+    if "server" in cls_name:
+        return "server"
+    # ``combined`` kept available for future module-scoped checks;
+    # the local var silences the linter without altering dispatch.
+    _ = combined
+    return "unknown"
+
+
+def classify_stream_exception(exc: BaseException) -> tuple[str, str]:
+    """Return ``(kind, user_copy)`` for a mid-flight stream exception.
+
+    ``kind`` is one of ``auth`` / ``network`` / ``timeout`` /
+    ``rate_limit`` / ``not_found`` / ``server`` / ``unknown`` —
+    a closed enum the SPA keys labels off of (no free text).
+    ``user_copy`` is short Chinese actionable text the SPA shows
+    verbatim; never blank.
+    """
+    kind = _classify_exception_type(exc)
+    return kind, _STREAM_FAILURE_USER_COPY[kind]
+
+
+# Patterns that look sensitive: an ``Authorization: Bearer ...``
+# header; ``key=...`` / ``token=...`` query-string style fragments;
+# full URLs whose path or query string embeds what looks like a
+# key (long alphanumeric token, hex blob). Each match collapses
+# to a short tag so the operator still sees "auth failed against
+# <URL redacted>" rather than losing all context.
+_SENSITIVE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?i)authorization\s*:\s*bearer\s+[A-Za-z0-9._\-]+"),
+    re.compile(r"(?i)(sk-[A-Za-z0-9_\-]{20,})"),
+    # ``key=`` / ``token=`` / ``api_key=`` query-string fragments;
+    # capture the assignment through the value delimiter.
+    re.compile(r"(?i)\b(api[_-]?key|token|access[_-]?token|secret)\s*[=:]\s*[^\s,;]+"),
+    # Long hex / base64url blobs (>=32 chars) — high-entropy tokens
+    # the operator never needs to see on the wire.
+    re.compile(r"\b[A-Fa-f0-9]{32,}\b"),
+    re.compile(r"\b[A-Za-z0-9_\-]{40,}\b"),
+)
+
+
+def _sanitize_reason_text(text: str, max_len: int = 200) -> str:
+    """Redact sensitive substrings and cap length on a wire string.
+
+    Why a small standalone helper: the refuse ``reason`` is the one
+    field on the wire that may carry provider-internal text. The
+    contract is "single-line, <=max_len chars, no tokens, no
+    headers". One choke point keeps every future caller honest.
+    """
+    if not text:
+        return ""
+    out = text
+    for pattern in _SENSITIVE_PATTERNS:
+        out = pattern.sub("[redacted]", out)
+    # Collapse whitespace so a multi-line provider error still
+    # reads as one line on the wire (SSE is line-oriented).
+    out = re.sub(r"\s+", " ", out).strip()
+    if len(out) > max_len:
+        out = out[: max_len - 3] + "..."
+    return out
+
+
 @dataclass(frozen=True)
 class RunStreamOutcome:
     """What ``_stream_run_frames`` hands back when the run's wire ends.
@@ -142,6 +299,12 @@ class RunStreamOutcome:
     thinking_ms: int
     refuse_reason: str | None = None
     refuse_copy: str | None = None
+    # Mid-flight stream error taxonomy (auth / network / timeout /
+    # rate_limit / not_found / server / unknown). ``None`` when
+    # the run did not end on the refuse branch. The same value
+    # rides the SSE ``status_classified`` field and the persisted
+    # RunRecord so reload keeps the classification visible.
+    refuse_kind: str | None = None
     answer_reset: bool = False
 
 
@@ -244,6 +407,13 @@ class TurnRow(BaseModel):
     in_flight: bool = False
     # Soft-Track T5: auditable classify outcome for this run_id.
     track_decision: dict[str, Any] = Field(default_factory=dict)
+    # Mid-flight stream error taxonomy on refuse rows
+    # (``auth`` / ``network`` / ``timeout`` / ``rate_limit`` /
+    # ``not_found`` / ``server`` / ``unknown``). Empty on done
+    # rows. The SPA keys a small "原因" label off this field so
+    # a 401 / 429 / 504 reads distinctly instead of as one opaque
+    # English sentence.
+    status_classified: str = ""
 
 
 class WorkspaceStatusResponse(BaseModel):
@@ -353,6 +523,10 @@ def _serialize_run(run: RunRecord, *, in_flight: bool = False) -> dict[str, Any]
         "in_flight": in_flight,
         # Soft-Track: deep-copied so callers cannot mutate the store.
         "track_decision": dict(run.track_decision or {}),
+        # Mid-flight stream error taxonomy (see TurnRow). Empty on
+        # rows whose refusal came from the gate rather than the
+        # stream engine.
+        "status_classified": run.status_classified,
     }
 
 
@@ -574,20 +748,28 @@ def _stream_run_frames(
         # the SSE body before any terminal frame, and the SPA's reader
         # hangs waiting for ``citations`` (spec line 96: terminal
         # statuses carry explicit copy — never swallowed blanks).
-        # Emit the refuse-shaped terminal sequence so the client sees
-        # a closed stream, log with traceback for the operator, and
-        # report ``final_state=None`` so callers skip persistence of
-        # a half-run state. The exception type name goes into
-        # ``reason``; the message itself stays out of the wire (it may
-        # carry provider internals).
+        #
+        # Classify the exception so the SPA can render an actionable
+        # label instead of one opaque English sentence. The
+        # classification ``kind`` is a closed enum (auth / network /
+        # timeout / rate_limit / not_found / server / unknown); the
+        # user-facing copy is hand-written Chinese keyed off that
+        # kind. The exception type name rides ``reason`` for operator
+        # debuggability, with ``str(exc)`` appended only AFTER the
+        # sanitize pass — provider error text commonly embeds the
+        # auth header, the key, or a long opaque token, none of which
+        # belong on the wire.
+        kind, user_copy = classify_stream_exception(exc)
+        raw_reason = f"stream raised mid-flight: {type(exc).__name__}: {exc}"
+        sanitized = _sanitize_reason_text(raw_reason)
+        reason = f"{sanitized} (kind={kind})" if sanitized else f"stream raised mid-flight: {type(exc).__name__} (kind={kind})"
         logger.exception(
             "run stream raised mid-flight",
-            extra={"run_id": run_id, "thread_id": thread_id},
-        )
-        reason = f"stream raised mid-flight: {type(exc).__name__}"
-        copy = (
-            "The answer stream failed partway through. Try "
-            "sending the question again."
+            extra={
+                "run_id": run_id,
+                "thread_id": thread_id,
+                "kind": kind,
+            },
         )
         yield _format_sse(
             "status",
@@ -595,7 +777,8 @@ def _stream_run_frames(
                 "run_id": run_id,
                 "status": "refuse",
                 "reason": reason,
-                "assistant_message": copy,
+                "assistant_message": user_copy,
+                "status_classified": kind,
                 "thinking_ms": clock.total_ms,
             },
         )
@@ -610,7 +793,8 @@ def _stream_run_frames(
             final_state=None,
             thinking_ms=clock.total_ms,
             refuse_reason=reason,
-            refuse_copy=copy,
+            refuse_copy=user_copy,
+            refuse_kind=kind,
         )
     clock.close()
     return RunStreamOutcome(
@@ -1021,6 +1205,12 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                             thinking_duration_ms=outcome.thinking_ms,
                             tool_summaries=[],
                             assistant_message=outcome.refuse_copy or "",
+                            # Stream error taxonomy (auth / network /
+                            # ...). ``None`` when the run did not end
+                            # on the refuse branch; the field default
+                            # (``""``) carries the same meaning so the
+                            # SPA never sees an unexpected ``None``.
+                            status_classified=outcome.refuse_kind or "",
                         )
                     )
                 except ThreadNotFoundError:

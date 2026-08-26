@@ -174,6 +174,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       thinking_duration_ms: 0,
       tool_summaries: [],
       assistant_message: "",
+      // Mid-flight stream error taxonomy: empty until the
+      // terminal ``status`` SSE frame arrives; the SPA renders
+      // the "原因" label off this field on refuse rows.
+      status_classified: "",
       // T4 (#37): the optimistic turn is LIVE until the terminal
       // status frame — the thinking region line-clamps and the tool
       // rows stay open while the run streams, then collapse.
@@ -269,6 +273,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
                 // Soft-Track: optional until host SSE includes track.
                 track: event.track ?? t.track,
                 track_decision: event.track_decision ?? t.track_decision,
+                // Mid-flight stream taxonomy: only set on refuse
+                // rows whose refusal came from the stream engine;
+                // an empty value from the wire keeps the prior
+                // row's value (a fresh turn starts as ``""``).
+                status_classified:
+                  event.status_classified !== undefined
+                    ? event.status_classified
+                    : t.status_classified,
                 // T4 (#37): the run ended — thinking collapses to the
                 // duration label, tool rows collapse.
                 in_flight: false,
@@ -306,6 +318,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
             result.citations.length > 0 ? result.citations : t.citations,
           track: result.track ?? t.track,
           track_decision: result.track_decision ?? t.track_decision,
+          status_classified: result.status_classified ?? t.status_classified,
         }));
       }
       await get().refreshThreads();
@@ -409,6 +422,12 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
               assistant_message: event.assistant_message,
               track: event.track ?? t.track,
               track_decision: event.track_decision ?? t.track_decision,
+              // Mid-flight stream taxonomy (see sendQuestion's
+              // status branch for the same handling rationale).
+              status_classified:
+                event.status_classified !== undefined
+                  ? event.status_classified
+                  : t.status_classified,
               in_flight: false,
               thinking_duration_ms: event.thinking_ms ?? t.thinking_duration_ms,
             }));
@@ -443,6 +462,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
             result.citations.length > 0 ? result.citations : t.citations,
           track: result.track ?? t.track,
           track_decision: result.track_decision ?? t.track_decision,
+          status_classified: result.status_classified ?? t.status_classified,
         }));
       }
       await get().refreshThreads();

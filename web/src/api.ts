@@ -9,6 +9,7 @@ import type {
   Citation,
   Filing,
   SoftTrack,
+  StreamErrorKind,
   ThreadDetail,
   ThreadListItem,
   TrackDecision,
@@ -16,6 +17,7 @@ import type {
 } from "./types";
 import { parseSoftTrack, parseTrackDecision } from "./softTrack";
 import { parseWorkspaceStatus } from "./statusStrip";
+import { parseStreamErrorKind } from "./streamErrorKind";
 import { foldSendResultAnswer } from "./turnStream";
 
 async function jsonOrThrow<T>(res: Response): Promise<T> {
@@ -102,6 +104,11 @@ export interface SendResult {
   // Soft-Track: optional until the host peer lands SSE ``track``.
   track?: SoftTrack;
   track_decision?: TrackDecision;
+  // Mid-flight stream error taxonomy on refuse rows. Empty when
+  // the run did not end on the stream-engine failure path; the
+  // SPA renders a small "原因" label off this field so a 401 /
+  // 429 / 504 reads distinctly.
+  status_classified?: StreamErrorKind | "";
 }
 
 // T3 streaming events surfaced to the caller as they arrive.
@@ -136,6 +143,11 @@ export type SendEvent =
       // Soft-Track: optional until host SSE includes ``track``.
       track?: SoftTrack;
       track_decision?: TrackDecision;
+      // Mid-flight stream error taxonomy; non-empty only on
+      // refuse rows whose refusal came from the stream engine
+      // (not the citation gate). Mirrors the SSE
+      // ``status_classified`` field.
+      status_classified?: StreamErrorKind | "";
     }
   | { type: "answer"; text: string; reset?: boolean }
   | { type: "citations"; citations: Citation[] };
@@ -307,7 +319,9 @@ async function consumeSseStream(
           // the persisted RunRecord BEFORE any re-GET. T2 adds
           // ``assistant_message`` (ordinary-person copy on
           // refuse / step_cap). Soft-Track may add ``track`` /
-          // ``track_decision``; both are optional until the peer lands.
+          // ``track_decision``; both are optional until the peer
+          // lands. The mid-flight stream taxonomy (``status_classified``)
+          // rides the same frame on refuse rows.
           sawStatus = true;
           const s = payload as {
             run_id?: string;
@@ -317,6 +331,7 @@ async function consumeSseStream(
             thinking_ms?: number;
             track?: unknown;
             track_decision?: unknown;
+            status_classified?: string;
           };
           result.status = s.status;
           result.reason = s.reason ?? null;
@@ -326,6 +341,8 @@ async function consumeSseStream(
           if (track !== undefined) result.track = track;
           if (trackDecision !== undefined)
             result.track_decision = trackDecision;
+          const classified = parseStreamErrorKind(s.status_classified) ?? "";
+          if (classified) result.status_classified = classified;
           if (typeof s.run_id === "string" && s.run_id.length > 0) {
             result.run_id = s.run_id;
           }
@@ -338,6 +355,7 @@ async function consumeSseStream(
             thinking_ms: s.thinking_ms,
             track: result.track,
             track_decision: result.track_decision,
+            status_classified: classified,
           });
           break;
         }
