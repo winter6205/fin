@@ -3315,7 +3315,7 @@ def test_status_model_identity_is_the_slug_only(
     """``FIN_MODEL`` only — never ``FIN_BASE_URL``, never key material."""
     monkeypatch.setenv("FIN_MODEL", "fin/MiniMax-M3")
     monkeypatch.setenv("FIN_BASE_URL", "http://operator-secret.invalid/v1")
-    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "sk-do-not-leak")
+    monkeypatch.setenv("FIN_API_KEY", "sk-do-not-leak")
 
     body = client.get("/api/status").json()
 

@@ -15,11 +15,11 @@
 //      citation set that contradicts the status)
 //   2  the lane could not run (server never came up, thread could not
 //      be created, browser harness missing) — never reported as a pass
-//   3  ANTHROPIC_AUTH_TOKEN is missing: nothing was started
+//   3  FIN_API_KEY is missing: nothing was started
 //
 // Why exit 3 exists, and why the check lives HERE: `fin.host.compile`
 // resolves the provider key as
-// `ANTHROPIC_AUTH_TOKEN or "sk-no-key-required"`, so an unset token
+// `FIN_API_KEY or "sk-no-key-required"`, so an unset token
 // does not stop the boot — it reaches the provider as a placeholder
 // and comes back as a 401 that is indistinguishable from a revoked
 // key, a wrong base URL, or an outage. This lane therefore owns the
@@ -58,7 +58,7 @@ const EXIT_MISSING_CREDENTIAL = 3;
 
 // The one variable this lane cannot run without. Named in the abort
 // message and in `specs/workspace.md` Amendment 2026-08-26.
-const CREDENTIAL_VAR = "ANTHROPIC_AUTH_TOKEN";
+const CREDENTIAL_VAR = "FIN_API_KEY";
 
 // A scripted transcript would make every observable below pass while
 // proving nothing about the provider, so the opt-in that selects it

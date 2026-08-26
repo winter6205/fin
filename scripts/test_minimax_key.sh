@@ -4,8 +4,8 @@
 #
 # Prints HTTP status + MiniMax error body but NEVER the key itself.
 # Reads the key from the MINIMAX_TEST_KEY env var (deliberately a
-# distinct name so the script does not silently use ANTHROPIC_AUTH_TOKEN
-# or anything in your .env).
+# distinct name so the script does not silently use the project-owned
+# FIN_API_KEY or anything in your .env).
 #
 # Usage:
 #   MINIMAX_TEST_KEY=sk-... ./scripts/test_minimax_key.sh

@@ -32,7 +32,7 @@ Hard contracts under test here:
   LLM-provider / Postgres-checkpointer dependency at module load.
 
 All scripted tests run with ``ScriptedChatModel`` + ``InMemorySaver``
-and require no ``ANTHROPIC_AUTH_TOKEN``.
+and require no ``FIN_API_KEY``.
 """
 
 from __future__ import annotations
@@ -144,7 +144,7 @@ def test_help_via_subprocess_exits_zero_without_api_key():
     env = {
         k: v
         for k, v in os.environ.items()
-        if k != "ANTHROPIC_AUTH_TOKEN"
+        if k != "FIN_API_KEY"
     }
     proc = subprocess.run(
         [sys.executable, "-m", "fin", "--help"],

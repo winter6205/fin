@@ -17,7 +17,7 @@
 // FIN_SCRIPTED_MODEL=1, which selects the scripted transcript boot in
 // `fin.host.scripted_boot`, and with every provider variable REMOVED
 // from its environment. No network LLM can be reached even on a
-// machine that has ANTHROPIC_AUTH_TOKEN exported.
+// machine that has FIN_API_KEY exported.
 //
 // Assertions are not duplicated here: the lane shells out to the T6
 // runner (`scripts/run-stream-checks.mjs`), which owns the checks and
@@ -51,7 +51,7 @@ const SCENARIOS = ["grounded", "bounce"];
 // cannot be talked out of by a stray provider setting, and so "this
 // lane needs no credentials" is enforced rather than asserted.
 const PROVIDER_ENV = [
-  "ANTHROPIC_AUTH_TOKEN",
+  "FIN_API_KEY",
   "ANTHROPIC_API_KEY",
   "OPENAI_API_KEY",
   "FIN_MODEL",

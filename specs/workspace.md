@@ -85,7 +85,7 @@ This amendment is the outcome of `plans/workspace-stream-fidelity.md` T5 (`[deci
 **In scope (new):**
 
 - **Scripted-provider browser e2e lane** — a browser is driven against a locally served workspace booted on the scripted model + `InMemorySaver`: no network LLM, no credentials, deterministic. It runs only via its explicit opt-in command (and any CI lane wired to that same command); default `uv run pytest -q` never invokes a browser.
-- **Live-provider smoke lane** — a browser (or the same runner) sends at least one real question through the configured provider. It runs only via its explicit opt-in command and is **never** part of default `uv run pytest -q`. When `ANTHROPIC_AUTH_TOKEN` is unset, the lane aborts non-zero with an explicit message naming the missing variable and runs nothing — never a silent skip that reads as a pass.
+- **Live-provider smoke lane** — a browser (or the same runner) sends at least one real question through the configured provider. It runs only via its explicit opt-in command and is **never** part of default `uv run pytest -q`. When `FIN_API_KEY` is unset, the lane aborts non-zero with an explicit message naming the missing variable and runs nothing — never a silent skip that reads as a pass.
 
 **Still out (unchanged from the original exclusion):** Playwright (or any browser harness) as a dependency or collection target of default `uv run pytest -q`; browser tests replacing the scripted-model pytest contract above; any browser lane beyond the two named here. Runner filenames, harness library choice, and per-check assertion lists are not fixed by this amendment — the implementation bullets (`plans/workspace-stream-fidelity.md` T6–T8) own those.
 
