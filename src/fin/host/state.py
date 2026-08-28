@@ -85,6 +85,42 @@ class EvidenceReset:
 EVIDENCE_RESET: Final[EvidenceReset] = EvidenceReset()
 
 
+@dataclass(frozen=True)
+class FanoutReset:
+    """Sentinel value: replace ``AgentState["issuer_findings"]`` with ``[]``.
+
+    Same shape and the same reason as :class:`EvidenceReset` (see its
+    docstring for why an empty frozen dataclass and not ``__slots__``):
+    the fan-out findings channel is additive so LangGraph can merge the
+    parallel per-issuer branches, and an additive reducer cannot be
+    cleared by writing ``[]``. The fan-out planner writes this sentinel
+    one superstep before the workers run, so each fan-out starts from a
+    clean roster even inside a single run.
+    """
+
+
+FANOUT_RESET: Final[FanoutReset] = FanoutReset()
+
+
+def _issuer_findings_reducer(
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]] | FanoutReset,
+) -> list[dict[str, Any]]:
+    """Reducer for ``AgentState["issuer_findings"]`` (T6, ADR 0034).
+
+    Mirrors :func:`_evidence_reducer`: a ``FanoutReset`` clears the
+    channel, an empty list is a no-op, and a non-empty list concats.
+    The concat path is what makes the Send fan-out a map-reduce — each
+    parallel issuer node returns ONLY its own finding and LangGraph
+    merges them.
+    """
+    if isinstance(right, FanoutReset):
+        return []
+    if not right:
+        return list(left or [])
+    return list(left or []) + list(right)
+
+
 def _evidence_reducer(
     left: list[EvidenceItem],
     right: list[EvidenceItem] | EvidenceReset,
@@ -256,6 +292,34 @@ class AgentState(TypedDict, total=False):
         (``company``, ``period``, ``document_ids``). Latest entry is
         the active routing view. ``reset_input_state`` must NOT wipe
         this channel.
+    comparisons
+        T3 (enterprise-kb Focus 1): the ``fin.comparison.v1``
+        envelopes this run's ``compare_facts`` calls produced, each
+        carrying the ``tool_call_id`` that generated it. Structured
+        data, not prose — the workspace turn row renders a table off
+        it and the numeric gate reads its columns as claims. Run
+        scoped: ``reset_input_state`` clears the channel so a
+        follow-up never inherits the previous turn's table.
+    issuer_plan
+        T6 (enterprise-kb Focus 4 / ADR 0034): the roster the fan-out
+        planner approved for this run — ``{issuers, query, cap,
+        requested}`` — or the typed ``issuer_overflow`` /
+        ``empty_fanout`` EXIT it refused with. Overwrite semantics
+        (one writer, the planner node). Shape SSOT is
+        ``fin.host.tools.issuer_fanout``.
+    issuer_findings
+        T6: one record per fan-out worker (``issuer``, ``status``,
+        ``chunk_count``, ``locators``, ``error``). Additive via
+        :func:`_issuer_findings_reducer` because LangGraph merges the
+        parallel ``Send`` branches into this channel; the planner
+        writes ``FANOUT_RESET`` before the branches start so a second
+        fan-out in the same run does not read the first one's rows.
+    issuer_fanout
+        T6: the ``fin.issuer_fanout.v1`` envelope the join node built
+        from ``issuer_findings``. Structured data the workspace tool
+        trace narrates and the citation gate reads to enforce
+        "every contributing issuer keeps a citation" (SC7). Overwrite
+        semantics; run scoped via ``reset_input_state``.
     """
 
     messages: Annotated[list[BaseMessage], add_messages]
@@ -295,6 +359,21 @@ class AgentState(TypedDict, total=False):
     track: Track
     track_decision: dict[str, Any]
     status_snapshots: Annotated[list[StatusSnapshot], operator.add]
+    # T3 (enterprise-kb Focus 1): OVERWRITE semantics, not
+    # ``operator.add``. ``tool_node`` already reads ``state`` and so
+    # returns prior + new itself; an additive reducer would make
+    # ``reset_input_state``'s ``[]`` a no-op (``prior + [] == prior``)
+    # and a follow-up run would inherit the previous turn's table.
+    comparisons: list[dict[str, Any]]
+    # T6 (enterprise-kb Focus 4 / ADR 0034). ``issuer_plan`` and
+    # ``issuer_fanout`` have single writers (the planner and the join
+    # node), so they stay overwrite-semantics and ``reset_input_state``
+    # genuinely clears them. ``issuer_findings`` is the only channel
+    # several nodes write in the SAME superstep, which is why it needs
+    # a reducer and a reset sentinel.
+    issuer_plan: dict[str, Any]
+    issuer_findings: Annotated[list[dict[str, Any]], _issuer_findings_reducer]
+    issuer_fanout: dict[str, Any]
 
 
 def reset_input_state(question: str) -> dict[str, Any]:
@@ -324,6 +403,16 @@ def reset_input_state(question: str) -> dict[str, Any]:
         "status": "running",
         "thinking_text": "",
         "tool_summaries": [],
+        # T3 (enterprise-kb Focus 1): the comparison channel is
+        # overwrite-semantics, so ``[]`` genuinely clears it and a
+        # follow-up starts without the previous turn's table.
+        "comparisons": [],
+        # T6 (enterprise-kb Focus 4): the fan-out channels are run
+        # scoped too. ``issuer_findings`` is additive, so it takes the
+        # sentinel rather than ``[]``.
+        "issuer_plan": {},
+        "issuer_findings": FANOUT_RESET,
+        "issuer_fanout": {},
         # T4: every fresh send clears the in-flight marker. The
         # live GET-while-running signal lives on the per-thread
         # lock (graph.is_locked), not on this state field; we
@@ -341,6 +430,8 @@ __all__ = [
     "AgentState",
     "EVIDENCE_RESET",
     "EvidenceReset",
+    "FANOUT_RESET",
+    "FanoutReset",
     "MIN_SPAN_LEN",
     "REPAIR_CAP",
     "RECURSION_LIMIT",
@@ -350,5 +441,6 @@ __all__ = [
     "TERMINAL_STATUSES",
     "Track",
     "_evidence_reducer",
+    "_issuer_findings_reducer",
     "reset_input_state",
 ]

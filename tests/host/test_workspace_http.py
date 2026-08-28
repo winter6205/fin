@@ -875,15 +875,52 @@ def test_get_corpus_returns_twelve_filings_with_required_keys(
     assert len(filings) == 12
 
     for f in filings:
-        assert set(f.keys()) == {"document_id", "company", "period", "version", "page_count"}
+        # SC3 adds ``form`` to the card; the rest of the EDGAR-shaped
+        # submission header stays off the wire.
+        assert set(f.keys()) == {
+            "document_id",
+            "company",
+            "period",
+            "version",
+            "page_count",
+            "form",
+        }
         assert isinstance(f["page_count"], int)
         assert f["page_count"] >= 1
+        assert f["form"] == "10-Q"
 
     ids = sorted(f["document_id"] for f in filings)
     expected_substrings = {"AAPL-2022Q3", "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
     assert expected_substrings.issubset(set(ids))
     # Defensive: never return prototype-style ids.
     assert not any("Q3-2024" in fid for fid in ids)
+
+
+def test_get_corpus_shows_each_form_the_corpus_actually_holds(
+    client: TestClient, fresh_store, multi_form_corpus, monkeypatch
+) -> None:
+    """SC3: the card reports the form, not a hard-coded 10-Q.
+
+    Pointed at a corpus of one 10-K, one 8-K and one 10-Q, the route
+    reports all three — this is the surface the operator reads to see
+    what is in the library.
+    """
+    monkeypatch.setattr(
+        "fin.corpus.catalog._DEFAULT_MANIFEST_PATH",
+        multi_form_corpus["manifest_path"],
+    )
+    monkeypatch.setattr(
+        "fin.corpus.catalog._DEFAULT_EXTRACTED_ROOT",
+        multi_form_corpus["extracted_root"],
+    )
+
+    filings = client.get("/api/corpus").json()["filings"]
+
+    assert {f["document_id"]: f["form"] for f in filings} == {
+        "ZEUS-2023-10K": "10-K",
+        "ZEUS-2023-8K": "8-K",
+        "ZEUS-2023Q1": "10-Q",
+    }
 
 
 # ----- run persistence: GET turn table reflects POST history -----

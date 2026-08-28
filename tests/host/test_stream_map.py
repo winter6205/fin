@@ -452,6 +452,17 @@ def test_summarize_list_files_combines_company_and_period_filters() -> None:
     assert "period=2023Q1" in out
 
 
+def test_summarize_list_files_shows_the_form_filter() -> None:
+    """A ``form`` search renders its filter (spec SC3).
+
+    ``0 filings`` on its own would read as "the corpus is empty"; the
+    operator needs to see that the model asked for 8-Ks and this
+    corpus holds none.
+    """
+    out = summarize_list_files(filings=[], args={"form": "8-K"})
+    assert out == "0 filings [form=8-K]"
+
+
 # ----- summarize_retrieve -----
 
 

@@ -52,6 +52,94 @@ export interface ToolSummary {
   tool_call_id: string;
 }
 
+// ----- T3 comparison (enterprise-kb Focus 1) -----
+//
+// The ``fin.comparison.v1`` envelope produced by the
+// ``compare_facts`` host tool. SSOT for the shape (including the
+// typed EXITs this SPA never renders) is
+// src/fin/host/tools/compare_facts.py; these interfaces mirror it
+// field-for-field so the table renders STRUCTURE instead of
+// re-parsing a prose table out of ``answer``.
+//
+// The envelope arrives twice by design: live on the ``comparison``
+// SSE frame, and persisted on ``Turn.comparisons`` after a reload.
+// Both carry byte-identical entries.
+
+export interface ComparisonLocator {
+  document_id: string;
+  version: string;
+  page: number;
+}
+
+export interface ComparisonColumn {
+  key: string;
+  label: string;
+}
+
+// One (row, column) intersection. ``value`` is null on a miss AND
+// on a textual XBRL fact; ``display`` is always renderable, so the
+// table reads ``display`` and never formats a number itself.
+export interface ComparisonCell {
+  row: string;
+  column: string;
+  status: "hit" | "missing";
+  value: number | null;
+  display: string;
+  unit: string;
+  scale: string;
+  locator: ComparisonLocator | null;
+}
+
+export interface ComparisonRow {
+  key: string;
+  label: string;
+  kind: "issuer" | "document";
+  cells: ComparisonCell[];
+}
+
+export interface ComparisonEnd {
+  row: string;
+  column: string;
+}
+
+// The redline between two cells. Computed by the host tool, never
+// by the model and never by this client: an SPA that did its own
+// arithmetic would be a second, ungated source of numbers.
+export interface ComparisonDelta {
+  from: ComparisonEnd;
+  to: ComparisonEnd;
+  absolute: number;
+  // Null at a zero baseline (percent change is undefined there).
+  percent: number | null;
+  direction: "up" | "down" | "flat";
+  display: string;
+}
+
+export interface ComparisonMissing {
+  row: string;
+  column: string;
+  reason: string;
+}
+
+export interface Comparison {
+  schema: "fin.comparison.v1";
+  kind: "table";
+  axis: "period" | "peer" | "matrix" | "single";
+  concept: string;
+  unit: string;
+  scale: string;
+  columns: ComparisonColumn[];
+  rows: ComparisonRow[];
+  deltas: ComparisonDelta[];
+  missing: ComparisonMissing[];
+  hit_count: number;
+  cell_count: number;
+  locators: ComparisonLocator[];
+  // Present on wire entries (both SSE and persisted); correlates
+  // the table with the tool row that produced it.
+  tool_call_id?: string;
+}
+
 export interface Turn {
   run_id: string;
   question: string;
@@ -91,6 +179,13 @@ export interface Turn {
   // field so a 401 / 429 / 504 reads distinctly instead of as one
   // opaque English sentence.
   status_classified?: StreamErrorKind | "";
+  // T3 (enterprise-kb Focus 1 / SC2): structured comparison tables
+  // this turn's ``compare_facts`` calls produced. Mirrors
+  // ``fin.host.workspace_http.TurnRow.comparisons``. Non-empty on
+  // refuse rows too — on a ``numeric_gate_fail`` the table holds
+  // the numbers the filing actually reported, which is the
+  // evidence for the refusal.
+  comparisons?: Comparison[];
   created_at: string;
 }
 
@@ -110,6 +205,33 @@ export interface ThreadDetail extends ThreadListItem {
   // it is needed). The server derives this from
   // ``pending_nodes(thread_id) and not is_locked``.
   pending_checkpoint?: boolean;
+}
+
+// ----- T4 workflow (the tracked change): watchlist + in-app notices -----
+//
+// Mirrors fin.host.watchlist (``fin.watchlist.v1``). ``forms`` empty
+// means every form type — the operator watched the issuer, not a
+// filing kind.
+
+export interface WatchEntry {
+  id: string;
+  issuer: string;
+  forms: string[];
+  created_at: string;
+}
+
+// One watched filing that is now in the LOCAL catalog. In-app only:
+// spec Focus 3 forbids outbound email / Slack, so ``read`` is the
+// operator's own dismissal, not a delivery receipt.
+export interface Notice {
+  id: string;
+  watch_id: string;
+  issuer: string;
+  form: string;
+  document_id: string;
+  period: string;
+  created_at: string;
+  read: boolean;
 }
 
 // T10 (ADR 0033): the boot-scoped workspace status surface behind
@@ -144,6 +266,11 @@ export interface Filing {
   period: string;
   version: string;
   page_count: number;
+  // Spec SC3: the EDGAR form type behind the row (``10-Q``, ``10-K``,
+  // ``8-K``, ...). ``null`` on a corpus row the catalog was never
+  // given a form for; optional so a peer predating SC3 still
+  // typechecks.
+  form?: string | null;
 
   // T1 does not render these; they exist in the payload.
   [key: string]: unknown;

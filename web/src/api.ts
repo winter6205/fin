@@ -7,18 +7,23 @@
 
 import type {
   Citation,
+  Comparison,
   Filing,
+  Notice,
   SoftTrack,
   StreamErrorKind,
   ThreadDetail,
   ThreadListItem,
   TrackDecision,
+  WatchEntry,
   WorkspaceStatus,
 } from "./types";
+import { parseComparison } from "./comparison";
 import { parseSoftTrack, parseTrackDecision } from "./softTrack";
 import { parseWorkspaceStatus } from "./statusStrip";
 import { parseStreamErrorKind } from "./streamErrorKind";
 import { foldSendResultAnswer } from "./turnStream";
+import { parseNotices, parseWatchlist } from "./watchlist";
 
 async function jsonOrThrow<T>(res: Response): Promise<T> {
   if (!res.ok) {
@@ -86,6 +91,68 @@ export async function getStatus(): Promise<WorkspaceStatus> {
   return parsed;
 }
 
+// ----- T4 workflow (the tracked change): watchlist, notices, stop -----
+
+export async function listWatchlist(): Promise<WatchEntry[]> {
+  const res = await fetch("/api/watchlist");
+  return parseWatchlist(await jsonOrThrow<unknown>(res));
+}
+
+export async function createWatch(
+  issuer: string,
+  forms: string[],
+): Promise<WatchEntry[]> {
+  const res = await fetch("/api/watchlist", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ issuer, forms }),
+  });
+  // A blank issuer is a typed 400 the caller renders as form
+  // validation; ``jsonOrThrow`` surfaces the ``error`` code verbatim.
+  await jsonOrThrow<unknown>(res);
+  return listWatchlist();
+}
+
+export async function deleteWatch(watchId: string): Promise<void> {
+  const res = await fetch(`/api/watchlist/${encodeURIComponent(watchId)}`, {
+    method: "DELETE",
+  });
+  await jsonOrThrow<unknown>(res);
+}
+
+export async function listNotices(): Promise<Notice[]> {
+  // The host reconciles the watchlist against the local catalog on
+  // this read — the read IS the delivery, so there is no poller and
+  // nothing leaves the process.
+  const res = await fetch("/api/notices");
+  return parseNotices(await jsonOrThrow<unknown>(res));
+}
+
+export async function markNoticeRead(noticeId: string): Promise<void> {
+  const res = await fetch(
+    `/api/notices/${encodeURIComponent(noticeId)}/read`,
+    { method: "POST" },
+  );
+  await jsonOrThrow<unknown>(res);
+}
+
+/**
+ * Stop the in-flight run on a thread. Resolves ``true`` when a run was
+ * signalled and ``false`` on the 204 no-op (the run ended between the
+ * click and the request) — neither is an error the operator must act
+ * on. The stopped run's own ``sendMessage`` promise still resolves
+ * with the terminal ``refuse`` / ``stopped`` frames.
+ */
+export async function stopRun(threadId: string): Promise<boolean> {
+  const res = await fetch(
+    `/api/threads/${encodeURIComponent(threadId)}/stop`,
+    { method: "POST" },
+  );
+  if (res.status === 204) return false;
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return true;
+}
+
 export interface SendResult {
   // Server-minted run id (UUID4). The same id is persisted on
   // the RunRecord and surfaces on the turn table; the client
@@ -109,6 +176,11 @@ export interface SendResult {
   // SPA renders a small "原因" label off this field so a 401 /
   // 429 / 504 reads distinctly.
   status_classified?: StreamErrorKind | "";
+  // T3 (enterprise-kb Focus 1): the structured comparison tables
+  // the run produced, in call order. Populated from the
+  // ``comparison`` SSE frames, so the terminal result agrees with
+  // what the live view already painted.
+  comparisons: Comparison[];
 }
 
 // T3 streaming events surfaced to the caller as they arrive.
@@ -150,7 +222,13 @@ export type SendEvent =
       status_classified?: StreamErrorKind | "";
     }
   | { type: "answer"; text: string; reset?: boolean }
-  | { type: "citations"; citations: Citation[] };
+  | { type: "citations"; citations: Citation[] }
+  // T3 (enterprise-kb Focus 1): one structured comparison table,
+  // emitted right after the ``compare_facts`` tool returns. The
+  // only structured payload on this wire — tool-computed data, not
+  // model prose — so the live view can render the table before the
+  // answer is authored.
+  | { type: "comparison"; comparison: Comparison };
 
 export class ConcurrentRunError extends Error {}
 export class IngestMissingError extends Error {}
@@ -197,6 +275,7 @@ export async function sendMessage(
       citations: [],
       answerText: "",
       assistantMessage: "",
+      comparisons: [],
     };
   }
   if (!res.ok || !res.body) {
@@ -233,6 +312,7 @@ async function consumeSseStream(
     citations: [],
     answerText: "",
     assistantMessage: "",
+    comparisons: [],
   };
 
   const reader = body.getReader();
@@ -363,6 +443,19 @@ async function consumeSseStream(
           result.citations = payload as SendResult["citations"];
           onEvent?.({ type: "citations", citations: result.citations });
           break;
+        case "comparison": {
+          // T3: one ``fin.comparison.v1`` envelope. Parsed at this
+          // boundary (the wire is ``unknown``) so a payload from a
+          // future schema renders nothing instead of a half-drawn
+          // table; the frame is skipped exactly like a malformed
+          // one.
+          const comparison = parseComparison(payload);
+          if (comparison !== null) {
+            result.comparisons.push(comparison);
+            onEvent?.({ type: "comparison", comparison });
+          }
+          break;
+        }
         case "answer": {
           const a = payload as { text: string; reset?: boolean };
           result.answerText = foldSendResultAnswer(
@@ -428,6 +521,7 @@ export async function resumeThread(
       citations: [],
       answerText: "",
       assistantMessage: "",
+      comparisons: [],
     };
   }
   if (res.status === 503) throw new IngestMissingError("ingest_missing");

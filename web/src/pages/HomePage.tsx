@@ -5,6 +5,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import CorpusCard from "../components/CorpusCard";
+import { corpusSummary } from "../corpusCards";
 import {
   decideLastThreadRestore,
   forgetLastThread,
@@ -57,7 +58,7 @@ export default function HomePage() {
     <main className="p-6">
       <h2 className="text-xl font-bold mb-1">研究对话</h2>
       <p className="text-sm text-gray-600 mb-4">
-        就冻结的 AAPL / MSFT / AMZN 10-Q 提问。
+        就本地语料库里的 SEC filing 提问。
       </p>
 
       <section aria-label="对话列表" className="mb-8">
@@ -91,9 +92,7 @@ export default function HomePage() {
         {!corpusLoaded ? (
           <>
             <h3 className="text-base font-semibold mb-1">正在加载 Corpus…</h3>
-            <p className="text-sm text-gray-600 mb-3">
-              从服务读取已冻结的 12 份 10-Q 索引
-            </p>
+            <p className="text-sm text-gray-600 mb-3">从服务读取语料索引</p>
             <div
               className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
               aria-busy="true"
@@ -113,7 +112,9 @@ export default function HomePage() {
           </div>
         ) : (
           <>
-            <h3 className="text-base font-semibold mb-2">Corpus（冻结 12）</h3>
+            <h3 className="text-base font-semibold mb-2">
+              Corpus（{corpusSummary(corpus)}）
+            </h3>
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
               {corpus.map((f) => (
                 <CorpusCard key={f.document_id} filing={f} />

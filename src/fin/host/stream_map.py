@@ -71,6 +71,8 @@ from typing import Any, Iterable, Mapping
 
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 
+from fin.host.tools.issuer_fanout import ISSUER_FANOUT_TOOL
+
 
 # ----- chunk assembly -----
 
@@ -724,9 +726,11 @@ def summarize_list_files(
 
     ``filings`` is the tool's return value (the catalog rows); we
     render the count only - filing ids belong to the sources list,
-    not the tools region. Optional ``company`` / ``period`` filters
-    from the model's call arguments render as ``[key=value]`` so the
-    operator can see why the tool ran.
+    not the tools region. Optional ``company`` / ``period`` / ``form``
+    filters from the model's call arguments render as ``[key=value]``
+    so the operator can see why the tool ran: a bare ``0 filings``
+    reads as an empty corpus, ``0 filings [form=8-K]`` as a corpus
+    that holds no 8-K.
     """
     count = len(filings) if filings else 0
     noun = "filing" if count == 1 else "filings"
@@ -734,7 +738,7 @@ def summarize_list_files(
     if args:
         parts = [
             f"{key}={args[key]}"
-            for key in ("company", "period")
+            for key in ("company", "period", "form")
             if args.get(key)
         ]
         if parts:
@@ -959,6 +963,87 @@ def summarize_get_xbrl_fact(
     return f"{head} = {value}{qualifiers}{_fact_locator_suffix(src_result)}"
 
 
+def summarize_compare_facts(
+    *,
+    result: dict[str, Any] | None = None,
+    args: dict[str, Any] | None = None,
+) -> str:
+    """Human-readable one-liner for ``compare_facts`` calls (T3).
+
+    The tools region gets the SHAPE of the table
+    (``concept · 2 rows × 2 periods · 4/4 facts``); the table itself
+    renders as structure on the turn, never as JSON in this string
+    (spec line 32). A typed EXIT (``empty_comparison`` /
+    ``comparison_overflow``) appends its token the same way
+    :func:`summarize_read_file` does.
+    """
+    src_args = args or {}
+    src_result = result if isinstance(result, dict) else {}
+    comparison = src_result.get("comparison")
+    if not isinstance(comparison, dict):
+        comparison = {}
+    concept = str(
+        comparison.get("concept") or src_args.get("concept") or ""
+    )
+    head = concept or "compare"
+
+    error = src_result.get("error")
+    if error:
+        return f"{head} ({error})"
+
+    rows = comparison.get("rows")
+    columns = comparison.get("columns")
+    if not isinstance(rows, list) or not isinstance(columns, list):
+        # No ToolMessage for this call yet (the run ended before the
+        # tool returned): the arguments still say what was asked.
+        return head
+    row_noun = "row" if len(rows) == 1 else "rows"
+    period_noun = "period" if len(columns) == 1 else "periods"
+    hits = comparison.get("hit_count", 0)
+    cells = comparison.get("cell_count", 0)
+    return (
+        f"{head} · {len(rows)} {row_noun} × {len(columns)} {period_noun} "
+        f"· {hits}/{cells} facts"
+    )
+
+
+def summarize_research_issuers(
+    *,
+    result: dict[str, Any] | None = None,
+    args: dict[str, Any] | None = None,
+) -> str:
+    """Human-readable one-liner for the issuer fan-out (T6).
+
+    The tools region gets the SHAPE of the fan-out
+    (``services revenue · 5 issuers · 4/5 with evidence``); the roster
+    and its locators render as structure, never as JSON in this string
+    (spec line 32). A typed EXIT (``empty_fanout`` /
+    ``issuer_overflow``) appends its token the same way
+    :func:`summarize_read_file` does, so an operator whose ask was over
+    the cap can see why nothing was researched.
+    """
+    src_args = args or {}
+    src_result = result if isinstance(result, dict) else {}
+    fanout = src_result.get("fanout")
+    if not isinstance(fanout, dict):
+        fanout = {}
+    head = str(fanout.get("query") or src_args.get("query") or "issuers")
+
+    error = src_result.get("error")
+    if error:
+        return f"{head} ({error})"
+
+    rows = fanout.get("issuers")
+    if not isinstance(rows, list):
+        # No ToolMessage for this call yet (the run ended before the
+        # join): the arguments still say who was asked about.
+        return head
+    contributing = fanout.get("contributing")
+    hits = len(contributing) if isinstance(contributing, list) else 0
+    noun = "issuer" if len(rows) == 1 else "issuers"
+    return f"{head} · {len(rows)} {noun} · {hits}/{len(rows)} with evidence"
+
+
 def _list_files_filings(result: dict[str, Any] | None) -> list[Any] | None:
     """Pull the ``filings`` list off a ``list_files`` result, else ``None``."""
     if result is not None and isinstance(result.get("filings"), list):
@@ -991,10 +1076,12 @@ def format_tool_summary(
 ) -> str:
     """Dispatch to the correct ``summarize_*`` based on tool ``name``.
 
-    Exhaustive over the host graph's four tools (ADR 0009 +
-    ``get_xbrl_fact`` from ADR 0031). An unknown name falls back to
-    the bare tool name so a future tool still surfaces a readable row
-    in the tools region instead of an empty cell - never raw JSON.
+    Exhaustive over the host graph's six model-facing tools (ADR 0009 +
+    ``get_xbrl_fact`` from ADR 0031 + ``compare_facts`` from the
+    enterprise-kb Focus 1 + ``research_issuers`` from Focus 4 /
+    ADR 0034). An unknown name falls back to the bare tool name so a
+    future tool still surfaces a readable row in the tools region
+    instead of an empty cell - never raw JSON.
     """
     result_dict = result if isinstance(result, dict) else None
     if name == "list_files":
@@ -1007,6 +1094,10 @@ def format_tool_summary(
         return summarize_read_file(result=result_dict, args=args)
     if name == "get_xbrl_fact":
         return summarize_get_xbrl_fact(result=result_dict, args=args)
+    if name == "compare_facts":
+        return summarize_compare_facts(result=result_dict, args=args)
+    if name == ISSUER_FANOUT_TOOL:
+        return summarize_research_issuers(result=result_dict, args=args)
     return name or "tool"
 
 
@@ -1024,8 +1115,10 @@ __all__ = [
     "replay_reasoning_into_payload",
     "split_stream_delta",
     "strip_thinking_from_answer",
+    "summarize_compare_facts",
     "summarize_get_xbrl_fact",
     "summarize_list_files",
     "summarize_read_file",
+    "summarize_research_issuers",
     "summarize_retrieve",
 ]

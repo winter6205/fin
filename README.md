@@ -93,3 +93,26 @@ Prerequisites:
 Exit codes: `0` every check passed, `1` a check failed or produced no verdict, `2` the harness itself could not run (binary missing, browser refused to open, snippet crashed, wall-clock timeout). `node scripts/run-stream-checks.mjs --help` lists the flags (`--poll-count`, `--poll-interval-ms`, `--require-stream-growth`, `--timeout-ms`, `--session`, `--browser`, `--keep-open`, `--json`).
 
 Assertions live in `scripts/playwright-stream-checks.mjs`; the driver imports that ES module and evaluates the check function through `playwright-cli run-code`, so the function stays self-contained (no imports, no module-scope references).
+
+### Eval lane: nine gold cases, and counting their outcomes
+
+The nine gold cases (ADR 0012) stay opt-in — default `uv run pytest -q` deselects them:
+
+```bash
+uv run pytest -q -m eval               # the nine cases, pass/fail
+uv run python scripts/eval_counts.py   # the same lane, plus done / refuse integers
+```
+
+The count command prints exactly two lines on stdout (`done=6`, `refuse=3`) and forwards pytest's own report to stderr, so a CI step can read the integers without parsing test output. The numbers are **observed**: `tests/eval/conftest.py` wraps the graph each case invokes and records that run's terminal status, so the tally reflects what the runs did, not what the assertions expect. No live LLM and no LLM-as-judge are involved — the lane runs `ScriptedChatModel` against the frozen corpus. Exit code is pytest's, so a red eval suite fails the command; a lane that reports no count line exits `2` rather than printing zeros.
+
+### Process health (`GET /health`)
+
+`GET /health` reports whether this process can reach the Postgres behind `FIN_CHECKPOINT_URL` (LangGraph's `PostgresSaver`, ADR 0015, and the workspace thread store):
+
+```json
+{ "status": "degraded", "checkpoint": { "state": "unconfigured", "reason": "checkpoint_url_unset", "detail": "..." } }
+```
+
+`state` is `reachable` / `unconfigured` (URL unset — the process serves, run state lives in memory) / `unreachable` (URL set, Postgres did not answer). Both degraded states are a 200 with operator copy: a monitoring probe can tell "fin is down" from "fin is up without a database", which a blank 500 cannot. The body never echoes the URL — that string carries the operator's password.
+
+This is a separate route from `GET /api/status`, which stays boot-scoped per ADR 0033 (retrieve reachability, adapter kind, model slug, corpus filing count) and grows no per-request database probe.

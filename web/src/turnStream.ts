@@ -108,5 +108,15 @@ export function mergeReconciledTurn(streamed: Turn, persisted: Turn): Turn {
       (streamed.tool_summaries?.length ?? 0) > 0
         ? streamed.tool_summaries
         : persisted.tool_summaries,
+    // T3: the persisted envelope wins — it is the same table the
+    // stream sent, and the server row is authoritative. The
+    // streamed one is the fallback for a mid-run reopen, where the
+    // RunRecord does not exist yet (it is appended once the stream
+    // completes) and dropping the table would blank a grid the
+    // operator is already reading.
+    comparisons:
+      (persisted.comparisons?.length ?? 0) > 0
+        ? persisted.comparisons
+        : streamed.comparisons,
   };
 }

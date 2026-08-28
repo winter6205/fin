@@ -114,6 +114,14 @@ class RunRecord:
     reads it as the presentation SSOT for past turns; empty when
     the run never reached classify (e.g. mid-flight refuse before
     a values frame).
+
+    T3 (enterprise-kb Focus 1): ``comparisons`` holds the
+    ``fin.comparison.v1`` envelopes this run's ``compare_facts``
+    calls produced — the STRUCTURE the turn table renders as a
+    table instead of re-parsing prose. Shape SSOT is
+    ``fin.host.tools.compare_facts``; stored as JSONB so the
+    round-trip needs no codec. Non-empty on ``refuse`` rows too:
+    the table is tool output, not model prose.
     """
 
     id: str
@@ -149,6 +157,20 @@ class RunRecord:
     # engine. Persisted so a reload restores the label the SPA
     # rendered live.
     status_classified: str = ""
+    # T3 (enterprise-kb Focus 1): ``fin.comparison.v1`` envelopes,
+    # one per ``compare_facts`` call this run made. Nested plain
+    # JSON (rows / cells / deltas / locators), not a dataclass, so
+    # the JSONB round-trip is lossless without a codec.
+    comparisons: list[dict[str, Any]] = field(default_factory=list)
+    # Trust (the tracked change, spec SC8): the locators this run retrieved or
+    # read, one ``{document_id, version, page}`` dict per distinct
+    # unit, in first-touch order. Wider than ``citations`` on
+    # purpose — a refused run records what it looked at, so the
+    # turn stays auditable even when no span passed the verifier.
+    # Run-scoped: the send route copies this run's evidence before
+    # the next run resets it (ADR 0016), so a follow-up row never
+    # lists the previous run's pages.
+    evidence_locators: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ----- enum + validation -----
@@ -466,7 +488,14 @@ CREATE TABLE IF NOT EXISTS fin_run (
     -- (auth / network / timeout / rate_limit / not_found /
     -- server / unknown). Empty on rows whose refusal came from
     -- the gate rather than the stream engine.
-    status_classified TEXT NOT NULL DEFAULT ''
+    status_classified TEXT NOT NULL DEFAULT '',
+    -- T3 (enterprise-kb Focus 1): fin.comparison.v1 envelopes from
+    -- this run's compare_facts calls. JSONB so the turn table can
+    -- render structure instead of re-parsing prose.
+    comparisons       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    -- Trust (the tracked change): the locators this run retrieved or read, not
+    -- only the verifier-passed citations.
+    evidence_locators JSONB NOT NULL DEFAULT '[]'::jsonb
 );
 
 -- T2 column migration: add ``assistant_message`` to existing
@@ -499,6 +528,17 @@ ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS track_decision JSONB NOT NULL DEFAU
 -- so the SPA can render a precise label rather than one opaque
 -- English sentence. Empty on rows that did not fail mid-stream.
 ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS status_classified TEXT NOT NULL DEFAULT '';
+
+-- T3 (enterprise-kb Focus 1) column migration: structured
+-- comparison envelopes on existing tables. Pre-T3 rows read back
+-- as ``[]`` — those turns never called compare_facts.
+ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS comparisons JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+-- Trust (the tracked change, spec SC8): run-scoped evidence locators on existing
+-- tables. Pre-migration rows read back as ``[]`` — the run happened
+-- before the column existed, so "no recorded locators" is the only
+-- honest value.
+ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS evidence_locators JSONB NOT NULL DEFAULT '[]'::jsonb;
 """
 
 
@@ -578,6 +618,28 @@ class PostgresThreadStore:
             # Empty when pre-migration; rows that did not fail
             # mid-flight never set this column.
             status_classified=(row[14] or "") if len(row) > 14 else "",
+            # T3: ``[]`` when the row predates the migration or the
+            # run never called ``compare_facts``.
+            comparisons=copy.deepcopy(
+                (
+                    json.loads(row[15])
+                    if isinstance(row[15], str)
+                    else list(row[15] or [])
+                )
+                if len(row) > 15
+                else []
+            ),
+            # Trust (the tracked change): empty list when pre-migration / the run
+            # touched no locator.
+            evidence_locators=copy.deepcopy(
+                (
+                    json.loads(row[16])
+                    if isinstance(row[16], str)
+                    else list(row[16] or [])
+                )
+                if len(row) > 16
+                else []
+            ),
         )
 
     # -- threads --
@@ -690,8 +752,10 @@ class PostgresThreadStore:
                     "INSERT INTO fin_run (id, thread_id, question, status, "
                     "status_reason, answer, citations, thinking_text, "
                     "tool_summaries, assistant_message, created_at, in_flight, "
-                    "thinking_duration_ms, track_decision, status_classified) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    "thinking_duration_ms, track_decision, status_classified, "
+                    "comparisons, evidence_locators) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+                    "%s, %s, %s)",
                     (
                         record.id,
                         record.thread_id,
@@ -709,6 +773,8 @@ class PostgresThreadStore:
                         record.thinking_duration_ms,
                         json.dumps(record.track_decision),
                         record.status_classified,
+                        json.dumps(record.comparisons),
+                        json.dumps(record.evidence_locators),
                     ),
                 )
                 conn.commit()
@@ -728,8 +794,6 @@ class PostgresThreadStore:
         # WHY deepcopy on the returned rows: same invariant
         # as the in-memory path — caller cannot mutate
         # store state through the returned records.
-        import json
-
         with self._connect() as conn:
             exists = conn.execute(
                 "SELECT 1 FROM fin_thread WHERE id = %s", (thread_id,)
@@ -740,23 +804,16 @@ class PostgresThreadStore:
                 "SELECT id, thread_id, question, status, status_reason, "
                 "answer, citations, thinking_text, tool_summaries, "
                 "assistant_message, created_at, in_flight, "
-                "thinking_duration_ms, track_decision, status_classified "
+                "thinking_duration_ms, track_decision, status_classified, "
+                "comparisons, evidence_locators "
                 "FROM fin_run WHERE thread_id = %s ORDER BY created_at ASC",
                 (thread_id,),
             ).fetchall()
-            return [
-                self._row_to_run(r).__class__(
-                    **{
-                        field.name: (
-                            copy.deepcopy(getattr(self._row_to_run(r), field.name))
-                            if field.name in ("citations", "tool_summaries")
-                            else getattr(self._row_to_run(r), field.name)
-                        )
-                        for field in self._row_to_run(r).__dataclass_fields__.values()
-                    }
-                )
-                for r in rows
-            ]
+            # ``_row_to_run`` already deep-copies every mutable field
+            # off the driver buffer (citations / tool_summaries /
+            # track_decision / comparisons / evidence_locators), so
+            # one outer deepcopy per row is enough.
+            return [copy.deepcopy(self._row_to_run(r)) for r in rows]
 
 
 # ----- env-based default selection -----

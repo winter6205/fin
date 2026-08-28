@@ -31,6 +31,12 @@ export default function Composer({
     (s) => s.resumingThreadId === threadId,
   );
   const busy = sending || threadInFlight || resumingThis;
+  // T4 workflow (the tracked change): Stop ends the in-flight run on this thread.
+  // Shown only while something is running — the host answers 204 on an
+  // idle thread, so a stale click is harmless, but a permanently
+  // visible Stop button reads as if a run were always live.
+  const stopRun = useWorkspaceStore((s) => s.stopRun);
+  const stopping = useWorkspaceStore((s) => s.stoppingThreadId === threadId);
   // T3 (#34): the operator's GLOBAL thinking preference. Defaults
   // ON (spec line 28: default is on / `adaptive`); persisted in
   // localStorage so a reload keeps the choice. This is a thinking
@@ -158,6 +164,19 @@ export default function Composer({
         <span className="text-xs text-gray-500">
           Enter 发送 · Shift+Enter 换行
         </span>
+        {busy ? (
+          <button
+            type="button"
+            data-testid="stop-run"
+            disabled={stopping}
+            onClick={() => {
+              void stopRun(threadId);
+            }}
+            className="border border-black bg-card px-4 py-1.5 text-sm font-medium hover:bg-black hover:text-white disabled:opacity-50"
+          >
+            {stopping ? "停止中…" : "停止"}
+          </button>
+        ) : null}
         <button
           type="submit"
           disabled={busy || !draft.trim()}

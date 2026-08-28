@@ -32,6 +32,34 @@ Routes
                                           spec line 30).
 * ``POST   /api/threads/{id}/resume``   - crash resume on the SAME
                                           delta wire (T2, #36).
+* ``POST   /api/threads/{id}/stop``     - cooperative stop of the
+                                          in-flight run (T4 workflow,
+                                          the tracked change): flips the run's stop
+                                          token, the SSE generator
+                                          closes the graph stream and
+                                          writes a terminal ``refuse``
+                                          / ``stopped`` turn row. No
+                                          HumanMessage is appended and
+                                          the per-thread lock is
+                                          released, so a later send is
+                                          accepted while a CONCURRENT
+                                          one is still 409.
+* ``GET    /api/threads/{id}/export``   - the thread's comparison or
+                                          citation bundle as a file
+                                          download (T4 workflow, the tracked change).
+                                          Comparison exports bind to
+                                          ``fin.comparison.v1``; a
+                                          missing run is a typed 404.
+* ``GET    /api/watchlist``             - watched issuers (+ form
+                                          types); ``POST`` adds,
+                                          ``DELETE /{watch_id}``
+                                          removes (T4 workflow, the tracked change).
+* ``GET    /api/notices``               - in-app notices for watched
+                                          filings that are in the LOCAL
+                                          catalog; ``POST
+                                          /{notice_id}/read`` dismisses
+                                          one. Workspace-only — nothing
+                                          is emailed or posted out.
 * ``GET    /api/corpus``                - real ``list_filings()`` over
                                           the frozen manifest.
 * ``GET    /api/status``                - the boot-scoped status
@@ -68,6 +96,7 @@ no body chunk).
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -88,7 +117,12 @@ from pydantic import BaseModel, Field
 
 from fin.corpus.catalog import list_filings
 from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER, strip_hidden_bounce_marker
-from fin.host.graph import ConcurrentRunError
+from fin.host.export import (
+    ExportError,
+    UnsupportedExportError,
+    build_export,
+)
+from fin.host.graph import ConcurrentRunError, comparison_from_tool_message
 from fin.host.operator_env import (
     probe_retrieve_reachability,
     resolve_retrieve_adapter_kind,
@@ -102,12 +136,23 @@ from fin.host.stream_map import (
     split_stream_delta,
     strip_thinking_from_answer,
 )
+from fin.host.run_control import RunControl, StopToken
 from fin.host.state import reset_input_state
 from fin.host.thread_store import (
     RunRecord,
     ThreadNotFoundError,
     ThreadRecord,
     ThreadStore,
+)
+from fin.host.watchlist import (
+    InvalidWatchError,
+    JsonFileWatchlistStore,
+    Notice,
+    NoticeNotFoundError,
+    WatchEntry,
+    WatchNotFoundError,
+    default_watchlist_store,
+    refresh_notices,
 )
 
 
@@ -306,6 +351,12 @@ class RunStreamOutcome:
     # RunRecord so reload keeps the classification visible.
     refuse_kind: str | None = None
     answer_reset: bool = False
+    # T4 workflow (the tracked change): the operator pressed Stop and the engine
+    # closed the graph stream between frames. Distinct from
+    # ``refuse_reason`` (a failure) — a stop is a deliberate end, so
+    # the caller writes the ``stopped`` turn row and its own terminal
+    # frames rather than a stream-error refusal.
+    stopped: bool = False
 
 
 # Graph nodes whose model deltas are the operator-visible reply.
@@ -352,6 +403,18 @@ class SendMessageRequest(BaseModel):
     # The proxy keeps ``reasoning_split=True`` regardless — only the
     # thinking TYPE toggles; reasoning_details round-trip remains on.
     thinking: bool = True
+
+
+class CreateWatchRequest(BaseModel):
+    """T4 workflow (the tracked change): one watched issuer, optionally narrowed.
+
+    ``forms`` empty (or omitted) watches every form type — the
+    operator asked about the issuer, not about a filing kind. The
+    store normalizes casing, so the SPA does not have to.
+    """
+
+    issuer: str
+    forms: list[str] = Field(default_factory=list)
 
 
 class CitationPayload(BaseModel):
@@ -414,6 +477,23 @@ class TurnRow(BaseModel):
     # a 401 / 429 / 504 reads distinctly instead of as one opaque
     # English sentence.
     status_classified: str = ""
+    # T3 (enterprise-kb Focus 1 / SC2): the ``fin.comparison.v1``
+    # envelopes this run's ``compare_facts`` calls produced. The
+    # turn renders a TABLE off this field rather than re-parsing a
+    # prose table out of ``answer``. Untyped nested JSON on purpose
+    # — the producing tool
+    # (``fin.host.tools.compare_facts``) owns and validates the
+    # shape, and a read path that 500s on an unexpected key would
+    # lose the whole turn. Same precedent as ``track_decision``.
+    # Present (and non-empty) on ``refuse`` rows too: on a
+    # ``numeric_gate_fail`` the table is the evidence FOR the
+    # refusal.
+    comparisons: list[dict[str, Any]] = Field(default_factory=list)
+    # Trust (the tracked change, spec SC8): the locators this run retrieved or
+    # read (``{document_id, version, page}``), copied from the
+    # run's evidence before the next run resets it. Wider than
+    # ``citations``: a refused turn still shows what it looked at.
+    evidence_locators: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class WorkspaceStatusResponse(BaseModel):
@@ -527,6 +607,35 @@ def _serialize_run(run: RunRecord, *, in_flight: bool = False) -> dict[str, Any]
         # rows whose refusal came from the gate rather than the
         # stream engine.
         "status_classified": run.status_classified,
+        # T3: structured comparison envelopes. Deep-copied because
+        # the entries nest (rows -> cells), so a shallow ``dict()``
+        # would still share the inner lists with the store.
+        "comparisons": copy.deepcopy(list(run.comparisons or [])),
+        # Trust (the tracked change): copied so a caller cannot mutate the store's
+        # list through the serialized view.
+        "evidence_locators": [dict(loc) for loc in run.evidence_locators],
+    }
+
+
+def _serialize_watch(entry: WatchEntry) -> dict[str, Any]:
+    return {
+        "id": entry.id,
+        "issuer": entry.issuer,
+        "forms": list(entry.forms),
+        "created_at": entry.created_at.isoformat(),
+    }
+
+
+def _serialize_notice(notice: Notice) -> dict[str, Any]:
+    return {
+        "id": notice.id,
+        "watch_id": notice.watch_id,
+        "issuer": notice.issuer,
+        "form": notice.form,
+        "document_id": notice.document_id,
+        "period": notice.period,
+        "created_at": notice.created_at.isoformat(),
+        "read": notice.read,
     }
 
 
@@ -560,7 +669,13 @@ def _node_frame_payloads(message: BaseMessage) -> Iterator[tuple[str, Any]]:
       on ``additional_kwargs.reasoning_details`` arrived chunk by
       chunk first).
     * ``ToolMessage`` -> one ``tool_result`` frame with the
-      human-readable summary (never the raw JSON payload).
+      human-readable summary (never the raw JSON payload), plus —
+      for ``compare_facts`` only — one ``comparison`` frame
+      carrying the ``fin.comparison.v1`` envelope (T3). That
+      envelope is the sole structured payload on this wire: it is
+      tool-computed data, not model prose, and the live view
+      renders it as a table before the answer arrives. A typed
+      EXIT (no columns) emits no frame.
     * HumanMessage / SystemMessage / others -> no frame. The user
       side has its own UI; SystemMessages are the gate's hidden
       bounce templates and MUST NOT appear on the wire (ADR 0021).
@@ -607,6 +722,13 @@ def _node_frame_payloads(message: BaseMessage) -> Iterator[tuple[str, Any]]:
                 "tool_call_id": tool_call_id,
             },
         )
+        # T3: the comparison table rides its own frame so the SPA
+        # does not have to re-parse ``tool_result``. Reuses the
+        # graph's extractor so the wire entry and the persisted
+        # ``RunRecord.comparisons`` entry are byte-identical.
+        comparison = comparison_from_tool_message(message)
+        if comparison is not None:
+            yield ("comparison", comparison)
 
 
 def _stream_run_frames(
@@ -617,6 +739,7 @@ def _stream_run_frames(
     config: dict[str, Any],
     seen_message_ids: set[str],
     thread_id: str | None = None,
+    stop_token: StopToken | None = None,
 ) -> Iterator[str]:
     """Drive one run on the combined delta wire; return the outcome.
 
@@ -654,6 +777,15 @@ def _stream_run_frames(
     nothing. On exception the generator still emits status / answer
     / citations before returning; the send caller then persists a
     refuse row (``refuse_reason`` set), the resume caller skips.
+
+    ``stop_token`` (T4 workflow, the tracked change) is checked between frames: a
+    set token stops consuming the graph stream and returns
+    ``stopped=True`` WITHOUT emitting terminal frames, because a stop
+    is not a stream failure and the caller owns the ``stopped`` copy.
+    The graph iterator is closed explicitly in a ``finally`` so
+    ``_LockedGraph.stream`` runs its own ``finally`` and releases the
+    per-thread lock right away — the composer must be usable the
+    moment the wire closes, not whenever the iterator is collected.
     """
     clock = ThinkingClock()
 
@@ -684,12 +816,17 @@ def _stream_run_frames(
             pending_answer_reset = False
         return data
 
+    stopped = False
+    graph_stream = graph.stream(
+        input_value,
+        config=config,
+        stream_mode=["messages", "values"],
+    )
     try:
-        for mode, payload in graph.stream(
-            input_value,
-            config=config,
-            stream_mode=["messages", "values"],
-        ):
+        for mode, payload in graph_stream:
+            if stop_token is not None and stop_token.is_set():
+                stopped = True
+                break
             if mode == "messages":
                 chunk, meta = payload
                 # The aggregated end-of-call AIMessage is not a chunk;
@@ -736,12 +873,15 @@ def _stream_run_frames(
                         yield _frame(event, data)
 
         # Stream end: release any held-back inline-filter fragment so
-        # the live view never silently loses trailing text.
-        tail = split_stream_delta(filter_state, "", final=True)
-        if tail.thinking:
-            yield _frame("thinking", {"text": tail.thinking})
-        if tail.answer:
-            yield _frame("answer", _answer_payload(tail.answer))
+        # the live view never silently loses trailing text. Skipped on
+        # a stop — the operator asked for the run to end, and the
+        # caller's terminal empty answer frame clears the draft.
+        if not stopped:
+            tail = split_stream_delta(filter_state, "", final=True)
+            if tail.thinking:
+                yield _frame("thinking", {"text": tail.thinking})
+            if tail.answer:
+                yield _frame("answer", _answer_payload(tail.answer))
     except Exception as exc:
         # Mid-flight failure (model raise, node crash): without this
         # boundary the exception escapes the generator, FastAPI kills
@@ -796,11 +936,21 @@ def _stream_run_frames(
             refuse_copy=user_copy,
             refuse_kind=kind,
         )
+    finally:
+        # Close the graph iterator explicitly. On the stop path the
+        # ``break`` above leaves it suspended, and only ``close()``
+        # runs ``_LockedGraph.stream``'s ``finally`` — i.e. releases
+        # the per-thread lock. Without it the composer would stay
+        # disabled until the generator was garbage-collected.
+        close = getattr(graph_stream, "close", None)
+        if callable(close):
+            close()
     clock.close()
     return RunStreamOutcome(
         final_state=final_state,
         thinking_ms=clock.total_ms,
         answer_reset=pending_answer_reset,
+        stopped=stopped,
     )
 
 
@@ -885,6 +1035,92 @@ def _terminal_sse_frames(
     yield _format_sse("citations", _citations_wire_payload(payload["citations"]))
 
 
+# T4 workflow (the tracked change): the ordinary-person copy a stopped run leaves on
+# its turn row. A stop is the operator's own action, so the copy says
+# what happened and what is possible next — never an error sentence.
+STOPPED_ASSISTANT_MESSAGE: Final[str] = "本轮已停止。可以直接再发一条。"
+
+# ``RunRecord.status`` is a closed enum (``done`` / ``refuse`` /
+# ``step_cap``); a stop is not a completed answer, so it lands on
+# ``refuse`` with ``status_reason="stopped"`` as the discriminator the
+# SPA reads. Adding a fourth status would ripple through the gate, the
+# ask payload, and the persisted enum for one presentation difference.
+STOPPED_STATUS_REASON: Final[str] = "stopped"
+
+
+def _stopped_terminal_frames(run_id: str, *, thinking_ms: int) -> Iterator[str]:
+    """Terminal ``status`` -> ``answer`` -> ``citations`` for a stop.
+
+    Same fixed order (and same terminal ``citations`` frame) as every
+    other run end, so the SPA's reader closes on a stop exactly as it
+    does on a refuse. The empty answer frame clears whatever partial
+    draft was on screen when the operator pressed Stop.
+    """
+    yield _format_sse(
+        "status",
+        {
+            "run_id": run_id,
+            "status": "refuse",
+            "reason": STOPPED_STATUS_REASON,
+            "assistant_message": STOPPED_ASSISTANT_MESSAGE,
+            "thinking_ms": thinking_ms,
+        },
+    )
+    yield _format_sse("answer", {"text": "", "reset": True})
+    yield _format_sse("citations", _citations_wire_payload([]))
+
+
+def _persist_and_close_stopped_run(
+    graph: Any,
+    *,
+    store: ThreadStore,
+    thread_id: str,
+    run_id: str,
+    question: str,
+    thinking_ms: int,
+) -> Iterator[str]:
+    """Write the stopped turn row, clear the checkpoint, close the wire.
+
+    A stopped run is still a turn the operator can see: without the row
+    the SPA's ``openThread`` reconcile would replace its optimistic turn
+    with the server's list and the question would vanish (same
+    reasoning as the mid-flight refuse row).
+
+    ``finalize_abandoned_run`` mirrors the mid-flight refuse path: the
+    LangGraph checkpoint may still list pending nodes after the stream
+    was closed, and without this a Resume banner would appear above a
+    turn the operator deliberately ended.
+    """
+    try:
+        store.append_run(
+            RunRecord(
+                id=run_id,
+                thread_id=thread_id,
+                question=question,
+                status="refuse",
+                status_reason=STOPPED_STATUS_REASON,
+                answer="",
+                citations=[],
+                thinking_text="",
+                thinking_duration_ms=thinking_ms,
+                tool_summaries=[],
+                assistant_message=STOPPED_ASSISTANT_MESSAGE,
+            )
+        )
+    except ThreadNotFoundError:
+        # The thread was deleted while the run was being stopped; do
+        # not resurrect it. The frames below still close the wire so
+        # the SPA's reader does not hang.
+        pass
+    if hasattr(graph, "finalize_abandoned_run"):
+        graph.finalize_abandoned_run(
+            thread_id,
+            status="refuse",
+            status_reason=STOPPED_STATUS_REASON,
+        )
+    yield from _stopped_terminal_frames(run_id, thinking_ms=thinking_ms)
+
+
 def _model_identity() -> str:
     """The resolved ``FIN_MODEL`` slug, or the ADR 0022 default.
 
@@ -926,14 +1162,24 @@ def _corpus_filing_count() -> int:
 # ----- route factory -----
 
 
-def build_router(*, get_graph, get_thread_store) -> APIRouter:
+def build_router(
+    *, get_graph, get_thread_store, get_watchlist_store=None
+) -> APIRouter:
     """Build the workspace APIRouter.
 
-    The two dependencies are passed in so the router can be wired
-    against any FastAPI app (the prod app in
-    ``fin.host.http``, and any test app).
+    The dependencies are passed in so the router can be wired against
+    any FastAPI app (the prod app in ``fin.host.http``, and any test
+    app). ``get_watchlist_store`` defaults to the env-selected store so
+    an existing caller that predates T4 still mounts.
+
+    The stop registry (:class:`RunControl`) is created HERE rather than
+    at module level: one registry per mounted router means two apps in
+    one test session cannot stop each other's runs.
     """
     router = APIRouter(prefix="/api")
+    run_control = RunControl()
+    if get_watchlist_store is None:
+        get_watchlist_store = default_watchlist_store
 
     @router.get("/threads")
     def list_threads(store: ThreadStore = Depends(get_thread_store)) -> list[dict]:
@@ -1167,14 +1413,34 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
             # (spec line 34).
             if hasattr(graph, "checkpoint_message_ids"):
                 seen_message_ids |= graph.checkpoint_message_ids(thread_id)
-            outcome = yield from _stream_run_frames(
-                graph,
-                run_id=run_id,
-                input_value=reset_input_state(body.question),
-                config=config,
-                seen_message_ids=seen_message_ids,
-                thread_id=thread_id,
-            )
+            # T4 workflow (the tracked change): register the run as stoppable BEFORE
+            # the first frame so a Stop pressed during the very first
+            # model call still lands. ``finally`` deregisters so a
+            # later Stop on an idle thread answers 204.
+            stop_token = run_control.begin(thread_id, run_id)
+            try:
+                outcome = yield from _stream_run_frames(
+                    graph,
+                    run_id=run_id,
+                    input_value=reset_input_state(body.question),
+                    config=config,
+                    seen_message_ids=seen_message_ids,
+                    thread_id=thread_id,
+                    stop_token=stop_token,
+                )
+            finally:
+                run_control.end(stop_token)
+
+            if outcome.stopped:
+                yield from _persist_and_close_stopped_run(
+                    graph,
+                    store=store,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    question=body.question,
+                    thinking_ms=outcome.thinking_ms,
+                )
+                return
 
             if outcome.final_state is None:
                 if outcome.refuse_reason is None:
@@ -1252,6 +1518,13 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                         tool_summaries=payload["tool_summaries"],
                         assistant_message=payload["assistant_message"],
                         track_decision=dict(payload.get("track_decision") or {}),
+                        # T3: the structured table the turn renders.
+                        # Persisted on refuse rows too — see TurnRow.
+                        comparisons=list(payload.get("comparisons") or []),
+                        # SC8: this run's retrieved / read locators,
+                        # taken from the final state BEFORE the next
+                        # send resets the evidence channel.
+                        evidence_locators=list(payload["evidence_locators"]),
                     )
                 )
             except ThreadNotFoundError:
@@ -1363,14 +1636,32 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
             seen_message_ids: set[str] = set()
             if hasattr(graph, "checkpoint_message_ids"):
                 seen_message_ids |= graph.checkpoint_message_ids(thread_id)
-            outcome = yield from _stream_run_frames(
-                graph,
-                run_id=run_id,
-                input_value=None,
-                config={"configurable": {"thread_id": thread_id}},
-                seen_message_ids=seen_message_ids,
-                thread_id=thread_id,
-            )
+            # A resumed remainder is an in-flight run on this thread
+            # too, so Stop must reach it (the composer is disabled for
+            # its whole duration).
+            stop_token = run_control.begin(thread_id, run_id)
+            try:
+                outcome = yield from _stream_run_frames(
+                    graph,
+                    run_id=run_id,
+                    input_value=None,
+                    config={"configurable": {"thread_id": thread_id}},
+                    seen_message_ids=seen_message_ids,
+                    thread_id=thread_id,
+                    stop_token=stop_token,
+                )
+            finally:
+                run_control.end(stop_token)
+
+            if outcome.stopped:
+                # No row: the original send's row already tells the
+                # story, and one row per stopped Resume click would
+                # spam the turn table (same policy as this route's
+                # mid-flight refuse branch).
+                yield from _stopped_terminal_frames(
+                    run_id, thinking_ms=outcome.thinking_ms
+                )
+                return
 
             if outcome.final_state is None:
                 # Mid-flight raise on a RESUME: unlike the send path,
@@ -1399,6 +1690,11 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
                         tool_summaries=payload["tool_summaries"],
                         assistant_message=payload["assistant_message"],
                         track_decision=dict(payload.get("track_decision") or {}),
+                        comparisons=list(payload.get("comparisons") or []),
+                        # SC8: the RESUMED remainder's locators. The
+                        # crashed prefix's row (when one exists) keeps
+                        # its own.
+                        evidence_locators=list(payload["evidence_locators"]),
                     )
                 )
             except ThreadNotFoundError:
@@ -1424,6 +1720,150 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
         )
+
+    @router.post("/threads/{thread_id}/stop")
+    def stop_thread(
+        thread_id: str,
+        store: ThreadStore = Depends(get_thread_store),
+    ) -> Response:
+        """Stop the in-flight run on this thread (T4 workflow, the tracked change).
+
+        Rejection order mirrors send / resume:
+
+        * 404 — unknown thread metadata row;
+        * 204 — nothing in flight (a Stop the operator pressed just
+          after the run ended is a no-op, not a failure);
+        * 200 ``{"stopped": true, "run_id": ...}`` — the flag is set.
+
+        This route deliberately does NOT touch the graph: the run owns
+        the per-thread lock, so acquiring it here would deadlock the
+        one moment a stop matters. It flips the token and returns; the
+        SSE generator does the ending.
+        """
+        if store.get_thread(thread_id) is None:
+            return JSONResponse(
+                status_code=404, content={"error": "thread_not_found"}
+            )
+        stopped_run_id = run_control.request_stop(thread_id)
+        if stopped_run_id is None:
+            return Response(status_code=204)
+        return JSONResponse(
+            status_code=200,
+            content={"stopped": True, "run_id": stopped_run_id},
+        )
+
+    @router.get("/threads/{thread_id}/export")
+    def export_thread(
+        thread_id: str,
+        kind: str = "comparison",
+        format: str = "csv",
+        run_id: str | None = None,
+        store: ThreadStore = Depends(get_thread_store),
+    ) -> Response:
+        """Download this thread's comparison or citation bundle.
+
+        Comparison exports bind to ``fin.comparison.v1`` — the same
+        envelopes the turn row persists (``TurnRow.comparisons``) and
+        the SSE ``comparison`` frame carried. ``fin.host.export`` owns
+        the rendering; this route owns only the HTTP shape.
+
+        Typed failures, all with a stable ``error`` code:
+        ``thread_not_found`` / ``run_not_found`` / ``export_empty``
+        (404), ``unsupported_export`` (400),
+        ``unsupported_comparison_schema`` (422).
+        """
+        if store.get_thread(thread_id) is None:
+            return JSONResponse(
+                status_code=404, content={"error": "thread_not_found"}
+            )
+        try:
+            export = build_export(
+                runs=store.list_runs(thread_id),
+                kind=kind,
+                thread_id=thread_id,
+                run_id=run_id,
+                fmt=format,
+            )
+        except UnsupportedExportError as exc:
+            return JSONResponse(status_code=400, content={"error": exc.code})
+        except ExportError as exc:
+            status = 422 if exc.code == "unsupported_comparison_schema" else 404
+            return JSONResponse(status_code=status, content={"error": exc.code})
+        return Response(
+            content=export.body,
+            media_type=export.media_type,
+            headers={
+                # ``attachment`` is what makes the browser save a file
+                # rather than render the CSV as a page of text.
+                "Content-Disposition": f'attachment; filename="{export.filename}"',
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @router.get("/watchlist")
+    def list_watchlist(
+        watchlist: JsonFileWatchlistStore = Depends(get_watchlist_store),
+    ) -> list[dict]:
+        """Watched issuers. Empty is ``[]``, never an error (SC4)."""
+        return [_serialize_watch(w) for w in watchlist.list_watches()]
+
+    @router.post("/watchlist")
+    def create_watch(
+        body: CreateWatchRequest,
+        watchlist: JsonFileWatchlistStore = Depends(get_watchlist_store),
+    ) -> Response:
+        try:
+            entry = watchlist.add_watch(issuer=body.issuer, forms=body.forms)
+        except InvalidWatchError:
+            return JSONResponse(status_code=400, content={"error": "invalid_watch"})
+        return JSONResponse(status_code=200, content=_serialize_watch(entry))
+
+    @router.delete("/watchlist/{watch_id}")
+    def delete_watch(
+        watch_id: str,
+        watchlist: JsonFileWatchlistStore = Depends(get_watchlist_store),
+    ) -> Response:
+        try:
+            watchlist.remove_watch(watch_id)
+        except WatchNotFoundError:
+            return JSONResponse(
+                status_code=404, content={"error": "watch_not_found"}
+            )
+        return JSONResponse(status_code=200, content={"ok": True})
+
+    @router.get("/notices")
+    def list_notices(
+        unread_only: bool = False,
+        watchlist: JsonFileWatchlistStore = Depends(get_watchlist_store),
+    ) -> list[dict]:
+        """In-app notices for watched filings in the LOCAL catalog.
+
+        Reconcile-on-read: the catalog is a committed tree, not an
+        event source, so the read IS the delivery. Nothing leaves the
+        process — spec Focus 3 forbids outbound email / Slack.
+
+        A corpus that was never ingested raises ``IngestMissingError``,
+        which the shared handler turns into the typed 503 the rest of
+        the corpus surface already uses.
+        """
+        refresh_notices(watchlist, filings=list_filings()["filings"])
+        return [
+            _serialize_notice(n)
+            for n in watchlist.list_notices(unread_only=unread_only)
+        ]
+
+    @router.post("/notices/{notice_id}/read")
+    def mark_notice_read(
+        notice_id: str,
+        watchlist: JsonFileWatchlistStore = Depends(get_watchlist_store),
+    ) -> Response:
+        try:
+            notice = watchlist.mark_notice_read(notice_id)
+        except NoticeNotFoundError:
+            return JSONResponse(
+                status_code=404, content={"error": "notice_not_found"}
+            )
+        return JSONResponse(status_code=200, content=_serialize_notice(notice))
 
     @router.get("/corpus")
     def corpus() -> dict:
@@ -1457,10 +1897,16 @@ def build_router(*, get_graph, get_thread_store) -> APIRouter:
 # ----- mount helper -----
 
 
-def mount(app: FastAPI, *, get_graph, get_thread_store) -> None:
+def mount(
+    app: FastAPI, *, get_graph, get_thread_store, get_watchlist_store=None
+) -> None:
     """Mount the workspace routes onto an existing FastAPI app."""
     app.include_router(
-        build_router(get_graph=get_graph, get_thread_store=get_thread_store)
+        build_router(
+            get_graph=get_graph,
+            get_thread_store=get_thread_store,
+            get_watchlist_store=get_watchlist_store,
+        )
     )
 
 

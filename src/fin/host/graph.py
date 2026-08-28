@@ -14,6 +14,21 @@ three nodes the v1 spec requires:
 * ``citation_gate_node`` — call ``verify_citations`` and translate
   the gate result into the run-status enum.
 
+T6 of the enterprise-kb spec (Focus 4) adds the issuer fan-out
+ADR 0034 accepted, as three more nodes on the same level — never
+nested inside ``model_node``:
+
+* ``issuer_fanout_node`` — cap and normalize the roster a
+  ``research_issuers`` call asked for, then ``Send`` one branch per
+  approved issuer. Over the cap is the typed ``issuer_overflow``
+  refusal, not a truncated roster.
+* ``issuer_research_node`` — one branch, one issuer, one retrieve-port
+  call; its chunks become ordinary evidence.
+* ``issuer_join_node`` — fold the branches into one
+  ``fin.issuer_fanout.v1`` envelope and hand control back to
+  ``model_node``, so the citation verifier still runs exactly ONCE,
+  on the synthesized answer.
+
 The two fuses live in ``AgentState``:
 
 * ``step_count`` increments once per ``model_node`` entry. When
@@ -51,7 +66,7 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Iterable, Literal, TypedDict
 
 from langchain_core.messages import (
     AIMessage,
@@ -65,7 +80,7 @@ from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 from langchain_core.runnables import RunnableConfig
-from langgraph.types import Command
+from langgraph.types import Command, Send
 
 from fin.corpus.errors import IngestMissingError
 from fin.corpus.extracted import Locator, load_extracted_tree
@@ -77,9 +92,11 @@ from fin.host.citation_gate import (
 )
 from fin.host.state import (
     AgentState,
+    FANOUT_RESET,
     REPAIR_CAP,
     RECURSION_LIMIT,
     STEP_CAP,
+    TERMINAL_STATUSES,
 )
 from fin.host.agent_instructions import messages_for_model
 from fin.host.stream_map import (
@@ -89,10 +106,23 @@ from fin.host.stream_map import (
     strip_thinking_from_answer,
 )
 from fin.host.tools import list_files, read_file
+from fin.host.tools.issuer_fanout import (
+    ISSUER_FANOUT_TOOL,
+    MAX_ISSUERS,
+    STATUS_EMPTY,
+    STATUS_HIT,
+    STATUS_UNAVAILABLE,
+    issuer_query,
+    join_issuer_findings,
+    plan_issuer_fanout,
+)
 from fin.host.track_decision import decide_track, snapshot_delta_for_utterance
 from fin.retrieve import MCPRetrieveAdapter, FakeRetrievePort
 from fin.retrieve.tool import retrieve
 from fin.retrieve.port import RetrievePort
+
+if TYPE_CHECKING:  # ``fin.corpus.facts`` is imported lazily at call time
+    from fin.corpus.facts import Fact
 
 
 # ----- typed errors -----
@@ -512,6 +542,225 @@ def _make_get_xbrl_fact_tool(facts_root: Path):
     return get_xbrl_fact_tool
 
 
+def _make_compare_facts_tool(facts_root: Path):
+    """Build the ``compare_facts`` host tool (T3 / spec Focus 1).
+
+    Cross-period and peer comparison is a HOST TOOL result, not a
+    prose table the model writes: the tool resolves each cell against
+    the ingest-built fact table (locator per cell) and computes the
+    deltas itself. Like ``get_xbrl_fact`` it contributes NO
+    ``EvidenceItem`` — a fact row is not page text, so the citation
+    verifier still requires a read / retrieve span before any prose
+    answer passes.
+
+    Returns a plain dict so the prebuilt ``ToolNode`` serializes it as
+    ToolMessage JSON; ``tool_node_with_summaries`` then lifts the
+    ``comparison`` envelope onto ``AgentState`` for the turn row, and
+    the numeric gate reads its columns as ``(concept, period)``
+    claims.
+    """
+
+    @tool("compare_facts")
+    def compare_facts_tool(
+        concept: str,
+        periods: list[str],
+        document_ids: list[str] | None = None,
+        issuers: list[str] | None = None,
+    ) -> dict:
+        """Compare one XBRL concept across periods and/or issuers.
+
+        ``concept`` is the XBRL tag (e.g. ``us-gaap:Revenues``).
+        ``periods`` are the reporting periods to use as columns
+        (e.g. ``["2022-Q3-YTD", "2023-Q3-YTD"]``). Rows come from
+        ``issuers`` (tickers, resolved across that issuer's filings —
+        use this for cross-period) or ``document_ids`` (exact
+        filings); with neither, every filing holding facts is a row.
+        Returns a structured comparison table with per-cell locators
+        and code-computed deltas. Cells with no fact row are marked
+        ``missing``; an unresolvable request returns the typed
+        ``empty_comparison`` / ``comparison_overflow`` dict. Never
+        raises. Quote only the values this table reports.
+        """
+        from fin.host.tools.compare_facts import compare_facts
+
+        return compare_facts(
+            concept=concept,
+            periods=list(periods or []),
+            document_ids=list(document_ids) if document_ids else None,
+            issuers=list(issuers) if issuers else None,
+            facts_root=facts_root,
+        )
+
+    return compare_facts_tool
+
+
+class IssuerTask(TypedDict, total=False):
+    """The payload one ``Send`` carries to a fan-out worker (T6).
+
+    Declared as the worker node's input schema so a branch reads its
+    own issuer instead of the whole ``AgentState``: a worker that could
+    see the accumulated evidence of its siblings would be a per-issuer
+    node that quietly depends on join order.
+    """
+
+    issuer: str
+    query: str
+
+
+def _make_research_issuers_tool(issuer_cap: int):
+    """Build the ``research_issuers`` schema the model binds against
+    (T6 / ADR 0034 / spec Focus 4).
+
+    This is the one bound tool the prebuilt ``ToolNode`` does NOT
+    execute: a call by this name is intercepted in ``from_model`` and
+    served by the fan-out planner / worker / join nodes, because ADR
+    0034 makes the fan-out **graph topology** rather than a tool body.
+    Running it as an ordinary tool would put the per-issuer work back
+    inside one serial node — exactly what Focus 4 asks the host graph
+    to stop doing. The body below is therefore unreachable in the
+    compiled graph; it returns a typed marker instead of raising so a
+    future rewiring that DID hand it to the ToolNode surfaces as a
+    readable tool result rather than a crashed run.
+    """
+
+    @tool(ISSUER_FANOUT_TOOL)
+    def research_issuers_tool(issuers: list[str], query: str) -> dict:
+        """Research one question across several issuers at once.
+
+        ``issuers`` are tickers (e.g. ``["AAPL", "MSFT"]``), at most
+        {cap} of them; ``query`` is the single question asked of each.
+        The host graph researches every issuer, joins the results, and
+        returns one envelope naming which issuers had supporting
+        passages. More than {cap} issuers returns the typed
+        ``issuer_overflow`` dict — ask about fewer issuers instead.
+        Cite at least one verbatim passage for every issuer that came
+        back with evidence.
+        """
+        return {
+            "error": "fanout_not_dispatched",
+            "limit": issuer_cap,
+            "issuers": list(issuers or []),
+        }
+
+    # ``@tool`` freezes the docstring as the model-visible description,
+    # so the cap is substituted after the fact rather than f-stringed
+    # into a docstring literal (which Python would not accept).
+    research_issuers_tool.description = (
+        research_issuers_tool.description or ""
+    ).format(cap=issuer_cap)
+    return research_issuers_tool
+
+
+def _first_fanout_call(state: AgentState) -> tuple[dict[str, Any], str]:
+    """The ``(args, tool_call_id)`` of this turn's fan-out request.
+
+    Only the FIRST such call is served: two fan-outs in one AIMessage
+    would be two rosters racing for the same run-scoped channels, and
+    the router only sends here when every pending call is a fan-out,
+    so ignoring the rest cannot strand an unrelated tool.
+    """
+    for name, args, call_id in _pending_tool_calls(state):
+        if name == ISSUER_FANOUT_TOOL:
+            return dict(args or {}), call_id
+    return {}, ""
+
+
+def _issuer_of(document_id: str) -> str:
+    """The issuer key behind a ``document_id``.
+
+    ``document_id`` is ``TICKER-YYYYQn`` (ADR 0006 / manifest), the
+    same prefix convention ``compare_facts`` uses to resolve an issuer
+    row across that issuer's filings.
+    """
+    return str(document_id or "").split("-", 1)[0].strip().upper()
+
+
+def _issuer_finding(issuer: str, status: str, **extra: Any) -> dict[str, Any]:
+    """The state update carrying ONE branch's non-hit finding row.
+
+    Every branch reports, so ``empty`` and ``unavailable`` travel on
+    the same additive channel as a hit and reach the join's envelope
+    instead of being swallowed (spec SC7).
+    """
+    return {
+        "issuer_findings": [
+            {
+                "issuer": issuer,
+                "status": status,
+                "chunk_count": 0,
+                "locators": [],
+                "error": "",
+                **extra,
+            }
+        ]
+    }
+
+
+def _issuer_evidence(result: Any) -> list[EvidenceItem]:
+    """The retrieve result's chunks as ordinary ``EvidenceItem``s.
+
+    Fan-out evidence is deliberately indistinguishable from a
+    ``read_file`` page here, so the ONE citation verifier after the
+    join treats both alike (ADR 0034). Text-less chunks are dropped:
+    they can carry no citable span.
+    """
+    chunks = result.get("chunks", []) if isinstance(result, dict) else []
+    return [
+        EvidenceItem(locator=chunk.source_ref, page_text=chunk.text)
+        for chunk in chunks
+        if getattr(chunk, "text", "")
+    ]
+
+
+def _issuer_hit_update(
+    issuer: str, evidence: list[EvidenceItem]
+) -> dict[str, Any]:
+    """The state update for a branch that found citable passages."""
+    return {
+        "evidence": evidence,
+        "issuer_findings": [
+            {
+                "issuer": issuer,
+                "status": STATUS_HIT,
+                "chunk_count": len(evidence),
+                "error": "",
+                "locators": [
+                    {
+                        "document_id": item.locator.document_id,
+                        "version": item.locator.version,
+                        "page": item.locator.page,
+                    }
+                    for item in evidence
+                ],
+            }
+        ],
+    }
+
+
+def _uncited_contributors(
+    fanout: dict[str, Any], citations: Iterable[Citation]
+) -> list[str]:
+    """Issuers that produced evidence but hold no citation (SC7).
+
+    Spec Focus 4 wants the synthesis to keep "≥1 citation per issuer
+    that contributed". An issuer whose fan-out returned passages and
+    whose evidence the answer then quoted nowhere was dropped from the
+    synthesis — the citation verifier alone cannot see that, because
+    the OTHER issuers' spans already passed it. Empty and unavailable
+    issuers are not contributors and are not required to be cited;
+    they are reported in the envelope instead.
+    """
+    contributing = [
+        str(issuer)
+        for issuer in (fanout.get("contributing") or ())
+        if str(issuer)
+    ]
+    if not contributing:
+        return []
+    cited = {_issuer_of(citation.document_id) for citation in citations}
+    return [issuer for issuer in contributing if issuer not in cited]
+
+
 def _clarify_missing_slots(state: AgentState) -> list[str]:
     """Return the slots the clarify leaf must still ask for.
 
@@ -615,6 +864,45 @@ def _build_tool_summaries(
     return rendered
 
 
+def comparison_from_tool_message(message: BaseMessage) -> dict | None:
+    """The ``fin.comparison.v1`` envelope a ``compare_facts``
+    ``ToolMessage`` carries, stamped with its ``tool_call_id``.
+
+    ``None`` for every other message, for a typed EXIT whose skeleton
+    holds no columns (``empty_comparison`` / ``comparison_overflow``
+    — nothing to render and nothing to gate), and for content that
+    does not parse. The parse is defensive because this runs inside
+    the graph: a malformed payload must not kill the run.
+    """
+    if not isinstance(message, ToolMessage):
+        return None
+    if getattr(message, "name", "") != "compare_facts":
+        return None
+    try:
+        payload = json.loads(message.content)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    comparison = payload.get("comparison")
+    if not isinstance(comparison, dict) or not comparison.get("columns"):
+        return None
+    return {
+        **comparison,
+        "tool_call_id": getattr(message, "tool_call_id", "") or "",
+    }
+
+
+def _collect_comparisons(messages: list[BaseMessage]) -> list[dict]:
+    """Every renderable comparison in ``messages``, in call order."""
+    found: list[dict] = []
+    for message in messages:
+        comparison = comparison_from_tool_message(message)
+        if comparison is not None:
+            found.append(comparison)
+    return found
+
+
 def _extract_thinking_text(message: AIMessage) -> str:
     """Pull the thinking prose from an ``AIMessage`` for the turn row.
 
@@ -651,6 +939,28 @@ def _extract_thinking_text(message: AIMessage) -> str:
 # ----- the graph factory -----
 
 
+def _locator_from_payload(payload: Any) -> Locator | None:
+    """Decode an evidence-locator dict into a ``Locator``.
+
+    Both the ``get_xbrl_fact`` row (``source_locator``) and a
+    ``compare_facts`` cell (``locator``) carry the same three-field
+    shape. A payload that is not a dict, is missing a field, or
+    carries an unparseable page decodes to ``None`` — the caller
+    drops the row rather than registering a fact the numeric gate
+    could not trace back to a page.
+    """
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return Locator(
+            document_id=payload["document_id"],
+            version=payload["version"],
+            page=int(payload["page"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _collect_fact_tool_calls(
     messages: list[BaseMessage],
 ) -> tuple[list[tuple[str, str]], list[Fact]]:
@@ -675,7 +985,7 @@ def _collect_fact_tool_calls(
         the model's claim was already a no-hit, so the numeric
         gate's "no matching fact row" branch will fire.
     """
-    from fin.corpus.facts import Fact, Locator
+    from fin.corpus.facts import Fact
 
     claimed: list[tuple[str, str]] = []
     facts: list[Fact] = []
@@ -705,16 +1015,8 @@ def _collect_fact_tool_calls(
                     payload = None
                 if not isinstance(payload, dict) or "error" in payload:
                     continue
-                locator_payload = payload.get("source_locator")
-                if not isinstance(locator_payload, dict):
-                    continue
-                try:
-                    locator = Locator(
-                        document_id=locator_payload["document_id"],
-                        version=locator_payload["version"],
-                        page=int(locator_payload["page"]),
-                    )
-                except (KeyError, TypeError, ValueError):
+                locator = _locator_from_payload(payload.get("source_locator"))
+                if locator is None:
                     continue
                 facts.append(
                     Fact(
@@ -730,27 +1032,116 @@ def _collect_fact_tool_calls(
     return claimed, facts
 
 
+def _comparison_column_claims(
+    concept: str, comparison: dict
+) -> list[tuple[str, str]]:
+    """The ``(concept, period)`` claims one comparison table makes.
+
+    Each COLUMN key is a period the model asked about, so it is an
+    implicit numeric claim even when every cell under it missed.
+    """
+    claims: list[tuple[str, str]] = []
+    for column in comparison.get("columns") or ():
+        key = str((column or {}).get("key") or "")
+        if key and (concept, key) not in claims:
+            claims.append((concept, key))
+    return claims
+
+
+def _comparison_cell_fact(concept: str, cell: dict) -> "Fact | None":
+    """Convert one HIT cell of a comparison table into a ``Fact``.
+
+    A cell with no value (the ``missing`` shape) or an undecodable
+    locator yields ``None``: the column's claim still stands, but
+    there is no evidenced row behind it.
+    """
+    from fin.corpus.facts import Fact
+
+    if cell.get("value") is None:
+        return None
+    locator = _locator_from_payload(cell.get("locator"))
+    if locator is None:
+        return None
+    return Fact(
+        concept=concept,
+        value=cell["value"],
+        period=str(cell.get("column") or ""),
+        unit=str(cell.get("unit") or ""),
+        scale=str(cell.get("scale") or ""),
+        source_locator=locator,
+    )
+
+
+def _comparison_cell_facts(concept: str, comparison: dict) -> list["Fact"]:
+    """Every evidenced cell of one comparison table, as ``Fact`` rows."""
+    facts: list[Fact] = []
+    for row in comparison.get("rows") or ():
+        for cell in (row or {}).get("cells") or ():
+            fact = _comparison_cell_fact(concept, cell)
+            if fact is not None:
+                facts.append(fact)
+    return facts
+
+
+def _collect_comparison_claims(
+    messages: list[BaseMessage],
+) -> tuple[list[tuple[str, str]], list["Fact"]]:
+    """Read every ``compare_facts`` table as numeric claims + facts.
+
+    T3 / spec SC2: a comparison is the model asking for numbers, so
+    each COLUMN of a table is an implicit ``(concept, period)`` claim
+    and each HIT cell is the evidenced row that claim must match. A
+    ``missing`` cell contributes a claim with no fact, which is what
+    makes "the comparison reported nothing, the answer reported a
+    number" fail instead of passing silently.
+
+    The delta rows are deliberately NOT registered as facts: they are
+    arithmetic the tool performed over cells the gate already checks,
+    and the gate's per-claim rule ("some fact matches some number in
+    the answer") already tolerates a quoted delta.
+    """
+    claimed: list[tuple[str, str]] = []
+    facts: list[Fact] = []
+    for message in messages:
+        comparison = comparison_from_tool_message(message)
+        if comparison is None:
+            continue
+        concept = str(comparison.get("concept") or "")
+        if not concept:
+            continue
+        for pair in _comparison_column_claims(concept, comparison):
+            if pair not in claimed:
+                claimed.append(pair)
+        facts.extend(_comparison_cell_facts(concept, comparison))
+    return claimed, facts
+
+
 def _evaluate_numeric_gate_in_node(messages: list[BaseMessage]):
     """Run the numeric gate on the run's accumulated messages.
 
     Returns the ``NumericGateResult`` from
     :func:`evaluate_numeric_gate`, or ``None`` if the model made no
-    ``get_xbrl_fact`` call this run (the gate is skipped per T5
-    spec acceptance).
+    numeric lookup this run — neither ``get_xbrl_fact`` (T5) nor
+    ``compare_facts`` (T3). The gate is skipped in that case per T5
+    spec acceptance.
     """
     from fin.host.numeric_gate import evaluate_numeric_gate
 
-    claimed, facts = _collect_fact_tool_calls(messages)
+    fact_claims, fact_rows = _collect_fact_tool_calls(messages)
+    compare_claims, compare_rows = _collect_comparison_claims(messages)
+    claimed = fact_claims + [
+        pair for pair in compare_claims if pair not in fact_claims
+    ]
     if not claimed:
-        # No ``get_xbrl_fact`` call -> gate is skipped. We return
-        # ``None`` so the caller can distinguish "no claim" from
-        # "claim, gate passed" (which would be ``outcome="pass"``).
+        # No numeric lookup -> gate is skipped. We return ``None`` so
+        # the caller can distinguish "no claim" from "claim, gate
+        # passed" (which would be ``outcome="pass"``).
         return None
     answer = _last_ai_text(messages)
     return evaluate_numeric_gate(
         answer=answer,
         claimed_concepts=claimed,
-        available_facts=facts,
+        available_facts=fact_rows + compare_rows,
     )
 
 
@@ -764,6 +1155,7 @@ def compile_graph(
     facts_root: Path | str | None = None,
     known_document_ids: set[str] | None = None,
     step_cap: int = STEP_CAP,
+    issuer_cap: int = MAX_ISSUERS,
     recursion_limit: int = RECURSION_LIMIT,
     classify_model: Any | None = None,
     retrieve_adapter: str = RETRIEVE_ADAPTER_FAKE,
@@ -813,6 +1205,12 @@ def compile_graph(
         smaller fixture set.
     step_cap
         The agent-loop step fuse. Default ``STEP_CAP`` (32).
+    issuer_cap
+        T6 (spec Focus 4 / ADR 0034): the most issuers one
+        ``research_issuers`` fan-out may cover. Default
+        ``MAX_ISSUERS`` (5, the ADR's recommendation). A roster over
+        this cap ends the run with the typed ``issuer_overflow``
+        reason rather than fanning out and dropping the remainder.
     recursion_limit
         LangGraph's recursion limit. Default ``RECURSION_LIMIT``
         from ``fin.host.state`` (currently ``2 * STEP_CAP + 6 = 70``).
@@ -935,9 +1333,24 @@ def compile_graph(
     read_file_tool = _make_read_file_tool()
     retrieve_tool = _make_retrieve_tool(adapter)
     get_xbrl_fact_tool = _make_get_xbrl_fact_tool(fpath)
+    # T3 (spec Focus 1): bound LAST so the four prior tools keep
+    # their positions — LangChain's tool binding is order-sensitive
+    # and existing tests assert those indices.
+    compare_facts_tool = _make_compare_facts_tool(fpath)
+    # T6 (spec Focus 4): bound last, and bound ONLY to the model — the
+    # ToolNode below deliberately does not receive it (see
+    # ``_make_research_issuers_tool``).
+    research_issuers_tool = _make_research_issuers_tool(issuer_cap)
 
     bound_model = model.bind_tools(
-        [list_files_tool, read_file_tool, retrieve_tool, get_xbrl_fact_tool]
+        [
+            list_files_tool,
+            read_file_tool,
+            retrieve_tool,
+            get_xbrl_fact_tool,
+            compare_facts_tool,
+            research_issuers_tool,
+        ]
     )
     # T3 (#34): the off-preference binding layers the MiniMax
     # ``extra_body`` (``thinking.type=disabled``) on top of the same
@@ -956,7 +1369,13 @@ def compile_graph(
     unbound_model_no_thinking = model.bind(extra_body=_thinking_off_body)
 
     tool_dispatcher = ToolNode(
-        [list_files_tool, read_file_tool, retrieve_tool, get_xbrl_fact_tool],
+        [
+            list_files_tool,
+            read_file_tool,
+            retrieve_tool,
+            get_xbrl_fact_tool,
+            compare_facts_tool,
+        ],
         name="tool_node",
         handle_tool_errors=True,
     )
@@ -1194,7 +1613,162 @@ def compile_graph(
         if merged_evidence:
             update["evidence"] = merged_evidence
         update["tool_summaries"] = new_summaries
+        # T3 (spec Focus 1): lift any ``compare_facts`` table onto the
+        # state so the turn row persists STRUCTURE, not prose. The
+        # channel is overwrite-semantics, so this node folds the prior
+        # list itself (see ``AgentState.comparisons``). Written on
+        # EVERY tool step, including the empty fold: a run whose only
+        # comparison was a typed EXIT must still leave the reader a
+        # ``[]``, not an absent key.
+        update["comparisons"] = list(state.get("comparisons") or []) + (
+            _collect_comparisons(merged_messages)
+        )
         return update
+
+    def _fanout_tool_update(
+        payload: dict[str, Any], tool_call_id: str
+    ) -> dict[str, Any]:
+        """The ``ToolMessage`` + tool-trace half of a fan-out result.
+
+        Both the planner's typed EXITs and the join's envelope answer
+        the SAME model tool call, so they share one renderer: the
+        message history never carries a dangling ``research_issuers``
+        call, and the workspace tools region gets the same
+        human-readable one-liner either way (spec line 32).
+        """
+        return {
+            "messages": [
+                ToolMessage(
+                    content=json.dumps(payload, default=str),
+                    tool_call_id=tool_call_id,
+                    name=ISSUER_FANOUT_TOOL,
+                )
+            ],
+            "tool_summaries": [
+                {
+                    "name": ISSUER_FANOUT_TOOL,
+                    "summary": format_tool_summary(
+                        ISSUER_FANOUT_TOOL, result=payload
+                    ),
+                    "tool_call_id": tool_call_id,
+                }
+            ],
+        }
+
+    def issuer_fanout_node(state: AgentState) -> dict[str, Any]:
+        """Plan the fan-out: normalize the roster and apply the cap.
+
+        The cap is enforced HERE, on the request, before any branch
+        runs — "over-cap issuer lists are a typed overflow, not a
+        hang" (spec Focus 4). An over-cap roster ends the run with
+        ``status_reason == "issuer_overflow"`` instead of quietly
+        researching the first ``issuer_cap`` issuers, because a
+        ``done`` built on a truncated roster is the silent drop SC7
+        forbids; the typed EXIT still reaches the message history so
+        the operator can re-ask with fewer issuers.
+
+        ``empty_fanout`` is NOT terminal: no issuers to research is an
+        empty-hit shape like ``{"filings": []}``, so the model gets the
+        typed dict back and may continue with the ordinary tools.
+        """
+        args, tool_call_id = _first_fanout_call(state)
+        question = ""
+        for message in reversed(state.get("messages") or []):
+            if isinstance(message, HumanMessage):
+                content = message.content
+                question = (
+                    content if isinstance(content, str) else str(content)
+                )
+                break
+        plan = plan_issuer_fanout(
+            issuers=args.get("issuers"),
+            # The model normally restates the question per fan-out; a
+            # call that omitted it falls back to the operator's own
+            # utterance rather than fanning out an empty query.
+            query=str(args.get("query") or question or ""),
+            cap=issuer_cap,
+        )
+        update: dict[str, Any] = {
+            "issuer_plan": {**plan, "tool_call_id": tool_call_id},
+            "issuer_fanout": plan.get("fanout") or {},
+            # Clear any earlier fan-out's findings before this one's
+            # branches start writing to the additive channel.
+            "issuer_findings": FANOUT_RESET,
+        }
+        if not plan.get("error"):
+            # The accepted path answers the model's call from the JOIN,
+            # once the branches have reported. Answering it here too
+            # would put two ``ToolMessage``s on one ``tool_call_id``.
+            return update
+        update.update(_fanout_tool_update(plan, tool_call_id))
+        if plan["error"] == "issuer_overflow":
+            update["status"] = "refuse"
+            update["status_reason"] = "issuer_overflow"
+        return update
+
+    def issuer_research_node(task: IssuerTask) -> dict[str, Any]:
+        """Research ONE issuer through the retrieve port.
+
+        This is the fan-out branch ADR 0034 permits. It calls the port
+        once and no more: ranking stays behind the port and there is no
+        hybrid / RRF pass in here (ADR 0032 + ADR 0034's rejected
+        list). Its chunks become ordinary ``EvidenceItem``s, so the one
+        citation verifier after the join treats fan-out evidence
+        exactly like a ``read_file`` page.
+        """
+        issuer = str(task.get("issuer") or "").strip().upper()
+        query = str(task.get("query") or "")
+        if not issuer or not query:
+            return {}
+
+        try:
+            result = retrieve(
+                query=issuer_query(issuer, query),
+                ticker=issuer,
+                adapter=adapter,
+            )
+        except Exception as exc:  # noqa: BLE001 — one branch, not the run
+            # A port that raises breaks its own contract ("empty hits,
+            # not exceptions"). Letting it propagate would kill the
+            # join and take the other issuers' work with it, so the
+            # branch degrades to the typed unavailable row — which is
+            # reported in the envelope, never swallowed.
+            return _issuer_finding(
+                issuer,
+                STATUS_UNAVAILABLE,
+                error=f"retrieve_raised:{type(exc).__name__}",
+            )
+
+        if isinstance(result, dict) and "error" in result:
+            # Typed EXIT (ADR 0030): "retrieve is down" must not read
+            # as "the corpus has nothing about this issuer".
+            return _issuer_finding(
+                issuer, STATUS_UNAVAILABLE, error=str(result["error"])
+            )
+
+        new_evidence = _issuer_evidence(result)
+        if not new_evidence:
+            return _issuer_finding(issuer, STATUS_EMPTY)
+        return _issuer_hit_update(issuer, new_evidence)
+
+    def issuer_join_node(state: AgentState) -> dict[str, Any]:
+        """Join the branches into one ``fin.issuer_fanout.v1`` envelope.
+
+        The join exists so the citation verifier runs ONCE, on the
+        synthesized answer, instead of once per issuer (ADR 0034's
+        rejected "verifier-per-issuer with no join"). It answers the
+        single ``research_issuers`` call and hands control back to
+        ``model``, which writes the synthesis.
+        """
+        plan = dict(state.get("issuer_plan") or {})
+        result = join_issuer_findings(
+            plan=plan, findings=list(state.get("issuer_findings") or [])
+        )
+        tool_call_id = str(plan.get("tool_call_id") or "")
+        return {
+            **_fanout_tool_update(result, tool_call_id),
+            "issuer_fanout": result["fanout"],
+        }
 
     def citation_gate_node(state: AgentState) -> dict[str, Any]:
         # Pull the last ``AIMessage``'s text as the candidate
@@ -1234,6 +1808,21 @@ def compile_graph(
                     "messages": [],
                     "status": "refuse",
                     "status_reason": "numeric_gate_fail",
+                    "repair_count": repair_count,
+                }
+            # T6 (spec Focus 4 / SC7): a fan-out run must keep every
+            # issuer that contributed evidence in the synthesis. The
+            # verifier above already passed — on the OTHER issuers'
+            # spans — so without this check a five-issuer ask could
+            # ``done`` on four. Runs with no fan-out skip it entirely.
+            dropped = _uncited_contributors(
+                dict(state.get("issuer_fanout") or {}), gate_result.citations
+            )
+            if dropped:
+                return {
+                    "messages": [],
+                    "status": "refuse",
+                    "status_reason": "issuer_coverage_fail",
                     "repair_count": repair_count,
                 }
             return {
@@ -1286,7 +1875,9 @@ def compile_graph(
             return "off_topic"
         return "model"
 
-    def from_model(state: AgentState) -> Literal["tools", "citation_gate", "__end__"]:
+    def from_model(
+        state: AgentState,
+    ) -> Literal["tools", "issuer_fanout", "citation_gate", "__end__"]:
         # Step-cap fires here: the node already set ``status`` to
         # ``step_cap`` and we route to END. Status-vs-tool_call
         # precedence: terminal status wins, even if the AIMessage
@@ -1297,11 +1888,44 @@ def compile_graph(
         messages = state["messages"]
         last = messages[-1]
         if isinstance(last, AIMessage) and last.tool_calls:
+            # T6: ``research_issuers`` is served by the fan-out
+            # topology, not by the ToolNode. A MIXED batch still goes
+            # to the ToolNode so the ordinary tools in it are not
+            # stranded; the fan-out call then comes back as ToolNode's
+            # invalid-tool-name result, which is a readable answer
+            # rather than a lost tool call.
+            if all(
+                call.get("name") == ISSUER_FANOUT_TOOL
+                for call in last.tool_calls
+            ):
+                return "issuer_fanout"
             return "tools"
         # Soft-Track: citation verifier is research-only.
         if state.get("track") == "research":
             return "citation_gate"
         return END
+
+    def from_issuer_fanout(state: AgentState) -> Any:
+        """Fan out one branch per approved issuer, else fall through.
+
+        Returning a list of ``Send`` is what makes the branches
+        parallel AND bounded: the list is exactly the roster the cap
+        already approved, so the graph never opens an unbounded set of
+        agents (ADR 0034's first rejected option). A typed EXIT routes
+        back to ``model`` (``empty_fanout``) or to END (the refused
+        ``issuer_overflow``) without opening any branch at all.
+        """
+        if state.get("status") in TERMINAL_STATUSES:
+            return END
+        plan = dict(state.get("issuer_plan") or {})
+        issuers = [str(issuer) for issuer in (plan.get("issuers") or ())]
+        query = str(plan.get("query") or "")
+        if plan.get("error") or not issuers or not query:
+            return "model"
+        return [
+            Send("issuer_research", {"issuer": issuer, "query": query})
+            for issuer in issuers
+        ]
 
     def from_gate(state: AgentState) -> Literal["model", "__end__"]:
         # Status-based routing out of the citation gate. Done /
@@ -1327,6 +1951,14 @@ def compile_graph(
     # update (T3). The forward edge ``tools -> model`` still routes
     # back to model_node for the next agent-loop iteration.
     graph.add_node("tools", tool_node_with_summaries)
+    # T6 (ADR 0034): plan -> Send per issuer -> join -> back to the
+    # model, and only THEN the one citation gate. The three nodes are
+    # siblings of ``tools``, not nested inside ``model_node``, so the
+    # fan-out is topology the checkpointer can resume like any other
+    # node (spec ACR: "fan-out is a graph join node").
+    graph.add_node("issuer_fanout", issuer_fanout_node)
+    graph.add_node("issuer_research", issuer_research_node, input_schema=IssuerTask)
+    graph.add_node("issuer_join", issuer_join_node)
     graph.add_node("citation_gate", citation_gate_node)
 
     graph.add_edge(START, "classify")
@@ -1336,6 +1968,11 @@ def compile_graph(
     graph.add_edge("off_topic", END)
     graph.add_conditional_edges("model", from_model)
     graph.add_edge("tools", "model")
+    graph.add_conditional_edges(
+        "issuer_fanout", from_issuer_fanout, ["issuer_research", "model", END]
+    )
+    graph.add_edge("issuer_research", "issuer_join")
+    graph.add_edge("issuer_join", "model")
     graph.add_conditional_edges("citation_gate", from_gate)
 
     compiled = graph.compile(checkpointer=checkpointer)
@@ -1345,6 +1982,7 @@ def compile_graph(
         model=model,
         classify_model=classify_model,
         step_cap=step_cap,
+        issuer_cap=issuer_cap,
         recursion_limit=recursion_limit,
         compiled_graph=compiled,
     )
@@ -1377,12 +2015,17 @@ def _make_locked_graph(
     model: Any,
     step_cap: int,
     classify_model: Any | None = None,
+    issuer_cap: int = MAX_ISSUERS,
 ) -> "_LockedGraph":
     key = (
         id(checkpointer),
         id(model),
         id(classify_model) if classify_model is not None else 0,
         int(step_cap),
+        # T6: two graphs that differ ONLY in the issuer cap are two
+        # different graphs; without this the cache would hand a test
+        # tuning the cap the previously-compiled default.
+        int(issuer_cap),
         int(recursion_limit),
     )
     cached = _IDEMPOTENCE_CACHE.get(key)
@@ -1667,4 +2310,5 @@ __all__ = [
     "HostGraphError",
     "RetrieveAdapterConfigError",
     "compile_graph",
+    "comparison_from_tool_message",
 ]

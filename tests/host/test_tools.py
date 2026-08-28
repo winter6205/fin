@@ -159,17 +159,23 @@ def test_list_files_empty_returns_full_12_doc_list() -> None:
     assert len(result["filings"]) == 12
 
     sample = result["filings"][0]
-    # Contract keys: no ``filename``, ``bytes``, or ``sha256`` (only ``version``).
+    # Contract keys: no ``filename``, ``bytes``, or ``sha256`` (only
+    # ``version``). ``form`` joined the shape with spec SC3 of
+    # ``specs/enterprise-kb-agent.md``; the rest of the EDGAR-shaped
+    # submission header stays filter-only.
     assert set(sample.keys()) == {
         "document_id",
         "company",
         "period",
         "version",
         "page_count",
+        "form",
     }
     assert "filename" not in sample
     assert "bytes" not in sample
     assert "sha256" not in sample
+    for filter_only in ("cik", "accession", "filing_date", "ticker"):
+        assert filter_only not in sample
 
     # Deterministic order: sorted by document_id.
     document_ids = [f["document_id"] for f in result["filings"]]

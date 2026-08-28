@@ -1,10 +1,11 @@
 """Host tool wrapper for ADR 0009's ``list_files`` tool.
 
 Pure function over the committed corpus manifest and extracted tree;
-returns the contract shape documented in ADR 0009:
+returns the contract shape documented in ADR 0009, extended with
+``form`` per spec SC3 of ``specs/enterprise-kb-agent.md``:
 
     {"filings": [{"document_id", "company", "period", "version",
-                  "page_count"}, ...]}
+                  "page_count", "form"}, ...]}
 
 or ``{"filings": []}`` when filters match nothing. No LangChain /
 LangGraph imports on this path; T6 binds the callables to the model
@@ -38,10 +39,11 @@ def list_files(
     ``ticker``, exact ``filing_date``) per ADR 0031 are forwarded
     through to the catalog. Empty filter values, unknown values,
     and conflicting filters all yield ``{"filings": []}`` (no
-    exception). ``page_count`` per filing comes from the committed
-    extracted tree; if that tree is missing, ``IngestMissingError``
-    propagates so the host graph can fail fast at boot (T6,
-    ADR 0020).
+    exception). Each hit reports its ``form`` (``None`` on a corpus
+    row that was never given one). ``page_count`` per filing comes
+    from the committed extracted tree; if that tree is missing,
+    ``IngestMissingError`` propagates so the host graph can fail fast
+    at boot (T6, ADR 0020).
     """
     return list_filings(
         company=company,

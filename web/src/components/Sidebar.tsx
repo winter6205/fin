@@ -8,6 +8,7 @@ import { NavLink, useNavigate } from "react-router-dom";
 import { markCorpusHomeVisit } from "../sessionKeys";
 import { describeStatusStrip, workspaceStatusView } from "../statusStrip";
 import { useWorkspaceStore } from "../store";
+import WatchlistPanel from "./WatchlistPanel";
 
 export function truncateTitle(title: string, max = 50): string {
   if (title.length <= max) return title;
@@ -121,6 +122,7 @@ export default function Sidebar() {
           ))}
         </ul>
       </nav>
+      <WatchlistPanel />
       <StatusStrip />
     </aside>
   );

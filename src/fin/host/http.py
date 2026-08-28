@@ -40,6 +40,7 @@ from fin.host.operator_env import apply_dotenv, warn_if_mcp_retrieve_unreachable
 from fin.host.run_payload import _run_to_response_payload
 from fin.host.state import EVIDENCE_RESET, reset_input_state
 from fin.host.thread_store import default_thread_store
+from fin.host.watchlist import default_watchlist_store
 
 
 logger = logging.getLogger(__name__)
@@ -200,12 +201,35 @@ def get_thread_store() -> Any:
     return default_thread_store()
 
 
+def get_watchlist_store() -> Any:
+    """FastAPI dependency that returns the watchlist / notice store.
+
+    T4 workflow (the tracked change). Location comes from ``FIN_WATCHLIST_PATH``
+    (default ``data/workspace/watchlist.json``); tests override this
+    to point at a tmp path. Separate from the thread store because a
+    watchlist is operator preference, not turn presentation state.
+    """
+    return default_watchlist_store()
+
+
 # Mount the workspace routes (T1, #28) on the same FastAPI app.
 # Done at module load so ``uvicorn fin.host.http:app`` exposes the
 # workspace surface out of the box (spec / ADR 0013 / ADR 0024).
 from fin.host.workspace_http import mount as _mount_workspace_routes  # noqa: E402
 
-_mount_workspace_routes(app, get_graph=get_graph, get_thread_store=get_thread_store)
+_mount_workspace_routes(
+    app,
+    get_graph=get_graph,
+    get_thread_store=get_thread_store,
+    get_watchlist_store=get_watchlist_store,
+)
+
+# ``GET /health`` (the tracked change, SC9): checkpoint reachability, separate from
+# the boot-scoped ``GET /api/status`` (ADR 0033). Mounted before
+# ``mount_spa`` below so the SPA catch-all cannot shadow it.
+from fin.host.health import mount as _mount_health_route  # noqa: E402
+
+_mount_health_route(app)
 
 # Mount the built SPA (``web/dist``) if it exists - see the
 # ``mount_spa(app)`` call below (after the function is defined).
@@ -442,6 +466,7 @@ __all__ = [
     "compile_for_http",
     "get_graph",
     "get_thread_store",
+    "get_watchlist_store",
     "mount_spa",
     "serve",
 ]
