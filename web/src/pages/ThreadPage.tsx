@@ -6,7 +6,17 @@ import { useLocation, useParams } from "react-router-dom";
 import AnswerWithCitations from "../components/CitationChips";
 import Composer from "../components/Composer";
 import CorpusCard from "../components/CorpusCard";
-import type { Turn } from "../types";
+import type { Comparison, Turn } from "../types";
+import {
+  cellTitle,
+  comparisonCaption,
+  deltaForRow,
+  directionClass,
+  directionMark,
+  locatorLabel,
+  turnComparisons,
+} from "../comparison";
+import { exportAvailability, exportUrl } from "../exportBundle";
 import { resolveTurnTrack, showResearchTrackHint } from "../softTrack";
 import {
   shouldRenderStreamErrorKind,
@@ -88,11 +98,16 @@ export default function ThreadPage() {
 
   return (
     <main className="flex flex-col h-full">
-      <header className="border-b border-black px-4 py-3 bg-page">
-        <h2 className="text-sm font-semibold truncate">{activeThread.title}</h2>
-        <p className="text-xs text-gray-500">
-          创建于 {new Date(activeThread.created_at).toLocaleString()}
-        </p>
+      <header className="border-b border-black px-4 py-3 bg-page flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h2 className="text-sm font-semibold truncate">
+            {activeThread.title}
+          </h2>
+          <p className="text-xs text-gray-500">
+            创建于 {new Date(activeThread.created_at).toLocaleString()}
+          </p>
+        </div>
+        <ExportLinks threadId={thread_id} turns={activeThread.turns} />
       </header>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
@@ -154,6 +169,40 @@ function CrashResumeBanner({ threadId }: { threadId: string }) {
   );
 }
 
+// T4 workflow (#138): download this thread's comparison or citation
+// bundle. Plain anchors — the browser performs the GET and saves the
+// file, so there is no blob juggling and no second copy of the data in
+// the SPA. A kind the thread never produced is not rendered at all
+// rather than offered as a link that would answer a typed 404.
+function ExportLinks({ threadId, turns }: { threadId: string; turns: Turn[] }) {
+  const available = exportAvailability(turns);
+  if (!available.comparison && !available.citations) return null;
+  return (
+    <nav aria-label="导出" className="flex shrink-0 items-center gap-2">
+      {available.comparison ? (
+        <a
+          data-testid="export-comparison"
+          href={exportUrl(threadId, "comparison")}
+          download
+          className="border border-black bg-card px-2 py-1 text-xs hover:bg-accent hover:text-white"
+        >
+          导出对比 CSV
+        </a>
+      ) : null}
+      {available.citations ? (
+        <a
+          data-testid="export-citations"
+          href={exportUrl(threadId, "citations")}
+          download
+          className="border border-black bg-card px-2 py-1 text-xs hover:bg-accent hover:text-white"
+        >
+          导出引用 CSV
+        </a>
+      ) : null}
+    </nav>
+  );
+}
+
 function EmptyThreadCorpusGrid() {
   const corpus = useWorkspaceStore((s) => s.corpus);
   if (corpus.length === 0) return null;
@@ -179,6 +228,12 @@ function TurnView({ turn }: { turn: Turn }) {
   const hasTrace =
     Boolean(turn.thinking_text) ||
     (turn.tool_summaries != null && turn.tool_summaries.length > 0);
+  // T3 (spec Focus 1): structured comparison tables from the
+  // ``compare_facts`` tool. Rendered between the trace and the
+  // answer card — the order they arrived in, and the one place
+  // they stay visible on a refuse row where the answer card holds
+  // only the ordinary-person copy.
+  const comparisons = turnComparisons(turn);
   return (
     <article className="max-w-3xl mx-auto space-y-2">
       <div className="flex justify-end">
@@ -222,6 +277,12 @@ function TurnView({ turn }: { turn: Turn }) {
           ) : null}
         </div>
       ) : null}
+      {comparisons.map((comparison, i) => (
+        <ComparisonTable
+          key={`${comparison.tool_call_id ?? "compare"}-${i}`}
+          comparison={comparison}
+        />
+      ))}
       {live && !turn.answer && !turn.assistant_message ? null : (
         <div
           data-testid="turn-answer-card"
@@ -271,6 +332,108 @@ function TurnView({ turn }: { turn: Turn }) {
         </div>
       )}
     </article>
+  );
+}
+
+// T3 (spec Focus 1): the comparison the host tool computed, as a
+// table rather than prose. Every figure here is a ``display``
+// string off a fact row with a locator — this component formats
+// nothing and computes nothing, so the numbers on screen are
+// exactly the numbers the numeric gate holds the answer to.
+//
+// The trailing delta column is the redline: for a cross-period
+// table it is the latest period-over-period change, for a peer
+// table each row against the baseline. A row with no delta (the
+// peer baseline, or any row where a missing cell suppressed the
+// arithmetic) leaves the cell blank rather than showing a zero.
+function ComparisonTable({ comparison }: { comparison: Comparison }) {
+  const showDeltas = comparison.deltas.length > 0;
+  return (
+    <section
+      data-testid="turn-comparison"
+      data-axis={comparison.axis}
+      className="border border-black bg-card"
+    >
+      <p className="border-b border-black px-3 py-1.5 text-xs font-mono text-gray-600">
+        {comparisonCaption(comparison)}
+      </p>
+      <div className="overflow-x-auto">
+        <table className="w-full border-collapse text-sm">
+          <thead>
+            <tr className="text-xs uppercase tracking-wide text-gray-500">
+              <th scope="col" className="px-3 py-1.5 text-left font-medium">
+                {comparison.rows[0]?.kind === "document" ? "文件" : "主体"}
+              </th>
+              {comparison.columns.map((column) => (
+                <th
+                  key={column.key}
+                  scope="col"
+                  className="px-3 py-1.5 text-right font-medium whitespace-nowrap"
+                >
+                  {column.label}
+                </th>
+              ))}
+              {showDeltas ? (
+                <th
+                  scope="col"
+                  className="px-3 py-1.5 text-right font-medium whitespace-nowrap"
+                >
+                  变化
+                </th>
+              ) : null}
+            </tr>
+          </thead>
+          <tbody>
+            {comparison.rows.map((row) => {
+              const delta = deltaForRow(comparison, row.key);
+              return (
+                <tr key={row.key} className="border-t border-gray-300">
+                  <th
+                    scope="row"
+                    className="px-3 py-1.5 text-left font-medium whitespace-nowrap"
+                  >
+                    {row.label}
+                  </th>
+                  {row.cells.map((cell) => (
+                    <td
+                      key={`${cell.row}-${cell.column}`}
+                      title={cellTitle(cell)}
+                      data-status={cell.status}
+                      className={
+                        cell.status === "hit"
+                          ? "px-3 py-1.5 text-right font-mono tabular-nums whitespace-nowrap"
+                          : "px-3 py-1.5 text-right font-mono text-gray-400 whitespace-nowrap"
+                      }
+                    >
+                      {cell.display}
+                    </td>
+                  ))}
+                  {showDeltas ? (
+                    <td className="px-3 py-1.5 text-right font-mono whitespace-nowrap">
+                      {delta ? (
+                        <span className={directionClass(delta.direction)}>
+                          {directionMark(delta.direction)} {delta.display}
+                        </span>
+                      ) : null}
+                    </td>
+                  ) : null}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      {/* The pages every number came from. A figure in this table
+          is not a citation — the verifier only fills verified page
+          spans — but the operator still needs the trail back to
+          the filing. */}
+      {comparison.locators.length > 0 ? (
+        <p className="border-t border-gray-300 px-3 py-1.5 text-xs text-gray-500">
+          来源：
+          {comparison.locators.map((l) => locatorLabel(l)).join("、")}
+        </p>
+      ) : null}
+    </section>
   );
 }
 

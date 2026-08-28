@@ -10,8 +10,8 @@
 ### Product identity
 
 **fin**:
-A normal conversational agent whose durable runtime is a LangGraph host graph: each turn is routed to a **track**; only the **research track** specializes in the frozen 10-Q corpus with tools and the citation verifier. Retrieve ranking stays off-graph behind the retrieve port.
-_Avoid_: Q&A API, memory backend, retrieval graph, treating research-track contracts as the whole product personality
+A **workspace** knowledge-base Agent: the operator asks in a **research thread**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held SEC filings; retrieve ranking stays off-graph behind the **retrieve port**.
+_Avoid_: research-agent product, Q&A API as the product, memory backend, retrieval graph, treating research-track contracts as the whole product personality
 
 **host agent**:
 fin as the LangGraph runtime that routes tracks and calls research tools behind the **retrieve port**; it is not the ranking or vector store.
@@ -56,6 +56,14 @@ _Avoid_: list_filings, list_documents, glob, requiring ticker, treating company 
 **get_xbrl_fact**:
 Research-track **lookup** of one tagged financial fact from an ingest-built fact table (concept, period, issuer/document). XBRL is the reporting format, not a website. A numeric citation gate matches the claimed value to that row; the model does not invent the arithmetic. Embeddings may later resolve concept aliases; they do not author the number.
 _Avoid_: treating XBRL as a site name, OCR or vision as the number SSOT, a `verify` tool, using retrieve/embeddings as the fact SSOT
+
+**compare_facts**:
+Research-track host tool that resolves one XBRL concept over a grid of rows (issuers or documents) x columns (periods) against the same fact table `get_xbrl_fact` reads, and returns the `fin.comparison.v1` envelope. Deltas are computed in the tool, not by the model. Every column is an implicit `(concept, period)` claim for the numeric gate, so an answer quoting figures the table never reported cannot `done`. It contributes no citation evidence: a fact row is not page text.
+_Avoid_: a prose table the model authors, a chart tool, treating a comparison cell as a citation, computing the delta in the SPA or the export
+
+**comparison result** (`fin.comparison.v1`):
+The JSON envelope `compare_facts` returns and the workspace persists on the turn row (`TurnRow.comparisons`) and streams on the `comparison` SSE frame: `{schema, kind, axis, concept, unit, scale, columns[], rows[].cells[], deltas[], missing[], hit_count, cell_count, locators[]}`. Shape SSOT is `src/fin/host/tools/compare_facts.py`. `empty_comparison` / `comparison_overflow` are typed EXITs carrying a column-less skeleton, not exceptions and not renderable tables.
+_Avoid_: a markdown table on the wire, re-parsing the answer prose for structure, per-surface variant shapes
 
 **XBRL**:
 The tagged-numbers format inside official 10-Q/10-K iXBRL. Not a website; SEC.gov is the filing host.

@@ -24,6 +24,7 @@ vite.config.d.ts
 !.env.example
 
 # Data / runtime
+data/workspace/
 *.sqlite
 *.sqlite3
 .langgraph_api/

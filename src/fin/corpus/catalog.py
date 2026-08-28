@@ -26,33 +26,6 @@ _DEFAULT_MANIFEST_PATH = _DEFAULT_DATA_DIR / "manifest.json"
 _DEFAULT_EXTRACTED_ROOT = _DEFAULT_DATA_DIR / "extracted"
 
 
-# EDGAR-shaped optional fields per ADR 0031. T1 only reads them off
-# the manifest so the live ingest path can use them; the additive
-# filter kwargs land in T2 (catalog shape stays v1 for now).
-_EDGAR_OPTIONAL_FIELDS = (
-    "cik",
-    "accession",
-    "filing_date",
-    "ticker",
-    "form",
-)
-
-
-def _read_edgar_fields(doc: dict[str, Any]) -> dict[str, Any]:
-    """Read the optional EDGAR-shaped fields off a manifest entry.
-
-    Returns a dict containing only the fields that are actually
-    present in the manifest entry (the demo corpus may leave them
-    null, and a future live-edited row is allowed to omit some). The
-    caller decides whether / how to merge them into the output shape.
-    """
-    return {
-        key: doc[key]
-        for key in _EDGAR_OPTIONAL_FIELDS
-        if key in doc and doc[key] is not None
-    }
-
-
 def list_filings(
     company: str | None = None,
     period: str | None = None,
@@ -64,19 +37,23 @@ def list_filings(
     manifest_path: Path | None = None,
     extracted_root: Path | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Return the ADR 0009 catalog shape for the frozen 10-Qs.
+    """Return the ADR 0009 catalog shape for the ingested filings.
 
-    Each hit is ``{document_id, company, period, version, page_count}``.
-    Filings are sorted by ``document_id`` for deterministic output.
-    Unknown filters yield ``{"filings": []}``.
+    Each hit is ``{document_id, company, period, version, page_count,
+    form}``. Filings are sorted by ``document_id`` for deterministic
+    output. Unknown filters yield ``{"filings": []}``.
 
     Additive EDGAR-shaped optional filters per ADR 0031: ``cik``,
     ``form``, ``ticker``, exact ``filing_date``. Filters are
     AND-combined. Empty filter values (``cik=""`` etc.) behave as
     empty hits — NOT "match anything" and NOT an exception, per
-    spec "empty hits not exceptions". The new fields are filter
-    inputs only; the v1 output hit shape is preserved until a
-    later ticket extends the output keys.
+    spec "empty hits not exceptions".
+
+    ``form`` is the one EDGAR-shaped field that is also emitted, per
+    spec SC3: the operator reads the Corpus 首页 card to see what kind
+    of filing a row is, and the model needs the same answer from the
+    catalog tool. ``cik`` / ``accession`` / ``filing_date`` / ``ticker``
+    stay filter inputs only.
     """
     if manifest_path is None:
         manifest_path = _DEFAULT_MANIFEST_PATH
@@ -126,12 +103,11 @@ def list_filings(
             "period": doc["period"],
             "version": doc["sha256"],
             "page_count": len(pages_by_doc[doc_id]),
+            # Always present, ``None`` when the manifest row was never
+            # given one: a dropped key would read on the card as a
+            # rendering bug rather than as an unlabelled corpus row.
+            "form": doc.get("form"),
         }
-        # T2: the new EDGAR-shaped fields are filter inputs only;
-        # the v1 hit shape stays stable. ``_read_edgar_fields`` is
-        # called to validate the manifest shape at boot — drift in
-        # the optional fields surfaces here, not at a deeper site.
-        _read_edgar_fields(doc)
         filings.append(hit)
     return {"filings": filings}
 

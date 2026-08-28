@@ -48,6 +48,20 @@ class RunResponsePayload(TypedDict):
     Soft-Track T5: ``track`` mirrors the graph decision for the
     SSE status frame; ``track_decision`` is the full auditable
     dict persisted on ``RunRecord`` / GET history.
+
+    T3 (enterprise-kb Focus 1): ``comparisons`` carries the
+    ``fin.comparison.v1`` envelopes this run's ``compare_facts``
+    calls produced (shape SSOT:
+    ``fin.host.tools.compare_facts``). Unlike ``answer`` /
+    ``citations`` it survives a ``refuse``: the table is TOOL
+    output, and on ``numeric_gate_fail`` it is precisely what
+    contradicted the answer. ``/ask`` ignores it — the AskResponse
+    wire shape is frozen.
+
+    Trust (#135, spec SC8): ``evidence_locators`` lists every
+    locator this run retrieved or read — populated on ``refuse`` /
+    ``step_cap`` too, because the point is auditing what the run
+    looked at, not repeating what the verifier passed.
     """
 
     status: RunStatus
@@ -59,6 +73,8 @@ class RunResponsePayload(TypedDict):
     tool_summaries: list[dict[str, str]]
     track: str
     track_decision: dict[str, Any]
+    comparisons: list[dict[str, Any]]
+    evidence_locators: list[dict[str, Any]]
 
 
 # Ordinary-person copy the SPA renders when a run ended
@@ -115,6 +131,41 @@ def ordinary_person_copy(status: str, reason: str) -> str:
     return ""
 
 
+def _evidence_locators(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    """List this run's retrieved / read locators, deduplicated.
+
+    Reads ``AgentState["evidence"]`` — the run-scoped list the tool
+    node appends to and ``reset_input_state`` clears between runs
+    (ADR 0016) — so the value is always THIS run's, never the
+    thread's history. Retrieve contributes several chunks per page,
+    so identical ``{document_id, version, page}`` triples collapse
+    to one entry in first-touch order.
+
+    An entry without a well-formed ``locator`` is skipped rather
+    than crashing the response: the turn row is a presentation
+    surface, and the citation gate already rejects malformed
+    evidence on the path that matters (``MalformedEvidenceError``).
+    """
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, int]] = set()
+    for item in raw.get("evidence", ()) or ():
+        locator = getattr(item, "locator", None)
+        if locator is None:
+            continue
+        key = (
+            str(getattr(locator, "document_id", "")),
+            str(getattr(locator, "version", "")),
+            int(getattr(locator, "page", 0) or 0),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {"document_id": key[0], "version": key[1], "page": key[2]}
+        )
+    return out
+
+
 def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
     """Map the host graph's result dict into the wire payload.
 
@@ -169,6 +220,18 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
                 }
             )
 
+    # T3: the comparison channel is graph-owned structured data, so
+    # it passes through unshaped — no marker strip (no model prose
+    # in a fact table) and no re-validation of the envelope. Only
+    # non-dict entries are dropped, so a malformed channel cannot
+    # reach a response model.
+    raw_comparisons = raw.get("comparisons", ()) or ()
+    comparisons_value: list[dict[str, Any]] = []
+    if isinstance(raw_comparisons, list):
+        comparisons_value = [c for c in raw_comparisons if isinstance(c, dict)]
+
+    locators_value = _evidence_locators(raw)
+
     raw_td = raw.get("track_decision") or {}
     track_decision_value: dict[str, Any] = (
         dict(raw_td) if isinstance(raw_td, dict) else {}
@@ -202,6 +265,8 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
             tool_summaries=summaries_value,
             track=track_value,
             track_decision=track_decision_value,
+            comparisons=comparisons_value,
+            evidence_locators=locators_value,
         )
 
     # ``refuse`` / ``step_cap`` keep their status + reason; anything
@@ -230,6 +295,14 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
         tool_summaries=summaries_value,
         track=track_value,
         track_decision=track_decision_value,
+        # The comparison SURVIVES the refusal (unlike answer /
+        # citations): a ``numeric_gate_fail`` row that hid the fact
+        # table would hide the evidence for its own refusal.
+        comparisons=comparisons_value,
+        # SC8: a refused run still records the locators it read.
+        # ``citations`` is empty here BECAUSE the verifier said no;
+        # the two fields answer different questions.
+        evidence_locators=locators_value,
     )
 
 

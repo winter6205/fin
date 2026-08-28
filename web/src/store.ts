@@ -9,10 +9,12 @@ import * as api from "./api";
 import { forgetLastThreadIf, rememberLastThread } from "./lastThread";
 import type {
   Filing,
+  Notice,
   ThreadDetail,
   ThreadListItem,
   ToolSummary,
   Turn,
+  WatchEntry,
   WorkspaceStatus,
 } from "./types";
 import {
@@ -46,6 +48,13 @@ interface WorkspaceState {
   // flight. Tracks the THREAD, not just a boolean, so a resume on
   // thread A does not block a fresh send on thread B.
   resumingThreadId: string | null;
+  // T4 workflow (#138): watched issuers and the in-app notices their
+  // filings raised. Both are workspace-local — no outbound delivery.
+  watchlist: WatchEntry[];
+  notices: Notice[];
+  // ``true`` while a Stop request for the active thread is in flight,
+  // so the button cannot be pressed twice before the wire closes.
+  stoppingThreadId: string | null;
 
   refreshThreads: () => Promise<void>;
   loadCorpus: () => Promise<void>;
@@ -69,6 +78,18 @@ interface WorkspaceState {
   // by re-checking ``get().activeThread?.id`` against ``threadId``
   // on every patch.
   resumeThread: (threadId: string) => Promise<api.SendResult | null>;
+  // T4 workflow (#138). ``addWatch`` rejects with the host's typed
+  // error so the panel can show it inline; the rest resolve quietly
+  // and leave the slice consistent.
+  loadWatchlist: () => Promise<void>;
+  addWatch: (issuer: string, forms: string[]) => Promise<void>;
+  removeWatch: (watchId: string) => Promise<void>;
+  loadNotices: () => Promise<void>;
+  dismissNotice: (noticeId: string) => Promise<void>;
+  // Stop the in-flight run on ``threadId``. The run's own send promise
+  // resolves with the terminal stopped frames, so this action only has
+  // to signal and refresh the turn table.
+  stopRun: (threadId: string) => Promise<void>;
 }
 
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
@@ -82,6 +103,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   statusLoaded: false,
   sendingQuestion: false,
   resumingThreadId: null,
+  watchlist: [],
+  notices: [],
+  stoppingThreadId: null,
 
   async refreshThreads() {
     set({ loadingThreads: true });
@@ -178,6 +202,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       // terminal ``status`` SSE frame arrives; the SPA renders
       // the "原因" label off this field on refuse rows.
       status_classified: "",
+      // T3 (enterprise-kb Focus 1): filled by ``comparison`` frames
+      // as each ``compare_facts`` call returns, so the table is on
+      // screen while the answer is still being authored.
+      comparisons: [],
       // T4 (#37): the optimistic turn is LIVE until the terminal
       // status frame — the thinking region line-clamps and the tool
       // rows stay open while the run streams, then collapse.
@@ -300,6 +328,12 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
               break;
             case "citations":
               patchTurn((t) => ({ ...t, citations: event.citations }));
+              break;
+            case "comparison":
+              patchTurn((t) => ({
+                ...t,
+                comparisons: [...(t.comparisons ?? []), event.comparison],
+              }));
               break;
           }
         },
@@ -449,6 +483,12 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
               citations: event.citations,
             }));
             break;
+          case "comparison":
+            patchLatestTurn(threadId, (t) => ({
+              ...t,
+              comparisons: [...(t.comparisons ?? []), event.comparison],
+            }));
+            break;
         }
       });
 
@@ -472,6 +512,62 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       // a freshly-started resume on another thread.
       if (get().resumingThreadId === threadId) {
         set({ resumingThreadId: null });
+      }
+    }
+  },
+
+  async loadWatchlist() {
+    // A watchlist that cannot be read is an empty panel with its own
+    // copy, not a broken workspace: the thread surface keeps working.
+    try {
+      set({ watchlist: await api.listWatchlist() });
+    } catch {
+      set({ watchlist: [] });
+    }
+  },
+
+  async addWatch(issuer, forms) {
+    // Rethrows: a blank issuer is a typed 400 the panel renders inline
+    // next to the input, so it must not be swallowed here.
+    set({ watchlist: await api.createWatch(issuer, forms) });
+    await get().loadNotices();
+  },
+
+  async removeWatch(watchId) {
+    await api.deleteWatch(watchId);
+    // The host cascades the watch's notices; mirror that locally so the
+    // panel does not keep rows the operator can no longer act on.
+    set((s) => ({
+      watchlist: s.watchlist.filter((w) => w.id !== watchId),
+      notices: s.notices.filter((n) => n.watch_id !== watchId),
+    }));
+  },
+
+  async loadNotices() {
+    try {
+      set({ notices: await api.listNotices() });
+    } catch {
+      set({ notices: [] });
+    }
+  },
+
+  async dismissNotice(noticeId) {
+    await api.markNoticeRead(noticeId);
+    set((s) => ({
+      notices: s.notices.map((n) =>
+        n.id === noticeId ? { ...n, read: true } : n,
+      ),
+    }));
+  },
+
+  async stopRun(threadId) {
+    if (get().stoppingThreadId === threadId) return;
+    set({ stoppingThreadId: threadId });
+    try {
+      await api.stopRun(threadId);
+    } finally {
+      if (get().stoppingThreadId === threadId) {
+        set({ stoppingThreadId: null });
       }
     }
   },

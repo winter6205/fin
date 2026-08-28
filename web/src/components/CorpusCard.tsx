@@ -2,6 +2,7 @@
 // with the filing question; NEVER auto-send (spec).
 
 import { useNavigate } from "react-router-dom";
+import { cardMetaLine, cardThreadQuestion } from "../corpusCards";
 import { useWorkspaceStore } from "../store";
 import type { Filing } from "../types";
 
@@ -12,9 +13,7 @@ export default function CorpusCard({ filing }: { filing: Filing }) {
   return (
     <button
       onClick={async () => {
-        const id = await createThread(
-          `What does ${filing.company} report in its ${filing.period} 10-Q?`
-        );
+        const id = await createThread(cardThreadQuestion(filing));
         if (id) {
           // Prefill via navigation state so ThreadPage's Composer
           // picks it up without auto-sending.
@@ -28,9 +27,7 @@ export default function CorpusCard({ filing }: { filing: Filing }) {
       className="text-left border border-black bg-card p-3 hover:bg-tool"
     >
       <p className="font-mono text-sm font-semibold">{filing.document_id}</p>
-      <p className="text-xs text-gray-600 mt-1">
-        {filing.company} · {filing.period}
-      </p>
+      <p className="text-xs text-gray-600 mt-1">{cardMetaLine(filing)}</p>
       <p className="text-xs text-gray-500">{filing.page_count} pages</p>
     </button>
   );

@@ -19,10 +19,13 @@ Filter semantics under test (per ADR 0031 / spec):
   which is MSFT's CIK) MUST return ``{"filings": []}`` — the
   filters are AND-combined, so a row that passes one but fails the
   other is dropped.
-* The output hit shape stays ``{document_id, company, period,
-  version, page_count}`` — the new EDGAR-shaped fields are
-  filter inputs only, NOT emitted in the output until a later
-  ticket extends the output keys.
+* The output hit shape is ``{document_id, company, period, version,
+  page_count, form}``. ``form`` was the "later ticket extends the
+  output keys" case, opened by spec SC3 of
+  ``specs/enterprise-kb-agent.md`` (the Corpus 首页 card shows the
+  form); ``cik`` / ``accession`` / ``filing_date`` / ``ticker`` remain
+  filter inputs only. The SC3 form behaviour itself lives in
+  ``test_catalog_form_types.py``.
 """
 
 from __future__ import annotations
@@ -302,22 +305,26 @@ def test_missing_extracted_root_raises_typed_error() -> None:
 # ===== v1-shape preservation =====
 
 
-_V1_HIT_KEYS = {
+_HIT_KEYS = {
     "document_id",
     "company",
     "period",
     "version",
     "page_count",
+    "form",
 }
 
+# The EDGAR-shaped fields that stay filter inputs. Named so a later
+# ticket that wants one of them on the wire has to say so out loud.
+_FILTER_ONLY_FIELDS = ("cik", "accession", "filing_date", "ticker")
 
-def test_list_files_aapl_preserves_v1_shape() -> None:
-    """``list_files(company="AAPL")`` returns the v1 hit shape only.
 
-    The new EDGAR-shaped fields (``cik``, ``accession``,
-    ``filing_date``, ``ticker``, ``form``) MUST NOT appear in the
-    output dict until a later ticket explicitly extends the output
-    keys. They are filter inputs only in T2.
+def test_list_files_aapl_preserves_hit_shape() -> None:
+    """``list_files(company="AAPL")`` returns the documented hit shape.
+
+    ``form`` is on the hit per spec SC3; the remaining EDGAR-shaped
+    fields (``cik``, ``accession``, ``filing_date``, ``ticker``) are
+    filter inputs and MUST NOT appear in the output dict.
     """
     result = list_files(
         company="AAPL",
@@ -326,28 +333,28 @@ def test_list_files_aapl_preserves_v1_shape() -> None:
     )
     assert result["filings"], "expected at least one AAPL hit"
     for filing in result["filings"]:
-        assert set(filing.keys()) == _V1_HIT_KEYS, (
-            f"output hit must stay v1-shaped; got {set(filing.keys())}. "
-            "T2 is filter-only, not output-shape extension."
+        assert set(filing.keys()) == _HIT_KEYS, (
+            f"output hit drifted from the documented shape; got "
+            f"{set(filing.keys())}"
         )
-        # And explicitly forbid the EDGAR-shaped fields.
-        for forbidden in ("cik", "accession", "filing_date", "ticker", "form"):
+        for forbidden in _FILTER_ONLY_FIELDS:
             assert forbidden not in filing, (
-                f"{forbidden!r} leaked into the v1 hit shape; T2 is "
-                "filter-only, output-shape change belongs to a later "
-                "ticket"
+                f"{forbidden!r} leaked onto the hit; only ``form`` was "
+                "promoted from filter input to output key"
             )
 
 
-def test_list_files_default_returns_all_12_with_v1_shape() -> None:
-    """``list_files()`` returns 12 filings each with the v1 hit shape."""
+def test_list_files_default_returns_all_12_with_hit_shape() -> None:
+    """``list_files()`` returns 12 filings each with the hit shape."""
     result = list_files(
         manifest_path=_manifest_path(),
         extracted_root=_extracted_root(),
     )
     assert len(result["filings"]) == 12
     for filing in result["filings"]:
-        assert set(filing.keys()) == _V1_HIT_KEYS
+        assert set(filing.keys()) == _HIT_KEYS
+        for forbidden in _FILTER_ONLY_FIELDS:
+            assert forbidden not in filing
 
 
 # ===== synthetic manifest: form rows other than 10-Q =====

@@ -1,0 +1,480 @@
+"""Multi-issuer fan-out inside the host graph (T6 / spec Focus 4, SC7).
+
+ADR 0034 fixes the topology: the host graph fans out one node per
+issuer, JOINS, and only then runs the **citation verifier** once on the
+synthesized answer. This suite pins that shape end to end:
+
+* a scripted turn at the cap synthesizes with >=1 citation for every
+  issuer that contributed evidence;
+* one issuer over the cap is a typed ``issuer_overflow`` that ends the
+  run — never a ``done`` that silently drops the extra issuer;
+* an issuer with no hits and an issuer whose retrieve is unavailable
+  stay distinguishable in the joined envelope instead of vanishing;
+* Soft-Track classify stays flat — the fan-out lives after the
+  research leaf, not inside the track decision.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.checkpoint.memory import InMemorySaver
+
+from fin.corpus.extracted import Locator
+from fin.host import ScriptedChatModel, compile_graph
+from fin.host.state import reset_input_state
+from fin.host.tools.issuer_fanout import (
+    ISSUER_FANOUT_SCHEMA,
+    ISSUER_FANOUT_TOOL,
+    MAX_ISSUERS,
+    issuer_query,
+)
+from fin.host.workspace_http import _node_frame_payloads
+from fin.retrieve import FakeRetrievePort
+from fin.retrieve.port import Chunk
+
+
+QUERY = "services revenue"
+CAP_ROSTER = ["AAPL", "MSFT", "AMZN", "NVDA", "GOOG"]
+OVER_CAP_ROSTER = CAP_ROSTER + ["TSLA"]
+
+# Both Soft-Track slots (a known company + a period) are present so the
+# rules tier lands on ``research``; a slot-less ask routes to clarify
+# and never reaches a tool.
+FANOUT_QUESTION = (
+    "Compare services revenue across AAPL, MSFT, AMZN, NVDA and GOOG "
+    "for Q3 2023."
+)
+
+
+def _document_id(issuer: str) -> str:
+    return f"{issuer}-2023Q3"
+
+
+def _version(issuer: str) -> str:
+    return (issuer[0].lower() * 64)[:64]
+
+
+# One evidence passage per issuer. Each is >=32 characters (the gate's
+# minimum extractive span) and shares no 32-character run with any
+# other, so a citation can only come from the issuer it belongs to —
+# boilerplate passages would let one issuer's span vouch for another
+# and the coverage contract below would pass vacuously. Digit-free on
+# purpose: a number would be a claim the numeric gate has to match.
+_PASSAGES = {
+    "AAPL": "Apple grew services and wearables faster than hardware.",
+    "MSFT": "Microsoft cloud bookings expanded on enterprise renewals.",
+    "AMZN": "Third-party seller fees lifted the marketplace mix again.",
+    "NVDA": "Accelerated computing demand outran the available supply.",
+    "GOOG": "Search monetization held steady as cloud losses narrowed.",
+    "TSLA": "Energy storage deployments doubled on a softer vehicle mix.",
+}
+
+
+def _page_text(issuer: str) -> str:
+    return _PASSAGES[issuer]
+
+
+def _chunk(issuer: str, page: int = 1) -> Chunk:
+    return Chunk(
+        text=_page_text(issuer),
+        source_ref=Locator(
+            document_id=_document_id(issuer),
+            version=_version(issuer),
+            page=page,
+        ),
+        score=1.0,
+    )
+
+
+KNOWN_IDS = {_document_id(issuer) for issuer in OVER_CAP_ROSTER}
+
+
+class RecordingPort:
+    """Retrieve port that records every query and can fail one issuer.
+
+    Wraps a ``FakeRetrievePort`` so the hit path stays the shared
+    contract; ``unavailable_for`` reproduces the ADR 0030 typed EXIT
+    for a single issuer without a live MCP process.
+    """
+
+    def __init__(
+        self,
+        *,
+        issuers: list[str],
+        unavailable_for: str | None = None,
+    ) -> None:
+        self._fake = FakeRetrievePort(
+            hits_by_query={
+                issuer_query(issuer, QUERY): [_chunk(issuer)]
+                for issuer in issuers
+            }
+        )
+        self._unavailable_for = unavailable_for
+        self.queries: list[str] = []
+
+    def retrieve(self, query: str, **kwargs: Any) -> dict[str, Any]:
+        self.queries.append(query)
+        ticker = kwargs.get("ticker")
+        if self._unavailable_for and ticker == self._unavailable_for:
+            return {"error": "retrieve_unavailable"}
+        return self._fake.retrieve(query, **kwargs)
+
+
+def _fanout_script(
+    *, issuers: list[str], answer: str, query: str = QUERY
+) -> list[AIMessage]:
+    """``research_issuers`` fan-out, then the synthesized prose."""
+    return [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": ISSUER_FANOUT_TOOL,
+                    "args": {"issuers": issuers, "query": query},
+                    "id": "c-fanout",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        AIMessage(content=answer),
+    ]
+
+
+def _synthesis(issuers: list[str]) -> str:
+    return " ".join(_page_text(issuer) for issuer in issuers)
+
+
+def _run(
+    script: list[AIMessage],
+    *,
+    adapter: Any,
+    thread_id: str,
+    question: str = FANOUT_QUESTION,
+) -> dict:
+    graph = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=ScriptedChatModel(script=script),
+        adapter=adapter,
+        known_document_ids=KNOWN_IDS,
+    )
+    return graph.invoke(
+        reset_input_state(question),
+        config={"configurable": {"thread_id": thread_id}},
+    )
+
+
+def _tool_messages(state: dict, name: str) -> list[ToolMessage]:
+    return [
+        message
+        for message in state["messages"]
+        if isinstance(message, ToolMessage)
+        and getattr(message, "name", "") == name
+    ]
+
+
+# ----- wiring -----
+
+
+def test_compile_graph_binds_research_issuers_after_compare_facts() -> None:
+    """Additive binding: the fan-out tool is registered LAST so the five
+    prior tools keep their positions."""
+    model = ScriptedChatModel(script=[])
+    compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        adapter=FakeRetrievePort(),
+        known_document_ids=KNOWN_IDS,
+    )
+    names = [getattr(t, "name", repr(t)) for t in model.bound_tools]
+    assert ISSUER_FANOUT_TOOL in names
+    assert names.index(ISSUER_FANOUT_TOOL) > names.index("compare_facts")
+
+
+def test_reset_input_state_clears_the_fanout_channels() -> None:
+    """A follow-up run must not inherit the previous run's roster."""
+    fresh = reset_input_state("q")
+    assert fresh["issuer_plan"] == {}
+    assert fresh["issuer_fanout"] == {}
+
+
+# ----- SC7 positive: full cap synthesizes with a citation per contributor -----
+
+
+def test_full_cap_fanout_synthesizes_with_a_citation_per_contributor() -> None:
+    port = RecordingPort(issuers=CAP_ROSTER)
+    out = _run(
+        _fanout_script(
+            issuers=CAP_ROSTER, answer=_synthesis(CAP_ROSTER)
+        ),
+        adapter=port,
+        thread_id="t-fanout-cap",
+    )
+    assert len(CAP_ROSTER) == MAX_ISSUERS
+    assert out["status"] == "done"
+    assert out["status_reason"] == "done"
+    cited = {citation.document_id for citation in out["citations"]}
+    assert cited == {_document_id(issuer) for issuer in CAP_ROSTER}
+
+
+def test_fanout_runs_one_worker_per_issuer() -> None:
+    """The fan-out is per issuer and bounded by the cap: five issuers,
+    five port calls, no re-entry."""
+    port = RecordingPort(issuers=CAP_ROSTER)
+    _run(
+        _fanout_script(issuers=CAP_ROSTER, answer=_synthesis(CAP_ROSTER)),
+        adapter=port,
+        thread_id="t-fanout-workers",
+    )
+    assert sorted(port.queries) == sorted(
+        issuer_query(issuer, QUERY) for issuer in CAP_ROSTER
+    )
+
+
+def test_join_envelope_lands_on_state_for_the_turn_row() -> None:
+    port = RecordingPort(issuers=CAP_ROSTER)
+    out = _run(
+        _fanout_script(issuers=CAP_ROSTER, answer=_synthesis(CAP_ROSTER)),
+        adapter=port,
+        thread_id="t-fanout-envelope",
+    )
+    fanout = out["issuer_fanout"]
+    assert fanout["schema"] == ISSUER_FANOUT_SCHEMA
+    assert fanout["contributing"] == CAP_ROSTER
+    assert fanout["cap"] == MAX_ISSUERS
+    assert fanout["locator_count"] == len(CAP_ROSTER)
+
+
+def test_fanout_narrates_one_human_readable_tool_summary() -> None:
+    port = RecordingPort(issuers=CAP_ROSTER)
+    out = _run(
+        _fanout_script(issuers=CAP_ROSTER, answer=_synthesis(CAP_ROSTER)),
+        adapter=port,
+        thread_id="t-fanout-summary",
+    )
+    summaries = {s["name"]: s["summary"] for s in out["tool_summaries"]}
+    assert "5 issuers" in summaries[ISSUER_FANOUT_TOOL]
+    assert "{" not in summaries[ISSUER_FANOUT_TOOL]
+
+
+def test_workspace_narrates_the_join_on_the_tool_result_frame() -> None:
+    """No new SSE frame type: the fan-out rides the tool trace the
+    workspace already renders, so the operator sees the roster without
+    the thread surface learning a sixth envelope."""
+    port = RecordingPort(issuers=CAP_ROSTER)
+    out = _run(
+        _fanout_script(issuers=CAP_ROSTER, answer=_synthesis(CAP_ROSTER)),
+        adapter=port,
+        thread_id="t-fanout-sse",
+    )
+    message = _tool_messages(out, ISSUER_FANOUT_TOOL)[0]
+    frames = dict(_node_frame_payloads(message))
+    assert frames["tool_result"]["name"] == ISSUER_FANOUT_TOOL
+    assert "5 issuers" in frames["tool_result"]["summary"]
+    assert "{" not in frames["tool_result"]["summary"]
+
+
+def test_the_join_answers_the_fanout_call_exactly_once() -> None:
+    """One tool call, one ``ToolMessage``: the verifier runs after the
+    join, not once per issuer (ADR 0034 rejects verifier-per-issuer)."""
+    port = RecordingPort(issuers=CAP_ROSTER)
+    out = _run(
+        _fanout_script(issuers=CAP_ROSTER, answer=_synthesis(CAP_ROSTER)),
+        adapter=port,
+        thread_id="t-fanout-join-once",
+    )
+    messages = _tool_messages(out, ISSUER_FANOUT_TOOL)
+    assert len(messages) == 1
+    assert messages[0].tool_call_id == "c-fanout"
+
+
+def test_soft_track_classify_stays_flat_for_a_fanout_turn() -> None:
+    """ADR 0034: the fan-out is a host-graph topology change, not a new
+    track — classify still resolves the turn on the rules tier."""
+    port = RecordingPort(issuers=CAP_ROSTER)
+    out = _run(
+        _fanout_script(issuers=CAP_ROSTER, answer=_synthesis(CAP_ROSTER)),
+        adapter=port,
+        thread_id="t-fanout-flat",
+    )
+    assert out["track"] == "research"
+    assert out["track_decision"]["decision_tier"] == "rules"
+
+
+# ----- SC7 negative: over the cap is a typed overflow -----
+
+
+def test_over_cap_roster_is_a_typed_overflow_not_a_done() -> None:
+    port = RecordingPort(issuers=OVER_CAP_ROSTER)
+    out = _run(
+        _fanout_script(
+            issuers=OVER_CAP_ROSTER, answer=_synthesis(OVER_CAP_ROSTER)
+        ),
+        adapter=port,
+        thread_id="t-fanout-overflow",
+    )
+    assert out["status"] == "refuse"
+    assert out["status_reason"] == "issuer_overflow"
+    assert tuple(out.get("citations") or ()) == ()
+
+
+def test_overflow_records_the_limit_and_the_full_ask() -> None:
+    port = RecordingPort(issuers=OVER_CAP_ROSTER)
+    out = _run(
+        _fanout_script(
+            issuers=OVER_CAP_ROSTER, answer=_synthesis(OVER_CAP_ROSTER)
+        ),
+        adapter=port,
+        thread_id="t-fanout-overflow-shape",
+    )
+    plan = out["issuer_plan"]
+    assert plan["error"] == "issuer_overflow"
+    assert plan["limit"] == MAX_ISSUERS
+    assert plan["requested"] == len(OVER_CAP_ROSTER)
+    assert plan["issuers"] == OVER_CAP_ROSTER
+
+
+def test_overflow_runs_no_issuer_worker() -> None:
+    """"Not a hang" means the cap is checked on the REQUEST: the graph
+    never fans out the over-cap roster and then throws the work away."""
+    port = RecordingPort(issuers=OVER_CAP_ROSTER)
+    _run(
+        _fanout_script(
+            issuers=OVER_CAP_ROSTER, answer=_synthesis(OVER_CAP_ROSTER)
+        ),
+        adapter=port,
+        thread_id="t-fanout-overflow-workers",
+    )
+    assert port.queries == []
+
+
+def test_overflow_still_answers_the_tool_call() -> None:
+    """The typed EXIT reaches the message history (and so the workspace
+    tool trace) instead of the run ending on a dangling tool call."""
+    port = RecordingPort(issuers=OVER_CAP_ROSTER)
+    out = _run(
+        _fanout_script(
+            issuers=OVER_CAP_ROSTER, answer=_synthesis(OVER_CAP_ROSTER)
+        ),
+        adapter=port,
+        thread_id="t-fanout-overflow-trace",
+    )
+    messages = _tool_messages(out, ISSUER_FANOUT_TOOL)
+    assert len(messages) == 1
+    assert "issuer_overflow" in messages[0].content
+
+
+# ----- empty / negative / exception issuers -----
+
+
+def test_issuer_without_hits_is_reported_empty_not_dropped() -> None:
+    roster = ["AAPL", "MSFT", "NVDA"]
+    port = RecordingPort(issuers=["AAPL", "MSFT"])
+    out = _run(
+        _fanout_script(issuers=roster, answer=_synthesis(["AAPL", "MSFT"])),
+        adapter=port,
+        thread_id="t-fanout-empty-issuer",
+    )
+    assert out["status"] == "done"
+    fanout = out["issuer_fanout"]
+    assert fanout["contributing"] == ["AAPL", "MSFT"]
+    assert fanout["empty"] == ["NVDA"]
+
+
+def test_unavailable_retrieve_for_one_issuer_stays_typed() -> None:
+    roster = ["AAPL", "MSFT"]
+    port = RecordingPort(issuers=roster, unavailable_for="MSFT")
+    out = _run(
+        _fanout_script(issuers=roster, answer=_synthesis(["AAPL"])),
+        adapter=port,
+        thread_id="t-fanout-unavailable",
+    )
+    fanout = out["issuer_fanout"]
+    assert fanout["unavailable"] == ["MSFT"]
+    assert fanout["empty"] == []
+    assert fanout["contributing"] == ["AAPL"]
+
+
+def test_empty_roster_is_a_typed_exit_the_model_can_see() -> None:
+    """No issuers at all is ``empty_fanout``: a typed EXIT on the tool
+    message, not an overflow and not a crash."""
+    port = RecordingPort(issuers=CAP_ROSTER)
+    out = _run(
+        _fanout_script(issuers=[], answer="No issuers were named."),
+        adapter=port,
+        thread_id="t-fanout-empty-roster",
+    )
+    messages = _tool_messages(out, ISSUER_FANOUT_TOOL)
+    assert "empty_fanout" in messages[0].content
+    assert out["status_reason"] != "issuer_overflow"
+    # The run still terminates (the citation verifier had nothing to
+    # match, so it bounces to the repair cap and refuses).
+    assert out["status"] in ("refuse", "done", "step_cap")
+    assert port.queries == []
+
+
+# ----- the single citation verifier still gates the synthesis -----
+
+
+def test_contributing_issuer_dropped_from_the_answer_does_not_done() -> None:
+    """SC7: every issuer that contributed evidence needs >=1 citation.
+    An answer that quotes four of five contributors dropped one — that
+    is exactly the silent drop the spec forbids."""
+    port = RecordingPort(issuers=CAP_ROSTER)
+    out = _run(
+        _fanout_script(
+            issuers=CAP_ROSTER, answer=_synthesis(CAP_ROSTER[:-1])
+        ),
+        adapter=port,
+        thread_id="t-fanout-partial",
+    )
+    assert out["status"] == "refuse"
+    assert out["status_reason"] == "issuer_coverage_fail"
+    assert tuple(out.get("citations") or ()) == ()
+
+
+def test_an_uncited_synthesis_still_bounces_to_the_repair_cap() -> None:
+    """The verifier is unchanged: prose with no verbatim span never
+    reaches ``done`` just because the fan-out gathered evidence."""
+    port = RecordingPort(issuers=CAP_ROSTER)
+    out = _run(
+        _fanout_script(
+            issuers=CAP_ROSTER,
+            answer="All five issuers grew, broadly speaking, this quarter.",
+        ),
+        adapter=port,
+        thread_id="t-fanout-uncited",
+    )
+    assert out["status"] == "refuse"
+    assert out["status_reason"] == "citation_repair_cap"
+
+
+# ----- run scoping -----
+
+
+def test_a_follow_up_run_does_not_inherit_the_previous_roster() -> None:
+    port = RecordingPort(issuers=CAP_ROSTER)
+    graph = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=ScriptedChatModel(
+            script=_fanout_script(
+                issuers=["AAPL"], answer=_synthesis(["AAPL"])
+            )
+        ),
+        adapter=port,
+        known_document_ids=KNOWN_IDS,
+    )
+    config = {"configurable": {"thread_id": "t-fanout-followup"}}
+    first = graph.invoke(reset_input_state(FANOUT_QUESTION), config=config)
+    assert first["issuer_fanout"]["contributing"] == ["AAPL"]
+
+    second = graph.invoke(
+        reset_input_state("And AAPL for Q3 2023 overall?"), config=config
+    )
+    # The scripted model has run out of tool calls, so run 2 makes no
+    # fan-out of its own; the channels must be empty rather than
+    # replaying run 1's roster onto this turn.
+    assert second["issuer_fanout"] == {}
+    assert second["issuer_plan"] == {}
+    assert second["issuer_findings"] == []
