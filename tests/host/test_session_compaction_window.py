@@ -142,4 +142,3 @@ def test_summary_model_failure_is_typed() -> None:
 
     with pytest.raises(SummaryModelError, match="could not create session summary"):
         compactor.compact(_messages(5))
-
