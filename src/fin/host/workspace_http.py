@@ -1709,23 +1709,17 @@ def build_router(
                 # persist nothing — when the original send row exists
                 # it already tells the story, and appending a refuse
                 # row per failed Resume click would spam the turn
-                # table. KNOWN GAP (follow-up): after a process death
-                # there is no send row at all, so a resume that also
-                # raises leaves the question invisible in history;
-                # fixing that needs the checkpointed HumanMessage,
-                # which this route does not carry.
+                # table. After process death with no send row, a resume
+                # that also raises still leaves history without a row
+                # (success-path resume below does load the checkpoint
+                # HumanMessage when final_state is present).
                 return
             payload = _run_to_response_payload(outcome.final_state)
             resume_question = (
                 graph.checkpoint_last_human_text(thread_id)
                 if hasattr(graph, "checkpoint_last_human_text")
                 else None
-            )
-            if not resume_question:
-                # Last-resort label only when the checkpoint has no
-                # HumanMessage (should not happen on a recoverable
-                # crash resume). Prefer empty over a fake question.
-                resume_question = ""
+            ) or ""
             try:
                 store.append_run(
                     RunRecord(
