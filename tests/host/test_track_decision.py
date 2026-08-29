@@ -56,14 +56,18 @@ def test_underspecified_metric_ask_decides_clarify() -> None:
 class _StealClassify:
     """Classify stub whose invoke must exist as a method (not nested in __init__)."""
 
-    def __init__(self, track: str) -> None:
+    def __init__(self, track: str, confidence: float = 0.99) -> None:
         self.calls = 0
         self._track = track
+        self._confidence = confidence
 
     def invoke(self, messages, **kwargs):  # noqa: ANN001, ARG002
         self.calls += 1
         return AIMessage(
-            content=f'{{"track": "{self._track}", "confidence": 0.99}}'
+            content=(
+                f'{{"track": "{self._track}", '
+                f'"confidence": {self._confidence}}}'
+            )
         )
 
 
@@ -104,6 +108,24 @@ def test_underspec_followup_inherits_before_llm_steal() -> None:
     assert stub.calls == 0
     assert decision.track == "research"
     assert decision.decision_tier == "inherit"
+
+
+@pytest.mark.soft_track
+def test_low_confidence_classify_routes_to_clarify() -> None:
+    """An uncertain optional classifier must not select a track silently."""
+    stub = _StealClassify("research", confidence=0.2)
+
+    decision = decide_track(
+        [HumanMessage(content="maybe compare these?")],
+        classify_model=stub,
+    )
+
+    assert stub.calls == 1
+    assert decision.track == "clarify"
+    assert decision.decision_tier == "clarify"
+    assert decision.confidence == 0.2
+    assert decision.signals.get("classify_exit") == "low_confidence"
+    assert decision.signals.get("llm_track") == "research"
 
 
 def test_metric_with_company_missing_period_decides_clarify() -> None:

@@ -24,6 +24,7 @@ dependents).
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -43,6 +44,7 @@ DecisionTier = Literal[
 _VALID_TRACKS: frozenset[str] = frozenset(
     {"dialogue", "clarify", "off_topic", "research"}
 )
+_MIN_CLASSIFY_CONFIDENCE = 0.6
 
 # Canonical ticker spellings for snapshot storage.
 _COMPANY_CANON: dict[str, str] = {
@@ -383,8 +385,20 @@ def _try_llm_classify(
         confidence_f = float(confidence)
     except (TypeError, ValueError):
         confidence_f = 0.7
+    if not math.isfinite(confidence_f):
+        confidence_f = 0.0
+    confidence_f = min(max(confidence_f, 0.0), 1.0)
 
     signals["llm_track"] = track
+    if confidence_f < _MIN_CLASSIFY_CONFIDENCE:
+        signals["classify_exit"] = "low_confidence"
+        signals["low_confidence"] = True
+        return TrackDecision(
+            track="clarify",
+            confidence=confidence_f,
+            decision_tier="clarify",
+            signals=signals,
+        )
     return TrackDecision(
         track=track,  # type: ignore[arg-type]
         confidence=confidence_f,
