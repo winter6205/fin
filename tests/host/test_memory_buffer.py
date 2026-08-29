@@ -224,6 +224,25 @@ def test_recall_only_counts_the_rows_it_returned(buffer) -> None:
     }
 
 
+def test_concurrent_recalls_accumulate_hit_counts_exactly(buffer) -> None:
+    """Concurrent recall adds up: no read-modify-write on the way in.
+
+    The atomic ``UPDATE ... SET hit_count = hit_count + 1`` is proven at
+    the store level; this pins that the port's recall path actually goes
+    through it rather than reading a row back and rewriting it.
+    """
+    buffer.extract("Quarterly revenue comparisons.")
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(
+            executor.map(
+                lambda _: buffer.recall("quarterly revenue"), range(32)
+            )
+        )
+
+    assert [row["hit_count"] for row in buffer.entries()] == [32]
+
+
 def test_disabled_rows_are_excluded_from_entries_when_asked(buffer) -> None:
     buffer.extract("Quarterly revenue comparisons.")
     buffer.extract(
