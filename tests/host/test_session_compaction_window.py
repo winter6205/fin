@@ -79,6 +79,34 @@ def test_incremental_summary_only_receives_evicted_history() -> None:
     assert second.messages[-1].content == "new-answer"
 
 
+def test_recompaction_carries_forward_embedded_summary_and_snapshot() -> None:
+    compactor = SessionCompactor(window_size=3, keep_last=1)
+    first = compactor.compact(
+        _messages(5),
+        status_snapshots=[
+            {
+                "company": "AAPL",
+                "period": "2023 Q3",
+                "document_ids": ["AAPL-2023Q3"],
+            }
+        ],
+    )
+
+    second = compactor.compact(
+        first.messages
+        + [
+            HumanMessage(content="new-question-1"),
+            HumanMessage(content="new-question-2"),
+            HumanMessage(content="new-question-3"),
+        ]
+    )
+
+    assert second.compacted is True
+    assert "question-0" in second.summary
+    assert "AAPL" in second.messages[0].content
+    assert "2023 Q3" in second.messages[0].content
+
+
 def test_empty_history_is_a_noop() -> None:
     result = compact_session([], window_size=4, keep_last=2)
 

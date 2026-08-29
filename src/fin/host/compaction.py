@@ -132,14 +132,27 @@ def _message_text(message: BaseMessage) -> str:
     return str(content)
 
 
-def _without_existing_summary(messages: list[BaseMessage]) -> list[BaseMessage]:
-    """Remove this module's leading marker before counting the active window."""
+def _extract_existing_compaction(
+    messages: list[BaseMessage],
+) -> tuple[list[BaseMessage], str, dict[str, Any]]:
+    """Remove a leading marker and recover state for the next pass."""
     if not messages or not isinstance(messages[0], SystemMessage):
-        return messages
-    marker = messages[0].additional_kwargs.get("fin_compaction_summary")
-    if marker is True or _message_text(messages[0]).startswith(_SUMMARY_MARKER):
-        return messages[1:]
-    return messages
+        return messages, "", {}
+    message = messages[0]
+    content = _message_text(message)
+    marker = message.additional_kwargs.get("fin_compaction_summary")
+    if marker is not True and not content.startswith(_SUMMARY_MARKER):
+        return messages, "", {}
+    summary = message.additional_kwargs.get("fin_compaction_summary_text", "")
+    if not isinstance(summary, str):
+        summary = ""
+    if not summary:
+        body = content[len(_SUMMARY_MARKER) :].lstrip("\n")
+        summary = body.split("\nActive status snapshot:", 1)[0]
+    embedded_snapshot = message.additional_kwargs.get("status_snapshot", {})
+    if not isinstance(embedded_snapshot, Mapping):
+        embedded_snapshot = {}
+    return messages[1:], summary, dict(embedded_snapshot)
 
 
 def _bounded_text(text: str, limit: int) -> str:
@@ -167,7 +180,11 @@ def _render_summary_message(summary: str, snapshot: Mapping[str, Any]) -> System
         lines.append(f"Active status snapshot: {slots}")
     return SystemMessage(
         content="\n".join(lines),
-        additional_kwargs={"fin_compaction_summary": True},
+        additional_kwargs={
+            "fin_compaction_summary": True,
+            "fin_compaction_summary_text": summary,
+            "status_snapshot": dict(snapshot),
+        },
     )
 
 
@@ -274,11 +291,18 @@ class SessionCompactor:
         """Compact history only when it exceeds ``window_size`` messages."""
         if not isinstance(previous_summary, str):
             raise CompactionInputError("previous_summary must be text")
-        history = _without_existing_summary(_validate_messages(messages))
+        original_messages = _validate_messages(messages)
+        history, embedded_summary, embedded_snapshot = _extract_existing_compaction(
+            original_messages
+        )
+        if not previous_summary:
+            previous_summary = embedded_summary
         snapshot = _copy_snapshot(status_snapshots)
+        if status_snapshots is None and embedded_snapshot:
+            snapshot = embedded_snapshot
         if len(history) <= self.window_size:
             return CompactionResult(
-                messages=list(messages or []),
+                messages=original_messages,
                 summary=previous_summary,
                 active_snapshot=snapshot,
             )
