@@ -30,18 +30,31 @@ One append-only per-turn record of research working context (e.g. company, perio
 _Avoid_: overwriting away prior snapshots, dual-writing into thread_store as SSOT, replacing full message history with snapshots
 
 **iknow-memory**:
-A separate TypeScript MCP memory server (own repo and release train). It may later supply institutional or cross-session memory behind fin's retrieve adapter; fin's filing vertical slice does not wait on it.
-_Avoid_: treating fin as the long-term vector backend, lockstep releases with fin, mirroring fin consumer ADRs into that repo
+A separate TypeScript MCP memory server (own repo and release train). It may supply institutional or cross-session durable memory behind fin's **memory backend**, and may also back filing **retrieve** when configured — those are separate adapters/channels. fin's filing cite tree does not wait on it.
+_Avoid_: treating fin as the long-term vector backend, lockstep releases with fin, collapsing retrieve MCP and memory MCP into one config key, mirroring fin consumer ADRs into that repo
+
+**memory port**:
+The only dependency fin is allowed for switchable session/buffer memory operations (extract, recall, GC, dream transport): port in, typed results out — MCP-shaped for the durable backend, transport-agnostic. Default product boot leaves memory **OFF** (no tools, no dream).
+_Avoid_: stuffing memory into the retrieve port, dual-writing memory bodies into the checkpointer as SSOT, treating memory recall as citation evidence
+
+**memory backend**:
+The implementation behind the memory port. Local Postgres buffer is the in-fin working store; an optional MCP server (often iknow-memory) receives **dream** transports for durable persistence. Swapping MCP changes the adapter only.
+_Avoid_: requiring MCP for memory ON, storing cite-tree pages as memory entries, using Redis as memory SSOT
+
+**dream** (fin):
+A rule-gated consolidate step that selects useful local buffer memory and transports it to the configured **memory backend** MCP for durable persistence. With memory OFF or MCP absent it skips or stops at the Postgres buffer; it must not fail the foreground turn.
+_Avoid_: running dream inside model_node, auto-writing every turn to MCP, using dream to move filing locator units out of fin
+
 
 ### Seams
 
 **retrieve port**:
 The only retrieve dependency fin is allowed to have: `query` (+ optional filters) in, ranked chunks with `source_ref` out — MCP-shaped, transport-agnostic.
-_Avoid_: search API, vector store
+_Avoid_: search API, vector store, conflating with the memory port
 
 **retrieve adapter**:
 The implementation behind the retrieve port. Default pytest uses a Fake port. When configured, product retrieve is an MCP 2.0 client (protocol-testable against a compliant public or fixture server); hits map to fin locators as `source_ref`. In-process BM25 is archived (ADR 0007; ADR 0030 superseded by 0032). Ranking and chunking for remote memory stay outside fin; the extracted cite tree stays in fin.
-_Avoid_: shipping BM25 as the product path, hybrid/RRF implemented in this repo, moving the cite tree into a memory server, compile-time coupling to one memory repo
+_Avoid_: shipping BM25 as the product path, hybrid/RRF implemented in this repo, moving the cite tree into a memory server, compile-time coupling to one memory repo, reusing the memory-backend URL as the retrieve adapter by implication
 
 ### Agent
 
