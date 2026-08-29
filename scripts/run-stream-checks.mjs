@@ -170,7 +170,7 @@ function printReport(checks, { baseUrl, cliVersion, session, reachability }) {
     const verdict = check.pass ? "PASS" : "FAIL";
     const took = typeof check.ms === "number" ? ` ${(check.ms / 1000).toFixed(1)}s` : "";
     const why = check.error ? `error: ${check.error}` : JSON.stringify(check.detail ?? {});
-    console.log(`${verdict} ${check.id.padEnd(width)}${took}  ${why}`);
+    console.log(`[${verdict}] ${check.id.padEnd(width)}${took}  ${why}`);
   }
   const passed = checks.filter((c) => c.pass).length;
   console.log("");
@@ -180,7 +180,7 @@ function printReport(checks, { baseUrl, cliVersion, session, reachability }) {
 }
 
 function fail(message) {
-  console.error(`stream-checks: ${message}`);
+  console.error(`[FAIL] harness  ${message}`);
   return EXIT_HARNESS;
 }
 
@@ -244,6 +244,10 @@ async function main(argv) {
     );
     if (run.timedOut) {
       return fail(`checks did not finish within ${opts.timeoutMs}ms — killed, no verdict reached`);
+    }
+    if (run.spawnFailed || run.code !== EXIT_OK) {
+      const status = run.spawnFailed ? "could not start" : `exited with code ${run.code}`;
+      return fail(`checks process ${status}: ${(run.stderr || "no output").trim()}`);
     }
 
     let report;
