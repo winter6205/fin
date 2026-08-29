@@ -29,6 +29,14 @@ class IngestMissingError(RuntimeError):
     """
 
 
+class MalformedExtractedIndexError(IngestMissingError):
+    """An existing ``_index.json`` cannot satisfy the ingest schema.
+
+    This is distinct from a missing index: replacing a damaged index
+    could discard document records owned by another ingest path.
+    """
+
+
 class ManifestShaMismatchError(IngestMissingError):
     """A frozen PDF's sha256 does not match the value in the corpus manifest.
 
@@ -42,4 +50,8 @@ class ManifestShaMismatchError(IngestMissingError):
     pass
 
 
-__all__ = ["IngestMissingError", "ManifestShaMismatchError"]
+__all__ = [
+    "IngestMissingError",
+    "MalformedExtractedIndexError",
+    "ManifestShaMismatchError",
+]

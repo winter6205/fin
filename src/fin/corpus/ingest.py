@@ -57,7 +57,11 @@ from pathlib import Path
 
 import pdfplumber
 
-from fin.corpus.errors import IngestMissingError, ManifestShaMismatchError
+from fin.corpus.errors import (
+    IngestMissingError,
+    MalformedExtractedIndexError,
+    ManifestShaMismatchError,
+)
 from fin.corpus.ocr import (
     OCREngine,
     OCRError,
@@ -152,25 +156,53 @@ def _write_if_drifted(path: Path, payload: bytes) -> bool:
 
 
 def _read_existing_index(extracted_root: Path) -> dict[str, dict[str, object]] | None:
-    """Try to read the committed ``_index.json``.
+    """Read the committed ``_index.json`` for the fast-skip predicate.
 
-    Returns the per-document records, or ``None`` if the index is
-    missing / malformed (in which case the caller falls back to a full
-    pdfplumber extraction). This is the fast-skip predicate: if the
-    index says a document was extracted at the current expected sha
-    and the page count matches the existing files, we can skip
-    reopening the PDF.
+    A missing index is an initialization case and returns ``None``.
+    An existing unreadable or structurally invalid index is corruption:
+    raising before any output write prevents a damaged catalog from
+    being silently replaced.
     """
     index_path = extracted_root / "_index.json"
-    if not index_path.is_file():
+    if not index_path.exists():
         return None
+    if not index_path.is_file():
+        raise MalformedExtractedIndexError(
+            f"extracted index is not a regular file: {index_path}"
+        )
     try:
         payload = json.loads(index_path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        raise MalformedExtractedIndexError(
+            f"malformed extracted index: {index_path}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise MalformedExtractedIndexError(
+            f"extracted index must be a JSON object: {index_path}"
+        )
     docs = payload.get("documents")
     if not isinstance(docs, dict):
-        return None
+        raise MalformedExtractedIndexError(
+            f"extracted index has no 'documents' object: {index_path}"
+        )
+    for document_id, entry in docs.items():
+        if not isinstance(document_id, str) or not isinstance(entry, dict):
+            raise MalformedExtractedIndexError(
+                f"extracted index has an invalid document record: {index_path}"
+            )
+        version = entry.get("version")
+        page_count = entry.get("page_count")
+        if (
+            not isinstance(version, str)
+            or not version
+            or not isinstance(page_count, int)
+            or isinstance(page_count, bool)
+            or page_count < 0
+        ):
+            raise MalformedExtractedIndexError(
+                f"extracted index has an invalid document record for "
+                f"{document_id!r}: {index_path}"
+            )
     return docs
 
 
@@ -864,14 +896,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     ocr_engine = _resolve_ocr_engine(args.ocr_engine)
-    result = run_ingest(
-        manifest_path=args.manifest,
-        pdf_dir=args.pdf_dir,
-        extracted_root=args.extracted_root,
-        facts_root=args.facts_root,
-        ocr_engine=ocr_engine,
-        catalog_seed_path=args.catalog_seed,
-    )
+    try:
+        result = run_ingest(
+            manifest_path=args.manifest,
+            pdf_dir=args.pdf_dir,
+            extracted_root=args.extracted_root,
+            facts_root=args.facts_root,
+            ocr_engine=ocr_engine,
+            catalog_seed_path=args.catalog_seed,
+        )
+    except MalformedExtractedIndexError as exc:
+        print(f"ingest: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     print(
         f"ingest: documents={result.documents} "
         f"pages={result.pages} "
@@ -885,6 +921,7 @@ def main(argv: list[str] | None = None) -> int:
 __all__ = [
     "CatalogSeedError",
     "IngestResult",
+    "MalformedExtractedIndexError",
     "load_catalog_seed",
     "run_ingest",
     "update_catalog_fields",
