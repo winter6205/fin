@@ -33,6 +33,7 @@ from fin.host.memory_port import (
     DreamInputError,
     DreamTransportError,
     MemoryDreamError,
+    MemoryPort,
 )
 from fin.host.memory_store import (
     DreamCursor,
@@ -157,6 +158,33 @@ class NullDreamBackend:
 
     def persist(self, memories: Sequence[dict[str, object]]) -> int:
         return 0
+
+
+def run_dream_after_turn(port: MemoryPort, *, thread_id: str) -> None:
+    """Run one dream window now that the turn's response is delivered.
+
+    This is the reason dream is not a graph node (CONTEXT.md:46): by the
+    time this runs the operator already has their answer, so transport
+    latency and failure are invisible to the turn.
+
+    Memory OFF is a hard skip: SC2 requires the default boot to do no
+    dream work at all, so an OFF port is not even asked.
+
+    Nothing may raise out of here. Starlette runs background tasks
+    without isolation, so an escaping exception would turn a turn that
+    already succeeded into a broken response (SC21).
+    """
+    if getattr(port, "enabled", False) is not True:
+        return
+    try:
+        result = port.dream()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "memory dream failed after thread %s; the turn is unaffected",
+            thread_id,
+        )
+        return
+    logger.info("memory dream after thread %s: %s", thread_id, result)
 
 
 @dataclass(frozen=True)
@@ -380,4 +408,5 @@ __all__ = [
     "NullDreamBackend",
     "NullDreamSummarizer",
     "ScoredMemory",
+    "run_dream_after_turn",
 ]

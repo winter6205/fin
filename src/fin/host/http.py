@@ -110,6 +110,11 @@ class AskResponse(BaseModel):
 _http_graph_singleton: Any | None = None
 _http_singleton_lock = threading.Lock()
 
+# The memory port owns a Postgres pool when memory is ON, so it is built
+# once per process too (see ``get_memory_port``).
+_http_memory_singleton: Any | None = None
+_http_memory_lock = threading.Lock()
+
 
 def compile_for_http(
     *,
@@ -201,6 +206,27 @@ def get_thread_store() -> Any:
     return default_thread_store()
 
 
+def get_memory_port() -> Any:
+    """FastAPI dependency that returns the configured memory port.
+
+    Built once per process. The ON port owns a Postgres pool, so building
+    one per request would open a pool per request and exhaust the
+    server's connections. Memory stays OFF unless ``FIN_MEMORY_ENABLED``
+    is set, in which case nothing here touches Postgres at all.
+
+    Tests override this via ``app.dependency_overrides[get_memory_port]``.
+    """
+    global _http_memory_singleton
+    with _http_memory_lock:
+        if _http_memory_singleton is None:
+            # Imported lazily: compile owns the env contract, and it
+            # pulls in psycopg for the checkpoint path.
+            from fin.host.compile import build_memory_port_for_runtime
+
+            _http_memory_singleton = build_memory_port_for_runtime()
+        return _http_memory_singleton
+
+
 def get_watchlist_store() -> Any:
     """FastAPI dependency that returns the watchlist / notice store.
 
@@ -222,6 +248,7 @@ _mount_workspace_routes(
     get_graph=get_graph,
     get_thread_store=get_thread_store,
     get_watchlist_store=get_watchlist_store,
+    get_memory_port=get_memory_port,
 )
 
 # ``GET /health`` (#135, SC9): checkpoint reachability, separate from

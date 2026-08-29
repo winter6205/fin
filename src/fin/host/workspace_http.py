@@ -104,7 +104,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Final, Iterator, Literal
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from langchain_core.messages import (
     AIMessage,
@@ -123,6 +123,8 @@ from fin.host.export import (
     build_export,
 )
 from fin.host.graph import ConcurrentRunError, comparison_from_tool_message
+from fin.host.memory_dream import run_dream_after_turn
+from fin.host.memory_port import build_memory_port
 from fin.host.operator_env import (
     probe_retrieve_reachability,
     resolve_retrieve_adapter_kind,
@@ -1163,14 +1165,19 @@ def _corpus_filing_count() -> int:
 
 
 def build_router(
-    *, get_graph, get_thread_store, get_watchlist_store=None
+    *,
+    get_graph,
+    get_thread_store,
+    get_watchlist_store=None,
+    get_memory_port=None,
 ) -> APIRouter:
     """Build the workspace APIRouter.
 
     The dependencies are passed in so the router can be wired against
     any FastAPI app (the prod app in ``fin.host.http``, and any test
     app). ``get_watchlist_store`` defaults to the env-selected store so
-    an existing caller that predates T4 still mounts.
+    an existing caller that predates T4 still mounts; ``get_memory_port``
+    does the same for callers that predate dream.
 
     The stop registry (:class:`RunControl`) is created HERE rather than
     at module level: one registry per mounted router means two apps in
@@ -1180,6 +1187,8 @@ def build_router(
     run_control = RunControl()
     if get_watchlist_store is None:
         get_watchlist_store = default_watchlist_store
+    if get_memory_port is None:
+        get_memory_port = build_memory_port
 
     @router.get("/threads")
     def list_threads(store: ThreadStore = Depends(get_thread_store)) -> list[dict]:
@@ -1294,8 +1303,10 @@ def build_router(
     def send_message(
         thread_id: str,
         body: SendMessageRequest,
+        background: BackgroundTasks,
         graph: Any = Depends(get_graph),
         store: ThreadStore = Depends(get_thread_store),
+        memory_port: Any = Depends(get_memory_port),
     ) -> Response:
         """Run one v1 host-graph run on the thread over SSE (T1 #33).
 
@@ -1551,6 +1562,13 @@ def build_router(
                 answer_reset=outcome.answer_reset,
             )
 
+        # Dream runs AFTER the stream is exhausted, never inside a graph
+        # node (CONTEXT.md:46). Registering before the response is
+        # returned means every exit path from the generator still gets
+        # its chance; the gate inside dream decides whether it runs.
+        background.add_task(
+            run_dream_after_turn, memory_port, thread_id=thread_id
+        )
         return StreamingResponse(
             event_stream(),
             media_type="text/event-stream",
@@ -1560,8 +1578,10 @@ def build_router(
     @router.post("/threads/{thread_id}/resume")
     def resume_thread(
         thread_id: str,
+        background: BackgroundTasks,
         graph: Any = Depends(get_graph),
         store: ThreadStore = Depends(get_thread_store),
+        memory_port: Any = Depends(get_memory_port),
     ) -> Response:
         """T4 crash resume (spec line 39 / ADR 0026 / ADR 0018).
 
@@ -1715,6 +1735,9 @@ def build_router(
                 answer_reset=outcome.answer_reset,
             )
 
+        background.add_task(
+            run_dream_after_turn, memory_port, thread_id=thread_id
+        )
         return StreamingResponse(
             event_stream(),
             media_type="text/event-stream",
@@ -1898,7 +1921,12 @@ def build_router(
 
 
 def mount(
-    app: FastAPI, *, get_graph, get_thread_store, get_watchlist_store=None
+    app: FastAPI,
+    *,
+    get_graph,
+    get_thread_store,
+    get_watchlist_store=None,
+    get_memory_port=None,
 ) -> None:
     """Mount the workspace routes onto an existing FastAPI app."""
     app.include_router(
@@ -1906,6 +1934,7 @@ def mount(
             get_graph=get_graph,
             get_thread_store=get_thread_store,
             get_watchlist_store=get_watchlist_store,
+            get_memory_port=get_memory_port,
         )
     )
 
