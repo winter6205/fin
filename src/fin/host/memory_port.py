@@ -17,13 +17,23 @@ requires an MCP server: MCP is only ever a dream transport target
 from __future__ import annotations
 
 import os
-from typing import Mapping, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Mapping, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from fin.host.memory_dream import MemoryDreamBackend
 
 
 MEMORY_ENABLED_ENV_VAR = "FIN_MEMORY_ENABLED"
 CHECKPOINT_URL_ENV_VAR = "FIN_CHECKPOINT_URL"
 DEFAULT_MEMORY_LIMIT = 8
 MEMORY_LIMIT_CAP = 20
+
+# ADR 0035: retrieve MCP and memory MCP must not share one implied
+# config, so the dream transport gets its own key next to
+# FIN_MEMORY_ENABLED.
+MEMORY_DREAM_BACKEND_ENV_VAR = "FIN_MEMORY_DREAM_BACKEND"
+DEFAULT_MEMORY_DREAM_BACKEND = "null"
+MEMORY_DREAM_BACKEND_KINDS = ("null",)
 
 _FALSE_VALUES = frozenset({"", "0", "false", "no", "off"})
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -169,8 +179,29 @@ def _read_enabled(env: Mapping[str, str]) -> bool:
     )
 
 
+def build_memory_dream_backend(kind: str) -> MemoryDreamBackend:
+    """Instantiate the dream transport named by ``kind``.
+
+    ``null`` is the only wired kind: T6d owns the iknow-memory transport.
+    Anything else raises instead of falling back, so a misspelled key
+    stops the boot rather than silently disabling transport.
+    """
+    # Imported here so this module stays the seam: the implementations
+    # depend on it, never the other way round.
+    from fin.host.memory_dream import NullDreamBackend
+
+    if (kind or "").strip().lower() == "null":
+        return NullDreamBackend()
+    raise MemoryConfigError(
+        f"unknown memory dream backend {kind!r}; the wired kinds are "
+        f"{', '.join(MEMORY_DREAM_BACKEND_KINDS)}"
+    )
+
+
 def build_memory_port(
-    *, env: Mapping[str, str] | None = None
+    *,
+    env: Mapping[str, str] | None = None,
+    dream_backend_kind: str | None = None,
 ) -> MemoryPort:
     """Build the configured memory port, defaulting to OFF.
 
@@ -189,12 +220,18 @@ def build_memory_port(
             f"configured ({CHECKPOINT_URL_ENV_VAR} is unset)"
         )
 
-    # Imported here so this module stays the seam: the implementations
-    # depend on it, never the other way round.
     from fin.host.db_pool import create_postgres_pool
     from fin.host.memory_buffer import PostgresMemoryBuffer
 
-    return PostgresMemoryBuffer(create_postgres_pool(url))
+    kind = (
+        DEFAULT_MEMORY_DREAM_BACKEND
+        if dream_backend_kind is None
+        else dream_backend_kind
+    )
+    return PostgresMemoryBuffer(
+        create_postgres_pool(url),
+        backend=build_memory_dream_backend(kind),
+    )
 
 
 # Friendly names for callers that describe this seam as an env-backed port.
@@ -204,7 +241,10 @@ memory_port_from_env = build_memory_port
 
 __all__ = [
     "CHECKPOINT_URL_ENV_VAR",
+    "DEFAULT_MEMORY_DREAM_BACKEND",
     "DEFAULT_MEMORY_LIMIT",
+    "MEMORY_DREAM_BACKEND_ENV_VAR",
+    "MEMORY_DREAM_BACKEND_KINDS",
     "MEMORY_ENABLED_ENV_VAR",
     "MEMORY_LIMIT_CAP",
     "DreamCursorError",
@@ -217,6 +257,7 @@ __all__ = [
     "MemoryPortError",
     "OffMemory",
     "OffMemoryAdapter",
+    "build_memory_dream_backend",
     "build_memory_port",
     "memory_port_from_env",
 ]

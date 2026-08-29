@@ -29,10 +29,10 @@ from typing import Protocol, Sequence
 from fin.host.memory_port import (
     DEFAULT_MEMORY_LIMIT,
     MEMORY_LIMIT_CAP,
-    DreamCursorError,
     DreamInputError,
     DreamTransportError,
     MemoryDreamError,
+    MemoryPort,
 )
 from fin.host.memory_store import (
     DreamCursor,
@@ -136,7 +136,12 @@ class DreamSummarizer(Protocol):
 
 
 class NullDreamSummarizer:
-    """The default summarizer: no model call, the batch passes through."""
+    """An explicit no-op summarizer: no model call, the batch passes through.
+
+    Not the default — :class:`MemoryDream` defaults to no summarizer at
+    all, which is the same outcome by a shorter path. This exists so a
+    caller can name "condensation is off" instead of relying on absence.
+    """
 
     def summarize(
         self, memories: Sequence[ScoredMemory]
@@ -157,6 +162,33 @@ class NullDreamBackend:
 
     def persist(self, memories: Sequence[dict[str, object]]) -> int:
         return 0
+
+
+def run_dream_after_turn(port: MemoryPort, *, thread_id: str) -> None:
+    """Run one dream window now that the turn's response is delivered.
+
+    This is the reason dream is not a graph node (CONTEXT.md:46): by the
+    time this runs the operator already has their answer, so transport
+    latency and failure are invisible to the turn.
+
+    Memory OFF is a hard skip: SC2 requires the default boot to do no
+    dream work at all, so an OFF port is not even asked.
+
+    Nothing may raise out of here. Starlette runs background tasks
+    without isolation, so an escaping exception would turn a turn that
+    already succeeded into a broken response (SC21).
+    """
+    if not port.enabled:
+        return
+    try:
+        result = port.dream()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "memory dream failed after thread %s; the turn is unaffected",
+            thread_id,
+        )
+        return
+    logger.info("memory dream after thread %s: %s", thread_id, result)
 
 
 @dataclass(frozen=True)
@@ -242,11 +274,25 @@ class MemoryDream:
             return self._consolidate(
                 rows, at=at, limit=resolved_limit, seen=frozenset(seen)
             )
-        except MemoryDreamError:
-            self._cursors.advance(
-                at=at, seen_thread_ids=frozenset(seen), last_status="error"
-            )
+        except Exception:
+            # ``claim`` already consumed the window, so the cursor must
+            # stop claiming to be mid-run. A pool outage or an unusable
+            # row raises OUTSIDE the MemoryDreamError family, and a
+            # cursor stuck at "running" would misreport why dream went
+            # quiet for the next interval.
+            self._record_failure(at=at, seen=frozenset(seen))
             raise
+
+    def _record_failure(self, *, at: datetime, seen: frozenset[str]) -> None:
+        """Mark the claimed window failed without masking the cause."""
+        try:
+            self._cursors.advance(
+                at=at, seen_thread_ids=seen, last_status="error"
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "memory dream failed and the cursor could not record it"
+            )
 
     def _consolidate(
         self,
@@ -368,7 +414,6 @@ __all__ = [
     "SCORE_SINGLE_HIT",
     "SELECTION_THRESHOLD",
     "TRANSPORT_RETENTION_DAYS",
-    "DreamCursorError",
     "DreamGate",
     "DreamInputError",
     "DreamSummarizer",
@@ -380,4 +425,5 @@ __all__ = [
     "NullDreamBackend",
     "NullDreamSummarizer",
     "ScoredMemory",
+    "run_dream_after_turn",
 ]
