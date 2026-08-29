@@ -1395,7 +1395,15 @@ def build_router(
         # not a continuation. ``messages`` keeps accumulating via
         # ``add_messages``; the helper clears the six run-scoped
         # fields per ADR 0016 / spec line 34.
-        config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+        config: dict[str, Any] = {
+            "configurable": {
+                "thread_id": thread_id,
+                # LangGraph persists configurable.run_id in checkpoint
+                # metadata. Keeping the HTTP run id there makes a later
+                # crash resume address the same canonical run.
+                "run_id": run_id,
+            }
+        }
         thinking_type = "adaptive" if body.thinking else "disabled"
         if not body.thinking:
             # T3 (#34): the operator's thinking preference rides the
@@ -1631,12 +1639,25 @@ def build_router(
         if not hasattr(graph, "pending_nodes") or not graph.pending_nodes(thread_id):
             return Response(status_code=204)
 
-        # Mint a NEW run id for the resumed remainder. The prior
-        # run's turn row already exists in the store; this row holds
-        # whatever the remainder produces. The SSE ``status`` frame
-        # carries this id so the SPA can reconcile its optimistic
-        # turn with the persisted rows.
-        run_id = str(uuid.uuid4())
+        # Reuse the id attached to the recoverable checkpoint. A resume
+        # continues the in-flight run; minting here would split the SSE
+        # turn from the canonical checkpoint identity.
+        run_id = (
+            graph.checkpoint_run_id(thread_id)
+            if hasattr(graph, "checkpoint_run_id")
+            else None
+        )
+        if not run_id:
+            return JSONResponse(
+                status_code=500,
+                content={"error": "resume_run_id_unavailable"},
+            )
+        resume_config: dict[str, Any] = {
+            "configurable": {
+                "thread_id": thread_id,
+                "run_id": run_id,
+            }
+        }
 
         def event_stream() -> Iterator[str]:
             """Yield the resumed remainder on the SAME delta wire.
@@ -1665,7 +1686,7 @@ def build_router(
                     graph,
                     run_id=run_id,
                     input_value=None,
-                    config={"configurable": {"thread_id": thread_id}},
+                    config=resume_config,
                     seen_message_ids=seen_message_ids,
                     thread_id=thread_id,
                     stop_token=stop_token,

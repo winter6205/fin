@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import json
 import threading
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Iterable, Literal, TypedDict
 
@@ -2135,6 +2136,20 @@ class _LockedGraph:
         )
         return tuple(snapshot.next or ())
 
+    def checkpoint_run_id(self, thread_id: str) -> str | None:
+        """Return the canonical run id stored on the latest checkpoint.
+
+        LangGraph records ``configurable.run_id`` as checkpoint metadata.
+        The workspace resume route uses this seam instead of minting a
+        second id or reaching through the compiled graph internals.
+        """
+        snapshot = self._graph.get_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        metadata = snapshot.metadata or {}
+        run_id = metadata.get("run_id")
+        return run_id if isinstance(run_id, str) and run_id else None
+
     def checkpoint_message_ids(self, thread_id: str) -> set[str]:
         """Return the message ids on ``thread_id``'s latest checkpoint.
 
@@ -2221,9 +2236,19 @@ class _LockedGraph:
         thread_id = self._extract_thread_id(config)
         lock = self._acquire_thread(thread_id)
         try:
+            effective_config = self._apply_recursion_limit(config)
+            if input is not None:
+                configurable = dict(
+                    effective_config.get("configurable") or {}
+                )
+                # Direct graph callers may omit the HTTP-owned id; mint
+                # it at the start of a fresh run so its checkpoint can
+                # still be resumed without minting on the resume path.
+                configurable.setdefault("run_id", str(uuid.uuid4()))
+                effective_config["configurable"] = configurable
             yield from self._graph.stream(
                 input,
-                self._apply_recursion_limit(config),
+                effective_config,
                 **kwargs,
             )
         finally:
