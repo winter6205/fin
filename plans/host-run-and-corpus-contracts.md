@@ -51,49 +51,49 @@ minimal-change-verifier: yes — 与「一次提交修完全部可靠性」冲�
    - **Inherits:** `specs/workspace.md`："Process died: open/resume the thread with `stream(None)` (no new HumanMessage) on the same `thread_id` / `run_id` from the last complete node"；CONTEXT **run**："Crash resume continues that in-flight `run_id`"。
    - **Surface:** host / workspace HTTP 与 run 持久化（既有 thread/run/SSE 能力）。
    - **Acceptance:** 创建可恢复 checkpoint 后调用 resume：SSE `status`、optimistic turn、最终存储记录使用同一个规范 `run_id`；不得因 resume 再 mint 一个无法对账的新 UUID。既有 pytest workspace/resume 相关套件保持绿。
-   - Status: [ ] pending
+   - Status: [x] done
 
 2. **Stop 之后同一 thread 可再 send** — tag: `[implementation]`
    - **Inherits:** CONTEXT **run**："at most one run is active per thread"；`done` / `refuse` / `step_cap` 结束 run，follow-up 是新 run。cooperative stop 结束的是 **active run**，不得留下第二个 user message 属于被停的那一跑，也不得让后续 send 得到 409。
    - **Surface:** host / workspace HTTP 与 run 控制。
    - **Acceptance:** 在阻塞的 scripted run 上 stop → HTTP 200 且带被停 `run_id`；随后 send 非 409；被停那一跑的 HumanMessage 条数不因 stop 再增一条；终端事件顺序仍可结束为 status + answer + citations（或该 track 的既有终端形状）。
    - [blocks: T1]
-   - Status: [ ] pending
+   - Status: [x] done
 
 3. **[parallel] MCP 业务请求前完成 initialize 握手** — tag: `[implementation]`
    - **Inherits:** ADR 0032："the product adapter is an MCP 2.0 client (initialize → tools/call)"；`specs/s1-corpus-retrieve.md`：`retrieve_unavailable` "does not return `{chunks:[]}` as if a miss"。
    - **Surface:** retrieve 能力切片（MCP adapter）。
    - **Acceptance:** 记录请求顺序的 fixture：业务 retrieve 之前依次出现 initialize 与 initialized；握手失败 → `{error: "retrieve_unavailable"}`，无成功 chunks。默认 `uv run pytest -q` 仍不依赖 live MCP；协议级断言走既有 `mcp` mark 或与之等价的 opt-in。
    - [parallel]
-   - Status: [ ] pending
+   - Status: [x] done
 
 4. **[parallel] 损坏的 extracted index fail-closed** — tag: `[implementation]`
    - **Inherits:** `specs/s1-corpus-retrieve.md` 对 ingest 失败的 fail-closed 精神（`sec_http_fail` / `ocr_required_unavailable`：失败不得把该单位标 complete）；malformed 已存在的 `_index.json` 视为损坏，不是 missing。
    - **Surface:** corpus ingest。
    - **Acceptance:** 写入 malformed index 后跑 ingest：进程非零、typed ingest error、原始文件字节不变；不得走「当缺失然后重建覆盖」路径。缺文件（真正 missing）仍允许初始化。
    - [parallel]
-   - Status: [ ] pending
+   - Status: [x] done
 
 5. **Live fetch 原子发布且登记 catalog** — tag: `[implementation]`
    - **Inherits:** `specs/s1-corpus-retrieve.md`：`sec_http_fail` 时 "no catalog row marked complete for that accession"；成功路径必须让 catalog / `list_files` 能发现该 accession。
    - **Surface:** corpus live fetch 与 catalog/manifest。
    - **Acceptance:** 成功 live ingest 后 extracted index **与** manifest 都含该 accession，`list_files` 能列出。在 page 写入后注入异常：可见树不出现未提交 accession，既有 index 与 manifest 不变。公开 API 不得再忽略调用方传入的 manifest 路径。
    - [parallel] 相对 T1–T3；与 T4 同属 corpus，若共享 index 读写则实施时接在 T4 之后，否则可并行。
-   - Status: [ ] pending
+   - Status: [x] done
 
 6. **[parallel] Watchlist 非法形状与跨实例写入** — tag: `[implementation]`
    - **Inherits:** 失败须 typed，不得依赖 Python 属性错误；持久化错误不得静默改写输入文件。并发一致性是 store 边界契约，不是实例内 `threading.Lock` 的实现细节。
    - **Surface:** host watchlist 持久化。
    - **Acceptance:** 根值为 `[]`、标量、缺字段、字段类型错误 → 均为 `WatchlistError`，文件字节不变；空/缺文件仍保持既有默认空表语义。两个独立 store（最好跨进程）并发 add 两个 issuer：最终集合恰好两项、JSON 可解析、重复 add 幂等。
    - [parallel]
-   - Status: [ ] pending
+   - Status: [x] done
 
 7. **[parallel] Stream harness 尊重 child exit 与 FAIL 行格式** — tag: `[implementation]`
    - **Inherits:** 检测器/harness 不得把「stdout 有 PASS JSON」当成成功；非零 child 必须是 machine-visible failure。
    - **Surface:** 既有 workspace stream check scripts。
    - **Acceptance:** fake child stdout 为全 PASS JSON 但 exit 非零 → runner 不成功退出。注入一个失败 check：文本含 protocol 的 `[FAIL]` 行（或与之等价、可机器解析的单一 formatter 输出），且最终 exit 非成功。`--help` 成功不替代本弹。
    - [parallel]
-   - Status: [ ] pending
+   - Status: [x] done
 
 ## Code review phase（整轮结束后）
 
