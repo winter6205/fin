@@ -65,11 +65,13 @@ import html.parser
 import json
 import os
 import re
+import shutil
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-from fin.corpus.errors import IngestMissingError
+from fin.corpus.errors import IngestMissingError, MalformedExtractedIndexError
 
 
 # Import at module level so tests can mock
@@ -393,19 +395,37 @@ def _read_index_documents(index_path: Path) -> dict[str, dict[str, object]]:
     query SSOT (ADR 0020).
     """
     if not index_path.is_file():
-        return {}
+        raise MalformedExtractedIndexError(
+            f"extracted index is not a regular file: {index_path}"
+        )
     try:
         payload = json.loads(index_path.read_text())
-    except (json.JSONDecodeError, OSError) as exc:
-        raise IngestMissingError(
-            f"refusing to merge into an unreadable index: {index_path}"
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        raise MalformedExtractedIndexError(
+            f"malformed extracted index: {index_path}"
         ) from exc
-    documents = payload.get("documents") if isinstance(payload, dict) else None
-    if not isinstance(documents, dict):
-        raise IngestMissingError(
-            f"refusing to merge into an index with no 'documents' object: "
-            f"{index_path}"
+    if not isinstance(payload, dict):
+        raise MalformedExtractedIndexError(
+            f"extracted index must be a JSON object: {index_path}"
         )
+    documents = payload.get("documents")
+    if not isinstance(documents, dict):
+        raise MalformedExtractedIndexError(
+            f"extracted index has no 'documents' object: {index_path}"
+        )
+    for document_id, entry in documents.items():
+        if (
+            not isinstance(document_id, str)
+            or not isinstance(entry, dict)
+            or not isinstance(entry.get("version"), str)
+            or not entry["version"]
+            or not isinstance(entry.get("page_count"), int)
+            or isinstance(entry["page_count"], bool)
+            or entry["page_count"] < 0
+        ):
+            raise MalformedExtractedIndexError(
+                f"extracted index has an invalid document record: {index_path}"
+            )
     return documents
 
 
@@ -416,6 +436,7 @@ def _write_live_unit(
     source_url: str,
     extracted_root: Path,
     facts_root: Path,
+    existing_documents: dict[str, dict[str, object]] | None = None,
 ) -> str:
     """Freeze the primary document into the extracted tree.
 
@@ -429,7 +450,11 @@ def _write_live_unit(
 
     index_path = extracted_root / "_index.json"
     extracted_root.mkdir(parents=True, exist_ok=True)
-    documents = _read_index_documents(index_path)
+    documents = (
+        dict(existing_documents)
+        if existing_documents is not None
+        else _read_index_documents(index_path)
+    )
 
     doc_dir = extracted_root / accession
     doc_dir.mkdir(parents=True, exist_ok=True)
@@ -476,6 +501,156 @@ def _write_live_unit(
     return version
 
 
+def _read_manifest_payload(manifest_path: Path) -> dict[str, object]:
+    """Read the catalog manifest before staging any live artifacts.
+
+    A missing manifest is the initialization case. A present malformed
+    manifest is corruption, not an empty catalog, because treating it as
+    empty would discard rows owned by another ingest path.
+    """
+    if not manifest_path.exists():
+        return {"documents": []}
+    try:
+        payload = json.loads(manifest_path.read_text())
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        raise IngestMissingError(
+            f"refusing to merge into an unreadable manifest: {manifest_path}"
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(
+        payload.get("documents"), list
+    ):
+        raise IngestMissingError(
+            f"manifest has no 'documents' list: {manifest_path}"
+        )
+    if any(not isinstance(document, dict) for document in payload["documents"]):
+        raise IngestMissingError(
+            f"manifest has an invalid document record: {manifest_path}"
+        )
+    return payload
+
+
+def _live_manifest_payload(
+    *,
+    manifest_payload: dict[str, object],
+    cik: str,
+    accession: str,
+    primary_url: str,
+    body: bytes,
+    version: str,
+) -> dict[str, object]:
+    """Return a manifest copy with the live accession registered.
+
+    Existing metadata for the same accession is reused when available.
+    A fetch with no prior catalog row gets explicit placeholder values
+    for fields that cannot be inferred from the two live-fetch inputs.
+    """
+    documents = list(manifest_payload["documents"])
+    template: dict[str, object] = {}
+    for document in documents:
+        if document.get("document_id") == accession or document.get(
+            "accession"
+        ) == accession:
+            template = dict(document)
+            break
+
+    filename = primary_url.rsplit("/", 1)[-1]
+    row = {
+        **template,
+        "document_id": accession,
+        "source_id": template.get("source_id", f"EDGAR-{cik}"),
+        "company": template.get("company", cik),
+        "ticker": template.get("ticker"),
+        "cik": cik,
+        "accession": accession,
+        "filing_date": template.get("filing_date"),
+        "form": template.get("form"),
+        "period": template.get("period", "live"),
+        "doc_type": template.get("doc_type", template.get("form")),
+        "filename": filename,
+        "upstream_name": template.get("upstream_name", filename),
+        "bytes": len(body),
+        "sha256": version,
+    }
+    documents = [
+        document
+        for document in documents
+        if document.get("document_id") != accession
+    ]
+    documents.append(row)
+    return {**manifest_payload, "documents": documents}
+
+
+def _move_to_backup(target: Path, backup: Path) -> bool:
+    """Move an existing publish target aside on the same filesystem."""
+    if not target.exists():
+        return False
+    os.replace(target, backup)
+    return True
+
+
+def _rollback_publish(
+    *,
+    published: list[Path],
+    backups: list[tuple[Path, Path]],
+) -> None:
+    """Restore targets after a failed multi-file publish attempt."""
+    for target in reversed(published):
+        if target.is_dir():
+            shutil.rmtree(target)
+        elif target.exists():
+            target.unlink()
+    for target, backup in reversed(backups):
+        if backup.exists():
+            os.replace(backup, target)
+
+
+def _publish_staged(
+    *,
+    staged_doc_dir: Path,
+    staged_index: Path,
+    staged_facts: Path,
+    staged_manifest: Path,
+    extracted_root: Path,
+    facts_root: Path,
+    manifest_path: Path,
+) -> None:
+    """Publish prepared artifacts with rollback across all four targets.
+
+    Page and passage files are only written below staging directories.
+    The commit then replaces the accession directory, extracted index,
+    facts row, and manifest in that order; manifest is last so catalog
+    readers never discover an accession before its extracted artifacts.
+    """
+    targets = [
+        (staged_doc_dir, extracted_root / staged_doc_dir.name, extracted_root),
+        (staged_facts, facts_root / staged_facts.name, facts_root),
+        (staged_index, extracted_root / "_index.json", extracted_root),
+        (staged_manifest, manifest_path, manifest_path.parent),
+    ]
+    backup_dirs: dict[Path, Path] = {}
+    for _staged, target, parent in targets:
+        backup_dirs.setdefault(
+            parent,
+            Path(tempfile.mkdtemp(prefix=".live-publish-backup-", dir=parent)),
+        )
+
+    published: list[Path] = []
+    backups: list[tuple[Path, Path]] = []
+    try:
+        for staged, target, parent in targets:
+            backup = backup_dirs[parent] / target.name
+            if _move_to_backup(target, backup):
+                backups.append((target, backup))
+            os.replace(staged, target)
+            published.append(target)
+    except BaseException:
+        _rollback_publish(published=published, backups=backups)
+        raise
+    finally:
+        for backup_dir in backup_dirs.values():
+            shutil.rmtree(backup_dir, ignore_errors=True)
+
+
 def fetch_and_ingest(
     *,
     cik: str,
@@ -509,19 +684,62 @@ def fetch_and_ingest(
         base_url=base_url, ua=ua, accession=accession, primary_doc=primary_doc
     )
     body = _sec_get(primary_url, ua, accession=accession)
-    _write_live_unit(
-        accession=accession,
-        body=body,
-        source_url=primary_url,
-        extracted_root=extracted_root,
-        facts_root=facts_root,
+    manifest_payload = _read_manifest_payload(manifest_path)
+    existing_documents = _read_index_documents(
+        extracted_root / "_index.json"
+    ) if (extracted_root / "_index.json").exists() else {}
+    version = _sha256_bytes(body)
+
+    extracted_root.parent.mkdir(parents=True, exist_ok=True)
+    facts_root.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    staged_extracted = Path(
+        tempfile.mkdtemp(prefix=".live-fetch-", dir=extracted_root.parent)
     )
-    # The ``manifest_path`` argument is part of the public API; the
-    # full manifest update (a catalog row keyed by ``accession``) lands
-    # when the live path can supply the row's company / period fields
-    # the frozen-12 rows carry. Until then the live tree is
-    # reachable by locator but not listed by ``list_files``.
-    _ = manifest_path
+    staged_facts_root = Path(
+        tempfile.mkdtemp(prefix=".live-fetch-facts-", dir=facts_root.parent)
+    )
+    staged_manifest_root = Path(
+        tempfile.mkdtemp(prefix=".live-fetch-manifest-", dir=manifest_path.parent)
+    )
+    try:
+        _write_live_unit(
+            accession=accession,
+            body=body,
+            source_url=primary_url,
+            extracted_root=staged_extracted,
+            facts_root=staged_facts_root,
+            existing_documents=existing_documents,
+        )
+        staged_manifest = staged_manifest_root / manifest_path.name
+        _atomic_write(
+            staged_manifest,
+            _dump(
+                _live_manifest_payload(
+                    manifest_payload=manifest_payload,
+                    cik=cik,
+                    accession=accession,
+                    primary_url=primary_url,
+                    body=body,
+                    version=version,
+                )
+            ),
+        )
+        extracted_root.mkdir(parents=True, exist_ok=True)
+        facts_root.mkdir(parents=True, exist_ok=True)
+        _publish_staged(
+            staged_doc_dir=staged_extracted / accession,
+            staged_index=staged_extracted / "_index.json",
+            staged_facts=staged_facts_root / f"{accession}.json",
+            staged_manifest=staged_manifest,
+            extracted_root=extracted_root,
+            facts_root=facts_root,
+            manifest_path=manifest_path,
+        )
+    finally:
+        shutil.rmtree(staged_extracted, ignore_errors=True)
+        shutil.rmtree(staged_facts_root, ignore_errors=True)
+        shutil.rmtree(staged_manifest_root, ignore_errors=True)
     return body
 
 
