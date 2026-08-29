@@ -16,13 +16,14 @@ from __future__ import annotations
 import copy
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal, Protocol, Sequence, cast
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from fin.host.db_pool import PostgresPool
+from fin.host.memory_port import DreamCursorError, DreamInputError
 
 
 MEMORY_TABLE = "fin_memory"
@@ -107,7 +108,24 @@ class MemoryStore(Protocol):
         ...
 
     def disable(self, row_id: str, *, reason: str, at: datetime) -> None:
-        """Soft-disable one row, recording why and when."""
+        """Soft-disable one row, recording why and when.
+
+        Unknown ids are ignored: callers select candidates from
+        :meth:`rows`, so an id that has gone missing is a row another
+        worker already retired, not an error.
+        """
+        ...
+
+    def mark_transported(self, ids: Sequence[str], *, at: datetime) -> None:
+        """Retire rows the backend confirmed it stored."""
+        ...
+
+    def delete_transported_before(self, cutoff: datetime) -> int:
+        """Hard-delete transported rows older than ``cutoff``.
+
+        Only transported rows are eligible; a local buffer row that was
+        never handed to a backend is never deleted (SC19).
+        """
         ...
 
 
@@ -151,6 +169,28 @@ class InProcessMemoryStore:
             row.disabled_reason = reason
             row.disabled_at = at
 
+    def mark_transported(self, ids: Sequence[str], *, at: datetime) -> None:
+        with self._lock:
+            for row_id in ids:
+                row = self._rows.get(row_id)
+                if row is None:
+                    continue
+                row.status = "disabled"
+                row.disabled_reason = "transported"
+                row.disabled_at = at
+                row.transported_at = at
+
+    def delete_transported_before(self, cutoff: datetime) -> int:
+        with self._lock:
+            stale = [
+                row_id
+                for row_id, row in self._rows.items()
+                if row.transported_at is not None and row.transported_at <= cutoff
+            ]
+            for row_id in stale:
+                del self._rows[row_id]
+        return len(stale)
+
 
 class PostgresMemoryStore:
     """Row store backed by ``fin_memory`` over an explicit Postgres pool.
@@ -165,10 +205,7 @@ class PostgresMemoryStore:
 
     def setup(self) -> None:
         """Create the memory tables if they are missing. Safe to re-run."""
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(MEMORY_SCHEMA_SQL)
-            conn.commit()
+        ensure_memory_schema(self._pool)
 
     def add(self, row: MemoryRow) -> None:
         with self._pool.connection() as conn:
@@ -227,20 +264,79 @@ class PostgresMemoryStore:
                 )
             conn.commit()
 
+    def mark_transported(self, ids: Sequence[str], *, at: datetime) -> None:
+        if not ids:
+            return
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE fin_memory SET status = 'disabled', "
+                    "disabled_reason = 'transported', disabled_at = %s, "
+                    "transported_at = %s WHERE id = ANY(%s)",
+                    (at, at, list(ids)),
+                )
+            conn.commit()
+
+    def delete_transported_before(self, cutoff: datetime) -> int:
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM fin_memory WHERE transported_at IS NOT NULL "
+                    "AND transported_at <= %s",
+                    (cutoff,),
+                )
+                deleted = cur.rowcount
+            conn.commit()
+        return deleted
+
 
 def _row_from_record(record: dict[str, object]) -> MemoryRow:
     metadata = record["metadata"]
+    if not isinstance(metadata, dict):
+        raise DreamInputError(
+            f"memory row metadata is not an object: {metadata!r}"
+        )
     return MemoryRow(
         id=str(record["id"]),
         text=str(record["text"]),
-        metadata=dict(metadata) if isinstance(metadata, dict) else {},
-        created_at=_as_datetime(record["created_at"]),
+        metadata=dict(metadata),
+        created_at=_as_created_at(record["created_at"]),
         expires_at=_as_datetime(record["expires_at"]),
         hit_count=int(record["hit_count"]),  # type: ignore[arg-type]
         status=cast(MemoryStatus, record["status"]),
         disabled_reason=_as_optional_str(record["disabled_reason"]),
         disabled_at=_as_datetime(record["disabled_at"]),
         transported_at=_as_datetime(record["transported_at"]),
+    )
+
+
+def ensure_memory_schema(pool: PostgresPool) -> None:
+    """Create the memory tables if they are missing. Safe to re-run.
+
+    Shared by both Postgres stores so the DDL is stated once, and so
+    constructing a buffer's two stores runs it once per boot path
+    rather than twice.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(MEMORY_SCHEMA_SQL)
+        conn.commit()
+
+
+def _as_created_at(value: object) -> datetime:
+    """Coerce the non-nullable ``created_at`` column.
+
+    Loud rather than silent, for the same reason
+    :func:`parse_dream_cursor` rejects corruption instead of resetting:
+    a row whose creation time is unusable would otherwise reach the
+    scorer as ``None``, where ``now - row.created_at`` raises
+    ``TypeError`` — outside the ``MemoryDreamError`` family ``run()``
+    catches, leaving the cursor claimed and dream stalled for 24h.
+    """
+    if isinstance(value, datetime):
+        return value
+    raise DreamInputError(
+        f"memory row created_at is not a datetime: {value!r}"
     )
 
 
@@ -270,6 +366,44 @@ class DreamCursor:
     last_status: str | None = None
 
 
+def parse_dream_cursor(
+    last_dream_at: object,
+    seen_thread_ids: object,
+    last_status: object,
+) -> DreamCursor:
+    """Build a cursor from a stored payload, rejecting corruption.
+
+    Both cursor stores funnel through here so a corrupt cursor raises
+    :class:`DreamCursorError` in the process-local store and in Postgres
+    alike, instead of one silently resetting and the other crashing.
+    """
+    if last_dream_at is not None and not isinstance(last_dream_at, datetime):
+        raise DreamCursorError(
+            f"dream cursor last_dream_at is not a datetime: {last_dream_at!r}"
+        )
+    if isinstance(seen_thread_ids, (str, bytes)) or not isinstance(
+        seen_thread_ids, (list, tuple, set, frozenset)
+    ):
+        raise DreamCursorError(
+            f"dream cursor seen_thread_ids is not a list of ids: "
+            f"{seen_thread_ids!r}"
+        )
+    if not all(isinstance(value, str) for value in seen_thread_ids):
+        raise DreamCursorError(
+            f"dream cursor seen_thread_ids holds a non-string: "
+            f"{seen_thread_ids!r}"
+        )
+    if last_status is not None and not isinstance(last_status, str):
+        raise DreamCursorError(
+            f"dream cursor last_status is not a string: {last_status!r}"
+        )
+    return DreamCursor(
+        last_dream_at=last_dream_at,
+        seen_thread_ids=frozenset(seen_thread_ids),
+        last_status=last_status,
+    )
+
+
 class DreamCursorStore(Protocol):
     """Durable dream cursor, deliberately not in Redis (``CONTEXT.md:42``)."""
 
@@ -287,6 +421,23 @@ class DreamCursorStore(Protocol):
         """Replace the cursor with the state after one dream window."""
         ...
 
+    def claim(
+        self,
+        *,
+        at: datetime,
+        min_interval: timedelta,
+        seen_thread_ids: frozenset[str],
+        last_status: str,
+    ) -> bool:
+        """Take the window that opened at ``at``, or report a loss.
+
+        Compare-and-swap on ``last_dream_at``: the write only lands when
+        the previous dream is at least ``min_interval`` old. Concurrent
+        callers therefore lose the race instead of running the dream twice
+        (SC16).
+        """
+        ...
+
 
 class InProcessDreamCursorStore:
     """Process-local cursor. Loses its position on restart, like its store."""
@@ -297,7 +448,10 @@ class InProcessDreamCursorStore:
 
     def load(self) -> DreamCursor:
         with self._lock:
-            return self._cursor
+            cursor = self._cursor
+        return parse_dream_cursor(
+            cursor.last_dream_at, sorted(cursor.seen_thread_ids), cursor.last_status
+        )
 
     def advance(
         self,
@@ -313,6 +467,25 @@ class InProcessDreamCursorStore:
                 last_status=last_status,
             )
 
+    def claim(
+        self,
+        *,
+        at: datetime,
+        min_interval: timedelta,
+        seen_thread_ids: frozenset[str],
+        last_status: str,
+    ) -> bool:
+        with self._lock:
+            previous = self._cursor.last_dream_at
+            if previous is not None and at - previous < min_interval:
+                return False
+            self._cursor = DreamCursor(
+                last_dream_at=at,
+                seen_thread_ids=frozenset(seen_thread_ids),
+                last_status=last_status,
+            )
+            return True
+
 
 class PostgresDreamCursorStore:
     """Cursor backed by the singleton ``fin_memory_dream_cursor`` row."""
@@ -322,10 +495,8 @@ class PostgresDreamCursorStore:
         self.setup()
 
     def setup(self) -> None:
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(MEMORY_SCHEMA_SQL)
-            conn.commit()
+        """Create the memory tables if they are missing. Safe to re-run."""
+        ensure_memory_schema(self._pool)
 
     def load(self) -> DreamCursor:
         with self._pool.connection() as conn:
@@ -340,21 +511,40 @@ class PostgresDreamCursorStore:
         if record is None:
             return DreamCursor()
 
-        seen = record["seen_thread_ids"]
-        seen_ids = frozenset(seen) if isinstance(seen, list) else frozenset()
-        return DreamCursor(
-            last_dream_at=_as_datetime(record["last_dream_at"]),
-            seen_thread_ids=seen_ids,
-            last_status=_as_optional_str(record["last_status"]),
+        return parse_dream_cursor(
+            record["last_dream_at"],
+            record["seen_thread_ids"],
+            record["last_status"],
         )
 
-    def advance(
+    def _upsert(
         self,
         *,
         at: datetime,
         seen_thread_ids: frozenset[str],
         last_status: str,
-    ) -> None:
+        not_before: datetime | None,
+    ) -> int:
+        """Write the singleton cursor row and report how many rows moved.
+
+        ``not_before`` turns the write into a compare-and-swap: the row is
+        only replaced when the previous dream is old enough, so the second
+        of two concurrent callers moves nothing and loses the window.
+        """
+        guard = ""
+        params: list[object] = [
+            CURSOR_ID,
+            at,
+            Jsonb(sorted(seen_thread_ids)),
+            last_status,
+        ]
+        if not_before is not None:
+            guard = (
+                f" WHERE {CURSOR_TABLE}.last_dream_at IS NULL OR "
+                f"{CURSOR_TABLE}.last_dream_at <= %s"
+            )
+            params.append(not_before)
+
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -364,10 +554,44 @@ class PostgresDreamCursorStore:
                     "ON CONFLICT (id) DO UPDATE SET "
                     "last_dream_at = EXCLUDED.last_dream_at, "
                     "seen_thread_ids = EXCLUDED.seen_thread_ids, "
-                    "last_status = EXCLUDED.last_status",
-                    (CURSOR_ID, at, Jsonb(sorted(seen_thread_ids)), last_status),
+                    "last_status = EXCLUDED.last_status" + guard,
+                    params,
                 )
+                moved = cur.rowcount
             conn.commit()
+        return moved
+
+    def advance(
+        self,
+        *,
+        at: datetime,
+        seen_thread_ids: frozenset[str],
+        last_status: str,
+    ) -> None:
+        self._upsert(
+            at=at,
+            seen_thread_ids=seen_thread_ids,
+            last_status=last_status,
+            not_before=None,
+        )
+
+    def claim(
+        self,
+        *,
+        at: datetime,
+        min_interval: timedelta,
+        seen_thread_ids: frozenset[str],
+        last_status: str,
+    ) -> bool:
+        return (
+            self._upsert(
+                at=at,
+                seen_thread_ids=seen_thread_ids,
+                last_status=last_status,
+                not_before=at - min_interval,
+            )
+            > 0
+        )
 
 
 __all__ = [
