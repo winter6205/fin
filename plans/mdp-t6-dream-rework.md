@@ -70,7 +70,7 @@ OVERALL: PASS
      - 触发后推进游标（成功或跳过都推进）；同一窗口并发调用只执行一次。
      - 游标损坏 → `DreamCursorError`，不静默重置。
      - LLM 归纳默认关闭：OFF 下 dream 产生 0 次模型调用；开启后归纳失败 → `DreamInputError`，该批记忆保持原样留在 buffer，不丢弃、不部分落库。
-   - Status: [ ] pending
+   - Status: [x] done — `cursor/mdp-t6b-dream-scoring-gates`。新增 `src/fin/host/memory_dream.py`（`MemoryDreamScorer` 纯函数打分、`DreamGate` 双闸门、`MemoryDreamBackend`/`DreamSummarizer` 可注入接缝、`MemoryDream` 协调器）；异常谱系 `MemoryDreamError(MemoryPortError)` + 三子类落在 `memory_port.py`（避免 store↔dream 循环导入）；`LocalMemoryBuffer.dream()` 接管 T5 的 deferred 接线点；`gc()` 对已出库超 7 天行硬删。SC7–SC8、SC12–SC21 达成。
    - [blocks: T6a]
 
 3. **T6c — 接线装配与落库后状态流转** — tag: `[implementation]`
