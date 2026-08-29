@@ -21,11 +21,11 @@ server, no network, no SEC.
    is exercised against bytes a server really produced.
 
 The two layers are separate because the product adapter opens a fresh
-subprocess per call and sends ``tools/call`` alone; it never sends
-``initialize``. The fixture server is strict by default (``tools/call``
-before the handshake is a JSON-RPC ``-32002`` error), which pins that
-gap as a typed ``retrieve_unavailable`` EXIT rather than a crash, and
-``--allow-uninitialized`` serves the adapter's single-shot shape.
+subprocess per call and completes a full handshake on that connection.
+The fixture server is strict by default (``tools/call`` before the
+handshake is a JSON-RPC ``-32002`` error), which makes the ordering
+observable, and ``--allow-uninitialized`` remains available for
+single-shot transport tests.
 """
 
 from __future__ import annotations
@@ -379,10 +379,8 @@ def _loc(document_id: str, page: int = 1) -> Locator:
 def _lenient_command() -> list[str]:
     """Launch command for a server that skips the handshake requirement.
 
-    The product adapter opens a fresh subprocess per call and sends
-    ``tools/call`` alone, so a strict server would answer every call
-    with ``-32002``. ``--allow-uninitialized`` is the fixture's
-    accommodation of that single-shot shape.
+    The product adapter still handshakes, but this option keeps the
+    fixture useful for testing the single-shot tools-call shape.
     """
     return [sys.executable, str(_SERVER_PATH), "--allow-uninitialized"]
 
@@ -414,6 +412,45 @@ def test_adapter_over_real_stdio_transport_maps_hits_to_chunks() -> None:
         assert isinstance(chunk.source_ref, Locator)
         assert chunk.source_ref.document_id.startswith("DOC-")
     assert chunks == sorted(chunks, key=lambda c: c.score, reverse=True)
+
+
+def test_adapter_completes_handshake_before_tools_call(tmp_path: Path) -> None:
+    """The product adapter must send the MCP session handshake before
+    the first business request on the same stdio connection."""
+    trace_path = tmp_path / "mcp-methods.json"
+    adapter = MCPRetrieveAdapter(
+        command=[
+            sys.executable,
+            str(_SERVER_PATH),
+            "--record-methods",
+            str(trace_path),
+        ],
+        locator_map={"fixture-1": _loc("DOC-2023Q1")},
+        timeout_seconds=20.0,
+    )
+
+    result = adapter.retrieve("revenue")
+
+    assert "chunks" in result, result
+    assert trace_path.read_text(encoding="utf-8") == (
+        '["initialize", "notifications/initialized", "tools/call"]'
+    )
+
+
+def test_adapter_handshake_failure_returns_typed_exit() -> None:
+    """An initialize failure is unavailable, never a successful miss or
+    a partial chunks result."""
+    adapter = MCPRetrieveAdapter(
+        command=[
+            sys.executable,
+            str(_SERVER_PATH),
+            "--fail-initialize",
+        ],
+        locator_map={"fixture-1": _loc("DOC-2023Q1")},
+        timeout_seconds=20.0,
+    )
+
+    assert adapter.retrieve("revenue") == {"error": "retrieve_unavailable"}
 
 
 def test_adapter_over_real_transport_drops_unmapped_hits() -> None:
@@ -459,21 +496,17 @@ def test_adapter_over_real_transport_forwards_document_id_filter() -> None:
     assert document_ids == {"DOC-2023Q2"}
 
 
-def test_adapter_against_strict_server_returns_the_typed_exit() -> None:
-    """Against a handshake-strict server the adapter's un-negotiated
-    ``tools/call`` is refused, and that refusal surfaces as the typed
-    EXIT ``{"error": "retrieve_unavailable"}``.
-
-    The adapter is not yet an initialize-sending client; this pins the
-    gap to a contract the host already knows how to render, instead of
-    an exception or a fabricated empty result.
-    """
+def test_adapter_against_strict_server_completes_the_handshake() -> None:
+    """A handshake-strict MCP server accepts the product adapter's
+    initialized tools/call session."""
     adapter = MCPRetrieveAdapter(
         command=[sys.executable, str(_SERVER_PATH)],
         locator_map={"fixture-1": _loc("DOC-2023Q1")},
         timeout_seconds=20.0,
     )
-    assert adapter.retrieve("revenue") == {"error": "retrieve_unavailable"}
+    result = adapter.retrieve("revenue")
+    assert "chunks" in result, result
+    assert result["chunks"][0].source_ref == _loc("DOC-2023Q1")
 
 
 def test_adapter_against_a_crashing_server_returns_the_typed_exit() -> None:

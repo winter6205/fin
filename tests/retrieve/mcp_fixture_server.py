@@ -23,16 +23,16 @@ Handshake
 
 Strict by default: ``tools/list`` and ``tools/call`` before
 ``initialize`` answer JSON-RPC ``-32002``. The product adapter opens a
-fresh subprocess per call and sends ``tools/call`` with no preceding
-handshake, so ``--allow-uninitialized`` relaxes that check for the
-adapter-level tests. Keeping strict as the default is deliberate: the
-ordering requirement is what makes this a protocol test rather than a
-JSON echo.
+fresh subprocess per call and completes the handshake before the
+business request. ``--allow-uninitialized`` remains available for
+negative transport-shape tests. Keeping strict as the default is
+deliberate: the ordering requirement is what makes this a protocol
+test rather than a JSON echo.
 
 Usage
 -----
 
-``python tests/retrieve/mcp_fixture_server.py [--allow-uninitialized] [--crash]``
+``python tests/retrieve/mcp_fixture_server.py [--allow-uninitialized] [--fail-initialize] [--record-methods PATH] [--crash]``
 
 ``--crash`` exits non-zero on the first request, standing in for a
 server that dies mid-call.
@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+from pathlib import Path
 from typing import Any
 
 
@@ -159,8 +160,14 @@ def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:
 class FixtureServer:
     """Session state for one stdio connection."""
 
-    def __init__(self, *, allow_uninitialized: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        allow_uninitialized: bool = False,
+        fail_initialize: bool = False,
+    ) -> None:
         self.allow_uninitialized = allow_uninitialized
+        self.fail_initialize = fail_initialize
         self.initialized = False
 
     def handle(self, request: Any) -> dict[str, Any] | None:
@@ -175,6 +182,8 @@ class FixtureServer:
         if not isinstance(params, dict):
             return _error(request_id, INVALID_PARAMS, "params must be an object")
 
+        if method == "initialize" and self.fail_initialize:
+            return _error(request_id, INVALID_REQUEST, "initialize failed")
         if method == "initialize":
             return _result(request_id, self._initialize(params))
         if method.startswith("notifications/"):
@@ -258,7 +267,18 @@ class FixtureServer:
 
 
 def main(argv: list[str]) -> int:
-    server = FixtureServer(allow_uninitialized="--allow-uninitialized" in argv)
+    record_path: Path | None = None
+    if "--record-methods" in argv:
+        record_index = argv.index("--record-methods") + 1
+        if record_index >= len(argv):
+            raise SystemExit("--record-methods requires a path")
+        record_path = Path(argv[record_index])
+
+    server = FixtureServer(
+        allow_uninitialized="--allow-uninitialized" in argv,
+        fail_initialize="--fail-initialize" in argv,
+    )
+    recorded_methods: list[str] = []
     crash = "--crash" in argv
     for line in sys.stdin:
         line = line.strip()
@@ -272,9 +292,13 @@ def main(argv: list[str]) -> int:
         except ValueError as exc:
             _emit(_error(None, PARSE_ERROR, f"invalid JSON: {exc}"))
             continue
+        if isinstance(request, dict) and isinstance(request.get("method"), str):
+            recorded_methods.append(request["method"])
         response = server.handle(request)
         if response is not None:
             _emit(response)
+    if record_path is not None:
+        record_path.write_text(json.dumps(recorded_methods), encoding="utf-8")
     return 0
 
 
