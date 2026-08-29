@@ -31,6 +31,8 @@ from unittest import mock
 import pytest
 
 from fin.corpus.errors import IngestMissingError
+from fin.corpus import live_fetch
+from fin.corpus.catalog import list_filings
 from fin.corpus.live_fetch import (
     SecHttpFailError,
     SecPrimaryDocUnresolvedError,
@@ -138,6 +140,81 @@ def _roots(tmp_path: Path) -> dict[str, Path]:
         "extracted_root": tmp_path / "extracted",
         "facts_root": tmp_path / "facts",
     }
+
+
+# ---------- atomic publish + catalog registration ----------
+
+
+def test_successful_live_fetch_registers_accession_in_manifest_and_catalog(
+    tmp_path: Path,
+) -> None:
+    """A successful live fetch publishes one catalog-visible accession."""
+    roots = _roots(tmp_path)
+    calls: list[str] = []
+
+    with _scripted_sec({_INDEX_URL: _AAPL_LISTING, _PRIMARY_URL: _PRIMARY_HTML}, calls):
+        fetch_and_ingest(
+            cik=_CIK,
+            accession=_ACCESSION,
+            primary_doc="aapl-20230701.htm",
+            **roots,
+        )
+
+    manifest = json.loads(roots["manifest_path"].read_text())
+    row = next(
+        document
+        for document in manifest["documents"]
+        if document["document_id"] == _ACCESSION
+    )
+    assert row["accession"] == _ACCESSION
+
+    index = json.loads(
+        (roots["extracted_root"] / "_index.json").read_text()
+    )
+    assert _ACCESSION in index["documents"]
+
+    result = list_filings(
+        manifest_path=roots["manifest_path"],
+        extracted_root=roots["extracted_root"],
+    )
+    assert [filing["document_id"] for filing in result["filings"]] == [
+        _ACCESSION
+    ]
+
+
+def test_failure_after_staged_page_write_leaves_visible_publish_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page-write failure cannot expose an unregistered accession."""
+    roots = _roots(tmp_path)
+    roots["extracted_root"].mkdir(parents=True)
+    original_index = b'{"schema_version": 1, "documents": {}}\n'
+    (roots["extracted_root"] / "_index.json").write_bytes(original_index)
+    original_manifest = b'{"documents": []}\n'
+    roots["manifest_path"].write_bytes(original_manifest)
+
+    real_atomic_write = live_fetch._atomic_write
+
+    def fail_after_page_write(path: Path, payload: bytes) -> None:
+        real_atomic_write(path, payload)
+        if path.name == "page-001.json":
+            raise RuntimeError("injected page-write failure")
+
+    monkeypatch.setattr(live_fetch, "_atomic_write", fail_after_page_write)
+
+    with _scripted_sec({_PRIMARY_URL: _PRIMARY_HTML}, []):
+        with pytest.raises(RuntimeError, match="injected page-write failure"):
+            fetch_and_ingest(
+                cik=_CIK,
+                accession=_ACCESSION,
+                primary_doc="aapl-20230701.htm",
+                **roots,
+            )
+
+    assert not (roots["extracted_root"] / _ACCESSION).exists()
+    assert (roots["extracted_root"] / "_index.json").read_bytes() == original_index
+    assert roots["manifest_path"].read_bytes() == original_manifest
 
 
 # ---------- primary document resolution ----------
