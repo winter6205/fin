@@ -1,12 +1,17 @@
 """Switchable memory seam and the default OFF adapter.
 
 Memory is a host capability separate from filing retrieve.  This module
-only defines the transport-neutral port and its safe default; local-buffer
-and MCP-backed implementations belong to later memory tickets.
+only defines the transport-neutral port, its safe default, and the env
+wiring that picks an implementation.
 
 The default is deliberately OFF.  An explicit ON request fails loudly
 until an enabled backend is supplied, rather than silently changing the
 operator's requested mode back to OFF.
+
+ADR 0035 puts the working buffer in local Postgres, so ON resolves to the
+``fin_memory`` buffer behind ``FIN_CHECKPOINT_URL``.  Memory ON never
+requires an MCP server: MCP is only ever a dream transport target
+(``CONTEXT.md:42``).
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ from typing import Mapping, Protocol, runtime_checkable
 
 
 MEMORY_ENABLED_ENV_VAR = "FIN_MEMORY_ENABLED"
+CHECKPOINT_URL_ENV_VAR = "FIN_CHECKPOINT_URL"
 DEFAULT_MEMORY_LIMIT = 8
 MEMORY_LIMIT_CAP = 20
 
@@ -143,16 +149,27 @@ def build_memory_port(
 ) -> MemoryPort:
     """Build the configured memory port, defaulting to OFF.
 
-    The ON implementation is intentionally deferred to the local-buffer
-    ticket.  Raising here prevents an explicit ON request from becoming
-    an unobservable OFF deployment.
+    ON requires a Postgres working buffer (ADR 0035). Raising when it is
+    missing prevents an explicit ON request from becoming an unobservable
+    OFF deployment.
     """
     source = os.environ if env is None else env
     if not _read_enabled(source):
         return OffMemoryAdapter()
-    raise MemoryBackendUnavailableError(
-        "memory is enabled, but no memory backend is wired"
-    )
+
+    url = (source.get(CHECKPOINT_URL_ENV_VAR) or "").strip()
+    if not url:
+        raise MemoryBackendUnavailableError(
+            "memory is enabled, but no PostgreSQL working buffer is "
+            f"configured ({CHECKPOINT_URL_ENV_VAR} is unset)"
+        )
+
+    # Imported here so this module stays the seam: the implementations
+    # depend on it, never the other way round.
+    from fin.host.db_pool import create_postgres_pool
+    from fin.host.memory_buffer import PostgresMemoryBuffer
+
+    return PostgresMemoryBuffer(create_postgres_pool(url))
 
 
 # Friendly names for callers that describe this seam as an env-backed port.
@@ -161,6 +178,7 @@ memory_port_from_env = build_memory_port
 
 
 __all__ = [
+    "CHECKPOINT_URL_ENV_VAR",
     "DEFAULT_MEMORY_LIMIT",
     "MEMORY_ENABLED_ENV_VAR",
     "MEMORY_LIMIT_CAP",
