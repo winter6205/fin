@@ -1716,12 +1716,22 @@ def build_router(
                 # which this route does not carry.
                 return
             payload = _run_to_response_payload(outcome.final_state)
+            resume_question = (
+                graph.checkpoint_last_human_text(thread_id)
+                if hasattr(graph, "checkpoint_last_human_text")
+                else None
+            )
+            if not resume_question:
+                # Last-resort label only when the checkpoint has no
+                # HumanMessage (should not happen on a recoverable
+                # crash resume). Prefer empty over a fake question.
+                resume_question = ""
             try:
                 store.append_run(
                     RunRecord(
                         id=run_id,
                         thread_id=thread_id,
-                        question=f"[resumed] {thread.title}"[:_TITLE_MAX_CHARS],
+                        question=resume_question,
                         status=payload["status"],
                         status_reason=payload["reason"],
                         answer=payload["answer"],

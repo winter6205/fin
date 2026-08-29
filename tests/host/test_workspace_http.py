@@ -1909,6 +1909,48 @@ def test_resume_reuses_checkpoint_run_id_for_sse_and_persisted_turn(
     assert turns[0]["run_id"] == canonical_run_id
 
 
+def test_resume_persists_checkpoint_human_question_not_synthetic_title(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """Resume row must reconcile to the crashed run's HumanMessage text.
+
+    A synthetic ``[resumed] {title}`` breaks optimistic-turn matching
+    against the original question and leaves process-death history with
+    the wrong user text.
+    """
+    g, _model = _install_crash_graph(http_app, aapl_page1_text)
+    created = client.post("/api/threads", json={"first_message": "seed"}).json()
+    tid = created["id"]
+    original_question = "what is Apple revenue for 2023 Q3?"
+    canonical_run_id = "a1b2c3d4-1111-2222-3333-444455556666"
+
+    cfg = {
+        "configurable": {
+            "thread_id": tid,
+            "run_id": canonical_run_id,
+        }
+    }
+    gen = g.stream(
+        reset_input_state(original_question),
+        config=cfg,
+        stream_mode="values",
+    )
+    for state in gen:
+        messages = state.get("messages", []) or []
+        if messages and getattr(messages[-1], "tool_calls", None):
+            break
+    gen.close()
+
+    events = _post_resume_events(client, tid)
+    assert any(name == "status" for name, _ in events)
+
+    turns = client.get(f"/api/threads/{tid}").json()["turns"]
+    assert len(turns) == 1
+    assert turns[0]["run_id"] == canonical_run_id
+    assert turns[0]["question"] == original_question
+    assert not turns[0]["question"].startswith("[resumed]")
+
+
 def test_get_thread_in_flight_true_while_lock_held(
     client: TestClient, fresh_store, http_app: FastAPI
 ) -> None:

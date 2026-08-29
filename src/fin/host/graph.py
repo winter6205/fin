@@ -2175,6 +2175,28 @@ class _LockedGraph:
             if mid
         }
 
+    def checkpoint_last_human_text(self, thread_id: str) -> str | None:
+        """Return the latest HumanMessage text on the thread checkpoint.
+
+        Workspace resume persists a RunRecord for the remainder; the
+        question must match the crashed run's user text so optimistic
+        turns and history can reconcile. Empty / missing → ``None``.
+        """
+        snapshot = self._graph.get_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        messages = (snapshot.values or {}).get("messages") or []
+        for message in reversed(messages):
+            if not isinstance(message, HumanMessage):
+                continue
+            content = message.content
+            if isinstance(content, str):
+                text = content.strip()
+            else:
+                text = str(content).strip()
+            return text or None
+        return None
+
     @staticmethod
     def _release_thread(lock: threading.Lock) -> None:
         lock.release()
