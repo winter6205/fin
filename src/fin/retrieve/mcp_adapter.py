@@ -1,4 +1,4 @@
-"""MCP adapter for the product retrieve path (T3, ADR 0030).
+"""MCP adapter for the product retrieve path (T3, ADR 0032).
 
 The adapter is the v1 retrieve implementation behind
 ``RetrievePort``: a stdio JSON-RPC client to the
@@ -10,22 +10,27 @@ only (ADR 0007 archived by 0030).
 Wire-level protocol
 -------------------
 
-MCP uses JSON-RPC 2.0 over stdio. The adapter sends one
-newline-delimited JSON object per ``tools/call`` request:
+MCP uses JSON-RPC 2.0 over stdio. The adapter sends a
+newline-delimited ``initialize`` request, the
+``notifications/initialized`` notification, and then the business
+request on each new connection:
 
 .. code-block:: json
 
-    {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
      "params": {"name": "retrieve",
                 "arguments": {"query": "...", "top_k": 8,
                               "document_id": "...",
                               "filter": {"cik": "...", ...}}}}
 
-The server replies with one newline-delimited JSON object on
-stdout. The adapter reads the first line and parses it as the
-JSON-RPC response.
+The server replies with one newline-delimited JSON object per
+request on stdout. The adapter validates the initialize response
+before parsing the ``tools/call`` response.
 
-The adapter DOES NOT inline OCR / XBRL / parse / locator
+The adapter completes the MCP session handshake
+(``initialize`` → ``notifications/initialized``) on the same
+connection before it sends ``tools/call``. It DOES NOT inline OCR /
+XBRL / parse / locator
 mapping into the ranking call (complexity-anti-drift). The
 locator map (``iknow-id`` → ``fin.Locator``) is configured at
 construction and applied as a separate post-rank step. Hits
@@ -59,20 +64,20 @@ Concurrency
 -----------
 
 The public ``retrieve`` is sync and bridges to ``aretrieve``
-via ``asyncio.run``. Each call allocates its own JSON-RPC
-request id and per-call transport (subprocess lifetime is
-per-call here for simplicity — a long-lived connection is a
-later optimization). Concurrent calls share the read-only
-locator map; there is no shared mutable state.
+via ``asyncio.run``. Each call uses its own JSON-RPC request ids
+and per-call transport (subprocess lifetime is per-call here for
+simplicity — a long-lived connection is a later optimization).
+Concurrent calls share the read-only locator map; there is no
+shared mutable state.
 
 Test seam
 ---------
 
-The default transport (``_call_mcp``) launches a subprocess.
-Tests subclass and override ``_call_mcp`` to inject a
-scripted response or scripted exception. The default is
-NEVER invoked during the default pytest run — the test
-surface is hermetic (no live MCP server).
+The default transport (``_call_mcp``) launches a subprocess and
+completes one MCP session per call. Tests subclass and override
+``_call_mcp`` to inject a scripted response or scripted exception.
+The default is NEVER invoked during the default pytest run — the
+test surface is hermetic (no live MCP server).
 """
 
 from __future__ import annotations
@@ -87,6 +92,9 @@ from fin.retrieve.port import Chunk
 
 _DEFAULT_LIMIT = 8
 _LIMIT_CAP = 20
+_MCP_PROTOCOL_VERSION = "2025-06-18"
+_INITIALIZE_REQUEST_ID = 1
+_TOOL_REQUEST_ID = 2
 
 
 # ----- typed exception -----
@@ -292,7 +300,7 @@ class MCPRetrieveAdapter:
 
         payload = {
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": _TOOL_REQUEST_ID,
             "method": "tools/call",
             "params": {
                 "name": "retrieve",
@@ -403,11 +411,12 @@ class MCPRetrieveAdapter:
         The default implementation:
 
         1. Launches ``self._command`` via asyncio subprocess.
-        2. Writes the JSON-serialized payload + ``\\n`` on stdin.
-        3. Reads stdout until the first newline (one JSON-RPC
-           response per call).
-        4. Times out after ``self._timeout`` seconds.
-        5. Returns the parsed response dict.
+        2. Sends ``initialize`` and
+           ``notifications/initialized`` on the new connection.
+        3. Writes the JSON-serialized ``tools/call`` payload.
+        4. Reads the initialize and business responses.
+        5. Times out after ``self._timeout`` seconds.
+        6. Returns the parsed business response dict.
 
         Tests subclass and override this method with a
         scripted response / exception. The override is the
@@ -432,9 +441,26 @@ class MCPRetrieveAdapter:
         except (OSError, FileNotFoundError) as exc:
             raise OSError(f"failed to launch MCP command: {exc}") from exc
         try:
-            line = (json.dumps(payload) + "\n").encode("utf-8")
+            initialize = {
+                "jsonrpc": "2.0",
+                "id": _INITIALIZE_REQUEST_ID,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": _MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "fin-retrieve", "version": "0.1.0"},
+                },
+            }
+            initialized = {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+            }
+            wire_messages = "\n".join(
+                json.dumps(message)
+                for message in (initialize, initialized, payload)
+            ) + "\n"
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(line),
+                proc.communicate(wire_messages.encode("utf-8")),
                 timeout=self._timeout,
             )
         except (asyncio.TimeoutError, TimeoutError):
@@ -449,19 +475,50 @@ class MCPRetrieveAdapter:
                 f"MCP server exited {proc.returncode}: "
                 f"{stderr.decode(errors='replace')!r}"
             )
-        # The response is one JSON-RPC object per line. Read
-        # the FIRST non-empty line; ignore any subsequent ones.
-        first_line = b""
-        for line in stdout.split(b"\n"):
-            if line.strip():
-                first_line = line
-                break
-        try:
-            return json.loads(first_line.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError) as exc:
+        # The notification has no response. The two response lines
+        # must therefore be initialize first, then tools/call.
+        responses: list[Any] = []
+        for line in stdout.splitlines():
+            if not line.strip():
+                continue
+            try:
+                responses.append(json.loads(line.decode("utf-8")))
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise RetrieveUnavailableError(
+                    f"malformed JSON-RPC response: {exc}"
+                ) from exc
+        if len(responses) < 2:
             raise RetrieveUnavailableError(
-                f"malformed JSON-RPC response: {exc}"
-            ) from exc
+                "MCP handshake or tools/call response is missing"
+            )
+
+        initialize_response = responses[0]
+        if (
+            not isinstance(initialize_response, dict)
+            or initialize_response.get("id") != _INITIALIZE_REQUEST_ID
+        ):
+            raise RetrieveUnavailableError(
+                f"invalid MCP initialize response: {initialize_response!r}"
+            )
+        if "error" in initialize_response:
+            raise RetrieveUnavailableError(
+                f"MCP initialize returned JSON-RPC error: "
+                f"{initialize_response['error']!r}"
+            )
+        if not isinstance(initialize_response.get("result"), dict):
+            raise RetrieveUnavailableError(
+                "MCP initialize response has no result"
+            )
+
+        tool_response = responses[1]
+        if (
+            not isinstance(tool_response, dict)
+            or tool_response.get("id") != payload.get("id")
+        ):
+            raise RetrieveUnavailableError(
+                f"invalid MCP tools/call response: {tool_response!r}"
+            )
+        return tool_response
 
 
 __all__ = ["MCPRetrieveAdapter", "RetrieveUnavailableError"]
