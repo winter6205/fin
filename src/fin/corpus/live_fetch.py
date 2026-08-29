@@ -582,7 +582,7 @@ def _live_manifest_payload(
 
 def _move_to_backup(target: Path, backup: Path) -> bool:
     """Move an existing publish target aside on the same filesystem."""
-    if not target.exists():
+    if not target.exists() and not target.is_symlink():
         return False
     os.replace(target, backup)
     return True
@@ -684,10 +684,7 @@ def _rollback_publish(
 ) -> None:
     """Restore targets after a failed multi-file publish attempt."""
     for target in reversed(published):
-        if target.is_dir():
-            shutil.rmtree(target)
-        elif target.exists():
-            target.unlink()
+        _remove_publish_target(target)
     for target, backup in reversed(backups):
         if backup.exists():
             os.replace(backup, target)
@@ -806,8 +803,8 @@ def fetch_and_ingest(
         The accession listing names no primary document. Nothing was
         written; re-run with ``primary_doc``.
     """
-    ua = _read_ua()
     _recover_interrupted_publish(manifest_path=manifest_path)
+    ua = _read_ua()
     base_url = _accession_base_url(cik, accession)
     primary_url = _resolve_primary_url(
         base_url=base_url, ua=ua, accession=accession, primary_doc=primary_doc

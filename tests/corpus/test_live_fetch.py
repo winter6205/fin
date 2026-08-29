@@ -36,6 +36,7 @@ from fin.corpus.catalog import list_filings
 from fin.corpus.live_fetch import (
     SecHttpFailError,
     SecPrimaryDocUnresolvedError,
+    SecUaUnsetError,
     fetch_and_ingest,
 )
 
@@ -289,6 +290,66 @@ def test_crash_mid_publish_is_recovered_before_next_live_read(
     assert (
         roots["facts_root"] / f"{_ACCESSION}.json"
     ).read_bytes() == committed["facts"]
+
+
+def test_interrupted_publish_is_recovered_before_ua_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery must run before a later invocation's SEC gate."""
+    roots = _roots(tmp_path)
+    roots["extracted_root"].mkdir(parents=True)
+    original_index = b'{"schema_version": 1, "documents": {}}\n'
+    (roots["extracted_root"] / "_index.json").write_bytes(original_index)
+    original_manifest = b'{"documents": []}\n'
+    roots["manifest_path"].write_bytes(original_manifest)
+
+    real_replace = live_fetch.os.replace
+    live_doc = roots["extracted_root"] / _ACCESSION
+
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    def crash_after_doc_swap(source: str | bytes, target: str | bytes) -> None:
+        real_replace(source, target)
+        if Path(target) == live_doc:
+            raise SimulatedProcessCrash("crashed after accession swap")
+
+    def terminate_rollback(**_: object) -> None:
+        raise SimulatedProcessCrash("process terminated")
+
+    with monkeypatch.context() as crash_patch:
+        crash_patch.setattr(live_fetch.os, "replace", crash_after_doc_swap)
+        crash_patch.setattr(live_fetch, "_rollback_publish", terminate_rollback)
+        crash_patch.setattr(
+            live_fetch.shutil, "rmtree", lambda *_args, **_kwargs: None
+        )
+        with _scripted_sec({_PRIMARY_URL: _PRIMARY_HTML}, []):
+            with pytest.raises(SimulatedProcessCrash):
+                fetch_and_ingest(
+                    cik=_CIK,
+                    accession=_ACCESSION,
+                    primary_doc="aapl-20230701.htm",
+                    **roots,
+                )
+
+    assert list_filings(
+        manifest_path=roots["manifest_path"],
+        extracted_root=roots["extracted_root"],
+    ) == {"filings": []}
+
+    monkeypatch.delenv("FIN_EDGAR_USER_AGENT")
+    with pytest.raises(SecUaUnsetError):
+        fetch_and_ingest(
+            cik=_CIK,
+            accession=_ACCESSION,
+            primary_doc="aapl-20230701.htm",
+            **roots,
+        )
+
+    assert not live_doc.exists()
+    assert (roots["extracted_root"] / "_index.json").read_bytes() == original_index
+    assert roots["manifest_path"].read_bytes() == original_manifest
 
 
 # ---------- primary document resolution ----------
