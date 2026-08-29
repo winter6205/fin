@@ -72,6 +72,13 @@ import psycopg
 # it via ``monkeypatch.setattr("fin.host.compile.compile_graph",
 # ...)``. Lazy imports below cover the runtime deps.
 from fin.host.graph import compile_graph
+from fin.host.memory_port import (
+    DEFAULT_MEMORY_DREAM_BACKEND,
+    MEMORY_DREAM_BACKEND_ENV_VAR,
+    MEMORY_DREAM_BACKEND_KINDS,
+    MemoryPort,
+    build_memory_port,
+)
 from fin.host.stream_map import reasoning_preserving_chat_openai
 
 
@@ -197,6 +204,38 @@ def _resolve_retrieve_adapter(env: Mapping[str, str] | None) -> str:
     misspelled kind stops the boot instead of falling back.
     """
     return _read_env(env, "FIN_RETRIEVE_ADAPTER") or DEFAULT_RETRIEVE_ADAPTER
+
+
+def _resolve_memory_dream_backend(env: Mapping[str, str] | None) -> str:
+    """Return the dream backend kind for a production boot.
+
+    ``FIN_MEMORY_DREAM_BACKEND`` when set, otherwise
+    ``DEFAULT_MEMORY_DREAM_BACKEND``. The key is deliberately not
+    ``FIN_RETRIEVE_ADAPTER``: ADR 0035 forbids sharing one implied
+    config between the retrieve MCP and the memory MCP. A misspelled
+    kind raises ``MemoryConfigError`` from
+    :func:`fin.host.memory_port.build_memory_dream_backend`, so a typo
+    stops the boot instead of falling back.
+    """
+    return (
+        _read_env(env, MEMORY_DREAM_BACKEND_ENV_VAR)
+        or DEFAULT_MEMORY_DREAM_BACKEND
+    )
+
+
+def build_memory_port_for_runtime(
+    *, env: Mapping[str, str] | None = None
+) -> MemoryPort:
+    """Build the memory port for a production boot from ``env``.
+
+    Mirrors ``compile_for_runtime``: this module owns the env contract,
+    ``memory_port`` owns the port. Memory stays OFF unless
+    ``FIN_MEMORY_ENABLED`` is set, so the default boot never opens a
+    Postgres connection (SC2).
+    """
+    return build_memory_port(
+        env=env, dream_backend_kind=_resolve_memory_dream_backend(env)
+    )
 
 
 # ----- shared model factory -----

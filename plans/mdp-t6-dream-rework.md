@@ -84,7 +84,7 @@ OVERALL: PASS
      - `gc()` 对已出库且超 7 天的行硬删；**未出库的行仍只软禁、不删**。
      - 任何失败都不影响前台 turn：失败时该 turn 仍正常 `done` / `refuse`，错误以 `MemoryDreamError` 谱系记录，不冒泡。
      - **Headroom 检验**：实现者可用不同的文件名、helper 拆分、测试布局达成以上验收。
-   - Status: [ ] pending
+   - Status: [x] done — `cursor/mdp-t6c-dream-http-wiring`。dream 不进 graph：节点集合断言 + `compile_graph` 无 dream 参数。落在 HTTP 层：`workspace_http` 的两条 SSE 路由（`send_message` / `resume_thread`）在返回 `StreamingResponse` 前 `background.add_task(run_dream_after_turn, ...)`，由 Starlette 在流耗尽后执行。独立 config key `FIN_MEMORY_DREAM_BACKEND`（常量在 `memory_port.py`，env 解析在 `compile.py` 的 `_resolve_memory_dream_backend`，仿 retrieve 链路），不与 `FIN_RETRIEVE_ADAPTER` 共用；只认 `null`，其它值报 `MemoryConfigError` 而不静默回落。`run_dream_after_turn` 吞掉一切异常只记日志 —— Starlette 的 background task 无隔离，冒泡会把已经成功的 turn 变成坏响应。SC17–SC21 达成。
    - [blocks: T6b]
 
 4. **T6d — MCP 传输与落库契约** — tag: `[implementation]`
