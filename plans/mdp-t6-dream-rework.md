@@ -57,7 +57,7 @@ OVERALL: PASS
      - 幂等 DDL 建表，表独立于 checkpointer。
      - `pyproject.toml` 显式声明 `psycopg-pool` 并同步 lockfile（目前只是传递依赖）。
      - 需要真实 PG 的测试是 **opt-in**（无 `FIN_CHECKPOINT_URL` 时 skip，与 `test_thread_store.py` 现处理方式一致）；`uv run pytest -q` 默认 exits 0。
-   - Status: [ ] pending
+   - Status: [x] done — `cursor/mdp-t6a-memory-buffer-pg`。落地 `src/fin/host/memory_store.py`（`fin_memory` + `fin_memory_dream_cursor`，进程内/PG 双实现）与 `PostgresMemoryBuffer`；`MemoryBuffer` 成为共享壳，两种实现共用一套参数化测试套件（`tests/host/test_memory_buffer.py`、`test_memory_store.py`）。SC4–SC11 达成。
 
 2. **T6b — 打分整理与双闸门** — tag: `[implementation]`
    - **Inherits:** `specs/memory-dream.md` SC7–SC8、SC12–SC16、SC21；Test allocation 五类
