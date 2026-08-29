@@ -41,6 +41,31 @@ class MemoryBackendUnavailableError(MemoryPortError):
     """Memory was explicitly enabled but no backend is wired yet."""
 
 
+class MemoryDreamError(MemoryPortError):
+    """Base class for typed dream failures.
+
+    Dream lives next to the port errors because a dream failure is a
+    memory-port failure, and because ``fin_memory``'s cursor has to type
+    its own corruption without importing the dream module back.
+    """
+
+
+class DreamInputError(MemoryDreamError):
+    """Scoring or summarization input was malformed."""
+
+
+class DreamTransportError(MemoryDreamError):
+    """The memory backend could not durably persist the batch."""
+
+
+class DreamCursorError(MemoryDreamError):
+    """The stored dream cursor is unreadable.
+
+    Raised instead of resetting the cursor: silently restarting the dream
+    timeline would re-transport everything the backend already holds.
+    """
+
+
 @runtime_checkable
 class MemoryPort(Protocol):
     """Port for extract, recall, garbage collection, and dream transport.
@@ -182,8 +207,12 @@ __all__ = [
     "DEFAULT_MEMORY_LIMIT",
     "MEMORY_ENABLED_ENV_VAR",
     "MEMORY_LIMIT_CAP",
+    "DreamCursorError",
+    "DreamInputError",
+    "DreamTransportError",
     "MemoryBackendUnavailableError",
     "MemoryConfigError",
+    "MemoryDreamError",
     "MemoryPort",
     "MemoryPortError",
     "OffMemory",

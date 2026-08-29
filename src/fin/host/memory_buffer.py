@@ -16,12 +16,20 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Mapping
 
 from fin.host.db_pool import PostgresPool
+from fin.host.memory_dream import (
+    TRANSPORT_RETENTION_DAYS,
+    DreamSummarizer,
+    MemoryDream,
+    MemoryDreamBackend,
+    MemoryDreamError,
+)
 from fin.host.memory_port import (
     DEFAULT_MEMORY_LIMIT,
     MEMORY_LIMIT_CAP,
@@ -37,6 +45,8 @@ from fin.host.memory_store import (
     PostgresDreamCursorStore,
     PostgresMemoryStore,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryBufferError(Exception):
@@ -111,9 +121,18 @@ class MemoryBuffer:
 
     enabled = True
 
-    def __init__(self, store: MemoryStore, cursors: DreamCursorStore) -> None:
+    def __init__(
+        self,
+        store: MemoryStore,
+        cursors: DreamCursorStore,
+        *,
+        backend: MemoryDreamBackend | None = None,
+        summarizer: DreamSummarizer | None = None,
+    ) -> None:
         self._store = store
         self._cursors = cursors
+        self._backend = backend
+        self._summarizer = summarizer
 
     def extract(
         self,
@@ -196,10 +215,13 @@ class MemoryBuffer:
         limit: int = DEFAULT_MEMORY_LIMIT,
         now: datetime | None = None,
     ) -> dict[str, object]:
-        """Soft-disable expired or superseded active rows.
+        """Soft-disable expired or superseded active rows, then purge.
 
-        ``now`` is injectable for deterministic boundary tests. Disabled rows
-        remain in :meth:`entries`, so GC never deletes untransported memory.
+        ``now`` is injectable for deterministic boundary tests. Rows that
+        were never transported are only soft-disabled; rows a backend
+        already confirmed are hard-deleted once they pass the retention
+        window, because a copy that exists durably elsewhere has no read
+        value locally (SC19).
         """
         resolved_limit = _resolve_limit(limit)
         gc_time = (
@@ -229,6 +251,10 @@ class MemoryBuffer:
             )
             self._store.disable(row.id, reason=reason, at=gc_time)
             removed += 1
+
+        self._store.delete_transported_before(
+            gc_time - timedelta(days=TRANSPORT_RETENTION_DAYS)
+        )
         return {"status": "ok", "removed": removed}
 
     def entries(self, *, include_disabled: bool = True) -> list[dict[str, object]]:
@@ -239,9 +265,26 @@ class MemoryBuffer:
         ]
 
     def dream(self, *, limit: int = DEFAULT_MEMORY_LIMIT) -> dict[str, object]:
-        """Defer durable transport to the T6b dream step."""
-        _resolve_limit(limit)
-        return {"status": "deferred", "transported": 0}
+        """Consolidate useful rows and transport them to the dream backend.
+
+        A failed dream is recorded, never raised: CONTEXT.md:45 requires
+        that dream must not fail the foreground turn, and the HTTP layer
+        that triggers it runs after the response has already streamed.
+        """
+        try:
+            return MemoryDream(
+                self._store,
+                self._cursors,
+                backend=self._backend,
+                summarizer=self._summarizer,
+            ).run(limit=limit)
+        except MemoryDreamError as exc:
+            logger.exception("memory dream failed; the buffer is untouched")
+            return {
+                "status": "error",
+                "error": type(exc).__name__,
+                "transported": 0,
+            }
 
     @staticmethod
     def _expiry_from_metadata(
@@ -287,8 +330,18 @@ class LocalMemoryBuffer(MemoryBuffer):
     not this one's.
     """
 
-    def __init__(self) -> None:
-        super().__init__(InProcessMemoryStore(), InProcessDreamCursorStore())
+    def __init__(
+        self,
+        *,
+        backend: MemoryDreamBackend | None = None,
+        summarizer: DreamSummarizer | None = None,
+    ) -> None:
+        super().__init__(
+            InProcessMemoryStore(),
+            InProcessDreamCursorStore(),
+            backend=backend,
+            summarizer=summarizer,
+        )
 
 
 class PostgresMemoryBuffer(MemoryBuffer):
@@ -298,12 +351,21 @@ class PostgresMemoryBuffer(MemoryBuffer):
     wiring time instead of on the first operator request.
     """
 
-    def __init__(self, pool: PostgresPool) -> None:
+    def __init__(
+        self,
+        pool: PostgresPool,
+        *,
+        backend: MemoryDreamBackend | None = None,
+        summarizer: DreamSummarizer | None = None,
+    ) -> None:
         self._pool = pool
         if not pool.is_open:
             pool.open()
         super().__init__(
-            PostgresMemoryStore(pool), PostgresDreamCursorStore(pool)
+            PostgresMemoryStore(pool),
+            PostgresDreamCursorStore(pool),
+            backend=backend,
+            summarizer=summarizer,
         )
 
     def close(self) -> None:

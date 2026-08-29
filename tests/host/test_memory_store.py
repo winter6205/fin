@@ -231,6 +231,39 @@ def test_thread_id_is_read_from_row_metadata(store) -> None:
     assert thread_ids == {"with-thread": "thread-7", "without-thread": None}
 
 
+def test_mark_transported_retires_only_the_named_rows(store) -> None:
+    store.add(_row("row-1"))
+    store.add(_row("row-2"))
+    at = datetime(2026, 8, 22, tzinfo=timezone.utc)
+
+    store.mark_transported(["row-1"], at=at)
+
+    rows = {row.id: row for row in store.rows()}
+    assert rows["row-1"].status == "disabled"
+    assert rows["row-1"].disabled_reason == "transported"
+    assert rows["row-1"].disabled_at == at
+    assert rows["row-1"].transported_at == at
+    assert rows["row-2"].status == "active"
+    assert [row.id for row in store.rows(include_disabled=False)] == ["row-2"]
+
+
+def test_delete_transported_before_spares_untransported_rows(store) -> None:
+    at = datetime(2026, 8, 22, tzinfo=timezone.utc)
+    store.add(_row("old-transport"))
+    store.add(_row("recent-transport"))
+    store.add(_row("never-transported"))
+    store.mark_transported(["old-transport"], at=at - timedelta(days=10))
+    store.mark_transported(["recent-transport"], at=at)
+
+    deleted = store.delete_transported_before(at - timedelta(days=7))
+
+    assert deleted == 1
+    assert {row.id for row in store.rows()} == {
+        "recent-transport",
+        "never-transported",
+    }
+
+
 # ----- shared cursor-store contract -----
 
 
@@ -271,6 +304,47 @@ def test_cursor_advance_overwrites_the_previous_window(cursors) -> None:
     assert cursor.last_status == "buffered"
 
 
+def test_claim_respects_the_min_interval(cursors) -> None:
+    at = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
+    day = timedelta(hours=24)
+
+    assert cursors.claim(
+        at=at, min_interval=day, seen_thread_ids=frozenset(), last_status="ok"
+    )
+    assert not cursors.claim(
+        at=at + timedelta(hours=1),
+        min_interval=day,
+        seen_thread_ids=frozenset(),
+        last_status="ok",
+    )
+    assert cursors.claim(
+        at=at + timedelta(hours=25),
+        min_interval=day,
+        seen_thread_ids=frozenset(),
+        last_status="ok",
+    )
+
+
+def test_claim_is_won_by_exactly_one_caller(cursors) -> None:
+    at = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(
+            executor.map(
+                lambda _: cursors.claim(
+                    at=at,
+                    min_interval=timedelta(hours=24),
+                    seen_thread_ids=frozenset({"thread-1"}),
+                    last_status="running",
+                ),
+                range(16),
+            )
+        )
+
+    assert sum(1 for won in results if won) == 1
+    assert cursors.load().last_status == "running"
+
+
 # ----- Postgres-only contracts (opt-in) -----
 
 
@@ -300,6 +374,32 @@ def test_postgres_setup_is_idempotent(postgres_pool) -> None:
         assert [row.id for row in store.rows()] == ["row-1"]
     finally:
         _truncate(postgres_pool, MEMORY_TABLE)
+
+
+def test_postgres_rejects_a_corrupt_cursor_row(postgres_pool) -> None:
+    """A corrupt cursor raises instead of silently restarting the timeline."""
+    from psycopg.types.json import Jsonb
+
+    from fin.host.memory_port import DreamCursorError
+    from fin.host.memory_store import CURSOR_ID, PostgresDreamCursorStore
+
+    with postgres_pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO {CURSOR_TABLE} "
+                "(id, last_dream_at, seen_thread_ids, last_status) "
+                "VALUES (%s, now(), %s, 'ok') "
+                "ON CONFLICT (id) DO UPDATE SET "
+                "seen_thread_ids = EXCLUDED.seen_thread_ids",
+                (CURSOR_ID, Jsonb([1, 2])),
+            )
+        conn.commit()
+
+    try:
+        with pytest.raises(DreamCursorError):
+            PostgresDreamCursorStore(postgres_pool).load()
+    finally:
+        _truncate(postgres_pool, CURSOR_TABLE)
 
 
 def test_postgres_cursor_survives_a_new_store_instance(postgres_pool) -> None:
