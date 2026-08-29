@@ -588,6 +588,95 @@ def _move_to_backup(target: Path, backup: Path) -> bool:
     return True
 
 
+_PUBLISH_JOURNAL_NAME = ".live-fetch-publish.json"
+
+
+def _publish_journal_path(manifest_path: Path) -> Path:
+    return manifest_path.parent / _PUBLISH_JOURNAL_NAME
+
+
+def _remove_publish_target(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def _read_publish_journal(journal_path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(journal_path.read_text())
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        raise IngestMissingError(
+            f"malformed live publish journal: {journal_path}"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("state") not in {"prepared", "committed"}
+        or not isinstance(payload.get("entries"), list)
+        or not isinstance(payload.get("cleanup_dirs"), list)
+    ):
+        raise IngestMissingError(
+            f"invalid live publish journal: {journal_path}"
+        )
+    return payload
+
+
+def _recover_interrupted_publish(*, manifest_path: Path) -> None:
+    """Complete or roll back a publish left by a process crash.
+
+    The manifest is the catalog's commit pointer: it is replaced last.
+    The journal makes that pointer durable across a crash, so a later
+    live-fetch operation can discard every uncommitted target before it
+    reads the manifest or extracted index.
+    """
+    journal_path = _publish_journal_path(manifest_path)
+    if not journal_path.is_file():
+        return
+
+    payload = _read_publish_journal(journal_path)
+    raw_entries = payload["entries"]
+    raw_cleanup_dirs = payload["cleanup_dirs"]
+    entries: list[tuple[Path, Path, Path, bool]] = []
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict):
+            raise IngestMissingError(
+                f"invalid live publish journal entry: {journal_path}"
+            )
+        staged = raw_entry.get("staged")
+        target = raw_entry.get("target")
+        backup = raw_entry.get("backup")
+        target_existed = raw_entry.get("target_existed")
+        if (
+            not all(isinstance(path, str) for path in (staged, target, backup))
+            or not isinstance(target_existed, bool)
+        ):
+            raise IngestMissingError(
+                f"invalid live publish journal entry: {journal_path}"
+            )
+        entries.append(
+            (Path(staged), Path(target), Path(backup), target_existed)
+        )
+
+    committed = payload["state"] == "committed" or all(
+        not staged.exists() for staged, _target, _backup, _existed in entries
+    )
+    if not committed:
+        for staged, target, backup, target_existed in reversed(entries):
+            if backup.exists():
+                _remove_publish_target(target)
+                os.replace(backup, target)
+            elif not staged.exists() and not target_existed:
+                _remove_publish_target(target)
+
+    for raw_dir in raw_cleanup_dirs:
+        if not isinstance(raw_dir, str):
+            raise IngestMissingError(
+                f"invalid live publish cleanup path: {journal_path}"
+            )
+        shutil.rmtree(raw_dir, ignore_errors=True)
+    journal_path.unlink(missing_ok=True)
+
+
 def _rollback_publish(
     *,
     published: list[Path],
@@ -614,12 +703,13 @@ def _publish_staged(
     facts_root: Path,
     manifest_path: Path,
 ) -> None:
-    """Publish prepared artifacts with rollback across all four targets.
+    """Publish prepared artifacts with crash recovery across four targets.
 
     Page and passage files are only written below staging directories.
-    The commit then replaces the accession directory, extracted index,
-    facts row, and manifest in that order; manifest is last so catalog
-    readers never discover an accession before its extracted artifacts.
+    A durable journal records the generation before any target is
+    replaced. The manifest is the catalog commit pointer and is last,
+    so catalog readers never discover an accession before its extracted
+    artifacts.
     """
     targets = [
         (staged_doc_dir, extracted_root / staged_doc_dir.name, extracted_root),
@@ -634,17 +724,55 @@ def _publish_staged(
             Path(tempfile.mkdtemp(prefix=".live-publish-backup-", dir=parent)),
         )
 
+    journal_path = _publish_journal_path(manifest_path)
+    journal_entries = [
+        {
+            "staged": str(staged),
+            "target": str(target),
+            "backup": str(backup_dirs[parent] / target.name),
+            "target_existed": target.exists(),
+        }
+        for staged, target, parent in targets
+    ]
+    cleanup_dirs = [
+        str(staged_doc_dir.parent),
+        str(staged_facts.parent),
+        str(staged_manifest.parent),
+        *(str(backup_dir) for backup_dir in backup_dirs.values()),
+    ]
     published: list[Path] = []
     backups: list[tuple[Path, Path]] = []
     try:
+        _atomic_write(
+            journal_path,
+            _dump(
+                {
+                    "cleanup_dirs": cleanup_dirs,
+                    "entries": journal_entries,
+                    "state": "prepared",
+                }
+            ),
+        )
         for staged, target, parent in targets:
             backup = backup_dirs[parent] / target.name
             if _move_to_backup(target, backup):
                 backups.append((target, backup))
-            os.replace(staged, target)
             published.append(target)
+            os.replace(staged, target)
+        _atomic_write(
+            journal_path,
+            _dump(
+                {
+                    "cleanup_dirs": cleanup_dirs,
+                    "entries": journal_entries,
+                    "state": "committed",
+                }
+            ),
+        )
+        journal_path.unlink(missing_ok=True)
     except BaseException:
         _rollback_publish(published=published, backups=backups)
+        journal_path.unlink(missing_ok=True)
         raise
     finally:
         for backup_dir in backup_dirs.values():
@@ -679,6 +807,7 @@ def fetch_and_ingest(
         written; re-run with ``primary_doc``.
     """
     ua = _read_ua()
+    _recover_interrupted_publish(manifest_path=manifest_path)
     base_url = _accession_base_url(cik, accession)
     primary_url = _resolve_primary_url(
         base_url=base_url, ua=ua, accession=accession, primary_doc=primary_doc
