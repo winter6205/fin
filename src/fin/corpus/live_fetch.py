@@ -945,6 +945,14 @@ def main(argv: list[str] | None = None) -> int:
     except SecPrimaryDocUnresolvedError as exc:
         print(f"live_fetch: primary_doc_unresolved: {exc}", file=sys.stderr)
         return 4
+    except MalformedExtractedIndexError as exc:
+        print(f"live_fetch: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    except IngestMissingError as exc:
+        # Journal / manifest / catalog typed failures (and any other
+        # IngestMissingError subclass not matched above).
+        print(f"live_fetch: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     print(
         f"live_fetch: accession={args.accession} "
         f"version={_sha256_bytes(body)} bytes={len(body)}"

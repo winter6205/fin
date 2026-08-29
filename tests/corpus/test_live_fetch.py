@@ -592,6 +592,64 @@ def test_malformed_existing_index_refuses_rather_than_overwrites(
     assert damaged.read_text() == "{ this is not json"
 
 
+def test_live_fetch_cli_reports_malformed_index_as_typed_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI must not dump a traceback for MalformedExtractedIndexError."""
+    roots = _roots(tmp_path)
+    roots["extracted_root"].mkdir(parents=True)
+    (roots["extracted_root"] / "_index.json").write_text("{ this is not json")
+    monkeypatch.setenv("FIN_EDGAR_USER_AGENT", "fin-test contact@example.com")
+
+    code = live_fetch.main(
+        [
+            "--cik",
+            _CIK,
+            "--accession",
+            _ACCESSION,
+            "--manifest",
+            str(roots["manifest_path"]),
+            "--extracted-root",
+            str(roots["extracted_root"]),
+            "--facts-root",
+            str(roots["facts_root"]),
+            "--primary-doc",
+            "aapl-20230701.htm",
+        ]
+    )
+    assert code == 1
+
+
+def test_live_fetch_cli_reports_malformed_manifest_as_typed_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed caller manifest is IngestMissingError → non-zero CLI."""
+    roots = _roots(tmp_path)
+    roots["extracted_root"].mkdir(parents=True)
+    roots["manifest_path"].write_text("{ not-json")
+    monkeypatch.setenv("FIN_EDGAR_USER_AGENT", "fin-test contact@example.com")
+
+    code = live_fetch.main(
+        [
+            "--cik",
+            _CIK,
+            "--accession",
+            _ACCESSION,
+            "--manifest",
+            str(roots["manifest_path"]),
+            "--extracted-root",
+            str(roots["extracted_root"]),
+            "--facts-root",
+            str(roots["facts_root"]),
+            "--primary-doc",
+            "aapl-20230701.htm",
+        ]
+    )
+    assert code == 1
+
+
 # ---------- the frozen unit ----------
 
 
