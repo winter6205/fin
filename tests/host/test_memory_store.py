@@ -10,8 +10,9 @@ Boundary classes (inherits the parent spec's five): empty (empty store,
 never-dreamed cursor); negative (unknown ids, malformed metadata keys);
 overflow (bounded by the buffer layer's ``MEMORY_LIMIT_CAP``, not here);
 concurrent (``bump_hit_counts`` accumulates exactly under contention);
-exception (pool closed / acquire timeout reuses T1's typed errors and is
-covered in ``test_memory_buffer.py``).
+exception (a closed pool surfaces T1's ``PostgresPoolClosedError``
+unchanged, and a corrupt cursor raises ``DreamCursorError`` — both
+asserted in this file's ``exception`` section).
 
 The Postgres half is opt-in: without ``FIN_CHECKPOINT_URL`` those
 parameterisations skip, keeping the default ``pytest -q`` hermetic (SC2).
@@ -231,6 +232,39 @@ def test_thread_id_is_read_from_row_metadata(store) -> None:
     assert thread_ids == {"with-thread": "thread-7", "without-thread": None}
 
 
+def test_mark_transported_retires_only_the_named_rows(store) -> None:
+    store.add(_row("row-1"))
+    store.add(_row("row-2"))
+    at = datetime(2026, 8, 22, tzinfo=timezone.utc)
+
+    store.mark_transported(["row-1"], at=at)
+
+    rows = {row.id: row for row in store.rows()}
+    assert rows["row-1"].status == "disabled"
+    assert rows["row-1"].disabled_reason == "transported"
+    assert rows["row-1"].disabled_at == at
+    assert rows["row-1"].transported_at == at
+    assert rows["row-2"].status == "active"
+    assert [row.id for row in store.rows(include_disabled=False)] == ["row-2"]
+
+
+def test_delete_transported_before_spares_untransported_rows(store) -> None:
+    at = datetime(2026, 8, 22, tzinfo=timezone.utc)
+    store.add(_row("old-transport"))
+    store.add(_row("recent-transport"))
+    store.add(_row("never-transported"))
+    store.mark_transported(["old-transport"], at=at - timedelta(days=10))
+    store.mark_transported(["recent-transport"], at=at)
+
+    deleted = store.delete_transported_before(at - timedelta(days=7))
+
+    assert deleted == 1
+    assert {row.id for row in store.rows()} == {
+        "recent-transport",
+        "never-transported",
+    }
+
+
 # ----- shared cursor-store contract -----
 
 
@@ -271,6 +305,47 @@ def test_cursor_advance_overwrites_the_previous_window(cursors) -> None:
     assert cursor.last_status == "buffered"
 
 
+def test_claim_respects_the_min_interval(cursors) -> None:
+    at = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
+    day = timedelta(hours=24)
+
+    assert cursors.claim(
+        at=at, min_interval=day, seen_thread_ids=frozenset(), last_status="ok"
+    )
+    assert not cursors.claim(
+        at=at + timedelta(hours=1),
+        min_interval=day,
+        seen_thread_ids=frozenset(),
+        last_status="ok",
+    )
+    assert cursors.claim(
+        at=at + timedelta(hours=25),
+        min_interval=day,
+        seen_thread_ids=frozenset(),
+        last_status="ok",
+    )
+
+
+def test_claim_is_won_by_exactly_one_caller(cursors) -> None:
+    at = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(
+            executor.map(
+                lambda _: cursors.claim(
+                    at=at,
+                    min_interval=timedelta(hours=24),
+                    seen_thread_ids=frozenset({"thread-1"}),
+                    last_status="running",
+                ),
+                range(16),
+            )
+        )
+
+    assert sum(1 for won in results if won) == 1
+    assert cursors.load().last_status == "running"
+
+
 # ----- Postgres-only contracts (opt-in) -----
 
 
@@ -300,6 +375,32 @@ def test_postgres_setup_is_idempotent(postgres_pool) -> None:
         assert [row.id for row in store.rows()] == ["row-1"]
     finally:
         _truncate(postgres_pool, MEMORY_TABLE)
+
+
+def test_postgres_rejects_a_corrupt_cursor_row(postgres_pool) -> None:
+    """A corrupt cursor raises instead of silently restarting the timeline."""
+    from psycopg.types.json import Jsonb
+
+    from fin.host.memory_port import DreamCursorError
+    from fin.host.memory_store import CURSOR_ID, PostgresDreamCursorStore
+
+    with postgres_pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO {CURSOR_TABLE} "
+                "(id, last_dream_at, seen_thread_ids, last_status) "
+                "VALUES (%s, now(), %s, 'ok') "
+                "ON CONFLICT (id) DO UPDATE SET "
+                "seen_thread_ids = EXCLUDED.seen_thread_ids",
+                (CURSOR_ID, Jsonb([1, 2])),
+            )
+        conn.commit()
+
+    try:
+        with pytest.raises(DreamCursorError):
+            PostgresDreamCursorStore(postgres_pool).load()
+    finally:
+        _truncate(postgres_pool, CURSOR_TABLE)
 
 
 def test_postgres_cursor_survives_a_new_store_instance(postgres_pool) -> None:
@@ -334,6 +435,68 @@ def test_schema_ddl_touches_only_the_two_memory_tables() -> None:
     assert mentioned == tables
     assert "fin_thread" not in mentioned
     assert "fin_run" not in mentioned
+
+
+def test_an_unusable_created_at_is_a_typed_input_error() -> None:
+    """A row whose created_at is not a datetime must fail loudly.
+
+    ``MemoryRow.created_at`` is typed non-optional. A silent ``None``
+    there would reach the dream scorer, where ``now - row.created_at``
+    raises ``TypeError`` — outside the ``MemoryDreamError`` family that
+    ``MemoryDream.run()`` catches, which would leave the cursor claimed
+    and dream stalled for a whole interval.
+    """
+    from fin.host.memory_port import DreamInputError
+    from fin.host.memory_store import _as_created_at
+
+    stamp = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+
+    assert _as_created_at(stamp) == stamp
+    with pytest.raises(DreamInputError):
+        _as_created_at(None)
+    with pytest.raises(DreamInputError):
+        _as_created_at("2026-08-20T12:00:00+00:00")
+
+
+# ----- exception: pool failures keep T1's typed errors (spec:104) -----
+
+
+def test_a_closed_pool_surfaces_postgres_pool_closed_error() -> None:
+    """A pool that was never opened fails loudly, with no DB contact.
+
+    ``PostgresPool`` starts closed, and ``connection()`` raises before
+    it dials, so this proves the typed error path without a live
+    Postgres. ``specs/memory-dream.md:104`` requires these errors to
+    reach the caller unchanged rather than being wrapped in
+    ``MemoryDreamError``.
+    """
+    from fin.host.db_pool import PostgresPool, PostgresPoolClosedError
+    from fin.host.memory_store import (
+        PostgresDreamCursorStore,
+        PostgresMemoryStore,
+    )
+
+    closed = PostgresPool("postgresql://fin:fin@localhost:5432/fin")
+    assert not closed.is_open
+
+    with pytest.raises(PostgresPoolClosedError):
+        PostgresMemoryStore(closed).rows()
+    with pytest.raises(PostgresPoolClosedError):
+        PostgresDreamCursorStore(closed).load()
+
+
+def test_a_closed_pool_error_is_not_wrapped_as_a_dream_error() -> None:
+    """The caller must be able to tell a pool outage from a dream bug."""
+    from fin.host.db_pool import PostgresPool, PostgresPoolClosedError
+    from fin.host.memory_port import MemoryDreamError
+    from fin.host.memory_store import PostgresDreamCursorStore
+
+    closed = PostgresPool("postgresql://fin:fin@localhost:5432/fin")
+
+    with pytest.raises(PostgresPoolClosedError) as caught:
+        PostgresDreamCursorStore(closed).load()
+
+    assert not isinstance(caught.value, MemoryDreamError)
 
 
 def test_pyproject_declares_psycopg_pool_explicitly() -> None:
