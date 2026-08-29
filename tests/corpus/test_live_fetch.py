@@ -217,6 +217,80 @@ def test_failure_after_staged_page_write_leaves_visible_publish_unchanged(
     assert roots["manifest_path"].read_bytes() == original_manifest
 
 
+def test_crash_mid_publish_is_recovered_before_next_live_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A process exit after one target swap restores the last generation.
+
+    The injected exit bypasses in-process rollback and cleanup, matching
+    the state a real crash leaves behind. Recovery must remove the
+    uncommitted generation before any subsequent live-fetch read.
+    """
+    roots = _roots(tmp_path)
+    with _scripted_sec({_PRIMARY_URL: _PRIMARY_HTML}, []):
+        fetch_and_ingest(
+            cik=_CIK,
+            accession=_ACCESSION,
+            primary_doc="aapl-20230701.htm",
+            **roots,
+        )
+
+    committed = {
+        "index": (roots["extracted_root"] / "_index.json").read_bytes(),
+        "manifest": roots["manifest_path"].read_bytes(),
+        "page": (
+            roots["extracted_root"] / _ACCESSION / "page-001.json"
+        ).read_bytes(),
+        "facts": (
+            roots["facts_root"] / f"{_ACCESSION}.json"
+        ).read_bytes(),
+    }
+    revised = _PRIMARY_HTML.replace(b"60,584", b"60,585")
+    real_replace = live_fetch.os.replace
+    live_doc = roots["extracted_root"] / _ACCESSION
+
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    def crash_after_doc_swap(source: str | bytes, target: str | bytes) -> None:
+        real_replace(source, target)
+        if Path(target) == live_doc:
+            raise SimulatedProcessCrash("crashed after accession swap")
+
+    def terminate_rollback(**_: object) -> None:
+        raise SimulatedProcessCrash("process terminated")
+
+    with monkeypatch.context() as crash_patch:
+        crash_patch.setattr(live_fetch.os, "replace", crash_after_doc_swap)
+        crash_patch.setattr(live_fetch, "_rollback_publish", terminate_rollback)
+        # A real process exit does not run either publish cleanup finally.
+        crash_patch.setattr(live_fetch.shutil, "rmtree", lambda *_args, **_kwargs: None)
+        with _scripted_sec({_PRIMARY_URL: revised}, []):
+            with pytest.raises(SimulatedProcessCrash):
+                fetch_and_ingest(
+                    cik=_CIK,
+                    accession=_ACCESSION,
+                    primary_doc="aapl-20230701.htm",
+                    **roots,
+                )
+
+    live_fetch._recover_interrupted_publish(
+        manifest_path=roots["manifest_path"]
+    )
+
+    assert (roots["extracted_root"] / "_index.json").read_bytes() == committed[
+        "index"
+    ]
+    assert roots["manifest_path"].read_bytes() == committed["manifest"]
+    assert (
+        roots["extracted_root"] / _ACCESSION / "page-001.json"
+    ).read_bytes() == committed["page"]
+    assert (
+        roots["facts_root"] / f"{_ACCESSION}.json"
+    ).read_bytes() == committed["facts"]
+
+
 # ---------- primary document resolution ----------
 
 
