@@ -195,12 +195,21 @@ def test_build_memory_dream_backend_returns_the_null_backend_by_default() -> Non
     assert isinstance(build_memory_dream_backend("null"), NullDreamBackend)
 
 
-def test_an_unknown_dream_backend_kind_is_a_typed_config_error() -> None:
+@pytest.mark.parametrize("kind", ["mcp", "", "   ", "MCP"])
+def test_an_unwired_dream_backend_kind_is_a_typed_config_error(
+    kind: str,
+) -> None:
     """A misspelled kind must stop the boot, not fall back to ``null``."""
     from fin.host.memory_port import build_memory_dream_backend
 
     with pytest.raises(MemoryConfigError):
-        build_memory_dream_backend("mcp")
+        build_memory_dream_backend(kind)
+
+
+def test_the_wired_null_kind_tolerates_case_and_padding() -> None:
+    from fin.host.memory_port import build_memory_dream_backend
+
+    assert isinstance(build_memory_dream_backend(" NULL "), NullDreamBackend)
 
 
 def test_the_runtime_memory_port_stays_off_until_enabled() -> None:

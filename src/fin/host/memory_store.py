@@ -23,7 +23,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from fin.host.db_pool import PostgresPool
-from fin.host.memory_port import DreamCursorError
+from fin.host.memory_port import DreamCursorError, DreamInputError
 
 
 MEMORY_TABLE = "fin_memory"
@@ -108,7 +108,12 @@ class MemoryStore(Protocol):
         ...
 
     def disable(self, row_id: str, *, reason: str, at: datetime) -> None:
-        """Soft-disable one row, recording why and when."""
+        """Soft-disable one row, recording why and when.
+
+        Unknown ids are ignored: callers select candidates from
+        :meth:`rows`, so an id that has gone missing is a row another
+        worker already retired, not an error.
+        """
         ...
 
     def mark_transported(self, ids: Sequence[str], *, at: datetime) -> None:
@@ -200,10 +205,7 @@ class PostgresMemoryStore:
 
     def setup(self) -> None:
         """Create the memory tables if they are missing. Safe to re-run."""
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(MEMORY_SCHEMA_SQL)
-            conn.commit()
+        ensure_memory_schema(self._pool)
 
     def add(self, row: MemoryRow) -> None:
         with self._pool.connection() as conn:
@@ -290,17 +292,51 @@ class PostgresMemoryStore:
 
 def _row_from_record(record: dict[str, object]) -> MemoryRow:
     metadata = record["metadata"]
+    if not isinstance(metadata, dict):
+        raise DreamInputError(
+            f"memory row metadata is not an object: {metadata!r}"
+        )
     return MemoryRow(
         id=str(record["id"]),
         text=str(record["text"]),
-        metadata=dict(metadata) if isinstance(metadata, dict) else {},
-        created_at=_as_datetime(record["created_at"]),
+        metadata=dict(metadata),
+        created_at=_as_created_at(record["created_at"]),
         expires_at=_as_datetime(record["expires_at"]),
         hit_count=int(record["hit_count"]),  # type: ignore[arg-type]
         status=cast(MemoryStatus, record["status"]),
         disabled_reason=_as_optional_str(record["disabled_reason"]),
         disabled_at=_as_datetime(record["disabled_at"]),
         transported_at=_as_datetime(record["transported_at"]),
+    )
+
+
+def ensure_memory_schema(pool: PostgresPool) -> None:
+    """Create the memory tables if they are missing. Safe to re-run.
+
+    Shared by both Postgres stores so the DDL is stated once, and so
+    constructing a buffer's two stores runs it once per boot path
+    rather than twice.
+    """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(MEMORY_SCHEMA_SQL)
+        conn.commit()
+
+
+def _as_created_at(value: object) -> datetime:
+    """Coerce the non-nullable ``created_at`` column.
+
+    Loud rather than silent, for the same reason
+    :func:`parse_dream_cursor` rejects corruption instead of resetting:
+    a row whose creation time is unusable would otherwise reach the
+    scorer as ``None``, where ``now - row.created_at`` raises
+    ``TypeError`` — outside the ``MemoryDreamError`` family ``run()``
+    catches, leaving the cursor claimed and dream stalled for 24h.
+    """
+    if isinstance(value, datetime):
+        return value
+    raise DreamInputError(
+        f"memory row created_at is not a datetime: {value!r}"
     )
 
 
@@ -459,10 +495,8 @@ class PostgresDreamCursorStore:
         self.setup()
 
     def setup(self) -> None:
-        with self._pool.connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(MEMORY_SCHEMA_SQL)
-            conn.commit()
+        """Create the memory tables if they are missing. Safe to re-run."""
+        ensure_memory_schema(self._pool)
 
     def load(self) -> DreamCursor:
         with self._pool.connection() as conn:
