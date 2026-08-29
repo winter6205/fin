@@ -25,7 +25,6 @@ from fin.host.memory_dream import (
     DREAM_MIN_THREADS,
     LONGEVITY_DAYS,
     TRANSPORT_RETENTION_DAYS,
-    DreamCursorError,
     DreamGate,
     DreamInputError,
     DreamTransportError,
@@ -36,7 +35,11 @@ from fin.host.memory_dream import (
     NullDreamSummarizer,
     ScoredMemory,
 )
-from fin.host.memory_port import MEMORY_LIMIT_CAP, MemoryPortError
+from fin.host.memory_port import (
+    MEMORY_LIMIT_CAP,
+    DreamCursorError,
+    MemoryPortError,
+)
 from fin.host.memory_store import (
     InProcessDreamCursorStore,
     InProcessMemoryStore,
@@ -648,6 +651,35 @@ def test_the_dream_error_hierarchy_hangs_off_the_memory_port() -> None:
     assert issubclass(DreamInputError, MemoryDreamError)
     assert issubclass(DreamTransportError, MemoryDreamError)
     assert issubclass(DreamCursorError, MemoryDreamError)
+
+
+@pytest.mark.parametrize("limit", [None, "8", 8.0, True])
+def test_a_non_integer_limit_is_a_typed_input_error(limit: object) -> None:
+    store = _store_with_threads(_thread_ids(DREAM_MIN_THREADS))
+    dream = MemoryDream(store, InProcessDreamCursorStore())
+
+    with pytest.raises(DreamInputError):
+        dream.run(limit=limit, now=NOW)  # type: ignore[arg-type]
+
+
+def test_a_backend_returning_a_non_integer_count_is_a_transport_error() -> None:
+    """A backend that reports its result in any other shape is a bug."""
+    store = _store_with_threads(_thread_ids(DREAM_MIN_THREADS))
+    for row in store.rows():
+        store.bump_hit_counts([row.id] * 2)
+
+    class _NonIntegerBackend:
+        def persist(self, memories: object) -> object:
+            return "all of them"
+
+    with pytest.raises(DreamTransportError):
+        MemoryDream(
+            store,
+            InProcessDreamCursorStore(),
+            backend=_NonIntegerBackend(),  # type: ignore[arg-type]
+        ).run(now=NOW)
+
+    assert all(row.status == "active" for row in store.rows())
 
 
 def test_the_default_gate_constants_match_the_spec() -> None:
