@@ -389,44 +389,14 @@ def _dump(payload: object) -> bytes:
 def _read_index_documents(index_path: Path) -> dict[str, dict[str, object]]:
     """Read the per-document records out of an existing ``_index.json``.
 
-    A missing index is an empty catalog. A present-but-unreadable one
-    is an EXIT: overwriting it would turn a damaged index into a
-    single-entry index and quietly drop every other document from the
-    query SSOT (ADR 0020).
+    Callers that treat a missing index as an empty catalog must probe
+    ``exists()`` first. A present-but-unreadable file is an EXIT:
+    overwriting it would turn a damaged index into a single-entry index
+    and quietly drop every other document from the query SSOT (ADR 0020).
     """
-    if not index_path.is_file():
-        raise MalformedExtractedIndexError(
-            f"extracted index is not a regular file: {index_path}"
-        )
-    try:
-        payload = json.loads(index_path.read_text())
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
-        raise MalformedExtractedIndexError(
-            f"malformed extracted index: {index_path}"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise MalformedExtractedIndexError(
-            f"extracted index must be a JSON object: {index_path}"
-        )
-    documents = payload.get("documents")
-    if not isinstance(documents, dict):
-        raise MalformedExtractedIndexError(
-            f"extracted index has no 'documents' object: {index_path}"
-        )
-    for document_id, entry in documents.items():
-        if (
-            not isinstance(document_id, str)
-            or not isinstance(entry, dict)
-            or not isinstance(entry.get("version"), str)
-            or not entry["version"]
-            or not isinstance(entry.get("page_count"), int)
-            or isinstance(entry["page_count"], bool)
-            or entry["page_count"] < 0
-        ):
-            raise MalformedExtractedIndexError(
-                f"extracted index has an invalid document record: {index_path}"
-            )
-    return documents
+    from fin.corpus.extracted_index import parse_extracted_index_documents
+
+    return parse_extracted_index_documents(index_path)
 
 
 def _write_live_unit(
@@ -621,21 +591,16 @@ def _read_publish_journal(journal_path: Path) -> dict[str, object]:
     return payload
 
 
-def _recover_interrupted_publish(*, manifest_path: Path) -> None:
-    """Complete or roll back a publish left by a process crash.
-
-    The manifest is the catalog's commit pointer: it is replaced last.
-    The journal makes that pointer durable across a crash, so a later
-    live-fetch operation can discard every uncommitted target before it
-    reads the manifest or extracted index.
-    """
-    journal_path = _publish_journal_path(manifest_path)
-    if not journal_path.is_file():
-        return
-
-    payload = _read_publish_journal(journal_path)
-    raw_entries = payload["entries"]
-    raw_cleanup_dirs = payload["cleanup_dirs"]
+def _decode_publish_journal_entries(
+    raw_entries: object,
+    *,
+    journal_path: Path,
+) -> list[tuple[Path, Path, Path, bool]]:
+    """Decode journal entry rows into typed path tuples."""
+    if not isinstance(raw_entries, list):
+        raise IngestMissingError(
+            f"invalid live publish journal entries: {journal_path}"
+        )
     entries: list[tuple[Path, Path, Path, bool]] = []
     for raw_entry in raw_entries:
         if not isinstance(raw_entry, dict):
@@ -656,18 +621,31 @@ def _recover_interrupted_publish(*, manifest_path: Path) -> None:
         entries.append(
             (Path(staged), Path(target), Path(backup), target_existed)
         )
+    return entries
 
-    committed = payload["state"] == "committed" or all(
-        not staged.exists() for staged, _target, _backup, _existed in entries
-    )
-    if not committed:
-        for staged, target, backup, target_existed in reversed(entries):
-            if backup.exists():
-                _remove_publish_target(target)
-                os.replace(backup, target)
-            elif not staged.exists() and not target_existed:
-                _remove_publish_target(target)
 
+def _rollback_uncommitted_publish_entries(
+    entries: list[tuple[Path, Path, Path, bool]],
+) -> None:
+    """Restore or discard targets for a journal still in ``prepared``."""
+    for staged, target, backup, target_existed in reversed(entries):
+        if backup.exists():
+            _remove_publish_target(target)
+            os.replace(backup, target)
+        elif not staged.exists() and not target_existed:
+            _remove_publish_target(target)
+
+
+def _cleanup_publish_journal(
+    *,
+    journal_path: Path,
+    raw_cleanup_dirs: object,
+) -> None:
+    """Remove staging/backup dirs recorded by the journal, then the journal."""
+    if not isinstance(raw_cleanup_dirs, list):
+        raise IngestMissingError(
+            f"invalid live publish cleanup path: {journal_path}"
+        )
     for raw_dir in raw_cleanup_dirs:
         if not isinstance(raw_dir, str):
             raise IngestMissingError(
@@ -675,6 +653,33 @@ def _recover_interrupted_publish(*, manifest_path: Path) -> None:
             )
         shutil.rmtree(raw_dir, ignore_errors=True)
     journal_path.unlink(missing_ok=True)
+
+
+def _recover_interrupted_publish(*, manifest_path: Path) -> None:
+    """Complete or roll back a publish left by a process crash.
+
+    The manifest is the catalog's commit pointer: it is replaced last.
+    The journal makes that pointer durable across a crash, so a later
+    live-fetch operation can discard every uncommitted target before it
+    reads the manifest or extracted index.
+    """
+    journal_path = _publish_journal_path(manifest_path)
+    if not journal_path.is_file():
+        return
+
+    payload = _read_publish_journal(journal_path)
+    entries = _decode_publish_journal_entries(
+        payload["entries"], journal_path=journal_path
+    )
+    committed = payload["state"] == "committed" or all(
+        not staged.exists() for staged, _target, _backup, _existed in entries
+    )
+    if not committed:
+        _rollback_uncommitted_publish_entries(entries)
+    _cleanup_publish_journal(
+        journal_path=journal_path,
+        raw_cleanup_dirs=payload["cleanup_dirs"],
+    )
 
 
 def _rollback_publish(

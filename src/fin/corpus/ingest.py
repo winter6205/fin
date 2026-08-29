@@ -163,47 +163,9 @@ def _read_existing_index(extracted_root: Path) -> dict[str, dict[str, object]] |
     raising before any output write prevents a damaged catalog from
     being silently replaced.
     """
-    index_path = extracted_root / "_index.json"
-    if not index_path.exists():
-        return None
-    if not index_path.is_file():
-        raise MalformedExtractedIndexError(
-            f"extracted index is not a regular file: {index_path}"
-        )
-    try:
-        payload = json.loads(index_path.read_text())
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
-        raise MalformedExtractedIndexError(
-            f"malformed extracted index: {index_path}"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise MalformedExtractedIndexError(
-            f"extracted index must be a JSON object: {index_path}"
-        )
-    docs = payload.get("documents")
-    if not isinstance(docs, dict):
-        raise MalformedExtractedIndexError(
-            f"extracted index has no 'documents' object: {index_path}"
-        )
-    for document_id, entry in docs.items():
-        if not isinstance(document_id, str) or not isinstance(entry, dict):
-            raise MalformedExtractedIndexError(
-                f"extracted index has an invalid document record: {index_path}"
-            )
-        version = entry.get("version")
-        page_count = entry.get("page_count")
-        if (
-            not isinstance(version, str)
-            or not version
-            or not isinstance(page_count, int)
-            or isinstance(page_count, bool)
-            or page_count < 0
-        ):
-            raise MalformedExtractedIndexError(
-                f"extracted index has an invalid document record for "
-                f"{document_id!r}: {index_path}"
-            )
-    return docs
+    from fin.corpus.extracted_index import read_existing_extracted_index
+
+    return read_existing_extracted_index(extracted_root)
 
 
 def _artifacts_present(doc_dir: Path, page_count: int) -> bool:
