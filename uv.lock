@@ -202,6 +202,7 @@ dependencies = [
     { name = "langgraph-checkpoint-postgres" },
     { name = "pdfplumber" },
     { name = "psycopg", extra = ["binary"] },
+    { name = "psycopg-pool" },
     { name = "rank-bm25" },
     { name = "uvicorn" },
 ]
@@ -226,6 +227,7 @@ requires-dist = [
     { name = "langgraph-checkpoint-postgres", specifier = ">=2.0.0" },
     { name = "pdfplumber", specifier = ">=0.11.10" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2.0" },
+    { name = "psycopg-pool", specifier = ">=3.2.0" },
     { name = "pytesseract", marker = "extra == 'ocr'", specifier = ">=0.3.10" },
     { name = "rank-bm25", specifier = ">=0.2.2" },
     { name = "uvicorn", specifier = ">=0.30.0" },

@@ -1,33 +1,52 @@
-"""Local advisory-memory buffer for an enabled memory adapter.
+"""Advisory-memory buffer behind the T3 :mod:`memory_port`.
 
 The T3 :mod:`memory_port` remains the product seam and stays OFF by default.
 This module owns local extract, recall, and soft garbage collection. Memory
 rows are deliberately not filing evidence: result rows carry an explicit
 advisory marker and no citation, evidence, or ``source_ref``.
 
-The behavior is kept behind this small backend so a later Postgres store can
-replace the process-local storage without changing the port or host graph.
+``MemoryBuffer`` holds the behaviour once and delegates persistence to a
+:class:`~fin.host.memory_store.MemoryStore`. Two subclasses pick the store:
+:class:`LocalMemoryBuffer` keeps rows in the process, and
+:class:`PostgresMemoryBuffer` keeps them in ``fin_memory`` per ADR 0035.
+Swapping stores never changes the port or the host graph.
 """
 
 from __future__ import annotations
 
 import copy
+import json
+import logging
 import re
-import threading
 import uuid
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Literal, Mapping
+from datetime import datetime, timedelta, timezone
+from typing import Mapping
 
+from fin.host.db_pool import PostgresPool
+from fin.host.memory_dream import (
+    TRANSPORT_RETENTION_DAYS,
+    DreamSummarizer,
+    MemoryDream,
+    MemoryDreamBackend,
+    MemoryDreamError,
+)
 from fin.host.memory_port import (
     DEFAULT_MEMORY_LIMIT,
     MEMORY_LIMIT_CAP,
     MemoryPort,
     OffMemoryAdapter,
 )
+from fin.host.memory_store import (
+    DreamCursorStore,
+    InProcessDreamCursorStore,
+    InProcessMemoryStore,
+    MemoryRow,
+    MemoryStore,
+    PostgresDreamCursorStore,
+    PostgresMemoryStore,
+)
 
-
-MemoryStatus = Literal["active", "disabled"]
+logger = logging.getLogger(__name__)
 
 
 class MemoryBufferError(Exception):
@@ -39,20 +58,6 @@ class MemoryBufferInputError(MemoryBufferError):
 
 
 MemoryInputError = MemoryBufferInputError
-
-
-@dataclass
-class _MemoryRow:
-    """Authority row kept internally, including soft-disabled records."""
-
-    id: str
-    text: str
-    metadata: dict[str, object]
-    created_at: datetime
-    expires_at: datetime | None
-    status: MemoryStatus = "active"
-    disabled_reason: str | None = None
-    disabled_at: datetime | None = None
 
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
@@ -95,20 +100,39 @@ def _tokens(value: str) -> set[str]:
     return {token.casefold() for token in _TOKEN_RE.findall(value)}
 
 
-class LocalMemoryBuffer:
-    """Thread-safe local buffer for advisory dialogue memories.
+def _json_safe_metadata(metadata: dict[str, object]) -> dict[str, object]:
+    """Normalise metadata to what a JSONB column can hold.
 
-    One non-empty extraction produces one row. GC changes row status instead
-    of deleting it, preserving the authority record for auditing or a later
-    Postgres persistence adapter. ``dream`` is a deferred no-op: T6 owns MCP
-    transport and this class never sends memory outside the process.
+    ``fin_memory.metadata`` is JSONB, so a ``datetime`` there would be
+    coerced to a string by Postgres while the process-local store kept the
+    object. Normalising at this boundary keeps the two implementations
+    behaviourally identical instead of drifting (SC10).
+    """
+    return json.loads(json.dumps(metadata, default=str))
+
+
+class MemoryBuffer:
+    """Advisory-memory behaviour over an injectable row store.
+
+    One non-empty extraction produces one row. Ranking, expiry, and
+    supersession live here so both stores behave identically; only
+    persistence differs.
     """
 
     enabled = True
 
-    def __init__(self) -> None:
-        self._rows: dict[str, _MemoryRow] = {}
-        self._lock = threading.RLock()
+    def __init__(
+        self,
+        store: MemoryStore,
+        cursors: DreamCursorStore,
+        *,
+        backend: MemoryDreamBackend | None = None,
+        summarizer: DreamSummarizer | None = None,
+    ) -> None:
+        self._store = store
+        self._cursors = cursors
+        self._backend = backend
+        self._summarizer = summarizer
 
     def extract(
         self,
@@ -133,15 +157,14 @@ class LocalMemoryBuffer:
         ):
             raise MemoryBufferInputError("supersedes must be a non-empty id")
 
-        row = _MemoryRow(
+        row = MemoryRow(
             id=str(uuid.uuid4()),
             text=cleaned,
-            metadata=copied_metadata,
+            metadata=_json_safe_metadata(copied_metadata),
             created_at=_utc_now(),
             expires_at=expires_at,
         )
-        with self._lock:
-            self._rows[row.id] = row
+        self._store.add(row)
         return {"status": "ok", "memories": [self._as_memory(row)]}
 
     def recall(
@@ -154,7 +177,8 @@ class LocalMemoryBuffer:
 
         This is advisory recall, not retrieval evidence. Returned rows
         intentionally cannot be passed to the citation gate as filing
-        locators.
+        locators. Every returned row records one hit, which is the
+        recurrence signal the dream score reads (SC7).
         """
         if not isinstance(query, str):
             raise MemoryBufferInputError("query must be a string")
@@ -163,19 +187,25 @@ class LocalMemoryBuffer:
         if not query_tokens:
             return {"status": "empty", "memories": []}
 
-        with self._lock:
-            ranked = [
-                (len(query_tokens & _tokens(row.text)), row)
-                for row in self._rows.values()
-                if row.status == "active"
-                and query_tokens & _tokens(row.text)
-            ]
+        rows = self._store.rows(include_disabled=False)
+        ranked = [
+            (len(query_tokens & _tokens(row.text)), row)
+            for row in rows
+            if query_tokens & _tokens(row.text)
+        ]
         ranked.sort(key=lambda pair: (pair[0], pair[1].created_at), reverse=True)
+        top = ranked[:resolved_limit]
+
+        self._store.bump_hit_counts([row.id for _score, row in top])
+        # ``rows()`` hands back copies, so mirror the increment onto them
+        # instead of re-reading the store for the response.
+        for _score, row in top:
+            row.hit_count += 1
+
         return {
             "status": "ok",
             "memories": [
-                self._as_memory(row, score=score)
-                for score, row in ranked[:resolved_limit]
+                self._as_memory(row, score=score) for score, row in top
             ],
         }
 
@@ -185,57 +215,76 @@ class LocalMemoryBuffer:
         limit: int = DEFAULT_MEMORY_LIMIT,
         now: datetime | None = None,
     ) -> dict[str, object]:
-        """Soft-disable expired or superseded active rows.
+        """Soft-disable expired or superseded active rows, then purge.
 
-        ``now`` is injectable for deterministic boundary tests. Disabled rows
-        remain in :meth:`entries`, so GC never deletes authority data.
+        ``now`` is injectable for deterministic boundary tests. Rows that
+        were never transported are only soft-disabled; rows a backend
+        already confirmed are hard-deleted once they pass the retention
+        window, because a copy that exists durably elsewhere has no read
+        value locally (SC19).
         """
         resolved_limit = _resolve_limit(limit)
         gc_time = (
             _utc_now() if now is None else _normalise_datetime(now, field="now")
         )
 
-        with self._lock:
-            superseded_ids = {
-                str(row.metadata["supersedes"])
-                for row in self._rows.values()
-                if row.status == "active" and row.metadata.get("supersedes")
-            }
-            candidates = [
-                row
-                for row in self._rows.values()
-                if row.status == "active"
-                and (
-                    (row.expires_at is not None and row.expires_at <= gc_time)
-                    or row.id in superseded_ids
-                )
-            ]
-            candidates.sort(key=lambda row: row.created_at)
-            removed = 0
-            for row in candidates[:resolved_limit]:
-                reason = (
-                    "expired"
-                    if row.expires_at is not None and row.expires_at <= gc_time
-                    else "superseded"
-                )
-                row.status = "disabled"
-                row.disabled_reason = reason
-                row.disabled_at = gc_time
-                removed += 1
+        rows = self._store.rows(include_disabled=False)
+        superseded_ids = {
+            str(row.metadata["supersedes"])
+            for row in rows
+            if row.metadata.get("supersedes")
+        }
+        candidates = [
+            row
+            for row in rows
+            if (row.expires_at is not None and row.expires_at <= gc_time)
+            or row.id in superseded_ids
+        ]
+        candidates.sort(key=lambda row: row.created_at)
+
+        removed = 0
+        for row in candidates[:resolved_limit]:
+            reason = (
+                "expired"
+                if row.expires_at is not None and row.expires_at <= gc_time
+                else "superseded"
+            )
+            self._store.disable(row.id, reason=reason, at=gc_time)
+            removed += 1
+
+        self._store.delete_transported_before(
+            gc_time - timedelta(days=TRANSPORT_RETENTION_DAYS)
+        )
         return {"status": "ok", "removed": removed}
 
     def entries(self, *, include_disabled: bool = True) -> list[dict[str, object]]:
         """Return copies of authority rows for inspection and persistence."""
-        with self._lock:
-            rows = list(self._rows.values())
-        if not include_disabled:
-            rows = [row for row in rows if row.status == "active"]
-        return [self._as_memory(row) for row in rows]
+        return [
+            self._as_memory(row)
+            for row in self._store.rows(include_disabled=include_disabled)
+        ]
 
     def dream(self, *, limit: int = DEFAULT_MEMORY_LIMIT) -> dict[str, object]:
-        """Defer durable transport to the T6 memory-MCP adapter."""
-        _resolve_limit(limit)
-        return {"status": "deferred", "transported": 0}
+        """Consolidate useful rows and transport them to the dream backend.
+
+        A failed dream is recorded, never raised: CONTEXT.md:45 requires
+        that dream must not fail the foreground turn, and the HTTP layer
+        that triggers it runs after the response has already streamed.
+        """
+        try:
+            return MemoryDream(
+                self._store,
+                self._cursors,
+                backend=self._backend,
+                summarizer=self._summarizer,
+            ).run(limit=limit)
+        except MemoryDreamError as exc:
+            logger.exception("memory dream failed; the buffer is untouched")
+            return {
+                "status": "error",
+                "error": type(exc).__name__,
+                "transported": 0,
+            }
 
     @staticmethod
     def _expiry_from_metadata(
@@ -248,7 +297,7 @@ class LocalMemoryBuffer:
 
     @staticmethod
     def _as_memory(
-        row: _MemoryRow,
+        row: MemoryRow,
         *,
         score: int | None = None,
     ) -> dict[str, object]:
@@ -260,6 +309,7 @@ class LocalMemoryBuffer:
             "expires_at": (
                 row.expires_at.isoformat() if row.expires_at is not None else None
             ),
+            "hit_count": row.hit_count,
             "status": row.status,
             "advisory": True,
             "citation_eligible": False,
@@ -273,12 +323,61 @@ class LocalMemoryBuffer:
         return result
 
 
+class LocalMemoryBuffer(MemoryBuffer):
+    """Process-local buffer used by tests and by in-memory deployments.
+
+    Rows do not survive a restart; that is the Postgres store's contract,
+    not this one's.
+    """
+
+    def __init__(
+        self,
+        *,
+        backend: MemoryDreamBackend | None = None,
+        summarizer: DreamSummarizer | None = None,
+    ) -> None:
+        super().__init__(
+            InProcessMemoryStore(),
+            InProcessDreamCursorStore(),
+            backend=backend,
+            summarizer=summarizer,
+        )
+
+
+class PostgresMemoryBuffer(MemoryBuffer):
+    """Buffer backed by ``fin_memory`` (ADR 0035's working store).
+
+    The pool is opened on construction so a misconfigured URL fails at
+    wiring time instead of on the first operator request.
+    """
+
+    def __init__(
+        self,
+        pool: PostgresPool,
+        *,
+        backend: MemoryDreamBackend | None = None,
+        summarizer: DreamSummarizer | None = None,
+    ) -> None:
+        self._pool = pool
+        if not pool.is_open:
+            pool.open()
+        super().__init__(
+            PostgresMemoryStore(pool),
+            PostgresDreamCursorStore(pool),
+            backend=backend,
+            summarizer=summarizer,
+        )
+
+    def close(self) -> None:
+        """Close the pool. The buffer is unusable afterwards."""
+        self._pool.close()
+
+
 def build_local_memory_port(*, enabled: bool = True) -> MemoryPort:
     """Build an explicit local/off port without changing the default port."""
     return LocalMemoryBuffer() if enabled else OffMemoryAdapter()
 
 
-MemoryBuffer = LocalMemoryBuffer
 LocalMemoryAdapter = LocalMemoryBuffer
 
 
@@ -289,5 +388,6 @@ __all__ = [
     "MemoryBufferError",
     "MemoryBufferInputError",
     "MemoryInputError",
+    "PostgresMemoryBuffer",
     "build_local_memory_port",
 ]
