@@ -50,8 +50,66 @@ class ManifestShaMismatchError(IngestMissingError):
     pass
 
 
+class ParseError(RuntimeError):
+    """Base class for the multi-format parse path's named failures (T6).
+
+    The seven-format parser (``fin.corpus.parsers``) never returns a
+    "silently empty" result: every failure shape it can produce is a
+    subclass of this family, so callers can distinguish "the source is
+    in a known-bad state" from generic runtime failures (SC9 / SC40
+    lineage: no empty string, no silent skip, no bare exception).
+    """
+
+
+class EmptySourceParseError(ParseError):
+    """The source bytes are empty (0-byte file) — SC9's empty-input
+    shape. Parsing cannot succeed because there is nothing to parse;
+    the unit is refused, not marked complete with empty frozen text.
+    """
+
+
+class UnsupportedFormatParseError(ParseError):
+    """The requested format is not one of the seven supported formats
+    (pdf / docx / xlsx / pptx / html / md / txt) — SC9's non-target
+    MIME shape. The caller names the format explicitly; an unknown
+    name is an EXIT, not a best-effort guess.
+    """
+
+
+class MalformedSourceParseError(ParseError):
+    """The source cannot be opened as its claimed format: corrupt
+    container (bad zip / bad XML), encrypted or unreadable PDF, or a
+    parser-level decode failure — SC9's corrupt-input shape. Refusing
+    beats guessing: a half-readable document must not yield units.
+    """
+
+
+class NoUnitsParseError(ParseError):
+    """The parse succeeded mechanically but produced zero non-empty
+    frozen units (e.g. a whitespace-only document) — SC6's non-empty
+    unit floor is violated, so the parse is a named failure instead of
+    an empty success.
+    """
+
+
+class ParseMetadataIncompleteError(ParseError):
+    """A produced unit (or the parse identity itself) is missing one of
+    the eight structured-metadata fields — format, source byte hash,
+    locator triple, unit ordinal, char count, language, parse rule
+    version, params-table version (SC10). The parse terminates with
+    this named failure; a "field missing but still successful" unit is
+    never emitted.
+    """
+
+
 __all__ = [
     "IngestMissingError",
     "MalformedExtractedIndexError",
     "ManifestShaMismatchError",
+    "ParseError",
+    "EmptySourceParseError",
+    "UnsupportedFormatParseError",
+    "MalformedSourceParseError",
+    "NoUnitsParseError",
+    "ParseMetadataIncompleteError",
 ]
