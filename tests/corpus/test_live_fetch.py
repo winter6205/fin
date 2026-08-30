@@ -717,3 +717,189 @@ def test_frozen_unit_is_loadable_as_an_extracted_document(
     assert len(pages) == 1
     assert pages[0].locator.version == version
     assert "Products $ 60,584 $ 63,355" in pages[0].text
+
+
+# ---------- publish staging cleanup ----------
+
+_BACKUP_PREFIX = ".live-publish-backup-"
+
+
+def _leftover_backup_dirs(*parents: Path) -> list[Path]:
+    return [
+        path
+        for parent in parents
+        for path in parent.rglob(f"{_BACKUP_PREFIX}*")
+    ]
+
+
+def _staged_publish(tmp_path: Path) -> dict[str, Path]:
+    """Four staged artifacts plus the corpus roots they publish into.
+
+    ``extracted_root`` is the parent of **two** targets (the accession
+    directory and ``_index.json``); the staging roots stay outside the
+    published tree so a leftover there cannot mask a leftover inside it.
+    """
+    staging = tmp_path / "staging"
+    doc_dir = staging / "extracted" / _ACCESSION
+    doc_dir.mkdir(parents=True)
+    (doc_dir / "page-001.json").write_text(
+        json.dumps(
+            {"document_id": _ACCESSION, "version": "v1", "text": "frozen unit"}
+        )
+    )
+    staged_index = staging / "extracted" / "_index.json"
+    staged_index.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "documents": {_ACCESSION: {"version": "v1", "page_count": 1}},
+            }
+        )
+    )
+    staged_facts = staging / "facts" / f"{_ACCESSION}.json"
+    staged_facts.parent.mkdir(parents=True, exist_ok=True)
+    staged_facts.write_text("{}")
+    staged_manifest = staging / "manifest" / "manifest.json"
+    staged_manifest.parent.mkdir(parents=True, exist_ok=True)
+    staged_manifest.write_text(
+        json.dumps({"documents": [{"document_id": _ACCESSION}]})
+    )
+
+    roots = _roots(tmp_path)
+    roots["extracted_root"].mkdir(parents=True, exist_ok=True)
+    roots["facts_root"].mkdir(parents=True, exist_ok=True)
+    roots["manifest_path"].write_text('{"documents": []}\n')
+    return {
+        **roots,
+        "staged_doc_dir": doc_dir,
+        "staged_index": staged_index,
+        "staged_facts": staged_facts,
+        "staged_manifest": staged_manifest,
+    }
+
+
+def test_publish_leaves_no_backup_directory_when_targets_share_a_parent(
+    tmp_path: Path,
+) -> None:
+    """Every temp backup dir the publish opens must be closed again.
+
+    ``_publish_staged`` publishes four targets under three parents, so
+    one parent (``extracted_root``, holding both the accession dir and
+    ``_index.json``) is visited twice. A backup dir created on that
+    repeat visit but never recorded would survive the cleanup ``finally``
+    and pile up one empty hidden dir per live fetch inside the corpus
+    tree.
+    """
+    staged = _staged_publish(tmp_path)
+
+    live_fetch._publish_staged(
+        staged_doc_dir=staged["staged_doc_dir"],
+        staged_index=staged["staged_index"],
+        staged_facts=staged["staged_facts"],
+        staged_manifest=staged["staged_manifest"],
+        extracted_root=staged["extracted_root"],
+        facts_root=staged["facts_root"],
+        manifest_path=staged["manifest_path"],
+    )
+
+    # The publish really happened, so the assertion below cannot pass by
+    # the publish refusing to run at all.
+    assert (staged["extracted_root"] / _ACCESSION / "page-001.json").exists()
+    assert json.loads(staged["manifest_path"].read_text())["documents"]
+    assert (
+        _leftover_backup_dirs(
+            staged["extracted_root"],
+            staged["facts_root"],
+            staged["manifest_path"].parent,
+        )
+        == []
+    )
+
+
+def test_successful_live_fetch_leaves_no_backup_directory_in_the_corpus(
+    tmp_path: Path,
+) -> None:
+    """The full live path (scripted SEC, no socket) leaves the published
+    tree free of publish scratch dirs."""
+    roots = _roots(tmp_path)
+    bodies = {_INDEX_URL: _AAPL_LISTING, _PRIMARY_URL: _PRIMARY_HTML}
+
+    with _scripted_sec(bodies, []):
+        fetch_and_ingest(cik=_CIK, accession=_ACCESSION, **roots)
+
+    assert (roots["extracted_root"] / _ACCESSION / "page-001.json").exists()
+    assert (
+        _leftover_backup_dirs(
+            roots["extracted_root"],
+            roots["facts_root"],
+            roots["manifest_path"].parent,
+        )
+        == []
+    )
+
+
+def test_failed_publish_rolls_back_without_leaving_a_backup_directory(
+    tmp_path: Path,
+) -> None:
+    """The rollback path must clean up scratch dirs too: a publish that
+    dies mid-swap is exactly when an unreachable target is most likely."""
+    staged = _staged_publish(tmp_path)
+    staged["staged_facts"].unlink()  # os.replace() on a missing staged file
+    original_manifest = staged["manifest_path"].read_bytes()
+
+    with pytest.raises(FileNotFoundError):
+        live_fetch._publish_staged(
+            staged_doc_dir=staged["staged_doc_dir"],
+            staged_index=staged["staged_index"],
+            staged_facts=staged["staged_facts"],
+            staged_manifest=staged["staged_manifest"],
+            extracted_root=staged["extracted_root"],
+            facts_root=staged["facts_root"],
+            manifest_path=staged["manifest_path"],
+        )
+
+    assert not (staged["extracted_root"] / _ACCESSION).exists()
+    assert not (staged["extracted_root"] / "_index.json").exists()
+    assert staged["manifest_path"].read_bytes() == original_manifest
+    assert (
+        _leftover_backup_dirs(
+            staged["extracted_root"],
+            staged["facts_root"],
+            staged["manifest_path"].parent,
+        )
+        == []
+    )
+
+
+def test_repeated_publishes_do_not_accumulate_backup_directories(
+    tmp_path: Path,
+) -> None:
+    """The unrecorded backup dir is one **per call**, so a corpus tree
+    refetched many times must not grow one hidden dir per fetch.
+
+    A single publish proves only that nothing survived this run; the
+    second publish is what separates "cleaned up" from "cleaned up by
+    luck". ``_staged_publish`` rebuilds its staging inputs each call,
+    since the previous publish moved them onto their targets.
+    """
+    for _ in range(2):
+        staged = _staged_publish(tmp_path)
+        live_fetch._publish_staged(
+            staged_doc_dir=staged["staged_doc_dir"],
+            staged_index=staged["staged_index"],
+            staged_facts=staged["staged_facts"],
+            staged_manifest=staged["staged_manifest"],
+            extracted_root=staged["extracted_root"],
+            facts_root=staged["facts_root"],
+            manifest_path=staged["manifest_path"],
+        )
+
+    assert (staged["extracted_root"] / _ACCESSION / "page-001.json").exists()
+    assert (
+        _leftover_backup_dirs(
+            staged["extracted_root"],
+            staged["facts_root"],
+            staged["manifest_path"].parent,
+        )
+        == []
+    )
