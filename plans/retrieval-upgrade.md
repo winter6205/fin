@@ -22,7 +22,7 @@ error-handling-enforcer: yes — 解析失败、OCR 不可用、推送不可用�
 complexity-anti-drift: yes — 解析 / 切分 / 推送 / 失效 / 评测五件事各自独立，切分规则是查表不是模型判断，检索侧不出现第二套切分；参数表是数据不是代码分支；数字口径收敛到基线一处，不在正文重复定义。
 minimal-change-verifier: yes — 本 spec 不改引用门、意图识别、编排、短期记忆的规则；不重命名既有过滤键；不把真实语料或真实检索服务引入默认 pytest；不新增排序 / 向量 / 图相关的库；改判范围限制在"切分归属"这一点，排序仍留在 fin 之外。
 
-**OVERALL: PASS — 待假设清单 F1–F4 确认后交 writing-plans。前置门禁：SC41（两份 spec 基线章节逐字一致）必须先过。**
+**OVERALL: PASS — F1–F4 已定稿并写回 B1（B1 全部为定稿契约），可交 writing-plans。前置门禁：SC41（两份 spec 基线章节逐字一致）必须先过。**
 
 ---
 
