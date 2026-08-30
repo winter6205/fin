@@ -67,6 +67,53 @@ SUPPORTED_FORMATS: Final[tuple[str, ...]] = (
     "txt",
 )
 
+# ---------------------------------------------------------------------------
+# Content-signature families (T8) — failure classification only.
+# ---------------------------------------------------------------------------
+
+# Magic prefixes of the container families a source can carry. The
+# mapping is deliberately small and exact: it exists to *classify
+# failures* (encrypted source, declared-format/MIME mismatch), never to
+# redirect or replace parsing — ``parse_document`` still dispatches on
+# the caller-named format, and a signature absence is never a failure.
+PDF_MAGIC: Final[bytes] = b"%PDF-"
+ZIP_MAGIC: Final[bytes] = b"PK\x03\x04"
+CFB_MAGIC: Final[bytes] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+_PNG_MAGIC: Final[bytes] = b"\x89PNG\r\n\x1a\n"
+_GIF_MAGIC: Final[bytes] = b"GIF8"
+_JPEG_MAGIC: Final[bytes] = b"\xff\xd8\xff"
+
+# Family labels returned by :func:`content_family`.
+FAMILY_PDF: Final[str] = "pdf"
+FAMILY_ZIP: Final[str] = "zip"
+FAMILY_CFB: Final[str] = "cfb"
+FAMILY_BINARY: Final[str] = "binary"
+
+
+def content_family(source_bytes: bytes) -> str | None:
+    """Classify the source's container family from its magic prefix.
+
+    Returns ``"pdf"`` / ``"zip"`` / ``"cfb"`` / ``"binary"``, or
+    ``None`` when no known signature is present (which includes every
+    plain-text shape — html / md / txt have no magic). Deterministic
+    prefix check, stdlib only; the result feeds only the T8 failure
+    classification (encryption, declared-format mismatch), never the
+    parse dispatch itself.
+    """
+    if source_bytes.startswith(PDF_MAGIC):
+        return FAMILY_PDF
+    if source_bytes.startswith(ZIP_MAGIC):
+        return FAMILY_ZIP
+    if source_bytes.startswith(CFB_MAGIC):
+        return FAMILY_CFB
+    if (
+        source_bytes.startswith(_PNG_MAGIC)
+        or source_bytes.startswith(_GIF_MAGIC)
+        or source_bytes.startswith(_JPEG_MAGIC)
+    ):
+        return FAMILY_BINARY
+    return None
+
 
 @dataclass(frozen=True)
 class UnitLocator:
@@ -224,14 +271,22 @@ def merge_blocks(blocks: list[str], cap: int = BLOCK_MERGE_CAP_CHARS) -> list[st
 
 __all__ = [
     "BLOCK_MERGE_CAP_CHARS",
+    "CFB_MAGIC",
+    "FAMILY_BINARY",
+    "FAMILY_CFB",
+    "FAMILY_PDF",
+    "FAMILY_ZIP",
     "PARAMS_TABLE_VERSION",
     "PARSE_RULE_VERSION",
+    "PDF_MAGIC",
     "SUPPORTED_FORMATS",
     "XLSX_ROWS_PER_UNIT",
+    "ZIP_MAGIC",
     "ParseResult",
     "ParsedUnit",
     "UnitLocator",
     "build_unit",
+    "content_family",
     "detect_language",
     "freeze_text",
     "merge_blocks",

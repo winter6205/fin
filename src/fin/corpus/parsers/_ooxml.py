@@ -18,7 +18,8 @@ import re
 import zipfile
 from xml.etree import ElementTree
 
-from fin.corpus.errors import MalformedSourceParseError
+from fin.corpus.errors import EncryptedSourceParseError, MalformedSourceParseError
+from fin.corpus.parsers._common import CFB_MAGIC
 
 # Numeric suffix of OOXML part names like ``slide7.xml`` /
 # ``sheet12.xml`` — sorted numerically, never lexically, so slide/sheet
@@ -27,9 +28,24 @@ _PART_NUMBER_RE = re.compile(r"(\d+)\.xml$")
 
 
 def open_zip(source_bytes: bytes, *, document_id: str) -> zipfile.ZipFile:
-    """Open ``source_bytes`` as a zip container, failing named."""
+    """Open ``source_bytes`` as a zip container, failing named.
+
+    A Compound File Binary container is not a broken zip — it is an
+    ECMA-376 **encrypted** package (Standard / Agile encryption), so it
+    is named as encrypted, not merely malformed (T8: the remediations
+    differ — credentials vs. repair). ``parse_document`` already gates
+    this shape for the dispatch path; the check is repeated here so
+    direct ``parse_docx`` / ``parse_xlsx`` / ``parse_pptx`` callers get
+    the same named surface.
+    """
     import io
 
+    if source_bytes.startswith(CFB_MAGIC):
+        raise EncryptedSourceParseError(
+            f"OOXML source for {document_id!r} is an encrypted package "
+            "(Compound File Binary container) and no credentials were "
+            "supplied"
+        )
     try:
         return zipfile.ZipFile(io.BytesIO(source_bytes))
     except Exception as exc:

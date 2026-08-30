@@ -40,10 +40,15 @@ splitter.
 
 Named failures (SC9 / SC40 lineage; all in ``fin.corpus.errors``):
 ``EmptySourceParseError`` (0-byte source), ``UnsupportedFormatParseError``
-(non-target format), ``MalformedSourceParseError`` (corrupt container /
+(non-target format name), ``FormatMismatchParseError`` (bytes carry a
+signature conflicting with the declared format — T8's non-target-MIME
+shape), ``EncryptedSourceParseError`` (encrypted PDF / encrypted OOXML
+package — T8), ``MalformedSourceParseError`` (corrupt container /
 bad XML / undecodable text), ``NoUnitsParseError`` (zero non-empty
 units), ``ParseMetadataIncompleteError`` (missing metadata field).
-No failure shape escapes as a bare exception; no failure yields a
+Each subclass carries a distinct stable ``code``. The T8 signature
+gate classifies failures only — it never redirects parsing. No
+failure shape escapes as a bare exception; no failure yields a
 silent empty success.
 """
 
@@ -54,16 +59,22 @@ from pathlib import Path
 
 from fin.corpus.errors import (
     EmptySourceParseError,
+    EncryptedSourceParseError,
+    FormatMismatchParseError,
     NoUnitsParseError,
     UnsupportedFormatParseError,
 )
 from fin.corpus.parsers._common import (
+    FAMILY_CFB,
+    FAMILY_PDF,
+    FAMILY_ZIP,
     PARAMS_TABLE_VERSION,
     PARSE_RULE_VERSION,
     SUPPORTED_FORMATS,
     ParseResult,
     ParsedUnit,
     UnitLocator,
+    content_family,
 )
 from fin.corpus.parsers._docx import parse_docx
 from fin.corpus.parsers._html import parse_html
@@ -72,6 +83,24 @@ from fin.corpus.parsers._pdf import parse_pdf
 from fin.corpus.parsers._pptx import parse_pptx
 from fin.corpus.parsers._text import parse_plain_text
 from fin.corpus.parsers._xlsx import parse_xlsx
+
+
+def _family_accepts(fmt: str, family: str) -> bool:
+    """Does the declared format accept this content-signature family?
+
+    Only strong foreign signatures fail: ``pdf`` must not arrive as a
+    zip / CFB / image, the OOXML trio must not arrive as a PDF or
+    image, and the text formats must not arrive as any known binary.
+    ``None`` (no signature — the shape of every plain-text source) is
+    decided by the format parser, never by this gate.
+    """
+    if family == FAMILY_PDF:
+        return fmt == "pdf"
+    if family == FAMILY_ZIP:
+        return fmt in ("docx", "xlsx", "pptx")
+    # FAMILY_CFB / FAMILY_BINARY: no declared format accepts them here
+    # (CFB + OOXML trio is re-classified as encrypted by the caller).
+    return False
 
 
 def parse_document(
@@ -116,6 +145,14 @@ def parse_document(
         The source bytes are empty.
     UnsupportedFormatParseError
         ``fmt`` is not one of the seven supported formats.
+    FormatMismatchParseError
+        The bytes carry a content signature that conflicts with the
+        declared ``fmt`` (T8: non-target MIME given the explicit-name
+        API).
+    EncryptedSourceParseError
+        The source is encrypted (PDF standard security handler, or an
+        ECMA-376 encrypted OOXML package in a CFB container) and no
+        credentials were supplied.
     MalformedSourceParseError
         The source cannot be parsed as its claimed format.
     NoUnitsParseError
@@ -136,6 +173,24 @@ def parse_document(
             f"source for {document_id!r} is empty (0 bytes)"
         )
     source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+
+    # T8 signature gate — failure classification only. A known magic
+    # that cannot belong to the declared format is a named mismatch
+    # (SC9's non-target-MIME shape under the explicit-name API); an
+    # encrypted OOXML package (CFB container) is named encrypted. No
+    # signature never fails, and dispatch below is untouched.
+    family = content_family(source_bytes)
+    if family is not None and not _family_accepts(fmt, family):
+        if family == FAMILY_CFB and fmt in ("docx", "xlsx", "pptx"):
+            raise EncryptedSourceParseError(
+                f"source for {document_id!r} is an encrypted OOXML "
+                f"package (Compound File Binary container, declared "
+                f"format {fmt!r}) and no credentials were supplied"
+            )
+        raise FormatMismatchParseError(
+            f"source for {document_id!r} carries a {family!r} content "
+            f"signature but was declared as {fmt!r}"
+        )
 
     parser_kwargs = {
         "source_bytes": source_bytes,

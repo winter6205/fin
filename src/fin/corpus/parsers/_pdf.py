@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fin.corpus.errors import (
+    EncryptedSourceParseError,
     MalformedSourceParseError,
     NoUnitsParseError,
     ParseError,
@@ -61,6 +62,27 @@ class OcrParsedUnit(ParsedUnit):
     """
 
     ocr_applied: bool = True
+
+
+def _is_encryption_failure(exc: BaseException) -> bool:
+    """Walk the cause chain looking for a pdfminer encryption error.
+
+    pdfplumber wraps pdfminer exceptions (``PdfminerException`` with
+    the original as ``__cause__``), so the chain must be walked to find
+    ``PDFEncryptionError`` (including ``PDFPasswordIncorrect``). Used
+    only to classify the failure as encrypted vs. corrupt (T8) — the
+    parse itself is never retried or redirected.
+    """
+    from pdfminer.pdfdocument import PDFEncryptionError
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, PDFEncryptionError):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def parse_pdf(
@@ -206,6 +228,14 @@ def parse_pdf(
         # be re-wrapped as malformed source.
         raise
     except Exception as exc:
+        if _is_encryption_failure(exc):
+            # T8: an encrypted PDF is structurally intact — it is
+            # named encrypted, not corrupt, because the remediation is
+            # credentials, not repair.
+            raise EncryptedSourceParseError(
+                f"PDF source for {document_id!r} is encrypted and no "
+                f"credentials were supplied: {exc}"
+            ) from exc
         raise MalformedSourceParseError(
             f"PDF source for {document_id!r} cannot be parsed: {exc}"
         ) from exc
