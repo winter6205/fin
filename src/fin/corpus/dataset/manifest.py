@@ -62,7 +62,9 @@ HARD_SAMPLE_KINDS = (
     HARD_HEADER_FOOTER,
 )
 QUERY_CLASSES = ("factoid", "narrative", "phrase", "cross_period")
-CHUNK_TOTAL_STATUS_PENDING_T11 = "pending_t11_splitter"
+# T11 landed the deterministic parent/child splitter: chunk_count per
+# sample and chunk_total are now computed by the splitter at build time.
+CHUNK_TOTAL_STATUS_SPLIT = "t11_splitter_computed"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -190,7 +192,7 @@ def _check_sample_fields(sample: dict, problems: list[str], *, index: int) -> No
         if not sample.get("source_units"):
             problems.append(f"{sid}: derived sample missing source_units")
     if not isinstance(sample.get("chunk_count"), int) or int(sample["chunk_count"]) < 0:
-        problems.append(f"{sid}: chunk_count missing (reserve the field, 0 until T11)")
+        problems.append(f"{sid}: chunk_count missing or negative (T11 splitter writes the real count)")
 
 
 def validate_manifest(
@@ -429,12 +431,14 @@ def _threshold_report(manifest: dict, counts: dict, query_report: dict) -> list[
             "criterion": "chunks within [20000, 120000] after T11 split",
             "met": isinstance(chunk_total, int)
             and B1_MIN_CHUNKS <= chunk_total <= B1_MAX_CHUNKS,
-            # Not enforceable in this ticket: the splitter is T11's
-            # deliverable; the field is reserved and honestly zero.
+            # Not enforceable as a validation floor on its own: the band
+            # scales with the tier-1 corpus size, and the primary
+            # expansion is a documented known gap (see known_gaps). The
+            # T11 splitter produces the real, deterministic count.
             "enforceable": False,
             "detail": (
                 f"chunk_total={chunk_total!r} status={chunk_status!r} "
-                "(reserved field; T11 splitter produces the real count)"
+                f"(B1 band [{B1_MIN_CHUNKS}, {B1_MAX_CHUNKS}]; T11 splitter output)"
             ),
         },
     ]
