@@ -115,7 +115,7 @@
    - **Acceptance:** 七种格式各自的脚本化样本产出 ≥1 个非空冻结单元；表格类样本的单元格文本能通过 ≥32 字符的引用门连续子串校验；任一解析产物的结构化元数据八项字段齐备，缺任一项时该次解析以具名失败终止（不是产出"字段缺失但仍算成功"的单元）；`uv run pytest -q` exits 0，且默认套件不读大语料、不起检索服务进程、不访问外网。
    - **Completion:** 各格式的解析器选型、单元粒度在同一版本内的具体取值、元数据的内部命名全部开放——契约只约束"同一规则版本下确定性产出"。
    - [blocks: T5]
-   - Status: [ ] pending
+   - Status: [x] done —— 入口 `fin.corpus.parsers.parse_document`（`parse-1` / `params-0` 占位）；pdf/pptx 物理页、xlsx 工作表内 64 行连续行块、html/md/docx 结构块（标题切分 + 6000 字上限合并）、txt 空行段；零新依赖（OOXML 走 stdlib，pdf 复用 pdfplumber）；`ParsedUnit` 八项元数据经唯一构造点 `build_unit` 产出，缺一即 `ParseMetadataIncompleteError`；xlsx/html/pdf 三例表格单元格 span 过引用门（gate=done，quote==span）；37 个新用例，默认套件只读小样本。
 
 7. **[parallel] 扫描件 OCR 分支与具名失败** — tag: `[implementation]`
    - **Inherits:** SC8："无文本层且含图像的页面走 OCR 分支并写入文本与 `ocr_applied`；OCR 引擎缺失时该单元以具名失败终止，不以空文本记为成功"；沿用既有 OCR 写入约定。
