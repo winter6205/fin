@@ -131,7 +131,7 @@
    - **Acceptance:** 加密、损坏、空文件、0 字节、非目标 MIME 五类输入各返回**互相可区分**的具名失败，调用方拿到的是失败结果而非空字符串、不是被跳过的缺失、也不是未捕获异常；`uv run pytest -q` exits 0。
    - **Completion:** 失败类型的载体（异常类型 / 结果对象 / 错误码枚举）与命名由实现者定，只要五类可区分且都不静默。
    - [blocks: T6]
-   - Status: [ ] pending
+   - Status: [x] done —— `ParseError` 家族新增稳定 `code` 属性（互异错误码）与两个新具名类型：`EncryptedSourceParseError`（`encrypted_source`：PDF 走 pdfminer `PDFEncryptionError` 因果链识别；OOXML 走 CFB 容器魔数识别）与 `FormatMismatchParseError`（`format_mismatch`：声明 fmt 与字节内容签名冲突——非目标 MIME 在显式命名 API 下的落地，签名判定只用于失败分类、不改派发、无签名不失败）；五类输入 × 具名失败对照：0 字节→`empty_source`、空文件→`no_units`、损坏→`malformed_source`、加密→`encrypted_source`、非目标 MIME→`format_mismatch`（fmt 名非法仍为 `unsupported_format`），类型与错误码两两互异（测试断言）；SC46 以 AST 扫描 + `rg` 双自证 `src/fin/corpus` 无空 except；13 个新用例，正常解析路径回归不受扰。
 
 9. **场景适配颗粒度：确定性参数查表 + 版本化** — tag: `[implementation]`
    - **Inherits:** SC13："分块参数**只**由（文档类型 × 板块 × 内容密度）查表决定；同一三元组两次查表返回同一参数组"；CONTEXT **场景适配颗粒度**：_Avoid_ 含"自适应切分""用模型判断颗粒度""双版本参数并存"；参数表版本进元数据、版本变更就地全量重建；边界优先级链与内容密度判定阈值用整数判定，不使用浮点比较与模型判断。
