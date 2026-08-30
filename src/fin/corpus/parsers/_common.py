@@ -30,6 +30,7 @@ from typing import Final
 
 from fin.corpus.errors import ParseMetadataIncompleteError
 from fin.corpus.normalization import normalize_frozen_text
+from fin.corpus.params import TABLE_VERSION as _PARAMS_TABLE_VERSION
 
 # Deterministic merge cap for the structure-block rule (HTML /
 # Markdown / Word). Consecutive blocks whose combined length stays
@@ -44,10 +45,11 @@ BLOCK_MERGE_CAP_CHARS: Final[int] = 6000
 # rule-version bump.
 XLSX_ROWS_PER_UNIT: Final[int] = 64
 
-# Placeholder until T9 lands the real deterministic parameter lookup
-# (文档类型 × 板块 × 内容密度). T9 owns replacing this constant and
-# stamping the real table version on every unit.
-PARAMS_TABLE_VERSION: Final[str] = "params-0"
+# Params-table version (T9 / SC13): the versioned lookup table lives
+# in ``fin.corpus.params`` — chunk parameters are decided by one triad
+# lookup there, and this stamp flows into every unit's metadata. Any
+# row change bumps ``fin.corpus.params.TABLE_VERSION``.
+PARAMS_TABLE_VERSION: Final[str] = _PARAMS_TABLE_VERSION
 
 # Parse-rule version of this package. Any change to granularity
 # constants, splitting, or freezing behavior must bump it (the spec's
@@ -107,7 +109,7 @@ class ParsedUnit:
     language: str
     # 7. parse rule version
     parse_rule_version: str
-    # 8. params-table version (placeholder ``params-0`` until T9)
+    # 8. params-table version (``params-1``, from fin.corpus.params)
     params_table_version: str
     # The frozen unit text itself (not one of the eight metadata
     # fields, but the payload they describe).
@@ -146,7 +148,7 @@ def detect_language(text: str) -> str:
             cjk += 1
         elif ch.isascii() and ch.isalpha():
             latin += 1
-    if cjk + latin == 0 or cjk / (cjk + latin) <= 0.2:
+    if cjk + latin == 0 or 4 * cjk <= latin:
         return "en"
     return "zh"
 
