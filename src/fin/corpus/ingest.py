@@ -57,7 +57,11 @@ from pathlib import Path
 
 import pdfplumber
 
-from fin.corpus.errors import IngestMissingError, ManifestShaMismatchError
+from fin.corpus.errors import (
+    IngestMissingError,
+    MalformedExtractedIndexError,
+    ManifestShaMismatchError,
+)
 from fin.corpus.ocr import (
     OCREngine,
     OCRError,
@@ -152,26 +156,16 @@ def _write_if_drifted(path: Path, payload: bytes) -> bool:
 
 
 def _read_existing_index(extracted_root: Path) -> dict[str, dict[str, object]] | None:
-    """Try to read the committed ``_index.json``.
+    """Read the committed ``_index.json`` for the fast-skip predicate.
 
-    Returns the per-document records, or ``None`` if the index is
-    missing / malformed (in which case the caller falls back to a full
-    pdfplumber extraction). This is the fast-skip predicate: if the
-    index says a document was extracted at the current expected sha
-    and the page count matches the existing files, we can skip
-    reopening the PDF.
+    A missing index is an initialization case and returns ``None``.
+    An existing unreadable or structurally invalid index is corruption:
+    raising before any output write prevents a damaged catalog from
+    being silently replaced.
     """
-    index_path = extracted_root / "_index.json"
-    if not index_path.is_file():
-        return None
-    try:
-        payload = json.loads(index_path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-    docs = payload.get("documents")
-    if not isinstance(docs, dict):
-        return None
-    return docs
+    from fin.corpus.extracted_index import read_existing_extracted_index
+
+    return read_existing_extracted_index(extracted_root)
 
 
 def _artifacts_present(doc_dir: Path, page_count: int) -> bool:
@@ -864,14 +858,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     ocr_engine = _resolve_ocr_engine(args.ocr_engine)
-    result = run_ingest(
-        manifest_path=args.manifest,
-        pdf_dir=args.pdf_dir,
-        extracted_root=args.extracted_root,
-        facts_root=args.facts_root,
-        ocr_engine=ocr_engine,
-        catalog_seed_path=args.catalog_seed,
-    )
+    try:
+        result = run_ingest(
+            manifest_path=args.manifest,
+            pdf_dir=args.pdf_dir,
+            extracted_root=args.extracted_root,
+            facts_root=args.facts_root,
+            ocr_engine=ocr_engine,
+            catalog_seed_path=args.catalog_seed,
+        )
+    except MalformedExtractedIndexError as exc:
+        print(f"ingest: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     print(
         f"ingest: documents={result.documents} "
         f"pages={result.pages} "
@@ -885,6 +883,7 @@ def main(argv: list[str] | None = None) -> int:
 __all__ = [
     "CatalogSeedError",
     "IngestResult",
+    "MalformedExtractedIndexError",
     "load_catalog_seed",
     "run_ingest",
     "update_catalog_fields",

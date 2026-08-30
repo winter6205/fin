@@ -31,9 +31,12 @@ from unittest import mock
 import pytest
 
 from fin.corpus.errors import IngestMissingError
+from fin.corpus import live_fetch
+from fin.corpus.catalog import list_filings
 from fin.corpus.live_fetch import (
     SecHttpFailError,
     SecPrimaryDocUnresolvedError,
+    SecUaUnsetError,
     fetch_and_ingest,
 )
 
@@ -138,6 +141,215 @@ def _roots(tmp_path: Path) -> dict[str, Path]:
         "extracted_root": tmp_path / "extracted",
         "facts_root": tmp_path / "facts",
     }
+
+
+# ---------- atomic publish + catalog registration ----------
+
+
+def test_successful_live_fetch_registers_accession_in_manifest_and_catalog(
+    tmp_path: Path,
+) -> None:
+    """A successful live fetch publishes one catalog-visible accession."""
+    roots = _roots(tmp_path)
+    calls: list[str] = []
+
+    with _scripted_sec({_INDEX_URL: _AAPL_LISTING, _PRIMARY_URL: _PRIMARY_HTML}, calls):
+        fetch_and_ingest(
+            cik=_CIK,
+            accession=_ACCESSION,
+            primary_doc="aapl-20230701.htm",
+            **roots,
+        )
+
+    manifest = json.loads(roots["manifest_path"].read_text())
+    row = next(
+        document
+        for document in manifest["documents"]
+        if document["document_id"] == _ACCESSION
+    )
+    assert row["accession"] == _ACCESSION
+
+    index = json.loads(
+        (roots["extracted_root"] / "_index.json").read_text()
+    )
+    assert _ACCESSION in index["documents"]
+
+    result = list_filings(
+        manifest_path=roots["manifest_path"],
+        extracted_root=roots["extracted_root"],
+    )
+    assert [filing["document_id"] for filing in result["filings"]] == [
+        _ACCESSION
+    ]
+
+
+def test_failure_after_staged_page_write_leaves_visible_publish_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page-write failure cannot expose an unregistered accession."""
+    roots = _roots(tmp_path)
+    roots["extracted_root"].mkdir(parents=True)
+    original_index = b'{"schema_version": 1, "documents": {}}\n'
+    (roots["extracted_root"] / "_index.json").write_bytes(original_index)
+    original_manifest = b'{"documents": []}\n'
+    roots["manifest_path"].write_bytes(original_manifest)
+
+    real_atomic_write = live_fetch._atomic_write
+
+    def fail_after_page_write(path: Path, payload: bytes) -> None:
+        real_atomic_write(path, payload)
+        if path.name == "page-001.json":
+            raise RuntimeError("injected page-write failure")
+
+    monkeypatch.setattr(live_fetch, "_atomic_write", fail_after_page_write)
+
+    with _scripted_sec({_PRIMARY_URL: _PRIMARY_HTML}, []):
+        with pytest.raises(RuntimeError, match="injected page-write failure"):
+            fetch_and_ingest(
+                cik=_CIK,
+                accession=_ACCESSION,
+                primary_doc="aapl-20230701.htm",
+                **roots,
+            )
+
+    assert not (roots["extracted_root"] / _ACCESSION).exists()
+    assert (roots["extracted_root"] / "_index.json").read_bytes() == original_index
+    assert roots["manifest_path"].read_bytes() == original_manifest
+
+
+def test_crash_mid_publish_is_recovered_before_next_live_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A process exit after one target swap restores the last generation.
+
+    The injected exit bypasses in-process rollback and cleanup, matching
+    the state a real crash leaves behind. Recovery must remove the
+    uncommitted generation before any subsequent live-fetch read.
+    """
+    roots = _roots(tmp_path)
+    with _scripted_sec({_PRIMARY_URL: _PRIMARY_HTML}, []):
+        fetch_and_ingest(
+            cik=_CIK,
+            accession=_ACCESSION,
+            primary_doc="aapl-20230701.htm",
+            **roots,
+        )
+
+    committed = {
+        "index": (roots["extracted_root"] / "_index.json").read_bytes(),
+        "manifest": roots["manifest_path"].read_bytes(),
+        "page": (
+            roots["extracted_root"] / _ACCESSION / "page-001.json"
+        ).read_bytes(),
+        "facts": (
+            roots["facts_root"] / f"{_ACCESSION}.json"
+        ).read_bytes(),
+    }
+    revised = _PRIMARY_HTML.replace(b"60,584", b"60,585")
+    real_replace = live_fetch.os.replace
+    live_doc = roots["extracted_root"] / _ACCESSION
+
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    def crash_after_doc_swap(source: str | bytes, target: str | bytes) -> None:
+        real_replace(source, target)
+        if Path(target) == live_doc:
+            raise SimulatedProcessCrash("crashed after accession swap")
+
+    def terminate_rollback(**_: object) -> None:
+        raise SimulatedProcessCrash("process terminated")
+
+    with monkeypatch.context() as crash_patch:
+        crash_patch.setattr(live_fetch.os, "replace", crash_after_doc_swap)
+        crash_patch.setattr(live_fetch, "_rollback_publish", terminate_rollback)
+        # A real process exit does not run either publish cleanup finally.
+        crash_patch.setattr(live_fetch.shutil, "rmtree", lambda *_args, **_kwargs: None)
+        with _scripted_sec({_PRIMARY_URL: revised}, []):
+            with pytest.raises(SimulatedProcessCrash):
+                fetch_and_ingest(
+                    cik=_CIK,
+                    accession=_ACCESSION,
+                    primary_doc="aapl-20230701.htm",
+                    **roots,
+                )
+
+    live_fetch._recover_interrupted_publish(
+        manifest_path=roots["manifest_path"]
+    )
+
+    assert (roots["extracted_root"] / "_index.json").read_bytes() == committed[
+        "index"
+    ]
+    assert roots["manifest_path"].read_bytes() == committed["manifest"]
+    assert (
+        roots["extracted_root"] / _ACCESSION / "page-001.json"
+    ).read_bytes() == committed["page"]
+    assert (
+        roots["facts_root"] / f"{_ACCESSION}.json"
+    ).read_bytes() == committed["facts"]
+
+
+def test_interrupted_publish_is_recovered_before_ua_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery must run before a later invocation's SEC gate."""
+    roots = _roots(tmp_path)
+    roots["extracted_root"].mkdir(parents=True)
+    original_index = b'{"schema_version": 1, "documents": {}}\n'
+    (roots["extracted_root"] / "_index.json").write_bytes(original_index)
+    original_manifest = b'{"documents": []}\n'
+    roots["manifest_path"].write_bytes(original_manifest)
+
+    real_replace = live_fetch.os.replace
+    live_doc = roots["extracted_root"] / _ACCESSION
+
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    def crash_after_doc_swap(source: str | bytes, target: str | bytes) -> None:
+        real_replace(source, target)
+        if Path(target) == live_doc:
+            raise SimulatedProcessCrash("crashed after accession swap")
+
+    def terminate_rollback(**_: object) -> None:
+        raise SimulatedProcessCrash("process terminated")
+
+    with monkeypatch.context() as crash_patch:
+        crash_patch.setattr(live_fetch.os, "replace", crash_after_doc_swap)
+        crash_patch.setattr(live_fetch, "_rollback_publish", terminate_rollback)
+        crash_patch.setattr(
+            live_fetch.shutil, "rmtree", lambda *_args, **_kwargs: None
+        )
+        with _scripted_sec({_PRIMARY_URL: _PRIMARY_HTML}, []):
+            with pytest.raises(SimulatedProcessCrash):
+                fetch_and_ingest(
+                    cik=_CIK,
+                    accession=_ACCESSION,
+                    primary_doc="aapl-20230701.htm",
+                    **roots,
+                )
+
+    assert list_filings(
+        manifest_path=roots["manifest_path"],
+        extracted_root=roots["extracted_root"],
+    ) == {"filings": []}
+
+    monkeypatch.delenv("FIN_EDGAR_USER_AGENT")
+    with pytest.raises(SecUaUnsetError):
+        fetch_and_ingest(
+            cik=_CIK,
+            accession=_ACCESSION,
+            primary_doc="aapl-20230701.htm",
+            **roots,
+        )
+
+    assert not live_doc.exists()
+    assert (roots["extracted_root"] / "_index.json").read_bytes() == original_index
+    assert roots["manifest_path"].read_bytes() == original_manifest
 
 
 # ---------- primary document resolution ----------
@@ -378,6 +590,64 @@ def test_malformed_existing_index_refuses_rather_than_overwrites(
             fetch_and_ingest(cik=_CIK, accession=_ACCESSION, **roots)
 
     assert damaged.read_text() == "{ this is not json"
+
+
+def test_live_fetch_cli_reports_malformed_index_as_typed_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI must not dump a traceback for MalformedExtractedIndexError."""
+    roots = _roots(tmp_path)
+    roots["extracted_root"].mkdir(parents=True)
+    (roots["extracted_root"] / "_index.json").write_text("{ this is not json")
+    monkeypatch.setenv("FIN_EDGAR_USER_AGENT", "fin-test contact@example.com")
+
+    code = live_fetch.main(
+        [
+            "--cik",
+            _CIK,
+            "--accession",
+            _ACCESSION,
+            "--manifest",
+            str(roots["manifest_path"]),
+            "--extracted-root",
+            str(roots["extracted_root"]),
+            "--facts-root",
+            str(roots["facts_root"]),
+            "--primary-doc",
+            "aapl-20230701.htm",
+        ]
+    )
+    assert code == 1
+
+
+def test_live_fetch_cli_reports_malformed_manifest_as_typed_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed caller manifest is IngestMissingError → non-zero CLI."""
+    roots = _roots(tmp_path)
+    roots["extracted_root"].mkdir(parents=True)
+    roots["manifest_path"].write_text("{ not-json")
+    monkeypatch.setenv("FIN_EDGAR_USER_AGENT", "fin-test contact@example.com")
+
+    code = live_fetch.main(
+        [
+            "--cik",
+            _CIK,
+            "--accession",
+            _ACCESSION,
+            "--manifest",
+            str(roots["manifest_path"]),
+            "--extracted-root",
+            str(roots["extracted_root"]),
+            "--facts-root",
+            str(roots["facts_root"]),
+            "--primary-doc",
+            "aapl-20230701.htm",
+        ]
+    )
+    assert code == 1
 
 
 # ---------- the frozen unit ----------
