@@ -107,7 +107,7 @@
    - **Acceptance:** 空白、Unicode、连字符、软换行四类归一化只由一个规则出口产生；冻结单元文本与切分后的块文本走同一出口，不存在第二处等价替换；以含上述四类字符的样本断言：引用门对一条真实块文本的 ≥32 字符 span 仍判定为连续子串（跨规则导致的断言失败次数 = 0）；`uv run pytest -q` exits 0。
    - **Completion:** 规则出口叫什么、放在哪个模块、是用一个函数还是一张映射表由实现者定；引用门本身不改。
    - [blocks: T4]
-   - Status: [ ] pending
+   - Status: [x] done —— 单一出口 `fin.corpus.normalization.normalize_frozen_text`（幂等 fixed point，规则版本 `norm-1`）；四类归一化全收敛该出口，`live_fetch._strip_html` 既有替换同步收敛，rg 证明仓库无第二处等价替换；引用门零改动，真实冻结页注入四类字符后 ≥32 字符 span 引用门判定通过；既有已冻结语料为 fixed point 无需重建。
 
 6. **七格式解析：冻结单元文本 + 结构化元数据** — tag: `[implementation]`
    - **Inherits:** SC6 / SC7 / SC10：七种格式各有 ≥1 个脚本化样本，解析后冻结单元文本非空且非空单元数 ≥1；表格类样本（Excel 工作表、HTML 表格、PDF 表区）的单元格文本可被检索命中并可作为 ≥32 字符的引用门 span 通过校验；结构化元数据至少包含格式、来源字节哈希、locator 三元组、单元序号、字符数、语言、解析规则版本、参数表版本，缺任一字段即为解析失败。粒度方向已定稿：PDF 与 PPT 以物理页、Excel 以工作表内的连续行块、HTML / Markdown 以结构块（标题切分 + 上限合并）、纯文本以空行段。

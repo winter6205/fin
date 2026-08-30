@@ -72,6 +72,7 @@ import urllib.request
 from pathlib import Path
 
 from fin.corpus.errors import IngestMissingError, MalformedExtractedIndexError
+from fin.corpus.normalization import normalize_frozen_text
 
 
 # Import at module level so tests can mock
@@ -332,22 +333,20 @@ class _TextExtractor(html.parser.HTMLParser):
 
 
 def _strip_html(body: bytes) -> str:
-    """Render the official HTML down to its visible text.
+    """Render the official HTML down to its visible frozen text.
 
     Deterministic by construction: decoding errors are replaced rather
-    than guessed at, non-breaking spaces collapse to ordinary ones,
-    and blank lines are dropped — so the same bytes always freeze to
-    the same unit text, which is what the citation verifier's
-    substring check depends on.
+    than guessed at, and the same bytes always freeze to the same unit
+    text, which is what the citation verifier's substring check depends
+    on. All character-level rules (whitespace, Unicode compatibility,
+    hyphens, soft line breaks) come from the single normalization
+    authority ``fin.corpus.normalization`` (SC17) — none are restated
+    here; this function only does the HTML-specific tag rendering.
     """
     parser = _TextExtractor()
     parser.feed(body.decode("utf-8", errors="replace"))
     parser.close()
-    lines = (
-        re.sub(r"[^\S\n]+", " ", line).strip()
-        for line in parser.text().replace("\xa0", " ").split("\n")
-    )
-    return "\n".join(line for line in lines if line)
+    return normalize_frozen_text(parser.text())
 
 
 def _chunk_unit_text(text: str) -> list[dict[str, object]]:
