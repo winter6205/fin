@@ -97,7 +97,7 @@
    - **Acceptance:** 一条命令接受两侧文件路径、按 B6 的取段规则分别算 sha256 并比对：一致时 exit 0，不一致时 exit 非 0 且把两侧哈希都打印出来（不只报"不一致"）；对一段被故意改动的副本，该命令 exit 非 0。
    - **Completion:** 命令的载体（脚本 / pytest 用例 / CLI 子命令）与取段实现由实现者定，只要双侧取段规则与 B6 逐字对应。
    - [blocks: T2, T3]
-   - Status: [ ] pending
+   - Status: [x] done —— 入口 `uv run python -m fin.corpus.baseline <fin_spec> <retrieval_spec>`，取段与 B6 逐字对应（标题行后起、下一 `## ` 前止、去首尾空行）；一致 exit 0，不一致 exit 1 且两侧哈希都打印，侧文件缺失 / 章节缺失各有具名失败（exit 2 / 3）；9 个用例覆盖，对真实 spec 正例与单字符改动反例实测通过。
 
 ### 阶段 1 — 线 A：解析与切分（与 B、C 并行）
 
@@ -147,7 +147,7 @@
     - **Acceptance:** 数据集清单存在且可校验，规模与构成三项下限全部达标；计数时排除无来源与标记为合成的样本；每格式的困难样本存在且解析后冻结文本非空；≥3 种文档类型各自 ≥1 条人工标注的"应有命中"；一键重建后样本清单哈希与清单文件记录一致（重跑不一致样本数 = 0）；数据集字节不进默认 `uv run pytest -q`（该命令仍 exits 0 且不读大语料）。
     - **Completion:** 语料来源、获取脚本、清单文件格式、许可记录的字段命名全部开放；规模数字不得在本地另立一套（一律取 B1）。
     - [blocks: T1]
-    - Status: [ ] pending
+    - Status: [x] done —— 入口 `uv run python -m fin.corpus.dataset build / verify / report / expand-primary`；真实样本 234（primary 12 + derived 222，全部带来源与许可记录），md/txt/html/docx/xlsx/pptx 各 37、pdf 12（pdf < 20 记为 known_gaps，待 expand-primary opt-in 冻结补齐）；文档类型 narrative / table_dense / clause_list 三类各 1 条以上人工标注「应有命中」，查询 108（四类各 ≥10%）；每格式 ≥1 困难样本标记落清单；一键重建两遍 manifest sha256 一致、verify 不一致样本数 = 0；计数排除逻辑具名（synthetic / 无 sha256 / 无 license 不计入）；chunk_total 字段预留记 0 待 T11；默认套件不读 data/corpus，数据集全契约走 `-m eval`。
 
 11. **父子分块与引用门连续子串硬约束** — tag: `[implementation]`
     - **Inherits:** SC11 / SC16：对**评测数据集全量**样本断言——每个子块文本是其父块文本的连续子串、每个父块文本是其冻结单元文本的连续子串，违规数必须为 0；每个子块在推送载荷中携带其父块文本，父块不单独作为可命中单元参与检索（命中集是子块）；ADR 0037：fin 推送的块文本即最终文本，检索服务不做二次切分。
