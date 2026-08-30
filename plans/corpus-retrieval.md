@@ -7,7 +7,7 @@
 **Spec link:** `specs/corpus-retrieval.md`
 **Master plan:** [`plans/retrieval-upgrade.md`](retrieval-upgrade.md)（阶段划分、并行边界、跨仓基线指针都在那里；本文件不复制基线内容，所有数字口径一律回源「跨仓对齐基线」章节）
 **Per-ticket loop (all bullets):** test-driven-development → typecheck+tests（`uv run pytest -q`；opt-in 标记另跑 `uv run pytest -q -m eval`）→ verification-before-completion → one commit on the ticket branch
-**Tracker:** FALLBACK — 本地 plan 文件。本轮只产出计划文件，不建 GitHub issue（开 issue 属外部可见副作用，需操作者单独授权）；授权后按 `writing-plans/references/tracker.md` 主路径补建，阻塞边即本文件的 `[blocks:]`。
+**Tracker:** 本轮 tracker 就是本文件（操作者指定，文件内 tracker）。不补建 GitHub issue；阻塞关系即各 bullet 的 `[blocks:]` 标记，状态即各 bullet 的 `Status` 复选框。
 
 ## ACR
 
@@ -33,6 +33,35 @@
 - 评测 / 并发的 opt-in 入口形态（沿用既有 `eval` mark 还是另立 opt-in 命令）——唯一约束是默认 `uv run pytest -q` 不收集、不读大语料、不起检索服务进程。
 
 ## Tasks (ordered by dependency)
+
+下面是本轮 tracker 的汇总索引：全部 bullet 一览、依赖与状态。状态以各 bullet 自己的 `Status` 复选框为准（两者同步维护），阻塞关系即文件内的 `[blocks:]` 标记，标了 `[parallel]` 的可与同阶段其他弹并行。
+
+| # | 标题 | Tag | 阻塞于 | 可并行 | 状态 |
+| --- | --- | --- | --- | --- | --- |
+| T1 | 假设清单 F1–F4 定稿：数字口径从建议值变成契约 | `[decision]` | — | — | 已完成 |
+| T2 | 补齐三份缺失 ADR：跨仓对齐基线 / 降级信号与部分失败语义 / 评测量化与并发基线 | `[decision]` | T1 | — | 待办 |
+| T3 | 切分归属改判同步进既有 ADR 与三份 spec | `[decision]` | T1 | 是 | 待办 |
+| T4 | 跨仓基线章节逐字一致的校验入口 | `[implementation]` | T2, T3 | — | 待办 |
+| T5 | 冻结文本归一化规则单一权威 | `[implementation]` | T4 | 是 | 待办 |
+| T6 | 七格式解析：冻结单元文本 + 结构化元数据 | `[implementation]` | T5 | — | 待办 |
+| T7 | 扫描件 OCR 分支与具名失败 | `[implementation]` | T6 | 是 | 待办 |
+| T8 | 异常输入的具名失败面 | `[implementation]` | T6 | 是 | 待办 |
+| T9 | 场景适配颗粒度：确定性参数查表 + 版本化 | `[implementation]` | T6 | — | 待办 |
+| T10 | 评测数据集：真实语料注入 + 多格式覆盖 + 可一键重建 | `[implementation]` | T1 | 是 | 待办 |
+| T11 | 父子分块与引用门连续子串硬约束 | `[implementation]` | T5, T9, T10 | — | 待办 |
+| T12 | 切分确定性可复现：全量 sha256 逐字节比对 | `[implementation]` | T11 | — | 待办 |
+| T13 | 规则 / 参数表版本变更触发就地全量重建 | `[implementation]` | T9, T11 | 是 | 待办 |
+| T14 | 幂等推送：`source_ref` + 幂等键 + 块标识 + 结构化元数据 | `[implementation]` | T11, T12 | — | 待办 |
+| T15 | 批量分批与断点续传 | `[implementation]` | T14 | 是 | 待办 |
+| T16 | 推送与协议失败的具名返回 | `[implementation]` | T14 | 是 | 待办 |
+| T17 | 命中映射失败：丢弃 + 计数，不静默 | `[implementation]` | T14 | 是 | 待办 |
+| T18 | 内容失效触发：版本变更即发起，幂等且具名 | `[implementation]` | T14, T13 | 是 | 待办 |
+| T19 | 能力默认全启用：8 键快照 + 静态检查 | `[implementation]` | T14 | 是 | 待办 |
+| T20 | 降级信号消费：`degraded` 不当空结果 | `[implementation]` | T14 | 是 | 待办 |
+| T21 | 无效输入与合法空结果的二分 | `[implementation]` | T14 | 是 | 待办 |
+| T22 | 消融矩阵与量化报告：绝对值 + 百分比 + 逐项贡献度 | `[implementation]` | T14, T10 | — | 待办 |
+| T23 | 并发评测：L1 检索路径场景 + L2 含 LLM 完整 run 场景 + 全写幂等场景 + 四个补充维度 | `[implementation]` | T14, T10 | 是 | 待办 |
+| T24 | 静默失败清零：失败清单逐条具名且留痕 | `[implementation]` | T16, T18, T20, T21 | — | 待办 |
 
 每个编号项是一颗 tracer bullet：一条可演示的端到端结果、一个 tag、一个 commit、给 implementer 留 headroom。Acceptance 只写可观察性质，不写复杂度门槛数字（那些 gate 归 `complexity-anti-drift` `references/thresholds.md`）。
 
