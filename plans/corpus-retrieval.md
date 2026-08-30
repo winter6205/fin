@@ -123,7 +123,7 @@
    - **Acceptance:** 无文本层且含图像的样本走 OCR 分支，写入非空冻结文本并置 `ocr_applied`；引擎缺失或 OCR 失败时该单元以具名失败终止，产物中既不出现"空文本但记为成功"的单元也不出现异常抛出到调用方；默认 `uv run pytest -q` 不要求真实 OCR 引擎可用（不可用的失败路径以脚本化方式驱动）。
    - **Completion:** 缺引擎的注入方式与具名失败码的措辞由实现者定；不把视觉模型引入为事实来源。
    - [blocks: T6]
-   - Status: [ ] pending
+   - Status: [x] done —— `parse_pdf` 页级空文本经 `ocr.detect_ocr_required` 判定走 OCR 分支，OCR 文本经 `build_unit` 冻结（即走 T5 出口）并置 `ocr_applied`（`OcrParsedUnit`）；引擎缺失 / 引擎失败 / 空文本等五类原因统一收敛 `ocr_required_unavailable` 具名失败，收集全部失败页后抛一次；13 个用例以 FakeOCREngine 注入驱动，默认套件不要求真实引擎。
 
 8. **[parallel] 异常输入的具名失败面** — tag: `[implementation]`
    - **Inherits:** SC9："加密、损坏、空文件、0 字节、非目标 MIME 的输入，各自返回一个具名失败（不是空串、不是静默跳过、不是异常抛出到调用方）"；SC46：不出现空 `except` 吞掉失败，不出现"失败即空成功"。
@@ -139,7 +139,7 @@
    - **Acceptance:** 分块参数只来自（文档类型 × 板块 × 内容密度）三元组的一次查表，同一三元组两次查表返回同一参数组（golden 参数表快照测试）；参数表是一份可版本化的数据而非代码分支，参数表版本随块元数据一起产出；内容密度判定走整数比较，代码中不存在浮点阈值比较与模型判断切点；`uv run pytest -q` exits 0。
    - **Completion:** 参数表的具体数值、表的数据形态、三元组的取值域全部开放——契约只约束"查表、确定性、版本化"。
    - [blocks: T6]
-   - Status: [ ] pending
+   - Status: [x] done —— `fin.corpus.params`：19 行字面量参数表（版本 `params-1`），`lookup_chunk_params(doc_type, section, density)` 一次查表 + 确定性 fallback 链，未知组合落默认行不抛错；golden 快照测试整表锁定；密度判定整数叉乘、测试化自证无浮点阈值；`params_table_version` 随解析元数据产出；24 个用例。
 
 10. **[parallel] 评测数据集：真实语料注入 + 多格式覆盖 + 可一键重建** — tag: `[implementation]`
     - **Inherits:** SC27–SC30：格式种数、每格式样本数下限、样本总数下限全部取 B1「数据集规模」行；样本须为真实样本（非合成、非占位），每个样本带来源与许可记录，缺来源或标记为合成的样本不计入计数；每种格式 ≥1 个困难样本（扫描 / 多栏 / 合并单元格 / 图文混排 / 内嵌公式 / 页眉页脚干扰之一）；覆盖 ≥3 种文档类型（至少财报叙述、表格密集、条款列表），每种类型 ≥1 条人工标注的"应有命中"（问题 → 期待 locator 单元）；数据集可一键重建且重建后清单哈希与记录一致。F3 已由 T1 定稿。
