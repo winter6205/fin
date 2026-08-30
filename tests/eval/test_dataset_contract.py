@@ -10,9 +10,10 @@ asserts the dataset contract end to end:
   produces (byte-identical manifest, SC30);
 * ``verify_dataset`` reports mismatch count = 0 and no on-disk drift;
 * the manifest validates cleanly against the corpus registry;
-* B1 floors are met everywhere except the two documented known gaps
-  (tier-1 PDF count pending the opt-in EDGAR expansion, and
-  ``chunk_total`` reserved for the T11 splitter).
+* B1 floors are met everywhere except the documented known gaps
+  (tier-1 PDF count pending the opt-in EDGAR expansion, and the B1
+  chunk band scaling with that same pending expansion — the T11
+  splitter computes the real deterministic chunk counts).
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from fin.corpus.dataset.manifest import (
     B1_MIN_QUERIES,
     B1_MIN_SAMPLES_PER_FORMAT,
     B1_MIN_SOURCE_DOCUMENTS,
+    CHUNK_TOTAL_STATUS_SPLIT,
     HARD_SAMPLE_KINDS,
     validate_manifest,
 )
@@ -107,7 +109,13 @@ def test_b1_floors() -> None:
         assert n * 100 // queries["total"] >= 10, f"class {cls} below 10%"
     assert len(manual_types) >= 3, manual_types
 
-    # Chunk floor is T11's deliverable: the field is reserved and zero.
-    assert payload["chunk_total"] == 0
-    assert payload["chunk_total_status"] == "pending_t11_splitter"
-    assert all(sample["chunk_count"] == 0 for sample in payload["documents"])
+    # T11: the splitter computes the real, deterministic chunk counts.
+    assert payload["chunk_total_status"] == CHUNK_TOTAL_STATUS_SPLIT
+    assert payload["chunk_total"] > 0
+    assert payload["chunk_total"] == sum(
+        sample["chunk_count"] for sample in payload["documents"]
+    )
+    assert all(
+        isinstance(sample["chunk_count"], int) and sample["chunk_count"] >= 0
+        for sample in payload["documents"]
+    )

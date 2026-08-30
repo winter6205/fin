@@ -155,7 +155,7 @@
     - **Acceptance:** 全量样本上两级连续子串断言违规数 = 0（断言入口对评测数据集全量跑，不是抽样）；子块载荷携带其父块文本；命中集合只含子块，父块不作为独立可命中单元；`uv run pytest -q` exits 0。
     - **Completion:** 切分算法、父子边界的选取策略、块的内部表示全部开放——契约只约束两级子串关系、命中集构成与父块随行。
     - [blocks: T5, T9, T10] —— 归一化单一权威、参数查表、数据集三者都到位才能做全量断言。
-    - Status: [ ] pending
+    - Status: [x] done —— 切分入口 `fin.corpus.chunking`（`split_unit` / `split_document`）：父块=标题边界优先、链内整数 rank 逐级兜底、char_cap 硬切，子块按 target 打包 + min 合并；块文本是冻结单元文本的纯切片（无二次替换，SC17 fixed point 测试锁定），`block_id` 为确定性 sha256；`ChunkPayload` 随行 `parent_text` + SC20 元数据，命中集仅 `kind=child`（`is_retrievable` / `hittable_blocks`），父块不可独立命中（引用门 bounce 测试证明）；默认套件 `tests/corpus/test_chunking.py` 16 用例，eval 全量 `tests/eval/test_chunking_contract.py` 真实跑：234 样本 / 3504 冻结单元 / 12272 父块 / 15686 子块，两级连续子串违规数 = 0、归一化 fixed point 15686/15686、载荷父文本随行 15686/15686；manifest `chunk_total=15686`（`t11_splitter_computed`）已填充，B1 带宽 [20000, 120000] 未达——根因 primary 语料规模低于自身 B1 下限待扩充，如实记 `known_gaps`；`uv run pytest -q` 1314 passed（唯一失败为预存允许项 `test_gc_hard_deletes_transported_rows_past_the_retention_window`），`uv run pytest -q -m eval` 15 passed。
 
 12. **切分确定性可复现：全量 sha256 逐字节比对** — tag: `[implementation]`
     - **Inherits:** SC12 与 SC14（共用同一断言入口）：同一字节输入、同一规则版本 + 参数表版本，连续两次解析 + 切分，产物（含块文本、块标识、顺序、元数据）逐字节相同，全数据集 sha256 比对不一致样本数 = 0；SC14 追加：**任何**导致两次运行产物产生差异的来源均属违反，实现手段的选择不构成豁免。

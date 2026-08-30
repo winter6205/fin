@@ -35,6 +35,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from fin.corpus.chunking import split_document, split_unit
 from fin.corpus.errors import ManifestShaMismatchError
 from fin.corpus.dataset.exporters import (
     EXPORTER_VERSION,
@@ -45,7 +46,9 @@ from fin.corpus.dataset.exporters import (
     export_derived,
 )
 from fin.corpus.dataset.manifest import (
-    CHUNK_TOTAL_STATUS_PENDING_T11,
+    B1_MAX_CHUNKS,
+    B1_MIN_CHUNKS,
+    CHUNK_TOTAL_STATUS_SPLIT,
     DATASET_ID,
     MANIFEST_SCHEMA_VERSION,
     compute_counts,
@@ -67,6 +70,8 @@ from fin.corpus.dataset.queries import (
     generate_phrase_queries,
     verify_manual_annotations,
 )
+from fin.corpus.parsers import parse_document
+from fin.corpus.parsers._common import build_unit
 
 PHRASE_QUERY_TARGET = 68
 PHRASE_PER_DOC_CAP = 10
@@ -93,16 +98,33 @@ KNOWN_GAPS = [
             "FIN_EDGAR_USER_AGENT); never executed by build, verify, or tests"
         ),
     },
-    {
-        "gap": "chunk_total_pending_t11",
-        "criterion": "chunks within [20000, 120000] after split",
-        "detail": (
-            "chunk_total is a reserved field recorded as 0; the deterministic "
-            "parent/child splitter is ticket T11's deliverable"
-        ),
-        "remediation": "rebuild the dataset after T11 lands to fill chunk_count per sample",
-    },
 ]
+
+# The T11 splitter computes chunk counts deterministically; the B1
+# chunk band [20000, 120000] scales with the tier-1 corpus size, so
+# while the primary corpus is below its own B1 floor the chunk band is
+# reported as a known gap with the actual numbers (never fabricated).
+CHUNK_GAP_BELOW_BAND = "chunk_total_outside_b1_band"
+
+
+def _chunk_gaps(chunk_total: int) -> list[dict]:
+    if B1_MIN_CHUNKS <= chunk_total <= B1_MAX_CHUNKS:
+        return []
+    return [
+        {
+            "gap": CHUNK_GAP_BELOW_BAND,
+            "criterion": f"chunks within [{B1_MIN_CHUNKS}, {B1_MAX_CHUNKS}] after split",
+            "detail": (
+                f"the T11 splitter computed chunk_total={chunk_total}; the band "
+                "scales with the tier-1 corpus size, which is still below its "
+                "own B1 floor pending the opt-in primary expansion"
+            ),
+            "remediation": (
+                "expand the tier-1 corpus (expand-primary) and rebuild; the "
+                "splitter re-derives every count deterministically"
+            ),
+        }
+    ]
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
@@ -397,6 +419,54 @@ class DatasetVerifyReport:
         return len(self.mismatches)
 
 
+# --------------------------------------------------------------------------
+# Chunk counting (T11 splitter)
+# --------------------------------------------------------------------------
+
+
+def count_derived_chunks(payload: bytes, *, fmt: str, sample_id: str, sha256: str, doc_type: str) -> int:
+    """Child-block count of one derived sample: parse the exported
+    bytes with the T6 entry point, split with the T11 splitter, count
+    the hit set (children only — parents ride along, they are not
+    pushed as independent blocks)."""
+    result = parse_document(
+        payload, fmt=fmt, document_id=sample_id, version=sha256
+    )
+    return len(split_document(result, doc_type=doc_type).hittable_blocks())
+
+
+def count_primary_chunks(
+    units: list[FrozenUnit], *, fmt: str, document_id: str, version: str
+) -> int:
+    """Child-block count of one primary sample.
+
+    The committed extracted tree is the frozen-unit SSOT the build
+    reads; each unit is re-frozen through the single construction
+    point (idempotent for already-normalized text — it only repairs
+    the few pre-T5 tree pages that still carry un-normalized
+    characters) and split with the T11 splitter. Empty-text pages
+    carry no frozen unit and produce no chunks. The eval chunk
+    contract (``tests/eval/test_chunking_contract.py``) independently
+    re-parses the primary bytes via ``parse_document`` and asserts the
+    same per-sample counts, so any drift between the tree and the
+    parser fails the eval suite (verified equal for the frozen 12).
+    """
+    total = 0
+    for unit in units:
+        if not unit.text.strip():
+            continue
+        parsed = build_unit(
+            fmt=fmt,
+            source_sha256=version,
+            document_id=document_id,
+            version=version,
+            unit=unit.unit,
+            text=unit.text,
+        )
+        total += len(split_unit(parsed, doc_type="mixed").children)
+    return total
+
+
 def _new_samples(
     registry: dict[str, dict],
     units_by_doc: dict[str, list[FrozenUnit]],
@@ -427,7 +497,12 @@ def _new_samples(
                 "document_id": doc_id,
                 "source_kind": kind,
                 "period": rec["period"],
-                "chunk_count": 0,
+                "chunk_count": count_primary_chunks(
+                    units_by_doc[doc_id],
+                    fmt="pdf" if kind == "pdf" else "html",
+                    document_id=doc_id,
+                    version=rec["version"],
+                ),
             }
         )
     for plan in plan_derived_docs(registry, units_by_doc):
@@ -456,7 +531,13 @@ def _new_samples(
                 },
                 "source_units": [{"unit": u.unit} for u in plan.units],
                 "unit_count": len(plan.units),
-                "chunk_count": 0,
+                "chunk_count": count_derived_chunks(
+                    payload,
+                    fmt=plan.fmt,
+                    sample_id=sample_id,
+                    sha256=sha256_bytes(payload),
+                    doc_type=plan.doc_type,
+                ),
             }
         )
     return samples, derived_bytes
@@ -482,6 +563,7 @@ def _manifest_payload(
         "items_sha256": sha256_bytes(_dump(queries)),
         "items": queries,
     }
+    chunk_total = sum(int(s["chunk_count"]) for s in samples)
     payload = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "dataset_id": DATASET_ID,
@@ -501,9 +583,9 @@ def _manifest_payload(
             "min_query_class_share_percent": 10,
             "source": "specs/corpus-retrieval.md §B1 数据集规模 / 查询分档（逐字口径）",
         },
-        "chunk_total": 0,
-        "chunk_total_status": CHUNK_TOTAL_STATUS_PENDING_T11,
-        "known_gaps": KNOWN_GAPS,
+        "chunk_total": chunk_total,
+        "chunk_total_status": CHUNK_TOTAL_STATUS_SPLIT,
+        "known_gaps": KNOWN_GAPS + _chunk_gaps(chunk_total),
         "counts": counts,
         "queries": queries_payload,
         "documents": samples,
