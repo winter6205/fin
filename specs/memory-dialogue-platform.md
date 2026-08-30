@@ -102,7 +102,7 @@ empty — flushed 2026-08-29: CONTEXT **memory port** / **memory backend** / **d
 
 Pre-impl 5-verdict (declared structure; not line-count of unwritten code):
 
-bounded-context-guardian: yes — memory stays a host/workspace capability behind a **memory port** (not a `controllers/` layer); filing retrieve stays on **retrieve port**; web only renders thumbs/compaction UX; ranking/chunking for memory MCP stay outside fin.
+bounded-context-guardian: yes — memory stays a host/workspace capability behind a **memory port** (not a `controllers/` layer); filing retrieve stays on **retrieve port**; web only renders thumbs/compaction UX; ranking for memory MCP stays outside fin; chunking is owned by fin and the memory MCP service does not re-split pushed text (ADR 0037).
 defensive-contract-validator: yes — Boundaries name empty / negative / overflow / concurrent / exception and bind them to SC 2–11.
 error-handling-enforcer: yes — inherit typed EXITs; new paths named (memory OFF, dream MCP fail, Redis down degrade, classify schema fail); no silent empty catch.
 complexity-anti-drift: yes — five foci, one concern each; writing-plans must not dump all foci into one god-plan; dream is not nested inside `model_node`; classify small-model stays in the classify tier.
