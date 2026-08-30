@@ -1867,6 +1867,90 @@ def test_resume_after_complete_aimessage_does_not_regenerate_that_message(
     assert model.call_count == 2, model.call_count
 
 
+def test_resume_reuses_checkpoint_run_id_for_sse_and_persisted_turn(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """Crash resume continues the in-flight run, not a new run.
+
+    The checkpoint metadata carries the canonical id minted for the
+    original send. Resume must use that same id on its status frame and
+    on the persisted remainder row so the optimistic turn can reconcile
+    with storage without an unreconcilable UUID.
+    """
+    g, _model = _install_crash_graph(http_app, aapl_page1_text)
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    tid = created["id"]
+    canonical_run_id = "7f4a8c2e-2c4e-4f7e-9e47-8d8f8c6b1a2d"
+
+    cfg = {
+        "configurable": {
+            "thread_id": tid,
+            "run_id": canonical_run_id,
+        }
+    }
+    gen = g.stream(
+        reset_input_state("q1"),
+        config=cfg,
+        stream_mode="values",
+    )
+    for state in gen:
+        messages = state.get("messages", []) or []
+        if messages and getattr(messages[-1], "tool_calls", None):
+            break
+    gen.close()
+    assert g._graph.get_state(cfg).metadata["run_id"] == canonical_run_id
+
+    events = _post_resume_events(client, tid)
+    status_event = next(data for name, data in events if name == "status")
+    assert status_event["run_id"] == canonical_run_id
+
+    turns = client.get(f"/api/threads/{tid}").json()["turns"]
+    assert len(turns) == 1
+    assert turns[0]["run_id"] == canonical_run_id
+
+
+def test_resume_persists_checkpoint_human_question_not_synthetic_title(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """Resume row must reconcile to the crashed run's HumanMessage text.
+
+    A synthetic ``[resumed] {title}`` breaks optimistic-turn matching
+    against the original question and leaves process-death history with
+    the wrong user text.
+    """
+    g, _model = _install_crash_graph(http_app, aapl_page1_text)
+    created = client.post("/api/threads", json={"first_message": "seed"}).json()
+    tid = created["id"]
+    original_question = "what is Apple revenue for 2023 Q3?"
+    canonical_run_id = "a1b2c3d4-1111-2222-3333-444455556666"
+
+    cfg = {
+        "configurable": {
+            "thread_id": tid,
+            "run_id": canonical_run_id,
+        }
+    }
+    gen = g.stream(
+        reset_input_state(original_question),
+        config=cfg,
+        stream_mode="values",
+    )
+    for state in gen:
+        messages = state.get("messages", []) or []
+        if messages and getattr(messages[-1], "tool_calls", None):
+            break
+    gen.close()
+
+    events = _post_resume_events(client, tid)
+    assert any(name == "status" for name, _ in events)
+
+    turns = client.get(f"/api/threads/{tid}").json()["turns"]
+    assert len(turns) == 1
+    assert turns[0]["run_id"] == canonical_run_id
+    assert turns[0]["question"] == original_question
+    assert not turns[0]["question"].startswith("[resumed]")
+
+
 def test_get_thread_in_flight_true_while_lock_held(
     client: TestClient, fresh_store, http_app: FastAPI
 ) -> None:

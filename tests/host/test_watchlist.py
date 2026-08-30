@@ -1,4 +1,4 @@
-"""Tests for the workspace watchlist + in-app notice store (T4, the tracked change).
+"""Tests for the workspace watchlist + in-app notice store (T4).
 
 Spec Focus 3 / SC4: "Watchlist: create / list / delete via workspace
 API; after process restart ... list matches; empty list is ``[]`` not
@@ -13,6 +13,8 @@ what a `fin-serve` restart does to the process.
 
 from __future__ import annotations
 
+import json
+import multiprocessing
 from pathlib import Path
 
 import pytest
@@ -22,6 +24,7 @@ from fin.host.watchlist import (
     JsonFileWatchlistStore,
     NoticeNotFoundError,
     WatchNotFoundError,
+    WatchlistError,
     default_watchlist_store,
     matches_watch,
     refresh_notices,
@@ -117,6 +120,98 @@ def test_a_store_over_a_missing_file_starts_empty(tmp_path: Path) -> None:
     """First boot has no file yet; that is an empty watchlist, not an
     exception the workspace has to catch."""
     assert JsonFileWatchlistStore(tmp_path / "never-written.json").list_watches() == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        42,
+        {"schema": "fin.watchlist.v1", "watches": []},
+        {"schema": "fin.watchlist.v1", "notices": []},
+        {"schema": "fin.watchlist.v1", "watches": {}, "notices": []},
+        {"schema": "fin.watchlist.v1", "watches": [], "notices": {}},
+        {
+            "schema": "fin.watchlist.v1",
+            "watches": [{"id": "watch-1", "issuer": "AAPL", "forms": []}],
+            "notices": [],
+        },
+        {
+            "schema": "fin.watchlist.v1",
+            "watches": [
+                {
+                    "id": "watch-1",
+                    "issuer": "AAPL",
+                    "forms": "10-K",
+                    "created_at": "2024-01-01T00:00:00+00:00",
+                }
+            ],
+            "notices": [],
+        },
+    ],
+)
+def test_invalid_watchlist_shapes_raise_typed_error_without_rewriting_file(
+    tmp_path: Path, payload
+) -> None:
+    path = tmp_path / "watchlist.json"
+    original = json.dumps(payload, separators=(",", ":")).encode()
+    path.write_bytes(original)
+    store = JsonFileWatchlistStore(path)
+
+    with pytest.raises(WatchlistError):
+        store.list_watches()
+
+    assert path.read_bytes() == original
+
+
+def test_empty_watchlist_file_starts_with_the_empty_table_default(tmp_path: Path) -> None:
+    path = tmp_path / "empty-watchlist.json"
+    path.write_bytes(b"")
+
+    assert JsonFileWatchlistStore(path).list_watches() == []
+
+
+def _add_watch_in_process(path: str, issuer: str, ready) -> None:
+    store = JsonFileWatchlistStore(path)
+    ready.wait()
+    store.add_watch(issuer=issuer)
+
+
+def test_independent_process_stores_preserve_concurrent_adds(tmp_path: Path) -> None:
+    path = tmp_path / "watchlist.json"
+    context = multiprocessing.get_context("fork")
+    ready = context.Barrier(2)
+    processes = [
+        context.Process(
+            target=_add_watch_in_process,
+            args=(str(path), issuer, ready),
+        )
+        for issuer in ("AAPL", "MSFT")
+    ]
+
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=10)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+
+    assert all(process.exitcode == 0 for process in processes)
+    restored = JsonFileWatchlistStore(path)
+    assert {entry.issuer for entry in restored.list_watches()} == {"AAPL", "MSFT"}
+    assert len(json.loads(path.read_text(encoding="utf-8"))["watches"]) == 2
+
+
+def test_duplicate_add_is_idempotent_across_independent_stores(tmp_path: Path) -> None:
+    path = tmp_path / "watchlist.json"
+    first = JsonFileWatchlistStore(path).add_watch(issuer="AAPL")
+    second = JsonFileWatchlistStore(path).add_watch(issuer="aapl")
+
+    assert second.id == first.id
+    assert [entry.issuer for entry in JsonFileWatchlistStore(path).list_watches()] == [
+        "AAPL"
+    ]
 
 
 # ----- matching -----

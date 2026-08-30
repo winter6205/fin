@@ -18,11 +18,17 @@ import concurrent.futures
 import hashlib
 import json
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from fin.corpus.errors import IngestMissingError, ManifestShaMismatchError
+from fin.corpus.errors import (
+    IngestMissingError,
+    MalformedExtractedIndexError,
+    ManifestShaMismatchError,
+)
 from fin.corpus.extracted import Locator, load_extracted_tree
 from fin.corpus.ingest import run_ingest
 
@@ -195,6 +201,78 @@ def test_run_ingest_missing_pdf_raises_typed_error(tmp_path: Path) -> None:
 
     # No tree should have been created — the typed error short-circuits.
     assert not (extracted_root / "TEST-2023Q1").exists()
+
+
+def test_run_ingest_malformed_existing_index_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """A present malformed index is corruption, not a missing index.
+
+    Ingest must raise before it computes or writes a replacement index.
+    The original bytes are the evidence needed to repair the extracted
+    tree, so they must remain untouched.
+    """
+    manifest_path = tmp_path / "manifest.json"
+    pdf_dir = tmp_path / "pdf"
+    extracted_root = tmp_path / "extracted"
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    _write_manifest(manifest_path, documents=[])
+
+    extracted_root.mkdir()
+    damaged = extracted_root / "_index.json"
+    original = b"{ this is not valid json"
+    damaged.write_bytes(original)
+
+    with pytest.raises(MalformedExtractedIndexError):
+        run_ingest(
+            manifest_path=manifest_path,
+            pdf_dir=pdf_dir,
+            extracted_root=extracted_root,
+        )
+
+    assert damaged.read_bytes() == original
+
+
+def test_ingest_process_returns_nonzero_for_malformed_existing_index(
+    tmp_path: Path,
+) -> None:
+    """The ingest CLI exposes the typed corruption failure as non-zero."""
+    manifest_path = tmp_path / "manifest.json"
+    pdf_dir = tmp_path / "pdf"
+    extracted_root = tmp_path / "extracted"
+    facts_root = tmp_path / "facts"
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    _write_manifest(manifest_path, documents=[])
+
+    extracted_root.mkdir()
+    damaged = extracted_root / "_index.json"
+    original = b"{ this is not valid json"
+    damaged.write_bytes(original)
+
+    process = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "fin.corpus.ingest",
+            "--manifest",
+            str(manifest_path),
+            "--pdf-dir",
+            str(pdf_dir),
+            "--extracted-root",
+            str(extracted_root),
+            "--facts-root",
+            str(facts_root),
+            "--ocr-engine",
+            "none",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert process.returncode != 0
+    assert "MalformedExtractedIndexError" in process.stderr
+    assert damaged.read_bytes() == original
 
 
 def test_run_ingest_sha_drift_raises_typed_error(tmp_path: Path) -> None:
