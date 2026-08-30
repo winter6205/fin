@@ -721,10 +721,14 @@ def _publish_staged(
     ]
     backup_dirs: dict[Path, Path] = {}
     for _staged, target, parent in targets:
-        backup_dirs.setdefault(
-            parent,
-            Path(tempfile.mkdtemp(prefix=".live-publish-backup-", dir=parent)),
-        )
+        # ``setdefault`` would evaluate its default on every visit, and a
+        # parent visited twice (``extracted_root`` holds both the
+        # accession dir and ``_index.json``) would then leak one backup
+        # dir the cleanup below never learns about.
+        if parent not in backup_dirs:
+            backup_dirs[parent] = Path(
+                tempfile.mkdtemp(prefix=".live-publish-backup-", dir=parent)
+            )
 
     journal_path = _publish_journal_path(manifest_path)
     journal_entries = [
