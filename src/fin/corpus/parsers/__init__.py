@@ -33,8 +33,10 @@ the pipeline. The full-corpus sha256 assertion is T12's deliverable.
 
 Versioning: any change to splitting, merging, or granularity constants
 must bump :data:`PARSE_RULE_VERSION` (``parse-1``); the params-table
-version is the placeholder :data:`PARAMS_TABLE_VERSION` (``params-0``)
-until T9 lands the real deterministic parameter lookup.
+version is :data:`PARAMS_TABLE_VERSION` (``params-1``), owned by
+``fin.corpus.params`` — the versioned (document type x section x
+content density) lookup table landed by T9, consumed by the T11
+splitter.
 
 Named failures (SC9 / SC40 lineage; all in ``fin.corpus.errors``):
 ``EmptySourceParseError`` (0-byte source), ``UnsupportedFormatParseError``
