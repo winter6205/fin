@@ -25,6 +25,8 @@ from typing import Any
 import pytest
 
 from fin.corpus.extracted import Locator
+from fin.corpus.parsers._common import UnitLocator
+from fin.corpus.push import serialize_source_ref
 from fin.retrieve.hit_mapping import (
     MAPPING_FAILURE_LOG_ENV,
     MAPPING_FAILURE_MALFORMED_HIT,
@@ -96,6 +98,34 @@ def test_fully_mapped_hits_record_no_failure() -> None:
     assert len(chunks) == 1
     assert ledger.count() == 0
     assert ledger.count_by_code() == {}
+
+
+def test_canonical_source_ref_maps_without_a_retrieval_id_map() -> None:
+    """B4 ``source_ref`` is the fin locator serialization, not an
+    iknow-memory row id.  The canonical value must be self-describing."""
+    locator = UnitLocator(
+        document_id="DOC-2023Q1",
+        version="v-" + "a" * 60,
+        unit=3,
+    )
+    ledger = MappingFailureLedger()
+
+    chunks = map_hits_to_chunks(
+        [
+            {
+                "text": "kept",
+                "source_ref": serialize_source_ref(locator),
+                "score": 1.0,
+            }
+        ],
+        locator_map={},
+        limit=10,
+        ledger=ledger,
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].source_ref == _loc(page=3)
+    assert ledger.count() == 0
 
 
 @pytest.mark.parametrize(

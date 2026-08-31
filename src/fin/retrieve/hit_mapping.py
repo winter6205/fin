@@ -21,9 +21,17 @@ Two authorities live here:
   host side (``fin.host.evidence_admission``) records into the same
   ledger, so one number covers both places a hit can fail to map.
 
-The retrieval-side identifier is written to the ledger — that record is
-the operator's diagnosis, and it is the only place the id survives. It
-never travels to citation evidence, which is what SC22 forbids.
+A canonical fin ``source_ref`` is parsed directly into a locator. A
+retrieval-side identifier, when an integration still needs one, must be
+carried under the explicitly transitional ``retrieval_id`` field and
+resolved through ``locator_map``. The legacy path that accepts a
+non-canonical ``source_ref`` key in an explicitly supplied
+``locator_map`` remains only for existing callers during migration; it
+is never emitted by fin and is not the canonical field meaning.
+
+Retrieval-side identifiers are written to the ledger — that record is the
+operator's diagnosis, and it is the only place the id survives. It never
+travels to citation evidence, which is what SC22 forbids.
 
 Failure vocabulary
 ------------------
@@ -52,6 +60,7 @@ from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
 
 from fin.corpus.extracted import Locator
+from fin.corpus.push import deserialize_source_ref
 from fin.retrieve.port import Chunk
 
 
@@ -374,19 +383,47 @@ def _locator_of_hit(
             retrieval_ref=_retrieval_ref_of(source_ref),
             message=(
                 f"hit source_ref is {type(source_ref).__name__}, expected a "
-                "retrieval-side id string"
+                "canonical fin locator serialization"
             ),
         )
         return None
-    locator = locator_map.get(source_ref)
-    if locator is None:
-        ledger.record(
-            code=MAPPING_FAILURE_UNMAPPED_SOURCE_REF,
-            stage=MAPPING_STAGE_RETRIEVE,
-            retrieval_ref=source_ref,
-            message="retrieval-side id is absent from the locator map",
+    try:
+        canonical_locator = deserialize_source_ref(source_ref)
+    except ValueError:
+        retrieval_id = hit.get("retrieval_id")
+        if isinstance(retrieval_id, str):
+            locator = locator_map.get(retrieval_id)
+            lookup_ref = retrieval_id
+            lookup_message = (
+                "transitional retrieval_id is absent from the locator map"
+            )
+        elif source_ref in locator_map:
+            # Transitional compatibility for callers that explicitly
+            # supplied the pre-B4 locator map and still receive its old
+            # source_ref key. New integrations must use retrieval_id.
+            locator = locator_map.get(source_ref)
+            lookup_ref = source_ref
+            lookup_message = (
+                "transitional source_ref key is absent from the locator map"
+            )
+        else:
+            locator = None
+            lookup_ref = source_ref
+            lookup_message = "source_ref is neither canonical nor mapped"
+        if locator is None:
+            ledger.record(
+                code=MAPPING_FAILURE_UNMAPPED_SOURCE_REF,
+                stage=MAPPING_STAGE_RETRIEVE,
+                retrieval_ref=lookup_ref,
+                message=lookup_message,
+            )
+            return None
+    else:
+        locator = Locator(
+            document_id=canonical_locator.document_id,
+            version=canonical_locator.version,
+            page=canonical_locator.unit,
         )
-        return None
     if not isinstance(locator, Locator):
         ledger.record(
             code=MAPPING_FAILURE_NON_LOCATOR_SOURCE_REF,
