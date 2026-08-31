@@ -59,14 +59,12 @@ shape).
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Final, Sequence
 
-from fin.corpus.determinism import canonical_json_bytes
-from fin.corpus.push import PushRecord
+from fin.corpus.push import PushRecord, idempotency_keys_digest
 from fin.retrieve.push_port import (
     MAX_PUSH_BATCH_RECORDS,
     PushBatchFailedError,
@@ -146,8 +144,9 @@ def expected_block_total(records: Sequence[PushRecord]) -> int:
 
 def batch_key(records: Sequence[PushRecord]) -> str:
     """The deterministic key of one batch composition (see module doc)."""
-    payload = [list(record.idempotency_key) for record in records]
-    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+    return idempotency_keys_digest(
+        [record.idempotency_key for record in records]
+    )
 
 
 def plan_batches(
