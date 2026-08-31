@@ -341,6 +341,59 @@ def test_unwritable_journal_is_named_and_does_not_update_memory(
     assert journal.failures() == ()
 
 
+def test_journal_directory_is_a_named_replay_read_failure(tmp_path) -> None:
+    journal_path = tmp_path / "journal-directory"
+    journal_path.mkdir()
+
+    with pytest.raises(PushError) as excinfo:
+        PushJournal(path=journal_path)
+
+    assert excinfo.value.code == "push_journal_unreadable"
+
+
+def test_unreadable_journal_file_is_a_named_replay_read_failure(
+    tmp_path, monkeypatch
+) -> None:
+    journal_path = tmp_path / "journal.jsonl"
+    journal_path.write_text("", encoding="utf-8")
+    original_read_text = type(journal_path).read_text
+
+    def deny_read(path, *args, **kwargs):
+        if path == journal_path:
+            raise PermissionError("permission denied")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(journal_path), "read_text", deny_read)
+
+    with pytest.raises(PushError) as excinfo:
+        PushJournal(path=journal_path)
+
+    assert excinfo.value.code == "push_journal_unreadable"
+
+
+def test_bad_json_journal_line_is_a_named_corruption(tmp_path) -> None:
+    journal_path = tmp_path / "journal.jsonl"
+    journal_path.write_text("{not json\n", encoding="utf-8")
+
+    with pytest.raises(PushError) as excinfo:
+        PushJournal(path=journal_path)
+
+    assert excinfo.value.code == "push_journal_corrupt"
+
+
+def test_journal_event_missing_fields_is_a_named_corruption(tmp_path) -> None:
+    journal_path = tmp_path / "journal.jsonl"
+    journal_path.write_text(
+        json.dumps({"event": "completed"}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PushError) as excinfo:
+        PushJournal(path=journal_path)
+
+    assert excinfo.value.code == "push_journal_corrupt"
+
+
 def test_journal_records_are_enumerable_and_replayable_from_disk(tmp_path) -> None:
     path = tmp_path / "push-journal.jsonl"
     inner = FakePushPort()

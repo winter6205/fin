@@ -18,6 +18,8 @@ from fin.retrieve.hit_mapping import MAPPING_FAILURE_UNMAPPED_SOURCE_REF
 from fin.retrieve.invalidation_port import InvalidationServiceUnavailableError
 from fin.retrieve.push_batching import (
     PushBatchFailedError,
+    PushJournalCorruptError,
+    PushJournalUnreadableError,
     PushJournalUnwritableError,
 )
 from fin.retrieve.push_port import (
@@ -34,6 +36,8 @@ FAILURE_CATEGORY_MAPPING: Final[str] = "mapping_failure"
 FAILURE_CATEGORY_INVALIDATION: Final[str] = "invalidation_failure"
 FAILURE_CATEGORY_BACKGROUND: Final[str] = "background_failure"
 FAILURE_CATEGORY_JOURNAL: Final[str] = "journal_persistence_failure"
+FAILURE_CATEGORY_JOURNAL_READ: Final[str] = "journal_replay_read_failure"
+FAILURE_CATEGORY_JOURNAL_CORRUPT: Final[str] = "journal_replay_corruption"
 
 FAILURE_EVIDENCE_NAMED_ERROR: Final[str] = "named_error"
 FAILURE_EVIDENCE_COUNT: Final[str] = "count"
@@ -116,6 +120,20 @@ FAILURE_CATALOG: Final[tuple[FailureCatalogEntry, ...]] = (
         carrier="fin.retrieve.push_batching.PushJournalUnwritableError.code",
         code_source=_class_code(PushJournalUnwritableError),
     ),
+    FailureCatalogEntry(
+        category=FAILURE_CATEGORY_JOURNAL_READ,
+        code=PushJournalUnreadableError.code,
+        evidence=FAILURE_EVIDENCE_NAMED_ERROR,
+        carrier="fin.retrieve.push_batching.PushJournalUnreadableError.code",
+        code_source=_class_code(PushJournalUnreadableError),
+    ),
+    FailureCatalogEntry(
+        category=FAILURE_CATEGORY_JOURNAL_CORRUPT,
+        code=PushJournalCorruptError.code,
+        evidence=FAILURE_EVIDENCE_NAMED_ERROR,
+        carrier="fin.retrieve.push_batching.PushJournalCorruptError.code",
+        code_source=_class_code(PushJournalCorruptError),
+    ),
 )
 
 
@@ -140,6 +158,8 @@ __all__ = [
     "FAILURE_CATEGORY_BACKGROUND",
     "FAILURE_CATEGORY_INVALIDATION",
     "FAILURE_CATEGORY_JOURNAL",
+    "FAILURE_CATEGORY_JOURNAL_CORRUPT",
+    "FAILURE_CATEGORY_JOURNAL_READ",
     "FAILURE_CATEGORY_MAPPING",
     "FAILURE_CATEGORY_OCR",
     "FAILURE_CATEGORY_PARSE",

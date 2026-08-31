@@ -18,6 +18,8 @@ from fin.retrieve.failure_catalog import (
     FAILURE_CATALOG,
     FAILURE_CATEGORY_BACKGROUND,
     FAILURE_CATEGORY_INVALIDATION,
+    FAILURE_CATEGORY_JOURNAL_CORRUPT,
+    FAILURE_CATEGORY_JOURNAL_READ,
     FAILURE_CATEGORY_JOURNAL,
     FAILURE_CATEGORY_MAPPING,
     FAILURE_CATEGORY_OCR,
@@ -35,6 +37,8 @@ from fin.retrieve.invalidation_port import (
 )
 from fin.retrieve.push_batching import (
     PushJournal,
+    PushJournalCorruptError,
+    PushJournalUnreadableError,
     PushJournalUnwritableError,
     plan_batches,
     push_in_batches,
@@ -145,8 +149,10 @@ def test_failure_catalog_names_exactly_the_seven_required_paths() -> None:
         FAILURE_CATEGORY_INVALIDATION,
         FAILURE_CATEGORY_BACKGROUND,
         FAILURE_CATEGORY_JOURNAL,
+        FAILURE_CATEGORY_JOURNAL_READ,
+        FAILURE_CATEGORY_JOURNAL_CORRUPT,
     }
-    assert len(FAILURE_CATALOG) == 8
+    assert len(FAILURE_CATALOG) == 10
 
 
 def test_failure_catalog_has_zero_untraced_paths() -> None:
@@ -164,6 +170,8 @@ def test_failure_catalog_has_zero_untraced_paths() -> None:
         FAILURE_CATEGORY_INVALIDATION,
         FAILURE_CATEGORY_BACKGROUND,
         FAILURE_CATEGORY_JOURNAL,
+        FAILURE_CATEGORY_JOURNAL_READ,
+        FAILURE_CATEGORY_JOURNAL_CORRUPT,
     ],
 )
 def test_every_catalog_code_is_published_by_its_real_failure_surface(
@@ -273,6 +281,28 @@ def test_journal_persistence_catalog_code_is_triggerable(tmp_path) -> None:
 
     assert excinfo.value.code == entry.code
     assert journal.failures() == ()
+
+
+def test_journal_replay_read_catalog_code_is_triggerable(tmp_path) -> None:
+    entry = _catalog_entry(FAILURE_CATEGORY_JOURNAL_READ)
+    journal_path = tmp_path / "journal-directory"
+    journal_path.mkdir()
+
+    with pytest.raises(PushJournalUnreadableError) as excinfo:
+        PushJournal(path=journal_path)
+
+    assert excinfo.value.code == entry.code
+
+
+def test_journal_replay_corrupt_catalog_code_is_triggerable(tmp_path) -> None:
+    entry = _catalog_entry(FAILURE_CATEGORY_JOURNAL_CORRUPT)
+    journal_path = tmp_path / "journal.jsonl"
+    journal_path.write_text("{not json\n", encoding="utf-8")
+
+    with pytest.raises(PushJournalCorruptError) as excinfo:
+        PushJournal(path=journal_path)
+
+    assert excinfo.value.code == entry.code
 
 
 def test_no_empty_except_handler_exists_in_the_full_fin_source_tree() -> None:
