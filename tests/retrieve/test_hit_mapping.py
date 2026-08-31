@@ -18,7 +18,9 @@ The host half (citation-evidence admission) is
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -295,6 +297,34 @@ def test_records_append_across_ledger_instances(tmp_path: Path) -> None:
     )
 
     assert MappingFailureLedger(path=path).count() == 2
+
+
+def test_shared_ledger_serializes_concurrent_records_and_appends(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "concurrent-failures.jsonl"
+    ledger = MappingFailureLedger(path=path)
+    workers = 8
+    start = threading.Barrier(workers)
+
+    def record_from_worker(index: int) -> object:
+        start.wait()
+        return ledger.record(
+            code=MAPPING_FAILURE_UNMAPPED_SOURCE_REF,
+            stage=MAPPING_STAGE_RETRIEVE,
+            retrieval_ref=f"id-{index}",
+            message=f"worker-{index}",
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=workers
+    ) as pool:
+        records = tuple(pool.map(record_from_worker, range(workers)))
+
+    assert len(records) == workers
+    assert ledger.count() == workers
+    assert len(path.read_text(encoding="utf-8").splitlines()) == workers
+    assert MappingFailureLedger(path=path).count() == workers
 
 
 def test_unwritable_ledger_path_fails_by_name(tmp_path: Path) -> None:
