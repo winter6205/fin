@@ -91,6 +91,12 @@ import json
 from typing import Any
 
 from fin.corpus.extracted import Locator
+from fin.retrieve.degradation import (
+    NOT_DEGRADED,
+    DegradationError,
+    DegradationSignal,
+    read_degradation_signal,
+)
 from fin.retrieve.hit_mapping import MappingFailureLedger, map_hits_to_chunks
 
 
@@ -117,7 +123,43 @@ class RetrieveUnavailableError(Exception):
 
     The adapter does NOT swallow MCP failures as empty chunks
     and does NOT fall back to BM25.
+
+    :attr:`code` is the token ``retrieve`` puts on the product
+    error dict, and :attr:`signal` carries the response's §B3
+    degradation state so a failed *and* degraded request reaches
+    the host with its reasons attached (T20).
     """
+
+    code: str = "retrieve_unavailable"
+    signal: DegradationSignal = NOT_DEGRADED
+
+    def error_dict(self) -> dict[str, Any]:
+        """The product EXIT shape for this failure.
+
+        Undegraded failures keep the historical single-key dict; a
+        degraded one adds the two verbatim §B3 fields, because a
+        named failure that drops the reasons is exactly the
+        「静默」 SC39 counts.
+        """
+        return {"error": self.code, **self.signal.as_envelope_fields()}
+
+
+class RetrieveDegradedFailureError(RetrieveUnavailableError):
+    """The service answered degraded AND did not answer with results.
+
+    §B2 第 2 条: when the request itself failed, the degradation is a
+    named failure — never ``{"chunks": []}``, which would tell the
+    caller the corpus has nothing while the arms were down. Kept in
+    the :class:`RetrieveUnavailableError` family so callers that
+    already branch on "retrieve did not answer" need no change, with
+    a distinct :attr:`code` for callers that must tell the two apart.
+    """
+
+    code = "retrieve_degraded_failure"
+
+    def __init__(self, message: str, *, signal: DegradationSignal) -> None:
+        super().__init__(message)
+        self.signal = signal
 
 
 # ----- limit resolution -----
@@ -260,6 +302,35 @@ def _validate_tool_response(
     return response
 
 
+def _degradation_of_response(response: Any) -> DegradationSignal:
+    """The §B3 signal this response carries, wherever it sits.
+
+    Servers put it on the tool result; a JSON-RPC error envelope has no
+    result to put it on, so the top level is read too. Both are read
+    strictly — an unreadable signal raises rather than passing as 未降级.
+    """
+    top_level = read_degradation_signal(response)
+    if top_level.degraded:
+        return top_level
+    if isinstance(response, dict):
+        return read_degradation_signal(response.get("result"))
+    return NOT_DEGRADED
+
+
+def _unavailable(
+    message: str, signal: DegradationSignal
+) -> RetrieveUnavailableError:
+    """The typed EXIT for a request that produced no usable result.
+
+    Degraded responses take the named degraded failure so the caller can
+    tell「能力降级且这次没答上」from a plain transport outage — and so the
+    reasons survive to the user-facing notice (SC39).
+    """
+    if signal.degraded:
+        return RetrieveDegradedFailureError(message, signal=signal)
+    return RetrieveUnavailableError(message)
+
+
 def _validate_mcp_responses(
     responses: list[Any],
     payload: dict[str, Any],
@@ -387,9 +458,16 @@ class MCPRetrieveAdapter:
                     limit=limit,
                 )
             )
-        except RetrieveUnavailableError:
-            # Typed EXIT — the product shape is the error dict.
-            return {"error": "retrieve_unavailable"}
+        except RetrieveUnavailableError as exc:
+            # Typed EXIT — the product shape is the error dict. A
+            # degraded failure carries its §B3 reasons along (T20).
+            return exc.error_dict()
+        except DegradationError as exc:
+            # The service answered with an unreadable / renamed
+            # degradation signal (§B3). Named EXIT rather than a
+            # coerced result: neither「未降级」nor an empty hit list
+            # would be a true reading of that response.
+            return {"error": exc.code}
 
     async def aretrieve(
         self,
@@ -480,10 +558,17 @@ class MCPRetrieveAdapter:
                 f"MCP transport failed: {exc!r}"
             ) from exc
 
+        # §B3 signal, read once for this response: the envelope may
+        # carry it beside the JSON-RPC error or inside ``result``.
+        # Read BEFORE the failure branches so a degraded failure keeps
+        # its reasons instead of collapsing into a bare unavailable.
+        signal = _degradation_of_response(response)
+
         # JSON-RPC error response: surface as unavailable.
         if isinstance(response, dict) and "error" in response:
-            raise RetrieveUnavailableError(
-                f"MCP returned JSON-RPC error: {response['error']!r}"
+            raise _unavailable(
+                f"MCP returned JSON-RPC error: {response['error']!r}",
+                signal,
             )
 
         # Result shape: accept three envelope variants for
@@ -509,8 +594,8 @@ class MCPRetrieveAdapter:
             if isinstance(response.get("hits"), list):
                 result = response
             else:
-                raise RetrieveUnavailableError(
-                    f"MCP returned non-dict result: {result!r}"
+                raise _unavailable(
+                    f"MCP returned non-dict result: {result!r}", signal
                 )
         # Variant 3: content-block envelope.
         if "hits" not in result and "content" in result:
@@ -530,8 +615,8 @@ class MCPRetrieveAdapter:
                         result = inner
         hits = result.get("hits")
         if not isinstance(hits, list):
-            raise RetrieveUnavailableError(
-                f"MCP returned non-list hits: {hits!r}"
+            raise _unavailable(
+                f"MCP returned non-list hits: {hits!r}", signal
             )
 
         # Map iknow ids → fin locators; drop unmapped, and count
@@ -544,7 +629,10 @@ class MCPRetrieveAdapter:
             limit=effective_limit,
             ledger=self.mapping_failures,
         )
-        return {"chunks": list(chunks)}
+        # A degraded response with results is 放行 (§B2 第 1 条) — but it
+        # travels with its flag, so the host can record the reasons and
+        # tell the user this answer is not a complete one.
+        return {"chunks": list(chunks), **signal.as_envelope_fields()}
 
     # ----- transport (test seam) -----
 
@@ -588,4 +676,8 @@ class MCPRetrieveAdapter:
         return _validate_mcp_responses(responses, payload)
 
 
-__all__ = ["MCPRetrieveAdapter", "RetrieveUnavailableError"]
+__all__ = [
+    "MCPRetrieveAdapter",
+    "RetrieveDegradedFailureError",
+    "RetrieveUnavailableError",
+]
