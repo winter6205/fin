@@ -104,6 +104,11 @@ from fin.host.state import (
     TERMINAL_STATUSES,
 )
 from fin.host.agent_instructions import messages_for_model
+from fin.host.degradation_notice import (
+    DEGRADATION_NOTICE_FIELD,
+    consume_degradation,
+    degradation_notice_entry,
+)
 from fin.host.stream_map import (
     assemble_final_ai_message,
     format_tool_summary,
@@ -123,6 +128,10 @@ from fin.host.tools.issuer_fanout import (
 )
 from fin.host.track_decision import decide_track, snapshot_delta_for_utterance
 from fin.retrieve import MCPRetrieveAdapter, FakeRetrievePort
+from fin.retrieve.degradation import (
+    DegradationLedger,
+    degradation_ledger_from_env,
+)
 from fin.retrieve.hit_mapping import MappingFailureLedger, ledger_from_env
 from fin.retrieve.tool import retrieve
 from fin.retrieve.port import RetrievePort
@@ -382,6 +391,7 @@ def _make_retrieve_tool(
     adapter: RetrievePort,
     *,
     mapping_ledger: MappingFailureLedger | None = None,
+    degradation_ledger: DegradationLedger | None = None,
 ):
     """Build the ``retrieve`` host tool.
 
@@ -406,11 +416,24 @@ def _make_retrieve_tool(
     The error contributes no evidence and triggers no BM25
     fallback; the model can retry or say retrieval is down.
 
+    Degradation (T20 / SC39 / §B3): a response carrying
+    ``degraded`` has every one of its ``degraded_reasons``
+    recorded on ``degradation_ledger``, and the notice rides
+    onto the tool envelope so the run's tool trace tells the
+    user this answer is partial. The flag changes neither the
+    evidence a hit contributes nor the citation gate's rules —
+    a degraded result is usable but must be visible.
+
     The tool's registered name is ``retrieve`` so the model can
     call it by name.
     """
     ledger = (
         mapping_ledger if mapping_ledger is not None else ledger_from_env()
+    )
+    degradations = (
+        degradation_ledger
+        if degradation_ledger is not None
+        else degradation_ledger_from_env()
     )
 
     @tool("retrieve")
@@ -450,12 +473,17 @@ def _make_retrieve_tool(
         if isinstance(result, dict) and "error" in result:
             # Typed EXIT: surface the port's error dict verbatim.
             # Building evidence / a chunks envelope here would
-            # destroy the distinction the spec requires.
+            # destroy the distinction the spec requires. A degraded
+            # failure keeps its reasons on the same dict (§B2 第 2
+            # 条: 具名失败, not an empty result), and consuming it
+            # here is what puts them in front of the user.
+            envelope = dict(result)
+            _consume_into_envelope(envelope, result, ledger=degradations)
             return Command(
                 update={
                     "messages": [
                         ToolMessage(
-                            content=json.dumps(result, default=str),
+                            content=json.dumps(envelope, default=str),
                             tool_call_id=tool_call_id,
                             name="retrieve",
                         )
@@ -484,8 +512,10 @@ def _make_retrieve_tool(
             }
             for chunk in chunks
         ]
+        envelope: dict[str, Any] = {"chunks": serialized_chunks}
+        _consume_into_envelope(envelope, result, ledger=degradations)
         tool_message = ToolMessage(
-            content=json.dumps({"chunks": serialized_chunks}, default=str),
+            content=json.dumps(envelope, default=str),
             tool_call_id=tool_call_id,
             name="retrieve",
         )
@@ -494,6 +524,31 @@ def _make_retrieve_tool(
         )
 
     return retrieve_tool
+
+
+def _consume_into_envelope(
+    envelope: dict[str, Any],
+    result: Any,
+    *,
+    ledger: DegradationLedger,
+) -> None:
+    """Record ``result``'s degradation and publish it on ``envelope``.
+
+    Publishing IS the exposure: the two verbatim §B3 fields and the
+    rendered notice ride on the envelope the tool trace summarizes, so
+    the reasons reach the user on the same row as the call. The notice
+    record is written only after they are on the envelope.
+    """
+    consume_degradation(
+        result,
+        ledger=ledger,
+        expose=lambda signal, line: envelope.update(
+            {
+                **signal.as_envelope_fields(),
+                DEGRADATION_NOTICE_FIELD: line,
+            }
+        ),
+    )
 
 
 def _make_get_xbrl_fact_tool(facts_root: Path):
@@ -1183,6 +1238,7 @@ def compile_graph(
     mcp_command: list[str] | None = None,
     locator_map: dict[str, "Locator"] | None = None,
     mapping_failure_ledger: MappingFailureLedger | None = None,
+    degradation_ledger: DegradationLedger | None = None,
 ) -> "_LockedGraph":
     """Build the v1 host graph (T6).
 
@@ -1279,6 +1335,14 @@ def compile_graph(
         count, unset keeps it in memory. The same ledger is shared
         by the auto-built MCP adapter and the host's evidence
         admission, so one number covers both drop sites.
+    degradation_ledger
+        T20 (SC39 / §B3): where a retrieval response's
+        ``degraded_reasons`` are recorded, and where the matching
+        user-facing notice is recorded against them. ``None`` (the
+        default) resolves the ledger from ``FIN_DEGRADATION_LOG``.
+        Shared by the ``retrieve`` tool and the fan-out workers, so
+        「记录原因且暴露信号」is one count over every consumption
+        point rather than one per call site.
 
     Returns
     -------
@@ -1303,6 +1367,12 @@ def compile_graph(
     # both are the same SC22 failure, so they must not be two numbers.
     if mapping_failure_ledger is None:
         mapping_failure_ledger = ledger_from_env()
+
+    # One degradation ledger per graph for the same reason (T20): the
+    # single-issuer tool and every fan-out worker consume the same §B3
+    # signal, and SC39 counts reasons across the run, not per seam.
+    if degradation_ledger is None:
+        degradation_ledger = degradation_ledger_from_env()
 
     # Build the adapter if the caller did not inject one. The kind
     # comes from configuration only (``retrieve_adapter``), so a
@@ -1368,7 +1438,9 @@ def compile_graph(
     list_files_tool = _make_list_files_tool(mpath, rpath)
     read_file_tool = _make_read_file_tool()
     retrieve_tool = _make_retrieve_tool(
-        adapter, mapping_ledger=mapping_failure_ledger
+        adapter,
+        mapping_ledger=mapping_failure_ledger,
+        degradation_ledger=degradation_ledger,
     )
     get_xbrl_fact_tool = _make_get_xbrl_fact_tool(fpath)
     # T3 (spec Focus 1): bound LAST so the four prior tools keep
@@ -1777,17 +1849,40 @@ def compile_graph(
                 error=f"retrieve_raised:{type(exc).__name__}",
             )
 
+        # T20 / SC39: a fan-out worker is a retrieval consumption point
+        # like any other, so a degraded answer here is recorded and
+        # shown too — otherwise the branch would be the one place a
+        # degradation could arrive silently. The notice rides on the
+        # run's tool trace, which is additive across branches.
+        notices: list[dict[str, str]] = []
+        consume_degradation(
+            result,
+            ledger=degradation_ledger,
+            expose=lambda signal, _line: notices.append(
+                degradation_notice_entry(
+                    signal, tool_call_id=str(task.get("issuer") or "")
+                )
+            ),
+            detail=f"issuer={issuer}",
+        )
+        summaries: dict[str, Any] = (
+            {"tool_summaries": notices} if notices else {}
+        )
+
         if isinstance(result, dict) and "error" in result:
             # Typed EXIT (ADR 0030): "retrieve is down" must not read
             # as "the corpus has nothing about this issuer".
-            return _issuer_finding(
-                issuer, STATUS_UNAVAILABLE, error=str(result["error"])
-            )
+            return {
+                **summaries,
+                **_issuer_finding(
+                    issuer, STATUS_UNAVAILABLE, error=str(result["error"])
+                ),
+            }
 
         new_evidence = _issuer_evidence(result, ledger=mapping_failure_ledger)
         if not new_evidence:
-            return _issuer_finding(issuer, STATUS_EMPTY)
-        return _issuer_hit_update(issuer, new_evidence)
+            return {**summaries, **_issuer_finding(issuer, STATUS_EMPTY)}
+        return {**summaries, **_issuer_hit_update(issuer, new_evidence)}
 
     def issuer_join_node(state: AgentState) -> dict[str, Any]:
         """Join the branches into one ``fin.issuer_fanout.v1`` envelope.
