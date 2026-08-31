@@ -48,8 +48,9 @@ when the operator configures a path. The chunks answer is still
 a miss on the wire; the counter is what tells the operator it is not
 one. Wiring the map remains the caller's job, and
 ``fin.host.compile_graph`` refuses to build a product adapter
-without one: it derives ``"{document_id}#{page}"`` keys from the
-extracted tree unless the operator supplies an explicit map.
+without one: it derives canonical ``source_ref`` keys with
+``fin.corpus.push.serialize_source_ref`` from the extracted tree
+unless the operator supplies an explicit compatibility map.
 
 Error contract
 --------------

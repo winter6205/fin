@@ -139,7 +139,7 @@ def _catalog_entry(category: str):
     return next(entry for entry in FAILURE_CATALOG if entry.category == category)
 
 
-def test_failure_catalog_names_exactly_the_seven_required_paths() -> None:
+def test_failure_catalog_names_logical_paths_and_journal_subpaths() -> None:
     assert {entry.category for entry in FAILURE_CATALOG} == {
         FAILURE_CATEGORY_PARSE,
         FAILURE_CATEGORY_OCR,
@@ -153,6 +153,20 @@ def test_failure_catalog_names_exactly_the_seven_required_paths() -> None:
         FAILURE_CATEGORY_JOURNAL_CORRUPT,
     }
     assert len(FAILURE_CATALOG) == 10
+
+
+def test_t24_status_explains_journal_catalog_subpaths_and_size() -> None:
+    plan = (_PROJECT_ROOT / "plans" / "corpus-retrieval.md").read_text(
+        encoding="utf-8"
+    )
+    t24 = plan.split("24. **静默失败清零", 1)[1].split(
+        "## End-of-round", 1
+    )[0]
+    status = next(line for line in t24.splitlines() if "Status:" in line)
+
+    assert "七类逻辑路径之外" in status
+    assert "journal persistence/replay" in status
+    assert "10 个 catalog 条目" in status
 
 
 def test_failure_catalog_has_zero_untraced_paths() -> None:
