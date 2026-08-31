@@ -64,6 +64,7 @@ from fin.retrieve.invalidation_port import (
     InvalidationUnknownTargetError,
     validate_targets_not_empty,
 )
+from fin.retrieve.input_validation import InputValidationLedger
 from fin.retrieve.push_port import (
     MAX_PUSH_BATCH_RECORDS,
     PushBatchOverflowError,
@@ -71,6 +72,7 @@ from fin.retrieve.push_port import (
     UnknownPushedBlockError,
     validate_batch_not_empty,
     validate_wire_record,
+    validate_wire_record_text,
 )
 
 # The logical instant every pushed block becomes valid at. Closing an
@@ -94,13 +96,33 @@ class FakePushPort:
     it to exercise the overflow path cheaply.
     """
 
-    def __init__(self, *, max_batch_records: int = MAX_PUSH_BATCH_RECORDS) -> None:
+    def __init__(
+        self,
+        *,
+        max_batch_records: int = MAX_PUSH_BATCH_RECORDS,
+        input_validation_ledger: InputValidationLedger | None = None,
+    ) -> None:
         self._by_key: dict[tuple[str, str], dict[str, Any]] = {}
         self._by_block_id: dict[str, dict[str, Any]] = {}
         self._rejected_batches: int = 0
         self._invalidations: list[dict[str, Any]] = []
         self._refused_invalidations: int = 0
         self.max_batch_records = max_batch_records
+        self._input_validation_ledger = input_validation_ledger
+
+    @property
+    def input_validation_failures(self) -> InputValidationLedger:
+        """The「输入校验失败」count for refusals taken on this side (T21).
+
+        A store built without one still counts: the default is an
+        in-memory ledger created on first access, so an empty batch or an
+        empty document is a number here even when no log is configured.
+        """
+        ledger = self._input_validation_ledger
+        if ledger is None:
+            ledger = InputValidationLedger()
+            self._input_validation_ledger = ledger
+        return ledger
 
     # ----- push -----
 
@@ -112,10 +134,13 @@ class FakePushPort:
         so the store can never hold half of a refused push and never a
         truncated prefix of one (SC44). An empty batch is invalid input
         (§B2 第 5 条) and is refused here as well as client-side, so a
-        future transport cannot pass one off as an empty result.
+        future transport cannot pass one off as an empty result; a record
+        with no text is the same kind of thing (T21) and is counted on
+        :attr:`input_validation_failures`.
         """
+        ledger = self.input_validation_failures
         try:
-            validate_batch_not_empty(records)
+            validate_batch_not_empty(records, ledger=ledger)
             if len(records) > self.max_batch_records:
                 raise PushBatchOverflowError(
                     f"push batch of {len(records)} records exceeds the "
@@ -123,6 +148,7 @@ class FakePushPort:
                 )
             for record in records:
                 validate_wire_record(record)
+                validate_wire_record_text(record, ledger=ledger)
         except PushError:
             self._rejected_batches += 1
             raise

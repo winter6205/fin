@@ -34,6 +34,10 @@ from fin.retrieve.capabilities import (
     load_capability_keys,
     validate_capability_configuration,
 )
+from fin.retrieve.input_validation import (
+    InputValidationLedger,
+    validate_query,
+)
 from fin.retrieve.port import Chunk
 
 
@@ -103,6 +107,7 @@ class CapabilityAwareFakePort:
         self._validate_script()
         self.product_calls: list[RecordedCall] = []
         self.eval_calls: list[RecordedCall] = []
+        self.input_validation_failures = InputValidationLedger()
 
     def _validate_script(self) -> None:
         known = set(self._keys)
@@ -179,8 +184,11 @@ class CapabilityAwareFakePort:
         capabilities: Mapping[str, bool],
         limit: int,
     ) -> dict[str, list[Chunk]]:
-        if not query or not query.strip():
-            return {"chunks": []}
+        # An empty query is invalid input on every port implementation
+        # (T21 / §B2 第 5 条), the eval seam included — an ablation run
+        # must not read a refused call as "this configuration found
+        # nothing".
+        validate_query(query, ledger=self.input_validation_failures)
         enabled = {key for key, on in capabilities.items() if on}
         found = [
             hit.chunk

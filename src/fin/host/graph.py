@@ -133,6 +133,7 @@ from fin.retrieve.degradation import (
     degradation_ledger_from_env,
 )
 from fin.retrieve.hit_mapping import MappingFailureLedger, ledger_from_env
+from fin.retrieve.input_validation import InputValidationError
 from fin.retrieve.tool import retrieve
 from fin.retrieve.port import RetrievePort
 
@@ -407,6 +408,15 @@ def _make_retrieve_tool(
     citation gate's own rules are unchanged — admission decides
     what evidence exists, not how the gate rules on it.
 
+    Invalid input (T21 / SC42 / SC43): the port raises a named
+    ``InputValidationError`` for an empty query or a provably
+    conflicting filter set, and the tool serializes that code as
+    ``{"error": "<code>"}``. It is NOT rewritten to
+    ``{"chunks": []}`` — an empty result would answer a question
+    that was never asked — and it contributes no evidence. A
+    legal empty result (unknown filter, no hits) keeps the
+    ``{"chunks": []}`` shape it always had.
+
     Typed EXIT (spec s1-corpus-retrieve § Boundaries): when the
     port returns ``{"error": "retrieve_unavailable"}`` (product
     MCP transport / process down, ADR 0030) the tool serializes
@@ -460,16 +470,27 @@ def _make_retrieve_tool(
         is unavailable the tool returns
         ``{"error": "retrieve_unavailable"}``.
         """
-        result = retrieve(
-            query=query,
-            document_id=document_id,
-            cik=cik,
-            form=form,
-            ticker=ticker,
-            filing_date=filing_date,
-            limit=limit,
-            adapter=adapter,
-        )
+        try:
+            result = retrieve(
+                query=query,
+                document_id=document_id,
+                cik=cik,
+                form=form,
+                ticker=ticker,
+                filing_date=filing_date,
+                limit=limit,
+                adapter=adapter,
+            )
+        except InputValidationError as exc:
+            # Invalid input (T21 / §B2 第 5 条). The port already named
+            # and counted it; the tool's contract is an envelope, so the
+            # code travels as ``{"error": <code>}`` — the same named-EXIT
+            # shape as an unavailable transport, and deliberately NOT
+            # ``{"chunks": []}``, which would tell the model the corpus
+            # is empty for a call that was never askable. The model can
+            # fix its own arguments and retry; the run does not die on a
+            # blank ``query``.
+            result = {"error": exc.code}
         if isinstance(result, dict) and "error" in result:
             # Typed EXIT: surface the port's error dict verbatim.
             # Building evidence / a chunks envelope here would
@@ -1837,12 +1858,18 @@ def compile_graph(
                 ticker=issuer,
                 adapter=adapter,
             )
+        except InputValidationError as exc:
+            # Invalid input on one branch (T21). The blank-query guard
+            # above means this is a filter-level refusal; it is reported
+            # under the port's own code rather than as a transport
+            # problem, and it does not take the join down.
+            return _issuer_finding(issuer, STATUS_UNAVAILABLE, error=exc.code)
         except Exception as exc:  # noqa: BLE001 — one branch, not the run
-            # A port that raises breaks its own contract ("empty hits,
-            # not exceptions"). Letting it propagate would kill the
-            # join and take the other issuers' work with it, so the
-            # branch degrades to the typed unavailable row — which is
-            # reported in the envelope, never swallowed.
+            # A port that raises anything else breaks its own contract
+            # (a legal empty result is a value, not an exception).
+            # Letting it propagate would kill the join and take the
+            # other issuers' work with it, so the branch degrades to the
+            # typed unavailable row — reported, never swallowed.
             return _issuer_finding(
                 issuer,
                 STATUS_UNAVAILABLE,

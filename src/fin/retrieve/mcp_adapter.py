@@ -53,9 +53,13 @@ extracted tree unless the operator supplies an explicit map.
 Error contract
 --------------
 
-* Empty / whitespace ``query``, unknown ``document_id``, and
-  empty filter values (``cik=""``, etc.) are miss shapes and
-  return ``{"chunks": []}`` without touching MCP.
+* An empty / whitespace ``query`` is **invalid input** (T21 /
+  §B2 第 5 条): it raises ``EmptyQueryError`` and is counted on
+  :attr:`MCPRetrieveAdapter.input_validation_failures`, without
+  touching MCP.
+* Unknown ``document_id`` and empty filter values (``cik=""``,
+  etc.) are legal empty results and return ``{"chunks": []}``
+  without touching MCP.
 * MCP subprocess spawn failure, protocol timeout, malformed
   response, or JSON-RPC error response → typed exception
   ``RetrieveUnavailableError`` internally; ``retrieve()``
@@ -98,6 +102,10 @@ from fin.retrieve.degradation import (
     read_degradation_signal,
 )
 from fin.retrieve.hit_mapping import MappingFailureLedger, map_hits_to_chunks
+from fin.retrieve.input_validation import (
+    InputValidationLedger,
+    validate_query,
+)
 
 
 _DEFAULT_LIMIT = 8
@@ -374,12 +382,16 @@ class MCPRetrieveAdapter:
         owns — counting is never off, only unpersisted. Pass a
         ledger with a ``path`` (or share the host's) to make the
         count outlive the run.
+    input_validation_ledger
+        Where invalid input is counted (T21 / SC42). Same
+        default: an in-memory ledger this adapter owns.
     """
 
-    # Class-level default so the counter exists even for a subclass
+    # Class-level defaults so the counters exist even for a subclass
     # that skips ``__init__`` (the documented ``_call_mcp`` test seam
-    # does exactly that). ``mapping_failures`` fills it lazily.
+    # does exactly that). The properties fill them lazily.
     _mapping_ledger: MappingFailureLedger | None = None
+    _input_validation_ledger: InputValidationLedger | None = None
 
     def __init__(
         self,
@@ -389,6 +401,7 @@ class MCPRetrieveAdapter:
         known_document_ids: set[str] | None = None,
         timeout_seconds: float = 5.0,
         mapping_ledger: MappingFailureLedger | None = None,
+        input_validation_ledger: InputValidationLedger | None = None,
     ) -> None:
         self._command: list[str] | None = (
             list(command) if command is not None else None
@@ -408,8 +421,23 @@ class MCPRetrieveAdapter:
         )
         self._timeout: float = float(timeout_seconds)
         self._mapping_ledger = mapping_ledger
+        self._input_validation_ledger = input_validation_ledger
 
     # ----- public surface -----
+
+    @property
+    def input_validation_failures(self) -> InputValidationLedger:
+        """The「输入校验失败」count for this adapter (T21 / SC42).
+
+        Like :attr:`mapping_failures`, an adapter built without one
+        still counts: the default is an in-memory ledger created on
+        first access.
+        """
+        ledger = self._input_validation_ledger
+        if ledger is None:
+            ledger = InputValidationLedger()
+            self._input_validation_ledger = ledger
+        return ledger
 
     @property
     def mapping_failures(self) -> MappingFailureLedger:
@@ -440,9 +468,12 @@ class MCPRetrieveAdapter:
         """Sync retrieve: returns ``{"chunks": [...]}`` or
         ``{"error": "retrieve_unavailable"}``.
 
-        Empty / whitespace queries and unknown filters
-        short-circuit BEFORE the MCP round-trip. Any MCP
-        transport / protocol failure surfaces as
+        Unknown filters short-circuit to the miss shape BEFORE the
+        MCP round-trip; an empty query raises ``EmptyQueryError``
+        there instead (T21 — invalid input is not a miss, and the
+        typed error travels out of this seam rather than being
+        flattened into an envelope the model reads as "no hits").
+        Any MCP transport / protocol failure surfaces as
         ``{"error": "retrieve_unavailable"}`` (no BM25
         fallback).
         """
@@ -487,9 +518,11 @@ class MCPRetrieveAdapter:
         Tests subclass and override ``_call_mcp`` for scripted
         transport. The default transport launches a subprocess.
         """
-        # Empty / whitespace query: short-circuit (miss shape).
-        if not query or not query.strip():
-            return {"chunks": []}
+        # Empty / whitespace query: invalid input (T21 / §B2 第 5 条),
+        # named and counted before any round trip. The other
+        # short-circuits below stay miss shapes — they are legal empty
+        # results, and the split is the whole point of the ticket.
+        validate_query(query, ledger=self.input_validation_failures)
         # Empty / whitespace document_id filter: miss shape.
         if document_id is not None and not document_id.strip():
             return {"chunks": []}

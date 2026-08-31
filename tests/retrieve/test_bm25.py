@@ -31,7 +31,14 @@ import pytest
 from fin.corpus.errors import IngestMissingError
 from fin.corpus.extracted import Locator, load_extracted_tree
 from fin.corpus.ingest import run_ingest
-from fin.retrieve import BM25Adapter, Chunk, RetrievePort, retrieve
+from fin.retrieve import (
+    BM25Adapter,
+    Chunk,
+    ConflictingFiltersError,
+    EmptyQueryError,
+    RetrievePort,
+    retrieve,
+)
 
 
 # ---------- helpers ----------
@@ -90,12 +97,16 @@ def real_ingested_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
 def test_retrieve_with_empty_query_returns_empty_chunks(
     real_ingested_tree: Path,
 ) -> None:
-    """Empty / whitespace-only query must return ``{"chunks": []}``
-    without indexing lookup.
+    """Empty / whitespace-only query is invalid input: a named
+    ``EmptyQueryError``, counted, with no index lookup.
 
     Boundary "empty": the model may pass ``""`` or whitespace during
-    abuse or while reasoning aloud. The adapter must short-circuit on
-    ``query.strip() == ""`` and return the empty contract — NOT raise.
+    abuse or while reasoning aloud. Until T21 the adapter answered
+    ``{"chunks": []}``; §B2 第 5 条 / SC42 make that the conflation to
+    avoid — an empty result would report on the corpus, when the truth
+    is that nothing was asked. The host tool turns the typed error into
+    ``{"error": "empty_query"}`` so a blank query still cannot kill a
+    run (``tests/host/test_input_validation_exit.py``).
     """
     manifest_path, _, _ = _real_manifest()
     tree = load_extracted_tree(
@@ -105,11 +116,12 @@ def test_retrieve_with_empty_query_returns_empty_chunks(
     adapter = BM25Adapter(tree)
 
     for empty_query in ("", "   ", "\t\n", "\n"):
-        result = adapter.retrieve(empty_query)
-        assert result == {"chunks": []}, (
-            f"empty query {empty_query!r} must yield empty contract; "
-            f"got {result!r}"
-        )
+        with pytest.raises(EmptyQueryError):
+            adapter.retrieve(empty_query)
+
+    assert adapter.input_validation_failures.count_by_code() == {
+        "empty_query": 4
+    }
 
 
 def test_retrieve_on_empty_corpus_returns_empty_chunks(tmp_path: Path) -> None:
@@ -937,14 +949,17 @@ def test_bm25_unknown_form_returns_empty_chunks(
     assert result == {"chunks": []}
 
 
-def test_bm25_conflicting_ticker_and_cik_returns_empty_chunks(
+def test_bm25_conflicting_ticker_and_cik_is_a_named_failure(
     small_tree_with_manifest_docs: tuple[Path, Path],
 ) -> None:
-    """Conflicting ``ticker`` + ``cik`` returns ``{"chunks": []}``.
+    """Conflicting ``ticker`` + ``cik`` is invalid input (T21 / SC43).
 
     AAPL's ticker (``AAPL``) paired with MSFT's CIK
-    (``0000789019``) — no doc satisfies both. AND-combined
-    filters drop all rows; the empty chunks path is the contract.
+    (``0000789019``) — the manifest binds ``AAPL`` to AAPL's CIK, so
+    the pair is provably unsatisfiable: mutually exclusive conditions
+    specified together, not a filter that merely matched nothing.
+    Until T21 this answered ``{"chunks": []}``, which is the shape an
+    *unknown* value keeps (see the tests above).
     """
     manifest_path, extracted_root = small_tree_with_manifest_docs
     tree = load_extracted_tree(
@@ -952,10 +967,12 @@ def test_bm25_conflicting_ticker_and_cik_returns_empty_chunks(
     )
     adapter = BM25Adapter(tree, manifest_docs=_build_manifest_docs(manifest_path))
 
-    result = adapter.retrieve(
-        "revenue", ticker="AAPL", cik="0000789019", limit=20
-    )
-    assert result == {"chunks": []}
+    with pytest.raises(ConflictingFiltersError):
+        adapter.retrieve("revenue", ticker="AAPL", cik="0000789019", limit=20)
+
+    assert adapter.input_validation_failures.count_by_code() == {
+        "conflicting_filters": 1
+    }
 
 
 def test_bm25_matching_cik_returns_hits_from_matching_doc_only(

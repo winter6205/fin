@@ -42,6 +42,13 @@ An empty block batch is a third thing: **invalid input** per §B2 第 5
 条, refused with :class:`PushEmptyBatchError` rather than answered with
 a zero-write success, and — unlike the two capability failures above —
 it does not set ``degraded`` (see :class:`PushError`).
+
+T21 folds that third thing into the shared dichotomy: the two
+invalid-input failures on this seam (:class:`PushEmptyBatchError` and
+:class:`PushEmptyDocumentError`, a record offered with no text) also
+inherit :class:`~fin.retrieve.input_validation.InputValidationError`, so
+one classification and one「输入校验失败」count cover the push side and
+the retrieve side alike.
 """
 
 from __future__ import annotations
@@ -50,6 +57,13 @@ from dataclasses import dataclass
 from typing import Any, Final, Mapping, Protocol, Sequence, runtime_checkable
 
 from fin.corpus.push import REQUIRED_PUSH_METADATA_FIELDS, PushRecord
+from fin.retrieve.input_validation import (
+    INPUT_CLASS_EMPTY_BATCH,
+    INPUT_CLASS_EMPTY_DOCUMENT,
+    InputValidationError,
+    InputValidationLedger,
+    raise_input_failure,
+)
 
 # §B1「幂等基准」: same batch pushed 3 times in a row → block total
 # increment = 0, block id set unchanged.
@@ -186,7 +200,7 @@ class PushProtocolError(PushError):
     degraded_reasons = (DEGRADED_REASON_PUSH_ATTEMPT_FAILED,)
 
 
-class PushEmptyBatchError(PushError):
+class PushEmptyBatchError(PushError, InputValidationError):
     """A push carried no records at all (§B2 第 5 条).
 
     An empty block batch is **invalid input**, not a legitimate empty
@@ -196,6 +210,20 @@ class PushEmptyBatchError(PushError):
     """
 
     code = "push_empty_batch"
+    input_class = INPUT_CLASS_EMPTY_BATCH
+
+
+class PushEmptyDocumentError(PushError, InputValidationError):
+    """A pushed record carries no text (§B2 第 5 条's 空文档 / 空内容).
+
+    A block with nothing in it cannot be recalled verbatim and cannot be
+    a citation's evidence, so storing it would create a row that looks
+    like content. Refused by name, with the batch unwritten — the same
+    class the parse path names as ``empty_source`` / ``no_units``.
+    """
+
+    code = "push_empty_document"
+    input_class = INPUT_CLASS_EMPTY_DOCUMENT
 
 
 @dataclass(frozen=True)
@@ -257,19 +285,52 @@ def validate_wire_record(wire: Mapping[str, Any]) -> None:
         )
 
 
-def validate_batch_not_empty(records: Sequence[object]) -> None:
+def validate_batch_not_empty(
+    records: Sequence[object],
+    *,
+    ledger: InputValidationLedger | None = None,
+) -> None:
     """Raise :class:`PushEmptyBatchError` for a batch with no records.
 
     Single authority for §B2 第 5 条's empty-batch rule, applied on both
     sides of the seam: the caller is refused before a pointless round
     trip, and the receiving side refuses independently so a future
     transport cannot smuggle an empty batch past a client-only check.
+
+    ``ledger`` is the「输入校验失败」count (T21). Whichever side refuses
+    the batch is the side that counts it, so the number is taken exactly
+    once per refusal rather than once per validation call.
     """
     if len(records) == 0:
-        raise PushEmptyBatchError(
+        failure = PushEmptyBatchError(
             "push batch is empty; an empty block batch is invalid input, "
             "not an empty result"
         )
+        if ledger is None:
+            raise failure
+        raise_input_failure(failure, ledger=ledger)
+
+
+def validate_wire_record_text(
+    wire: Mapping[str, Any],
+    *,
+    ledger: InputValidationLedger | None = None,
+) -> None:
+    """Raise :class:`PushEmptyDocumentError` for a record with no text.
+
+    Whitespace-only counts as none: the retrieval service stores the text
+    verbatim and the citation gate quotes it, so a blank block is not a
+    thinner block, it is an absent one.
+    """
+    text = wire.get("text")
+    if not isinstance(text, str) or not text.strip():
+        failure = PushEmptyDocumentError(
+            f"push of block {wire.get('block_id')!r} carries no text; an "
+            "empty document is invalid input, not an empty result"
+        )
+        if ledger is None:
+            raise failure
+        raise_input_failure(failure, ledger=ledger)
 
 
 def outcome_of_response(
@@ -340,7 +401,10 @@ def outcome_of_response(
 
 
 def push_records(
-    port: PushPort, records: Sequence[PushRecord]
+    port: PushPort,
+    records: Sequence[PushRecord],
+    *,
+    input_validation_ledger: InputValidationLedger | None = None,
 ) -> PushOutcome:
     """Push ``records`` through ``port`` idempotently.
 
@@ -359,8 +423,12 @@ def push_records(
     :class:`PushProtocolError`. Neither is retried
     (:data:`PUSH_ATTEMPTS_PER_BATCH`) and neither returns an outcome, so
     a failed batch is never recorded as a write.
+
+    ``input_validation_ledger`` is where a client-side refusal of an
+    empty batch is counted (T21). The record-level checks stay on the
+    receiving side, which carries its own ledger.
     """
-    validate_batch_not_empty(records)
+    validate_batch_not_empty(records, ledger=input_validation_ledger)
     try:
         response = port.push([record.to_wire() for record in records])
     except PushError:
@@ -383,6 +451,7 @@ __all__ = [
     "PushBatchOverflowError",
     "PushBatchSizeInvalidError",
     "PushEmptyBatchError",
+    "PushEmptyDocumentError",
     "PushError",
     "PushMetadataIncompleteError",
     "PushOutcome",
@@ -395,4 +464,5 @@ __all__ = [
     "push_records",
     "validate_batch_not_empty",
     "validate_wire_record",
+    "validate_wire_record_text",
 ]
