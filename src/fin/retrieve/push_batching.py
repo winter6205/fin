@@ -65,6 +65,7 @@ from pathlib import Path
 from typing import Final, Sequence
 
 from fin.corpus.push import PushRecord, idempotency_keys_digest
+from fin.retrieve.input_validation import InputValidationLedger
 from fin.retrieve.push_port import (
     MAX_PUSH_BATCH_RECORDS,
     PushBatchFailedError,
@@ -303,6 +304,7 @@ def push_in_batches(
     *,
     journal: PushJournal,
     batch_size: int = MAX_PUSH_BATCH_RECORDS,
+    input_validation_ledger: InputValidationLedger | None = None,
 ) -> BatchedPushOutcome:
     """Push ``records`` batch by batch, resuming from ``journal``.
 
@@ -316,8 +318,9 @@ def push_in_batches(
     be exactly the empty success the contract forbids.
     :func:`plan_batches` stays a pure splitter and answers ``()`` for an
     empty sequence; the judgement lives on the push entry point.
+    ``input_validation_ledger`` is where that refusal is counted (T21).
     """
-    validate_batch_not_empty(records)
+    validate_batch_not_empty(records, ledger=input_validation_ledger)
     plans = plan_batches(records, batch_size=batch_size)
     pushed = skipped = written = duplicates = 0
     block_ids: list[str] = []

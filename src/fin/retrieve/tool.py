@@ -42,16 +42,16 @@ def retrieve(
     Parameters
     ----------
     query
-        Lexical query. Empty / whitespace-only queries yield
-        ``{"chunks": []}`` without touching the index.
+        Lexical query. Empty / whitespace-only queries raise the
+        port's ``EmptyQueryError`` (T21: invalid input, not a miss).
     document_id
         Optional corpus filter. Unknown document_id yields
         ``{"chunks": []}``.
     cik / form / ticker / filing_date
         Additive EDGAR-shaped optional filters (ADR 0031), forwarded
-        to the adapter. Empty filter values, unknown values, and
-        conflicting filters all yield ``{"chunks": []}`` — NOT an
-        exception.
+        to the adapter. Empty and unknown values yield
+        ``{"chunks": []}``; a provably conflicting set raises the
+        port's ``ConflictingFiltersError``.
     limit
         Default 8, hard cap 20 (ADR 0009). The adapter resolves the
         cap internally; we just pass through.

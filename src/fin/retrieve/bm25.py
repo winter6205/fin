@@ -45,11 +45,16 @@ The additive EDGAR-shaped filters (``cik`` / ``form`` / ``ticker``
 / ``filing_date``) per ADR 0031 are evaluated against a manifest
 metadata table passed in at construction time via ``manifest_docs``
 (a ``{document_id: {cik, form, ticker, filing_date, ...}}`` map).
-Empty filter values, unknown values, and conflicting filters all
-return ``{"chunks": []}`` — NOT an exception. When ``manifest_docs``
-is ``None`` (default), the metadata filters are no-ops and only
-``document_id`` is consulted; this preserves the v1 construction
-shape for callers that have not wired the catalog in.
+Empty filter values and unknown values return ``{"chunks": []}`` —
+a legal empty result, NOT an exception. **Conflicting** filters are
+the other side of that split (T21 / SC43): a set no document could
+satisfy is invalid input and raises ``ConflictingFiltersError``,
+because an empty list there would read as "the corpus has nothing"
+for a question that was never askable. When ``manifest_docs`` is
+``None`` (default), the metadata filters are no-ops and only
+``document_id`` is consulted; with no bindings there is also no
+conflict to prove, so nothing raises. This preserves the v1
+construction shape for callers that have not wired the catalog in.
 
 Limit cap
 ---------
@@ -66,6 +71,11 @@ from dataclasses import dataclass
 from rank_bm25 import BM25Okapi  # type: ignore[import-untyped]
 
 from fin.corpus.extracted import ExtractedPage, Locator
+from fin.retrieve.input_validation import (
+    InputValidationLedger,
+    validate_filters,
+    validate_query,
+)
 from fin.retrieve.port import Chunk
 
 
@@ -120,6 +130,7 @@ class BM25Adapter:
         extracted_tree: dict[str, tuple[ExtractedPage, ...]],
         *,
         manifest_docs: dict[str, dict[str, object]] | None = None,
+        input_validation_ledger: InputValidationLedger | None = None,
     ) -> None:
         # Flatten the tree into a parallel list of indexed chunks and a
         # parallel list of tokenized passage texts. The two lists must
@@ -163,7 +174,18 @@ class BM25Adapter:
             BM25Okapi(tokenized_corpus) if self._corpus_size > 0 else None
         )
 
+        self._input_validation_ledger = input_validation_ledger
+
     # ----- helpers -----
+
+    @property
+    def input_validation_failures(self) -> InputValidationLedger:
+        """The「输入校验失败」count for this adapter (T21 / SC42)."""
+        ledger = self._input_validation_ledger
+        if ledger is None:
+            ledger = InputValidationLedger()
+            self._input_validation_ledger = ledger
+        return ledger
 
     @staticmethod
     def _resolve_limit(limit: int) -> int:
@@ -235,19 +257,20 @@ class BM25Adapter:
         Parameters
         ----------
         query
-            Lexical query. Empty / whitespace-only queries return
-            ``{"chunks": []}`` without touching the index.
+            Lexical query. Empty / whitespace-only queries raise
+            ``EmptyQueryError`` without touching the index.
         document_id
             Optional corpus filter. Unknown document_id returns
             ``{"chunks": []}`` without raising.
         cik / form / ticker / filing_date
             Additive EDGAR-shaped optional filters (ADR 0031).
-            Empty filter values, unknown values, and conflicting
-            filters all return ``{"chunks": []}`` — NOT an exception.
-            The adapter consults the manifest metadata passed in at
-            construction time (``manifest_docs``) to evaluate these
-            filters; when ``manifest_docs`` is ``None`` the filters
-            are no-ops.
+            Empty and unknown filter values return ``{"chunks": []}``
+            — a legal empty result. A **conflicting** set raises
+            ``ConflictingFiltersError`` (T21 / SC43). The adapter
+            consults the manifest metadata passed in at construction
+            time (``manifest_docs``) to evaluate these filters and to
+            prove a conflict; when ``manifest_docs`` is ``None`` the
+            filters are no-ops and no conflict is provable.
         limit
             Default 8, hard cap 20 (see ``_resolve_limit``).
 
@@ -256,11 +279,20 @@ class BM25Adapter:
         dict
             ``{"chunks": [Chunk, ...]}`` in descending score order.
         """
-        # Empty / whitespace-only query: short-circuit before tokenization
-        # or BM25 lookup. The model can pass ``""`` or whitespace during
-        # abuse; we must NOT treat that as an error.
-        if not query or not query.strip():
-            return {"chunks": []}
+        # Invalid input first (T21 / §B2 第 5 条): an empty query and a
+        # provably unsatisfiable filter set are named failures, counted
+        # on the adapter's ledger, and never the miss shape.
+        ledger = self.input_validation_failures
+        validate_query(query, ledger=ledger)
+        validate_filters(
+            document_id=document_id,
+            cik=cik,
+            form=form,
+            ticker=ticker,
+            filing_date=filing_date,
+            manifest_docs=self._manifest_docs,
+            ledger=ledger,
+        )
 
         # Empty filter values behave as empty hits (ADR 0031 /
         # spec "empty hits not exceptions"). Catch them early —

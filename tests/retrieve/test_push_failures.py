@@ -36,6 +36,7 @@ from fin.retrieve.push_port import (
     PushBatchOverflowError,
     PushBatchSizeInvalidError,
     PushEmptyBatchError,
+    PushEmptyDocumentError,
     PushError,
     PushMetadataIncompleteError,
     PushProtocolError,
@@ -400,6 +401,7 @@ def test_empty_batch_failure_does_not_set_degraded() -> None:
     ("error_class", "degraded"),
     [
         (PushEmptyBatchError, False),
+        (PushEmptyDocumentError, False),
         (PushMetadataIncompleteError, False),
         (PushBatchOverflowError, False),
         (PushBatchSizeInvalidError, False),
