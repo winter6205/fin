@@ -32,26 +32,36 @@ The adapter completes the MCP session handshake
 connection before it sends ``tools/call``. It DOES NOT inline OCR /
 XBRL / parse / locator
 mapping into the ranking call (complexity-anti-drift). The
-locator map (``iknow-id`` → ``fin.Locator``) is configured at
-construction and applied as a separate post-rank step. Hits
-whose ``source_ref`` is not in the map are **dropped** — the
-adapter never passes an iknow-memory id to the citation gate
-(ADR 0030 + spec success-criteria item 7).
+The returned ``source_ref`` is the canonical fin locator serialization
+defined by ``fin.corpus.push`` and is parsed as a separate post-rank
+step. A retrieval service's internal id, if present for a transitional
+integration, uses ``retrieval_id`` and is resolved through the
+explicitly supplied locator map; it is never carried in ``source_ref``
+or passed to the citation gate.
 
-Because mapper-drop is silent by design, an adapter built with
-an empty map answers every query with ``{"chunks": []}`` and
-looks perfectly healthy. Wiring the map is therefore the
-caller's job, and ``fin.host.compile_graph`` refuses to build a
-product adapter without one: it derives
-``"{document_id}#{page}"`` keys from the extracted tree unless
-the operator supplies an explicit map.
+Mapper-drop is not silent: every dropped hit is counted on the
+adapter's :attr:`MCPRetrieveAdapter.mapping_failures` ledger with a
+stable reason code (T17 / SC22 — see
+:mod:`fin.retrieve.hit_mapping`), and the ledger persists the count
+when the operator configures a path. The chunks answer is still
+``{"chunks": []}``, so an adapter built with an empty map looks like
+a miss on the wire; the counter is what tells the operator it is not
+one. Wiring the map remains the caller's job, and
+``fin.host.compile_graph`` refuses to build a product adapter
+without one: it derives canonical ``source_ref`` keys with
+``fin.corpus.push.serialize_source_ref`` from the extracted tree
+unless the operator supplies an explicit compatibility map.
 
 Error contract
 --------------
 
-* Empty / whitespace ``query``, unknown ``document_id``, and
-  empty filter values (``cik=""``, etc.) are miss shapes and
-  return ``{"chunks": []}`` without touching MCP.
+* An empty / whitespace ``query`` is **invalid input** (T21 /
+  §B2 第 5 条): it raises ``EmptyQueryError`` and is counted on
+  :attr:`MCPRetrieveAdapter.input_validation_failures`, without
+  touching MCP.
+* Unknown ``document_id`` and empty filter values (``cik=""``,
+  etc.) are legal empty results and return ``{"chunks": []}``
+  without touching MCP.
 * MCP subprocess spawn failure, protocol timeout, malformed
   response, or JSON-RPC error response → typed exception
   ``RetrieveUnavailableError`` internally; ``retrieve()``
@@ -84,10 +94,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any
 
 from fin.corpus.extracted import Locator
-from fin.retrieve.port import Chunk
+from fin.retrieve.degradation import (
+    NOT_DEGRADED,
+    DegradationError,
+    DegradationSignal,
+    read_degradation_signal,
+)
+from fin.retrieve.hit_mapping import MappingFailureLedger, map_hits_to_chunks
+from fin.retrieve.input_validation import (
+    InputValidationLedger,
+    validate_query,
+)
 
 
 _DEFAULT_LIMIT = 8
@@ -95,6 +116,8 @@ _LIMIT_CAP = 20
 _MCP_PROTOCOL_VERSION = "2025-06-18"
 _INITIALIZE_REQUEST_ID = 1
 _TOOL_REQUEST_ID = 2
+
+logger = logging.getLogger(__name__)
 
 
 # ----- typed exception -----
@@ -113,7 +136,43 @@ class RetrieveUnavailableError(Exception):
 
     The adapter does NOT swallow MCP failures as empty chunks
     and does NOT fall back to BM25.
+
+    :attr:`code` is the token ``retrieve`` puts on the product
+    error dict, and :attr:`signal` carries the response's §B3
+    degradation state so a failed *and* degraded request reaches
+    the host with its reasons attached (T20).
     """
+
+    code: str = "retrieve_unavailable"
+    signal: DegradationSignal = NOT_DEGRADED
+
+    def error_dict(self) -> dict[str, Any]:
+        """The product EXIT shape for this failure.
+
+        Undegraded failures keep the historical single-key dict; a
+        degraded one adds the two verbatim §B3 fields, because a
+        named failure that drops the reasons is exactly the
+        「静默」 SC39 counts.
+        """
+        return {"error": self.code, **self.signal.as_envelope_fields()}
+
+
+class RetrieveDegradedFailureError(RetrieveUnavailableError):
+    """The service answered degraded AND did not answer with results.
+
+    §B2 第 2 条: when the request itself failed, the degradation is a
+    named failure — never ``{"chunks": []}``, which would tell the
+    caller the corpus has nothing while the arms were down. Kept in
+    the :class:`RetrieveUnavailableError` family so callers that
+    already branch on "retrieve did not answer" need no change, with
+    a distinct :attr:`code` for callers that must tell the two apart.
+    """
+
+    code = "retrieve_degraded_failure"
+
+    def __init__(self, message: str, *, signal: DegradationSignal) -> None:
+        super().__init__(message)
+        self.signal = signal
 
 
 # ----- limit resolution -----
@@ -196,7 +255,10 @@ async def _exchange_mcp_messages(
         try:
             await proc.wait()
         except Exception:
-            pass
+            logger.debug(
+                "MCP process cleanup failed after timeout",
+                exc_info=True,
+            )
         raise
     if proc.returncode != 0:
         raise OSError(
@@ -256,6 +318,45 @@ def _validate_tool_response(
     return response
 
 
+def _degradation_of_response(
+    response: Any,
+    *,
+    business_result: Any | None = None,
+) -> DegradationSignal:
+    """Read the §B3 signal from the relevant response envelope.
+
+    Servers put it on the tool result; a JSON-RPC error envelope has no
+    result to put it on, so the top level is read too. Once the canonical
+    content block has been decoded, ``business_result`` is the actual
+    business envelope and is read last. All layers are read strictly —
+    an unreadable signal raises rather than passing as 未降级.
+    """
+    top_level = read_degradation_signal(response)
+    if top_level.degraded:
+        return top_level
+    if isinstance(response, dict):
+        result_signal = read_degradation_signal(response.get("result"))
+        if result_signal.degraded:
+            return result_signal
+    if business_result is not None:
+        return read_degradation_signal(business_result)
+    return NOT_DEGRADED
+
+
+def _unavailable(
+    message: str, signal: DegradationSignal
+) -> RetrieveUnavailableError:
+    """The typed EXIT for a request that produced no usable result.
+
+    Degraded responses take the named degraded failure so the caller can
+    tell「能力降级且这次没答上」from a plain transport outage — and so the
+    reasons survive to the user-facing notice (SC39).
+    """
+    if signal.degraded:
+        return RetrieveDegradedFailureError(message, signal=signal)
+    return RetrieveUnavailableError(message)
+
+
 def _validate_mcp_responses(
     responses: list[Any],
     payload: dict[str, Any],
@@ -285,15 +386,32 @@ class MCPRetrieveAdapter:
         sees a typed ``retrieve_unavailable`` rather than a
         silent fall-through.
     locator_map
-        Map from iknow-memory ``source_ref`` id to a fin
-        ``Locator``. Hits whose id is not in the map are dropped
-        (never passed through to the citation gate). An empty
-        map drops everything; ``compile_graph`` treats that as a
-        configuration error rather than a retrieve result.
+        Explicit transitional map from ``retrieval_id`` to a fin
+        ``Locator``. Canonical ``source_ref`` values do not need this
+        map. Non-canonical hits using an old ``source_ref`` key remain
+        supported only through this explicit compatibility seam. An
+        empty map therefore drops only non-canonical hits;
+        ``compile_graph`` still requires a non-empty map for compatibility
+        with integrations that use retrieval ids.
     timeout_seconds
         Per-call timeout on the JSON-RPC exchange. Default 5s
         (operator override via constructor).
+    mapping_ledger
+        Where mapper-drops are counted (T17 / SC22). ``None``
+        (the default) means an in-memory ledger this adapter
+        owns — counting is never off, only unpersisted. Pass a
+        ledger with a ``path`` (or share the host's) to make the
+        count outlive the run.
+    input_validation_ledger
+        Where invalid input is counted (T21 / SC42). Same
+        default: an in-memory ledger this adapter owns.
     """
+
+    # Class-level defaults so the counters exist even for a subclass
+    # that skips ``__init__`` (the documented ``_call_mcp`` test seam
+    # does exactly that). The properties fill them lazily.
+    _mapping_ledger: MappingFailureLedger | None = None
+    _input_validation_ledger: InputValidationLedger | None = None
 
     def __init__(
         self,
@@ -302,6 +420,8 @@ class MCPRetrieveAdapter:
         locator_map: dict[str, Locator] | None = None,
         known_document_ids: set[str] | None = None,
         timeout_seconds: float = 5.0,
+        mapping_ledger: MappingFailureLedger | None = None,
+        input_validation_ledger: InputValidationLedger | None = None,
     ) -> None:
         self._command: list[str] | None = (
             list(command) if command is not None else None
@@ -320,8 +440,39 @@ class MCPRetrieveAdapter:
             else None
         )
         self._timeout: float = float(timeout_seconds)
+        self._mapping_ledger = mapping_ledger
+        self._input_validation_ledger = input_validation_ledger
 
     # ----- public surface -----
+
+    @property
+    def input_validation_failures(self) -> InputValidationLedger:
+        """The「输入校验失败」count for this adapter (T21 / SC42).
+
+        Like :attr:`mapping_failures`, an adapter built without one
+        still counts: the default is an in-memory ledger created on
+        first access.
+        """
+        ledger = self._input_validation_ledger
+        if ledger is None:
+            ledger = InputValidationLedger()
+            self._input_validation_ledger = ledger
+        return ledger
+
+    @property
+    def mapping_failures(self) -> MappingFailureLedger:
+        """The ledger counting this adapter's mapper-drops (SC22).
+
+        An adapter built without one still counts: the default is an
+        in-memory ledger, created on first access, so a map-less
+        adapter's silence is diagnosable from its own surface rather
+        than only from the absence of chunks.
+        """
+        ledger = self._mapping_ledger
+        if ledger is None:
+            ledger = MappingFailureLedger()
+            self._mapping_ledger = ledger
+        return ledger
 
     def retrieve(
         self,
@@ -337,9 +488,12 @@ class MCPRetrieveAdapter:
         """Sync retrieve: returns ``{"chunks": [...]}`` or
         ``{"error": "retrieve_unavailable"}``.
 
-        Empty / whitespace queries and unknown filters
-        short-circuit BEFORE the MCP round-trip. Any MCP
-        transport / protocol failure surfaces as
+        Unknown filters short-circuit to the miss shape BEFORE the
+        MCP round-trip; an empty query raises ``EmptyQueryError``
+        there instead (T21 — invalid input is not a miss, and the
+        typed error travels out of this seam rather than being
+        flattened into an envelope the model reads as "no hits").
+        Any MCP transport / protocol failure surfaces as
         ``{"error": "retrieve_unavailable"}`` (no BM25
         fallback).
         """
@@ -355,9 +509,16 @@ class MCPRetrieveAdapter:
                     limit=limit,
                 )
             )
-        except RetrieveUnavailableError:
-            # Typed EXIT — the product shape is the error dict.
-            return {"error": "retrieve_unavailable"}
+        except RetrieveUnavailableError as exc:
+            # Typed EXIT — the product shape is the error dict. A
+            # degraded failure carries its §B3 reasons along (T20).
+            return exc.error_dict()
+        except DegradationError as exc:
+            # The service answered with an unreadable / renamed
+            # degradation signal (§B3). Named EXIT rather than a
+            # coerced result: neither「未降级」nor an empty hit list
+            # would be a true reading of that response.
+            return {"error": exc.code}
 
     async def aretrieve(
         self,
@@ -377,9 +538,11 @@ class MCPRetrieveAdapter:
         Tests subclass and override ``_call_mcp`` for scripted
         transport. The default transport launches a subprocess.
         """
-        # Empty / whitespace query: short-circuit (miss shape).
-        if not query or not query.strip():
-            return {"chunks": []}
+        # Empty / whitespace query: invalid input (T21 / §B2 第 5 条),
+        # named and counted before any round trip. The other
+        # short-circuits below stay miss shapes — they are legal empty
+        # results, and the split is the whole point of the ticket.
+        validate_query(query, ledger=self.input_validation_failures)
         # Empty / whitespace document_id filter: miss shape.
         if document_id is not None and not document_id.strip():
             return {"chunks": []}
@@ -448,10 +611,17 @@ class MCPRetrieveAdapter:
                 f"MCP transport failed: {exc!r}"
             ) from exc
 
+        # §B3 signal, read once for this response: the envelope may
+        # carry it beside the JSON-RPC error or inside ``result``.
+        # Read BEFORE the failure branches so a degraded failure keeps
+        # its reasons instead of collapsing into a bare unavailable.
+        envelope_signal = _degradation_of_response(response)
+
         # JSON-RPC error response: surface as unavailable.
         if isinstance(response, dict) and "error" in response:
-            raise RetrieveUnavailableError(
-                f"MCP returned JSON-RPC error: {response['error']!r}"
+            raise _unavailable(
+                f"MCP returned JSON-RPC error: {response['error']!r}",
+                envelope_signal,
             )
 
         # Result shape: accept three envelope variants for
@@ -477,8 +647,9 @@ class MCPRetrieveAdapter:
             if isinstance(response.get("hits"), list):
                 result = response
             else:
-                raise RetrieveUnavailableError(
-                    f"MCP returned non-dict result: {result!r}"
+                raise _unavailable(
+                    f"MCP returned non-dict result: {result!r}",
+                    envelope_signal,
                 )
         # Variant 3: content-block envelope.
         if "hits" not in result and "content" in result:
@@ -494,42 +665,32 @@ class MCPRetrieveAdapter:
                         raise RetrieveUnavailableError(
                             f"MCP content text is not JSON: {exc}"
                         ) from exc
-                    if isinstance(inner, dict) and "hits" in inner:
+                    if isinstance(inner, dict):
                         result = inner
+        signal = _degradation_of_response(
+            response,
+            business_result=result,
+        )
         hits = result.get("hits")
         if not isinstance(hits, list):
-            raise RetrieveUnavailableError(
-                f"MCP returned non-list hits: {hits!r}"
+            raise _unavailable(
+                f"MCP returned non-list hits: {hits!r}", signal
             )
 
-        # Map iknow ids → fin locators; drop unmapped. The cap
-        # is enforced AFTER mapping so the returned list is
-        # the locatable subset, not a slice of unmapped ids.
-        chunks: list[Chunk] = []
-        for hit in hits:
-            if len(chunks) >= effective_limit:
-                break
-            if not isinstance(hit, dict):
-                continue
-            text = hit.get("text", "")
-            if not isinstance(text, str):
-                continue
-            source_ref = hit.get("source_ref")
-            if not isinstance(source_ref, str):
-                continue
-            locator = self._locator_map.get(source_ref)
-            if locator is None:
-                # Mapper-drop: omit this hit; do NOT pass
-                # through an iknow id to the citation gate.
-                continue
-            try:
-                score = float(hit.get("score", 0.0))
-            except (TypeError, ValueError):
-                score = 0.0
-            chunks.append(
-                Chunk(text=text, source_ref=locator, score=score)
-            )
-        return {"chunks": chunks}
+        # Map iknow ids → fin locators; drop unmapped, and count
+        # every drop on the ledger (T17 / SC22: the drop must not be
+        # silent). The cap is enforced AFTER mapping so the returned
+        # list is the locatable subset, not a slice of unmapped ids.
+        chunks = map_hits_to_chunks(
+            hits,
+            locator_map=self._locator_map,
+            limit=effective_limit,
+            ledger=self.mapping_failures,
+        )
+        # A degraded response with results is 放行 (§B2 第 1 条) — but it
+        # travels with its flag, so the host can record the reasons and
+        # tell the user this answer is not a complete one.
+        return {"chunks": list(chunks), **signal.as_envelope_fields()}
 
     # ----- transport (test seam) -----
 
@@ -573,4 +734,8 @@ class MCPRetrieveAdapter:
         return _validate_mcp_responses(responses, payload)
 
 
-__all__ = ["MCPRetrieveAdapter", "RetrieveUnavailableError"]
+__all__ = [
+    "MCPRetrieveAdapter",
+    "RetrieveDegradedFailureError",
+    "RetrieveUnavailableError",
+]

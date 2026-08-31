@@ -1,0 +1,279 @@
+# Plan: corpus-retrieval（fin 侧 tracer bullets）
+
+**Goal:** fin 成为语料的唯一解析与切分权威：多格式文档产出冻结单元文本、按确定性查表切成父子块、以幂等方式推送给检索服务 **iknow-memory**，且推送出去的每段文本都能被引用门在同一冻结单元上逐字符命中。
+
+**Approach:** 先收口阶段 0 的共享基线（数字口径定稿、缺失 ADR 补齐、切分改判同步），因为它是全部后续线的入口。随后三条线并行：解析与切分（T5–T9、T11–T13）、评测数据集（T10）、以及住在 **iknow-memory** 仓库的检索栈。数据集先于"全量断言"落地，因为子串关系与确定性两条硬约束要在**评测数据集全量样本**上断言，而不是在脚本化样本上。推送对接（T14 起）串在解析切分与检索栈都可用之后；评测收口（T22–T24）最后。**引用门、意图识别、编排、短期记忆的规则本轮一字不改**，本计划只保证不被破坏。
+
+**Spec link:** `specs/corpus-retrieval.md`
+**Master plan:** [`plans/retrieval-upgrade.md`](retrieval-upgrade.md)（阶段划分、并行边界、跨仓基线指针都在那里；本文件不复制基线内容，所有数字口径一律回源「跨仓对齐基线」章节）
+**Per-ticket loop (all bullets):** test-driven-development → typecheck+tests（`uv run pytest -q`；opt-in 标记另跑 `uv run pytest -q -m eval`）→ verification-before-completion → one commit on the ticket branch
+**Tracker:** 本轮 tracker 就是本文件（操作者指定，文件内 tracker）。不补建 GitHub issue；阻塞关系即各 bullet 的 `[blocks:]` 标记，状态即各 bullet 的 `Status` 复选框。
+
+## ACR
+
+（5 行裁决块见 master plan `plans/retrieval-upgrade.md`，本文件不复制第二份——同一次判定，同一处权威。摘要：bounded-context-guardian / defensive-contract-validator / error-handling-enforcer / complexity-anti-drift / minimal-change-verifier 全部 yes，OVERALL: PASS，前置门禁为 SC41 两份 spec 基线章节逐字一致。）
+
+## Harvest（已决 vs 开放）
+
+**已决（各弹 Inherits 引用原文）：**
+
+- 切分归 fin、检索服务不二次切分（ADR 0037）；排序 / 融合 / 重排仍留在 **retrieve port** 之外。
+- 检索栈定档 B：图数据库主路径 + Postgres 向量扩展原地加索引 + 精度层（Elasticsearch）+ RRF + 重排开启；权威源与派生索引分离、派生索引可重灌（ADR 0038）。
+- 检索能力默认全启用，能力开关只作评测维度存在（ADR 0039）；8 个能力项键名逐字固定，命名权归检索服务。
+- 引用门兼容硬约束：块文本必须是冻结单元文本的连续子串（父子两级都是），归一化规则单一权威。
+- 各格式冻结单元粒度方向已定稿：PDF 与 PPT 以物理页、Excel 以工作表内的连续行块、HTML / Markdown 以结构块（标题切分 + 上限合并）、纯文本以空行段。
+- 解析规则或参数表升版本时**就地全量重建**，不做双版本并存。
+- 长文档召回与跨文档多跳召回**不属于** fin 的评测维度，其数字由检索服务侧产出，fin 侧只消费。
+
+**开放（implementer headroom，不在弹内固化）：**
+
+- 分块参数表的具体数值、边界优先级链与内容密度判定阈值的具体取值——契约只约束"确定性查表 + 整数判定 + 版本化 + 版本变更触发重建"。
+- 单批推送条数上限的具体取值——契约只约束"超限分批、不丢尾、可断点续传"。
+- 模块与目录划分、内部字段与类型命名；失效记录与失败记录的落盘形态。
+- 评测 / 并发的 opt-in 入口形态（沿用既有 `eval` mark 还是另立 opt-in 命令）——唯一约束是默认 `uv run pytest -q` 不收集、不读大语料、不起检索服务进程。
+
+## Tasks (ordered by dependency)
+
+下面是本轮 tracker 的汇总索引：全部 bullet 一览、依赖与状态。状态以各 bullet 自己的 `Status` 复选框为准（两者同步维护），阻塞关系即文件内的 `[blocks:]` 标记，标了 `[parallel]` 的可与同阶段其他弹并行。
+
+| # | 标题 | Tag | 阻塞于 | 可并行 | 状态 |
+| --- | --- | --- | --- | --- | --- |
+| T1 | 假设清单 F1–F4 定稿：数字口径从建议值变成契约 | `[decision]` | — | — | 已完成 |
+| T2 | 补齐三份缺失 ADR：跨仓对齐基线 / 降级信号与部分失败语义 / 评测量化与并发基线 | `[decision]` | T1 | — | 待办 |
+| T3 | 切分归属改判同步进既有 ADR 与三份 spec | `[decision]` | T1 | 是 | 待办 |
+| T4 | 跨仓基线章节逐字一致的校验入口 | `[implementation]` | T2, T3 | — | 待办 |
+| T5 | 冻结文本归一化规则单一权威 | `[implementation]` | T4 | 是 | 待办 |
+| T6 | 七格式解析：冻结单元文本 + 结构化元数据 | `[implementation]` | T5 | — | 待办 |
+| T7 | 扫描件 OCR 分支与具名失败 | `[implementation]` | T6 | 是 | 待办 |
+| T8 | 异常输入的具名失败面 | `[implementation]` | T6 | 是 | 待办 |
+| T9 | 场景适配颗粒度：确定性参数查表 + 版本化 | `[implementation]` | T6 | — | 待办 |
+| T10 | 评测数据集：真实语料注入 + 多格式覆盖 + 可一键重建 | `[implementation]` | T1 | 是 | 待办 |
+| T11 | 父子分块与引用门连续子串硬约束 | `[implementation]` | T5, T9, T10 | — | 待办 |
+| T12 | 切分确定性可复现：全量 sha256 逐字节比对 | `[implementation]` | T11 | — | 待办 |
+| T13 | 规则 / 参数表版本变更触发就地全量重建 | `[implementation]` | T9, T11 | 是 | 待办 |
+| T14 | 幂等推送：`source_ref` + 幂等键 + 块标识 + 结构化元数据 | `[implementation]` | T11, T12 | — | 待办 |
+| T15 | 批量分批与断点续传 | `[implementation]` | T14 | 是 | 待办 |
+| T16 | 推送与协议失败的具名返回 | `[implementation]` | T14 | 是 | 待办 |
+| T17 | 命中映射失败：丢弃 + 计数，不静默 | `[implementation]` | T14 | 是 | 待办 |
+| T18 | 内容失效触发：版本变更即发起，幂等且具名 | `[implementation]` | T14, T13 | 是 | 待办 |
+| T19 | 能力默认全启用：8 键快照 + 静态检查 | `[implementation]` | T14 | 是 | 待办 |
+| T20 | 降级信号消费：`degraded` 不当空结果 | `[implementation]` | T14 | 是 | 待办 |
+| T21 | 无效输入与合法空结果的二分 | `[implementation]` | T14 | 是 | 待办 |
+| T22 | 消融矩阵与量化报告：绝对值 + 百分比 + 逐项贡献度 | `[implementation]` | T14, T10 | — | 待办 |
+| T23 | 并发评测：L1 检索路径场景 + L2 含 LLM 完整 run 场景 + 全写幂等场景 + 四个补充维度 | `[implementation]` | T14, T10 | 是 | 待办 |
+| T24 | 静默失败清零：失败清单逐条具名且留痕 | `[implementation]` | T16, T18, T20, T21 | — | 待办 |
+
+每个编号项是一颗 tracer bullet：一条可演示的端到端结果、一个 tag、一个 commit、给 implementer 留 headroom。Acceptance 只写可观察性质，不写复杂度门槛数字（那些 gate 归 `complexity-anti-drift` `references/thresholds.md`）。
+
+### 阶段 0 — 共享基线（串行，一切前置）
+
+1. **假设清单 F1–F4 定稿：数字口径从建议值变成契约** — tag: `[decision]`
+   - **Inherits:** spec 假设清单 F1–F4 仍是"待确认假设，不是定稿契约"；跨仓基线 B1 中并发、延迟、数据集规模三项的具体数字标注为"待确认建议值，两侧共用同一组"。
+   - **Surface:** `specs`（两份 spec 的 B1 表与假设清单）+ `docs/adr`
+   - **Acceptance:** F1（并发与延迟阈值）、F2（数据集规模与构成）、F3（真实语料来源与许可边界）、F4（评测与并发的资源占用）四项各有操作者的明确确认；确认后的取值写回两份 spec 的 B1 表对应行，"待确认建议值"的标注被移除，两侧取值逐字相同；本弹不触碰任何代码，`uv run pytest -q` 不受影响。
+   - **Completion:** 定稿落在哪一行、取值具体为多少由确认结果决定，headroom 在于"定稿"这一事实本身与双侧同步；本弹不预设数字。
+   - **Result（已定稿，写回完成）：** F1–F4 全部定稿并写回两份 spec 的 B1，定稿结果如下 —— 并发拆为 L1（检索 / 读取路径，不含 LLM：并发 16 / 120 秒 / 读写比 9:1 / 总请求数 ≥ 1200）与 L2（完整 run，含 LLM：并发 8 / 120 秒、p50 < 60 s、p95 ≤ 120 s）两层，延迟阈值 p95 ≤ 800 ms / p99 ≤ 2000 ms 仅作用于 L1（原并发 50、总请求 ≥ 3000 下调）；数据集规模块数由 ≥ 5000 上调为 ≥ 20000 且 ≤ 120000；新增「查询分档」（CI 契约集 40 题、全量集 ≥ 100 题每周一次）、「语料来源与许可」（分三级，派生格式由一级真实内容经确定性导出器生成）、「评测资源预算」（消融 30 次约 3–8 小时夜间串行、全量每周约 1–2 小时、两个并发场景 ≤ 30 分钟）三行；消融改为跑 20–40 题脚本化子集、重复 ≥ 3 次。B1 末尾"待确认建议值"的注已整体删除，表中各项均为定稿契约。两侧共享章节逐字相同，sha256 已重算一致。fin spec 的 F1–F4 与检索服务 spec 的 R1–R4 均已从假设清单移除。本弹未触碰任何代码，`uv run pytest -q` 不受影响。
+   - Status: [x] done —— 定稿结果已写回 B1，两侧共享章节 sha256 一致，假设清单已清空
+
+2. **补齐三份缺失 ADR：跨仓对齐基线 / 降级信号与部分失败语义 / 评测量化与并发基线** — tag: `[decision]`
+   - **Inherits:** spec「待写入 ADR」第 3、4、6 条，编号自现有最大号顺延（ADR 0037 / 0038 / 0039 已 accepted，本弹自 0040 起）；B3 是 `degraded` 置位规则的**唯一权威定义**，需显式改判"图地址缺失即静默跳过且不置降级"与"重排失败 fail-open 不标记"两处既有语义。
+   - **Surface:** `docs/adr` —— 三份 ADR 文件即本弹的产出
+   - **Acceptance:** 三份 ADR 均以 accepted 状态落盘并各自写明决定与理由，其中：跨仓对齐基线 ADR 规定"两份 spec 共享同名章节 + 逐字比对为验收"；降级信号 ADR 完整收录 B3 的四条置位规则、消费规则与禁止的静默形态，并显式改判上述两处既有语义、明确凭证缺失不得用确定性伪向量兜底；评测量化与并发基线 ADR 收录的指标集与阈值取自 T1 定稿值。三份 ADR 的正文与基线章节不矛盾。
+   - **Completion:** ADR 的编号分配与论证铺陈由实现者定，只要上述三件事各自被一份 accepted ADR 明确记录。
+   - [blocks: T1] —— 评测量化与并发基线的取值依赖 F1 / F2 定稿。
+   - Status: [x] done —— ADR 0040（跨仓对齐基线：共享同名章节 + 逐字比对验收）/ 0041（降级信号与部分失败语义：B3 四条置位规则 + 消费规则 + 禁止静默，显式改判「图地址缺失静默跳过」与「重排 fail-open 不标记」两处既有语义）/ 0042（评测量化与并发基线：取值逐字取 B1 定稿）均 accepted 落盘。
+
+3. **[parallel] 切分归属改判同步进既有 ADR 与三份 spec** — tag: `[decision]`
+   - **Inherits:** spec「冲突声明」表：ADR 0030"面向检索的切分…判给检索服务"、ADR 0032"远程排序与切分留在 fin 之外"、三份既有 spec 的"chunking … stay outside fin / land in iknow-memory"表述，均由 ADR 0037 反向改判；两条 ADR 的其余决定不变。
+   - **Surface:** `docs/adr`（ADR 0030 / 0032 正文标注改判）+ `specs`（三份既有 spec 的冲突表述）
+   - **Acceptance:** ADR 0030 与 ADR 0032 的正文各自标注"切分条款由 ADR 0037 改判：切分归 fin、检索服务不二次切分"，且两条 ADR 的其余决定未被动摇（既有 superseded 状态也不因此变更）；三份既有 spec 中"切分归检索服务"方向的表述全部改为"切分归 fin、排序仍留在外"并指向 ADR 0037；全仓 `rg` 已无反向表述残留。
+   - **Completion:** 改判标注的措辞与位置由实现者定；CONTEXT 的 **retrieve adapter** / **ingest** 词条已由 persist 提交更新，本弹只处理 ADR 与 spec 正文。
+   - [blocks: T1]
+   - Status: [x] done —— ADR 0030 / 0032 正文各加「Amended (ADR 0037)」条款级改判标注（status 行不动）；specs/s1-corpus-retrieve.md 4 处、vertical-slice-hardening.md 2 处、memory-dialogue-platform.md 1 处反向表述全部改为「切分归 fin、排序仍留在外」并指向 ADR 0037；rg 自查无活性反向表述残留。
+
+4. **跨仓基线章节逐字一致的校验入口** — tag: `[implementation]`
+   - **Inherits:** B6：两份 spec 的该章节正文（自 `## 跨仓对齐基线` 标题行之后起，到下一个 `## ` 标题行之前止，去掉首尾空行）分别计算 sha256，两值相等则通过；文件路径由执行方在运行时给出，不写死在 spec 内。
+   - **Surface:** `corpus`（语料契约的校验入口）+ 仓库脚本面
+   - **Acceptance:** 一条命令接受两侧文件路径、按 B6 的取段规则分别算 sha256 并比对：一致时 exit 0，不一致时 exit 非 0 且把两侧哈希都打印出来（不只报"不一致"）；对一段被故意改动的副本，该命令 exit 非 0。
+   - **Completion:** 命令的载体（脚本 / pytest 用例 / CLI 子命令）与取段实现由实现者定，只要双侧取段规则与 B6 逐字对应。
+   - [blocks: T2, T3]
+   - Status: [x] done —— 入口 `uv run python -m fin.corpus.baseline <fin_spec> <retrieval_spec>`，取段与 B6 逐字对应（标题行后起、下一 `## ` 前止、去首尾空行）；一致 exit 0，不一致 exit 1 且两侧哈希都打印，侧文件缺失 / 章节缺失各有具名失败（exit 2 / 3）；9 个用例覆盖，对真实 spec 正例与单字符改动反例实测通过。
+
+### 阶段 1 — 线 A：解析与切分（与 B、C 并行）
+
+5. **[parallel] 冻结文本归一化规则单一权威** — tag: `[implementation]`
+   - **Inherits:** SC17："冻结文本的归一化（空白、Unicode、连字符、软换行）由**一处**规则产生，且冻结单元文本与块文本使用同一规则：跨规则的字符替换导致子串断言失败的次数 = 0"；CONTEXT **冻结单元**：文本一经产出即冻结，是引用门逐字符比对的基准。
+   - **Surface:** `corpus`
+   - **Acceptance:** 空白、Unicode、连字符、软换行四类归一化只由一个规则出口产生；冻结单元文本与切分后的块文本走同一出口，不存在第二处等价替换；以含上述四类字符的样本断言：引用门对一条真实块文本的 ≥32 字符 span 仍判定为连续子串（跨规则导致的断言失败次数 = 0）；`uv run pytest -q` exits 0。
+   - **Completion:** 规则出口叫什么、放在哪个模块、是用一个函数还是一张映射表由实现者定；引用门本身不改。
+   - [blocks: T4]
+   - Status: [x] done —— 单一出口 `fin.corpus.normalization.normalize_frozen_text`（幂等 fixed point，规则版本 `norm-1`）；四类归一化全收敛该出口，`live_fetch._strip_html` 既有替换同步收敛，rg 证明仓库无第二处等价替换；引用门零改动，真实冻结页注入四类字符后 ≥32 字符 span 引用门判定通过；既有已冻结语料为 fixed point 无需重建。
+
+6. **七格式解析：冻结单元文本 + 结构化元数据** — tag: `[implementation]`
+   - **Inherits:** SC6 / SC7 / SC10：七种格式各有 ≥1 个脚本化样本，解析后冻结单元文本非空且非空单元数 ≥1；表格类样本（Excel 工作表、HTML 表格、PDF 表区）的单元格文本可被检索命中并可作为 ≥32 字符的引用门 span 通过校验；结构化元数据至少包含格式、来源字节哈希、locator 三元组、单元序号、字符数、语言、解析规则版本、参数表版本，缺任一字段即为解析失败。粒度方向已定稿：PDF 与 PPT 以物理页、Excel 以工作表内的连续行块、HTML / Markdown 以结构块（标题切分 + 上限合并）、纯文本以空行段。
+   - **Surface:** `corpus`
+   - **Acceptance:** 七种格式各自的脚本化样本产出 ≥1 个非空冻结单元；表格类样本的单元格文本能通过 ≥32 字符的引用门连续子串校验；任一解析产物的结构化元数据八项字段齐备，缺任一项时该次解析以具名失败终止（不是产出"字段缺失但仍算成功"的单元）；`uv run pytest -q` exits 0，且默认套件不读大语料、不起检索服务进程、不访问外网。
+   - **Completion:** 各格式的解析器选型、单元粒度在同一版本内的具体取值、元数据的内部命名全部开放——契约只约束"同一规则版本下确定性产出"。
+   - [blocks: T5]
+   - Status: [x] done —— 入口 `fin.corpus.parsers.parse_document`（`parse-1` / `params-0` 占位）；pdf/pptx 物理页、xlsx 工作表内 64 行连续行块、html/md/docx 结构块（标题切分 + 6000 字上限合并）、txt 空行段；零新依赖（OOXML 走 stdlib，pdf 复用 pdfplumber）；`ParsedUnit` 八项元数据经唯一构造点 `build_unit` 产出，缺一即 `ParseMetadataIncompleteError`；xlsx/html/pdf 三例表格单元格 span 过引用门（gate=done，quote==span）；37 个新用例，默认套件只读小样本。
+
+7. **[parallel] 扫描件 OCR 分支与具名失败** — tag: `[implementation]`
+   - **Inherits:** SC8："无文本层且含图像的页面走 OCR 分支并写入文本与 `ocr_applied`；OCR 引擎缺失时该单元以具名失败终止，不以空文本记为成功"；沿用既有 OCR 写入约定。
+   - **Surface:** `corpus`
+   - **Acceptance:** 无文本层且含图像的样本走 OCR 分支，写入非空冻结文本并置 `ocr_applied`；引擎缺失或 OCR 失败时该单元以具名失败终止，产物中既不出现"空文本但记为成功"的单元也不出现异常抛出到调用方；默认 `uv run pytest -q` 不要求真实 OCR 引擎可用（不可用的失败路径以脚本化方式驱动）。
+   - **Completion:** 缺引擎的注入方式与具名失败码的措辞由实现者定；不把视觉模型引入为事实来源。
+   - [blocks: T6]
+   - Status: [x] done —— `parse_pdf` 页级空文本经 `ocr.detect_ocr_required` 判定走 OCR 分支，OCR 文本经 `build_unit` 冻结（即走 T5 出口）并置 `ocr_applied`（`OcrParsedUnit`）；引擎缺失 / 引擎失败 / 空文本等五类原因统一收敛 `ocr_required_unavailable` 具名失败，收集全部失败页后抛一次；13 个用例以 FakeOCREngine 注入驱动，默认套件不要求真实引擎。
+
+8. **[parallel] 异常输入的具名失败面** — tag: `[implementation]`
+   - **Inherits:** SC9："加密、损坏、空文件、0 字节、非目标 MIME 的输入，各自返回一个具名失败（不是空串、不是静默跳过、不是异常抛出到调用方）"；SC46：不出现空 `except` 吞掉失败，不出现"失败即空成功"。
+   - **Surface:** `corpus`
+   - **Acceptance:** 加密、损坏、空文件、0 字节、非目标 MIME 五类输入各返回**互相可区分**的具名失败，调用方拿到的是失败结果而非空字符串、不是被跳过的缺失、也不是未捕获异常；`uv run pytest -q` exits 0。
+   - **Completion:** 失败类型的载体（异常类型 / 结果对象 / 错误码枚举）与命名由实现者定，只要五类可区分且都不静默。
+   - [blocks: T6]
+   - Status: [x] done —— `ParseError` 家族新增稳定 `code` 属性（互异错误码）与两个新具名类型：`EncryptedSourceParseError`（`encrypted_source`：PDF 走 pdfminer `PDFEncryptionError` 因果链识别；OOXML 走 CFB 容器魔数识别）与 `FormatMismatchParseError`（`format_mismatch`：声明 fmt 与字节内容签名冲突——非目标 MIME 在显式命名 API 下的落地，签名判定只用于失败分类、不改派发、无签名不失败）；五类输入 × 具名失败对照：0 字节→`empty_source`、空文件→`no_units`、损坏→`malformed_source`、加密→`encrypted_source`、非目标 MIME→`format_mismatch`（fmt 名非法仍为 `unsupported_format`），类型与错误码两两互异（测试断言）；SC46 以 AST 扫描 + `rg` 双自证 `src/fin/corpus` 无空 except；13 个新用例，正常解析路径回归不受扰。
+
+9. **场景适配颗粒度：确定性参数查表 + 版本化** — tag: `[implementation]`
+   - **Inherits:** SC13："分块参数**只**由（文档类型 × 板块 × 内容密度）查表决定；同一三元组两次查表返回同一参数组"；CONTEXT **场景适配颗粒度**：_Avoid_ 含"自适应切分""用模型判断颗粒度""双版本参数并存"；参数表版本进元数据、版本变更就地全量重建；边界优先级链与内容密度判定阈值用整数判定，不使用浮点比较与模型判断。
+   - **Surface:** `corpus`
+   - **Acceptance:** 分块参数只来自（文档类型 × 板块 × 内容密度）三元组的一次查表，同一三元组两次查表返回同一参数组（golden 参数表快照测试）；参数表是一份可版本化的数据而非代码分支，参数表版本随块元数据一起产出；内容密度判定走整数比较，代码中不存在浮点阈值比较与模型判断切点；`uv run pytest -q` exits 0。
+   - **Completion:** 参数表的具体数值、表的数据形态、三元组的取值域全部开放——契约只约束"查表、确定性、版本化"。
+   - [blocks: T6]
+   - Status: [x] done —— `fin.corpus.params`：19 行字面量参数表（版本 `params-1`），`lookup_chunk_params(doc_type, section, density)` 一次查表 + 确定性 fallback 链，未知组合落默认行不抛错；golden 快照测试整表锁定；密度判定整数叉乘、测试化自证无浮点阈值；`params_table_version` 随解析元数据产出；24 个用例。
+
+10. **[parallel] 评测数据集：真实语料注入 + 多格式覆盖 + 可一键重建** — tag: `[implementation]`
+    - **Inherits:** SC27–SC30：格式种数、每格式样本数下限、样本总数下限全部取 B1「数据集规模」行；样本须为真实样本（非合成、非占位），每个样本带来源与许可记录，缺来源或标记为合成的样本不计入计数；每种格式 ≥1 个困难样本（扫描 / 多栏 / 合并单元格 / 图文混排 / 内嵌公式 / 页眉页脚干扰之一）；覆盖 ≥3 种文档类型（至少财报叙述、表格密集、条款列表），每种类型 ≥1 条人工标注的"应有命中"（问题 → 期待 locator 单元）；数据集可一键重建且重建后清单哈希与记录一致。F3 已由 T1 定稿。
+    - **Surface:** `corpus`（语料资产与清单）+ 仓库数据面
+    - **Acceptance:** 数据集清单存在且可校验，规模与构成三项下限全部达标；计数时排除无来源与标记为合成的样本；每格式的困难样本存在且解析后冻结文本非空；≥3 种文档类型各自 ≥1 条人工标注的"应有命中"；一键重建后样本清单哈希与清单文件记录一致（重跑不一致样本数 = 0）；数据集字节不进默认 `uv run pytest -q`（该命令仍 exits 0 且不读大语料）。
+    - **Completion:** 语料来源、获取脚本、清单文件格式、许可记录的字段命名全部开放；规模数字不得在本地另立一套（一律取 B1）。
+    - [blocks: T1]
+    - Status: [x] done —— 入口 `uv run python -m fin.corpus.dataset build / verify / report / expand-primary`；真实样本 234（primary 12 + derived 222，全部带来源与许可记录），md/txt/html/docx/xlsx/pptx 各 37、pdf 12（pdf < 20 记为 known_gaps，待 expand-primary opt-in 冻结补齐）；文档类型 narrative / table_dense / clause_list 三类各 1 条以上人工标注「应有命中」，查询 108（四类各 ≥10%）；每格式 ≥1 困难样本标记落清单；一键重建两遍 manifest sha256 一致、verify 不一致样本数 = 0；计数排除逻辑具名（synthetic / 无 sha256 / 无 license 不计入）；chunk_total 字段预留记 0 待 T11；默认套件不读 data/corpus，数据集全契约走 `-m eval`。
+
+11. **父子分块与引用门连续子串硬约束** — tag: `[implementation]`
+    - **Inherits:** SC11 / SC16：对**评测数据集全量**样本断言——每个子块文本是其父块文本的连续子串、每个父块文本是其冻结单元文本的连续子串，违规数必须为 0；每个子块在推送载荷中携带其父块文本，父块不单独作为可命中单元参与检索（命中集是子块）；ADR 0037：fin 推送的块文本即最终文本，检索服务不做二次切分。
+    - **Surface:** `corpus`
+    - **Acceptance:** 全量样本上两级连续子串断言违规数 = 0（断言入口对评测数据集全量跑，不是抽样）；子块载荷携带其父块文本；命中集合只含子块，父块不作为独立可命中单元；`uv run pytest -q` exits 0。
+    - **Completion:** 切分算法、父子边界的选取策略、块的内部表示全部开放——契约只约束两级子串关系、命中集构成与父块随行。
+    - [blocks: T5, T9, T10] —— 归一化单一权威、参数查表、数据集三者都到位才能做全量断言。
+    - Status: [x] done —— 切分入口 `fin.corpus.chunking`（`split_unit` / `split_document`）：父块=标题边界优先、链内整数 rank 逐级兜底、char_cap 硬切，子块按 target 打包 + min 合并；块文本是冻结单元文本的纯切片（无二次替换，SC17 fixed point 测试锁定），`block_id` 为确定性 sha256；`ChunkPayload` 随行 `parent_text` + SC20 元数据，命中集仅 `kind=child`（`is_retrievable` / `hittable_blocks`），父块不可独立命中（引用门 bounce 测试证明）；默认套件 `tests/corpus/test_chunking.py` 16 用例，eval 全量 `tests/eval/test_chunking_contract.py` 真实跑：234 样本 / 3504 冻结单元 / 12272 父块 / 15686 子块，两级连续子串违规数 = 0、归一化 fixed point 15686/15686、载荷父文本随行 15686/15686；manifest `chunk_total=15686`（`t11_splitter_computed`）已填充，B1 带宽 [20000, 120000] 未达——根因 primary 语料规模低于自身 B1 下限待扩充，如实记 `known_gaps`；`uv run pytest -q` 1314 passed（唯一失败为预存允许项 `test_gc_hard_deletes_transported_rows_past_the_retention_window`），`uv run pytest -q -m eval` 15 passed。
+
+12. **切分确定性可复现：全量 sha256 逐字节比对** — tag: `[implementation]`
+    - **Inherits:** SC12 与 SC14（共用同一断言入口）：同一字节输入、同一规则版本 + 参数表版本，连续两次解析 + 切分，产物（含块文本、块标识、顺序、元数据）逐字节相同，全数据集 sha256 比对不一致样本数 = 0；SC14 追加：**任何**导致两次运行产物产生差异的来源均属违反，实现手段的选择不构成豁免。
+    - **Surface:** `corpus`
+    - **Acceptance:** 全量样本连续两次解析 + 切分的产物序列化后 sha256 不一致样本数 = 0；断言覆盖块文本、块标识、顺序与元数据四项，不只比块文本；注入任意非确定性来源（如集合迭代序、字典序、时钟、随机）后该断言即失败——即以该断言本身作为"无隐藏非确定性"的见证；`uv run pytest -q` exits 0。
+    - **Completion:** 产物的序列化格式与比对粒度由实现者定，只要四项全比且非确定性来源能被该断言捕获。
+    - [blocks: T11]
+   - Status: [x] done —— 全量 234 样本连续两次解析+切分的规范化产物（sort_keys JSON，覆盖块文本/块标识/顺序/元数据四项）sha256 不一致样本数 = 0（`-m eval` 4 passed, 920s）；时钟/随机/数组序/集合迭代序四类注入均被断言捕获（含跨进程见证），小样用例锁 canonical 序列化对键序/迭代序不敏感。
+
+13. **[parallel] 规则 / 参数表版本变更触发就地全量重建** — tag: `[implementation]`
+    - **Inherits:** spec「已定稿、不再作为开放问题」："解析规则或参数表升版本时**就地全量重建**，不做双版本并存"；ADR 0038 的 fin 侧义务："任意时点都能用同一规则版本与参数表版本从权威源重建全部推送内容"；版本变更同时是内容失效的触发条件之一（见 T18）。
+    - **Surface:** `corpus`
+    - **Acceptance:** 解析规则版本或参数表版本变更时，存在一条命令以新版本就地全量重建全部冻结单元与块，重建后不存在新旧两个版本并存的状态；重建产物满足 T12 的确定性断言；重建过程本身是可重入的（中断后重跑不产生半套新旧混合）；`uv run pytest -q` exits 0。
+    - **Completion:** 重建命令的形态（CLI 子命令 / 脚本）、版本号的载体与推进规则由实现者定；不做双版本并存是硬约束。
+    - [blocks: T9, T11]
+   - Status: [x] done —— 入口 `uv run python -m fin.corpus.rebuild rebuild|check`：staging 构建 + 原子交换，交换前后双次 `validate_no_mixed_versions`（版本字段 + 逐文件 sha256 对账，违例抛 `mixed_version_state`）；中断模拟测试证明旧产物原样可见、重跑逐字节恢复基线；全量双跑 `find data/corpus/blocks | sha256sum` 一致（235 文件 / 97MB，已 gitignore）；`check` 输出 `parse_changed`/`params_changed` 信号供 T18 消费。
+
+### 阶段 2 — 入库推送对接（依赖线 A 与线 B 都完成）
+
+14. **幂等推送：`source_ref` + 幂等键 + 块标识 + 结构化元数据** — tag: `[implementation]`
+    - **Inherits:** B4：幂等键 =（`source_ref`，内容标识）二元组，内容标识 =（块文本 + 归一化规则版本 + 解析规则版本 + 参数表版本）的确定性哈希，同一幂等键重复推送不产生第二份写入、返回同一批块标识；`source_ref` 拼写逐字为 `source_ref`，内容是 fin **locator** `{document_id, version, unit}` 的稳定序列化，粒度为冻结单元级（同一冻结单元的所有块共享同一个 `source_ref`），`source_ref` 不是块身份；不二次切分——召回返回的块文本与推送文本逐字节相同；SC18（四条合一）：次数与并发数取 B1「幂等基准」与「并发幂等场景（全写）」两行，块总数增量 = 0 且块标识集合不变，重放返回同一结果，失败推送具名返回且不计入幂等断言；SC20：结构化元数据可被检索侧作为过滤条件消费（至少格式、文档类型、板块、来源哈希、解析规则版本、参数表版本），缺字段的推送被拒并返回具名失败。
+    - **Surface:** `corpus`（块与元数据的生成）+ `retrieve`（对检索服务的推送适配）
+    - **Acceptance:** 同一批块连续推送（次数取 B1「幂等基准」行）后块总数增量 = 0 且块标识集合不变；重放同一幂等键返回同一批块标识、不产生第二份写入；每个块携带冻结单元级的 `source_ref`，同一冻结单元的所有块共享同一个值，且 `source_ref` 不充当块身份（块标识由 fin 侧确定性哈希生成）；检索侧取回的命中块文本与推送文本逐字节相同；元数据缺字段的推送被拒并返回具名失败；失败推送具名返回且不计入幂等断言。
+    - **Completion:** 推送的传输形态、批次编排、幂等键与块标识的哈希构造由实现者定；`source_ref` 的拼写、粒度与"非身份"三条不可变通。
+    - [blocks: T11, T12] —— 需要切分产物与其确定性，且线 B 的契约字段须已可用（见 master plan 阶段 2 入口）。
+    - Status: [x] done —— 语料侧 `fin.corpus.push`：`serialize_source_ref`（locator 三元组的 canonical JSON 稳定序列化，复用 T12 的 `canonical_json_bytes`，无块成分故冻结单元级粒度是结构性的）+ `content_identity`（块文本 + 归一化 / 解析 / 参数表三版本经 `\x1f` 连接的 sha256）+ `PushRecord`（`idempotency_key` = (`source_ref`, `content_id`) 二元组；`block_id` 仍是 T11 的确定性哈希，`source_ref` 不充当块身份）+ `REQUIRED_PUSH_METADATA_FIELDS`（SC20 六项：格式 / 文档类型 / 板块 / 来源哈希 / 解析规则版本 / 参数表版本，required 列表单一权威，推送侧与契约 fake 共用）；推送侧 `fin.retrieve.push_port`（`PushPort` 协议 + `PushOutcome` + `PushError` 家族三个稳定 code：`push_metadata_incomplete` / `unknown_pushed_block` / 基类 `push_error`，外加 `IDEMPOTENCY_BASELINE_PUSHES = 3` 取自 B1「幂等基准」）+ 契约 fake `fin.retrieve.fake_push_port.FakePushPort`（字段名逐字 §B4，按幂等键去重、整批先校验后写入故被拒批次零写入、`recall` 逐字节返回推送文本、`rejected_batches()` 留痕）；元数据完整性判定只在接收侧一处（SC20「被拒」语义），不做客户端二次校验。验证：`uv run pytest -q` → 1356 passed / 1 failed（唯一失败为预存允许项 `test_gc_hard_deletes_transported_rows_past_the_retention_window`）/ 46 skipped，其中本弹新增 24 用例覆盖 Acceptance 逐条：连推 3 次块总数增量 = 0 且块标识集合不变、重放同一幂等键返回同一批块标识且零写入、同一冻结单元所有块共享同一 `source_ref`（跨单元互异）、`source_ref` 不在块标识集合内且 `recall(source_ref)` 具名失败、取回块文本与父块文本逐字节相同、SC20 六字段各自缺失均被拒并抛 `PushMetadataIncompleteError`（参数化 6 例，整批零写入）、失败推送具名返回且不计入幂等断言（`rejected_batches()=1`、`written_total()` 不变）。全部为小样脚本化用例，不读大语料、不起检索服务进程、不访问外网，故未新增 `eval` mark 测试。真实检索服务联调留待线 B（iknow-memory）就绪。
+
+15. **[parallel] 批量分批与断点续传** — tag: `[implementation]`
+    - **Inherits:** SC23："推送是批量 + 可断点续传的：中断后重推已成功批次不重复写入，未成功批次被重推后补齐（补齐后块数 = 预期总数）"；SC44：单文档块数超限 → 分批而非截断丢尾，单次推送批量超限 → 具名溢出；B4 后台路径失败契约：异步入库 / 抽取 / 投影的失败落成可列举、可重放的具名失败记录，重试幂等、不静默丢弃。
+    - **Surface:** `corpus` + `retrieve`
+    - **Acceptance:** 单文档块数超限时分批且不丢尾（补齐后块数 = 预期总数）；单次批量超限时具名溢出而非静默截断；模拟中途中断后重推：已成功批次不重复写入（块总数增量 = 0），未成功批次被补齐至预期总数；失败的后台路径留下可列举、可重放的具名记录，重试幂等。
+    - **Completion:** 批次划分策略、续传的进度记录形态、单批上限的具体取值全部开放。
+    - [blocks: T14]
+    - Status: [x] done —— 驱动侧 `fin.retrieve.push_batching`：`plan_batches`（连续切批，各批拼接 == 输入序列故不丢尾；`batch_size` 非正 → `push_batch_size_invalid`，超单批上限 → `push_batch_overflow`）+ `batch_key`（批次内 T14 幂等键序列的 canonical JSON sha256，复用既有 `(source_ref, content identity)` 语义，未另起哈希、未另立 `source_ref` 拼写）+ `PushJournal`（append-only JSONL 事件日志，`completed` / `failed` 两类事件重放恢复状态，无 path 时纯内存）+ `BatchFailure`（batch_key / batch_index / 稳定 code / message / source_refs / block_count / resolved）+ `push_in_batches`（已完成批次零 push 调用直接跳过；首个失败批次先落具名记录再原样重抛，非 `PushError` 的传输级异常包成 `PushBatchFailedError` 且 `raise ... from exc` 保留 cause，无空 except、无「失败即空成功」）；单批上限落在接收侧契约 fake（`FakePushPort(max_batch_records=...)`，默认 `MAX_PUSH_BATCH_RECORDS = 200`），与 T14 的 SC20 校验同址（服务侧单一权威），超限整批拒绝、不存截断前缀；`PushError` 家族新增三个稳定 code：`push_batch_overflow` / `push_batch_size_invalid` / `push_batch_failed`。验证：`uv run pytest -q` → 1372 passed / 1 failed（唯一失败为预存允许项 `test_gc_hard_deletes_transported_rows_past_the_retention_window`）/ 46 skipped，其中本弹新增 16 用例覆盖 Acceptance 逐条：超限文档分批后 `block_total() == expected_block_total()`（= 去重幂等键数，不丢尾）、单次超限推送抛 `push_batch_overflow` 且 `block_total() == 0` / `rejected_batches() == 1`、中断后重推已成功批次零转发（转发键集与首轮不相交、`batches_skipped == 1`）且未成功批次补齐至预期总数、已完成 run 再推两次写入增量 = 0、ack 丢失场景的重放被幂等键识别为 duplicate 而非二次写入、失败批次具名可列举（`failures()` 带 code 与 source_refs）且落盘 JSONL 可跨实例重载续传、失败批次不计入写入（`written_total() == 0`）。全部为小样脚本化用例，不读大语料、不起检索服务进程、不访问外网，故未新增 `eval` mark 测试。真实检索服务的批量上限与断点续传联调留待线 B（iknow-memory）就绪。
+
+16. **[parallel] 推送与协议失败的具名返回** — tag: `[implementation]`
+    - **Inherits:** SC21："检索服务不可用 / 协议失败时，推送返回具名失败，不静默丢弃、不把写入记为成功、不降级为本地落盘即算完成"；B2 第 5 条：空块批次推送属**无效输入** → 具名失败（typed error），不返回空结果冒充"命中为空"，且**不**置 `degraded`。
+    - **Surface:** `retrieve`
+    - **Acceptance:** 服务不可达与协议错误各返回互相可区分的具名失败；上述任一失败路径下，写入都不被记为成功、不落本地盘即算完成、不静默重试；空块批次作为无效输入返回具名失败且不置 `degraded`（按 B2 第 5 条与"合法空结果"区分）；`uv run pytest -q` exits 0。
+    - **Completion:** 失败类型的载体与命名、重试策略（是否重试、重试几次）由实现者定；"不可静默"与"落盘不算完成"是硬约束。
+    - [blocks: T14]
+    - Status: [x] done —— `fin.retrieve.push_port` 将 SC21 的两种失败形拆成两个互斥、稳定可断言的 code，均扩展 T14 的 `PushError` 家族而非另立体系：`PushServiceUnavailableError` / `push_service_unavailable`（传输层 `OSError` 簇——含拒连 / DNS / 超时——在 `push_records` 处具名化，原异常以 `raise ... from exc` 保留 `__cause__`）与 `PushProtocolError` / `push_protocol_error`（新增 `outcome_of_response` 逐字段校验 §B4 响应信封：非 mapping / 缺字段 / `block_ids` 类型或长度与推送数不符 / 计数器非正整数或不能完全账平——短信封不补齐、多余不截断）；两者均不返回 outcome、均不在推送路径内重试（重试策略显式化为 `PUSH_ATTEMPTS_PER_BATCH = 1`，重放只走 T15 `PushJournal` 的具名记录，故不存在隐式重试），且 `_push_one_batch` 对已具名的 `PushError` 原样重抛，不被压成通用 `push_batch_failed`；空块批次则是第三类——`PushEmptyBatchError` / `push_empty_batch`，经单一权威 `validate_batch_not_empty` 在驱动侧（`push_records` / `push_in_batches`）与接收侧（`FakePushPort.push`）两头各自拒绝，不以零写入成功冒充；按 §B2 第 5 条 / §B3 在 `PushError` 上声明逐字字段 `degraded` / `degraded_reasons`（默认 `False` / `()`）：无效入参类（空批次 / 缺字段 / 溢出 / 批大小非法 / 未知块）不置位，能力尝试失败类（不可达 / 协议 / 传输层包裹）置位为 `("push:attempt_failed",)`；`degraded` 的消费逻辑仍属 T20，本弹只声明分类。验证：`uv run pytest -q` → 1409 passed / 1 failed（唯一失败为预存允许项 `test_gc_hard_deletes_transported_rows_past_the_retention_window`）/ 46 skipped，其中本弹新增 `tests/retrieve/test_push_failures.py` 37 用例逐条覆盖 Acceptance：不可达与协议（参数化 12 种违约信封）各自具名且 code 互异、互不为子类；两条失败路径各自断言 ① 写入不记为成功（`completed_keys() == ()`、日志只有 `failed` 事件，另有一例服务端确已写入但 ack 违约的硬场景：`block_total() > 0` 而 fin 侧零入账，重放后冗余转 duplicates、存量补齐至预期而无二次写入）② 不落本地盘即算完成（tmp_path 下唯一产物是失败日志；跳进程重载后 `batches_skipped == 0`、全部批次重推）③ 不隐式重试（`port.calls == PUSH_ATTEMPTS_PER_BATCH == 1`，`push_records` 与 `push_in_batches` 两层各断言一次）；空批次在三个入口均具名失败且 `degraded is False` / `degraded_reasons == ()`，与「合法零写入成功」（全重复批次返回 `written == 0` / `duplicates == len(records)`）不合并；8 个错误类的 degraded 分类参数化锁定。全为小样脚本化用例（服务端为 T14 契约 fake 与两个脚本化 port），不读大语料、不起检索服务进程、不访外网。真实检索服务的不可达 / 协议违约联调留待线 B（iknow-memory）就绪。
+
+17. **[parallel] 命中映射失败：丢弃 + 计数，不静默** — tag: `[implementation]`
+    - **Inherits:** SC22："命中映射回 **locator** 失败的块被丢弃（不进入引用证据），检索侧标识永不作为引用证据传给用户；同时该次映射失败**计数**落盘且 >0 时可断言——丢弃不静默"；SC43：未知 **locator** → `unknown_locator`。
+    - **Surface:** `retrieve` + `host`（引用证据的准入）
+    - **Acceptance:** 注入映射失败的命中后，该命中不进入引用证据、检索侧标识不出现在用户可见的引用中，且失败计数 +1 并落盘（可断言 >0）；未知 locator 走 `unknown_locator` 的既有语义、不因本弹改变；`uv run pytest -q` exits 0。
+    - **Completion:** 计数的落盘位置与载体由实现者定；丢弃不得影响引用门本身的判定规则。
+    - [blocks: T14]
+    - Status: [x] done —— 新增 `fin.retrieve.hit_mapping` 作为「命中→locator 映射」与其失败计数的单一权威：`map_hits_to_chunks`（从 `MCPRetrieveAdapter.aretrieve` 抽出的原 mapper-drop 循环，行为不变——limit 仍只计已映射的块、score 不可读仍降为 0.0 而不算映射失败）+ 四个稳定 drop code（`unmapped_source_ref` / `missing_source_ref` / `malformed_hit` / `non_locator_source_ref`，闭集故 `count_by_code()` 可断言）+ `MappingFailureLedger`（无 path 时纯内存计数、有 path 时 append-only JSONL 并在构造时重放，故计数跨进程可断言 >0；落盘先于内存计数自增，写不动即抛具名错而不留「以为写成了」的计数）+ 沿用 T14 `PushError` 风格的 `HitMappingError` 家族三个稳定 code（`mapping_failure_ledger_unwritable` / `mapping_failure_ledger_corrupt` / `mapping_failure_record_invalid`，损坏行不静默跳过以免计数偷偷变小）+ `ledger_from_env`（`FIN_MAPPING_FAILURE_LOG` 有值即落盘，未设为内存）。`MCPRetrieveAdapter` 改为调用该 seam，新增 `mapping_ledger=` 参数与 `mapping_failures` 属性（默认懒建内存 ledger——计数从不关闭，只是不持久化；类级默认值使跳过 `__init__` 的 `_call_mcp` 测试替身仍可用），wire 形状仍是 `{"chunks": []}`（miss 形不变），是计数而非 chunks 告诉运维「这不是空语料」。host 侧新增 `fin.host.evidence_admission`：`admit_retrieved_chunks` 只按一条判据准入——`source_ref` 是否为 fin `Locator`；否则丢弃并以 `non_locator_source_ref` / stage `evidence_admission` 记账，`evidence_from_chunks` 再由已准入块建 `EvidenceItem`。`_make_retrieve_tool` 与 `_issuer_evidence`（fanout 分支同路）都过准入，故被丢命中既不入 `evidence`、也不入序列化 chunk 信封；`compile_graph` 新增 `mapping_failure_ledger=`（默认走 env），adapter 与 host 两个丢弃点共用同一个 ledger，SC22 的「计数」是一个数而不是两个。**引用门未改一行**：`citation_gate.py` 零改动，准入决定「有哪些证据」、不决定「门如何裁决」——`unknown_locator`（SC43）、repair cap、空 `page_text` 的 `MalformedEvidenceError` 三条既有语义原样保留，映射失败是丢弃而非新增拒绝理由（丢弃后无可引跨度则走既有 bounce 路径）。验证：`uv run pytest -q` → 1437 passed / 1 failed（唯一失败为预存允许项 `test_gc_hard_deletes_transported_rows_past_the_retention_window`）/ 46 skipped（基线 1409 passed，本弹 +28）；新增 `tests/retrieve/test_hit_mapping.py`（18 例）与 `tests/host/test_evidence_admission.py`（10 例）逐条覆盖 Acceptance：注入映射失败命中后端到端跑图——`evidence` 为空、`citations == []`、`evidence_locators == []`、检索侧标识不出现在 payload JSON 与任何 `ToolMessage` 中，同时 tmp_path 下 JSONL 重载 `count() > 0`；混合场景（一条可映射 + 一条失败）证明准入是逐命中而非整批拒绝；不可写 path / 损坏行 / 词表外 code 三类具名失败；`unknown_locator` 与 malformed-evidence 两条既有语义各有 pin，且已做一次性 mutation 验证（临时把门的 refuse 改成 bounce、把空 `page_text` 的 raise 改成 return，两个 pin 各自失败，随后还原且 `git diff` 干净）。全为小样脚本化用例（脚本化 port + 脚本化 `_call_mcp`），不读大语料、不起检索服务进程、不访外网。真实检索服务的 id→locator 映射联调留待线 B（iknow-memory）就绪。
+
+18. **[parallel] 内容失效触发：版本变更即发起，幂等且具名** — tag: `[implementation]`
+    - **Inherits:** B4：fin 的冻结单元文本发生变更（同一 `{document_id, unit}` 产生新 `version`，或解析规则版本 / 参数表版本变更导致块文本变化）时，fin 必须对该冻结单元的旧块发起失效；失效动作 = 关闭时间有效区间使其不再被任何查询时刻命中、不物理删除、失效幂等可重复执行并留下可查询记录；SC24：失效后以任意查询时刻检索该旧块出现次数 = 0，重复发起结果一致，失效请求失败时具名返回、不静默。
+    - **Surface:** `corpus`（触发侧）+ `retrieve`（对检索服务的失效调用）
+    - **Acceptance:** 同一 `{document_id, unit}` 产生新 `version` 时、以及规则 / 参数表版本变更导致块文本变化时，fin 均对该单元旧块发起失效；失效后以任意查询时刻检索该旧块出现次数 = 0；重复发起同一失效请求结果一致（幂等）；失效请求失败时具名返回、不静默、不留半成品状态；失效记录可查询。
+    - **Completion:** 触发的探测点、失效记录形态、"旧块"的识别方式由实现者定；"不物理删除"与"幂等"是检索侧语义、fin 侧只保证触发与具名。
+    - [blocks: T14, T13]
+    - Status: [x] done —— 触发侧 `fin.corpus.invalidation`：「旧块」= T14 幂等键 `(source_ref, content identity)`，`plan_invalidations(previous, current, version_signal=...)` 把 §B4 两条触发条件归约为「旧键从当前键集消失」——新 `version` 改 `source_ref`、规则 / 参数表升版改块文本改 content identity，两者落同一判据，未另立哈希、未另立 `source_ref` 拼写；五个稳定 reason（`unit_version_changed` / `unit_absent` / `parse_rule_version_changed` / `params_table_version_changed` / `block_text_changed`，闭集可断言），其中「文本变化归因到解析规则还是参数表」直接消费 T13 信号——`version_signal_for_product_area()` 委托 `fin.corpus.rebuild.detect_version_changes`（即 `rebuild check` 打印的 `parse_changed` / `params_changed`），不做第二套版本探测；scope 按文档：current 未提及的文档不判（分文档推送不误伤邻居），提及的文档内单元消失记 `unit_absent`；`request_key` = 目标幂等键排序后经 `fin.corpus.push.idempotency_keys_digest`（新提取的单一哈希构造，T15 `batch_key` 已改为委托它）故与目标顺序、与 reason 无关。调用侧 `fin.retrieve.invalidation_port`：`InvalidationPort` 协议 + `InvalidationOutcome`（`block_ids` / `closed` / `already_closed` / `closed_at` 逐块关闭时刻，幂等重放返回同一时刻）+ 与 `PushError` 同风格的 `InvalidationError` 家族 8 个稳定 code（`invalidation_error` / `invalidation_empty_batch` / `invalidation_unknown_target` / `invalidation_service_unavailable` / `invalidation_protocol_error` / `invalidation_failed` / `invalidation_ledger_unwritable` / `invalidation_ledger_corrupt`，按 §B2 第 5 条 / §B3 声明 `degraded` / `degraded_reasons`：入参类不置位、能力尝试失败类置 `("invalidation:attempt_failed",)`）+ `INVALIDATION_ATTEMPTS_PER_REQUEST = 1`（不隐式重试，重放靠具名记录）+ `InvalidationLedger`（append-only，有 path 即 JSONL 并在构造时重放，落盘先于内存计数故不存在「以为记下了」；`records()` / `failures()` / `settled_requests()` / `records_for_source_ref()` / `count()` 使失效记录可查询）。契约 fake 扩展 `FakePushPort` 实现检索侧语义：每块带 `[valid_from, valid_to)` 逻辑区间（整数，无时钟故确定性），`invalidate` 关闭区间（`valid_to = valid_from`，半开区间为空）故 `is_hittable_at_any_time()` 直接回答「任意查询时刻」而非抽样，行不删（`physically_present` / `recall` 仍逐字节一致），重复失效不二次关闭且返回同一 `closed_at`，未知目标 / 空请求在关闭任何区间之前整体拒绝（`refused_invalidations()` 留痕）。验证：`uv run pytest -q` → 1493 passed / 1 failed（唯一失败为预存允许项 `test_gc_hard_deletes_transported_rows_past_the_retention_window`）/ 46 skipped（基线 1437 passed，本弹 +56）；新增 `tests/corpus/test_invalidation.py`（16 例）与 `tests/retrieve/test_invalidation_port.py`（40 例，含 16 种违约信封参数化）逐条覆盖 Acceptance：新 `version` 与规则版本变更两条触发各自发起失效、失效后 7 个跨量级查询时刻（含负数与 10^18）出现次数 = 0 且 `hits(at=...)` 不含旧块而新版块仍命中、重复发起两次 `block_ids` / `closed_at` / store 状态完全一致且 `settled_requests()` 仍为 1 个 key（记录 3 条不覆盖）、目标顺序颠倒仍是同一请求、不可达 / 协议违约 / 未类型化传输异常 / 空目标 / 未知目标五类具名且 code 两两互异、失败后 `invalidation_state() == {}` 且全部块仍可命中（无半成品）、失效记录内存与 JSONL 跨进程均可查询、ledger 不可写 / 损坏行各自具名。三次一次性 mutation 验证用例可承重（fake 不真关区间 / 驱动把不可达咽成空成功 / 不消费 T13 `parse_changed` 信号，分别失败 2 / 1 / 3 例），随后还原且 `git diff` 干净。全为小样脚本化用例，不读大语料、不起检索服务进程、不访外网，故未新增 `eval` mark 测试。真实检索服务的失效联调留待线 B（iknow-memory）就绪。
+
+19. **[parallel] 能力默认全启用：8 键快照 + 静态检查** — tag: `[implementation]`
+    - **Inherits:** ADR 0039 与 SC25：产品调用路径不携带任何关闭检索能力的参数。K1：fin 侧维护一份能力开关键名快照，逐项对应 B4 的 8 个能力项，条目数必须恰为 8（多、缺、为空即失败），键名取检索服务侧枚举名，枚举变更时快照必须同步；K2：产品调用的参数集合中，命中前缀形式 `^(disable|no|off|without|exclude)_<X>$`、后缀形式 `^<X>_(enabled|disabled|off|on)$` 且取值为假值、或键名直接等于 `<X>` 且取值为假值，均计入"能力关闭类键"；断言：命中 K2 的键数 = 0，且快照存在、条目数 = 8、非空。SC26：同一份评测集上，产品路径与"全开"评测配置的命中 locator 集合相同（顺序与分数可不同）。
+    - **Surface:** `retrieve` + `corpus`（键名快照与静态检查入口）
+    - **Acceptance:** 快照文件存在、条目数恰为 8、非空，且与检索服务侧公布的枚举逐项对应（枚举变更时有一处显式的同步点）；对产品调用路径跑一次静态检查，命中 K2 形式的参数键数 = 0；同一份评测集上产品路径与"全开"配置的命中 locator 集合相同；`uv run pytest -q` exits 0。
+    - **Completion:** 快照的数据形态与静态检查的载体（测试 / lint 规则 / 脚本）由实现者定；8 个键名逐字固定、不得自造等价名。
+    - [blocks: T14]
+    - Status: [x] done —— K1 快照落盘 `data/retrieval/capability_keys.json`（8 键逐字 `vector` / `keyword_bm25` / `cjk_segmentation` / `phrase` / `field_boost` / `graph_ppr` / `rrf` / `rerank`，取自 spec §B4「消融的 8 个能力项」行）；`fin.retrieve.capabilities` 是 K1 / K2 的单一权威：`load_capability_keys` 校验存在 / 恰 8 条 / 非空 / 无空白键 / 无重复（三个稳定 code `capability_snapshot_missing` / `capability_snapshot_malformed` / `capability_snapshot_count_mismatch`），`published_capability_keys` 直接回读 spec §B4 表行的反引号 token（不在代码里另抄一份枚举），`assert_snapshot_matches_published` 即「枚举变更时的唯一显式同步点」——不一致抛 `capability_enumeration_drift` 且两侧清单都打印，表行缺失抛 `capability_enumeration_row_missing`。K2 三形式逐字落在 `classify_capability_key`：前缀 `^(disable|no|off|without|exclude)_<X>$`（任意取值即命中）、后缀 `^<X>_(enabled|disabled|off|on)$` 且假值、键名等于 `<X>` 且假值；`capability_switch_hits` 作用于运行期参数映射，`scan_source_for_capability_switches` 以 AST 把同一判据作用于源码（调用关键字实参、函数形参与默认值、字典字面量字符串键、`d["k"] = v` 下标赋值），静态读不出字面量的取值按「未证明为真」计为命中而非放行。静态检查的载体是测试 `tests/retrieve/test_capability_static_check.py`，扫描范围为 `PRODUCT_CALL_PATH_FILES` 五个产品调用路径文件（`src/fin/retrieve/port.py` / `tool.py` / `mcp_adapter.py` + `src/fin/host/graph.py` / `compile.py`；评测路径刻意不在内——开关只许在那边），扫描目标读不到即 `product_call_path_target_missing`，杜绝「扫了 0 个文件所以 0 命中」。SC26 由 `fin.retrieve.fake_capability_port.CapabilityAwareFakePort` 驱动：产品 seam `retrieve()` 与 `RetrievePort` 同签名、无能力参数可传（服务端默认全开），评测 seam `retrieve_for_eval(capabilities=...)` 是唯一收配置处且必须裁决全部 8 键（`capability_configuration_incomplete` / `unknown_capability`）；6 个生产型能力决定命中集，`rrf` / `rerank` 只动顺序。验证：`uv run pytest -q` → 1565 passed / 1 failed（唯一失败为预存允许项 `test_gc_hard_deletes_transported_rows_past_the_retention_window`）/ 46 skipped（基线 1493 passed，本弹 +72）；72 个新用例逐条覆盖 Acceptance：快照存在 / 恰 8 条 / 非空 / 逐字有序 / 无重复，条目数 0 / 7 / 9 三种参数化各自具名失败，K2 三形式参数化（后缀与裸键取真值不命中，`vectorizer` / `rerank_threshold` / `no_rerank_at_all` 等相邻键名不误报，全开配置本身不命中），`scan_product_call_path() == ()` 且五个扫描目标逐个 `is_file()` 并可 `ast.parse`，脚本化评测集上产品路径与全开配置的命中 locator 集合逐 query 相同，8 键逐项关闭各自使结果改变（6 个生产型能力使 locator 集合真收缩，两个融合能力只动顺序不动集合）。四次一次性 mutation 验证用例可承重：① `tool.py` 产品调用加 `disable_rerank=True` → 静态检查以 `prefix/rerank` 失败；② `mcp_adapter.py` 的 MCP `arguments` 字面量加 `"graph_ppr": False` 与 `"vector_enabled": 0` → `bare` 与 `suffix` 两形各自命中失败；③ 快照把 `graph_ppr` 改成等价名 `graph_multi_hop` → 逐字用例与同步点两条失败并打印两侧清单；④ fake 的产品 seam 偷偷关掉 `graph_ppr` → SC26 平价用例失败；四次均已还原，`git diff` 干净。全为小样脚本化用例，不读大语料、不起检索服务进程、不访外网，故未新增 `eval` mark 测试。检索服务真实公布枚举的联调与消融矩阵本身留待线 B（iknow-memory）就绪与 T22。
+
+20. **[parallel] 降级信号消费：`degraded` 不当空结果** — tag: `[implementation]`
+    - **Inherits:** B3（唯一权威定义）：字段名逐字为 `degraded` 与 `degraded_reasons`，不得另立名称、另作翻译或改用等价表述；置位规则四条（凭证 / 地址缺失无法尝试 → 置位；已尝试失败 → 置位；已尝试未命中 → 不置位；调用方显式关闭 → 不置位）；禁止的静默形态；消费规则：为真时不得把该次结果当作完整结果。SC39：注入 `degraded` 为 true 的响应后，fin 侧既未记录原因也未暴露可见信号的次数 = 0；降级不得放宽引用门的任何判定。
+    - **Surface:** `retrieve`（信封读取）+ `host`（用户侧可见信号与终局处置）
+    - **Acceptance:** 注入 `degraded` 为 true 的响应后，fin 侧记录 `degraded_reasons` 的**每一项**并向用户侧暴露可见信号（两者都发生的缺失次数 = 0）；请求失败时降级转为具名失败而非空结果；`degraded` 为真不会放宽引用门的任何判定；字段名逐字为 `degraded` / `degraded_reasons`，代码中无另立名称；`uv run pytest -q` exits 0。
+    - **Completion:** 可见信号的呈现形态（日志 / SSE 帧 / 终局文案）与记录位置由实现者定；引用门规则不改。
+    - [blocks: T14]
+    - Status: [x] done —— 消费侧落在两个新模块加三个既有 seam。`fin.retrieve.degradation` 是 §B3 在 fin 侧的单一权威：字段名常量 `DEGRADED_FIELD = "degraded"` / `DEGRADED_REASONS_FIELD = "degraded_reasons"` 逐字，`FORBIDDEN_DEGRADED_ALIASES` 把 `isDegraded` / `is_degraded` / `degradedReasons` / `degraded_reason` / `degradation_reasons` / `degrade` / `downgraded` / `fallback_reasons` / `降级` / `降级原因` 十种等价表述在信封层判为具名失败 `degraded_field_alias`（既不当真也不忽略），另有一条静态用例对 `mcp_adapter.py` / `degradation_notice.py` / `graph.py` / `stream_map.py` 四个文件做 word-boundary 扫描，锁死代码中无另立名称；`read_degradation_signal` 严格读信封——缺 flag 即未降级，但 flag 非 bool、为真而无 reasons、reasons 非字符串列表、有 reasons 无 flag、flag 为假却带 reasons 五类一律 `degraded_envelope_invalid`，「读不懂就当没降级」这一静默形态被堵死；`DegradationLedger` 按 `degraded_reasons` 的**每一项**各记一条（不是「降级了一次」的计数），无 path 纯内存、有 path 即 append-only JSONL 并在构造时重放（落盘先于内存自增，写不动即 `degradation_ledger_unwritable`、坏行即 `degradation_ledger_corrupt`），`FIN_DEGRADATION_LOG` 决定是否落盘；SC39 的断言形态是 `unsignalled_degradation_count()`——按 reason 多重集比对 `retrieve` 阶段与 `user_notice` 阶段，「既未记录也未暴露」的缺失次数直接是一个数，验收值 0。**用户侧可见信号选了运行的 tool trace 一行**（`tool_summaries` → run payload → workspace SSE / SPA 工具区，spec line 32 的既有渲染面）：它是已经端到端到达用户、逐调用对齐的面，不必新开 wire channel，也不必改答案正文（正文是引用门读的 `_last_ai_text`，动它就等于动门的输入），而降级本就属于「这次检索发生了什么」而非「答案说了什么」。`fin.host.degradation_notice` 是 host 侧单一消费点：`consume_degradation(result, ledger=, expose=)` 把 expose 做成必填参数——先记 `retrieve` 阶段、再调用 expose 把 `degradation_notice_line`（逐条列出每个 reason）放上可见面、最后才记 `user_notice` 阶段，故 ledger 说「已暴露」时确实已经暴露。两个消费点各自接线：`_make_retrieve_tool` 把两个逐字字段与渲染好的 notice 写进 ToolMessage 信封（命中与具名失败两条路径都过，`summarize_retrieve` 追加降级从句），`issuer_research_node`（fan-out 分支）追加一条 `tool_summaries` 记录——分支不能是那个可以静默的地方；`compile_graph(degradation_ledger=)` 与 T17 的 mapping ledger 同形、默认走 env，全图共用一本账。检索侧 `MCPRetrieveAdapter` 在解析 hits 之前先读信封（top-level 与 `result` 两处都读）：命中时把两个字段原样带到产品结果上（未降级则**不**加字段，既有 `{"chunks": [...]}` 形状零变化），请求失败时（无 `hits` 键 / JSON-RPC error）转 `RetrieveDegradedFailureError` / code `retrieve_degraded_failure`——挂在既有 `RetrieveUnavailableError` 家族下故老调用方无需改动，但 code 互异且 `error_dict()` 带上 reasons，绝不退化成 `{"chunks": []}`；信封本身读不懂时 `retrieve()` 返回 `{"error": "<具名 code>"}` 而非空结果。**引用门零改动**：`citation_gate.py` 未改一行，且有一条用例断言该文件正文里根本不出现 `degraded` 一词——门无法对它没听说过的信号让步。验证：`uv run pytest -q` → 1630 passed / 1 failed（唯一失败为预存允许项 `test_gc_hard_deletes_transported_rows_past_the_retention_window`）/ 46 skipped（基线 1565 passed，本弹 +65）；新增 `tests/retrieve/test_degradation.py`（45 例）与 `tests/host/test_degradation_signal.py`（20 例）逐条覆盖 Acceptance：注入 degraded 响应后每一项 reason 均落账且 `unsignalled_degradation_count() == 0`（单次、连续三次、tmp_path JSONL 跨进程重载三种形态各断言一次），端到端跑图后每个 reason 都出现在 `_run_to_response_payload()["tool_summaries"]` 中；失败态断言信封 `error == "retrieve_degraded_failure"`、带 reasons、**无 `chunks` 键**、不产生 evidence；「不放宽引用门」四条 pin——降级下无引文跨度的答案不得 done（同脚本未降级版本作为对照）、降级下有跨度的答案照常 done 且引文不变、降级下 `unknown_locator` 仍 refuse、门的源码不含该字段名。三次一次性 mutation 验证用例可承重：① 在 `citation_gate_node` 里加「见到 degraded 即直接 done」的放宽分支 → 三条门 pin 全部失败（`assert 'done' == 'refuse'` 等）；② 删掉 `consume_degradation` 的 `expose(signal, line)`（只记账不暴露）→ 四条可见性用例失败而计数用例仍过，证明可见性断言不是靠 ledger 自证；③ 把降级失败塌回通用 `RetrieveUnavailableError` → 四条具名失败用例失败；三次均已还原，`git diff` 干净。全为小样脚本化用例（脚本化 port 与脚本化 `_call_mcp`），不读大语料、不起检索服务进程、不访外网，故未新增 `eval` mark 测试。真实检索服务置位 `degraded` 的联调留待线 B（iknow-memory）就绪。
+
+21. **[parallel] 无效输入与合法空结果的二分** — tag: `[implementation]`
+    - **Inherits:** B2 第 5 条与 SC42 / SC43：空文档、空查询、空块批次推送、**冲突**过滤条件（互斥条件同时指定）属无效输入 → 具名失败（typed error），不返回空结果冒充"命中为空"，且不置 `degraded`；入参有效而未命中、**未知**过滤条件（语法合法但无匹配）属合法空结果 → 成功响应与空结果列表，不抛异常、不置 `degraded`。断言：注入无效输入后未返回 typed error 或未计入"输入校验失败"计数的次数 = 0；注入有效但未命中的查询后被当作失败或被置 `degraded` 的次数 = 0。
+    - **Surface:** `retrieve` + `corpus`
+    - **Acceptance:** 空文档 / 空查询 / 空块批次 / 冲突过滤条件四类各自返回具名 typed error，且均**不**置 `degraded`，同时计入"输入校验失败"计数；有效但未命中的查询、未知过滤条件各自返回成功响应与空结果、不抛异常、**不**置 `degraded`；两类不被混同；`uv run pytest -q` exits 0。
+    - **Completion:** 具名错误的载体与计数落盘位置由实现者定；"入参非法不是能力失败"这条不可变通。
+    - [blocks: T14]
+    - Status: [x] done —— 新增 `fin.retrieve.input_validation` 作为二分的单一权威：`InputValidationError` 家族（`code` + `input_class` + 逐字 `degraded` / `degraded_reasons` 默认不置位）落两个检索侧具名失败 `empty_query` / `conflicting_filters`，推送侧 T16 的 `PushEmptyBatchError` 改为同时继承该基类、并新增 `PushEmptyDocumentError`（`push_empty_document`，推送记录无文本），语料侧 `empty_source` / `no_units` 由**闭集 code 注册表**归入同一 `empty_document` 类（两个 code 直接读 `fin.corpus.errors` 的类属性而非另抄，两个 push code 以字符串登记 + 一条 pin 用例对齐 `.code`，避免 `push_port` 与本模块循环 import）；四类 → `INPUT_VALIDATION_CLASSES`（`empty_document` / `empty_query` / `empty_batch` / `conflicting_filters`）。「输入校验失败」计数落 `InputValidationLedger`（无 path 纯内存、有 path 即 append-only JSONL 并在构造时重放，落盘先于内存自增，写不动即 `input_validation_ledger_unwritable`、坏行即 `input_validation_ledger_corrupt`，`FIN_INPUT_VALIDATION_LOG` 决定是否持久化），每个 port / store 挂一本（`input_validation_failures` 懒建，故「没配日志」只是不持久化、不是不计数）；`raise_input_failure` 把「计数」与「抛具名错」合成一个动作，`record_input_failure` 拒绝两种形状——不属四类者抛 `unclassified_input_failure`（计数不做万能桶）、声明了 `degraded` 者抛 `invalid_input_marked_degraded`（「入参非法不是能力失败」在取数处强制，不只在测试里）。**「不置位」复用 T20 而非另造**：`degradation_signal_of_failure` 用 `DegradationSignal.as_envelope_fields()` 构信封再过 `read_degradation_signal`，两个字段名仍只在 `fin.retrieve.degradation` 里拼写一次。合法空结果与两类不混同的判据收在 `observe_input_outcome` 一处（返回 `invalid_input` / `legal_empty` / `hits` / `other_failure`），故「不被混同」是同一判断的一次直接对比而非两个形状的目测；`is_empty_result` 明确「`{"error": ...}` 信封不是空结果」。**语义变更**（本弹改判，已一次改到位）：空查询与冲突过滤条件由原先 `{"chunks": []}` 改为具名 typed error，四个 port 实现（`bm25` / `fake_port` / `mcp_adapter` / `fake_capability_port` 的 `_run`）统一前置校验、`port.py` / `tool.py` / `bm25.py` / `fake_port.py` / `mcp_adapter.py` 的 docstring 同步改写，四条依赖旧语义的既有用例改判（`test_bm25.py` 空查询 + 冲突过滤两条、`test_fake_port.py` 空查询、`test_mcp_adapter.py` 空查询），未留两套并存语义。冲突判据是**可证明**的互斥而非猜测：`detect_filter_conflict` 只在 fin 手上有绑定时判——已知 `document_id` 钉住一行故与该行字段值不同的过滤条件互斥、已知 `ticker` 绑定某 `cik` 故指向另一 issuer 的 `cik` 互斥；无 `manifest_docs` 即不判（有一条用例把该边界钉死），未知值一律是合法空结果。`FakeRetrievePort` 同步补 `manifest_docs`（有绑定时真按元数据收窄命中，否则未知过滤条件无法与冲突区分；无绑定时仍是原 no-op，故既有调用方零影响）。host 侧 `_make_retrieve_tool` 捕获 `InputValidationError` 转 `{"error": <code>}` 具名 EXIT（无 `chunks` 键、不产生 evidence），所以模型传空 query 不会掀掉整个 run，也不会读到「语料没东西」；fanout 分支同步把入参非法与传输不可达分开归因。**引用门与 `unknown_locator` 零改动**：`citation_gate.py` 未改一行，并新增一条用例断言 `unknown_locator` 不在本弹注册表内（既有语义不被本弹改判）。验证：`uv run pytest -q` → **1678 passed / 1 failed（唯一失败为预存允许项 `test_gc_hard_deletes_transported_rows_past_the_retention_window`）/ 46 skipped**（基线 1630 passed，本弹 +48 = 新增 `tests/retrieve/test_input_validation.py` 41 例 + `tests/host/test_input_validation_exit.py` 6 例 + `test_push_failures.py` degraded 分类参数化增 1 例；四条改判用例为原地重写，计数不变）。逐条覆盖 Acceptance：四类无效输入各自具名 + `degraded is False` + 计数 +1（空文档两侧、空查询四种空白、空批次、冲突过滤两种可证明形状），合法空结果两类各自成功返回空列表 + 不抛 + 不置位（有效未命中、五种未知过滤值参数化），两类不混同三处直接对比（port 层、tool 信封层、SC43 的冲突 vs 未知），另有计数跨进程重载、不可写 / 坏行具名、闭集 code 与四类互相对齐、`degraded` 字段名逐字。三次一次性 mutation 验证用例可承重：① fake port 把「无命中」也当无效输入 → 两条合法空结果用例失败；② `PushEmptyBatchError` 偷偷置 `degraded` → 6 条用例失败（含 T16 既有分类用例）；③ 注册表里 push code 拼错一个字母 → 4 条失败（证明 code 对齐用例不是自证）；三次均已还原，`rg MUTATION` 无残留。全为小样脚本化用例，不读大语料、不起检索服务进程、不访外网，故未新增 `eval` mark 测试。刻意不纳入本弹：`fin.corpus.catalog.list_filings` 的过滤语义（ADR 0009 读工具，不是 §B2 管辖的检索信封；纳入需把分类下沉到 `fin.corpus` 之下，与分层相悖，已在模块 docstring 记明）；真实检索服务侧的同一二分留待线 B（iknow-memory）就绪。
+
+### 阶段 3 — 评测收口（依赖线 C 与阶段 2 都完成）
+
+22. **消融矩阵与量化报告：绝对值 + 百分比 + 逐项贡献度** — tag: `[implementation]`
+    - **Inherits:** SC31–SC35：配置总数与构成取 B1「消融矩阵」行（全开 1 + 逐项关闭 8 + 全关 1），关闭项即 B4 的 8 个能力项，一条命令跑完全部配置并落盘，缺失配置数 = 0；每个配置输出 B1「指标集」行的全部字段（引用门通过率由 fin 侧在同一份运行结果上产出）并输出相对"全关"基线的百分比提升（数字，不是"更好"），任一指标缺失的配置数 = 0；重复次数取 B1「消融矩阵」行，落原始值与中位数；报告同时给出全开相对"仅关掉某一项"的差值（该项能力的贡献度）；任一"提升"结论必须同时给出样本数与基线绝对值，只给百分比视为不通过。能力开关只出现在评测调用路径（ADR 0039）。
+    - **Surface:** `corpus`（评测驱动）+ `host`（引用门通过率）+ 仓库脚本面
+    - **Acceptance:** 一条 opt-in 命令跑完全部配置并落盘，缺失配置数 = 0；每个配置的报告含完整指标集，且`引用门通过率`由 fin 侧在同一份运行结果上产出；每个"提升"结论同时给出百分比、样本数与基线绝对值，只给百分比的条数 = 0；每个配置落逐次原始值与中位数，重复次数达 B1 下限；报告含全开相对"仅关掉某一项"的逐项贡献度，缺失项数 = 0；报告可与检索侧报告合并（指标口径一致、不重算对方维度）；默认 `uv run pytest -q` 不收集该命令。
+    - **Completion:** 报告格式、opt-in 入口形态（沿用既有 `eval` mark 还是另立命令）、落盘目录由实现者定；指标清单与配置数一律取 B1，不得在本地另立一套。
+    - [blocks: T14, T10] —— 需要推送链路与数据集都可用。
+    - Status: [x] done —— 入口 `uv run python -m fin.eval.ablation run` 按 §B1 实跑 10 配置 / 40 题 / 每配置 3 次并落盘；缺失配置数 = 0、缺失指标配置数 = 0、逐项贡献 88 项且缺失项数 = 0、百分比-only = 0，报告含逐次原始值与中位数；定向 60 passed、eval 8 passed，全量唯一持续失败为预存 memory dream（live-fetch 与 citation gate 性能单测隔离重跑通过）。
+
+23. **[parallel] 并发评测：L1 检索路径场景 + L2 含 LLM 完整 run 场景 + 全写幂等场景 + 四个补充维度** — tag: `[implementation]`
+    - **Inherits:** SC36 / SC37：L1 的并发数、持续时长、读写比、总请求数下限、错误数判定、延迟阈值全部取 B1「并发 L1（检索 / 读取路径，不含 LLM）」与「延迟阈值」两行，p95 与 p99 落盘且不超阈值、压测前后块总数不变；L2 的并发数与 p50 / p95 判据取 B1「并发 L2（完整 run，含 LLM）」行，不套用「延迟阈值」行；幂等场景的并发数与时长取 B1「并发幂等场景（全写）」行，错误数 = 0 且压测后块总数 = 压测前块总数。SC38：引用门通过率、拒答率（应拒答而拒答 / 应拒答而未拒答）、首命中位置分布、重复提交幂各有一条命令可跑并落盘，缺维度数 = 0；**长文档召回与跨文档多跳召回不属于 fin 的评测维度**，其数字由检索服务侧产出，fin 侧清单中出现这两项的条数 = 0。并发与延迟的具体取值已由 T1 定稿。
+    - **Surface:** `corpus` + `retrieve` + `host`（引用门通过率与拒答率）
+    - **Acceptance:** L1 场景按 B1 的并发数 / 时长 / 读写比跑完，错误数 = 0、总请求数达下限、p50 / p95 / p99 全部落盘且 p95 与 p99 不超阈值（预热请求不计入），压测前后块总数不变；L2 场景按 B1 的并发数与自身 p50 / p95 判据跑完，错误数 = 0；幂等场景全写跑完，错误数 = 0 且压测前后块总数相等；四个补充维度各有一条命令可跑并落盘，缺维度数 = 0；fin 侧评测维度清单中出现"长文档召回""跨文档多跳召回"的条数 = 0；默认 `uv run pytest -q` 不跑这些场景。
+    - **Completion:** 压测驱动方式、落盘格式、opt-in 入口由实现者定；数字一律取 B1，不本地另设阈值。
+    - [blocks: T14, T10]
+    - Status: [x] done —— 新增 `fin.eval.concurrency`：复用 `matrix.py` 动态读取 §B1 的 L1/L2/全写驱动与四个补充维度 CLI；L2 真实凭证缺失以 `l2_credentials_missing` 落盘并 exit 3，fake LLM 结构断言在默认套件；L1（1200 请求）/L2 fake（8 请求）/全写（120 请求）均以 0.05 秒 smoke 实跑，错误数均 0、L1 p50/p95/p99 均落盘、块总数不变，四命令缺维度数均 0；定向 14 passed，全量 1724 passed / 1 预存 failed / 46 skipped / 79 deselected，T19 29 passed；smoke 未替代 120 秒达标运行，T10 known_gaps 原样保留。
+
+24. **静默失败清零：失败清单逐条具名且留痕** — tag: `[implementation]`
+    - **Inherits:** SC40："本 spec 涉及的失败路径（解析失败、OCR 不可用、推送不可用、协议失败、映射失败、失效失败、后台路径失败）在失败清单中逐条具名，且各自留下可断言的痕迹（具名错误码 / 计数 / 可列举记录）；清单中出现『无痕迹的失败路径』条数 = 0"；B3：任何失败路径必须留下可断言的痕迹——信封标记、具名错误码、可列举的失败记录，三者必居其一；SC46：不出现空 `except`、不出现"失败即空成功"。
+    - **Surface:** `corpus` + `retrieve` + `host`（跨切片的清单收口）
+    - **Acceptance:** 七类失败路径在一份失败清单中逐条具名，每条都能被一条断言命中（具名错误码 / 计数 / 可列举记录三者居其一），清单中"无痕迹的失败路径"条数 = 0；全仓不出现空 `except` 吞掉本计划涉及的失败；`uv run pytest -q` exits 0，且默认套件仍不读大语料、不起检索服务进程、不访问外网。
+    - **Completion:** 清单的载体（文档 / 测试断言表 / 运行时注册表）与留痕形态由实现者定；"每条失败都可断言"是硬约束。
+    - [blocks: T16, T18, T20, T21]
+    - Status: [x] done —— 新增 `fin.retrieve.failure_catalog` 可执行失败清单并绑定真实 code/计数/记录；catalog 实际为 10 个 catalog 条目：七类逻辑路径之外，journal persistence/replay 细分为 3 个可独立断言的子路径（unwritable / unreadable / corrupt）；定向回归覆盖每个 code，全仓静态的空 `except` 0 个
+
+---
+
+## End-of-round: code review phase（一次，非每弹）
+
+全部 24 弹落地后，对整轮 diff 做**一次** code review（不 per-commit 重复）。review 基准：`specs/corpus-retrieval.md` 的 46 条 Success Criteria、跨仓对齐基线章节（B1–B6）、ADR 0037 / 0038 / 0039 及本轮新增 ADR，以及仓库既有 Standards。跨仓项额外复核：字段名逐字一致（`source_ref`、`degraded`、`degraded_reasons`、8 个能力键）、数字口径未在本地另立一套、切分未出现在 **iknow-memory** 侧。
+
+## 待写入
+
+- **CONTEXT 新术语：** 空 —— spec 的 13 个术语缺口与「精度层」「权威源」「派生索引」均已由 persist 提交写入 `docs/CONTEXT.md`；本轮切片未再引入新词。
+- **ADR 新增（自 0040 起）：** 跨仓对齐基线；降级信号与部分失败语义；评测量化与并发基线。→ 由 T2 产出。
+- **ADR 重开：** ADR 0030 / ADR 0032 的"切分归检索服务 / 切分留在 fin 之外"条款需标注由 ADR 0037 改判，其余决定不变。→ 由 T3 产出。
+- **既有 spec 冲突表述同步：** 三份 spec 中"切分归检索服务"方向的表述需改为"切分归 fin、排序仍留在外"并指向 ADR 0037。→ 由 T3 产出。

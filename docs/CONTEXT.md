@@ -53,8 +53,26 @@ The only retrieve dependency fin is allowed to have: `query` (+ optional filters
 _Avoid_: search API, vector store, conflating with the memory port
 
 **retrieve adapter**:
-The implementation behind the retrieve port. Default pytest uses a Fake port. When configured, product retrieve is an MCP 2.0 client (protocol-testable against a compliant public or fixture server); hits map to fin locators as `source_ref`. In-process BM25 is archived (ADR 0007; ADR 0030 superseded by 0032). Ranking and chunking for remote memory stay outside fin; the extracted cite tree stays in fin.
-_Avoid_: shipping BM25 as the product path, hybrid/RRF implemented in this repo, moving the cite tree into a memory server, compile-time coupling to one memory repo, reusing the memory-backend URL as the retrieve adapter by implication
+The implementation behind the retrieve port. Default pytest uses a Fake port. When configured, product retrieve is an MCP 2.0 client (protocol-testable against a compliant public or fixture server); hits map to fin locators as `source_ref`. In-process BM25 is archived (ADR 0007; ADR 0030 superseded by 0032). Ranking stays outside fin; **切分** is fin's (ADR 0037) and the retrieval service stores and returns pushed chunk text byte-for-byte without re-splitting. The extracted cite tree stays in fin.
+_Avoid_: shipping BM25 as the product path, hybrid/RRF implemented in this repo, re-splitting / truncating / rewriting pushed chunk text on the retrieval side, moving the cite tree into a memory server, compile-time coupling to one memory repo, reusing the memory-backend URL as the retrieve adapter by implication
+
+**降级标记** (`degraded`):
+检索响应信封上的布尔字段 `degraded`（连同同处的 `degraded_reasons` 有限枚举列表）：置位表示存在失败或无法尝试的能力臂，缺省即未降级。已尝试而未命中、以及调用方显式关闭的能力都不置位；fin 必须读取该标记，为真时按部分失败语义处置，不得把降级当合法空结果。
+_Avoid_: 空结果, 静默回退, 确定性伪向量兜底, fail-open 重试, 另立名称（如 `partial` / `fallback` / 中译字段名）
+
+### Retrieval stack
+
+**精度层**:
+由 Elasticsearch 承担的词法能力层（中文分词、Okapi BM25、短语查询、字段加权），与向量互补，在「找实体」与回退两处都在场。不是向量的备路，不做主备切换。
+_Avoid_: 关键词库, 备用召回, Postgres 全文检索, 第二套词法排序实现
+
+**权威源**:
+块文本与其元数据的唯一权威副本，由 Postgres 承担；只保持「权威数据 + 一个向量扩展」的最小职责，不承担词法排序。
+_Avoid_: 缓存, 索引, 把派生索引当权威, 让权威源随索引格式搬迁
+
+**派生索引**:
+向量索引与词法索引，是权威源的派生物；可删除、可从权威源重灌，重灌不影响权威数据。因此向量库可平滑升级而不动权威数据。
+_Avoid_: 第二份数据, 备份, 与权威源互为校验的对等副本
 
 ### Agent
 
@@ -179,7 +197,7 @@ Historical private fixture source 12-PDF freeze (ADR 0004, superseded by 0029). 
 _Avoid_: current catalog, gold SSOT, demo FAQ
 
 **ingest**:
-A CLI that writes frozen locator-unit text from official filings (or the existing extracted tree) into an extracted tree. Retrieve sliding windows are not fin's ranking stack (ADR 0030). The ask path does not fetch EDGAR or open source filings.
+A CLI that writes frozen locator-unit text from official filings (or the existing extracted tree) into an extracted tree. 滑动窗口式**切分**是 fin 的职责而非排序栈（ADR 0037），排序仍留在 fin 之外；the ask path does not fetch EDGAR or open source filings.
 _Avoid_: extract-on-query, host-graph ingest node, putting filing bytes in the checkpointer database
 
 **contract eval**:
@@ -193,3 +211,51 @@ _Avoid_: web-search text as citations, making this the only eval
 **v1 eval slice**:
 Historical nine hand-authored cases against the private fixture source 12 (ADR 0012, superseded by 0029).
 _Avoid_: 40-question matrix as a v1 commitment, treating nine cases as the current ceiling
+
+**冻结单元**:
+fin 解析产出的最小可引用文本单位；文本一经产出即冻结，是 **citation verifier** 逐字符比对的基准。解析规则版本或参数表版本变更即产生新版本单元。
+_Avoid_: chunk, 原始文件, 任意段落, 未冻结的中间解析产物
+
+**切分**:
+fin 把冻结单元文本切成块的过程与规则，是 fin 的职责；切分必须确定性可复现，同一（字节输入 + 规则版本 + 参数表版本）两次切分产物逐字节相同。检索服务对推送文本不做二次切分、截断、重组或归一化改写。
+_Avoid_: chunking, sliding window, 检索侧切分, 按字符硬切, 模型判断切点
+
+**父子分块**:
+fin 切分的产物形态：子块用于精准匹配与引用定位，父块用于给模型完整上下文，命中集是子块且每个子块携带其父块文本。子块文本是父块文本的连续子串，父块文本是冻结单元文本的连续子串；父块不单独作为可命中单元。
+_Avoid_: 双层切分, 段落切分, 父块参与命中, 父子共用一份可召回文本
+
+**场景适配颗粒度**:
+按（文档类型 × 板块 × 内容密度）查一张确定性参数表决定分块参数的做法；同一三元组两次查表返回同一参数组，参数表版本进元数据、版本变更就地全量重建。
+_Avoid_: 自适应切分, 固定统一块长, 用模型判断颗粒度, 双版本参数并存
+
+**结构化元数据**:
+随块一同推送、可被检索侧作为过滤条件消费的字段集，至少包含格式、来源字节哈希、locator 三元组、单元序号、字符数、语言、解析规则版本、参数表版本。缺字段的推送被拒并返回具名失败。
+_Avoid_: 任意 JSON 载荷, 标签云, 与块文本分离存放的第二份属性
+
+**入库推送**:
+fin 把切分后的块及其结构化元数据以幂等方式推送给检索服务的动作；推送文本即最终文本，批量、可断点续传，失败具名返回不静默。
+_Avoid_: 检索侧自拉, 实时单条写入, 本地落盘即算完成, 静默重试
+
+**幂等键**:
+推送去重的身份，是（`source_ref`，内容标识）二元组；内容标识为（块文本 + 归一化规则版本 + 解析规则版本 + 参数表版本）的确定性哈希。同一幂等键重复推送不产生第二份写入，返回同一批块标识。
+_Avoid_: 块标识, request id, 时间戳去重, 内容无关的批次号
+
+**内容失效**:
+冻结单元文本变更时由 fin 对该单元旧块发起的失效动作；检索侧关闭其时间有效区间，使其不再被任何查询时刻命中，不物理删除、可重复执行并留下可查询记录。
+_Avoid_: 物理删除, 覆盖写, 多版本并存, 重建后才算失效
+
+**评测数据集**:
+按跨仓统一口径构建的多格式、多类型真实文档集合及其标注与查询集；样本须真实、带 provenance，且可一键重建。与 **eval fixture** 不同：后者是 git 冻结的快照，前者是规模与构成受契约约束的语料资产。
+_Avoid_: eval fixture, 合成语料, 公开 benchmark 榜单, 占位文本
+
+**真实语料注入**:
+把真实（非合成、非占位）语料按来源与许可记录引入**评测数据集**的过程；缺来源或标记为合成的样本不计入规模。
+_Avoid_: 合成生成, 占位文本, 无许可抓取, 以数量凑规模
+
+**并发评测**:
+在统一的并发数、持续时长与读写比下跑检索与推送，并把 p50 / p95 / p99 与错误数落盘的评测场景；含读为主的主场景与全写的幂等场景，错误数须为 0。
+_Avoid_: 压测, 负载测试, 单机串行基线, 只报均值
+
+**消融**:
+逐个关闭单个能力项、与全开 / 全关基线对照的评测方法；每个配置重复多次并落原始值与中位数，结论须同时给出百分比与绝对值。
+_Avoid_: A/B 测试, 参数扫描, 定性对比, 只给百分比的结论

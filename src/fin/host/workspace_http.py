@@ -1113,7 +1113,11 @@ def _persist_and_close_stopped_run(
         # The thread was deleted while the run was being stopped; do
         # not resurrect it. The frames below still close the wire so
         # the SPA's reader does not hang.
-        pass
+        logger.debug(
+            "run %s stop finalized after thread %s was deleted",
+            run_id,
+            thread_id,
+        )
     if hasattr(graph, "finalize_abandoned_run"):
         graph.finalize_abandoned_run(
             thread_id,
