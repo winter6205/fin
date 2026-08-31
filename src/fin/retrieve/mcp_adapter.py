@@ -317,18 +317,28 @@ def _validate_tool_response(
     return response
 
 
-def _degradation_of_response(response: Any) -> DegradationSignal:
-    """The §B3 signal this response carries, wherever it sits.
+def _degradation_of_response(
+    response: Any,
+    *,
+    business_result: Any | None = None,
+) -> DegradationSignal:
+    """Read the §B3 signal from the relevant response envelope.
 
     Servers put it on the tool result; a JSON-RPC error envelope has no
-    result to put it on, so the top level is read too. Both are read
-    strictly — an unreadable signal raises rather than passing as 未降级.
+    result to put it on, so the top level is read too. Once the canonical
+    content block has been decoded, ``business_result`` is the actual
+    business envelope and is read last. All layers are read strictly —
+    an unreadable signal raises rather than passing as 未降级.
     """
     top_level = read_degradation_signal(response)
     if top_level.degraded:
         return top_level
     if isinstance(response, dict):
-        return read_degradation_signal(response.get("result"))
+        result_signal = read_degradation_signal(response.get("result"))
+        if result_signal.degraded:
+            return result_signal
+    if business_result is not None:
+        return read_degradation_signal(business_result)
     return NOT_DEGRADED
 
 
@@ -604,13 +614,13 @@ class MCPRetrieveAdapter:
         # carry it beside the JSON-RPC error or inside ``result``.
         # Read BEFORE the failure branches so a degraded failure keeps
         # its reasons instead of collapsing into a bare unavailable.
-        signal = _degradation_of_response(response)
+        envelope_signal = _degradation_of_response(response)
 
         # JSON-RPC error response: surface as unavailable.
         if isinstance(response, dict) and "error" in response:
             raise _unavailable(
                 f"MCP returned JSON-RPC error: {response['error']!r}",
-                signal,
+                envelope_signal,
             )
 
         # Result shape: accept three envelope variants for
@@ -637,7 +647,8 @@ class MCPRetrieveAdapter:
                 result = response
             else:
                 raise _unavailable(
-                    f"MCP returned non-dict result: {result!r}", signal
+                    f"MCP returned non-dict result: {result!r}",
+                    envelope_signal,
                 )
         # Variant 3: content-block envelope.
         if "hits" not in result and "content" in result:
@@ -653,8 +664,12 @@ class MCPRetrieveAdapter:
                         raise RetrieveUnavailableError(
                             f"MCP content text is not JSON: {exc}"
                         ) from exc
-                    if isinstance(inner, dict) and "hits" in inner:
+                    if isinstance(inner, dict):
                         result = inner
+        signal = _degradation_of_response(
+            response,
+            business_result=result,
+        )
         hits = result.get("hits")
         if not isinstance(hits, list):
             raise _unavailable(

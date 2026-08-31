@@ -475,6 +475,26 @@ def test_empty_hit_envelope_maps_to_empty_chunks(envelope: dict) -> None:
     assert adapter.retrieve("foo") == {"chunks": []}
 
 
+def test_content_block_business_envelope_propagates_degradation_signal() -> None:
+    """Canonical MCP content blocks carry the business envelope inside
+    ``result.content[0].text``; its degradation fields must be consumed
+    after that JSON is decoded."""
+    envelope = _content_block(
+        {
+            "hits": [],
+            "degraded": True,
+            "degraded_reasons": ["vector:unavailable"],
+        }
+    )
+    adapter = _ScriptedAdapter(scripted_response=envelope)
+
+    assert adapter.retrieve("foo") == {
+        "chunks": [],
+        "degraded": True,
+        "degraded_reasons": ["vector:unavailable"],
+    }
+
+
 def test_empty_hit_envelope_does_not_raise_on_the_async_path() -> None:
     """The async seam agrees with the sync one: an empty hit list
     resolves, it does not raise ``RetrieveUnavailableError``."""
