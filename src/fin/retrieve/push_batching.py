@@ -145,6 +145,27 @@ class PushJournalUnwritableError(PushError):
     code = "push_journal_unwritable"
 
 
+class PushJournalUnreadableError(PushError):
+    """The background push journal could not be read for replay.
+
+    A journal path that is a directory, inaccessible, or otherwise
+    unreadable is a named failure rather than a fresh empty journal.
+    """
+
+    code = "push_journal_unreadable"
+
+
+class PushJournalCorruptError(PushError):
+    """The background push journal contains an unreplayable event.
+
+    Invalid JSON and JSON objects with a damaged event shape are kept
+    distinct from read failures so operators can repair the journal
+    content instead of changing its permissions or location.
+    """
+
+    code = "push_journal_corrupt"
+
+
 def expected_block_total(records: Sequence[PushRecord]) -> int:
     """The block total a complete push of ``records`` must reach.
 
@@ -287,14 +308,78 @@ class PushJournal:
             ) from exc
 
     def _replay(self, path: Path) -> None:
-        for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            contents = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise PushJournalCorruptError(
+                f"push journal at {path} is not valid UTF-8: {exc}"
+            ) from exc
+        except OSError as exc:
+            raise PushJournalUnreadableError(
+                f"cannot read push journal at {path}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        for number, line in enumerate(contents.splitlines(), start=1):
             if not line.strip():
                 continue
-            event = json.loads(line)
-            if event["event"] == _EVENT_COMPLETED:
-                self._apply_completed(str(event["batch_key"]))
-            elif event["event"] == _EVENT_FAILED:
-                self._apply_failed(event)
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise PushJournalCorruptError(
+                    f"push journal {path} line {number} is not valid JSON: "
+                    f"{exc}"
+                ) from exc
+            try:
+                self._apply_replayed_event(event)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PushJournalCorruptError(
+                    f"push journal {path} line {number} is not a "
+                    f"replayable event: {type(exc).__name__}: {exc}"
+                ) from exc
+
+    def _apply_replayed_event(self, event: object) -> None:
+        if not isinstance(event, dict):
+            raise TypeError(
+                f"event is {type(event).__name__}, expected an object"
+            )
+        event_name = event.get("event")
+        if event_name == _EVENT_COMPLETED:
+            self._validate_replayed_event(event, failed=False)
+            self._apply_completed(event["batch_key"])  # type: ignore[arg-type]
+        elif event_name == _EVENT_FAILED:
+            self._validate_replayed_event(event, failed=True)
+            self._apply_failed(event)
+        else:
+            raise ValueError(f"unsupported event {event_name!r}")
+
+    @staticmethod
+    def _validate_replayed_event(
+        event: dict[str, object], *, failed: bool
+    ) -> None:
+        required = ["event", "batch_key", "batch_index", "block_count"]
+        if failed:
+            required.extend(("code", "message", "source_refs"))
+        missing = [field for field in required if field not in event]
+        if missing:
+            raise KeyError(f"missing fields: {', '.join(missing)}")
+        if not isinstance(event["batch_key"], str) or not event["batch_key"]:
+            raise TypeError("batch_key must be a non-empty string")
+        for field in ("batch_index", "block_count"):
+            value = event[field]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise TypeError(f"{field} must be a non-negative integer")
+        if not failed:
+            return
+        if not isinstance(event["code"], str) or not event["code"]:
+            raise TypeError("code must be a non-empty string")
+        if not isinstance(event["message"], str):
+            raise TypeError("message must be a string")
+        source_refs = event["source_refs"]
+        if not isinstance(source_refs, list) or not all(
+            isinstance(ref, str) for ref in source_refs
+        ):
+            raise TypeError("source_refs must be a list of strings")
 
     def _apply_completed(self, key: str) -> None:
         self._completed.setdefault(key, None)
@@ -381,6 +466,8 @@ __all__ = [
     "BatchPlan",
     "BatchedPushOutcome",
     "PushJournal",
+    "PushJournalCorruptError",
+    "PushJournalUnreadableError",
     "PushJournalUnwritableError",
     "batch_key",
     "expected_block_total",
