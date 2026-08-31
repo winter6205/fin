@@ -91,6 +91,10 @@ from fin.host.citation_gate import (
     EvidenceItem,
     verify_citations,
 )
+from fin.host.evidence_admission import (
+    admit_retrieved_chunks,
+    evidence_from_chunks,
+)
 from fin.host.state import (
     AgentState,
     FANOUT_RESET,
@@ -119,6 +123,7 @@ from fin.host.tools.issuer_fanout import (
 )
 from fin.host.track_decision import decide_track, snapshot_delta_for_utterance
 from fin.retrieve import MCPRetrieveAdapter, FakeRetrievePort
+from fin.retrieve.hit_mapping import MappingFailureLedger, ledger_from_env
 from fin.retrieve.tool import retrieve
 from fin.retrieve.port import RetrievePort
 
@@ -373,13 +378,24 @@ def _make_read_file_tool():
     return read_file_tool
 
 
-def _make_retrieve_tool(adapter: RetrievePort):
+def _make_retrieve_tool(
+    adapter: RetrievePort,
+    *,
+    mapping_ledger: MappingFailureLedger | None = None,
+):
     """Build the ``retrieve`` host tool.
 
     The tool wraps T4's ``retrieve`` (which is the port-seam)
     with the factory's shared adapter. On a hit, each chunk
     contributes one ``EvidenceItem`` to ``AgentState``. An empty
     contract (``{"chunks": []}``) contributes nothing.
+
+    Evidence admission (T17 / SC22): a chunk whose ``source_ref``
+    is not a fin ``Locator`` never mapped back to one, so it is
+    dropped before it can become evidence or reach the serialized
+    envelope, and the drop is counted on ``mapping_ledger``. The
+    citation gate's own rules are unchanged — admission decides
+    what evidence exists, not how the gate rules on it.
 
     Typed EXIT (spec s1-corpus-retrieve § Boundaries): when the
     port returns ``{"error": "retrieve_unavailable"}`` (product
@@ -393,6 +409,9 @@ def _make_retrieve_tool(adapter: RetrievePort):
     The tool's registered name is ``retrieve`` so the model can
     call it by name.
     """
+    ledger = (
+        mapping_ledger if mapping_ledger is not None else ledger_from_env()
+    )
 
     @tool("retrieve")
     def retrieve_tool(
@@ -443,15 +462,12 @@ def _make_retrieve_tool(adapter: RetrievePort):
                     ]
                 }
             )
-        new_evidence: list[EvidenceItem] = []
-        chunks = result.get("chunks", []) if isinstance(result, dict) else []
-        for chunk in chunks:
-            new_evidence.append(
-                EvidenceItem(
-                    locator=chunk.source_ref,
-                    page_text=chunk.text,
-                )
-            )
+        raw_chunks = result.get("chunks", []) if isinstance(result, dict) else []
+        # SC22: hits that did not map back to a locator are dropped and
+        # counted here, so neither the evidence list nor the serialized
+        # envelope below can carry a retrieval-side identifier.
+        chunks = admit_retrieved_chunks(raw_chunks, ledger=ledger)
+        new_evidence: list[EvidenceItem] = evidence_from_chunks(chunks)
         # Serialize the chunks with their Locator as a dict so the
         # ToolMessage is JSON-friendly. The original ``Chunk`` value
         # objects live on ``page_text`` (string) for evidence;
@@ -697,20 +713,24 @@ def _issuer_finding(issuer: str, status: str, **extra: Any) -> dict[str, Any]:
     }
 
 
-def _issuer_evidence(result: Any) -> list[EvidenceItem]:
+def _issuer_evidence(
+    result: Any, *, ledger: MappingFailureLedger
+) -> list[EvidenceItem]:
     """The retrieve result's chunks as ordinary ``EvidenceItem``s.
 
     Fan-out evidence is deliberately indistinguishable from a
     ``read_file`` page here, so the ONE citation verifier after the
     join treats both alike (ADR 0034). Text-less chunks are dropped:
-    they can carry no citable span.
+    they can carry no citable span. Mapping-failed chunks go through
+    the same admission as the single-issuer path (T17 / SC22), so a
+    fan-out branch cannot be the way a retrieval-side identifier
+    reaches the citation gate.
     """
     chunks = result.get("chunks", []) if isinstance(result, dict) else []
-    return [
-        EvidenceItem(locator=chunk.source_ref, page_text=chunk.text)
-        for chunk in chunks
-        if getattr(chunk, "text", "")
-    ]
+    admitted = admit_retrieved_chunks(chunks, ledger=ledger)
+    return evidence_from_chunks(
+        [chunk for chunk in admitted if getattr(chunk, "text", "")]
+    )
 
 
 def _issuer_hit_update(
@@ -1162,6 +1182,7 @@ def compile_graph(
     retrieve_adapter: str = RETRIEVE_ADAPTER_FAKE,
     mcp_command: list[str] | None = None,
     locator_map: dict[str, "Locator"] | None = None,
+    mapping_failure_ledger: MappingFailureLedger | None = None,
 ) -> "_LockedGraph":
     """Build the v1 host graph (T6).
 
@@ -1251,6 +1272,13 @@ def compile_graph(
         :func:`_locator_map_from_tree`; an explicit map overrides
         that derivation. An empty effective map is refused —
         see ``RetrieveAdapterConfigError``.
+    mapping_failure_ledger
+        T17 (SC22): where hits that fail to map back to a locator
+        are counted. ``None`` (the default) resolves the ledger
+        from ``FIN_MAPPING_FAILURE_LOG`` — a path persists the
+        count, unset keeps it in memory. The same ledger is shared
+        by the auto-built MCP adapter and the host's evidence
+        admission, so one number covers both drop sites.
 
     Returns
     -------
@@ -1270,6 +1298,12 @@ def compile_graph(
         ``"mcp"`` auto-build would produce an adapter with an
         empty ``locator_map``.
     """
+    # One mapping-failure counter per graph, shared by the retrieve
+    # adapter's mapper-drop and the host's evidence admission (T17):
+    # both are the same SC22 failure, so they must not be two numbers.
+    if mapping_failure_ledger is None:
+        mapping_failure_ledger = ledger_from_env()
+
     # Build the adapter if the caller did not inject one. The kind
     # comes from configuration only (``retrieve_adapter``), so a
     # test checkpointer cannot force a fake port on a production
@@ -1312,6 +1346,7 @@ def compile_graph(
                 locator_map=locator_map,
                 known_document_ids=known_document_ids,
                 timeout_seconds=5.0,
+                mapping_ledger=mapping_failure_ledger,
             )
 
     if known_document_ids is None:
@@ -1332,7 +1367,9 @@ def compile_graph(
 
     list_files_tool = _make_list_files_tool(mpath, rpath)
     read_file_tool = _make_read_file_tool()
-    retrieve_tool = _make_retrieve_tool(adapter)
+    retrieve_tool = _make_retrieve_tool(
+        adapter, mapping_ledger=mapping_failure_ledger
+    )
     get_xbrl_fact_tool = _make_get_xbrl_fact_tool(fpath)
     # T3 (spec Focus 1): bound LAST so the four prior tools keep
     # their positions — LangChain's tool binding is order-sensitive
@@ -1747,7 +1784,7 @@ def compile_graph(
                 issuer, STATUS_UNAVAILABLE, error=str(result["error"])
             )
 
-        new_evidence = _issuer_evidence(result)
+        new_evidence = _issuer_evidence(result, ledger=mapping_failure_ledger)
         if not new_evidence:
             return _issuer_finding(issuer, STATUS_EMPTY)
         return _issuer_hit_update(issuer, new_evidence)

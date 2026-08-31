@@ -38,13 +38,17 @@ whose ``source_ref`` is not in the map are **dropped** — the
 adapter never passes an iknow-memory id to the citation gate
 (ADR 0030 + spec success-criteria item 7).
 
-Because mapper-drop is silent by design, an adapter built with
-an empty map answers every query with ``{"chunks": []}`` and
-looks perfectly healthy. Wiring the map is therefore the
-caller's job, and ``fin.host.compile_graph`` refuses to build a
-product adapter without one: it derives
-``"{document_id}#{page}"`` keys from the extracted tree unless
-the operator supplies an explicit map.
+Mapper-drop is not silent: every dropped hit is counted on the
+adapter's :attr:`MCPRetrieveAdapter.mapping_failures` ledger with a
+stable reason code (T17 / SC22 — see
+:mod:`fin.retrieve.hit_mapping`), and the ledger persists the count
+when the operator configures a path. The chunks answer is still
+``{"chunks": []}``, so an adapter built with an empty map looks like
+a miss on the wire; the counter is what tells the operator it is not
+one. Wiring the map remains the caller's job, and
+``fin.host.compile_graph`` refuses to build a product adapter
+without one: it derives ``"{document_id}#{page}"`` keys from the
+extracted tree unless the operator supplies an explicit map.
 
 Error contract
 --------------
@@ -87,7 +91,7 @@ import json
 from typing import Any
 
 from fin.corpus.extracted import Locator
-from fin.retrieve.port import Chunk
+from fin.retrieve.hit_mapping import MappingFailureLedger, map_hits_to_chunks
 
 
 _DEFAULT_LIMIT = 8
@@ -293,7 +297,18 @@ class MCPRetrieveAdapter:
     timeout_seconds
         Per-call timeout on the JSON-RPC exchange. Default 5s
         (operator override via constructor).
+    mapping_ledger
+        Where mapper-drops are counted (T17 / SC22). ``None``
+        (the default) means an in-memory ledger this adapter
+        owns — counting is never off, only unpersisted. Pass a
+        ledger with a ``path`` (or share the host's) to make the
+        count outlive the run.
     """
+
+    # Class-level default so the counter exists even for a subclass
+    # that skips ``__init__`` (the documented ``_call_mcp`` test seam
+    # does exactly that). ``mapping_failures`` fills it lazily.
+    _mapping_ledger: MappingFailureLedger | None = None
 
     def __init__(
         self,
@@ -302,6 +317,7 @@ class MCPRetrieveAdapter:
         locator_map: dict[str, Locator] | None = None,
         known_document_ids: set[str] | None = None,
         timeout_seconds: float = 5.0,
+        mapping_ledger: MappingFailureLedger | None = None,
     ) -> None:
         self._command: list[str] | None = (
             list(command) if command is not None else None
@@ -320,8 +336,24 @@ class MCPRetrieveAdapter:
             else None
         )
         self._timeout: float = float(timeout_seconds)
+        self._mapping_ledger = mapping_ledger
 
     # ----- public surface -----
+
+    @property
+    def mapping_failures(self) -> MappingFailureLedger:
+        """The ledger counting this adapter's mapper-drops (SC22).
+
+        An adapter built without one still counts: the default is an
+        in-memory ledger, created on first access, so a map-less
+        adapter's silence is diagnosable from its own surface rather
+        than only from the absence of chunks.
+        """
+        ledger = self._mapping_ledger
+        if ledger is None:
+            ledger = MappingFailureLedger()
+            self._mapping_ledger = ledger
+        return ledger
 
     def retrieve(
         self,
@@ -502,34 +534,17 @@ class MCPRetrieveAdapter:
                 f"MCP returned non-list hits: {hits!r}"
             )
 
-        # Map iknow ids → fin locators; drop unmapped. The cap
-        # is enforced AFTER mapping so the returned list is
-        # the locatable subset, not a slice of unmapped ids.
-        chunks: list[Chunk] = []
-        for hit in hits:
-            if len(chunks) >= effective_limit:
-                break
-            if not isinstance(hit, dict):
-                continue
-            text = hit.get("text", "")
-            if not isinstance(text, str):
-                continue
-            source_ref = hit.get("source_ref")
-            if not isinstance(source_ref, str):
-                continue
-            locator = self._locator_map.get(source_ref)
-            if locator is None:
-                # Mapper-drop: omit this hit; do NOT pass
-                # through an iknow id to the citation gate.
-                continue
-            try:
-                score = float(hit.get("score", 0.0))
-            except (TypeError, ValueError):
-                score = 0.0
-            chunks.append(
-                Chunk(text=text, source_ref=locator, score=score)
-            )
-        return {"chunks": chunks}
+        # Map iknow ids → fin locators; drop unmapped, and count
+        # every drop on the ledger (T17 / SC22: the drop must not be
+        # silent). The cap is enforced AFTER mapping so the returned
+        # list is the locatable subset, not a slice of unmapped ids.
+        chunks = map_hits_to_chunks(
+            hits,
+            locator_map=self._locator_map,
+            limit=effective_limit,
+            ledger=self.mapping_failures,
+        )
+        return {"chunks": list(chunks)}
 
     # ----- transport (test seam) -----
 
