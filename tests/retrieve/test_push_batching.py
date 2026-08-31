@@ -31,6 +31,7 @@ from fin.corpus.push import PushRecord, unit_push_records
 from fin.retrieve.fake_push_port import FakePushPort
 from fin.retrieve.push_batching import (
     PushJournal,
+    PushJournalUnwritableError,
     expected_block_total,
     plan_batches,
     push_in_batches,
@@ -316,6 +317,28 @@ def test_a_non_push_error_is_wrapped_in_a_named_failure_and_journaled() -> None:
     assert isinstance(excinfo.value.__cause__, ValueError)
     assert [failure.code for failure in journal.failures()] == ["push_batch_failed"]
     assert "garbled payload" in journal.failures()[0].message
+
+
+def test_unwritable_journal_is_named_and_does_not_update_memory(
+    tmp_path,
+) -> None:
+    """A journal persistence failure is itself a named background
+    failure, and the in-memory work list changes only after persistence."""
+    journal_parent = tmp_path / "journal-parent"
+    journal_parent.write_text("not a directory", encoding="utf-8")
+    journal_path = journal_parent / "journal.jsonl"
+    journal = PushJournal(path=journal_path)
+    plan = plan_batches(_records(1), batch_size=3)[0]
+
+    with pytest.raises(PushJournalUnwritableError) as excinfo:
+        journal.record_failure(
+            plan,
+            code="push_batch_failed",
+            message="background payload failed",
+        )
+
+    assert excinfo.value.code == "push_journal_unwritable"
+    assert journal.failures() == ()
 
 
 def test_journal_records_are_enumerable_and_replayable_from_disk(tmp_path) -> None:

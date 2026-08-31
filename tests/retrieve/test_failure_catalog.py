@@ -18,6 +18,7 @@ from fin.retrieve.failure_catalog import (
     FAILURE_CATALOG,
     FAILURE_CATEGORY_BACKGROUND,
     FAILURE_CATEGORY_INVALIDATION,
+    FAILURE_CATEGORY_JOURNAL,
     FAILURE_CATEGORY_MAPPING,
     FAILURE_CATEGORY_OCR,
     FAILURE_CATEGORY_PARSE,
@@ -34,6 +35,8 @@ from fin.retrieve.invalidation_port import (
 )
 from fin.retrieve.push_batching import (
     PushJournal,
+    PushJournalUnwritableError,
+    plan_batches,
     push_in_batches,
 )
 from fin.retrieve.push_port import (
@@ -141,8 +144,9 @@ def test_failure_catalog_names_exactly_the_seven_required_paths() -> None:
         FAILURE_CATEGORY_MAPPING,
         FAILURE_CATEGORY_INVALIDATION,
         FAILURE_CATEGORY_BACKGROUND,
+        FAILURE_CATEGORY_JOURNAL,
     }
-    assert len(FAILURE_CATALOG) == 7
+    assert len(FAILURE_CATALOG) == 8
 
 
 def test_failure_catalog_has_zero_untraced_paths() -> None:
@@ -159,6 +163,7 @@ def test_failure_catalog_has_zero_untraced_paths() -> None:
         FAILURE_CATEGORY_MAPPING,
         FAILURE_CATEGORY_INVALIDATION,
         FAILURE_CATEGORY_BACKGROUND,
+        FAILURE_CATEGORY_JOURNAL,
     ],
 )
 def test_every_catalog_code_is_published_by_its_real_failure_surface(
@@ -249,6 +254,25 @@ def test_background_catalog_code_is_triggerable() -> None:
         )
     assert excinfo.value.code == entry.code
     assert journal.failures()[0].code == entry.code
+
+
+def test_journal_persistence_catalog_code_is_triggerable(tmp_path) -> None:
+    entry = _catalog_entry(FAILURE_CATEGORY_JOURNAL)
+    journal_parent = tmp_path / "journal-parent"
+    journal_parent.write_text("not a directory", encoding="utf-8")
+    journal_path = journal_parent / "journal.jsonl"
+    journal = PushJournal(path=journal_path)
+    plan = plan_batches((_record(),), batch_size=1)[0]
+
+    with pytest.raises(PushJournalUnwritableError) as excinfo:
+        journal.record_failure(
+            plan,
+            code=PushBatchFailedError.code,
+            message="background payload failed",
+        )
+
+    assert excinfo.value.code == entry.code
+    assert journal.failures() == ()
 
 
 def test_no_empty_except_handler_exists_in_the_full_fin_source_tree() -> None:
