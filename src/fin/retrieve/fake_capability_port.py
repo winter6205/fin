@@ -15,6 +15,9 @@ exposes two seams:
 * :meth:`CapabilityAwareFakePort.retrieve_for_eval` — the eval seam, the only
   place a capability configuration is accepted. The configuration must decide
   all 8 keys; a partial one is a named failure, not a silently completed run.
+  :meth:`CapabilityAwareFakePort.retrieve_for_eval_with_arms` is the same seam
+  with per-hit arm attribution, which the T22 ablation report needs to produce
+  图臂命中率.
 
 Six of the keys produce hits (a hit surfaces when any of its producing
 retrievers is on); ``rrf`` and ``rerank`` are fusion stages that move order
@@ -164,6 +167,36 @@ class CapabilityAwareFakePort:
         limit: int = 8,
     ) -> dict[str, list[Chunk]]:
         """Run one ablation configuration. All 8 keys must be decided."""
+        effective = self._record_eval_call(query, capabilities)
+        return {"chunks": [hit.chunk for hit in self._ranked(query, effective, limit)]}
+
+    def retrieve_for_eval_with_arms(
+        self,
+        query: str,
+        *,
+        capabilities: Mapping[str, Any],
+        limit: int = 8,
+    ) -> dict[str, Any]:
+        """Eval seam that also says which enabled arms produced each hit.
+
+        The ablation report's 图臂命中率 (§B1「指标集」) is "share of
+        queries with a hit from the graph arm", which is unanswerable
+        from chunks alone. ``arms[i]`` is the set of *enabled*
+        capabilities able to produce ``chunks[i]`` under this
+        configuration, so the attribution follows the configuration
+        rather than the script.
+        """
+        effective = self._record_eval_call(query, capabilities)
+        enabled = {key for key, on in effective.items() if on}
+        ranked = self._ranked(query, effective, limit)
+        return {
+            "chunks": [hit.chunk for hit in ranked],
+            "arms": [frozenset(hit.produced_by & enabled) for hit in ranked],
+        }
+
+    def _record_eval_call(
+        self, query: str, capabilities: Mapping[str, Any]
+    ) -> dict[str, bool]:
         effective = validate_capability_configuration(
             capabilities, keys=self._keys
         )
@@ -174,7 +207,7 @@ class CapabilityAwareFakePort:
                 effective_capabilities=effective,
             )
         )
-        return self._run(query, effective, limit)
+        return effective
 
     # ----- shared retrieval body -----
 
@@ -184,6 +217,14 @@ class CapabilityAwareFakePort:
         capabilities: Mapping[str, bool],
         limit: int,
     ) -> dict[str, list[Chunk]]:
+        return {"chunks": [hit.chunk for hit in self._ranked(query, capabilities, limit)]}
+
+    def _ranked(
+        self,
+        query: str,
+        capabilities: Mapping[str, bool],
+        limit: int,
+    ) -> list[CapabilityHit]:
         # An empty query is invalid input on every port implementation
         # (T21 / §B2 第 5 条), the eval seam included — an ablation run
         # must not read a refused call as "this configuration found
@@ -191,19 +232,19 @@ class CapabilityAwareFakePort:
         validate_query(query, ledger=self.input_validation_failures)
         enabled = {key for key, on in capabilities.items() if on}
         found = [
-            hit.chunk
+            hit
             for hit in self._hits.get(query, [])
             if hit.produced_by & enabled
         ]
         if "rrf" in enabled:
             # Fusion: one merged ranking by score instead of the producers'
             # arrival order.
-            found = sorted(found, key=lambda chunk: -chunk.score)
+            found = sorted(found, key=lambda hit: -hit.chunk.score)
         if "rerank" in enabled:
             # A deterministic order-only permutation standing in for a real
             # cross-encoder: longest passage first, ties keep their position.
-            found = sorted(found, key=lambda chunk: -len(chunk.text))
-        return {"chunks": found[: _resolve_limit(limit)]}
+            found = sorted(found, key=lambda hit: -len(hit.chunk.text))
+        return found[: _resolve_limit(limit)]
 
 
 __all__ = [

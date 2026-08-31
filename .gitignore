@@ -55,3 +55,7 @@ data/workspace/
 
 # corpus rebuild products (T13, rebuildable via fin.corpus.rebuild)
 data/corpus/blocks/
+
+# ablation eval products (T22, rebuildable via `python -m fin.eval.ablation run`;
+# carries per-run latency numbers, so committing it would churn every run)
+data/eval/
