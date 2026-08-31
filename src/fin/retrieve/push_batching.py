@@ -134,6 +134,17 @@ class BatchedPushOutcome:
     block_ids: tuple[str, ...]
 
 
+class PushJournalUnwritableError(PushError):
+    """The background push journal could not persist an event.
+
+    The journal's in-memory state is updated only after this operation
+    succeeds, so callers never observe a completed or failed batch that
+    cannot be replayed from disk.
+    """
+
+    code = "push_journal_unwritable"
+
+
 def expected_block_total(records: Sequence[PushRecord]) -> int:
     """The block total a complete push of ``records`` must reach.
 
@@ -221,10 +232,6 @@ class PushJournal:
 
     def mark_completed(self, plan: BatchPlan) -> None:
         """Record that ``plan`` landed; resolve its failure if it had one."""
-        self._completed.setdefault(plan.key, None)
-        failure = self._failures.get(plan.key)
-        if failure is not None and not failure.resolved:
-            self._failures[plan.key] = replace(failure, resolved=True)
         self._append(
             {
                 "event": _EVENT_COMPLETED,
@@ -233,6 +240,10 @@ class PushJournal:
                 "block_count": len(plan.records),
             }
         )
+        self._completed.setdefault(plan.key, None)
+        failure = self._failures.get(plan.key)
+        if failure is not None and not failure.resolved:
+            self._failures[plan.key] = replace(failure, resolved=True)
 
     def record_failure(
         self, plan: BatchPlan, *, code: str, message: str
@@ -246,7 +257,6 @@ class PushJournal:
             source_refs=plan.source_refs(),
             block_count=len(plan.records),
         )
-        self._failures[plan.key] = failure
         self._append(
             {
                 "event": _EVENT_FAILED,
@@ -258,6 +268,7 @@ class PushJournal:
                 "block_count": failure.block_count,
             }
         )
+        self._failures[plan.key] = failure
         return failure
 
     # ----- persistence -----
@@ -265,9 +276,15 @@ class PushJournal:
     def _append(self, event: dict[str, object]) -> None:
         if self._path is None:
             return
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, sort_keys=True) + "\n")
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with self._path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, sort_keys=True) + "\n")
+        except OSError as exc:
+            raise PushJournalUnwritableError(
+                f"cannot append push journal at {self._path}: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
 
     def _replay(self, path: Path) -> None:
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -364,6 +381,7 @@ __all__ = [
     "BatchPlan",
     "BatchedPushOutcome",
     "PushJournal",
+    "PushJournalUnwritableError",
     "batch_key",
     "expected_block_total",
     "plan_batches",

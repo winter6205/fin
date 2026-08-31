@@ -16,7 +16,10 @@ from fin.corpus.errors import EmptySourceParseError
 from fin.corpus.ocr import OcrRequiredUnavailableError
 from fin.retrieve.hit_mapping import MAPPING_FAILURE_UNMAPPED_SOURCE_REF
 from fin.retrieve.invalidation_port import InvalidationServiceUnavailableError
-from fin.retrieve.push_batching import PushBatchFailedError
+from fin.retrieve.push_batching import (
+    PushBatchFailedError,
+    PushJournalUnwritableError,
+)
 from fin.retrieve.push_port import (
     PushProtocolError,
     PushServiceUnavailableError,
@@ -30,6 +33,7 @@ FAILURE_CATEGORY_PROTOCOL: Final[str] = "protocol_failure"
 FAILURE_CATEGORY_MAPPING: Final[str] = "mapping_failure"
 FAILURE_CATEGORY_INVALIDATION: Final[str] = "invalidation_failure"
 FAILURE_CATEGORY_BACKGROUND: Final[str] = "background_failure"
+FAILURE_CATEGORY_JOURNAL: Final[str] = "journal_persistence_failure"
 
 FAILURE_EVIDENCE_NAMED_ERROR: Final[str] = "named_error"
 FAILURE_EVIDENCE_COUNT: Final[str] = "count"
@@ -105,6 +109,13 @@ FAILURE_CATALOG: Final[tuple[FailureCatalogEntry, ...]] = (
         carrier="fin.retrieve.push_batching.PushJournal.failures",
         code_source=_class_code(PushBatchFailedError),
     ),
+    FailureCatalogEntry(
+        category=FAILURE_CATEGORY_JOURNAL,
+        code=PushJournalUnwritableError.code,
+        evidence=FAILURE_EVIDENCE_NAMED_ERROR,
+        carrier="fin.retrieve.push_batching.PushJournalUnwritableError.code",
+        code_source=_class_code(PushJournalUnwritableError),
+    ),
 )
 
 
@@ -128,6 +139,7 @@ __all__ = [
     "FAILURE_CATALOG",
     "FAILURE_CATEGORY_BACKGROUND",
     "FAILURE_CATEGORY_INVALIDATION",
+    "FAILURE_CATEGORY_JOURNAL",
     "FAILURE_CATEGORY_MAPPING",
     "FAILURE_CATEGORY_OCR",
     "FAILURE_CATEGORY_PARSE",
