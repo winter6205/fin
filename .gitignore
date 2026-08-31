@@ -52,3 +52,6 @@ data/workspace/
 # Cloud start writes these; keep husky pre-commit/pre-push tracked.
 .husky/commit-msg
 .husky/prepare-commit-msg
+
+# corpus rebuild products (T13, rebuildable via fin.corpus.rebuild)
+data/corpus/blocks/
