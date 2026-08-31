@@ -22,6 +22,9 @@ What the fake guarantees
 * **named overflow** (SC44) — a batch above the per-call cap raises
   ``PushBatchOverflowError`` and stores nothing, never a truncated
   prefix;
+* **named refusal of invalid input** — an empty batch raises
+  ``PushEmptyBatchError`` (§B2 第 5 条) instead of being answered with a
+  zero-write success;
 * **named refusal** — an incomplete record raises
   ``PushMetadataIncompleteError`` and the whole batch is refused, so a
   refused push leaves the block total untouched and is counted in
@@ -37,6 +40,7 @@ from fin.retrieve.push_port import (
     PushBatchOverflowError,
     PushError,
     UnknownPushedBlockError,
+    validate_batch_not_empty,
     validate_wire_record,
 )
 
@@ -67,12 +71,15 @@ class FakePushPort:
     def push(self, records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         """Store ``records`` idempotently and report the outcome.
 
-        Validation of the whole batch happens first: an over-sized or
-        incomplete batch is refused before a single write, so the store
-        can never hold half of a refused push and never a truncated
-        prefix of one (SC44).
+        Validation of the whole batch happens first: an empty,
+        over-sized or incomplete batch is refused before a single write,
+        so the store can never hold half of a refused push and never a
+        truncated prefix of one (SC44). An empty batch is invalid input
+        (§B2 第 5 条) and is refused here as well as client-side, so a
+        future transport cannot pass one off as an empty result.
         """
         try:
+            validate_batch_not_empty(records)
             if len(records) > self.max_batch_records:
                 raise PushBatchOverflowError(
                     f"push batch of {len(records)} records exceeds the "
