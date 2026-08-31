@@ -9,22 +9,31 @@ surface is hermetic.
 Boundary classes (mirrors ``RetrievePort`` semantics so tests
 do not care which implementation backs a ``retrieve`` call):
 
-* empty: empty / whitespace-only query → ``{"chunks": []}``
+* empty: empty / whitespace-only query → ``EmptyQueryError``
+  (invalid input, T21); a query with no hits → ``{"chunks": []}``
 * negative: unknown ``document_id`` (when ``known_document_ids``
   is set) → ``{"chunks": []}``
 * overflow: ``limit > 20`` clamps to 20; ``limit <= 0`` falls
   back to 8
 * concurrent: read-only access; thread-safe by construction
-* exception: N/A — the fake port cannot raise on construction
-  or retrieval (no subprocess, no I/O).
+* exception: invalid input only — the fake port has no subprocess
+  and no I/O to fail at, so the named ``EmptyQueryError`` is the
+  one exception it produces.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
 
+import pytest
+
 from fin.corpus.extracted import Locator
-from fin.retrieve import Chunk, FakeRetrievePort, RetrievePort
+from fin.retrieve import (
+    Chunk,
+    EmptyQueryError,
+    FakeRetrievePort,
+    RetrievePort,
+)
 
 
 def _chunk(text: str, document_id: str = "DOC-2023Q1", page: int = 1) -> Chunk:
@@ -42,12 +51,17 @@ def _chunk(text: str, document_id: str = "DOC-2023Q1", page: int = 1) -> Chunk:
 # ----- empty -----
 
 
-def test_empty_query_returns_empty_chunks() -> None:
-    """Boundary 'empty': empty / whitespace-only query yields
-    ``{"chunks": []}`` without raising."""
+def test_empty_query_is_a_named_failure() -> None:
+    """Boundary 'empty': an empty / whitespace-only query is invalid
+    input (T21 / §B2 第 5 条), named and counted — not the miss shape,
+    which belongs to a query the corpus simply has no hits for (the
+    next test)."""
     port = FakeRetrievePort()
     for empty_query in ("", "   ", "\t\n", "\n"):
-        assert port.retrieve(empty_query) == {"chunks": []}
+        with pytest.raises(EmptyQueryError):
+            port.retrieve(empty_query)
+
+    assert port.input_validation_failures.count() == 4
 
 
 def test_unknown_query_returns_empty_chunks() -> None:

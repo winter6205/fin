@@ -85,11 +85,17 @@ from langgraph.types import Command, Send
 
 from fin.corpus.errors import IngestMissingError
 from fin.corpus.extracted import Locator, load_extracted_tree
+from fin.corpus.parsers._common import UnitLocator
+from fin.corpus.push import serialize_source_ref
 from fin.host.citation_gate import (
     HIDDEN_BOUNCE_MARKER,
     Citation,
     EvidenceItem,
     verify_citations,
+)
+from fin.host.evidence_admission import (
+    admit_retrieved_chunks,
+    evidence_from_chunks,
 )
 from fin.host.state import (
     AgentState,
@@ -100,6 +106,11 @@ from fin.host.state import (
     TERMINAL_STATUSES,
 )
 from fin.host.agent_instructions import messages_for_model
+from fin.host.degradation_notice import (
+    DEGRADATION_NOTICE_FIELD,
+    consume_degradation,
+    degradation_notice_entry,
+)
 from fin.host.stream_map import (
     assemble_final_ai_message,
     format_tool_summary,
@@ -119,6 +130,12 @@ from fin.host.tools.issuer_fanout import (
 )
 from fin.host.track_decision import decide_track, snapshot_delta_for_utterance
 from fin.retrieve import MCPRetrieveAdapter, FakeRetrievePort
+from fin.retrieve.degradation import (
+    DegradationLedger,
+    degradation_ledger_from_env,
+)
+from fin.retrieve.hit_mapping import MappingFailureLedger, ledger_from_env
+from fin.retrieve.input_validation import InputValidationError
 from fin.retrieve.tool import retrieve
 from fin.retrieve.port import RetrievePort
 
@@ -189,24 +206,26 @@ def _resolve_path(value: Path | str | None, default: Path) -> Path:
 def _locator_map_from_tree(
     tree: dict[str, tuple[Any, ...]],
 ) -> dict[str, Locator]:
-    """Publish one ``iknow-memory id -> fin Locator`` entry per
-    frozen locator unit in the extracted ``tree``.
+    """Publish one canonical fin ``source_ref`` → ``Locator`` entry
+    per frozen locator unit in the extracted ``tree``.
 
-    ``MCPRetrieveAdapter`` maps each hit's ``source_ref`` through
-    this dict and DROPS whatever is missing, so the map is the
-    only thing standing between a healthy MCP server and a
-    retrieve path that returns nothing.
+    ``MCPRetrieveAdapter`` accepts this stable serialization directly,
+    so the retrieval service's internal id is never used as
+    ``source_ref`` or passed to citation evidence.
 
-    The published id spelling is ``"{document_id}#{page}"``: the
-    identity fin can address without reading iknow-memory's
-    storage. An operator whose iknow-memory corpus was ingested
-    under different ids passes an explicit ``locator_map`` to
-    ``compile_graph``; a stale mapping degrades safely because the
-    citation verifier still matches the claimed span against the
-    frozen unit's text.
+    An explicitly supplied ``locator_map`` remains a named
+    transitional compatibility seam for integrations using
+    ``retrieval_id``; auto-built product maps use only the canonical
+    ``source_ref`` spelling.
     """
     return {
-        f"{document_id}#{page.locator.page}": page.locator
+        serialize_source_ref(
+            UnitLocator(
+                document_id=page.locator.document_id,
+                version=page.locator.version,
+                unit=page.locator.page,
+            )
+        ): page.locator
         for document_id, pages in tree.items()
         for page in pages
     }
@@ -373,13 +392,34 @@ def _make_read_file_tool():
     return read_file_tool
 
 
-def _make_retrieve_tool(adapter: RetrievePort):
+def _make_retrieve_tool(
+    adapter: RetrievePort,
+    *,
+    mapping_ledger: MappingFailureLedger | None = None,
+    degradation_ledger: DegradationLedger | None = None,
+):
     """Build the ``retrieve`` host tool.
 
     The tool wraps T4's ``retrieve`` (which is the port-seam)
     with the factory's shared adapter. On a hit, each chunk
     contributes one ``EvidenceItem`` to ``AgentState``. An empty
     contract (``{"chunks": []}``) contributes nothing.
+
+    Evidence admission (T17 / SC22): a chunk whose ``source_ref``
+    is not a fin ``Locator`` never mapped back to one, so it is
+    dropped before it can become evidence or reach the serialized
+    envelope, and the drop is counted on ``mapping_ledger``. The
+    citation gate's own rules are unchanged — admission decides
+    what evidence exists, not how the gate rules on it.
+
+    Invalid input (T21 / SC42 / SC43): the port raises a named
+    ``InputValidationError`` for an empty query or a provably
+    conflicting filter set, and the tool serializes that code as
+    ``{"error": "<code>"}``. It is NOT rewritten to
+    ``{"chunks": []}`` — an empty result would answer a question
+    that was never asked — and it contributes no evidence. A
+    legal empty result (unknown filter, no hits) keeps the
+    ``{"chunks": []}`` shape it always had.
 
     Typed EXIT (spec s1-corpus-retrieve § Boundaries): when the
     port returns ``{"error": "retrieve_unavailable"}`` (product
@@ -390,9 +430,25 @@ def _make_retrieve_tool(adapter: RetrievePort):
     The error contributes no evidence and triggers no BM25
     fallback; the model can retry or say retrieval is down.
 
+    Degradation (T20 / SC39 / §B3): a response carrying
+    ``degraded`` has every one of its ``degraded_reasons``
+    recorded on ``degradation_ledger``, and the notice rides
+    onto the tool envelope so the run's tool trace tells the
+    user this answer is partial. The flag changes neither the
+    evidence a hit contributes nor the citation gate's rules —
+    a degraded result is usable but must be visible.
+
     The tool's registered name is ``retrieve`` so the model can
     call it by name.
     """
+    ledger = (
+        mapping_ledger if mapping_ledger is not None else ledger_from_env()
+    )
+    degradations = (
+        degradation_ledger
+        if degradation_ledger is not None
+        else degradation_ledger_from_env()
+    )
 
     @tool("retrieve")
     def retrieve_tool(
@@ -418,40 +474,53 @@ def _make_retrieve_tool(adapter: RetrievePort):
         is unavailable the tool returns
         ``{"error": "retrieve_unavailable"}``.
         """
-        result = retrieve(
-            query=query,
-            document_id=document_id,
-            cik=cik,
-            form=form,
-            ticker=ticker,
-            filing_date=filing_date,
-            limit=limit,
-            adapter=adapter,
-        )
+        try:
+            result = retrieve(
+                query=query,
+                document_id=document_id,
+                cik=cik,
+                form=form,
+                ticker=ticker,
+                filing_date=filing_date,
+                limit=limit,
+                adapter=adapter,
+            )
+        except InputValidationError as exc:
+            # Invalid input (T21 / §B2 第 5 条). The port already named
+            # and counted it; the tool's contract is an envelope, so the
+            # code travels as ``{"error": <code>}`` — the same named-EXIT
+            # shape as an unavailable transport, and deliberately NOT
+            # ``{"chunks": []}``, which would tell the model the corpus
+            # is empty for a call that was never askable. The model can
+            # fix its own arguments and retry; the run does not die on a
+            # blank ``query``.
+            result = {"error": exc.code}
         if isinstance(result, dict) and "error" in result:
             # Typed EXIT: surface the port's error dict verbatim.
             # Building evidence / a chunks envelope here would
-            # destroy the distinction the spec requires.
+            # destroy the distinction the spec requires. A degraded
+            # failure keeps its reasons on the same dict (§B2 第 2
+            # 条: 具名失败, not an empty result), and consuming it
+            # here is what puts them in front of the user.
+            envelope = dict(result)
+            _consume_into_envelope(envelope, result, ledger=degradations)
             return Command(
                 update={
                     "messages": [
                         ToolMessage(
-                            content=json.dumps(result, default=str),
+                            content=json.dumps(envelope, default=str),
                             tool_call_id=tool_call_id,
                             name="retrieve",
                         )
                     ]
                 }
             )
-        new_evidence: list[EvidenceItem] = []
-        chunks = result.get("chunks", []) if isinstance(result, dict) else []
-        for chunk in chunks:
-            new_evidence.append(
-                EvidenceItem(
-                    locator=chunk.source_ref,
-                    page_text=chunk.text,
-                )
-            )
+        raw_chunks = result.get("chunks", []) if isinstance(result, dict) else []
+        # SC22: hits that did not map back to a locator are dropped and
+        # counted here, so neither the evidence list nor the serialized
+        # envelope below can carry a retrieval-side identifier.
+        chunks = admit_retrieved_chunks(raw_chunks, ledger=ledger)
+        new_evidence: list[EvidenceItem] = evidence_from_chunks(chunks)
         # Serialize the chunks with their Locator as a dict so the
         # ToolMessage is JSON-friendly. The original ``Chunk`` value
         # objects live on ``page_text`` (string) for evidence;
@@ -468,8 +537,10 @@ def _make_retrieve_tool(adapter: RetrievePort):
             }
             for chunk in chunks
         ]
+        envelope: dict[str, Any] = {"chunks": serialized_chunks}
+        _consume_into_envelope(envelope, result, ledger=degradations)
         tool_message = ToolMessage(
-            content=json.dumps({"chunks": serialized_chunks}, default=str),
+            content=json.dumps(envelope, default=str),
             tool_call_id=tool_call_id,
             name="retrieve",
         )
@@ -478,6 +549,31 @@ def _make_retrieve_tool(adapter: RetrievePort):
         )
 
     return retrieve_tool
+
+
+def _consume_into_envelope(
+    envelope: dict[str, Any],
+    result: Any,
+    *,
+    ledger: DegradationLedger,
+) -> None:
+    """Record ``result``'s degradation and publish it on ``envelope``.
+
+    Publishing IS the exposure: the two verbatim §B3 fields and the
+    rendered notice ride on the envelope the tool trace summarizes, so
+    the reasons reach the user on the same row as the call. The notice
+    record is written only after they are on the envelope.
+    """
+    consume_degradation(
+        result,
+        ledger=ledger,
+        expose=lambda signal, line: envelope.update(
+            {
+                **signal.as_envelope_fields(),
+                DEGRADATION_NOTICE_FIELD: line,
+            }
+        ),
+    )
 
 
 def _make_get_xbrl_fact_tool(facts_root: Path):
@@ -697,20 +793,24 @@ def _issuer_finding(issuer: str, status: str, **extra: Any) -> dict[str, Any]:
     }
 
 
-def _issuer_evidence(result: Any) -> list[EvidenceItem]:
+def _issuer_evidence(
+    result: Any, *, ledger: MappingFailureLedger
+) -> list[EvidenceItem]:
     """The retrieve result's chunks as ordinary ``EvidenceItem``s.
 
     Fan-out evidence is deliberately indistinguishable from a
     ``read_file`` page here, so the ONE citation verifier after the
     join treats both alike (ADR 0034). Text-less chunks are dropped:
-    they can carry no citable span.
+    they can carry no citable span. Mapping-failed chunks go through
+    the same admission as the single-issuer path (T17 / SC22), so a
+    fan-out branch cannot be the way a retrieval-side identifier
+    reaches the citation gate.
     """
     chunks = result.get("chunks", []) if isinstance(result, dict) else []
-    return [
-        EvidenceItem(locator=chunk.source_ref, page_text=chunk.text)
-        for chunk in chunks
-        if getattr(chunk, "text", "")
-    ]
+    admitted = admit_retrieved_chunks(chunks, ledger=ledger)
+    return evidence_from_chunks(
+        [chunk for chunk in admitted if getattr(chunk, "text", "")]
+    )
 
 
 def _issuer_hit_update(
@@ -1162,6 +1262,8 @@ def compile_graph(
     retrieve_adapter: str = RETRIEVE_ADAPTER_FAKE,
     mcp_command: list[str] | None = None,
     locator_map: dict[str, "Locator"] | None = None,
+    mapping_failure_ledger: MappingFailureLedger | None = None,
+    degradation_ledger: DegradationLedger | None = None,
 ) -> "_LockedGraph":
     """Build the v1 host graph (T6).
 
@@ -1245,12 +1347,29 @@ def compile_graph(
         ``retrieve_adapter`` is ``"mcp"`` and no ``adapter`` was
         supplied. Defaults to ``["iknow-memory", "serve"]``.
     locator_map
-        T3 (#76): iknow-memory id → ``fin.Locator`` map passed
+        T3 (#76): explicit compatibility map from ``retrieval_id``
+        (or a legacy ``source_ref`` key) to ``fin.Locator``, passed
         to the auto-built ``MCPRetrieveAdapter``. ``None`` (the
-        default) derives the map from the extracted tree via
+        default) derives a canonical ``source_ref`` → ``Locator``
+        map from the extracted tree via
         :func:`_locator_map_from_tree`; an explicit map overrides
         that derivation. An empty effective map is refused —
         see ``RetrieveAdapterConfigError``.
+    mapping_failure_ledger
+        T17 (SC22): where hits that fail to map back to a locator
+        are counted. ``None`` (the default) resolves the ledger
+        from ``FIN_MAPPING_FAILURE_LOG`` — a path persists the
+        count, unset keeps it in memory. The same ledger is shared
+        by the auto-built MCP adapter and the host's evidence
+        admission, so one number covers both drop sites.
+    degradation_ledger
+        T20 (SC39 / §B3): where a retrieval response's
+        ``degraded_reasons`` are recorded, and where the matching
+        user-facing notice is recorded against them. ``None`` (the
+        default) resolves the ledger from ``FIN_DEGRADATION_LOG``.
+        Shared by the ``retrieve`` tool and the fan-out workers, so
+        「记录原因且暴露信号」is one count over every consumption
+        point rather than one per call site.
 
     Returns
     -------
@@ -1270,6 +1389,18 @@ def compile_graph(
         ``"mcp"`` auto-build would produce an adapter with an
         empty ``locator_map``.
     """
+    # One mapping-failure counter per graph, shared by the retrieve
+    # adapter's mapper-drop and the host's evidence admission (T17):
+    # both are the same SC22 failure, so they must not be two numbers.
+    if mapping_failure_ledger is None:
+        mapping_failure_ledger = ledger_from_env()
+
+    # One degradation ledger per graph for the same reason (T20): the
+    # single-issuer tool and every fan-out worker consume the same §B3
+    # signal, and SC39 counts reasons across the run, not per seam.
+    if degradation_ledger is None:
+        degradation_ledger = degradation_ledger_from_env()
+
     # Build the adapter if the caller did not inject one. The kind
     # comes from configuration only (``retrieve_adapter``), so a
     # test checkpointer cannot force a fake port on a production
@@ -1290,8 +1421,8 @@ def compile_graph(
             mpath = _resolve_path(manifest_path, _DEFAULT_MANIFEST_PATH)
             rpath = _resolve_path(extracted_root, _DEFAULT_EXTRACTED_ROOT)
             # The tree is the SSOT for BOTH the client-side
-            # document membership test and the iknow-id → locator
-            # map; load it once when either is missing.
+            # document membership test and the canonical source_ref
+            # → locator map; load it once when either is missing.
             if known_document_ids is None or locator_map is None:
                 tree = load_extracted_tree(mpath, rpath)
                 if known_document_ids is None:
@@ -1312,6 +1443,7 @@ def compile_graph(
                 locator_map=locator_map,
                 known_document_ids=known_document_ids,
                 timeout_seconds=5.0,
+                mapping_ledger=mapping_failure_ledger,
             )
 
     if known_document_ids is None:
@@ -1332,7 +1464,11 @@ def compile_graph(
 
     list_files_tool = _make_list_files_tool(mpath, rpath)
     read_file_tool = _make_read_file_tool()
-    retrieve_tool = _make_retrieve_tool(adapter)
+    retrieve_tool = _make_retrieve_tool(
+        adapter,
+        mapping_ledger=mapping_failure_ledger,
+        degradation_ledger=degradation_ledger,
+    )
     get_xbrl_fact_tool = _make_get_xbrl_fact_tool(fpath)
     # T3 (spec Focus 1): bound LAST so the four prior tools keep
     # their positions — LangChain's tool binding is order-sensitive
@@ -1728,29 +1864,58 @@ def compile_graph(
                 ticker=issuer,
                 adapter=adapter,
             )
+        except InputValidationError as exc:
+            # Invalid input on one branch (T21). The blank-query guard
+            # above means this is a filter-level refusal; it is reported
+            # under the port's own code rather than as a transport
+            # problem, and it does not take the join down.
+            return _issuer_finding(issuer, STATUS_UNAVAILABLE, error=exc.code)
         except Exception as exc:  # noqa: BLE001 — one branch, not the run
-            # A port that raises breaks its own contract ("empty hits,
-            # not exceptions"). Letting it propagate would kill the
-            # join and take the other issuers' work with it, so the
-            # branch degrades to the typed unavailable row — which is
-            # reported in the envelope, never swallowed.
+            # A port that raises anything else breaks its own contract
+            # (a legal empty result is a value, not an exception).
+            # Letting it propagate would kill the join and take the
+            # other issuers' work with it, so the branch degrades to the
+            # typed unavailable row — reported, never swallowed.
             return _issuer_finding(
                 issuer,
                 STATUS_UNAVAILABLE,
                 error=f"retrieve_raised:{type(exc).__name__}",
             )
 
+        # T20 / SC39: a fan-out worker is a retrieval consumption point
+        # like any other, so a degraded answer here is recorded and
+        # shown too — otherwise the branch would be the one place a
+        # degradation could arrive silently. The notice rides on the
+        # run's tool trace, which is additive across branches.
+        notices: list[dict[str, str]] = []
+        consume_degradation(
+            result,
+            ledger=degradation_ledger,
+            expose=lambda signal, _line: notices.append(
+                degradation_notice_entry(
+                    signal, tool_call_id=str(task.get("issuer") or "")
+                )
+            ),
+            detail=f"issuer={issuer}",
+        )
+        summaries: dict[str, Any] = (
+            {"tool_summaries": notices} if notices else {}
+        )
+
         if isinstance(result, dict) and "error" in result:
             # Typed EXIT (ADR 0030): "retrieve is down" must not read
             # as "the corpus has nothing about this issuer".
-            return _issuer_finding(
-                issuer, STATUS_UNAVAILABLE, error=str(result["error"])
-            )
+            return {
+                **summaries,
+                **_issuer_finding(
+                    issuer, STATUS_UNAVAILABLE, error=str(result["error"])
+                ),
+            }
 
-        new_evidence = _issuer_evidence(result)
+        new_evidence = _issuer_evidence(result, ledger=mapping_failure_ledger)
         if not new_evidence:
-            return _issuer_finding(issuer, STATUS_EMPTY)
-        return _issuer_hit_update(issuer, new_evidence)
+            return {**summaries, **_issuer_finding(issuer, STATUS_EMPTY)}
+        return {**summaries, **_issuer_hit_update(issuer, new_evidence)}
 
     def issuer_join_node(state: AgentState) -> dict[str, Any]:
         """Join the branches into one ``fin.issuer_fanout.v1`` envelope.

@@ -28,7 +28,7 @@ import json
 import pytest
 
 from fin.corpus.extracted import Locator
-from fin.retrieve import Chunk
+from fin.retrieve import Chunk, EmptyQueryError
 from fin.retrieve.mcp_adapter import (
     MCPRetrieveAdapter,
     RetrieveUnavailableError,
@@ -95,19 +95,24 @@ class _ScriptedAdapter(MCPRetrieveAdapter):
 # ----- boundary 1: empty -----
 
 
-def test_empty_query_returns_empty_chunks_without_mcp_call() -> None:
-    """Empty / whitespace-only query yields ``{"chunks": []}``
+def test_empty_query_is_a_named_failure_without_mcp_call() -> None:
+    """Empty / whitespace-only query raises ``EmptyQueryError``
     WITHOUT touching the MCP subprocess.
 
-    Boundary 'empty': a missing query is a miss shape — it must
-    short-circuit BEFORE the JSON-RPC request so the operator
-    never pays for an MCP round-trip on empty input.
+    Boundary 'empty': a missing query is invalid input (T21 / §B2 第 5
+    条), not a miss shape, and it is still refused BEFORE the JSON-RPC
+    request so the operator never pays for a round trip on it. The
+    scripted transport raises if reached, so "no MCP call" is asserted
+    by construction.
     """
-    # No scripted response — if the adapter tries to call MCP,
-    # the runtime error surfaces as a test failure.
     adapter = _ScriptedAdapter()
     for empty_query in ("", "   ", "\t\n", "\n"):
-        assert adapter.retrieve(empty_query) == {"chunks": []}
+        with pytest.raises(EmptyQueryError):
+            adapter.retrieve(empty_query)
+
+    assert adapter.input_validation_failures.count_by_code() == {
+        "empty_query": 4
+    }
 
 
 def test_empty_document_id_filter_returns_empty_chunks_without_mcp_call() -> None:
@@ -468,6 +473,26 @@ def test_empty_hit_envelope_maps_to_empty_chunks(envelope: dict) -> None:
         locator_map={"id-A": _loc("DOC-2023Q1")},
     )
     assert adapter.retrieve("foo") == {"chunks": []}
+
+
+def test_content_block_business_envelope_propagates_degradation_signal() -> None:
+    """Canonical MCP content blocks carry the business envelope inside
+    ``result.content[0].text``; its degradation fields must be consumed
+    after that JSON is decoded."""
+    envelope = _content_block(
+        {
+            "hits": [],
+            "degraded": True,
+            "degraded_reasons": ["vector:unavailable"],
+        }
+    )
+    adapter = _ScriptedAdapter(scripted_response=envelope)
+
+    assert adapter.retrieve("foo") == {
+        "chunks": [],
+        "degraded": True,
+        "degraded_reasons": ["vector:unavailable"],
+    }
 
 
 def test_empty_hit_envelope_does_not_raise_on_the_async_path() -> None:

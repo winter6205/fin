@@ -12,12 +12,22 @@ The contract shape is fixed by ADR 0009 and ADR 0031:
                 ticker=None, filing_date=None, limit=8)`` →
     ``{"chunks": [{"text", "source_ref", "score"}, ...]}``
 
-Empty query, unknown ``document_id``, unknown ``cik`` / ``ticker`` /
-``form`` / ``filing_date``, conflicting filters, and no hits all
-return ``{"chunks": []}`` without raising. ``limit`` defaults to 8
-and is hard-capped at 20. ``source_ref`` is a ``fin.corpus.Locator``
-instance so the citation gate (T5) can read ``.document_id`` /
-``.version`` / ``.page`` directly.
+Two answers, never conflated (T21 / SC42 / SC43 / §B2 第 5 条):
+
+* **invalid input** raises a named
+  :class:`~fin.retrieve.input_validation.InputValidationError` — an
+  empty / whitespace query (``EmptyQueryError``) and a *provably*
+  unsatisfiable filter set (``ConflictingFiltersError``, raised where
+  the adapter holds the bindings to prove the exclusion). Each is
+  counted on the adapter's
+  ``input_validation_failures`` ledger and never sets ``degraded``.
+* **legal empty result** returns ``{"chunks": []}`` without raising —
+  unknown ``document_id``, unknown or empty ``cik`` / ``ticker`` /
+  ``form`` / ``filing_date``, and a valid query with no hits.
+
+``limit`` defaults to 8 and is hard-capped at 20. ``source_ref`` is a
+``fin.corpus.Locator`` instance so the citation gate (T5) can read
+``.document_id`` / ``.version`` / ``.page`` directly.
 """
 
 from __future__ import annotations
@@ -70,7 +80,8 @@ class RetrievePort(Protocol):
         ----------
         query
             The user's lexical query. Empty / whitespace-only queries
-            must return ``{"chunks": []}`` without raising.
+            must raise ``EmptyQueryError``: nothing was asked, which is
+            not the same answer as "the corpus has no hits".
         document_id
             Optional filter. When set and the document is not in the
             loaded corpus, returns ``{"chunks": []}`` without raising.
@@ -78,10 +89,13 @@ class RetrievePort(Protocol):
             error.
         cik / form / ticker / filing_date
             Additive EDGAR-shaped optional filters (ADR 0031).
-            Empty filter values, unknown values, and conflicting
-            filters all return ``{"chunks": []}`` — NOT an exception.
+            Empty and unknown filter values return ``{"chunks": []}``
+            — legal empty results. A set the adapter can *prove* no
+            document satisfies raises ``ConflictingFiltersError``.
             The adapter is responsible for consulting its manifest
-            metadata to evaluate these filters.
+            metadata to evaluate these filters and to prove a conflict;
+            an adapter holding no bindings proves none and raises
+            nothing.
         limit
             Maximum number of chunks to return. Defaults to 8;
             hard-capped at 20. Values ``<= 0`` are treated as the
