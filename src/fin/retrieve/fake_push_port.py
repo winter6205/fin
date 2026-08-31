@@ -57,6 +57,7 @@ SC24 assertions need something to stand on:
 
 from __future__ import annotations
 
+import threading
 from typing import Any, Final, Mapping, Sequence
 
 from fin.retrieve.invalidation_port import (
@@ -104,11 +105,16 @@ class FakePushPort:
     ) -> None:
         self._by_key: dict[tuple[str, str], dict[str, Any]] = {}
         self._by_block_id: dict[str, dict[str, Any]] = {}
+        self._idempotency_lock = threading.Lock()
         self._rejected_batches: int = 0
         self._invalidations: list[dict[str, Any]] = []
         self._refused_invalidations: int = 0
         self.max_batch_records = max_batch_records
-        self._input_validation_ledger = input_validation_ledger
+        self._input_validation_ledger = (
+            input_validation_ledger
+            if input_validation_ledger is not None
+            else InputValidationLedger()
+        )
 
     @property
     def input_validation_failures(self) -> InputValidationLedger:
@@ -118,11 +124,7 @@ class FakePushPort:
         in-memory ledger created on first access, so an empty batch or an
         empty document is a number here even when no log is configured.
         """
-        ledger = self._input_validation_ledger
-        if ledger is None:
-            ledger = InputValidationLedger()
-            self._input_validation_ledger = ledger
-        return ledger
+        return self._input_validation_ledger
 
     # ----- push -----
 
@@ -158,20 +160,21 @@ class FakePushPort:
         duplicates = 0
         for record in records:
             key = (str(record["source_ref"]), str(record["content_id"]))
-            stored = self._by_key.get(key)
-            if stored is None:
-                # Deep-enough copy: the metadata mapping is copied so a
-                # caller mutating its wire dict afterwards cannot alter
-                # what the "service" holds.
-                stored = dict(record)
-                stored["metadata"] = dict(record["metadata"])
-                stored["valid_from"] = VALID_FROM
-                stored["valid_to"] = None
-                self._by_key[key] = stored
-                self._by_block_id[stored["block_id"]] = stored
-                written += 1
-            else:
-                duplicates += 1
+            with self._idempotency_lock:
+                stored = self._by_key.get(key)
+                if stored is None:
+                    # Deep-enough copy: the metadata mapping is copied so a
+                    # caller mutating its wire dict afterwards cannot alter
+                    # what the "service" holds.
+                    stored = dict(record)
+                    stored["metadata"] = dict(record["metadata"])
+                    stored["valid_from"] = VALID_FROM
+                    stored["valid_to"] = None
+                    self._by_key[key] = stored
+                    self._by_block_id[stored["block_id"]] = stored
+                    written += 1
+                else:
+                    duplicates += 1
             block_ids.append(str(stored["block_id"]))
         return {
             "block_ids": block_ids,

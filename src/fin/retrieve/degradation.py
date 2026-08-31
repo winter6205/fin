@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
@@ -292,6 +293,7 @@ class DegradationLedger:
 
     def __init__(self, *, path: Path | None = None) -> None:
         self._path = path
+        self._lock = threading.RLock()
         self._records: list[DegradationRecord] = []
         if path is not None and path.exists():
             self._replay(path)
@@ -304,16 +306,21 @@ class DegradationLedger:
 
     def count(self) -> int:
         """Total recorded reason items across every stage."""
-        return len(self._records)
+        with self._lock:
+            return len(self._records)
 
     def records(self) -> tuple[DegradationRecord, ...]:
-        return tuple(self._records)
+        with self._lock:
+            return tuple(self._records)
 
     def reasons_at(self, stage: str) -> tuple[str, ...]:
         """Every reason recorded at ``stage``, in record order."""
-        return tuple(
-            record.reason for record in self._records if record.stage == stage
-        )
+        with self._lock:
+            return tuple(
+                record.reason
+                for record in self._records
+                if record.stage == stage
+            )
 
     def count_by_reason(self) -> dict[str, int]:
         """Per-reason totals at the retrieve stage.
@@ -321,10 +328,12 @@ class DegradationLedger:
         The notice stage mirrors the retrieve stage by construction, so
         counting both would double every number the operator reads.
         """
-        counts: dict[str, int] = {}
-        for reason in self.reasons_at(DEGRADATION_STAGE_RETRIEVE):
-            counts[reason] = counts.get(reason, 0) + 1
-        return counts
+        with self._lock:
+            counts: dict[str, int] = {}
+            for record in self._records:
+                if record.stage == DEGRADATION_STAGE_RETRIEVE:
+                    counts[record.reason] = counts.get(record.reason, 0) + 1
+            return counts
 
     # ----- recording -----
 
@@ -343,48 +352,50 @@ class DegradationLedger:
         a ledger that raises never leaves a count the caller believes was
         written.
         """
-        if stage not in DEGRADATION_STAGES:
-            raise DegradationRecordInvalidError(
-                f"degradation stage {stage!r} is outside the vocabulary "
-                f"{sorted(DEGRADATION_STAGES)}"
-            )
-        if not signal.degraded:
-            return ()
-        recorded: list[DegradationRecord] = []
-        for reason in signal.degraded_reasons:
-            record = DegradationRecord(
-                reason=reason, stage=stage, detail=detail
-            )
-            self._append(record)
-            self._records.append(record)
-            recorded.append(record)
-        return tuple(recorded)
+        with self._lock:
+            if stage not in DEGRADATION_STAGES:
+                raise DegradationRecordInvalidError(
+                    f"degradation stage {stage!r} is outside the vocabulary "
+                    f"{sorted(DEGRADATION_STAGES)}"
+                )
+            if not signal.degraded:
+                return ()
+            recorded: list[DegradationRecord] = []
+            for reason in signal.degraded_reasons:
+                record = DegradationRecord(
+                    reason=reason, stage=stage, detail=detail
+                )
+                self._append(record)
+                self._records.append(record)
+                recorded.append(record)
+            return tuple(recorded)
 
     # ----- persistence -----
 
     def _append(self, record: DegradationRecord) -> None:
-        if self._path is None:
-            return
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            with self._path.open("a", encoding="utf-8") as handle:
-                handle.write(
-                    json.dumps(
-                        {
-                            "reason": record.reason,
-                            "stage": record.stage,
-                            "detail": record.detail,
-                        },
-                        sort_keys=True,
-                        ensure_ascii=False,
+        with self._lock:
+            if self._path is None:
+                return
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                with self._path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "reason": record.reason,
+                                "stage": record.stage,
+                                "detail": record.detail,
+                            },
+                            sort_keys=True,
+                            ensure_ascii=False,
+                        )
+                        + "\n"
                     )
-                    + "\n"
-                )
-        except OSError as exc:
-            raise DegradationLedgerUnwritableError(
-                f"cannot append the degradation record to {self._path}: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
+            except OSError as exc:
+                raise DegradationLedgerUnwritableError(
+                    f"cannot append the degradation record to {self._path}: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
 
     def _replay(self, path: Path) -> None:
         try:

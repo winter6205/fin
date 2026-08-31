@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
@@ -179,6 +180,7 @@ class MappingFailureLedger:
 
     def __init__(self, *, path: Path | None = None) -> None:
         self._path = path
+        self._lock = threading.RLock()
         self._failures: list[MappingFailure] = []
         if path is not None and path.exists():
             self._replay(path)
@@ -191,18 +193,21 @@ class MappingFailureLedger:
 
     def count(self) -> int:
         """Total recorded mapping failures (the SC22 counter)."""
-        return len(self._failures)
+        with self._lock:
+            return len(self._failures)
 
     def count_by_code(self) -> dict[str, int]:
         """Per-code totals, omitting codes with no occurrences."""
-        counts: dict[str, int] = {}
-        for failure in self._failures:
-            counts[failure.code] = counts.get(failure.code, 0) + 1
-        return counts
+        with self._lock:
+            counts: dict[str, int] = {}
+            for failure in self._failures:
+                counts[failure.code] = counts.get(failure.code, 0) + 1
+            return counts
 
     def failures(self) -> tuple[MappingFailure, ...]:
         """Every recorded failure, in record order."""
-        return tuple(self._failures)
+        with self._lock:
+            return tuple(self._failures)
 
     # ----- recording -----
 
@@ -220,51 +225,53 @@ class MappingFailureLedger:
         ledger that raises :class:`MappingFailureLedgerUnwritableError`
         never leaves a count the caller believes was written.
         """
-        if code not in MAPPING_FAILURE_CODES:
-            raise MappingFailureRecordInvalidError(
-                f"mapping failure code {code!r} is outside the vocabulary "
-                f"{sorted(MAPPING_FAILURE_CODES)}"
+        with self._lock:
+            if code not in MAPPING_FAILURE_CODES:
+                raise MappingFailureRecordInvalidError(
+                    f"mapping failure code {code!r} is outside the vocabulary "
+                    f"{sorted(MAPPING_FAILURE_CODES)}"
+                )
+            if stage not in MAPPING_STAGES:
+                raise MappingFailureRecordInvalidError(
+                    f"mapping failure stage {stage!r} is outside the vocabulary "
+                    f"{sorted(MAPPING_STAGES)}"
+                )
+            failure = MappingFailure(
+                code=code,
+                stage=stage,
+                retrieval_ref=retrieval_ref,
+                message=message,
             )
-        if stage not in MAPPING_STAGES:
-            raise MappingFailureRecordInvalidError(
-                f"mapping failure stage {stage!r} is outside the vocabulary "
-                f"{sorted(MAPPING_STAGES)}"
-            )
-        failure = MappingFailure(
-            code=code,
-            stage=stage,
-            retrieval_ref=retrieval_ref,
-            message=message,
-        )
-        self._append(failure)
-        self._failures.append(failure)
-        return failure
+            self._append(failure)
+            self._failures.append(failure)
+            return failure
 
     # ----- persistence -----
 
     def _append(self, failure: MappingFailure) -> None:
-        if self._path is None:
-            return
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            with self._path.open("a", encoding="utf-8") as handle:
-                handle.write(
-                    json.dumps(
-                        {
-                            "code": failure.code,
-                            "stage": failure.stage,
-                            "retrieval_ref": failure.retrieval_ref,
-                            "message": failure.message,
-                        },
-                        sort_keys=True,
+        with self._lock:
+            if self._path is None:
+                return
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                with self._path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "code": failure.code,
+                                "stage": failure.stage,
+                                "retrieval_ref": failure.retrieval_ref,
+                                "message": failure.message,
+                            },
+                            sort_keys=True,
+                        )
+                        + "\n"
                     )
-                    + "\n"
-                )
-        except OSError as exc:
-            raise MappingFailureLedgerUnwritableError(
-                f"cannot append the mapping failure count to {self._path}: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
+            except OSError as exc:
+                raise MappingFailureLedgerUnwritableError(
+                    f"cannot append the mapping failure count to {self._path}: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
 
     def _replay(self, path: Path) -> None:
         try:

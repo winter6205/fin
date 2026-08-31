@@ -52,7 +52,7 @@
    - **Acceptance:** 契约 fake 的完整「检查-写入」临界区加锁，并有一条**确定性**的竞争测试（不是靠 sleep 碰运气）；ledger 的记录与 append 走线程安全路径，并有并发记录测试；SC18 的幂等断言在加锁后仍成立且现在是真的在测并发。
    - **Completion:** 同步原语的选择由实现者定；「并发幂等场景必须能实际捕获竞争」是硬约束——加锁不得把测试变成串行假通过。
    - [blocks: T1]
-   - Status: [ ] pending
+   - Status: [x] completed
 
 7. **统一 `observe_input_outcome` 的两条记录入口** — tag: `[implementation]`
    - **Findings:** Standards Medium —— `input_validation.py:595-623` 的异常路径调用严格的 `record_input_failure`，error-envelope 路径却直接 `ledger.record`，两条路径的校验强度已不一致。

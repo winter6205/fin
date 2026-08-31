@@ -7,8 +7,11 @@ a service, reads the large corpus, or calls an LLM.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -54,6 +57,34 @@ def _record() -> PushRecord:
             "params_table_version": "params-1",
         },
     )
+
+
+class _CheckSnapshotStore(dict[tuple[str, str], dict[str, Any]]):
+    """Expose the check-then-write race without timing assumptions.
+
+    The snapshot is taken before the barrier, so two unprotected callers
+    deterministically observe the same empty key. Once ``FakePushPort`` owns
+    its idempotency lock, the second caller cannot enter ``get`` until the
+    first write has completed and therefore skips the barrier.
+    """
+
+    def __init__(
+        self, owner: FakePushPort, barrier: threading.Barrier
+    ) -> None:
+        super().__init__()
+        self._owner = owner
+        self._barrier = barrier
+
+    def get(
+        self,
+        key: tuple[str, str],
+        default: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        snapshot = super().get(key, default)
+        lock = getattr(self._owner, "_idempotency_lock", None)
+        if lock is None or not lock.locked():
+            self._barrier.wait()
+        return snapshot
 
 
 def test_b1_concurrency_numbers_are_the_published_values() -> None:
@@ -230,6 +261,24 @@ def test_concurrent_idempotent_all_write_smoke_keeps_block_total() -> None:
     assert result.block_total_before == before
     assert result.block_total_after == before
     assert result.to_dict()["all_writes"] is True
+
+
+def test_idempotency_check_and_write_is_one_concurrent_critical_section() -> None:
+    """Two concurrent first pushes must produce one write and one duplicate."""
+    port = FakePushPort()
+    port._by_key = _CheckSnapshotStore(
+        port, threading.Barrier(2)
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = tuple(
+            pool.map(lambda _: port.push([_record().to_wire()]), range(2))
+        )
+
+    assert sum(result["written"] for result in results) == 1
+    assert sum(result["duplicates"] for result in results) == 1
+    assert port.written_total() == 1
+    assert port.block_total() == 1
 
 
 def test_four_supplement_reports_are_complete_and_first_hit_distribution_is_stable() -> None:

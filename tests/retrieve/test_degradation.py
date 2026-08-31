@@ -18,8 +18,10 @@ independence from the flag) is ``tests/host/test_degradation_signal.py``.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -237,6 +239,35 @@ def test_ledger_records_nothing_for_an_undegraded_signal() -> None:
         DegradationSignal(), stage=DEGRADATION_STAGE_RETRIEVE
     ) == ()
     assert ledger.count() == 0
+
+
+def test_shared_ledger_serializes_concurrent_records_and_appends(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "concurrent-degradation.jsonl"
+    ledger = DegradationLedger(path=path)
+    signal = DegradationSignal(degraded=True, degraded_reasons=REASONS)
+    workers = 8
+    start = threading.Barrier(workers)
+
+    def record_from_worker(index: int) -> tuple[object, ...]:
+        start.wait()
+        return ledger.record_signal(
+            signal,
+            stage=DEGRADATION_STAGE_RETRIEVE,
+            detail=f"worker-{index}",
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=workers
+    ) as pool:
+        records = tuple(pool.map(record_from_worker, range(workers)))
+
+    expected_count = workers * len(REASONS)
+    assert sum(len(worker_records) for worker_records in records) == expected_count
+    assert ledger.count() == expected_count
+    assert len(path.read_text(encoding="utf-8").splitlines()) == expected_count
+    assert DegradationLedger(path=path).count() == expected_count
 
 
 def test_ledger_refuses_a_stage_outside_the_vocabulary() -> None:
