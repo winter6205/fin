@@ -40,6 +40,7 @@ fake so the required-field list cannot fork into two copies.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Final, Mapping, Sequence
@@ -72,6 +73,48 @@ def serialize_source_ref(locator: UnitLocator) -> str:
     every block of the unit necessarily gets the same string.
     """
     return canonical_json_bytes(locator.to_dict()).decode("utf-8")
+
+
+def deserialize_source_ref(source_ref: str) -> UnitLocator:
+    """Parse one canonical ``source_ref`` back into its locator triple.
+
+    This is the inverse of :func:`serialize_source_ref` and the single
+    authority for the wire representation.  Rejecting non-canonical JSON
+    prevents the same frozen unit from acquiring multiple reference strings.
+    """
+    try:
+        payload = json.loads(source_ref)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("source_ref is not valid JSON") from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "document_id",
+        "version",
+        "unit",
+    }:
+        raise ValueError(
+            "source_ref must contain exactly document_id, version, and unit"
+        )
+    document_id = payload["document_id"]
+    version = payload["version"]
+    unit = payload["unit"]
+    if (
+        not isinstance(document_id, str)
+        or not document_id
+        or not isinstance(version, str)
+        or not version
+        or isinstance(unit, bool)
+        or not isinstance(unit, int)
+        or unit < 1
+    ):
+        raise ValueError("source_ref contains an invalid locator value")
+    locator = UnitLocator(
+        document_id=document_id,
+        version=version,
+        unit=unit,
+    )
+    if source_ref != serialize_source_ref(locator):
+        raise ValueError("source_ref is not canonical JSON")
+    return locator
 
 
 def content_identity(
@@ -207,6 +250,7 @@ __all__ = [
     "REQUIRED_PUSH_METADATA_FIELDS",
     "PushRecord",
     "content_identity",
+    "deserialize_source_ref",
     "document_push_records",
     "idempotency_keys_digest",
     "record_of_payload",

@@ -32,11 +32,12 @@ The adapter completes the MCP session handshake
 connection before it sends ``tools/call``. It DOES NOT inline OCR /
 XBRL / parse / locator
 mapping into the ranking call (complexity-anti-drift). The
-locator map (``iknow-id`` → ``fin.Locator``) is configured at
-construction and applied as a separate post-rank step. Hits
-whose ``source_ref`` is not in the map are **dropped** — the
-adapter never passes an iknow-memory id to the citation gate
-(ADR 0030 + spec success-criteria item 7).
+The returned ``source_ref`` is the canonical fin locator serialization
+defined by ``fin.corpus.push`` and is parsed as a separate post-rank
+step. A retrieval service's internal id, if present for a transitional
+integration, uses ``retrieval_id`` and is resolved through the
+explicitly supplied locator map; it is never carried in ``source_ref``
+or passed to the citation gate.
 
 Mapper-drop is not silent: every dropped hit is counted on the
 adapter's :attr:`MCPRetrieveAdapter.mapping_failures` ledger with a
@@ -374,11 +375,13 @@ class MCPRetrieveAdapter:
         sees a typed ``retrieve_unavailable`` rather than a
         silent fall-through.
     locator_map
-        Map from iknow-memory ``source_ref`` id to a fin
-        ``Locator``. Hits whose id is not in the map are dropped
-        (never passed through to the citation gate). An empty
-        map drops everything; ``compile_graph`` treats that as a
-        configuration error rather than a retrieve result.
+        Explicit transitional map from ``retrieval_id`` to a fin
+        ``Locator``. Canonical ``source_ref`` values do not need this
+        map. Non-canonical hits using an old ``source_ref`` key remain
+        supported only through this explicit compatibility seam. An
+        empty map therefore drops only non-canonical hits;
+        ``compile_graph`` still requires a non-empty map for compatibility
+        with integrations that use retrieval ids.
     timeout_seconds
         Per-call timeout on the JSON-RPC exchange. Default 5s
         (operator override via constructor).

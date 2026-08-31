@@ -85,6 +85,8 @@ from langgraph.types import Command, Send
 
 from fin.corpus.errors import IngestMissingError
 from fin.corpus.extracted import Locator, load_extracted_tree
+from fin.corpus.parsers._common import UnitLocator
+from fin.corpus.push import serialize_source_ref
 from fin.host.citation_gate import (
     HIDDEN_BOUNCE_MARKER,
     Citation,
@@ -204,24 +206,26 @@ def _resolve_path(value: Path | str | None, default: Path) -> Path:
 def _locator_map_from_tree(
     tree: dict[str, tuple[Any, ...]],
 ) -> dict[str, Locator]:
-    """Publish one ``iknow-memory id -> fin Locator`` entry per
-    frozen locator unit in the extracted ``tree``.
+    """Publish one canonical fin ``source_ref`` → ``Locator`` entry
+    per frozen locator unit in the extracted ``tree``.
 
-    ``MCPRetrieveAdapter`` maps each hit's ``source_ref`` through
-    this dict and DROPS whatever is missing, so the map is the
-    only thing standing between a healthy MCP server and a
-    retrieve path that returns nothing.
+    ``MCPRetrieveAdapter`` accepts this stable serialization directly,
+    so the retrieval service's internal id is never used as
+    ``source_ref`` or passed to citation evidence.
 
-    The published id spelling is ``"{document_id}#{page}"``: the
-    identity fin can address without reading iknow-memory's
-    storage. An operator whose iknow-memory corpus was ingested
-    under different ids passes an explicit ``locator_map`` to
-    ``compile_graph``; a stale mapping degrades safely because the
-    citation verifier still matches the claimed span against the
-    frozen unit's text.
+    An explicitly supplied ``locator_map`` remains a named
+    transitional compatibility seam for integrations using
+    ``retrieval_id``; auto-built product maps use only the canonical
+    ``source_ref`` spelling.
     """
     return {
-        f"{document_id}#{page.locator.page}": page.locator
+        serialize_source_ref(
+            UnitLocator(
+                document_id=page.locator.document_id,
+                version=page.locator.version,
+                unit=page.locator.page,
+            )
+        ): page.locator
         for document_id, pages in tree.items()
         for page in pages
     }
