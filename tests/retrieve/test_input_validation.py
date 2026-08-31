@@ -408,6 +408,23 @@ def test_an_empty_result_list_is_never_read_off_an_error_envelope() -> None:
     assert is_empty_result({"chunks": [_chunk()]}) is False
 
 
+def test_error_envelope_reuses_strict_input_failure_validation() -> None:
+    """An invalid-input envelope cannot claim a capability degradation."""
+    ledger = InputValidationLedger()
+
+    with pytest.raises(InvalidInputMarkedDegradedError):
+        observe_input_outcome(
+            lambda: {
+                "error": "empty_query",
+                DEGRADED_FIELD: True,
+                DEGRADED_REASONS_FIELD: ["retrieve:attempt_failed"],
+            },
+            ledger=ledger,
+        )
+
+    assert ledger.count() == 0
+
+
 # ===== the count itself =====
 
 
