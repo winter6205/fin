@@ -41,6 +41,13 @@ from fin.corpus.push import REQUIRED_PUSH_METADATA_FIELDS, PushRecord
 # increment = 0, block id set unchanged.
 IDEMPOTENCY_BASELINE_PUSHES: Final[int] = 3
 
+# SC44: the number of records one push call accepts. The value itself is
+# open headroom (plan T15「单批上限的具体取值全部开放」); what is not open
+# is that crossing it is a named overflow rather than a truncation, and
+# that the batch planner (:mod:`fin.retrieve.push_batching`) reads the
+# same constant so a planned run never trips it.
+MAX_PUSH_BATCH_RECORDS: Final[int] = 200
+
 
 class PushError(RuntimeError):
     """Base class for the push path's named failures.
@@ -72,6 +79,39 @@ class UnknownPushedBlockError(PushError):
     """
 
     code = "unknown_pushed_block"
+
+
+class PushBatchOverflowError(PushError):
+    """One push call carries more records than the cap allows (SC44).
+
+    Raised instead of storing a prefix and dropping the rest: an
+    over-sized batch is a caller error the batch planner exists to
+    prevent, so it surfaces as a named failure with nothing written.
+    """
+
+    code = "push_batch_overflow"
+
+
+class PushBatchSizeInvalidError(PushError):
+    """A batch size of zero or less was requested.
+
+    A non-positive size cannot split a non-empty record sequence, so it
+    would silently produce no batches — refused by name instead.
+    """
+
+    code = "push_batch_size_invalid"
+
+
+class PushBatchFailedError(PushError):
+    """A batch failed for a reason that is not itself a :class:`PushError`.
+
+    The background push path (§B4) must leave a named record for every
+    failure, so a transport-level exception is wrapped (``raise ... from
+    exc``, original preserved as ``__cause__``) rather than escaping
+    untyped or being swallowed.
+    """
+
+    code = "push_batch_failed"
 
 
 @dataclass(frozen=True)
@@ -156,6 +196,10 @@ def push_records(
 
 __all__ = [
     "IDEMPOTENCY_BASELINE_PUSHES",
+    "MAX_PUSH_BATCH_RECORDS",
+    "PushBatchFailedError",
+    "PushBatchOverflowError",
+    "PushBatchSizeInvalidError",
     "PushError",
     "PushMetadataIncompleteError",
     "PushOutcome",
