@@ -19,6 +19,9 @@ What the fake guarantees
 * **no re-splitting** (§B4「不二次切分」) — the text is stored exactly
   as pushed and recalled byte-identical, never re-normalized, trimmed
   or re-chunked;
+* **named overflow** (SC44) — a batch above the per-call cap raises
+  ``PushBatchOverflowError`` and stores nothing, never a truncated
+  prefix;
 * **named refusal** — an incomplete record raises
   ``PushMetadataIncompleteError`` and the whole batch is refused, so a
   refused push leaves the block total untouched and is counted in
@@ -30,6 +33,8 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 from fin.retrieve.push_port import (
+    MAX_PUSH_BATCH_RECORDS,
+    PushBatchOverflowError,
     PushError,
     UnknownPushedBlockError,
     validate_wire_record,
@@ -43,23 +48,36 @@ class FakePushPort:
     Counters (:meth:`written_total`, :meth:`rejected_batches`) exist so
     tests can assert that a refused batch left a trace and did not
     contribute to the idempotency numbers.
+
+    ``max_batch_records`` is the receiving side's per-call cap (SC44).
+    Like the SC20 metadata check it lives here rather than in the
+    client, so a future real transport cannot smuggle an over-sized
+    batch past a limit that only existed client-side; a test can lower
+    it to exercise the overflow path cheaply.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_batch_records: int = MAX_PUSH_BATCH_RECORDS) -> None:
         self._by_key: dict[tuple[str, str], dict[str, Any]] = {}
         self._by_block_id: dict[str, dict[str, Any]] = {}
         self._rejected_batches: int = 0
+        self.max_batch_records = max_batch_records
 
     # ----- push -----
 
     def push(self, records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         """Store ``records`` idempotently and report the outcome.
 
-        Validation of the whole batch happens first: an incomplete
-        record refuses the batch before a single write, so the store
-        can never hold half of a refused push.
+        Validation of the whole batch happens first: an over-sized or
+        incomplete batch is refused before a single write, so the store
+        can never hold half of a refused push and never a truncated
+        prefix of one (SC44).
         """
         try:
+            if len(records) > self.max_batch_records:
+                raise PushBatchOverflowError(
+                    f"push batch of {len(records)} records exceeds the "
+                    f"per-call cap of {self.max_batch_records}"
+                )
             for record in records:
                 validate_wire_record(record)
         except PushError:
