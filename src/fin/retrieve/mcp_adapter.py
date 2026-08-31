@@ -92,6 +92,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any
 
 from fin.corpus.extracted import Locator
@@ -113,6 +114,8 @@ _LIMIT_CAP = 20
 _MCP_PROTOCOL_VERSION = "2025-06-18"
 _INITIALIZE_REQUEST_ID = 1
 _TOOL_REQUEST_ID = 2
+
+logger = logging.getLogger(__name__)
 
 
 # ----- typed exception -----
@@ -250,7 +253,10 @@ async def _exchange_mcp_messages(
         try:
             await proc.wait()
         except Exception:
-            pass
+            logger.debug(
+                "MCP process cleanup failed after timeout",
+                exc_info=True,
+            )
         raise
     if proc.returncode != 0:
         raise OSError(

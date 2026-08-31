@@ -263,7 +263,7 @@
     - **Acceptance:** 七类失败路径在一份失败清单中逐条具名，每条都能被一条断言命中（具名错误码 / 计数 / 可列举记录三者居其一），清单中"无痕迹的失败路径"条数 = 0；全仓不出现空 `except` 吞掉本计划涉及的失败；`uv run pytest -q` exits 0，且默认套件仍不读大语料、不起检索服务进程、不访问外网。
     - **Completion:** 清单的载体（文档 / 测试断言表 / 运行时注册表）与留痕形态由实现者定；"每条失败都可断言"是硬约束。
     - [blocks: T16, T18, T20, T21]
-    - Status: [ ] pending
+    - Status: [x] done —— 新增 `fin.retrieve.failure_catalog` 可执行七类失败清单，绑定真实 code/计数/记录；定向 18 passed，T24 相关回归 280 passed，全仓静态的空 `except` 0 个
 
 ---
 
