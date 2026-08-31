@@ -27,6 +27,7 @@ import pytest
 from fin.corpus.extracted import Locator
 from fin.corpus.parsers._common import UnitLocator
 from fin.corpus.push import serialize_source_ref
+from fin.host.evidence_admission import admit_retrieved_chunks
 from fin.retrieve.hit_mapping import (
     MAPPING_FAILURE_LOG_ENV,
     MAPPING_FAILURE_MALFORMED_HIT,
@@ -126,6 +127,46 @@ def test_canonical_source_ref_maps_without_a_retrieval_id_map() -> None:
     assert len(chunks) == 1
     assert chunks[0].source_ref == _loc(page=3)
     assert ledger.count() == 0
+
+
+def test_retrieval_id_maps_without_entering_chunk_or_evidence() -> None:
+    """A retrieval-side id has its own field and is replaced by a
+    fin locator before the chunk reaches citation-evidence admission."""
+    locator = _loc(page=3)
+    ledger = MappingFailureLedger()
+
+    chunks = map_hits_to_chunks(
+        [{"text": "kept", "retrieval_id": "row-7", "score": 1.0}],
+        locator_map={"row-7": locator},
+        limit=10,
+        ledger=ledger,
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].source_ref == locator
+    assert not hasattr(chunks[0], "retrieval_id")
+    admitted = admit_retrieved_chunks(chunks, ledger=MappingFailureLedger())
+    assert admitted == chunks
+    assert admitted[0].source_ref == locator
+    assert ledger.count() == 0
+
+
+def test_legacy_source_ref_requires_an_explicit_locator_map() -> None:
+    """The old ``source_ref``-keyed map remains only as an explicit
+    migration seam; without it the legacy id is dropped and counted."""
+    ledger = MappingFailureLedger()
+
+    chunks = map_hits_to_chunks(
+        [{"text": "legacy", "source_ref": "legacy-row-7", "score": 1.0}],
+        locator_map={},
+        limit=10,
+        ledger=ledger,
+    )
+
+    assert chunks == ()
+    assert ledger.count_by_code() == {
+        MAPPING_FAILURE_UNMAPPED_SOURCE_REF: 1
+    }
 
 
 @pytest.mark.parametrize(

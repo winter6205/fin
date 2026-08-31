@@ -1347,9 +1347,11 @@ def compile_graph(
         ``retrieve_adapter`` is ``"mcp"`` and no ``adapter`` was
         supplied. Defaults to ``["iknow-memory", "serve"]``.
     locator_map
-        T3 (#76): iknow-memory id → ``fin.Locator`` map passed
+        T3 (#76): explicit compatibility map from ``retrieval_id``
+        (or a legacy ``source_ref`` key) to ``fin.Locator``, passed
         to the auto-built ``MCPRetrieveAdapter``. ``None`` (the
-        default) derives the map from the extracted tree via
+        default) derives a canonical ``source_ref`` → ``Locator``
+        map from the extracted tree via
         :func:`_locator_map_from_tree`; an explicit map overrides
         that derivation. An empty effective map is refused —
         see ``RetrieveAdapterConfigError``.
@@ -1419,8 +1421,8 @@ def compile_graph(
             mpath = _resolve_path(manifest_path, _DEFAULT_MANIFEST_PATH)
             rpath = _resolve_path(extracted_root, _DEFAULT_EXTRACTED_ROOT)
             # The tree is the SSOT for BOTH the client-side
-            # document membership test and the iknow-id → locator
-            # map; load it once when either is missing.
+            # document membership test and the canonical source_ref
+            # → locator map; load it once when either is missing.
             if known_document_ids is None or locator_map is None:
                 tree = load_extracted_tree(mpath, rpath)
                 if known_document_ids is None:

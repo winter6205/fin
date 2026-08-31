@@ -376,59 +376,77 @@ def _locator_of_hit(
         )
         return None
     source_ref = hit.get("source_ref")
+    retrieval_id = hit.get("retrieval_id")
+    lookup_ref: Any = source_ref
     if not isinstance(source_ref, str):
-        ledger.record(
-            code=MAPPING_FAILURE_MISSING_SOURCE_REF,
-            stage=MAPPING_STAGE_RETRIEVE,
-            retrieval_ref=_retrieval_ref_of(source_ref),
-            message=(
-                f"hit source_ref is {type(source_ref).__name__}, expected a "
-                "canonical fin locator serialization"
-            ),
-        )
-        return None
-    try:
-        canonical_locator = deserialize_source_ref(source_ref)
-    except ValueError:
-        retrieval_id = hit.get("retrieval_id")
         if isinstance(retrieval_id, str):
             locator = locator_map.get(retrieval_id)
             lookup_ref = retrieval_id
-            lookup_message = (
-                "transitional retrieval_id is absent from the locator map"
-            )
-        elif source_ref in locator_map:
-            # Transitional compatibility for callers that explicitly
-            # supplied the pre-B4 locator map and still receive its old
-            # source_ref key. New integrations must use retrieval_id.
-            locator = locator_map.get(source_ref)
-            lookup_ref = source_ref
-            lookup_message = (
-                "transitional source_ref key is absent from the locator map"
-            )
+            if locator is None:
+                ledger.record(
+                    code=MAPPING_FAILURE_UNMAPPED_SOURCE_REF,
+                    stage=MAPPING_STAGE_RETRIEVE,
+                    retrieval_ref=retrieval_id,
+                    message=(
+                        "transitional retrieval_id is absent from the "
+                        "locator map"
+                    ),
+                )
+                return None
         else:
-            locator = None
-            lookup_ref = source_ref
-            lookup_message = "source_ref is neither canonical nor mapped"
-        if locator is None:
             ledger.record(
-                code=MAPPING_FAILURE_UNMAPPED_SOURCE_REF,
+                code=MAPPING_FAILURE_MISSING_SOURCE_REF,
                 stage=MAPPING_STAGE_RETRIEVE,
-                retrieval_ref=lookup_ref,
-                message=lookup_message,
+                retrieval_ref=_retrieval_ref_of(source_ref),
+                message=(
+                    f"hit source_ref is {type(source_ref).__name__}, expected "
+                    "a canonical fin locator serialization"
+                ),
             )
             return None
     else:
-        locator = Locator(
-            document_id=canonical_locator.document_id,
-            version=canonical_locator.version,
-            page=canonical_locator.unit,
-        )
+        try:
+            canonical_locator = deserialize_source_ref(source_ref)
+        except ValueError:
+            if isinstance(retrieval_id, str):
+                locator = locator_map.get(retrieval_id)
+                lookup_ref = retrieval_id
+                lookup_message = (
+                    "transitional retrieval_id is absent from the locator map"
+                )
+            elif source_ref in locator_map:
+                # Transitional compatibility for callers that explicitly
+                # supplied the pre-B4 locator map and still receive its old
+                # source_ref key. New integrations must use retrieval_id.
+                locator = locator_map.get(source_ref)
+                lookup_ref = source_ref
+                lookup_message = (
+                    "transitional source_ref key is absent from the locator "
+                    "map"
+                )
+            else:
+                locator = None
+                lookup_ref = source_ref
+                lookup_message = "source_ref is neither canonical nor mapped"
+            if locator is None:
+                ledger.record(
+                    code=MAPPING_FAILURE_UNMAPPED_SOURCE_REF,
+                    stage=MAPPING_STAGE_RETRIEVE,
+                    retrieval_ref=lookup_ref,
+                    message=lookup_message,
+                )
+                return None
+        else:
+            locator = Locator(
+                document_id=canonical_locator.document_id,
+                version=canonical_locator.version,
+                page=canonical_locator.unit,
+            )
     if not isinstance(locator, Locator):
         ledger.record(
             code=MAPPING_FAILURE_NON_LOCATOR_SOURCE_REF,
             stage=MAPPING_STAGE_RETRIEVE,
-            retrieval_ref=source_ref,
+            retrieval_ref=_retrieval_ref_of(lookup_ref),
             message=(
                 f"locator map holds {type(locator).__name__} for this id, "
                 "expected a fin Locator"
