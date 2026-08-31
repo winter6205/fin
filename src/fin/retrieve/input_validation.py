@@ -147,6 +147,23 @@ class InvalidInputMarkedDegradedError(RuntimeError):
     code = "invalid_input_marked_degraded"
 
 
+class _InputValidationEnvelopeError(InputValidationError):
+    """Represent a validated error envelope at the exception seam."""
+
+    def __init__(
+        self,
+        *,
+        code: str,
+        input_class: str,
+        signal: DegradationSignal,
+    ) -> None:
+        super().__init__(f"error envelope: {code}")
+        self.code = code
+        self.input_class = input_class
+        self.degraded = signal.degraded
+        self.degraded_reasons = signal.degraded_reasons
+
+
 class InputValidationLedgerUnwritableError(RuntimeError):
     """The ledger's path could not be appended to.
 
@@ -616,8 +633,14 @@ def observe_input_outcome(
                 degraded=signal.degraded,
                 result=result,
             )
-        ledger.record(
-            code=code, input_class=input_class, detail="error envelope"
+        record_input_failure(
+            _InputValidationEnvelopeError(
+                code=code,
+                input_class=input_class,
+                signal=signal,
+            ),
+            ledger=ledger,
+            detail="error envelope",
         )
         return InputOutcome(
             kind=OUTCOME_INVALID_INPUT,

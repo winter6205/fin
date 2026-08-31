@@ -58,7 +58,7 @@
    - **Findings:** Standards Medium —— `input_validation.py:595-623` 的异常路径调用严格的 `record_input_failure`，error-envelope 路径却直接 `ledger.record`，两条路径的校验强度已不一致。
    - **Acceptance:** 两条路径复用同一个记录入口，envelope 路径同样校验 `degraded` 与 code/class 的一致性；T21 既有测试全绿，并补一条 envelope 路径校验生效的测试。
    - [blocks: T1]
-   - Status: [ ] pending
+   - Status: [x] completed
 
 ## 不在本计划范围
 
