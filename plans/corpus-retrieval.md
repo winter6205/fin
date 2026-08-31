@@ -81,7 +81,7 @@
    - **Acceptance:** 三份 ADR 均以 accepted 状态落盘并各自写明决定与理由，其中：跨仓对齐基线 ADR 规定"两份 spec 共享同名章节 + 逐字比对为验收"；降级信号 ADR 完整收录 B3 的四条置位规则、消费规则与禁止的静默形态，并显式改判上述两处既有语义、明确凭证缺失不得用确定性伪向量兜底；评测量化与并发基线 ADR 收录的指标集与阈值取自 T1 定稿值。三份 ADR 的正文与基线章节不矛盾。
    - **Completion:** ADR 的编号分配与论证铺陈由实现者定，只要上述三件事各自被一份 accepted ADR 明确记录。
    - [blocks: T1] —— 评测量化与并发基线的取值依赖 F1 / F2 定稿。
-   - Status: [ ] pending
+   - Status: [x] done —— ADR 0040（跨仓对齐基线：共享同名章节 + 逐字比对验收）/ 0041（降级信号与部分失败语义：B3 四条置位规则 + 消费规则 + 禁止静默，显式改判「图地址缺失静默跳过」与「重排 fail-open 不标记」两处既有语义）/ 0042（评测量化与并发基线：取值逐字取 B1 定稿）均 accepted 落盘。
 
 3. **[parallel] 切分归属改判同步进既有 ADR 与三份 spec** — tag: `[decision]`
    - **Inherits:** spec「冲突声明」表：ADR 0030"面向检索的切分…判给检索服务"、ADR 0032"远程排序与切分留在 fin 之外"、三份既有 spec 的"chunking … stay outside fin / land in iknow-memory"表述，均由 ADR 0037 反向改判；两条 ADR 的其余决定不变。
@@ -89,7 +89,7 @@
    - **Acceptance:** ADR 0030 与 ADR 0032 的正文各自标注"切分条款由 ADR 0037 改判：切分归 fin、检索服务不二次切分"，且两条 ADR 的其余决定未被动摇（既有 superseded 状态也不因此变更）；三份既有 spec 中"切分归检索服务"方向的表述全部改为"切分归 fin、排序仍留在外"并指向 ADR 0037；全仓 `rg` 已无反向表述残留。
    - **Completion:** 改判标注的措辞与位置由实现者定；CONTEXT 的 **retrieve adapter** / **ingest** 词条已由 persist 提交更新，本弹只处理 ADR 与 spec 正文。
    - [blocks: T1]
-   - Status: [ ] pending
+   - Status: [x] done —— ADR 0030 / 0032 正文各加「Amended (ADR 0037)」条款级改判标注（status 行不动）；specs/s1-corpus-retrieve.md 4 处、vertical-slice-hardening.md 2 处、memory-dialogue-platform.md 1 处反向表述全部改为「切分归 fin、排序仍留在外」并指向 ADR 0037；rg 自查无活性反向表述残留。
 
 4. **跨仓基线章节逐字一致的校验入口** — tag: `[implementation]`
    - **Inherits:** B6：两份 spec 的该章节正文（自 `## 跨仓对齐基线` 标题行之后起，到下一个 `## ` 标题行之前止，去掉首尾空行）分别计算 sha256，两值相等则通过；文件路径由执行方在运行时给出，不写死在 spec 内。
@@ -163,7 +163,7 @@
     - **Acceptance:** 全量样本连续两次解析 + 切分的产物序列化后 sha256 不一致样本数 = 0；断言覆盖块文本、块标识、顺序与元数据四项，不只比块文本；注入任意非确定性来源（如集合迭代序、字典序、时钟、随机）后该断言即失败——即以该断言本身作为"无隐藏非确定性"的见证；`uv run pytest -q` exits 0。
     - **Completion:** 产物的序列化格式与比对粒度由实现者定，只要四项全比且非确定性来源能被该断言捕获。
     - [blocks: T11]
-    - Status: [ ] pending
+   - Status: [x] done —— 全量 234 样本连续两次解析+切分的规范化产物（sort_keys JSON，覆盖块文本/块标识/顺序/元数据四项）sha256 不一致样本数 = 0（`-m eval` 4 passed, 920s）；时钟/随机/数组序/集合迭代序四类注入均被断言捕获（含跨进程见证），小样用例锁 canonical 序列化对键序/迭代序不敏感。
 
 13. **[parallel] 规则 / 参数表版本变更触发就地全量重建** — tag: `[implementation]`
     - **Inherits:** spec「已定稿、不再作为开放问题」："解析规则或参数表升版本时**就地全量重建**，不做双版本并存"；ADR 0038 的 fin 侧义务："任意时点都能用同一规则版本与参数表版本从权威源重建全部推送内容"；版本变更同时是内容失效的触发条件之一（见 T18）。
@@ -171,7 +171,7 @@
     - **Acceptance:** 解析规则版本或参数表版本变更时，存在一条命令以新版本就地全量重建全部冻结单元与块，重建后不存在新旧两个版本并存的状态；重建产物满足 T12 的确定性断言；重建过程本身是可重入的（中断后重跑不产生半套新旧混合）；`uv run pytest -q` exits 0。
     - **Completion:** 重建命令的形态（CLI 子命令 / 脚本）、版本号的载体与推进规则由实现者定；不做双版本并存是硬约束。
     - [blocks: T9, T11]
-    - Status: [ ] pending
+   - Status: [x] done —— 入口 `uv run python -m fin.corpus.rebuild rebuild|check`：staging 构建 + 原子交换，交换前后双次 `validate_no_mixed_versions`（版本字段 + 逐文件 sha256 对账，违例抛 `mixed_version_state`）；中断模拟测试证明旧产物原样可见、重跑逐字节恢复基线；全量双跑 `find data/corpus/blocks | sha256sum` 一致（235 文件 / 97MB，已 gitignore）；`check` 输出 `parse_changed`/`params_changed` 信号供 T18 消费。
 
 ### 阶段 2 — 入库推送对接（依赖线 A 与线 B 都完成）
 
