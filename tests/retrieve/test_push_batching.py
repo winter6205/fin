@@ -299,9 +299,12 @@ def test_replaying_a_failed_batch_against_the_store_is_idempotent() -> None:
 
 
 def test_a_non_push_error_is_wrapped_in_a_named_failure_and_journaled() -> None:
+    """The catch-all wrapper covers exceptions with no named shape of
+    their own; transport-level `OSError`s have one since T16
+    (``push_service_unavailable``, asserted in test_push_failures.py)."""
     inner = FakePushPort()
     port = FlakyPushPort(
-        inner, fail_on_call=1, error=ConnectionResetError("socket closed")
+        inner, fail_on_call=1, error=ValueError("garbled payload")
     )
     journal = PushJournal()
     records = _records()
@@ -310,9 +313,9 @@ def test_a_non_push_error_is_wrapped_in_a_named_failure_and_journaled() -> None:
         push_in_batches(port, records, journal=journal, batch_size=3)
 
     assert excinfo.value.code == "push_batch_failed"
-    assert isinstance(excinfo.value.__cause__, ConnectionResetError)
+    assert isinstance(excinfo.value.__cause__, ValueError)
     assert [failure.code for failure in journal.failures()] == ["push_batch_failed"]
-    assert "socket closed" in journal.failures()[0].message
+    assert "garbled payload" in journal.failures()[0].message
 
 
 def test_journal_records_are_enumerable_and_replayable_from_disk(tmp_path) -> None:

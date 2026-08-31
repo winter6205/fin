@@ -46,7 +46,10 @@ empty success. Failures are enumerable via :meth:`PushJournal.failures`
 and replayable by running :func:`push_in_batches` again with the same
 journal; the record moves to :meth:`PushJournal.resolved_failures` once
 its batch completes, so a retried failure is neither lost nor
-double-counted.
+double-counted. A batch that failed for a named reason keeps that
+reason: the SC21 codes (``push_service_unavailable`` /
+``push_protocol_error``) travel through the driver unflattened, and only
+an untyped transport exception becomes ``push_batch_failed``.
 
 The journal is an append-only JSONL log when constructed with a
 ``path``, which is what makes the failure list survive the process that
@@ -72,6 +75,7 @@ from fin.retrieve.push_port import (
     PushError,
     PushPort,
     push_records,
+    validate_batch_not_empty,
 )
 
 _EVENT_COMPLETED: Final[str] = "completed"
@@ -307,7 +311,14 @@ def push_in_batches(
     The first failing batch is journaled with its stable error code and
     the typed error is re-raised; running again with the same journal
     replays exactly the batches that did not complete.
+
+    A push of no records is invalid input (§B2 第 5 条) and is refused
+    by name here rather than returning a zero-batch outcome, which would
+    be exactly the empty success the contract forbids.
+    :func:`plan_batches` stays a pure splitter and answers ``()`` for an
+    empty sequence; the judgement lives on the push entry point.
     """
+    validate_batch_not_empty(records)
     plans = plan_batches(records, batch_size=batch_size)
     pushed = skipped = written = duplicates = 0
     block_ids: list[str] = []
