@@ -42,7 +42,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Any, Final, Mapping
+from typing import Any, Final, Mapping, Sequence
 
 from fin.corpus.chunking import ChunkPayload, DocumentChunking, UnitChunking
 from fin.corpus.determinism import canonical_json_bytes
@@ -91,6 +91,20 @@ def content_identity(
         params_table_version,
     )
     return hashlib.sha256(_ID_SEPARATOR.join(parts).encode("utf-8")).hexdigest()
+
+
+def idempotency_keys_digest(keys: Sequence[tuple[str, str]]) -> str:
+    """The deterministic digest of an ordered set of idempotency keys.
+
+    One hashing construction for every "which writes does this request
+    cover" question: the canonical JSON of the ``(source_ref, content
+    identity)`` pairs, hashed with sha256. The batch key of
+    :mod:`fin.retrieve.push_batching` and the invalidation request key of
+    :mod:`fin.corpus.invalidation` both go through here rather than
+    growing a second scheme.
+    """
+    payload = [list(key) for key in keys]
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -194,6 +208,7 @@ __all__ = [
     "PushRecord",
     "content_identity",
     "document_push_records",
+    "idempotency_keys_digest",
     "record_of_payload",
     "serialize_source_ref",
     "unit_push_records",
