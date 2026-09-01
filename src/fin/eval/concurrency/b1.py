@@ -1,11 +1,10 @@
 """T23's published-number facade.
 
-The parser remains in ``fin.eval.ablation.matrix`` so T22 and T23 share one
-§B1 reading mechanism. This module only gives the concurrency package a
-focused import surface.
+The parser lives in ``fin.eval.ablation.concurrency_contract``; this module
+only gives the concurrency package a focused import surface.
 """
 
-from fin.eval.ablation.matrix import (
+from fin.eval.ablation.concurrency_contract import (
     B1_CONCURRENCY_CONTRACT,
     ConcurrencySpecDriftError,
     ConcurrencySpecRowMissingError,

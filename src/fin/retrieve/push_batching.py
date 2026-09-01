@@ -59,12 +59,12 @@ shape).
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Final, Sequence
 
 from fin.corpus.push import PushRecord, idempotency_keys_digest
+from fin.retrieve._ledger.jsonl import append_jsonl_object, replay_jsonl_objects
 from fin.retrieve.input_validation import InputValidationLedger
 from fin.retrieve.push_port import (
     MAX_PUSH_BATCH_RECORDS,
@@ -295,48 +295,40 @@ class PushJournal:
     # ----- persistence -----
 
     def _append(self, event: dict[str, object]) -> None:
-        if self._path is None:
-            return
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            with self._path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(event, sort_keys=True) + "\n")
-        except OSError as exc:
-            raise PushJournalUnwritableError(
-                f"cannot append push journal at {self._path}: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
+        append_jsonl_object(
+            self._path,
+            event,
+            unwritable=PushJournalUnwritableError,
+            message=f"cannot append push journal at {self._path}",
+        )
 
     def _replay(self, path: Path) -> None:
-        try:
-            contents = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError as exc:
-            raise PushJournalCorruptError(
-                f"push journal at {path} is not valid UTF-8: {exc}"
-            ) from exc
-        except OSError as exc:
-            raise PushJournalUnreadableError(
+        replay_jsonl_objects(
+            path,
+            lambda event, number: self._apply_or_corrupt(event, path, number),
+            on_read_oserror=lambda exc: PushJournalUnreadableError(
                 f"cannot read push journal at {path}: "
                 f"{type(exc).__name__}: {exc}"
-            ) from exc
+            ),
+            on_unicode=lambda exc: PushJournalCorruptError(
+                f"push journal at {path} is not valid UTF-8: {exc}"
+            ),
+            on_json=lambda exc, number: PushJournalCorruptError(
+                f"push journal {path} line {number} is not valid JSON: "
+                f"{exc}"
+            ),
+        )
 
-        for number, line in enumerate(contents.splitlines(), start=1):
-            if not line.strip():
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise PushJournalCorruptError(
-                    f"push journal {path} line {number} is not valid JSON: "
-                    f"{exc}"
-                ) from exc
-            try:
-                self._apply_replayed_event(event)
-            except (KeyError, TypeError, ValueError) as exc:
-                raise PushJournalCorruptError(
-                    f"push journal {path} line {number} is not a "
-                    f"replayable event: {type(exc).__name__}: {exc}"
-                ) from exc
+    def _apply_or_corrupt(
+        self, event: object, path: Path, number: int
+    ) -> None:
+        try:
+            self._apply_replayed_event(event)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PushJournalCorruptError(
+                f"push journal {path} line {number} is not a "
+                f"replayable event: {type(exc).__name__}: {exc}"
+            ) from exc
 
     def _apply_replayed_event(self, event: object) -> None:
         if not isinstance(event, dict):

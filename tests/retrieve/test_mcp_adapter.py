@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import logging
 
 import pytest
 
@@ -624,3 +625,108 @@ def test_non_dict_response_maps_to_retrieve_unavailable() -> None:
         scripted_response=["hits"],  # type: ignore[arg-type]
     )
     assert adapter.retrieve("foo") == {"error": "retrieve_unavailable"}
+
+
+# ----- schema field stripping (A6: mock zod without .strict()) -----
+
+
+def test_stripped_adapter_fields_emit_warning_and_degraded_reasons(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the mock MCP schema (no ``.strict()``) drops ``top_k`` /
+    ``filter`` / ``document_id``, fin must warn and surface
+    ``degraded_reasons`` — not silently return chunks as if the
+    filters ran."""
+    hits = [{"text": "hit", "source_ref": "id-A", "score": 1.0}]
+    locator_map = {"id-A": _loc("DOC-2023Q1")}
+    adapter = _ScriptedAdapter(
+        scripted_response={
+            "hits": hits,
+            # Mock echoes only ``query`` — other adapter fields stripped.
+            "applied_arguments": {"query": "revenue"},
+        },
+        locator_map=locator_map,
+        known_document_ids={"DOC-2023Q1"},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="fin.retrieve.mcp_adapter"):
+        result = adapter.retrieve(
+            "revenue",
+            document_id="DOC-2023Q1",
+            cik="0000320193",
+            form="10-Q",
+            limit=5,
+        )
+
+    assert len(result["chunks"]) == 1
+    assert result["degraded"] is True
+    assert result["degraded_reasons"]
+    assert any(
+        "field_stripped" in reason for reason in result["degraded_reasons"]
+    )
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+    assert warnings
+    assert any(
+        "adapter_field_stripped" in record.getMessage() for record in warnings
+    )
+
+
+def test_response_without_applied_arguments_stays_undegraded() -> None:
+    """Production servers that omit ``applied_arguments`` skip detection —
+    no spurious warnings or degradation envelope."""
+    hits = [{"text": "hit", "source_ref": "id-A", "score": 1.0}]
+    adapter = _ScriptedAdapter(
+        scripted_response={"hits": hits},
+        locator_map={"id-A": _loc("DOC-2023Q1")},
+    )
+
+    result = adapter.retrieve(
+        "revenue",
+        document_id="DOC-2023Q1",
+        cik="0000320193",
+        limit=5,
+    )
+
+    assert result == {"chunks": [_chunk("hit", "DOC-2023Q1")]}
+
+
+def test_all_adapter_fields_applied_stays_undegraded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When ``applied_arguments`` echoes every field fin sent, there is
+    nothing to report."""
+    hits = [{"text": "hit", "source_ref": "id-A", "score": 1.0}]
+    adapter = _ScriptedAdapter(
+        scripted_response={
+            "hits": hits,
+            "applied_arguments": {
+                "query": "revenue",
+                "top_k": 5,
+                "document_id": "DOC-2023Q1",
+                "filter": {"cik": "0000320193", "form": "10-Q"},
+            },
+        },
+        locator_map={"id-A": _loc("DOC-2023Q1")},
+        known_document_ids={"DOC-2023Q1"},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="fin.retrieve.mcp_adapter"):
+        result = adapter.retrieve(
+            "revenue",
+            document_id="DOC-2023Q1",
+            cik="0000320193",
+            form="10-Q",
+            limit=5,
+        )
+
+    assert result == {"chunks": [_chunk("hit", "DOC-2023Q1")]}
+    assert [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ] == []
