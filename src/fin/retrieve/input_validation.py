@@ -43,13 +43,13 @@ where the layering says it must not be.
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Final, Mapping, NoReturn, Sequence
 
 from fin.corpus.errors import EmptySourceParseError, NoUnitsParseError
+from fin.retrieve._ledger.jsonl import append_jsonl_object, replay_jsonl_objects
 from fin.retrieve.degradation import (
     DegradationSignal,
     read_degradation_signal,
@@ -279,7 +279,7 @@ class InputValidationLedger:
         self._path = path
         self._records: list[InputValidationRecord] = []
         if path is not None and path.exists():
-            self._replay(path)
+            self._records.extend(self._replay(path))
 
     @property
     def path(self) -> Path | None:
@@ -326,52 +326,53 @@ class InputValidationLedger:
     # ----- persistence -----
 
     def _append(self, record: InputValidationRecord) -> None:
-        if self._path is None:
-            return
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            with self._path.open("a", encoding="utf-8") as handle:
-                handle.write(
-                    json.dumps(
-                        {
-                            "code": record.code,
-                            "input_class": record.input_class,
-                            "detail": record.detail,
-                        },
-                        sort_keys=True,
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
-        except OSError as exc:
-            raise InputValidationLedgerUnwritableError(
-                f"cannot append the input-validation record to "
-                f"{self._path}: {type(exc).__name__}: {exc}"
-            ) from exc
+        append_jsonl_object(
+            self._path,
+            {
+                "code": record.code,
+                "input_class": record.input_class,
+                "detail": record.detail,
+            },
+            unwritable=InputValidationLedgerUnwritableError,
+            message=(
+                "cannot append the input-validation record to "
+                f"{self._path}"
+            ),
+            ensure_ascii=False,
+        )
 
-    def _replay(self, path: Path) -> None:
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeDecodeError) as exc:
-            raise InputValidationLedgerCorruptError(
+    def _replay(self, path: Path) -> list[InputValidationRecord]:
+        return replay_jsonl_objects(
+            path,
+            lambda event, number: self._record_of_event(event, path, number),
+            on_read_oserror=lambda exc: InputValidationLedgerCorruptError(
                 f"cannot read the input-validation ledger at {path}: "
                 f"{type(exc).__name__}: {exc}"
-            ) from exc
-        for number, line in enumerate(lines, start=1):
-            if not line.strip():
-                continue
-            self._records.append(self._parse_line(line, path, number))
+            ),
+            on_unicode=lambda exc: InputValidationLedgerCorruptError(
+                f"cannot read the input-validation ledger at {path}: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            on_json=lambda exc, number: InputValidationLedgerCorruptError(
+                f"input-validation ledger {path} line {number} is not a "
+                f"replayable record: {type(exc).__name__}: {exc}"
+            ),
+        )
 
     @staticmethod
-    def _parse_line(
-        line: str, path: Path, number: int
+    def _record_of_event(
+        event: object, path: Path, number: int
     ) -> InputValidationRecord:
         try:
-            event = json.loads(line)
+            payload = event if isinstance(event, dict) else {}
+            if not isinstance(event, dict):
+                raise TypeError(
+                    f"event is {type(event).__name__}, expected an object"
+                )
             return InputValidationRecord(
-                code=str(event["code"]),
-                input_class=str(event["input_class"]),
-                detail=str(event.get("detail", "")),
+                code=str(payload["code"]),
+                input_class=str(payload["input_class"]),
+                detail=str(payload.get("detail", "")),
             )
         except (ValueError, KeyError, TypeError) as exc:
             raise InputValidationLedgerCorruptError(

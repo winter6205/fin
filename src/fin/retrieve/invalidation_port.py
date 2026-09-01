@@ -48,12 +48,12 @@ repeated request adds an entry instead of overwriting the trail.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Mapping, Protocol, Sequence, runtime_checkable
 
 from fin.corpus.invalidation import InvalidationTarget, request_key
+from fin.retrieve._ledger.jsonl import append_jsonl_object, replay_jsonl_objects
 
 # T18 retry policy, mirroring the push path's
 # ``PUSH_ATTEMPTS_PER_BATCH``: one attempt per request, no retry hidden
@@ -370,7 +370,7 @@ class InvalidationLedger:
         self._path = path
         self._records: list[InvalidationRecord] = []
         if path is not None and path.exists():
-            self._replay(path)
+            self._records.extend(self._replay(path))
 
     @property
     def path(self) -> Path | None:
@@ -470,43 +470,44 @@ class InvalidationLedger:
         return record
 
     def _append(self, record: InvalidationRecord, event: str) -> None:
-        if self._path is None:
-            return
-        payload = {
-            "event": event,
-            "request_key": record.request_key,
-            "code": record.code,
-            "source_refs": list(record.source_refs),
-            "block_ids": list(record.block_ids),
-            "reasons": list(record.reasons),
-            "closed": record.closed,
-            "already_closed": record.already_closed,
-            "message": record.message,
-        }
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            with self._path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, sort_keys=True) + "\n")
-        except OSError as exc:
-            raise InvalidationLedgerUnwritableError(
-                f"cannot append the invalidation record for request "
-                f"{record.request_key!r} to {self._path}: "
+        append_jsonl_object(
+            self._path,
+            {
+                "event": event,
+                "request_key": record.request_key,
+                "code": record.code,
+                "source_refs": list(record.source_refs),
+                "block_ids": list(record.block_ids),
+                "reasons": list(record.reasons),
+                "closed": record.closed,
+                "already_closed": record.already_closed,
+                "message": record.message,
+            },
+            unwritable=InvalidationLedgerUnwritableError,
+            message=(
+                "cannot append the invalidation record for request "
+                f"{record.request_key!r} to {self._path}"
+            ),
+        )
+
+    def _replay(self, path: Path) -> list[InvalidationRecord]:
+        return replay_jsonl_objects(
+            path,
+            lambda event, number: self._record_of_event(event, path, number),
+            on_json=lambda exc, number: InvalidationLedgerCorruptError(
+                f"{path}:{number} is not a readable invalidation record: "
                 f"{type(exc).__name__}: {exc}"
-            ) from exc
+            ),
+        )
 
-    def _replay(self, path: Path) -> None:
-        for number, line in enumerate(
-            path.read_text(encoding="utf-8").splitlines(), start=1
-        ):
-            if not line.strip():
-                continue
-            self._records.append(self._record_of_line(path, number, line))
-
-    def _record_of_line(
-        self, path: Path, number: int, line: str
+    def _record_of_event(
+        self, event: object, path: Path, number: int
     ) -> InvalidationRecord:
         try:
-            event = json.loads(line)
+            if not isinstance(event, dict):
+                raise TypeError(
+                    f"event is {type(event).__name__}, expected an object"
+                )
             settled = str(event["event"]) == _EVENT_SETTLED
             return InvalidationRecord(
                 request_key=str(event["request_key"]),
