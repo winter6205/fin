@@ -39,12 +39,13 @@ the operator is told, never what the citation gate accepts.
 
 from __future__ import annotations
 
-import json
 import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
+
+from fin.retrieve._ledger.jsonl import append_jsonl_object, replay_jsonl_objects
 
 
 # ----- the two field names, verbatim -----
@@ -296,7 +297,7 @@ class DegradationLedger:
         self._lock = threading.RLock()
         self._records: list[DegradationRecord] = []
         if path is not None and path.exists():
-            self._replay(path)
+            self._records.extend(self._replay(path))
 
     @property
     def path(self) -> Path | None:
@@ -374,46 +375,47 @@ class DegradationLedger:
 
     def _append(self, record: DegradationRecord) -> None:
         with self._lock:
-            if self._path is None:
-                return
-            try:
-                self._path.parent.mkdir(parents=True, exist_ok=True)
-                with self._path.open("a", encoding="utf-8") as handle:
-                    handle.write(
-                        json.dumps(
-                            {
-                                "reason": record.reason,
-                                "stage": record.stage,
-                                "detail": record.detail,
-                            },
-                            sort_keys=True,
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-            except OSError as exc:
-                raise DegradationLedgerUnwritableError(
-                    f"cannot append the degradation record to {self._path}: "
-                    f"{type(exc).__name__}: {exc}"
-                ) from exc
+            append_jsonl_object(
+                self._path,
+                {
+                    "reason": record.reason,
+                    "stage": record.stage,
+                    "detail": record.detail,
+                },
+                unwritable=DegradationLedgerUnwritableError,
+                message=(
+                    f"cannot append the degradation record to {self._path}"
+                ),
+                ensure_ascii=False,
+            )
 
-    def _replay(self, path: Path) -> None:
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeDecodeError) as exc:
-            raise DegradationLedgerCorruptError(
+    def _replay(self, path: Path) -> list[DegradationRecord]:
+        return replay_jsonl_objects(
+            path,
+            lambda event, number: self._record_of_event(event, path, number),
+            on_read_oserror=lambda exc: DegradationLedgerCorruptError(
                 f"cannot read the degradation ledger at {path}: "
                 f"{type(exc).__name__}: {exc}"
-            ) from exc
-        for number, line in enumerate(lines, start=1):
-            if not line.strip():
-                continue
-            self._records.append(self._parse_line(line, path, number))
+            ),
+            on_unicode=lambda exc: DegradationLedgerCorruptError(
+                f"cannot read the degradation ledger at {path}: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            on_json=lambda exc, number: DegradationLedgerCorruptError(
+                f"degradation ledger {path} line {number} is not a "
+                f"replayable record: {type(exc).__name__}: {exc}"
+            ),
+        )
 
     @staticmethod
-    def _parse_line(line: str, path: Path, number: int) -> DegradationRecord:
+    def _record_of_event(
+        event: object, path: Path, number: int
+    ) -> DegradationRecord:
         try:
-            event = json.loads(line)
+            if not isinstance(event, dict):
+                raise TypeError(
+                    f"event is {type(event).__name__}, expected an object"
+                )
             return DegradationRecord(
                 reason=str(event["reason"]),
                 stage=str(event["stage"]),
