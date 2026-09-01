@@ -53,7 +53,6 @@ malformed-evidence contracts are unchanged.
 
 from __future__ import annotations
 
-import json
 import os
 import threading
 from dataclasses import dataclass
@@ -62,6 +61,7 @@ from typing import Any, Final, Mapping, Sequence
 
 from fin.corpus.extracted import Locator
 from fin.corpus.push import deserialize_source_ref
+from fin.retrieve._ledger.jsonl import append_jsonl_object, replay_jsonl_objects
 from fin.retrieve.port import Chunk
 
 
@@ -183,7 +183,7 @@ class MappingFailureLedger:
         self._lock = threading.RLock()
         self._failures: list[MappingFailure] = []
         if path is not None and path.exists():
-            self._replay(path)
+            self._failures.extend(self._replay(path))
 
     @property
     def path(self) -> Path | None:
@@ -250,46 +250,47 @@ class MappingFailureLedger:
 
     def _append(self, failure: MappingFailure) -> None:
         with self._lock:
-            if self._path is None:
-                return
-            try:
-                self._path.parent.mkdir(parents=True, exist_ok=True)
-                with self._path.open("a", encoding="utf-8") as handle:
-                    handle.write(
-                        json.dumps(
-                            {
-                                "code": failure.code,
-                                "stage": failure.stage,
-                                "retrieval_ref": failure.retrieval_ref,
-                                "message": failure.message,
-                            },
-                            sort_keys=True,
-                        )
-                        + "\n"
-                    )
-            except OSError as exc:
-                raise MappingFailureLedgerUnwritableError(
-                    f"cannot append the mapping failure count to {self._path}: "
-                    f"{type(exc).__name__}: {exc}"
-                ) from exc
+            append_jsonl_object(
+                self._path,
+                {
+                    "code": failure.code,
+                    "stage": failure.stage,
+                    "retrieval_ref": failure.retrieval_ref,
+                    "message": failure.message,
+                },
+                unwritable=MappingFailureLedgerUnwritableError,
+                message=(
+                    f"cannot append the mapping failure count to {self._path}"
+                ),
+            )
 
-    def _replay(self, path: Path) -> None:
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeDecodeError) as exc:
-            raise MappingFailureLedgerCorruptError(
+    def _replay(self, path: Path) -> list[MappingFailure]:
+        return replay_jsonl_objects(
+            path,
+            lambda event, number: self._record_of_event(event, path, number),
+            on_read_oserror=lambda exc: MappingFailureLedgerCorruptError(
                 f"cannot read the mapping failure ledger at {path}: "
                 f"{type(exc).__name__}: {exc}"
-            ) from exc
-        for number, line in enumerate(lines, start=1):
-            if not line.strip():
-                continue
-            self._failures.append(self._parse_line(line, path, number))
+            ),
+            on_unicode=lambda exc: MappingFailureLedgerCorruptError(
+                f"cannot read the mapping failure ledger at {path}: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            on_json=lambda exc, number: MappingFailureLedgerCorruptError(
+                f"mapping failure ledger {path} line {number} is not a "
+                f"replayable record: {type(exc).__name__}: {exc}"
+            ),
+        )
 
     @staticmethod
-    def _parse_line(line: str, path: Path, number: int) -> MappingFailure:
+    def _record_of_event(
+        event: object, path: Path, number: int
+    ) -> MappingFailure:
         try:
-            event = json.loads(line)
+            if not isinstance(event, dict):
+                raise TypeError(
+                    f"event is {type(event).__name__}, expected an object"
+                )
             return MappingFailure(
                 code=str(event["code"]),
                 stage=str(event["stage"]),
