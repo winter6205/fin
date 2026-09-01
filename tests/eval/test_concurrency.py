@@ -40,6 +40,20 @@ from fin.retrieve.fake_push_port import FakePushPort
 from fin.retrieve.push_port import push_records
 
 
+def test_concurrency_contract_parser_lives_outside_matrix_module() -> None:
+    """§B1 concurrency parsing must not share matrix.py's function body."""
+    import inspect
+
+    from fin.eval.ablation import concurrency_contract, matrix
+
+    assert hasattr(concurrency_contract, "published_concurrency_contract")
+    assert (
+        inspect.getmodule(concurrency_contract.published_concurrency_contract)
+        is concurrency_contract
+    )
+    assert inspect.getmodule(matrix.published_concurrency_contract) is concurrency_contract
+
+
 def _record() -> PushRecord:
     return PushRecord(
         block_id="t23-block",
