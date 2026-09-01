@@ -95,7 +95,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, Mapping
 
 from fin.corpus.extracted import Locator
 from fin.retrieve.degradation import (
@@ -368,6 +368,81 @@ def _validate_mcp_responses(
         )
     _validate_initialize_response(responses[0])
     return _validate_tool_response(responses[1], payload)
+
+
+def _stripped_adapter_field_names(
+    sent_arguments: Mapping[str, Any],
+    applied_arguments: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return adapter field names the MCP tool schema did not keep.
+
+    Compares what fin sent on the wire with what the server echoes in
+    ``applied_arguments``. Production servers that omit the echo field
+    are handled by the caller — this function is only invoked when the
+    echo is present.
+    """
+    stripped: list[str] = []
+    for key in ("top_k", "document_id"):
+        if key in sent_arguments and key not in applied_arguments:
+            stripped.append(key)
+
+    sent_filter = sent_arguments.get("filter")
+    applied_filter = applied_arguments.get("filter")
+    if isinstance(sent_filter, Mapping) and sent_filter:
+        if not isinstance(applied_filter, Mapping):
+            stripped.append("filter")
+        else:
+            for filter_key in sent_filter:
+                if filter_key not in applied_filter:
+                    stripped.append(f"filter.{filter_key}")
+
+    return tuple(stripped)
+
+
+def _signal_for_stripped_adapter_fields(
+    sent_arguments: Mapping[str, Any],
+    applied_arguments: Any,
+) -> DegradationSignal:
+    """Detect schema stripping via ``applied_arguments`` and surface §B3.
+
+    Mock iknow-memory schemas without ``.strict()`` drop unknown keys
+    silently; when the server echoes which keys it kept, fin compares
+    that echo to what it sent and refuses to treat the response as
+    undegraded.
+    """
+    if not isinstance(applied_arguments, Mapping):
+        return NOT_DEGRADED
+
+    stripped = _stripped_adapter_field_names(sent_arguments, applied_arguments)
+    if not stripped:
+        return NOT_DEGRADED
+
+    logger.warning(
+        "adapter_field_stripped: MCP tool schema dropped fin adapter "
+        "fields: %s",
+        ", ".join(stripped),
+    )
+    return DegradationSignal(
+        degraded=True,
+        degraded_reasons=tuple(
+            f"adapter:field_stripped:{name}" for name in stripped
+        ),
+    )
+
+
+def _merge_degradation_signals(
+    *signals: DegradationSignal,
+) -> DegradationSignal:
+    """Combine degradation from the service envelope and fin-side checks."""
+    reasons: list[str] = []
+    degraded = False
+    for signal in signals:
+        if signal.degraded:
+            degraded = True
+            reasons.extend(signal.degraded_reasons)
+    if not degraded:
+        return NOT_DEGRADED
+    return DegradationSignal(degraded=True, degraded_reasons=tuple(reasons))
 
 
 # ----- adapter -----
@@ -670,6 +745,13 @@ class MCPRetrieveAdapter:
         signal = _degradation_of_response(
             response,
             business_result=result,
+        )
+        signal = _merge_degradation_signals(
+            signal,
+            _signal_for_stripped_adapter_fields(
+                arguments,
+                result.get("applied_arguments"),
+            ),
         )
         hits = result.get("hits")
         if not isinstance(hits, list):
