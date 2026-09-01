@@ -93,6 +93,19 @@ def test_domain_ledgers_do_not_reimplement_jsonl_append_or_replay() -> None:
     assert offenders == []
 
 
+def test_domain_ledgers_have_no_jsonl_append_source_matches() -> None:
+    """rg-shaped companion to the AST proof (Plan A A1 dual self-check)."""
+    hits: list[str] = []
+    for path in _domain_python_files():
+        relative = path.relative_to(_PROJECT_ROOT).as_posix()
+        for number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if "json.dumps" in line or '.open("a"' in line or ".open('a'" in line:
+                hits.append(f"{relative}:{number}")
+    assert hits == []
+
+
 def test_shared_jsonl_primitive_module_exists() -> None:
     assert _PRIMITIVE.is_file()
 

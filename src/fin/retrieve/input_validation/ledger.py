@@ -132,15 +132,14 @@ class InputValidationLedger:
         event: object, path: Path, number: int
     ) -> InputValidationRecord:
         try:
-            payload = event if isinstance(event, dict) else {}
             if not isinstance(event, dict):
                 raise TypeError(
                     f"event is {type(event).__name__}, expected an object"
                 )
             return InputValidationRecord(
-                code=str(payload["code"]),
-                input_class=str(payload["input_class"]),
-                detail=str(payload.get("detail", "")),
+                code=str(event["code"]),
+                input_class=str(event["input_class"]),
+                detail=str(event.get("detail", "")),
             )
         except (ValueError, KeyError, TypeError) as exc:
             raise InputValidationLedgerCorruptError(
