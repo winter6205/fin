@@ -690,3 +690,40 @@ def test_cursor_start_exports_official_chat_defaults() -> None:
         or line.lstrip().startswith("export FIN_API_KEY=")
     ]
     assert assigned == []
+
+
+def test_default_mcp_command_fallback_shared_without_serve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``compile.DEFAULT_MCP_COMMAND`` and ``graph.compile_graph``'s MCP
+    fallback must stay aligned — ``iknow-memory`` alone, no ``serve``."""
+    from typing import Any
+
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from fin.corpus.extracted import Locator
+    from fin.host import ScriptedChatModel, compile_graph
+    from fin.host import graph as graph_module
+    from fin.host.compile import DEFAULT_MCP_COMMAND
+    from fin.retrieve import MCPRetrieveAdapter
+
+    assert DEFAULT_MCP_COMMAND == ("iknow-memory",)
+    assert "serve" not in DEFAULT_MCP_COMMAND
+
+    built: list[dict[str, Any]] = []
+
+    class _RecordingMCP(MCPRetrieveAdapter):
+        def __init__(self, **kwargs: Any) -> None:
+            built.append(kwargs)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(graph_module, "MCPRetrieveAdapter", _RecordingMCP)
+
+    compile_graph(
+        checkpointer=InMemorySaver(),
+        model=ScriptedChatModel(script=[]),
+        retrieve_adapter="mcp",
+        locator_map={"iknow-1": Locator("DOC-2023Q1", "v" * 64, 1)},
+    )
+    assert len(built) == 1
+    assert built[0]["command"] == list(DEFAULT_MCP_COMMAND)
