@@ -1345,7 +1345,7 @@ def compile_graph(
     mcp_command
         T3 (#76): launch command for the MCP server used when
         ``retrieve_adapter`` is ``"mcp"`` and no ``adapter`` was
-        supplied. Defaults to ``["iknow-memory", "serve"]``.
+        supplied. Defaults to ``["iknow-memory"]`` (兜底非契约).
     locator_map
         T3 (#76): explicit compatibility map from ``retrieval_id``
         (or a legacy ``source_ref`` key) to ``fin.Locator``, passed

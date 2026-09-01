@@ -22,10 +22,10 @@ from fin.retrieve.push_batching import (
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _DOMAIN_LEDGER_FILES = (
-    "src/fin/retrieve/input_validation.py",
+    "src/fin/retrieve/input_validation",
     "src/fin/retrieve/degradation.py",
     "src/fin/retrieve/hit_mapping.py",
-    "src/fin/retrieve/invalidation_port.py",
+    "src/fin/retrieve/invalidation_port",
     "src/fin/retrieve/push_batching.py",
 )
 _PRIMITIVE = (
@@ -49,10 +49,21 @@ def _call_func_name(node: ast.AST) -> str | None:
     return None
 
 
-def test_domain_ledgers_do_not_reimplement_jsonl_append_or_replay() -> None:
-    offenders: list[str] = []
+def _domain_python_files() -> tuple[Path, ...]:
+    files: list[Path] = []
     for relative in _DOMAIN_LEDGER_FILES:
         path = _PROJECT_ROOT / relative
+        if path.is_dir():
+            files.extend(sorted(path.rglob("*.py")))
+        else:
+            files.append(path)
+    return tuple(files)
+
+
+def test_domain_ledgers_do_not_reimplement_jsonl_append_or_replay() -> None:
+    offenders: list[str] = []
+    for path in _domain_python_files():
+        relative = path.relative_to(_PROJECT_ROOT).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and _call_func_name(node.func) == "dumps":
@@ -99,8 +110,7 @@ def test_stable_ledger_error_codes_remain_verbatim() -> None:
     assert MappingFailureLedgerCorruptError.code == "mapping_failure_ledger_corrupt"
     assert InputValidationLedgerCorruptError.code == "input_validation_ledger_corrupt"
     source = "\n".join(
-        (_PROJECT_ROOT / relative).read_text(encoding="utf-8")
-        for relative in _DOMAIN_LEDGER_FILES
+        path.read_text(encoding="utf-8") for path in _domain_python_files()
     )
     for code in _STABLE_CODES:
         assert f'"{code}"' in source or f"'{code}'" in source
