@@ -44,14 +44,14 @@ Each numbered item is one tracer bullet: one vertical-slice outcome, one tag `[i
    - **Inherits:** `plans/retrieve-maintainability-followup.md` T1：一处内部通用 append-only JSONL 组件承担写入、重放、以及 I/O 与损坏内容的错误包装；五个领域 ledger 改在其之上实现，各自保留领域错误类型与 code；`push_journal_corrupt` / `invalidation_ledger_unwritable` / `degradation_ledger_corrupt` / `mapping_failure_ledger_corrupt` / `input_validation_ledger_corrupt` 逐字保留。五处重复实现：`input_validation.py` / `degradation.py` / `hit_mapping.py` / `invalidation_port.py` / `push_batching.py` journal。
    - **Surface:** `src/fin/retrieve/` 内既有领域 ledger 调用点；Plan A 已允许单层内部模块（例如 `_ledger/` 或同等），新文件名由实现者定。
    - **Acceptance:** 领域 ledger 不再各自重写 append / replay / 错误包装三件套（rg 与 AST 双重自证）；对外错误 code 与行为不变；`uv run pytest -q` passed 数 ≥ 1758、failed 数 ≤ 1（仅预存 memory dream）。
-   - Status: [ ] pending
+   - Status: [x] completed
    - **默认第一刀**
 
 2. **拆分 concurrency runner 为 driver / report / validation** — tag: `[implementation]`
    - **Inherits:** `plans/retrieve-maintainability-followup.md` T2：按场景拆出 driver、report、validation 三部分，共享执行原语保留在一处；opt-in CLI 调用形式与落盘格式不变；同一进程内「串行假通过」必须仍被既有 barrier 驱动的并发幂等测试捕获。
    - **Surface:** `src/fin/eval/concurrency/`（既有 runner 所在包）
    - **Acceptance:** L1 / L2 / 幂等 driver、落盘 report、断言 validation 分责；共享执行原语单一权威；`tests/eval/test_concurrency.py` 全绿；默认 `uv run pytest -q` 不增加 regression。
-   - Status: [ ] pending
+   - Status: [x] completed
    - [blocks: T1]
    - [parallel] 与 T3（均只依赖 T1）
 
@@ -59,7 +59,7 @@ Each numbered item is one tracer bullet: one vertical-slice outcome, one tag `[i
    - **Inherits:** `plans/retrieve-maintainability-followup.md` T3：`input_validation` 拆为错误注册 / 持久化 / 分类规则 / 观察；`invalidation_port` 拆为 codec / ledger / port operation；对外导出面不扩大（既有 import 路径保留为 re-export）；持久化由 T1 抽出的 ledger 基础设施承载。
    - **Surface:** `src/fin/retrieve/` 内既有 `input_validation` 与 `invalidation_port` 模块
    - **Acceptance:** T18（`tests/retrieve/test_invalidation.py` / `tests/retrieve/test_invalidation_port.py`）与 T21（`tests/retrieve/test_input_validation.py` / `tests/host/test_input_validation_exit.py`）全绿；默认 `uv run pytest -q` 不增加 regression。
-   - Status: [ ] pending
+   - Status: [x] completed
    - [blocks: T1]
    - [parallel] 与 T2
 
@@ -67,28 +67,28 @@ Each numbered item is one tracer bullet: one vertical-slice outcome, one tag `[i
    - **Inherits:** `plans/retrieve-maintainability-followup.md` T4：snapshot/enumeration 与 static switch scanner 分离；T19 的 8 键逐字断言与「产品路径开关命中数 = 0」两条断言不变；`PRODUCT_CALL_PATH_FILES`（`port.py` / `tool.py` / `mcp_adapter.py` / `graph.py` / `compile.py`）列表的单一权威位置不变。
    - **Surface:** `src/fin/retrieve/` 内既有 capabilities 模块（Plan A 已允许包化，子文件名由实现者定）
    - **Acceptance:** `load_capability_keys` / `published_capability_keys` / `assert_snapshot_matches_published` 与 `scan_source_for_capability_switches` / `capability_switch_hits` 分责；`tests/retrieve/test_capability_static_check.py` 与 `tests/retrieve/test_capabilities.py` 全过；默认 `uv run pytest -q` 不增加 regression。
-   - Status: [ ] pending
+   - Status: [x] completed
    - [parallel] 与 T1 / T5 / T6 / T7（与 A1 无硬依赖）
 
 5. **拆分 ablation matrix 构建与 B1 口径解析** — tag: `[implementation]`
    - **Inherits:** `plans/retrieve-maintainability-followup.md` T5：ablation matrix 构建与 B1 并发契约解析拆为独立模块；§B1 动态读取与 drift 校验仍是单一权威、仍在 `uv run python -m fin.eval.ablation run` 入口生效；不允许在本地另立 §B1 第二套口径。锁定：本弹不碰 `specs/corpus-retrieval.md` §B1 正文。
    - **Surface:** `src/fin/eval/ablation/` 既有 matrix 所在包
    - **Acceptance:** T22 矩阵编排（10 配置 / 40 题 / 重复 3 次）与 T23 对 §B1 各行动态读取分责；`tests/eval/test_ablation.py` 与 `tests/eval/test_concurrency.py` 全绿；spec 文件无 diff；默认 `uv run pytest -q` 不增加 regression。
-   - Status: [ ] pending
+   - Status: [x] completed
    - [parallel] 与 T1 / T4 / T6 / T7（与 A1 无硬依赖）
 
 6. **fin 侧剥键警告（mock 无 `.strict()`）** — tag: `[implementation]`
    - **Inherits:** Plan A A6 / `docs/handoff/2026-09-01-pr225-merged.md` 缺口 1；`docs/cross-repo/alignment-proposal.md` 缺口 1；T16 `tests/retrieve/test_push_failures.py` 既有静默失败检测路径。锁定：只做 fin 侧；不改 iknow-memory；警告不得降为 debug。
    - **Surface:** `src/fin/retrieve/mcp_adapter.py` 与既有 `tests/retrieve/test_mcp_adapter.py`
    - **Acceptance:** mock zod schema 无 `.strict()`；fin 发送 `top_k` / `filter` / `document_id` 后被剥键时，至少一条 warning 级日志与一条 `degraded_reasons` 项；ToolMessage 不静默吞掉被剥字段；脚本化 port + 脚本化 `_call_mcp`；默认 `uv run pytest -q` 不增加 regression。
-   - Status: [ ] pending
+   - Status: [x] completed
    - [parallel] 与 T4 / T5 / T7
 
 7. **两处 DEFAULT_MCP_COMMAND 放宽为 `("iknow-memory",)`** — tag: `[implementation]`
    - **Inherits:** Plan A A7 / 缺口 3：`src/fin/host/compile.py` 与 `src/fin/host/graph.py` 的 `DEFAULT_MCP_COMMAND = ("iknow-memory", "serve")` → `("iknow-memory",)`；先走 stdio MCP（`npm start` 形态可启动）；纯兜底；常量变更不入 ADR、不入 spec；注释说明「兜底非契约」。锁定：只改这两处常量。
    - **Surface:** `src/fin/host/compile.py` 与 `src/fin/host/graph.py` 既有常量
    - **Acceptance:** 两处常量值同步为 `("iknow-memory",)`；不触其他 host 文件；默认 `uv run pytest -q` 不增加 regression。
-   - Status: [ ] pending
+   - Status: [x] completed
    - [parallel] 与 T4 / T5 / T6
 
 ## 不在本计划范围
