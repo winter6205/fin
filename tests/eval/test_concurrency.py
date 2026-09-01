@@ -32,12 +32,32 @@ from fin.eval.concurrency import (
     run_l1,
     run_l2,
     validate_fin_dimensions,
+    validate_idempotency_report,
     validate_l1_report,
     validate_l2_report,
 )
 from fin.eval.concurrency.b1 import ConcurrencySpecDriftError
 from fin.retrieve.fake_push_port import FakePushPort
 from fin.retrieve.push_port import push_records
+
+
+def test_concurrency_runner_split_across_driver_report_validation() -> None:
+    """Driver, report, and validation responsibilities live in separate modules."""
+    import inspect
+
+    from fin.eval.concurrency import driver, execution, report, validation
+
+    assert inspect.getmodule(run_l1) is driver
+    assert inspect.getmodule(run_l2) is driver
+    assert inspect.getmodule(run_idempotency) is driver
+    assert inspect.getmodule(L1Report) is report
+    assert inspect.getmodule(L2Report) is report
+    assert inspect.getmodule(validate_l1_report) is validation
+    assert inspect.getmodule(validate_l2_report) is validation
+    assert inspect.getmodule(validate_idempotency_report) is validation
+    assert hasattr(execution, "_run_phase")
+    assert hasattr(execution, "_claim")
+    assert hasattr(execution, "_record_operation")
 
 
 def test_concurrency_contract_parser_lives_outside_matrix_module() -> None:
