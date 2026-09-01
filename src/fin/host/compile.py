@@ -127,7 +127,8 @@ DEFAULT_RETRIEVE_ADAPTER = "mcp"
 # Named here so the boot-time reachability probe in
 # ``fin.host.operator_env`` checks the exact argv the graph would
 # spawn instead of re-spelling the binary name.
-DEFAULT_MCP_COMMAND: tuple[str, ...] = ("iknow-memory", "serve")
+# 兜底非契约 — operator may override; not a cross-repo API.
+DEFAULT_MCP_COMMAND: tuple[str, ...] = ("iknow-memory",)
 
 
 # ----- typed errors -----

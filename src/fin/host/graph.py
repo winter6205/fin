@@ -1439,7 +1439,7 @@ def compile_graph(
                     "corpus."
                 )
             adapter = MCPRetrieveAdapter(
-                command=mcp_command or ["iknow-memory", "serve"],
+                command=mcp_command or ["iknow-memory"],  # 兜底非契约
                 locator_map=locator_map,
                 known_document_ids=known_document_ids,
                 timeout_seconds=5.0,
