@@ -46,6 +46,7 @@ without one it lives in memory. It is appended to, never rewritten — a
 repeated request adds an entry instead of overwriting the trail.
 """
 
+from fin.corpus.invalidation import InvalidationTarget
 from fin.retrieve.invalidation_port.codec import outcome_of_invalidation_response
 from fin.retrieve.invalidation_port.errors import (
     CODE_INVALIDATION_SETTLED,
@@ -82,6 +83,7 @@ __all__ = [
     "InvalidationProtocolError",
     "InvalidationRecord",
     "InvalidationServiceUnavailableError",
+    "InvalidationTarget",
     "InvalidationUnknownTargetError",
     "invalidate_targets",
     "outcome_of_invalidation_response",
