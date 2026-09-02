@@ -19,9 +19,9 @@ request on each new connection:
 
     {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
      "params": {"name": "retrieve",
-                "arguments": {"query": "...", "top_k": 8,
-                              "document_id": "...",
-                              "filter": {"cik": "...", ...}}}}
+                "arguments": {"query": "...", "limit": 8,
+                              "filters": {"document_id": "...",
+                                          "cik": "...", ...}}}}
 
 The server replies with one newline-delimited JSON object per
 request on stdout. The adapter validates the initialize response
@@ -104,7 +104,11 @@ from fin.retrieve.degradation import (
     DegradationSignal,
     read_degradation_signal,
 )
-from fin.retrieve.hit_mapping import MappingFailureLedger, map_hits_to_chunks
+from fin.retrieve.hit_mapping import (
+    MappingFailureLedger,
+    map_chunks_to_fin_chunks,
+    map_hits_to_chunks,
+)
 from fin.retrieve.input_validation import (
     InputValidationLedger,
     validate_query,
@@ -380,21 +384,26 @@ def _stripped_adapter_field_names(
     ``applied_arguments``. Production servers that omit the echo field
     are handled by the caller — this function is only invoked when the
     echo is present.
+
+    Plan D0 I-T1: the wire keys are ``limit`` and ``filters`` (legacy
+    ``top_k`` / ``filter`` / top-level ``document_id`` are no longer
+    sent). When the schema keeps ``filters`` but drops one key inside
+    it, the per-key reason ``filters.<key>`` is appended instead of
+    the umbrella ``filters``.
     """
     stripped: list[str] = []
-    for key in ("top_k", "document_id"):
-        if key in sent_arguments and key not in applied_arguments:
-            stripped.append(key)
+    if "limit" in sent_arguments and "limit" not in applied_arguments:
+        stripped.append("limit")
 
-    sent_filter = sent_arguments.get("filter")
-    applied_filter = applied_arguments.get("filter")
-    if isinstance(sent_filter, Mapping) and sent_filter:
-        if not isinstance(applied_filter, Mapping):
-            stripped.append("filter")
+    sent_filters = sent_arguments.get("filters")
+    applied_filters = applied_arguments.get("filters")
+    if isinstance(sent_filters, Mapping) and sent_filters:
+        if not isinstance(applied_filters, Mapping):
+            stripped.append("filters")
         else:
-            for filter_key in sent_filter:
-                if filter_key not in applied_filter:
-                    stripped.append(f"filter.{filter_key}")
+            for filter_key in sent_filters:
+                if filter_key not in applied_filters:
+                    stripped.append(f"filters.{filter_key}")
 
     return tuple(stripped)
 
@@ -644,18 +653,25 @@ class MCPRetrieveAdapter:
         # Build the JSON-RPC payload. The MCP ``tools/call``
         # method takes ``arguments`` matching the tool's input
         # schema; we forward the lexical query, the optional
-        # ``top_k`` (limit), and the optional ``filter`` block.
+        # ``limit``, and the optional ``filters`` block.
+        #
+        # Plan D0 I-T1: the wire shape aligns to the iknow-memory
+        # ``z.strictObject`` schema — ``limit`` / ``filters`` are the
+        # only keys the server keeps. The legacy ``top_k`` /
+        # ``filter`` / top-level ``document_id`` would be rejected by
+        # strict mode, which is the symptom that exposed gap 1.
         arguments: dict[str, Any] = {
             "query": query,
-            "top_k": effective_limit,
+            "limit": effective_limit,
         }
-        if document_id is not None:
-            arguments["document_id"] = document_id
         # Only filters the caller actually passed. Blank values
         # already short-circuited above, so a non-``None`` value
         # here is a real filter; a ``None`` means "unset" and must
         # NOT be sent as an explicit ``null`` the server would try
         # to match on.
+        filters: dict[str, str] = {}
+        if document_id is not None:
+            filters["document_id"] = document_id
         for key, value in (
             ("cik", cik),
             ("form", form),
@@ -663,7 +679,9 @@ class MCPRetrieveAdapter:
             ("filing_date", filing_date),
         ):
             if value is not None:
-                arguments.setdefault("filter", {})[key] = value
+                filters[key] = value
+        if filters:
+            arguments["filters"] = filters
 
         payload = {
             "jsonrpc": "2.0",
@@ -699,35 +717,52 @@ class MCPRetrieveAdapter:
                 envelope_signal,
             )
 
-        # Result shape: accept three envelope variants for
-        # forward-compatibility with different MCP server
-        # implementations:
+        # Result shape: accept four envelope variants. The canonical wire
+        # shape is ``{chunks: [...]}`` per spec §B3 / §B4; the legacy
+        # ``{hits: [...]}`` is retained only as a forward-compat
+        # fallback for non-yet-upgraded servers (Plan D0 I-T2):
         #
-        # 1. ``{"result": {"hits": [...]}}`` — the standard
-        #    JSON-RPC success envelope with the raw tool output
-        #    as ``result``.
-        # 2. ``{"hits": [...]}`` — server returns the raw tool
+        # 1. ``{"result": {"chunks": [...]}}`` — canonical JSON-RPC
+        #    success envelope with the raw tool output as ``result``.
+        # 2. ``{"chunks": [...]}`` — server returns the raw tool
         #    output as the JSON-RPC result (some MCP servers
         #    unwrap automatically).
         # 3. ``{"result": {"content": [{"type": "text",
-        #    "text": "<json with hits>"}]}}`` — the canonical
-        #    MCP ``tools/call`` envelope with content blocks.
+        #    "text": "<json with chunks>"}]}}`` — the canonical
+        #    MCP ``tools/call`` envelope with content blocks
+        #    carrying the business envelope.
+        # 4. ``{"result": {"hits": [...]}}`` / ``{"hits": [...]}``
+        #    — legacy fallback for non-yet-upgraded servers; the
+        #    ``hits`` path was the v1 contract the iknow-memory side
+        #    has since replaced with ``chunks``.
         if not isinstance(response, dict):
             raise RetrieveUnavailableError(
                 f"MCP returned non-dict response: {response!r}"
             )
         result = response.get("result")
         if not isinstance(result, dict):
-            # Variant 2: ``{"hits": [...]}`` at top level.
-            if isinstance(response.get("hits"), list):
+            # Variant 2: ``{"chunks": [...]}`` or ``{"hits": [...]}``
+            # at top level.
+            top_level_chunks = response.get("chunks")
+            top_level_hits = response.get("hits")
+            if isinstance(top_level_chunks, list):
+                result = response
+            elif isinstance(top_level_hits, list):
                 result = response
             else:
                 raise _unavailable(
                     f"MCP returned non-dict result: {result!r}",
                     envelope_signal,
                 )
-        # Variant 3: content-block envelope.
-        if "hits" not in result and "content" in result:
+        # Variant 3: content-block envelope. Unwrap only when the
+        # block carries neither the canonical ``chunks`` key nor the
+        # legacy ``hits`` key — otherwise the block's ``content`` key
+        # is unrelated (degradation diagnostics, etc.).
+        if (
+            "chunks" not in result
+            and "hits" not in result
+            and "content" in result
+        ):
             content = result["content"]
             if isinstance(content, list) and content:
                 first = content[0]
@@ -753,22 +788,41 @@ class MCPRetrieveAdapter:
                 result.get("applied_arguments"),
             ),
         )
-        hits = result.get("hits")
-        if not isinstance(hits, list):
-            raise _unavailable(
-                f"MCP returned non-list hits: {hits!r}", signal
-            )
 
-        # Map iknow ids → fin locators; drop unmapped, and count
-        # every drop on the ledger (T17 / SC22: the drop must not be
-        # silent). The cap is enforced AFTER mapping so the returned
-        # list is the locatable subset, not a slice of unmapped ids.
-        chunks = map_hits_to_chunks(
-            hits,
-            locator_map=self._locator_map,
-            limit=effective_limit,
-            ledger=self.mapping_failures,
-        )
+        # Plan D0 I-T2: the canonical envelope is ``result.chunks``;
+        # ``result.hits`` is retained only as a forward-compat
+        # fallback. When both are present, ``chunks`` wins.
+        canonical_chunks = result.get("chunks")
+        legacy_hits = result.get("hits")
+        if isinstance(canonical_chunks, list):
+            # Map canonical chunks: each carries ``source_ref`` as
+            # the B4 fin locator serialization. Unmappable chunks
+            # are dropped AND counted (T17 / SC22: drop must not be
+            # silent). ``locator_map`` is the legacy hits-only seam;
+            # the chunks path does NOT consult it.
+            chunks = map_chunks_to_fin_chunks(
+                canonical_chunks,
+                limit=effective_limit,
+                ledger=self.mapping_failures,
+            )
+        elif isinstance(legacy_hits, list):
+            # Map iknow ids → fin locators; drop unmapped, and count
+            # every drop on the ledger (T17 / SC22: the drop must
+            # not be silent). The cap is enforced AFTER mapping so
+            # the returned list is the locatable subset, not a slice
+            # of unmapped ids.
+            chunks = map_hits_to_chunks(
+                legacy_hits,
+                locator_map=self._locator_map,
+                limit=effective_limit,
+                ledger=self.mapping_failures,
+            )
+        else:
+            raise _unavailable(
+                "MCP returned neither chunks nor a list of hits: "
+                f"chunks={canonical_chunks!r}, hits={legacy_hits!r}",
+                signal,
+            )
         # A degraded response with results is 放行 (§B2 第 1 条) — but it
         # travels with its flag, so the host can record the reasons and
         # tell the user this answer is not a complete one.

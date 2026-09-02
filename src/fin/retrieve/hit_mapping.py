@@ -84,12 +84,22 @@ MAPPING_FAILURE_MALFORMED_HIT: Final[str] = "malformed_hit"
 # retrieval-side id still in ``source_ref``.
 MAPPING_FAILURE_NON_LOCATOR_SOURCE_REF: Final[str] = "non_locator_source_ref"
 
+# A chunk that arrives without a canonical ``source_ref`` field at all.
+# Distinct from ``missing_source_ref`` (which targets the hits path):
+# the canonical chunk envelope always carries the B4 source_ref
+# serialization, so a missing field is a chunk-specific failure mode.
+# Plan D0 I-T2.
+MAPPING_FAILURE_MISSING_SOURCE_REF_IN_CHUNK: Final[str] = (
+    "missing_source_ref_in_chunk"
+)
+
 MAPPING_FAILURE_CODES: Final[frozenset[str]] = frozenset(
     {
         MAPPING_FAILURE_UNMAPPED_SOURCE_REF,
         MAPPING_FAILURE_MISSING_SOURCE_REF,
         MAPPING_FAILURE_MALFORMED_HIT,
         MAPPING_FAILURE_NON_LOCATOR_SOURCE_REF,
+        MAPPING_FAILURE_MISSING_SOURCE_REF_IN_CHUNK,
     }
 )
 
@@ -482,11 +492,118 @@ def _retrieval_ref_of(value: Any) -> str:
     return value if isinstance(value, str) else repr(value)
 
 
+# ----- canonical chunks envelope (Plan D0 I-T2) -----
+
+
+def map_chunks_to_fin_chunks(
+    chunks: Sequence[Any],
+    *,
+    limit: int,
+    ledger: MappingFailureLedger,
+) -> tuple[Chunk, ...]:
+    """Map canonical MCP ``chunks`` envelope items to fin chunks.
+
+    Each wire chunk carries ``source_ref`` as the B4 canonical fin
+    locator serialization, so the chunk path does NOT consult
+    ``locator_map``: a chunk with a parseable ``source_ref`` yields
+    a ``Chunk`` directly. The mapper refuses a chunk that omits the
+    field: silently dropping it would be the SC22 silence the ledger
+    exists to prevent.
+
+    Plan D0 I-T2: this is the canonical chunks path; the legacy hits
+    path remains in :func:`map_hits_to_chunks` for forward-compat with
+    servers that have not yet switched envelopes.
+    """
+    out: list[Chunk] = []
+    for chunk in chunks:
+        if len(out) >= limit:
+            break
+        locator = _locator_of_chunk(chunk, ledger=ledger)
+        if locator is None:
+            continue
+        text = chunk.get("content")
+        if not isinstance(text, str):
+            ledger.record(
+                code=MAPPING_FAILURE_MALFORMED_HIT,
+                stage=MAPPING_STAGE_RETRIEVE,
+                retrieval_ref=_retrieval_ref_of(chunk.get("source_ref")),
+                message=(
+                    f"chunk content is {type(text).__name__}, expected str"
+                ),
+            )
+            continue
+        out.append(
+            Chunk(text=text, source_ref=locator, score=_score_of_chunk(chunk))
+        )
+    return tuple(out)
+
+
+def _locator_of_chunk(
+    chunk: Any,
+    *,
+    ledger: MappingFailureLedger,
+) -> Locator | None:
+    """The fin locator for one canonical chunk, or ``None`` after recording why not."""
+    if not isinstance(chunk, Mapping):
+        ledger.record(
+            code=MAPPING_FAILURE_MALFORMED_HIT,
+            stage=MAPPING_STAGE_RETRIEVE,
+            retrieval_ref=_retrieval_ref_of(chunk),
+            message=(
+                f"chunk is {type(chunk).__name__}, expected a mapping"
+            ),
+        )
+        return None
+    source_ref = chunk.get("source_ref")
+    if not isinstance(source_ref, str):
+        ledger.record(
+            code=MAPPING_FAILURE_MISSING_SOURCE_REF_IN_CHUNK,
+            stage=MAPPING_STAGE_RETRIEVE,
+            retrieval_ref=_retrieval_ref_of(source_ref),
+            message=(
+                "chunk has no canonical source_ref; the wire envelope "
+                "must carry the B4 source_ref serialization"
+            ),
+        )
+        return None
+    try:
+        canonical = deserialize_source_ref(source_ref)
+    except ValueError:
+        ledger.record(
+            code=MAPPING_FAILURE_MALFORMED_HIT,
+            stage=MAPPING_STAGE_RETRIEVE,
+            retrieval_ref=source_ref,
+            message=(
+                "chunk source_ref is not a canonical fin serialization"
+            ),
+        )
+        return None
+    return Locator(
+        document_id=canonical.document_id,
+        version=canonical.version,
+        page=canonical.unit,
+    )
+
+
+def _score_of_chunk(chunk: Mapping[str, Any]) -> float:
+    """The chunk's score, defaulting to 0.0 for an unusable value.
+
+    Mirrors :func:`_score_of_hit` — a score is a ranking hint, not
+    identity, so an unreadable one leaves the chunk citable at the
+    bottom of the order rather than counting as a mapping failure.
+    """
+    try:
+        return float(chunk.get("score", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 __all__ = [
     "MAPPING_FAILURE_CODES",
     "MAPPING_FAILURE_LOG_ENV",
     "MAPPING_FAILURE_MALFORMED_HIT",
     "MAPPING_FAILURE_MISSING_SOURCE_REF",
+    "MAPPING_FAILURE_MISSING_SOURCE_REF_IN_CHUNK",
     "MAPPING_FAILURE_NON_LOCATOR_SOURCE_REF",
     "MAPPING_FAILURE_UNMAPPED_SOURCE_REF",
     "MAPPING_STAGES",
@@ -499,5 +616,6 @@ __all__ = [
     "MappingFailureLedgerUnwritableError",
     "MappingFailureRecordInvalidError",
     "ledger_from_env",
+    "map_chunks_to_fin_chunks",
     "map_hits_to_chunks",
 ]
