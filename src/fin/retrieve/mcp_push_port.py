@@ -50,6 +50,10 @@ from typing import Any, Mapping, Sequence
 
 from fin.host.compile import DEFAULT_MCP_COMMAND
 from fin.retrieve.input_validation import InputValidationLedger
+from fin.retrieve.mcp_session import (
+    MCPStdioProtocolError,
+    MCPStdioSession,
+)
 from fin.retrieve.push_port import (
     PushEmptyBatchError,
     PushMetadataIncompleteError,
@@ -366,10 +370,12 @@ class MCPPushPort:
         *,
         timeout_seconds: float = 5.0,
         ledger: InputValidationLedger | None = None,
+        session: MCPStdioSession | None = None,
     ) -> None:
         self._command: list[str] | None = list(command) if command else None
         self._timeout: float = float(timeout_seconds)
         self._ledger: InputValidationLedger | None = ledger
+        self._session = session
         # ``(source_ref, content_id)`` → ``block_id`` for the keys the
         # adapter has already seen, so a replay is reported as
         # ``duplicates`` instead of a fresh ``written`` batch.
@@ -514,6 +520,17 @@ class MCPPushPort:
         the same contract (return dict on success; raise ``OSError`` /
         ``TimeoutError`` on failure).
         """
+        session = getattr(self, "_session", None)
+        if session is not None:
+            try:
+                return await asyncio.to_thread(
+                    session.call, payload, self._timeout
+                )
+            except MCPStdioProtocolError as exc:
+                raise PushProtocolError(
+                    f"MCP session protocol failed: {exc}"
+                ) from exc
+
         if not self._command:
             # ``None`` (unset) and ``[]`` (configured to nothing) are
             # the same no-transport condition: there is no program to

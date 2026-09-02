@@ -42,6 +42,7 @@ from fin.retrieve.input_validation import (
     InputValidationLedger,
 )
 from fin.retrieve.mcp_adapter import MCPRetrieveAdapter, RetrieveUnavailableError
+from fin.retrieve.mcp_session import MCPStdioSession
 from fin.retrieve.port import Chunk, RetrievePort
 from fin.retrieve.tool import retrieve
 
@@ -54,6 +55,7 @@ __all__ = [
     "InputValidationError",
     "InputValidationLedger",
     "MCPRetrieveAdapter",
+    "MCPStdioSession",
     "RetrievePort",
     "RetrieveUnavailableError",
     "retrieve",

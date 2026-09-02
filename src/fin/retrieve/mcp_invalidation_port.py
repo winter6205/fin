@@ -50,6 +50,10 @@ from typing import Any, Mapping, Sequence
 
 from fin.corpus.invalidation import InvalidationTarget
 from fin.host.compile import DEFAULT_MCP_COMMAND
+from fin.retrieve.mcp_session import (
+    MCPStdioProtocolError,
+    MCPStdioSession,
+)
 from fin.retrieve.invalidation_port import (
     InvalidationEmptyBatchError,
     InvalidationOutcome,
@@ -398,9 +402,11 @@ class MCPInvalidationPort:
         command: Sequence[str] | None = DEFAULT_MCP_COMMAND,
         *,
         timeout_seconds: float = 5.0,
+        session: MCPStdioSession | None = None,
     ) -> None:
         self._command: list[str] | None = list(command) if command else None
         self._timeout: float = float(timeout_seconds)
+        self._session = session
         # ``(source_ref, chunk_id)`` pairs the adapter has already
         # closed. A second call for the same pair returns
         # ``already_closed`` instead of a fresh ``closed``.
@@ -561,6 +567,17 @@ class MCPInvalidationPort:
         contract (return dict on success; raise ``OSError`` /
         ``TimeoutError`` on failure).
         """
+        session = getattr(self, "_session", None)
+        if session is not None:
+            try:
+                return await asyncio.to_thread(
+                    session.call, payload, self._timeout
+                )
+            except MCPStdioProtocolError as exc:
+                raise InvalidationProtocolError(
+                    f"MCP session protocol failed: {exc}"
+                ) from exc
+
         if not self._command:
             # ``None`` (unset) and ``[]`` (configured to nothing) are
             # the same no-transport condition: there is no program to

@@ -113,6 +113,10 @@ from fin.retrieve.input_validation import (
     InputValidationLedger,
     validate_query,
 )
+from fin.retrieve.mcp_session import (
+    MCPStdioProtocolError,
+    MCPStdioSession,
+)
 
 
 _DEFAULT_LIMIT = 8
@@ -506,6 +510,7 @@ class MCPRetrieveAdapter:
         timeout_seconds: float = 5.0,
         mapping_ledger: MappingFailureLedger | None = None,
         input_validation_ledger: InputValidationLedger | None = None,
+        session: MCPStdioSession | None = None,
     ) -> None:
         self._command: list[str] | None = (
             list(command) if command is not None else None
@@ -526,6 +531,7 @@ class MCPRetrieveAdapter:
         self._timeout: float = float(timeout_seconds)
         self._mapping_ledger = mapping_ledger
         self._input_validation_ledger = input_validation_ledger
+        self._session = session
 
     # ----- public surface -----
 
@@ -851,6 +857,17 @@ class MCPRetrieveAdapter:
         (return dict on success; raise ``OSError`` /
         ``TimeoutError`` on failure).
         """
+        session = getattr(self, "_session", None)
+        if session is not None:
+            try:
+                return await asyncio.to_thread(
+                    session.call, payload, self._timeout
+                )
+            except MCPStdioProtocolError as exc:
+                raise RetrieveUnavailableError(
+                    f"MCP session protocol failed: {exc}"
+                ) from exc
+
         if not self._command:
             # ``None`` (unset) and ``[]`` (configured to nothing)
             # are the same no-transport condition: there is no
