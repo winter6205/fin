@@ -356,12 +356,8 @@ def _to_codec_response(envelope: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(record, Mapping):
             continue
         chunk_id = record.get("chunk_id")
-        invalidated_at = record.get("invalidated_at")
-        if (
-            isinstance(chunk_id, str)
-            and isinstance(invalidated_at, int)
-            and not isinstance(invalidated_at, bool)
-        ):
+        invalidated_at = _epoch_millis(record.get("invalidated_at"))
+        if isinstance(chunk_id, str) and invalidated_at is not None:
             closed_at[chunk_id] = invalidated_at
     placeholder_instant = int(
         datetime.now(timezone.utc).timestamp() * 1000
@@ -375,6 +371,22 @@ def _to_codec_response(envelope: dict[str, Any]) -> dict[str, Any]:
         "already_closed": 0,
         "closed_at": closed_at,
     }
+
+
+def _epoch_millis(value: Any) -> int | None:
+    """Convert the service's ISO instant or legacy integer to millis."""
+
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if instant.tzinfo is None:
+        return None
+    return int(instant.timestamp() * 1000)
 
 
 # ----- port -----
@@ -411,6 +423,9 @@ class MCPInvalidationPort:
         # closed. A second call for the same pair returns
         # ``already_closed`` instead of a fresh ``closed``.
         self._seen_keys: set[tuple[str, str]] = set()
+        # The target contract has no timestamp field. Reusing the first
+        # timestamp per source_ref makes a repeated target the same request.
+        self._invalidated_at_by_source_ref: dict[str, str] = {}
 
     # ----- InvalidationPort surface -----
 
@@ -518,8 +533,7 @@ class MCPInvalidationPort:
 
     # ----- helpers -----
 
-    @staticmethod
-    def _build_arguments(source_ref: str) -> dict[str, Any]:
+    def _build_arguments(self, source_ref: str) -> dict[str, Any]:
         """The ``arguments`` dict for one ``invalidation`` tool call.
 
         Field names are verbatim the **z.strictObject** schema in
@@ -528,9 +542,15 @@ class MCPInvalidationPort:
         ``idempotency_key``) are forwarded — ``strictObject`` would
         refuse them on the wire.
         """
+        timestamps = getattr(self, "_invalidated_at_by_source_ref", None)
+        if timestamps is None:
+            # Scripted subclasses may intentionally skip ``__init__``.
+            timestamps = {}
+            self._invalidated_at_by_source_ref = timestamps
+        invalidated_at = timestamps.setdefault(source_ref, _now_iso())
         return {
             "source_ref": source_ref,
-            "invalidated_at": _now_iso(),
+            "invalidated_at": invalidated_at,
             "triggered_by": "fin:corpus",
         }
 
