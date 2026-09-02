@@ -6,9 +6,13 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from fin.corpus.catalog import list_filings
 from fin.corpus.extracted import load_extracted_tree
 from fin.corpus.ingest import run_ingest
+from fin.corpus.ingest_state import InMemoryIngestStateStore, IngestState
+from fin.corpus.ingest_state_errors import IngestStepError
 from fin.corpus.metadata_store import InMemoryMetadataStore
 from fin.corpus.object_store import InMemoryObjectStore
 
@@ -136,3 +140,53 @@ def test_ingest_without_store_reports_documented_local_fallback(
         "documents"
     ][0]
     assert (extracted_root / "TEST-2026" / "page-001.json").is_file()
+
+
+def test_ingest_reaches_ready_and_records_audit(tmp_path: Path) -> None:
+    manifest_path, pdf_dir, extracted_root, _ = _fixture(tmp_path)
+    state_store = InMemoryIngestStateStore()
+
+    run_ingest(
+        manifest_path=manifest_path,
+        pdf_dir=pdf_dir,
+        extracted_root=extracted_root,
+        ingest_state_store=state_store,
+    )
+
+    job = state_store.get_job("TEST-2026")
+    assert job.state is IngestState.READY
+    assert [
+        row.to_state
+        for row in state_store.list_audit("TEST-2026")
+        if row.action == "transition"
+    ] == [
+        IngestState.FETCHING,
+        IngestState.EXTRACTING,
+        IngestState.CATALOGING,
+        IngestState.READY,
+    ]
+
+
+def test_catalog_failure_is_typed_and_audited(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    manifest_path, pdf_dir, extracted_root, _ = _fixture(tmp_path)
+    state_store = InMemoryIngestStateStore()
+
+    def fail_catalog(**_: object) -> int:
+        raise RuntimeError("catalog unavailable")
+
+    monkeypatch.setattr("fin.corpus.ingest.update_catalog_fields", fail_catalog)
+
+    with pytest.raises(IngestStepError) as exc_info:
+        run_ingest(
+            manifest_path=manifest_path,
+            pdf_dir=pdf_dir,
+            extracted_root=extracted_root,
+            ingest_state_store=state_store,
+        )
+
+    assert exc_info.value.step == "catalog"
+    assert state_store.get_job("TEST-2026").state is IngestState.FAILED
+    assert state_store.list_audit("TEST-2026")[-1].step == "catalog"
