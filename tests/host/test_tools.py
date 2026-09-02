@@ -148,7 +148,10 @@ def _build_synthetic_3page_tree(
 
 
 def test_list_files_empty_returns_full_12_doc_list() -> None:
-    """``list_files()`` returns the full 12-doc list with the contract shape."""
+    """``list_files()`` returns every committed filing with the contract
+    shape. Plan C expanded the tier-1 corpus via 8 EDGAR iXBRL primary
+    docs, so the floor is now >= 20 (12 frozen private fixture source PDFs + 8
+    live-fetched iXBRL HTMLs), not exactly 12."""
     result = list_files(
         manifest_path=_manifest_path(),
         extracted_root=_extracted_root(),
@@ -156,7 +159,7 @@ def test_list_files_empty_returns_full_12_doc_list() -> None:
     assert isinstance(result, dict)
     # Exactly one top-level key per ADR 0009.
     assert list(result.keys()) == ["filings"]
-    assert len(result["filings"]) == 12
+    assert len(result["filings"]) >= 20
 
     sample = result["filings"][0]
     # Contract keys: no ``filename``, ``bytes``, or ``sha256`` (only
@@ -461,13 +464,18 @@ def test_read_file_ingest_missing_returns_unknown_locator(
 
 
 def test_list_files_with_aapl_filter_returns_4_documents() -> None:
-    """``list_files(company='AAPL')`` returns exactly 4 AAPL docs."""
+    """``list_files(company='AAPL')`` returns every AAPL filing.
+
+    Plan C added 3 EDGAR iXBRL AAPL primary docs (CIK 0000320193)
+    on top of the 4 frozen private fixture source PDFs, so AAPL now has 7 filings
+    rather than 4.
+    """
     result = list_files(
         company="AAPL",
         manifest_path=_manifest_path(),
         extracted_root=_extracted_root(),
     )
-    assert len(result["filings"]) == 4
+    assert len(result["filings"]) == 7
     for filing in result["filings"]:
         assert filing["company"] == "AAPL"
 

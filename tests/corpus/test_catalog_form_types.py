@@ -74,10 +74,14 @@ def test_unfiltered_listing_spans_every_form_in_the_corpus(
 
 
 def test_frozen_twelve_hits_carry_their_form() -> None:
-    """Every frozen-12 hit reports the 10-Q it actually is."""
+    """Every committed hit reports the 10-Q it actually is.
+
+    Plan C expanded the tier-1 corpus via 8 EDGAR iXBRL primary docs
+    (all marked ``form="10-Q"`` by the catalog patch), so the floor is
+    now >= 20, not exactly 12."""
     result = list_files(**_frozen_twelve())
 
-    assert len(result["filings"]) == 12
+    assert len(result["filings"]) >= 20
     for filing in result["filings"]:
         assert filing["form"] == "10-Q"
 
