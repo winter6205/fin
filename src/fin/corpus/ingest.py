@@ -68,6 +68,15 @@ from fin.corpus.ocr import (
     OcrRequiredUnavailableError,
     detect_ocr_required,
 )
+from fin.corpus.metadata_store import (
+    MetadataStore,
+    default_metadata_store,
+)
+from fin.corpus.object_store import ObjectStore
+from fin.corpus.object_store_errors import (
+    ObjectStoreError,
+    ObjectStoreUnavailableError,
+)
 
 
 _PASSAGE_SIZE = 512
@@ -118,6 +127,7 @@ class IngestResult:
     pages_written: int
     pages_skipped: int
     catalog_updated: int = 0
+    raw_storage: str = "local_fallback"
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -528,6 +538,8 @@ def run_ingest(
     ocr_required_marker: str | None = None,
     catalog_seed: Mapping[str, Mapping[str, str]] | None = None,
     catalog_seed_path: Path | None = None,
+    object_store: ObjectStore | None = None,
+    metadata_store: MetadataStore | None = None,
 ) -> IngestResult:
     """Run the idempotent ingest command.
 
@@ -567,6 +579,17 @@ def run_ingest(
     catalog_seed_path:
         Path to the operator's ``--catalog-seed`` JSON file. Mutually
         exclusive with ``catalog_seed``.
+    object_store:
+        Optional raw-byte store. When supplied, verified PDF bytes are
+        written under ``filings/<document_id>/<filename>`` and the
+        resulting pointer is recorded in the manifest and metadata
+        store. When omitted, the local PDF directory is the documented
+        fallback and remains the source for extraction.
+    metadata_store:
+        Store for the durable document-to-object pointer. When raw
+        object storage is enabled and this is omitted, the configured
+        Postgres store is selected from the environment, or an
+        in-memory store is used for local tests.
 
     Raises
     ------
@@ -596,6 +619,11 @@ def run_ingest(
         )
     if catalog_seed_path is not None:
         catalog_seed = load_catalog_seed(catalog_seed_path)
+    pointer_store = (
+        metadata_store or default_metadata_store()
+        if object_store is not None
+        else None
+    )
 
     # Import here so this module's pdfplumber dep does not transitively
     # leak into the ask path if the facts module is reached via
@@ -619,6 +647,7 @@ def run_ingest(
     pages_total = 0
     pages_written = 0
     pages_skipped = 0
+    manifest_updated = False
     # Start from the entries this run has no authority over. The
     # manifest is the SSOT for the frozen PDFs only; documents the
     # gated live path froze into the same tree (keyed by accession)
@@ -664,12 +693,49 @@ def run_ingest(
             raise ManifestShaMismatchError(
                 f"missing frozen PDF for {document_id}: {pdf_path}"
             )
-        actual_sha = _sha256_file(pdf_path)
+        raw_bytes: bytes | None = None
+        if object_store is not None:
+            # The verified bytes are the payload that leaves the local
+            # filesystem. Hashing this exact buffer prevents a race from
+            # making the pointer describe bytes other than those parsed.
+            raw_bytes = pdf_path.read_bytes()
+            actual_sha = _sha256_bytes(raw_bytes)
+        else:
+            actual_sha = _sha256_file(pdf_path)
         if actual_sha != expected_sha:
             raise ManifestShaMismatchError(
                 f"sha256 mismatch for {document_id}: "
                 f"manifest={expected_sha} actual={actual_sha}"
             )
+        if object_store is not None:
+            assert raw_bytes is not None
+            raw_key = f"filings/{document_id}/{filename}"
+            pointer = object_store.put(
+                raw_key,
+                raw_bytes,
+                content_type="application/pdf",
+            )
+            if pointer.sha256 != expected_sha or pointer.size_bytes != len(
+                raw_bytes
+            ):
+                raise ObjectStoreUnavailableError(
+                    f"object store returned an invalid pointer for "
+                    f"{document_id}: key={pointer.key!r}"
+                )
+            if pointer_store is None:
+                raise ObjectStoreUnavailableError(
+                    "raw object storage has no metadata pointer store"
+                )
+            pointer_store.put_pointer(document_id, pointer)
+            raw_object = {
+                "key": pointer.key,
+                "size_bytes": pointer.size_bytes,
+                "sha256": pointer.sha256,
+                "content_type": pointer.content_type,
+            }
+            if doc.get("raw_object") != raw_object:
+                doc["raw_object"] = raw_object
+                manifest_updated = True
 
         doc_dir = extracted_root / document_id
         doc_dir.mkdir(parents=True, exist_ok=True)
@@ -743,6 +809,13 @@ def run_ingest(
     ).encode("utf-8")
     _write_if_drifted(extracted_root / "_index.json", index_payload)
 
+    if manifest_updated:
+        _atomic_write(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+            + b"\n",
+        )
+
     # Catalog step: only after every document extracted cleanly, so a
     # run that dies on a sha mismatch or an OCR-required unit does not
     # leave a catalog row claiming a filing this run never wrote.
@@ -773,6 +846,9 @@ def run_ingest(
         pages_written=pages_written,
         pages_skipped=pages_skipped,
         catalog_updated=catalog_updated,
+        raw_storage=(
+            "object_store" if object_store is not None else "local_fallback"
+        ),
     )
 
 
@@ -832,6 +908,23 @@ def _resolve_ocr_engine(name: str) -> OCREngine | None:
     raise ValueError(f"unknown --ocr-engine choice: {name!r}")
 
 
+def _resolve_object_store() -> ObjectStore | None:
+    """Resolve raw storage when its endpoint and bucket are configured."""
+    endpoint = (
+        os.environ.get("FIN_OBJECT_STORE_URL")
+        or os.environ.get("FIN_OBJECT_STORE_ENDPOINT")
+        or ""
+    ).strip()
+    bucket = os.environ.get("FIN_OBJECT_STORE_BUCKET", "").strip()
+    if not endpoint and not bucket:
+        # Documented local fallback: the verified local PDF remains the
+        # extraction source and no raw bytes are silently discarded.
+        return None
+    from fin.corpus.object_store import object_store_from_env
+
+    return object_store_from_env(environ=os.environ)
+
+
 def main(argv: list[str] | None = None) -> int:
     default_manifest, default_pdf_dir, default_extracted, default_facts = (
         _default_paths()
@@ -881,6 +974,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     ocr_engine = _resolve_ocr_engine(args.ocr_engine)
     try:
+        object_store = _resolve_object_store()
+        pointer_store = (
+            default_metadata_store() if object_store is not None else None
+        )
+    except ObjectStoreError as exc:
+        print(f"ingest: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    try:
         result = run_ingest(
             manifest_path=args.manifest,
             pdf_dir=args.pdf_dir,
@@ -888,8 +989,10 @@ def main(argv: list[str] | None = None) -> int:
             facts_root=args.facts_root,
             ocr_engine=ocr_engine,
             catalog_seed_path=args.catalog_seed,
+            object_store=object_store,
+            metadata_store=pointer_store,
         )
-    except MalformedExtractedIndexError as exc:
+    except (MalformedExtractedIndexError, ObjectStoreError) as exc:
         print(f"ingest: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     print(
@@ -897,7 +1000,8 @@ def main(argv: list[str] | None = None) -> int:
         f"pages={result.pages} "
         f"written={result.pages_written} "
         f"skipped={result.pages_skipped} "
-        f"catalog_updated={result.catalog_updated}"
+        f"catalog_updated={result.catalog_updated} "
+        f"raw_storage={result.raw_storage}"
     )
     return 0
 
@@ -911,6 +1015,7 @@ __all__ = [
     "update_catalog_fields",
     "main",
     "_resolve_ocr_engine",
+    "_resolve_object_store",
 ]
 
 
