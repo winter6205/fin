@@ -36,7 +36,7 @@ minimal-change-verifier: yes — 只补真实进程验收与 B6 若缺口；不�
    - **Surface:** fin `retrieve` MCP push/retrieve 适配 + **iknow-memory** 已公布的 `push` / `retrieve` 工具。
    - **Acceptance:** opt-in 下启动真实 iknow stdio：推送一批现有 child 块后 retrieve 命中文本与推送文本逐字节相同；同一批再推 2 次块总数增量 = 0；默认 `uv run pytest -q` 不跑该 opt-in。
    - **Completion:** 进程拉起方式与 fixture 块数由 implementer 选。
-   - Status: [ ] pending
+   - Status: [x] complete
    - [blocks: T1]
 
 3. **真实进程：分批中断后续传** — tag: `[implementation]`
