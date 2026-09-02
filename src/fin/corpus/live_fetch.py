@@ -820,13 +820,16 @@ def fetch_and_ingest(
         if (extracted_root / "_index.json").exists()
         else {}
     )
+    # Validate the local catalog before any network call. A malformed
+    # caller-owned manifest is a typed local failure, not permission to
+    # contact SEC while trying to report that failure.
+    manifest_payload = _read_manifest_payload(manifest_path)
     ua = _read_ua()
     base_url = _accession_base_url(cik, accession)
     primary_url = _resolve_primary_url(
         base_url=base_url, ua=ua, accession=accession, primary_doc=primary_doc
     )
     body = _sec_get(primary_url, ua, accession=accession)
-    manifest_payload = _read_manifest_payload(manifest_path)
     version = _sha256_bytes(body)
 
     extracted_root.parent.mkdir(parents=True, exist_ok=True)
