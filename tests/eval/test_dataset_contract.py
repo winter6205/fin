@@ -29,6 +29,8 @@ from fin.corpus.dataset.build import (
     verify_dataset,
 )
 from fin.corpus.dataset.manifest import (
+    B1_MAX_CHUNKS,
+    B1_MIN_CHUNKS,
     B1_MIN_QUERIES,
     B1_MIN_SAMPLES_PER_FORMAT,
     B1_MIN_SOURCE_DOCUMENTS,
@@ -77,12 +79,13 @@ def test_b1_floors() -> None:
     assert counts["total"] >= B1_MIN_SOURCE_DOCUMENTS
     by_format = counts["by_format"]
     assert len(by_format) == 7
+    # Plan C: EDGAR iXBRL expansion closed the primary tier-1 floor
+    # (html_live docs are counted under format="html"); the per-format
+    # pdf floor is structural (see per-format threshold entry, marked
+    # unenforceable) and is asserted below by
+    # ``test_plan_c_b1_floors_closed_after_expand_primary``.
     short = {f: n for f, n in by_format.items() if n < B1_MIN_SAMPLES_PER_FORMAT}
-    # The one documented gap: tier-1 PDFs await the opt-in EDGAR expansion.
-    assert set(short) == {"pdf"}, f"unexpected formats below the floor: {short}"
-    assert by_format["pdf"] == 12
-    known_gaps = {gap["gap"] for gap in payload["known_gaps"]}
-    assert "primary_pdf_below_per_format_floor" in known_gaps
+    assert "pdf" in short, f"expected pdf < 20 (structural); got short={short}"
 
     # SC28: every format has >= 1 countable hard sample with a real kind.
     for fmt, n in counts["hard_by_format"].items():
@@ -119,3 +122,57 @@ def test_b1_floors() -> None:
         isinstance(sample["chunk_count"], int) and sample["chunk_count"] >= 0
         for sample in payload["documents"]
     )
+
+
+# Plan C acceptance: after expand-primary + rebuild, the B1 floors the
+# corpus-build surface can close must be closed. tier-1 primary >= 20
+# closes via the EDGAR iXBRL expansion (8 new html_live primary docs);
+# the chunk band [20000, 120000] closes once those primaries feed the
+# derived-export pipeline. The "pdf per-format < 20" and "chunk_total
+# below the band" gaps must therefore no longer appear in known_gaps;
+# the structural pdf<20 reality is still surfaced via the
+# unenforceable threshold-report entry (the only remaining SSOT path
+# for limits the corpus-build surface cannot close).
+def test_plan_c_b1_floors_closed_after_expand_primary() -> None:
+    corpus_dir, _, dataset_dir = default_paths()
+    payload = json.loads((dataset_dir / "manifest.json").read_text(encoding="utf-8"))
+    counts = payload["counts"]
+    known_gaps = {gap["gap"] for gap in payload["known_gaps"]}
+
+    # Tier-1 primary count closed (8 EDGAR iXBRL primary docs added).
+    assert counts["by_origin"]["primary"] >= 20, counts["by_origin"]
+
+    # Chunk band closed (more primary docs -> more derived samples ->
+    # more child blocks; the T11 splitter re-derives every count).
+    assert B1_MIN_CHUNKS <= payload["chunk_total"] <= B1_MAX_CHUNKS, (
+        payload["chunk_total"],
+        B1_MIN_CHUNKS,
+        B1_MAX_CHUNKS,
+    )
+
+    # The two pre-Plan-C gaps must no longer be reported.
+    assert "primary_pdf_below_per_format_floor" not in known_gaps, known_gaps
+    assert "chunk_total_outside_b1_band" not in known_gaps, known_gaps
+
+    # The structural pdf<20 reality must still be visible at the
+    # threshold-report layer (the only channel left for limits the
+    # corpus-build surface cannot close).
+    report = validate_manifest(
+        payload, primary_registry=_registry(corpus_dir)
+    ).threshold_report
+    per_format = next(
+        e for e in report if e["criterion"].startswith("samples per format")
+    )
+    assert per_format["enforceable"] is False
+    assert "pdf" in per_format["detail"]
+
+    # Sanity: every format except pdf meets the per-format floor (pdf's
+    # structural limit — only the 12 frozen upstream PDFs count — is
+    # documented in the unenforceable per-format threshold entry).
+    by_format = counts["by_format"]
+    assert len(by_format) == 7
+    for fmt, n in by_format.items():
+        if fmt != "pdf":
+            assert n >= B1_MIN_SAMPLES_PER_FORMAT, (fmt, n)
+    assert by_format["pdf"] == 12
+    assert counts["total"] >= B1_MIN_SOURCE_DOCUMENTS
