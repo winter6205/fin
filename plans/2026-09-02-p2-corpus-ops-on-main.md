@@ -76,7 +76,7 @@ minimal-change-verifier: yes — one logical program, sequenced as plan P2 trace
    - **Surface:** `host` workspace + web
    - **Acceptance:** 脚本源触发 notice 且 reload 仍在；源 down typed degraded 非空白 500；`uv run pytest -q` exits 0。
    - **Completion:** poll vs webhook 开放。对照：parked #184。
-   - Status: [ ] pending
+   - Status: [x] complete
    - [blocks: T5]
 
 ## 不在本计划范围

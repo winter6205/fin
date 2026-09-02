@@ -55,8 +55,8 @@ Routes
                                           ``DELETE /{watch_id}``
                                           removes (T4 workflow, the tracked change).
 * ``GET    /api/notices``               - in-app notices for watched
-                                          filings that are in the LOCAL
-                                          catalog; ``POST
+                                          filings in the LOCAL catalog
+                                          and configured filing source; ``POST
                                           /{notice_id}/read`` dismisses
                                           one. Workspace-only — nothing
                                           is emailed or posted out.
@@ -122,6 +122,8 @@ from fin.host.export import (
     UnsupportedExportError,
     build_export,
 )
+from fin.host.filing_monitor import FilingMonitor, default_filing_monitor
+from fin.host.filing_monitor_errors import FilingSourceUnavailableError
 from fin.host.graph import (
     ConcurrentRunError,
     analysis_from_tool_message,
@@ -1184,6 +1186,7 @@ def build_router(
     get_thread_store,
     get_watchlist_store=None,
     get_memory_port=None,
+    get_filing_monitor=None,
 ) -> APIRouter:
     """Build the workspace APIRouter.
 
@@ -1191,7 +1194,8 @@ def build_router(
     any FastAPI app (the prod app in ``fin.host.http``, and any test
     app). ``get_watchlist_store`` defaults to the env-selected store so
     an existing caller that predates T4 still mounts; ``get_memory_port``
-    does the same for callers that predate dream.
+    does the same for callers that predate dream; ``get_filing_monitor``
+    defaults to the process default monitor.
 
     The stop registry (:class:`RunControl`) is created HERE rather than
     at module level: one registry per mounted router means two apps in
@@ -1203,6 +1207,8 @@ def build_router(
         get_watchlist_store = default_watchlist_store
     if get_memory_port is None:
         get_memory_port = build_memory_port
+    if get_filing_monitor is None:
+        get_filing_monitor = default_filing_monitor
 
     @router.get("/threads")
     def list_threads(store: ThreadStore = Depends(get_thread_store)) -> list[dict]:
@@ -1903,8 +1909,10 @@ def build_router(
     def list_notices(
         unread_only: bool = False,
         watchlist: JsonFileWatchlistStore = Depends(get_watchlist_store),
+        monitor: FilingMonitor = Depends(get_filing_monitor),
     ) -> list[dict]:
-        """In-app notices for watched filings in the LOCAL catalog.
+        """In-app notices for watched filings in the LOCAL catalog and
+        configured real filing source.
 
         Reconcile-on-read: the catalog is a committed tree, not an
         event source, so the read IS the delivery. Nothing leaves the
@@ -1912,13 +1920,21 @@ def build_router(
 
         A corpus that was never ingested raises ``IngestMissingError``,
         which the shared handler turns into the typed 503 the rest of
-        the corpus surface already uses.
+        the corpus surface already uses. A monitor outage leaves the
+        persisted rows in the response and adds typed degraded headers.
         """
         refresh_notices(watchlist, filings=list_filings()["filings"])
-        return [
+        headers = {"X-Filing-Monitor-Status": "healthy"}
+        try:
+            monitor.poll(watchlist)
+        except FilingSourceUnavailableError as exc:
+            headers["X-Filing-Monitor-Status"] = "degraded"
+            headers["X-Filing-Monitor-Error"] = exc.code
+        notices = [
             _serialize_notice(n)
             for n in watchlist.list_notices(unread_only=unread_only)
         ]
+        return JSONResponse(content=notices, headers=headers)
 
     @router.post("/notices/{notice_id}/read")
     def mark_notice_read(
@@ -1972,6 +1988,7 @@ def mount(
     get_thread_store,
     get_watchlist_store=None,
     get_memory_port=None,
+    get_filing_monitor=None,
 ) -> None:
     """Mount the workspace routes onto an existing FastAPI app."""
     app.include_router(
@@ -1980,6 +1997,7 @@ def mount(
             get_thread_store=get_thread_store,
             get_watchlist_store=get_watchlist_store,
             get_memory_port=get_memory_port,
+            get_filing_monitor=get_filing_monitor,
         )
     )
 

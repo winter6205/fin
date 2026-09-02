@@ -28,7 +28,7 @@ export function watchSummary(entry: WatchEntry): string {
   return entry.forms.length > 0 ? entry.forms.join("、") : "全部 form";
 }
 
-/** One line describing a filing that entered the local catalog. */
+/** One line describing a filing detected by the monitor. */
 export function noticeSummary(notice: Notice): string {
   const form = notice.form ? ` ${notice.form}` : "";
   const period = notice.period ? `（${notice.period}）` : "";
