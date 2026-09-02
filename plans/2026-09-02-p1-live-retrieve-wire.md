@@ -52,7 +52,7 @@ minimal-change-verifier: yes — 只补真实进程验收与 B6 若缺口；不�
    - **Surface:** 既有 invalidation 适配 + 对侧 `invalidation` 工具。
    - **Acceptance:** opt-in 下对同一旧块两次失效不报错且 retrieve 在有效时刻不再命中该旧文本；默认 pytest 不跑。
    - **Completion:** valid_at 时钟由 implementer 选。
-   - Status: [ ] pending
+   - Status: [x] complete
    - [blocks: T2]
 
 5. **真实进程：产品路径全开且降级不当空结果** — tag: `[implementation]`
@@ -60,7 +60,7 @@ minimal-change-verifier: yes — 只补真实进程验收与 B6 若缺口；不�
    - **Surface:** host 产品 compile 路径 + MCP retrieve。
    - **Acceptance:** opt-in 产品 retrieve 发出的键不含 K2 关闭形；对侧若返回 `degraded=true`，fin 不把该次当 `{chunks:[]}` 成功空结果；默认 pytest 不启进程。
    - **Completion:** 如何注入 degraded 信封由 implementer 选（真实工具或测试替身进程）。
-   - Status: [ ] pending
+   - Status: [x] complete
    - [blocks: T2]
 
 ## 不在本计划范围

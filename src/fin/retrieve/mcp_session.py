@@ -61,6 +61,14 @@ class MCPStdioSession:
         self._failed = False
         self._stderr = bytearray()
         self._stderr_lock = threading.Lock()
+        self._requests: list[dict[str, Any]] = []
+
+    @property
+    def requests(self) -> tuple[dict[str, Any], ...]:
+        """Requests sent on this session, for opt-in wire assertions."""
+
+        with self._io_lock:
+            return tuple(self._requests)
 
     def call(
         self,
@@ -80,6 +88,7 @@ class MCPStdioSession:
             )
         with self._io_lock:
             self._ensure_started(timeout)
+            self._requests.append(payload)
             self._write(payload)
             response = self._read_response(timeout)
             if not isinstance(response, dict):
