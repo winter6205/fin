@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fin.corpus.errors import IngestMissingError
+from fin.corpus.structure_units import StructureLocator, StructureUnit
 
 
 @dataclass(frozen=True)
@@ -261,4 +262,91 @@ def load_extracted_tree(
     return out
 
 
-__all__ = ["ExtractedPage", "Locator", "Passage", "load_extracted_tree"]
+def load_structure_units(
+    manifest_path: Path,
+    extracted_root: Path,
+) -> dict[str, tuple[StructureUnit, ...]]:
+    """Load structure units persisted by the ingest path.
+
+    The structure tree is optional to the legacy page loader. Once a
+    caller asks for structure units, every manifest document must have
+    a valid ``units.json`` artifact, and every child must remain a
+    contiguous substring of its declared parent.
+    """
+    documents = _load_manifest(manifest_path)
+    if not extracted_root.exists():
+        raise IngestMissingError(f"extracted tree missing: {extracted_root}")
+
+    out: dict[str, tuple[StructureUnit, ...]] = {}
+    for doc in sorted(documents, key=lambda item: item["document_id"]):
+        document_id = doc["document_id"]
+        expected_version = doc["sha256"]
+        units_path = extracted_root / document_id / "units.json"
+        if not units_path.is_file():
+            raise IngestMissingError(
+                f"structure units missing for {document_id}: {units_path}"
+            )
+        try:
+            payload = json.loads(units_path.read_text())
+            raw_units = payload["units"]
+            if not isinstance(raw_units, list) or not raw_units:
+                raise TypeError("units must be a non-empty list")
+            units: list[StructureUnit] = []
+            for raw_unit in raw_units:
+                locator_payload = raw_unit["locator"]
+                locator = StructureLocator(
+                    document_id=locator_payload["document_id"],
+                    version=locator_payload["version"],
+                    unit=locator_payload["unit"],
+                )
+                text = raw_unit["text"]
+                title = raw_unit.get("title")
+                parent_unit = raw_unit.get("parent_unit")
+                if (
+                    locator.document_id != document_id
+                    or locator.version != expected_version
+                    or not isinstance(locator.unit, str)
+                    or not locator.unit
+                    or not isinstance(text, str)
+                    or not text
+                    or (title is not None and not isinstance(title, str))
+                    or (
+                        parent_unit is not None
+                        and not isinstance(parent_unit, str)
+                    )
+                ):
+                    raise ValueError("structure unit does not match manifest")
+                units.append(
+                    StructureUnit(
+                        locator=locator,
+                        text=text,
+                        title=title,
+                        parent_unit=parent_unit,
+                    )
+                )
+            by_unit = {unit.locator.unit: unit for unit in units}
+            if len(by_unit) != len(units):
+                raise ValueError("structure unit locators are not unique")
+            for unit in units:
+                if unit.parent_unit is None:
+                    continue
+                parent = by_unit.get(unit.parent_unit)
+                if parent is None or unit.text not in parent.text:
+                    raise ValueError(
+                        "structure child text is not a substring of its parent"
+                    )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise IngestMissingError(
+                f"malformed structure units: {units_path}"
+            ) from exc
+        out[document_id] = tuple(units)
+    return out
+
+
+__all__ = [
+    "ExtractedPage",
+    "Locator",
+    "Passage",
+    "load_extracted_tree",
+    "load_structure_units",
+]

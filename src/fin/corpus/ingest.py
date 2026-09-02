@@ -86,6 +86,11 @@ from fin.corpus.object_store_errors import (
     ObjectStoreError,
     ObjectStoreUnavailableError,
 )
+from fin.corpus.structure_units import (
+    StructureParser,
+    StructureUnit,
+    parse_structure_units,
+)
 
 
 _PASSAGE_SIZE = 512
@@ -556,6 +561,30 @@ def _prepare_state_job(
     return False
 
 
+def _structure_units_payload(units: tuple[StructureUnit, ...]) -> bytes:
+    """Serialize structure units without changing their frozen text."""
+    return json.dumps(
+        {
+            "units": [
+                {
+                    "locator": {
+                        "document_id": unit.locator.document_id,
+                        "version": unit.locator.version,
+                        "unit": unit.locator.unit,
+                    },
+                    "text": unit.text,
+                    "title": unit.title,
+                    "parent_unit": unit.parent_unit,
+                }
+                for unit in units
+            ]
+        },
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ).encode("utf-8")
+
+
 def run_ingest(
     *,
     manifest_path: Path,
@@ -569,6 +598,8 @@ def run_ingest(
     object_store: ObjectStore | None = None,
     metadata_store: MetadataStore | None = None,
     ingest_state_store: IngestStateStore | None = None,
+    structure_parser: StructureParser | None = None,
+    max_structure_units: int = 1000,
 ) -> IngestResult:
     """Run the idempotent ingest command.
 
@@ -623,6 +654,12 @@ def run_ingest(
         Optional state/audit store. When omitted, an offline in-memory
         store is used. Each local PDF job is advanced through the
         documented state machine to ``READY``.
+    structure_parser:
+        Optional parser adapter for structure-aware units. When omitted,
+        the existing PDF extraction stack supplies the default parser;
+        no alternate splitter is introduced.
+    max_structure_units:
+        Positive cap on structure units emitted per document.
 
     Raises
     ------
@@ -801,6 +838,8 @@ def run_ingest(
                 existing_doc is not None
                 and existing_doc.get("version") == expected_sha
                 and isinstance(existing_doc.get("page_count"), int)
+                and isinstance(existing_doc.get("unit_count"), int)
+                and (doc_dir / "units.json").is_file()
                 and _artifacts_present(doc_dir, int(existing_doc["page_count"]))
             ):
                 # Fast-skip: trust the index and existence checks.
@@ -808,6 +847,7 @@ def run_ingest(
                 index[document_id] = {
                     "version": expected_sha,
                     "page_count": page_count,
+                    "unit_count": int(existing_doc["unit_count"]),
                 }
                 pages_total += page_count
                 pages_skipped += page_count
@@ -830,6 +870,17 @@ def run_ingest(
                 ocr_engine=ocr_engine,
                 ocr_required_marker=ocr_required_marker,
             )
+            units = parse_structure_units(
+                document_id=document_id,
+                version=expected_sha,
+                source=pdf_path,
+                parser=structure_parser,
+                max_units=max_structure_units,
+            )
+            _write_if_drifted(
+                doc_dir / "units.json",
+                _structure_units_payload(units),
+            )
 
             pages_written += pages_written_delta
             pages_skipped += pages_skipped_delta
@@ -838,6 +889,7 @@ def run_ingest(
             doc_index_entry: dict[str, object] = {
                 "version": expected_sha,
                 "page_count": pages_this_doc,
+                "unit_count": len(units),
             }
             if ocr_applied_pages:
                 doc_index_entry["ocr_applied"] = True
