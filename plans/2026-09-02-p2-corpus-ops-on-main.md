@@ -36,7 +36,7 @@ minimal-change-verifier: yes — one logical program, sequenced as plan P2 trace
    - **Surface:** `corpus`
    - **Acceptance:** happy path 到 Ready 等价态；非法迁移/失败步骤 typed + audit；`uv run pytest -q` exits 0。
    - **Completion:** 状态枚举名与存储由 implementer 选。对照：parked #175。
-   - Status: [ ] pending
+   - Status: [x] complete
    - [blocks: T1]
 
 3. **选择性 OCR 写回冻结单元** — tag: `[implementation]`
