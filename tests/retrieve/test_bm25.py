@@ -80,9 +80,23 @@ def _write_manifest(manifest_path: Path, documents: list[dict]) -> None:
 def real_ingested_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Run ``run_ingest`` once against the real corpus and share the
     populated tree across tests.
+
+    Plan C added 8 EDGAR iXBRL primary documents (html_live kind,
+    frozen by ``fin.corpus.live_fetch``); they are out of scope for the
+    local re-ingest path. Copy their already-frozen artifacts from the
+    committed extracted tree into the fixture's tmp root before
+    ``run_ingest`` so the merged tree still satisfies the catalog.
     """
     manifest_path, pdf_dir, _ = _real_manifest()
     extracted_root = tmp_path_factory.mktemp("real-ingest") / "extracted"
+    extracted_root.mkdir(parents=True, exist_ok=True)
+    committed_extracted = _project_data_dir() / "extracted"
+    for entry in committed_extracted.iterdir():
+        target = extracted_root / entry.name
+        if entry.is_dir():
+            shutil.copytree(entry, target)
+        elif entry.is_file():
+            shutil.copyfile(entry, target)
     run_ingest(
         manifest_path=manifest_path,
         pdf_dir=pdf_dir,

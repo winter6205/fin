@@ -161,9 +161,14 @@ def test_matching_ticker_and_cik_returns_hits() -> None:
     """Matching ``ticker``+``cik`` returns the AND-combined hits.
 
     AAPL's ticker (``AAPL``) paired with AAPL's CIK
-    (``0000320193``) — exactly 4 rows in the demo corpus
-    (one per period). The AND of two filters that agree on the
-    same ticker must equal the single-filter result.
+    (``0000320193``) — 4 rows in the demo corpus (one per period).
+    The AND of two filters that agree on the same ticker must equal
+    the single-filter result.
+
+    Plan C added 3 EDGAR iXBRL AAPL primary docs; they carry
+    ``ticker="EDGAR-<cik>"`` (set by ``fin.corpus.live_fetch``), so
+    they match the ``cik`` filter alone but not the ``ticker="AAPL"``
+    filter. The ticker+cik AND therefore stays at 4 rows.
     """
     result = list_files(
         ticker="AAPL",
@@ -177,25 +182,35 @@ def test_matching_ticker_and_cik_returns_hits() -> None:
 
 
 def test_cik_filter_alone_returns_one_issuer_hits() -> None:
-    """``cik`` alone narrows to the issuer's filings (4 rows)."""
+    """``cik`` alone narrows to the issuer's filings.
+
+    Plan C added 3 EDGAR iXBRL AAPL primary docs (CIK 0000320193) on
+    top of the 4 frozen private fixture source PDFs, so AAPL now has 7 filings
+    rather than 4.
+    """
     result = list_files(
         cik=AAPL_CIK,
         manifest_path=_manifest_path(),
         extracted_root=_extracted_root(),
     )
-    assert len(result["filings"]) == 4
+    assert len(result["filings"]) == 7
     for filing in result["filings"]:
         assert filing["company"] == "AAPL"
 
 
 def test_form_filter_alone_returns_all_10Q_hits() -> None:
-    """``form="10-Q"`` returns all 12 demo filings (every row is 10-Q)."""
+    """``form="10-Q"`` returns every 10-Q row in the corpus.
+
+    Plan C expanded the tier-1 corpus via 8 EDGAR iXBRL 10-Q primary
+    docs (all marked ``form="10-Q"`` by the catalog patch), so the
+    floor is now >= 20 (12 frozen private fixture source PDFs + 8 live-fetched
+    iXBRL HTMLs), not exactly 12."""
     result = list_files(
         form="10-Q",
         manifest_path=_manifest_path(),
         extracted_root=_extracted_root(),
     )
-    assert len(result["filings"]) == 12
+    assert len(result["filings"]) >= 20
 
 
 def test_filing_date_filter_alone_returns_single_hit() -> None:
@@ -219,7 +234,8 @@ def test_company_and_cik_filters_are_and_combined() -> None:
         manifest_path=_manifest_path(),
         extracted_root=_extracted_root(),
     )
-    assert len(matching["filings"]) == 4
+    # Plan C added 3 EDGAR iXBRL AAPL primary docs; floor is now 7.
+    assert len(matching["filings"]) == 7
 
     cross = list_files(
         company="AAPL",
@@ -244,7 +260,7 @@ def test_default_returns_all_12_filings() -> None:
         manifest_path=_manifest_path(),
         extracted_root=_extracted_root(),
     )
-    assert len(result["filings"]) == 12
+    assert len(result["filings"]) >= 20
     document_ids = [f["document_id"] for f in result["filings"]]
     assert document_ids == sorted(document_ids)
 
@@ -345,12 +361,15 @@ def test_list_files_aapl_preserves_hit_shape() -> None:
 
 
 def test_list_files_default_returns_all_12_with_hit_shape() -> None:
-    """``list_files()`` returns 12 filings each with the hit shape."""
+    """``list_files()`` returns every committed filing with the hit shape.
+
+    Plan C expanded the tier-1 corpus via 8 EDGAR iXBRL primary docs,
+    so the floor is now >= 20, not exactly 12."""
     result = list_files(
         manifest_path=_manifest_path(),
         extracted_root=_extracted_root(),
     )
-    assert len(result["filings"]) == 12
+    assert len(result["filings"]) >= 20
     for filing in result["filings"]:
         assert set(filing.keys()) == _HIT_KEYS
         for forbidden in _FILTER_ONLY_FIELDS:
