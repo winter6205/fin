@@ -812,6 +812,14 @@ def fetch_and_ingest(
         written; re-run with ``primary_doc``.
     """
     _recover_interrupted_publish(manifest_path=manifest_path)
+    # Validate an existing extracted index before resolving or fetching the
+    # remote document. A caller-supplied primary_doc skips the SEC listing,
+    # but it must not skip the local corruption guard.
+    existing_documents = (
+        _read_index_documents(extracted_root / "_index.json")
+        if (extracted_root / "_index.json").exists()
+        else {}
+    )
     ua = _read_ua()
     base_url = _accession_base_url(cik, accession)
     primary_url = _resolve_primary_url(
@@ -819,9 +827,6 @@ def fetch_and_ingest(
     )
     body = _sec_get(primary_url, ua, accession=accession)
     manifest_payload = _read_manifest_payload(manifest_path)
-    existing_documents = _read_index_documents(
-        extracted_root / "_index.json"
-    ) if (extracted_root / "_index.json").exists() else {}
     version = _sha256_bytes(body)
 
     extracted_root.parent.mkdir(parents=True, exist_ok=True)
