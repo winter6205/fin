@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from fin.corpus.catalog import list_filings
-from fin.corpus.extracted import load_extracted_tree
+from fin.corpus.extracted import load_extracted_tree, load_structure_units
 from fin.corpus.ingest import run_ingest
 from fin.corpus.ingest_state import InMemoryIngestStateStore, IngestState
 from fin.corpus.ingest_state_errors import IngestStepError
@@ -100,6 +100,9 @@ def test_ingest_stores_raw_bytes_and_keeps_locator_reads_local(
 
     pages = load_extracted_tree(manifest_path, extracted_root)
     assert pages["TEST-2026"][0].locator.document_id == "TEST-2026"
+    units = load_structure_units(manifest_path, extracted_root)
+    assert units["TEST-2026"][0].locator.document_id == "TEST-2026"
+    assert units["TEST-2026"][0].text
     assert list_filings(
         manifest_path=manifest_path,
         extracted_root=extracted_root,

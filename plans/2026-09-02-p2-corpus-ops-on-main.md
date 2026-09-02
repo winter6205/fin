@@ -52,7 +52,7 @@ minimal-change-verifier: yes — one logical program, sequenced as plan P2 trace
    - **Surface:** `corpus` + host `list_files`
    - **Acceptance:** 多 section fixture 产出稳定 locator 的 parent/child 或 section 单元；子串违规数 = 0；`list_files` 负例空列表；`uv run pytest -q` exits 0。
    - **Completion:** 字段名开放。对照：parked #181，禁止引入第二套滑动窗口。
-   - Status: [ ] pending
+   - Status: [x] complete
    - [blocks: T3]
 
 5. **扩 SEC 形图书馆（非 frozen-12）** — tag: `[implementation]`
