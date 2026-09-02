@@ -111,7 +111,7 @@ fin 子弹全部落地且对侧 I-T1–I-T7 可对账后，对照缺口 1–6 �
 | T3 | DEFAULT_MCP_COMMAND 一致 | _无 commit_ | `compile.DEFAULT_MCP_COMMAND == ("iknow-memory",)` 与 `graph.py` 行内兜底字面一致；`tests/host/test_compile.py::test_default_mcp_command_fallback_shared_without_serve` 守门 |
 | T4 | push MCP 客户端 | `e1c1b69` | `MCPPushPort` 用 iknow `z.strictObject` 信封 `{content, source_ref, metadata, valid_from, valid_until}` 发 `push` 工具；6 项护栏 |
 | T5 | invalidation MCP 客户端 | `9540aeb` | `MCPInvalidationPort` 按 source_ref 单点发 `invalidation` 工具；`closed`/`already_closed` 由适配器幂等账本维护；6 项护栏 |
-| T6 | B4 信封 + 8 能力键 | 见下 | 既有 `assert_snapshot_matches_published` 守门 + `degraded_failure_is_not_empty_chunk_list` 守门；本弹新增反退化文档断言 |
-| T7 | opt-in 不二次切分对账 | 见下 | `tests/retrieve/test_mcp_push_port.py` 已断言 chunk text 不被重切；opt-in 真实进程对账属阶段 2（D） |
+| T6 | B4 信封 + 8 能力键 | `f846f5b` | `tests/retrieve/test_plan_d0_capability_envelope.py` 11 项护栏：degraded ≠ 空 chunks、8 键逐字一致、不接受内部别名 |
+| T7 | opt-in 不二次切分对账 | `e3593fa` | `tests/retrieve/test_plan_d0_byte_identical_round_trip.py` 5 项护栏：push 端 text → wire content 字节一致、retrieve 端 chunks 内容字节一致、闭环 round-trip、1:1 不切片、3 次幂等基准 |
 
-T6 / T7 的 commit SHA 见后续 commit message。
+T6 / T7 在默认 pytest 跑通；opt-in 真实进程对账属阶段 2（D）超出本计划。
