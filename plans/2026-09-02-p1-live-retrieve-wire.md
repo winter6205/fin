@@ -44,7 +44,7 @@ minimal-change-verifier: yes — 只补真实进程验收与 B6 若缺口；不�
    - **Surface:** 既有 push batching + 真实 push 工具。
    - **Acceptance:** opt-in 下模拟中途失败后重跑：已成功批次不产生第二份写入，补齐后块数 = 预期总数；进程杀掉后的推送是具名失败不是空成功；默认 pytest 不跑。
    - **Completion:** 如何注入中断由 implementer 选。
-   - Status: [ ] pending
+   - Status: [x] complete
    - [blocks: T2]
 
 4. **真实进程：内容失效幂等** — tag: `[implementation]`
