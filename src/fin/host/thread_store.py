@@ -171,6 +171,9 @@ class RunRecord:
     # the next run resets it (ADR 0016), so a follow-up row never
     # lists the previous run's pages.
     evidence_locators: list[dict[str, Any]] = field(default_factory=list)
+    # T6: structured redline / table / statement envelopes from
+    # host analysis tools, persisted for GET history and reload.
+    analysis_results: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ----- enum + validation -----
@@ -495,7 +498,9 @@ CREATE TABLE IF NOT EXISTS fin_run (
     comparisons       JSONB NOT NULL DEFAULT '[]'::jsonb,
     -- Trust (the tracked change): the locators this run retrieved or read, not
     -- only the verifier-passed citations.
-    evidence_locators JSONB NOT NULL DEFAULT '[]'::jsonb
+    evidence_locators JSONB NOT NULL DEFAULT '[]'::jsonb,
+    -- T6: structured host analysis envelopes.
+    analysis_results  JSONB NOT NULL DEFAULT '[]'::jsonb
 );
 
 -- T2 column migration: add ``assistant_message`` to existing
@@ -539,6 +544,9 @@ ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS comparisons JSONB NOT NULL DEFAULT 
 -- before the column existed, so "no recorded locators" is the only
 -- honest value.
 ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS evidence_locators JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+-- T6: analysis-depth envelopes on existing tables.
+ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS analysis_results JSONB NOT NULL DEFAULT '[]'::jsonb;
 """
 
 
@@ -638,6 +646,15 @@ class PostgresThreadStore:
                     else list(row[16] or [])
                 )
                 if len(row) > 16
+                else []
+            ),
+            analysis_results=copy.deepcopy(
+                (
+                    json.loads(row[17])
+                    if isinstance(row[17], str)
+                    else list(row[17] or [])
+                )
+                if len(row) > 17
                 else []
             ),
         )
@@ -753,9 +770,9 @@ class PostgresThreadStore:
                     "status_reason, answer, citations, thinking_text, "
                     "tool_summaries, assistant_message, created_at, in_flight, "
                     "thinking_duration_ms, track_decision, status_classified, "
-                    "comparisons, evidence_locators) "
+                    "comparisons, evidence_locators, analysis_results) "
                     "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                    "%s, %s, %s)",
+                    "%s, %s, %s, %s)",
                     (
                         record.id,
                         record.thread_id,
@@ -775,6 +792,7 @@ class PostgresThreadStore:
                         record.status_classified,
                         json.dumps(record.comparisons),
                         json.dumps(record.evidence_locators),
+                        json.dumps(record.analysis_results),
                     ),
                 )
                 conn.commit()
@@ -805,7 +823,7 @@ class PostgresThreadStore:
                 "answer, citations, thinking_text, tool_summaries, "
                 "assistant_message, created_at, in_flight, "
                 "thinking_duration_ms, track_decision, status_classified, "
-                "comparisons, evidence_locators "
+                "comparisons, evidence_locators, analysis_results "
                 "FROM fin_run WHERE thread_id = %s ORDER BY created_at ASC",
                 (thread_id,),
             ).fetchall()

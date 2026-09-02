@@ -68,7 +68,7 @@ minimal-change-verifier: yes — one logical program, sequenced as plan P2 trace
    - **Surface:** `host` tools + workspace GET + web thread
    - **Acceptance:** scripted 周转 redline 后 GET 含结构化结果；表绑定 locator；三年表来自 XBRL facts；`uv run pytest -q` exits 0。
    - **Completion:** 一个或三个工具、UI 形态开放。对照：parked #183。
-   - Status: [ ] pending
+   - Status: [x] complete
    - [blocks: T5]
 
 7. **真 filing monitor + in-app notice** — tag: `[implementation]`

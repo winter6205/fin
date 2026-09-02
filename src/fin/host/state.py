@@ -300,6 +300,10 @@ class AgentState(TypedDict, total=False):
         it and the numeric gate reads its columns as claims. Run
         scoped: ``reset_input_state`` clears the channel so a
         follow-up never inherits the previous turn's table.
+    analysis_results
+        T6: structured redline, table, and statement envelopes
+        produced by host tools. Each entry carries the producing
+        ``tool_call_id`` and is reset between turns.
     issuer_plan
         T6 (enterprise-kb Focus 4 / ADR 0034): the roster the fan-out
         planner approved for this run — ``{issuers, query, cap,
@@ -365,6 +369,7 @@ class AgentState(TypedDict, total=False):
     # ``reset_input_state``'s ``[]`` a no-op (``prior + [] == prior``)
     # and a follow-up run would inherit the previous turn's table.
     comparisons: list[dict[str, Any]]
+    analysis_results: list[dict[str, Any]]
     # T6 (enterprise-kb Focus 4 / ADR 0034). ``issuer_plan`` and
     # ``issuer_fanout`` have single writers (the planner and the join
     # node), so they stay overwrite-semantics and ``reset_input_state``
@@ -407,6 +412,7 @@ def reset_input_state(question: str) -> dict[str, Any]:
         # overwrite-semantics, so ``[]`` genuinely clears it and a
         # follow-up starts without the previous turn's table.
         "comparisons": [],
+        "analysis_results": [],
         # T6 (enterprise-kb Focus 4): the fan-out channels are run
         # scoped too. ``issuer_findings`` is additive, so it takes the
         # sentinel rather than ``[]``.
