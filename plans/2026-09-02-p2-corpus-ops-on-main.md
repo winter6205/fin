@@ -44,7 +44,7 @@ minimal-change-verifier: yes — one logical program, sequenced as plan P2 trace
    - **Surface:** `corpus`（既有 OCR 入口，不新开产品）
    - **Acceptance:** fixture 页 collapsed+image OCR 后 verifier 能匹配写回 span；引擎缺失走既有具名失败，不以空文本成功；无 vision 路径；`uv run pytest -q` exits 0。
    - **Completion:** 引擎选型开放。对照：parked #174。
-   - Status: [ ] pending
+   - Status: [x] complete
    - [blocks: T2]
 
 4. **结构可引用单元（不换切分权威）** — tag: `[implementation]`
