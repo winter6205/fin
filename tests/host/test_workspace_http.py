@@ -10,7 +10,7 @@ The workspace routes sit on the same FastAPI app as the v1
   ``text/event-stream`` with terminal ``status`` / ``citations`` /
   ``answer`` events (T1 is sync invoke wrapped in an event stream
   - T3 will replace this with token-by-token streaming);
-* corpus list: ``GET /api/corpus`` returns the real 12 filings.
+* corpus list: ``GET /api/corpus`` returns the expanded filing library.
 
 Pattern
 -------
@@ -862,19 +862,17 @@ def test_create_thread_lets_store_mint_the_id(client: TestClient, fresh_store) -
 # ----- corpus endpoint -----
 
 
-def test_get_corpus_returns_twelve_filings_with_required_keys(
+def test_get_corpus_returns_library_filings_with_required_keys(
     client: TestClient, fresh_store
 ) -> None:
-    """``GET /api/corpus`` returns every committed filing with the
-    ADR 0009 shape. Plan C expanded the tier-1 corpus via 8 EDGAR
-    iXBRL primary docs, so the floor is now >= 20 (12 frozen private fixture source
-    PDFs + 8 live-fetched iXBRL HTMLs), not exactly 12."""
+    """``GET /api/corpus`` returns the expanded library with the
+    ADR 0009 shape."""
     r = client.get("/api/corpus")
     assert r.status_code == 200
     body = r.json()
     assert "filings" in body
     filings = body["filings"]
-    assert len(filings) >= 20
+    assert len(filings) >= 21
 
     for f in filings:
         # SC3 adds ``form`` to the card; the rest of the EDGAR-shaped
@@ -889,11 +887,16 @@ def test_get_corpus_returns_twelve_filings_with_required_keys(
         }
         assert isinstance(f["page_count"], int)
         assert f["page_count"] >= 1
-        assert f["form"] == "10-Q"
+        assert f["form"] in {"10-Q", "10-K"}
 
     ids = sorted(f["document_id"] for f in filings)
     expected_substrings = {"AAPL-2022Q3", "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
     assert expected_substrings.issubset(set(ids))
+    assert "GOOG-2023FY" in ids
+    goog = next(f for f in filings if f["document_id"] == "GOOG-2023FY")
+    assert goog["company"] == "GOOG"
+    assert goog["period"] == "2023 FY"
+    assert goog["form"] == "10-K"
     # Defensive: never return prototype-style ids.
     assert not any("Q3-2024" in fid for fid in ids)
 

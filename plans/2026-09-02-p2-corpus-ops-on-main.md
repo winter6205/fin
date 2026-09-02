@@ -60,7 +60,7 @@ minimal-change-verifier: yes — one logical program, sequenced as plan P2 trace
    - **Surface:** `corpus` + web Corpus 首页
    - **Acceptance:** 额外 issuer/form 的 fixture 出现在 `GET /api/corpus`/卡片；默认 pytest 无 live SEC；`uv run pytest -q` exits 0；本弹若改 web 则 `npx tsc --noEmit` exits 0。
    - **Completion:** 扩库目录布局开放。对照：parked #182。
-   - Status: [ ] pending
+   - Status: [x] complete
    - [blocks: T4]
 
 6. **分析深度：redline + 表 + 三年表** — tag: `[implementation]`
