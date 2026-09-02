@@ -122,7 +122,11 @@ from fin.host.export import (
     UnsupportedExportError,
     build_export,
 )
-from fin.host.graph import ConcurrentRunError, comparison_from_tool_message
+from fin.host.graph import (
+    ConcurrentRunError,
+    analysis_from_tool_message,
+    comparison_from_tool_message,
+)
 from fin.host.memory_dream import run_dream_after_turn
 from fin.host.memory_port import build_memory_port
 from fin.host.operator_env import (
@@ -496,6 +500,8 @@ class TurnRow(BaseModel):
     # run's evidence before the next run resets it. Wider than
     # ``citations``: a refused turn still shows what it looked at.
     evidence_locators: list[dict[str, Any]] = Field(default_factory=list)
+    # T6: structured host analysis envelopes persisted for reload.
+    analysis_results: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class WorkspaceStatusResponse(BaseModel):
@@ -616,6 +622,7 @@ def _serialize_run(run: RunRecord, *, in_flight: bool = False) -> dict[str, Any]
         # Trust (#135): copied so a caller cannot mutate the store's
         # list through the serialized view.
         "evidence_locators": [dict(loc) for loc in run.evidence_locators],
+        "analysis_results": copy.deepcopy(list(run.analysis_results or [])),
     }
 
 
@@ -731,6 +738,9 @@ def _node_frame_payloads(message: BaseMessage) -> Iterator[tuple[str, Any]]:
         comparison = comparison_from_tool_message(message)
         if comparison is not None:
             yield ("comparison", comparison)
+        analysis = analysis_from_tool_message(message)
+        if analysis is not None:
+            yield ("analysis", analysis)
 
 
 def _stream_run_frames(
@@ -1544,6 +1554,9 @@ def build_router(
                         # T3: the structured table the turn renders.
                         # Persisted on refuse rows too — see TurnRow.
                         comparisons=list(payload.get("comparisons") or []),
+                        analysis_results=list(
+                            payload.get("analysis_results") or []
+                        ),
                         # SC8: this run's retrieved / read locators,
                         # taken from the final state BEFORE the next
                         # send resets the evidence channel.
@@ -1740,6 +1753,9 @@ def build_router(
                         assistant_message=payload["assistant_message"],
                         track_decision=dict(payload.get("track_decision") or {}),
                         comparisons=list(payload.get("comparisons") or []),
+                        analysis_results=list(
+                            payload.get("analysis_results") or []
+                        ),
                         # SC8: the RESUMED remainder's locators. The
                         # crashed prefix's row (when one exists) keeps
                         # its own.
