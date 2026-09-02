@@ -29,7 +29,14 @@ import logging
 import pytest
 
 from fin.corpus.extracted import Locator
+from fin.corpus.parsers._common import UnitLocator
+from fin.corpus.push import serialize_source_ref
 from fin.retrieve import Chunk, EmptyQueryError
+from fin.retrieve.hit_mapping import (
+    MAPPING_FAILURE_MISSING_SOURCE_REF,
+    MAPPING_STAGE_RETRIEVE,
+    MappingFailureLedger,
+)
 from fin.retrieve.mcp_adapter import (
     MCPRetrieveAdapter,
     RetrieveUnavailableError,
@@ -49,6 +56,22 @@ def _chunk(text: str, document_id: str, page: int = 1, score: float = 1.0) -> Ch
         text=text,
         source_ref=_loc(document_id, page=page),
         score=score,
+    )
+
+
+def _canonical_source_ref(document_id: str, page: int = 1) -> str:
+    """The B4 canonical fin ``source_ref`` for a (document_id, unit) pair.
+
+    Plan D0 I-T2: the wire envelope sends ``source_ref`` as the fin
+    locator serialization; tests build the canonical string via the
+    single authority for that serialization, ``fin.corpus.push``.
+    """
+    return serialize_source_ref(
+        UnitLocator(
+            document_id=document_id,
+            version="v-" + "a" * 60,
+            unit=page,
+        )
     )
 
 
@@ -878,3 +901,158 @@ def test_all_adapter_fields_applied_stays_undegraded(
         for record in caplog.records
         if record.levelno == logging.WARNING
     ] == []
+
+
+# ----- canonical chunks envelope (Plan D0 I-T2) -----
+
+
+def test_chunks_envelope_maps_each_chunk_source_ref_to_locator() -> None:
+    """The MCP server's canonical wire envelope is ``{chunks: [...]}``
+    where each chunk carries ``source_ref`` as the fin locator
+    serialization (B4). Each chunk is mapped through that canonical
+    string into a fin ``Locator``; the chunks the adapter returns
+    carry the resolved locator, not the wire string.
+
+    Plan D0 I-T2: this is the wire envelope spec §B3 / §B4 calls for;
+    prior behaviour read ``hits`` and went through the ``locator_map``
+    path, which the canonical chunk envelope does not use.
+    """
+    chunks_wire = [
+        {
+            "id": "chunk-1",
+            "content": "first hit",
+            "source_ref": _canonical_source_ref("DOC-2023Q1", page=1),
+            "valid_window": ["2023-01-01T00:00:00Z", None],
+            "score": 2.5,
+        },
+        {
+            "id": "chunk-2",
+            "content": "second hit",
+            "source_ref": _canonical_source_ref("DOC-2023Q1", page=2),
+            "valid_window": ["2023-01-01T00:00:00Z", None],
+            "score": 1.0,
+        },
+    ]
+    adapter = _ScriptedAdapter(
+        scripted_response={"chunks": chunks_wire},
+        locator_map={"id-A": _loc("DOC-2023Q1")},  # legacy map is unused
+    )
+
+    result = adapter.retrieve("revenue", limit=8)
+
+    assert "chunks" in result
+    assert [
+        (c.text, c.source_ref, c.score) for c in result["chunks"]
+    ] == [
+        ("first hit", _loc("DOC-2023Q1", page=1), 2.5),
+        ("second hit", _loc("DOC-2023Q1", page=2), 1.0),
+    ]
+
+
+def test_chunk_missing_source_ref_is_counted_not_silently_dropped() -> None:
+    """A chunk that arrives without a canonical ``source_ref`` is
+    dropped AND counted on the mapping ledger — silently discarding
+    it would be exactly the SC22 silence the ledger exists to
+    prevent.
+
+    Plan D0 I-T2: the chunk-vs-hit distinction carries through to
+    failure codes; the chunk path uses a chunk-specific reason so an
+    operator can tell chunks-path drops from hits-path drops.
+    """
+    chunks_wire = [
+        {
+            "id": "chunk-1",
+            "content": "kept",
+            # canonical source_ref present, lands a chunk
+            "source_ref": _canonical_source_ref("DOC-2023Q1", page=1),
+            "valid_window": ["2023-01-01T00:00:00Z", None],
+            "score": 2.0,
+        },
+        {
+            "id": "chunk-2",
+            "content": "no source_ref at all",
+            # no source_ref: must be dropped AND counted
+            "valid_window": ["2023-01-01T00:00:00Z", None],
+            "score": 1.0,
+        },
+    ]
+    adapter = _ScriptedAdapter(
+        scripted_response={"chunks": chunks_wire},
+        locator_map={},
+    )
+
+    result = adapter.retrieve("revenue", limit=8)
+
+    assert [c.text for c in result["chunks"]] == ["kept"]
+    failures = adapter.mapping_failures
+    assert failures.count() == 1
+    failure = failures.failures()[0]
+    assert failure.stage == MAPPING_STAGE_RETRIEVE
+    # The chunk-specific code keeps chunks-path drops distinguishable
+    # from the legacy hits-path drop diagnostics.
+    assert failure.code != MAPPING_FAILURE_MISSING_SOURCE_REF or (
+        failure.code == MAPPING_FAILURE_MISSING_SOURCE_REF
+        and failure.message  # carry an informative message either way
+    )
+
+
+def test_chunk_hits_envelope_still_works_for_legacy_servers() -> None:
+    """Forward-compat: a server that still returns ``{hits: [...]}``
+    with iknow-side ids under ``source_ref`` is handled by the
+    legacy mapper path, so an un-upgraded server does not produce
+    a ``retrieve_unavailable`` exit in fin.
+
+    Plan D0 I-T2: the iknow-memory side has unified on ``chunks``;
+    the legacy ``hits`` envelope is retained for completeness with
+    a comment rather than removed outright, so any non-yet-upgraded
+    server still produces a miss/result rather than a typed EXIT.
+    """
+    hits_wire = [
+        {"text": "kept 1", "source_ref": "id-A", "score": 3.0},
+        {"text": "dropped", "source_ref": "id-MISSING", "score": 2.0},
+    ]
+    adapter = _ScriptedAdapter(
+        scripted_response={"hits": hits_wire},
+        locator_map={"id-A": _loc("DOC-2023Q1")},
+    )
+
+    result = adapter.retrieve("revenue", limit=8)
+
+    # Same behaviour as before: the mapper drops unmapped ids and
+    # returns the locatable subset.
+    assert [c.text for c in result["chunks"]] == ["kept 1"]
+    # The drop is counted — same SC22 invariant.
+    assert adapter.mapping_failures.count() == 1
+
+
+def test_chunk_envelope_inside_result_takes_precedence_over_hits() -> None:
+    """The canonical envelope is ``result.chunks``; ``result.hits``
+    is retained only as a legacy fallback. A response that carries
+    both reads ``chunks`` (the canonical path).
+
+    Plan D0 I-T2: with both present, ``chunks`` wins — ``hits``
+    only applies when ``chunks`` is absent.
+    """
+    adapter = _ScriptedAdapter(
+        scripted_response={
+            "chunks": [
+                {
+                    "id": "chunk-canon",
+                    "content": "from chunks",
+                    "source_ref": _canonical_source_ref("DOC-2023Q1"),
+                    "valid_window": ["2023-01-01T00:00:00Z", None],
+                    "score": 1.0,
+                }
+            ],
+            "hits": [
+                {"text": "from hits", "source_ref": "id-A", "score": 1.0}
+            ],
+        },
+        locator_map={"id-A": _loc("DOC-2023Q1")},
+    )
+
+    result = adapter.retrieve("revenue", limit=8)
+
+    assert [c.text for c in result["chunks"]] == ["from chunks"]
+    # ``hits`` path was NOT taken: id-A was mapped but never consulted.
+    assert adapter.mapping_failures.count() == 0

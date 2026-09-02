@@ -104,7 +104,11 @@ from fin.retrieve.degradation import (
     DegradationSignal,
     read_degradation_signal,
 )
-from fin.retrieve.hit_mapping import MappingFailureLedger, map_hits_to_chunks
+from fin.retrieve.hit_mapping import (
+    MappingFailureLedger,
+    map_chunks_to_fin_chunks,
+    map_hits_to_chunks,
+)
 from fin.retrieve.input_validation import (
     InputValidationLedger,
     validate_query,
@@ -713,35 +717,52 @@ class MCPRetrieveAdapter:
                 envelope_signal,
             )
 
-        # Result shape: accept three envelope variants for
-        # forward-compatibility with different MCP server
-        # implementations:
+        # Result shape: accept four envelope variants. The canonical wire
+        # shape is ``{chunks: [...]}`` per spec §B3 / §B4; the legacy
+        # ``{hits: [...]}`` is retained only as a forward-compat
+        # fallback for non-yet-upgraded servers (Plan D0 I-T2):
         #
-        # 1. ``{"result": {"hits": [...]}}`` — the standard
-        #    JSON-RPC success envelope with the raw tool output
-        #    as ``result``.
-        # 2. ``{"hits": [...]}`` — server returns the raw tool
+        # 1. ``{"result": {"chunks": [...]}}`` — canonical JSON-RPC
+        #    success envelope with the raw tool output as ``result``.
+        # 2. ``{"chunks": [...]}`` — server returns the raw tool
         #    output as the JSON-RPC result (some MCP servers
         #    unwrap automatically).
         # 3. ``{"result": {"content": [{"type": "text",
-        #    "text": "<json with hits>"}]}}`` — the canonical
-        #    MCP ``tools/call`` envelope with content blocks.
+        #    "text": "<json with chunks>"}]}}`` — the canonical
+        #    MCP ``tools/call`` envelope with content blocks
+        #    carrying the business envelope.
+        # 4. ``{"result": {"hits": [...]}}`` / ``{"hits": [...]}``
+        #    — legacy fallback for non-yet-upgraded servers; the
+        #    ``hits`` path was the v1 contract the iknow-memory side
+        #    has since replaced with ``chunks``.
         if not isinstance(response, dict):
             raise RetrieveUnavailableError(
                 f"MCP returned non-dict response: {response!r}"
             )
         result = response.get("result")
         if not isinstance(result, dict):
-            # Variant 2: ``{"hits": [...]}`` at top level.
-            if isinstance(response.get("hits"), list):
+            # Variant 2: ``{"chunks": [...]}`` or ``{"hits": [...]}``
+            # at top level.
+            top_level_chunks = response.get("chunks")
+            top_level_hits = response.get("hits")
+            if isinstance(top_level_chunks, list):
+                result = response
+            elif isinstance(top_level_hits, list):
                 result = response
             else:
                 raise _unavailable(
                     f"MCP returned non-dict result: {result!r}",
                     envelope_signal,
                 )
-        # Variant 3: content-block envelope.
-        if "hits" not in result and "content" in result:
+        # Variant 3: content-block envelope. Unwrap only when the
+        # block carries neither the canonical ``chunks`` key nor the
+        # legacy ``hits`` key — otherwise the block's ``content`` key
+        # is unrelated (degradation diagnostics, etc.).
+        if (
+            "chunks" not in result
+            and "hits" not in result
+            and "content" in result
+        ):
             content = result["content"]
             if isinstance(content, list) and content:
                 first = content[0]
@@ -767,22 +788,41 @@ class MCPRetrieveAdapter:
                 result.get("applied_arguments"),
             ),
         )
-        hits = result.get("hits")
-        if not isinstance(hits, list):
-            raise _unavailable(
-                f"MCP returned non-list hits: {hits!r}", signal
-            )
 
-        # Map iknow ids → fin locators; drop unmapped, and count
-        # every drop on the ledger (T17 / SC22: the drop must not be
-        # silent). The cap is enforced AFTER mapping so the returned
-        # list is the locatable subset, not a slice of unmapped ids.
-        chunks = map_hits_to_chunks(
-            hits,
-            locator_map=self._locator_map,
-            limit=effective_limit,
-            ledger=self.mapping_failures,
-        )
+        # Plan D0 I-T2: the canonical envelope is ``result.chunks``;
+        # ``result.hits`` is retained only as a forward-compat
+        # fallback. When both are present, ``chunks`` wins.
+        canonical_chunks = result.get("chunks")
+        legacy_hits = result.get("hits")
+        if isinstance(canonical_chunks, list):
+            # Map canonical chunks: each carries ``source_ref`` as
+            # the B4 fin locator serialization. Unmappable chunks
+            # are dropped AND counted (T17 / SC22: drop must not be
+            # silent). ``locator_map`` is the legacy hits-only seam;
+            # the chunks path does NOT consult it.
+            chunks = map_chunks_to_fin_chunks(
+                canonical_chunks,
+                limit=effective_limit,
+                ledger=self.mapping_failures,
+            )
+        elif isinstance(legacy_hits, list):
+            # Map iknow ids → fin locators; drop unmapped, and count
+            # every drop on the ledger (T17 / SC22: the drop must
+            # not be silent). The cap is enforced AFTER mapping so
+            # the returned list is the locatable subset, not a slice
+            # of unmapped ids.
+            chunks = map_hits_to_chunks(
+                legacy_hits,
+                locator_map=self._locator_map,
+                limit=effective_limit,
+                ledger=self.mapping_failures,
+            )
+        else:
+            raise _unavailable(
+                "MCP returned neither chunks nor a list of hits: "
+                f"chunks={canonical_chunks!r}, hits={legacy_hits!r}",
+                signal,
+            )
         # A degraded response with results is 放行 (§B2 第 1 条) — but it
         # travels with its flag, so the host can record the reasons and
         # tell the user this answer is not a complete one.
