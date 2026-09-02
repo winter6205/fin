@@ -394,7 +394,7 @@ class _CapturingAdapter(_ScriptedAdapter):
 
 def test_omitted_filters_are_absent_from_the_request() -> None:
     """A caller that passes no EDGAR filters must not produce a
-    ``filter`` block at all.
+    ``filters`` block at all.
 
     ``_is_blank(None)`` is ``False`` — ``None`` means "the caller did
     not pass this filter" — so testing ``not _is_blank(v)`` let every
@@ -402,20 +402,74 @@ def test_omitted_filters_are_absent_from_the_request() -> None:
     received ``{"cik": null, "form": null, ...}``: at best noise, at
     worst a filter that matches no document, which reads back as an
     ordinary empty result.
+
+    Plan D0 I-T1: the wire key is the plural ``filters`` (the
+    ``z.strictObject`` schema rejects the legacy singular ``filter``).
     """
     adapter = _CapturingAdapter()
     adapter.retrieve("revenue")
     arguments = adapter.payloads[0]["params"]["arguments"]
+    assert "filters" not in arguments, arguments
     assert "filter" not in arguments, arguments
 
 
 def test_supplied_filters_are_forwarded_in_the_request() -> None:
-    """The filters the caller DID pass still reach the server, and
-    only those."""
+    """The filters the caller DID pass still reach the server under
+    the plural ``filters`` key, and only those.
+
+    Plan D0 I-T1: ``filters`` is the wire-side spelling the iknow-memory
+    schema accepts; emitting the singular ``filter`` would be stripped.
+    """
     adapter = _CapturingAdapter()
     adapter.retrieve("revenue", cik="0000320193", form="10-Q")
     arguments = adapter.payloads[0]["params"]["arguments"]
-    assert arguments["filter"] == {"cik": "0000320193", "form": "10-Q"}
+    assert "filter" not in arguments
+    assert arguments["filters"] == {"cik": "0000320193", "form": "10-Q"}
+
+
+def test_retrieve_payload_uses_limit_not_top_k() -> None:
+    """The wire payload uses ``limit`` (not the legacy ``top_k``).
+
+    Plan D0 I-T1: the iknow-memory ``retrieve`` schema's `z.strictObject`
+    only knows ``limit``; emitting the legacy ``top_k`` would be
+    rejected by strict mode, surfacing contract drift instead of
+    silently dropping the value on the server side.
+    """
+    adapter = _CapturingAdapter()
+    adapter.retrieve("revenue", limit=7)
+    arguments = adapter.payloads[0]["params"]["arguments"]
+    assert arguments.get("limit") == 7
+    assert "top_k" not in arguments
+
+
+def test_retrieve_payload_filters_is_plural_record() -> None:
+    """The wire payload's filters are merged into one ``filters`` dict,
+    and ``document_id`` joins the EDGAR-shaped filters there (no longer
+    a top-level adapter field).
+
+    Plan D0 I-T1: ``document_id`` is now ``filters.document_id``;
+    cik / form / ticker / filing_date are siblings under ``filters``.
+    """
+    adapter = _CapturingAdapter()
+    adapter.retrieve(
+        "revenue",
+        document_id="DOC-2023Q1",
+        cik="0000320193",
+        form="10-Q",
+        ticker="AAPL",
+        filing_date="2023-09-30",
+        limit=5,
+    )
+    arguments = adapter.payloads[0]["params"]["arguments"]
+    assert "filter" not in arguments
+    assert "document_id" not in arguments, arguments
+    assert arguments.get("filters") == {
+        "document_id": "DOC-2023Q1",
+        "cik": "0000320193",
+        "form": "10-Q",
+        "ticker": "AAPL",
+        "filing_date": "2023-09-30",
+    }
 
 
 # ----- locator_map injection -----
@@ -633,10 +687,15 @@ def test_non_dict_response_maps_to_retrieve_unavailable() -> None:
 def test_stripped_adapter_fields_emit_warning_and_degraded_reasons(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """When the mock MCP schema (no ``.strict()``) drops ``top_k`` /
-    ``filter`` / ``document_id``, fin must warn and surface
+    """When the mock MCP schema (no ``.strict()``) drops ``limit`` /
+    ``filters`` / any key under ``filters``, fin must warn and surface
     ``degraded_reasons`` — not silently return chunks as if the
-    filters ran."""
+    filters ran.
+
+    Plan D0 I-T1: the wire field names are ``limit`` and ``filters``
+    (the legacy ``top_k`` / ``filter`` / top-level ``document_id`` are
+    no longer sent).
+    """
     hits = [{"text": "hit", "source_ref": "id-A", "score": 1.0}]
     locator_map = {"id-A": _loc("DOC-2023Q1")}
     adapter = _ScriptedAdapter(
@@ -676,6 +735,87 @@ def test_stripped_adapter_fields_emit_warning_and_degraded_reasons(
     )
 
 
+def test_stripped_adapter_fields_detects_limit_and_filters(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Per-key stripping on the new wire field names: a server that
+    echoes only ``query`` reports BOTH ``adapter:field_stripped:limit``
+    AND ``adapter:field_stripped:filters``.
+
+    Plan D0 I-T1: stripping detection must use the new names
+    (``limit`` and ``filters``); a server keeping ``filters`` but
+    dropping one key inside it reports the per-key ``filters.<key>``
+    reason instead.
+    """
+    hits = [{"text": "hit", "source_ref": "id-A", "score": 1.0}]
+    adapter = _ScriptedAdapter(
+        scripted_response={
+            "hits": hits,
+            "applied_arguments": {"query": "revenue"},
+        },
+        locator_map={"id-A": _loc("DOC-2023Q1")},
+        known_document_ids={"DOC-2023Q1"},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="fin.retrieve.mcp_adapter"):
+        result = adapter.retrieve(
+            "revenue",
+            document_id="DOC-2023Q1",
+            cik="0000320193",
+            form="10-Q",
+            limit=5,
+        )
+
+    reasons = result.get("degraded_reasons", [])
+    assert "adapter:field_stripped:limit" in reasons
+    assert "adapter:field_stripped:filters" in reasons
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+    assert any("adapter_field_stripped" in message for message in warnings)
+
+
+def test_stripped_filters_key_detected_per_missing_filter(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A server that keeps ``filters`` but drops one key inside
+    reports only ``adapter:field_stripped:filters.<key>`` — not the
+    umbrella ``filters`` reason."""
+    hits = [{"text": "hit", "source_ref": "id-A", "score": 1.0}]
+    adapter = _ScriptedAdapter(
+        scripted_response={
+            "hits": hits,
+            # Mock kept ``filters`` but dropped ``filters.document_id``.
+            "applied_arguments": {
+                "query": "revenue",
+                "limit": 5,
+                "filters": {"cik": "0000320193", "form": "10-Q"},
+            },
+        },
+        locator_map={"id-A": _loc("DOC-2023Q1")},
+        known_document_ids={"DOC-2023Q1"},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="fin.retrieve.mcp_adapter"):
+        result = adapter.retrieve(
+            "revenue",
+            document_id="DOC-2023Q1",
+            cik="0000320193",
+            form="10-Q",
+            limit=5,
+        )
+
+    reasons = result.get("degraded_reasons", [])
+    assert "adapter:field_stripped:filters.document_id" in reasons
+    # The umbrella "filters" reason is NOT appended when ``filters``
+    # was kept and only one key inside was dropped.
+    assert "adapter:field_stripped:filters" not in reasons
+    assert "adapter:field_stripped:limit" not in reasons
+
+
 def test_response_without_applied_arguments_stays_undegraded() -> None:
     """Production servers that omit ``applied_arguments`` skip detection —
     no spurious warnings or degradation envelope."""
@@ -699,16 +839,24 @@ def test_all_adapter_fields_applied_stays_undegraded(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """When ``applied_arguments`` echoes every field fin sent, there is
-    nothing to report."""
+    nothing to report.
+
+    Plan D0 I-T1: ``applied_arguments`` echoes the new wire keys
+    (``limit`` / ``filters``), so a server that keeps them all is
+    undegraded.
+    """
     hits = [{"text": "hit", "source_ref": "id-A", "score": 1.0}]
     adapter = _ScriptedAdapter(
         scripted_response={
             "hits": hits,
             "applied_arguments": {
                 "query": "revenue",
-                "top_k": 5,
-                "document_id": "DOC-2023Q1",
-                "filter": {"cik": "0000320193", "form": "10-Q"},
+                "limit": 5,
+                "filters": {
+                    "document_id": "DOC-2023Q1",
+                    "cik": "0000320193",
+                    "form": "10-Q",
+                },
             },
         },
         locator_map={"id-A": _loc("DOC-2023Q1")},
