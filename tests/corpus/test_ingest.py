@@ -114,9 +114,23 @@ def real_ingested_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
     exercising the public ``run_ingest`` entry point over the actual
     frozen data. Tests that need to mutate the tree restore files in a
     ``finally`` block so the next test sees an intact tree.
+
+    Plan C added 8 EDGAR iXBRL primary documents (html_live kind,
+    frozen by ``fin.corpus.live_fetch``); they are not in scope for the
+    local re-ingest path. Copy their already-frozen artifacts from the
+    committed extracted tree into the fixture's tmp root before
+    ``run_ingest`` so the merged tree still satisfies the catalog.
     """
     manifest_path, pdf_dir, _ = _real_manifest()
     extracted_root = tmp_path_factory.mktemp("real-ingest") / "extracted"
+    extracted_root.mkdir(parents=True, exist_ok=True)
+    committed_extracted = _project_data_dir() / "extracted"
+    for entry in committed_extracted.iterdir():
+        target = extracted_root / entry.name
+        if entry.is_dir():
+            shutil.copytree(entry, target)
+        elif entry.is_file():
+            shutil.copyfile(entry, target)
     run_ingest(
         manifest_path=manifest_path,
         pdf_dir=pdf_dir,
@@ -281,10 +295,14 @@ def test_run_ingest_sha_drift_raises_typed_error(tmp_path: Path) -> None:
     Boundary class "negative": the operator's ``data/corpus/pdf/`` has
     drifted (a byte was added or modified). ``run_ingest`` must refuse
     to extract from the drifted source rather than silently re-extract.
+
+    Plan C added 8 EDGAR iXBRL primary docs (html_live kind); the
+    local re-ingest path only owns PDF-kind entries, so pick a PDF.
     """
     _, pdf_dir, real_docs = _real_manifest()
+    pdf_docs = [d for d in real_docs if str(d.get("filename", "")).lower().endswith(".pdf")]
     # Copy the first real PDF into the temp pdf_dir.
-    sample = real_docs[0]
+    sample = pdf_docs[0]
     src_pdf = pdf_dir / sample["filename"]
     test_pdf_dir = tmp_path / "pdf"
     test_pdf_dir.mkdir(parents=True, exist_ok=True)
@@ -326,9 +344,22 @@ def test_load_extracted_tree_missing_page_raises_typed_error(
     Boundary "overflow": delete one page file from a populated tree,
     then ask the loader to validate. The loader must refuse with the
     typed error and not silently produce a truncated tree.
+
+    Plan C added EDGAR iXBRL primary docs (single-page html_live
+    kind); pick the first multi-page PDF kind instead so the test
+    can still delete a mid-range page.
     """
-    manifest_path, _, _ = _real_manifest()
-    doc_id = sorted(p.name for p in real_ingested_tree.iterdir() if p.is_dir())[0]
+    manifest_path, _, real_docs = _real_manifest()
+    pdf_doc_ids = {
+        d["document_id"]
+        for d in real_docs
+        if str(d.get("filename", "")).lower().endswith(".pdf")
+    }
+    doc_id = sorted(
+        p.name
+        for p in real_ingested_tree.iterdir()
+        if p.is_dir() and p.name in pdf_doc_ids
+    )[0]
     doc_dir = real_ingested_tree / doc_id
     page_files = sorted(p for p in doc_dir.glob("page-*.json"))
     assert len(page_files) >= 2
@@ -404,8 +435,17 @@ def test_load_extracted_tree_malformed_json_raises_typed_error(
     so callers can rely on ``IngestMissingError`` as the single
     recovery signal.
     """
-    manifest_path, _, _ = _real_manifest()
-    doc_id = sorted(p.name for p in real_ingested_tree.iterdir() if p.is_dir())[0]
+    manifest_path, _, real_docs = _real_manifest()
+    pdf_doc_ids = {
+        d["document_id"]
+        for d in real_docs
+        if str(d.get("filename", "")).lower().endswith(".pdf")
+    }
+    doc_id = sorted(
+        p.name
+        for p in real_ingested_tree.iterdir()
+        if p.is_dir() and p.name in pdf_doc_ids
+    )[0]
     doc_dir = real_ingested_tree / doc_id
     page_files = sorted(p for p in doc_dir.glob("page-*.json"))
     victim = page_files[len(page_files) // 2]

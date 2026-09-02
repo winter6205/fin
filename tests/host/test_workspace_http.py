@@ -865,14 +865,16 @@ def test_create_thread_lets_store_mint_the_id(client: TestClient, fresh_store) -
 def test_get_corpus_returns_twelve_filings_with_required_keys(
     client: TestClient, fresh_store
 ) -> None:
-    """``GET /api/corpus`` returns the frozen 12 filings with the
-    ADR 0009 shape."""
+    """``GET /api/corpus`` returns every committed filing with the
+    ADR 0009 shape. Plan C expanded the tier-1 corpus via 8 EDGAR
+    iXBRL primary docs, so the floor is now >= 20 (12 frozen private fixture source
+    PDFs + 8 live-fetched iXBRL HTMLs), not exactly 12."""
     r = client.get("/api/corpus")
     assert r.status_code == 200
     body = r.json()
     assert "filings" in body
     filings = body["filings"]
-    assert len(filings) == 12
+    assert len(filings) >= 20
 
     for f in filings:
         # SC3 adds ``form`` to the card; the rest of the EDGAR-shaped

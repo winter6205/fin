@@ -639,6 +639,28 @@ def run_ingest(
         pdf_path = pdf_dir / filename
 
         if not pdf_path.exists():
+            # The local re-ingest path doesn't own EDGAR iXBRL primary
+            # docs (filename ends with .htm/.html, catalog carries the
+            # accession); those were frozen by ``fin.corpus.live_fetch``
+            # into the extracted tree. Preserve any existing entry
+            # there so the rewritten ``_index.json`` doesn't silently
+            # drop the live path's catalog row, and refuse (typed error)
+            # when nothing exists to preserve — never silently skip.
+            existing_doc = (
+                existing_index.get(document_id) if existing_index else None
+            )
+            if (
+                existing_doc is not None
+                and existing_doc.get("version") == expected_sha
+                and isinstance(existing_doc.get("page_count"), int)
+            ):
+                index[document_id] = {
+                    "version": expected_sha,
+                    "page_count": int(existing_doc["page_count"]),
+                }
+                pages_total += int(existing_doc["page_count"])
+                pages_skipped += int(existing_doc["page_count"])
+                continue
             raise ManifestShaMismatchError(
                 f"missing frozen PDF for {document_id}: {pdf_path}"
             )
