@@ -553,10 +553,8 @@ def test_empty_hit_envelope_maps_to_empty_chunks(envelope: dict) -> None:
     assert adapter.retrieve("foo") == {"chunks": []}
 
 
-def test_content_block_business_envelope_propagates_degradation_signal() -> None:
-    """Canonical MCP content blocks carry the business envelope inside
-    ``result.content[0].text``; its degradation fields must be consumed
-    after that JSON is decoded."""
+def test_content_block_degraded_empty_envelope_is_named_failure() -> None:
+    """A degraded empty result is not a legal empty-result success."""
     envelope = _content_block(
         {
             "hits": [],
@@ -567,7 +565,7 @@ def test_content_block_business_envelope_propagates_degradation_signal() -> None
     adapter = _ScriptedAdapter(scripted_response=envelope)
 
     assert adapter.retrieve("foo") == {
-        "chunks": [],
+        "error": "retrieve_degraded_failure",
         "degraded": True,
         "degraded_reasons": ["vector:unavailable"],
     }

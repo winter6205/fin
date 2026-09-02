@@ -829,6 +829,11 @@ class MCPRetrieveAdapter:
                 f"chunks={canonical_chunks!r}, hits={legacy_hits!r}",
                 signal,
             )
+        if signal.degraded and not chunks:
+            raise _unavailable(
+                "MCP returned a degraded response without usable chunks",
+                signal,
+            )
         # A degraded response with results is 放行 (§B2 第 1 条) — but it
         # travels with its flag, so the host can record the reasons and
         # tell the user this answer is not a complete one.
