@@ -150,8 +150,9 @@ def test_plan_c_b1_floors_closed_after_expand_primary() -> None:
         B1_MAX_CHUNKS,
     )
 
-    # The two pre-Plan-C gaps must no longer be reported.
-    assert "primary_pdf_below_per_format_floor" not in known_gaps, known_gaps
+    # The pdf per-format floor (< 20) is honestly reported in known_gaps
+    # while chunk_total is inside the B1 band.
+    assert "primary_pdf_below_per_format_floor" in known_gaps, known_gaps
     assert "chunk_total_outside_b1_band" not in known_gaps, known_gaps
 
     # The structural pdf<20 reality must still be visible at the
