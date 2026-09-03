@@ -585,6 +585,270 @@ def _structure_units_payload(units: tuple[StructureUnit, ...]) -> bytes:
     ).encode("utf-8")
 
 
+@dataclass(frozen=True)
+class _DocumentOutcome:
+    """Per-document bookkeeping returned by ``_ingest_one_document``.
+
+    The parent loop merges each outcome into the run-wide
+    accumulators (index dict, page counters, manifest-updated flag,
+    reused-ready map) so the per-doc sequence — state prep, SHA
+    verify, raw upload, extraction, state transitions, partial
+    cleanup — lives in one place. Carrying the index entry out
+    instead of mutating the parent's ``index`` dict keeps the seam
+    between loop-level bookkeeping and per-doc work explicit.
+    """
+
+    index_entry: dict[str, object]
+    pages_total: int
+    pages_written: int
+    pages_skipped: int
+    manifest_row_updated: bool
+    reused_ready: bool
+
+
+def _ingest_one_document(
+    *,
+    doc: dict[str, object],
+    pdf_dir: Path,
+    extracted_root: Path,
+    existing_index: dict[str, dict[str, object]] | None,
+    object_store: ObjectStore | None,
+    pointer_store: MetadataStore | None,
+    state_store: IngestStateStore,
+    ocr_engine: OCREngine | None,
+    ocr_required_marker: str | None,
+    structure_parser: StructureParser | None,
+    max_structure_units: int,
+) -> _DocumentOutcome:
+    """Run the per-document sequence for one manifest entry.
+
+    Encapsulates: state prep, SHA verification, raw-object upload
+    + manifest pointer write, fast-skip against the prior index,
+    pdfplumber extraction, structure-unit parsing, state-machine
+    transitions through ``CATALOGING``, and partial-tree cleanup
+    on failure. The parent loop owns the per-doc counters, the
+    run-wide ``index`` dict, manifest rewriting, the catalog step,
+    and the fact-seeding loop.
+
+    Raises the same typed errors the inline sequence raised:
+    ``ManifestShaMismatchError`` for missing / SHA-mismatched
+    PDFs, ``OcrRequiredUnavailableError`` for OCR-required
+    failures, ``ObjectStoreError`` /
+    ``ObjectStoreUnavailableError`` for raw storage problems.
+    Partial ``doc_dir`` cleanup runs before any re-raise so a
+    failed verification retry cannot leave a half-written tree
+    behind an existing committed doc_dir.
+    """
+    document_id: str = str(doc["document_id"])
+    filename: str = str(doc["filename"])
+    expected_sha: str = str(doc["sha256"])
+    pdf_path = pdf_dir / filename
+    doc_dir = extracted_root / document_id
+    doc_dir_existed = doc_dir.exists()
+    reused_ready = _prepare_state_job(state_store, document_id)
+    if not reused_ready:
+        state_store.transition(
+            document_id,
+            IngestState.FETCHING,
+            metadata={"filename": filename},
+        )
+
+    pages_total = 0
+    pages_written = 0
+    pages_skipped = 0
+    manifest_row_updated = False
+    index_entry: dict[str, object]
+
+    try:
+        if not pdf_path.exists():
+            # The local re-ingest path does not own EDGAR iXBRL
+            # primary documents. Preserve a matching live entry
+            # already frozen by ``fin.corpus.live_fetch``.
+            existing_doc = (
+                existing_index.get(document_id) if existing_index else None
+            )
+            if (
+                existing_doc is not None
+                and existing_doc.get("version") == expected_sha
+                and isinstance(existing_doc.get("page_count"), int)
+            ):
+                index_entry = {
+                    "version": expected_sha,
+                    "page_count": int(existing_doc["page_count"]),
+                }
+                pages_total = int(existing_doc["page_count"])
+                pages_skipped = pages_total
+                if not reused_ready:
+                    state_store.transition(
+                        document_id, IngestState.EXTRACTING
+                    )
+                    state_store.transition(
+                        document_id, IngestState.CATALOGING
+                    )
+                return _DocumentOutcome(
+                    index_entry=index_entry,
+                    pages_total=pages_total,
+                    pages_written=pages_written,
+                    pages_skipped=pages_skipped,
+                    manifest_row_updated=manifest_row_updated,
+                    reused_ready=reused_ready,
+                )
+            raise ManifestShaMismatchError(
+                f"missing frozen PDF for {document_id}: {pdf_path}"
+            )
+
+        raw_bytes: bytes | None = None
+        if object_store is not None:
+            # Hash and upload the same buffer so the pointer cannot
+            # describe bytes other than those verified for parsing.
+            raw_bytes = pdf_path.read_bytes()
+            actual_sha = _sha256_bytes(raw_bytes)
+        else:
+            actual_sha = _sha256_file(pdf_path)
+        if actual_sha != expected_sha:
+            raise ManifestShaMismatchError(
+                f"sha256 mismatch for {document_id}: "
+                f"manifest={expected_sha} actual={actual_sha}"
+            )
+        if object_store is not None:
+            assert raw_bytes is not None
+            raw_key = f"filings/{document_id}/{filename}"
+            pointer = object_store.put(
+                raw_key,
+                raw_bytes,
+                content_type="application/pdf",
+            )
+            if pointer.sha256 != expected_sha or pointer.size_bytes != len(
+                raw_bytes
+            ):
+                raise ObjectStoreUnavailableError(
+                    f"object store returned an invalid pointer for "
+                    f"{document_id}: key={pointer.key!r}"
+                )
+            if pointer_store is None:
+                raise ObjectStoreUnavailableError(
+                    "raw object storage has no metadata pointer store"
+                )
+            pointer_store.put_pointer(document_id, pointer)
+            raw_object = {
+                "key": pointer.key,
+                "size_bytes": pointer.size_bytes,
+                "sha256": pointer.sha256,
+                "content_type": pointer.content_type,
+            }
+            if doc.get("raw_object") != raw_object:
+                doc["raw_object"] = raw_object
+                manifest_row_updated = True
+
+        if not reused_ready:
+            state_store.transition(
+                document_id,
+                IngestState.EXTRACTING,
+                metadata={"sha256": expected_sha},
+            )
+        doc_dir.mkdir(parents=True, exist_ok=True)
+
+        existing_doc = (
+            existing_index.get(document_id) if existing_index else None
+        )
+        if (
+            existing_doc is not None
+            and existing_doc.get("version") == expected_sha
+            and isinstance(existing_doc.get("page_count"), int)
+            and isinstance(existing_doc.get("unit_count"), int)
+            and (doc_dir / "units.json").is_file()
+            and _artifacts_present(doc_dir, int(existing_doc["page_count"]))
+        ):
+            # Fast-skip: trust the index and existence checks.
+            page_count = int(existing_doc["page_count"])
+            index_entry = {
+                "version": expected_sha,
+                "page_count": page_count,
+                "unit_count": int(existing_doc["unit_count"]),
+            }
+            pages_total = page_count
+            pages_skipped = page_count
+            if not reused_ready:
+                state_store.transition(
+                    document_id, IngestState.CATALOGING
+                )
+            return _DocumentOutcome(
+                index_entry=index_entry,
+                pages_total=pages_total,
+                pages_written=pages_written,
+                pages_skipped=pages_skipped,
+                manifest_row_updated=manifest_row_updated,
+                reused_ready=reused_ready,
+            )
+
+        (
+            pages_this_doc,
+            ocr_applied_pages,
+            pages_written_delta,
+            pages_skipped_delta,
+        ) = _ingest_all_pages(
+            pdf_path=pdf_path,
+            document_id=document_id,
+            doc_dir=doc_dir,
+            version=expected_sha,
+            ocr_engine=ocr_engine,
+            ocr_required_marker=ocr_required_marker,
+        )
+        units = parse_structure_units(
+            document_id=document_id,
+            version=expected_sha,
+            source=pdf_path,
+            parser=structure_parser,
+            max_units=max_structure_units,
+        )
+        _write_if_drifted(
+            doc_dir / "units.json",
+            _structure_units_payload(units),
+        )
+
+        pages_total = pages_this_doc
+        pages_written = pages_written_delta
+        pages_skipped = pages_skipped_delta
+
+        doc_index_entry: dict[str, object] = {
+            "version": expected_sha,
+            "page_count": pages_this_doc,
+            "unit_count": len(units),
+        }
+        if ocr_applied_pages:
+            doc_index_entry["ocr_applied"] = True
+            doc_index_entry["ocr_applied_pages"] = sorted(ocr_applied_pages)
+        index_entry = doc_index_entry
+        if not reused_ready:
+            if ocr_applied_pages:
+                state_store.transition(document_id, IngestState.OCR)
+            state_store.transition(document_id, IngestState.CATALOGING)
+    except Exception as exc:
+        # Remove only a newly-created partial tree. Existing committed
+        # artifacts must survive a failed verification retry.
+        if not doc_dir_existed and doc_dir.exists():
+            shutil.rmtree(doc_dir)
+        if not reused_ready:
+            try:
+                state_store.fail_step(
+                    document_id, step="ingest", cause=exc
+                )
+            except IngestStepError as state_error:
+                # Keep the established ingest error as the public
+                # failure while retaining the audit row.
+                raise exc from state_error
+        raise
+
+    return _DocumentOutcome(
+        index_entry=index_entry,
+        pages_total=pages_total,
+        pages_written=pages_written,
+        pages_skipped=pages_skipped,
+        manifest_row_updated=manifest_row_updated,
+        reused_ready=reused_ready,
+    )
+
+
 def run_ingest(
     *,
     manifest_path: Path,
@@ -734,186 +998,27 @@ def run_ingest(
     # runs and machines.
     reused_ready_jobs: dict[str, bool] = {}
     for doc in sorted(documents, key=lambda d: d["document_id"]):
-        document_id: str = doc["document_id"]
-        filename: str = doc["filename"]
-        expected_sha: str = doc["sha256"]
-        pdf_path = pdf_dir / filename
-        doc_dir = extracted_root / document_id
-        doc_dir_existed = doc_dir.exists()
-        reused_ready = _prepare_state_job(state_store, document_id)
-        reused_ready_jobs[document_id] = reused_ready
-        if not reused_ready:
-            state_store.transition(
-                document_id,
-                IngestState.FETCHING,
-                metadata={"filename": filename},
-            )
-
-        try:
-            if not pdf_path.exists():
-                # The local re-ingest path does not own EDGAR iXBRL
-                # primary documents. Preserve a matching live entry
-                # already frozen by ``fin.corpus.live_fetch``.
-                existing_doc = (
-                    existing_index.get(document_id) if existing_index else None
-                )
-                if (
-                    existing_doc is not None
-                    and existing_doc.get("version") == expected_sha
-                    and isinstance(existing_doc.get("page_count"), int)
-                ):
-                    index[document_id] = {
-                        "version": expected_sha,
-                        "page_count": int(existing_doc["page_count"]),
-                    }
-                    pages_total += int(existing_doc["page_count"])
-                    pages_skipped += int(existing_doc["page_count"])
-                    if not reused_ready:
-                        state_store.transition(
-                            document_id, IngestState.EXTRACTING
-                        )
-                        state_store.transition(
-                            document_id, IngestState.CATALOGING
-                        )
-                    continue
-                raise ManifestShaMismatchError(
-                    f"missing frozen PDF for {document_id}: {pdf_path}"
-                )
-
-            raw_bytes: bytes | None = None
-            if object_store is not None:
-                # Hash and upload the same buffer so the pointer cannot
-                # describe bytes other than those verified for parsing.
-                raw_bytes = pdf_path.read_bytes()
-                actual_sha = _sha256_bytes(raw_bytes)
-            else:
-                actual_sha = _sha256_file(pdf_path)
-            if actual_sha != expected_sha:
-                raise ManifestShaMismatchError(
-                    f"sha256 mismatch for {document_id}: "
-                    f"manifest={expected_sha} actual={actual_sha}"
-                )
-            if object_store is not None:
-                assert raw_bytes is not None
-                raw_key = f"filings/{document_id}/{filename}"
-                pointer = object_store.put(
-                    raw_key,
-                    raw_bytes,
-                    content_type="application/pdf",
-                )
-                if pointer.sha256 != expected_sha or pointer.size_bytes != len(
-                    raw_bytes
-                ):
-                    raise ObjectStoreUnavailableError(
-                        f"object store returned an invalid pointer for "
-                        f"{document_id}: key={pointer.key!r}"
-                    )
-                if pointer_store is None:
-                    raise ObjectStoreUnavailableError(
-                        "raw object storage has no metadata pointer store"
-                    )
-                pointer_store.put_pointer(document_id, pointer)
-                raw_object = {
-                    "key": pointer.key,
-                    "size_bytes": pointer.size_bytes,
-                    "sha256": pointer.sha256,
-                    "content_type": pointer.content_type,
-                }
-                if doc.get("raw_object") != raw_object:
-                    doc["raw_object"] = raw_object
-                    manifest_updated = True
-
-            if not reused_ready:
-                state_store.transition(
-                    document_id,
-                    IngestState.EXTRACTING,
-                    metadata={"sha256": expected_sha},
-                )
-            doc_dir.mkdir(parents=True, exist_ok=True)
-
-            existing_doc = (
-                existing_index.get(document_id) if existing_index else None
-            )
-            if (
-                existing_doc is not None
-                and existing_doc.get("version") == expected_sha
-                and isinstance(existing_doc.get("page_count"), int)
-                and isinstance(existing_doc.get("unit_count"), int)
-                and (doc_dir / "units.json").is_file()
-                and _artifacts_present(doc_dir, int(existing_doc["page_count"]))
-            ):
-                # Fast-skip: trust the index and existence checks.
-                page_count = int(existing_doc["page_count"])
-                index[document_id] = {
-                    "version": expected_sha,
-                    "page_count": page_count,
-                    "unit_count": int(existing_doc["unit_count"]),
-                }
-                pages_total += page_count
-                pages_skipped += page_count
-                if not reused_ready:
-                    state_store.transition(
-                        document_id, IngestState.CATALOGING
-                    )
-                continue
-
-            (
-                pages_this_doc,
-                ocr_applied_pages,
-                pages_written_delta,
-                pages_skipped_delta,
-            ) = _ingest_all_pages(
-                pdf_path=pdf_path,
-                document_id=document_id,
-                doc_dir=doc_dir,
-                version=expected_sha,
-                ocr_engine=ocr_engine,
-                ocr_required_marker=ocr_required_marker,
-            )
-            units = parse_structure_units(
-                document_id=document_id,
-                version=expected_sha,
-                source=pdf_path,
-                parser=structure_parser,
-                max_units=max_structure_units,
-            )
-            _write_if_drifted(
-                doc_dir / "units.json",
-                _structure_units_payload(units),
-            )
-
-            pages_written += pages_written_delta
-            pages_skipped += pages_skipped_delta
-            pages_total += pages_this_doc
-
-            doc_index_entry: dict[str, object] = {
-                "version": expected_sha,
-                "page_count": pages_this_doc,
-                "unit_count": len(units),
-            }
-            if ocr_applied_pages:
-                doc_index_entry["ocr_applied"] = True
-                doc_index_entry["ocr_applied_pages"] = sorted(ocr_applied_pages)
-            index[document_id] = doc_index_entry
-            if not reused_ready:
-                if ocr_applied_pages:
-                    state_store.transition(document_id, IngestState.OCR)
-                state_store.transition(document_id, IngestState.CATALOGING)
-        except Exception as exc:
-            # Remove only a newly-created partial tree. Existing committed
-            # artifacts must survive a failed verification retry.
-            if not doc_dir_existed and doc_dir.exists():
-                shutil.rmtree(doc_dir)
-            if not reused_ready:
-                try:
-                    state_store.fail_step(
-                        document_id, step="ingest", cause=exc
-                    )
-                except IngestStepError as state_error:
-                    # Keep the established ingest error as the public
-                    # failure while retaining the audit row.
-                    raise exc from state_error
-            raise
+        outcome = _ingest_one_document(
+            doc=doc,
+            pdf_dir=pdf_dir,
+            extracted_root=extracted_root,
+            existing_index=existing_index,
+            object_store=object_store,
+            pointer_store=pointer_store,
+            state_store=state_store,
+            ocr_engine=ocr_engine,
+            ocr_required_marker=ocr_required_marker,
+            structure_parser=structure_parser,
+            max_structure_units=max_structure_units,
+        )
+        document_id = str(doc["document_id"])
+        reused_ready_jobs[document_id] = outcome.reused_ready
+        index[document_id] = outcome.index_entry
+        pages_total += outcome.pages_total
+        pages_written += outcome.pages_written
+        pages_skipped += outcome.pages_skipped
+        if outcome.manifest_row_updated:
+            manifest_updated = True
 
     # Rewrite the index deterministically (sorted by document_id).
     index_payload = json.dumps(
