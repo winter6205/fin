@@ -45,7 +45,7 @@ minimal-change-verifier: yes — 不改 §B1–§B6 数字正文；不改引用�
    - **Surface:** 既有 `fin.eval.ablation`（或同等 opt-in 命令）
    - **Acceptance:** 一条 opt-in 命令跑完全部 10 配置并落盘，缺失配置数 = 0；每个配置含完整指标集与引用门通过率；百分比-only 条数 = 0；默认 `uv run pytest -q` 不收集该命令。
    - **Completion:** 是否夜间窗口、题集取 20–40 脚本化子集，由 implementer 按 B1 资源预算选。
-   - Status: [ ] pending
+   - Status: [x] complete
    - [blocks: T2]
 
 4. **Live 并发 L1 / 全写按 B1 时长** — tag: `[implementation]`
