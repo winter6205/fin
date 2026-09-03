@@ -53,7 +53,7 @@ minimal-change-verifier: yes — 不改 §B1–§B6 数字正文；不改引用�
    - **Surface:** 既有 `fin.eval.concurrency`
    - **Acceptance:** L1 与全写按 B1 时长跑完并落盘；错误数 = 0；压测前后块总数增量 = 0（全写）；默认 pytest 不跑 120 秒场景。
    - **Completion:** L2 含 LLM 若本环境无凭证，具名 `l2_credentials_missing` 并在报告中声明，不静默 skip 当通过。
-   - Status: [ ] pending
+   - Status: [x] complete
    - [blocks: T3]
 
 ## 不在本计划范围
