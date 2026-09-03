@@ -97,6 +97,14 @@ export default async function runStreamChecks(page, options = {}) {
 
   const readAssistantLen = async () => (await readAssistantText()).length;
 
+  // The thread page renders TWO `type="submit"` buttons: this one and
+  // the watchlist's "+ 关注" (WatchlistPanel, in the sidebar). A
+  // page-wide `form button[type="submit"]` resolves to both and every
+  // call on it dies in strict mode, so the composer's send button is
+  // addressed by test id — the harness binds to the one control it
+  // means, and to no other form on the page.
+  const sendButton = () => page.locator('[data-testid="composer-send"]');
+
   // `waitForURL` returns the moment the address bar changes, but the
   // SPA still shows the PREVIOUS thread's composer until `openThread`
   // resolves for the new id — at which point ThreadPage swaps in the
@@ -107,7 +115,7 @@ export default async function runStreamChecks(page, options = {}) {
   // arms; that is the composer being ready, with no sleep guessing.
   const fillAndArm = async (question) => {
     const textarea = page.locator("textarea").first();
-    const send = page.locator('form button[type="submit"]');
+    const send = sendButton();
     const deadline = Date.now() + cfg.navTimeoutMs;
     let attempts = 0;
     while (Date.now() < deadline) {
@@ -160,7 +168,7 @@ export default async function runStreamChecks(page, options = {}) {
     await page.waitForURL(/\/t\//, { timeout: cfg.navTimeoutMs });
 
     await fillAndArm(cfg.question);
-    await page.getByRole("button", { name: "发送" }).click();
+    await sendButton().click();
 
     let maxLen = 0;
     let sawRetract = false;
@@ -472,9 +480,7 @@ export default async function runStreamChecks(page, options = {}) {
       );
       await at("arm composer", () => fillAndArm(cfg.bounceQuestion));
       await at("click 发送", () =>
-        page
-          .getByRole("button", { name: "发送" })
-          .click({ timeout: cfg.navTimeoutMs }),
+        sendButton().click({ timeout: cfg.navTimeoutMs }),
       );
       void step;
 

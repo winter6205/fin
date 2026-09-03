@@ -102,9 +102,16 @@ def _stage_one_doc_ingest(
     ``sample`` is the manifest dict entry used. The real AAPL-2022Q3
     PDF is copied into ``tmp_path/pdf`` and a one-doc manifest is
     written at ``tmp_path/manifest.json`` with the actual sha.
+
+    Plan C added EDGAR iXBRL primary docs (html_live kind); the local
+    re-ingest fixture only owns PDF-kind entries, so skip the html_live
+    ones when picking a sample.
     """
     _, pdf_dir, documents = _real_manifest()
-    sample = documents[sample_index]
+    pdf_documents = [
+        d for d in documents if str(d.get("filename", "")).lower().endswith(".pdf")
+    ]
+    sample = pdf_documents[sample_index]
     test_pdf_dir = tmp_path / "pdf"
     test_pdf_dir.mkdir(parents=True, exist_ok=True)
     test_pdf = test_pdf_dir / sample["filename"]
@@ -526,8 +533,14 @@ def test_run_ingest_default_does_not_require_ocr_engine(tmp_path: Path) -> None:
     text without OCR.
     """
     manifest_path, pdf_dir, _ = _real_manifest()
-    # Reuse a one-document manifest pointing at AAPL-2023Q3.
-    sample_doc = json.loads(manifest_path.read_text())["documents"][3]
+    # Reuse a one-document manifest pointing at AAPL-2023Q3 (Plan C
+    # added EDGAR iXBRL primary docs that sort before AAPL-2023Q3, so
+    # locate by document_id rather than by position).
+    sample_doc = next(
+        d
+        for d in json.loads(manifest_path.read_text())["documents"]
+        if d["document_id"] == "AAPL-2023Q3"
+    )
     test_manifest = tmp_path / "manifest.json"
     _write_manifest(test_manifest, documents=[sample_doc])
     extracted_root = tmp_path / "extracted"

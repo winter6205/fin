@@ -1,10 +1,11 @@
-"""Watchlist + in-app notice storage for the workspace (T4, the tracked change).
+"""Watchlist + in-app notice storage for the workspace (T4).
 
 Spec Focus 3 / SC4: the operator watches an issuer (optionally
 narrowed to form types) from the workspace, the list survives a
-restart, and a watched filing appearing in the LOCAL catalog raises an
-in-app notice. Nothing leaves the process — no email, no Slack, no
-outbound webhook (spec Focus 3: "no outbound email/Slack").
+restart, and a watched filing appearing in the LOCAL catalog or the
+configured filing monitor raises an in-app notice. Nothing leaves the
+process — no email, no Slack, no outbound webhook (spec Focus 3:
+"no outbound email/Slack").
 
 Why a side file rather than a ``fin_run``-style table: the plan leaves
 storage open ("Postgres 表 vs 侧文件，只要 reload 后仍在"). A watchlist
@@ -33,10 +34,13 @@ import json
 import os
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+import fcntl
 
 
 WATCHLIST_SCHEMA = "fin.watchlist.v1"
@@ -181,6 +185,19 @@ class JsonFileWatchlistStore:
 
     # -- disk seam --
 
+    @contextmanager
+    def _locked(self):
+        """Hold an OS lock for the whole read/modify/write transaction."""
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self._path.with_suffix(self._path.suffix + ".lock")
+        with lock_path.open("a+", encoding="utf-8") as lock_file:
+            with self._lock:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
     def _read(self) -> dict[str, Any]:
         """Load the document; a missing file is an empty watchlist.
 
@@ -191,16 +208,20 @@ class JsonFileWatchlistStore:
         try:
             raw = self._path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            return {"schema": WATCHLIST_SCHEMA, "watches": [], "notices": []}
+            return _empty_payload()
+        except UnicodeDecodeError as exc:
+            raise WatchlistError(
+                f"watchlist document at {self._path} is not valid UTF-8"
+            ) from exc
+        if not raw.strip():
+            return _empty_payload()
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise WatchlistError(
                 f"watchlist document at {self._path} is not valid JSON"
             ) from exc
-        payload.setdefault("watches", [])
-        payload.setdefault("notices", [])
-        return payload
+        return _validate_payload(payload, self._path)
 
     def _write(self, payload: dict[str, Any]) -> None:
         payload["schema"] = WATCHLIST_SCHEMA
@@ -224,7 +245,7 @@ class JsonFileWatchlistStore:
         if not key:
             raise InvalidWatchError("a watch needs a non-empty issuer")
         form_tuple = normalize_forms(forms)
-        with self._lock:
+        with self._locked():
             payload = self._read()
             for row in payload["watches"]:
                 if row["issuer"] == key and tuple(row.get("forms") or ()) == form_tuple:
@@ -242,7 +263,7 @@ class JsonFileWatchlistStore:
     def list_watches(self) -> list[WatchEntry]:
         """Watches newest-first (same ordering rule as the sidebar's
         thread list). Empty is ``[]``, never an error (SC4)."""
-        with self._lock:
+        with self._locked():
             rows = self._read()["watches"]
         entries = [_row_to_watch(row) for row in rows]
         return sorted(entries, key=lambda e: e.created_at, reverse=True)
@@ -254,7 +275,7 @@ class JsonFileWatchlistStore:
         notice whose watch is gone is an orphan the operator can no
         longer act on or explain.
         """
-        with self._lock:
+        with self._locked():
             payload = self._read()
             remaining = [r for r in payload["watches"] if r["id"] != watch_id]
             if len(remaining) == len(payload["watches"]):
@@ -269,7 +290,7 @@ class JsonFileWatchlistStore:
 
     def list_notices(self, *, unread_only: bool = False) -> list[Notice]:
         """Notices newest-first; ``unread_only`` hides dismissed rows."""
-        with self._lock:
+        with self._locked():
             rows = self._read()["notices"]
         notices = [_row_to_notice(row) for row in rows]
         if unread_only:
@@ -283,10 +304,10 @@ class JsonFileWatchlistStore:
         lives on the persisted rows — so a restart cannot re-announce a
         filing the operator already saw.
         """
-        if not notices:
-            return []
-        with self._lock:
+        with self._locked():
             payload = self._read()
+            if not notices:
+                return []
             seen = {
                 (row.get("watch_id"), row.get("document_id"))
                 for row in payload["notices"]
@@ -304,7 +325,7 @@ class JsonFileWatchlistStore:
             return created
 
     def mark_notice_read(self, notice_id: str) -> Notice:
-        with self._lock:
+        with self._locked():
             payload = self._read()
             for row in payload["notices"]:
                 if row["id"] == notice_id:
@@ -349,6 +370,82 @@ def refresh_notices(
 
 
 # ----- row codecs -----
+
+
+def _empty_payload() -> dict[str, Any]:
+    return {"schema": WATCHLIST_SCHEMA, "watches": [], "notices": []}
+
+
+def _validate_payload(payload: Any, path: Path) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise WatchlistError(f"watchlist document at {path} must be a JSON object")
+    required = ("schema", "watches", "notices")
+    missing = [field for field in required if field not in payload]
+    if missing:
+        names = ", ".join(missing)
+        raise WatchlistError(f"watchlist document at {path} is missing {names}")
+    if payload["schema"] != WATCHLIST_SCHEMA:
+        raise WatchlistError(f"watchlist document at {path} has an invalid schema")
+    if not isinstance(payload["watches"], list):
+        raise WatchlistError(f"watchlist document at {path} has invalid watches")
+    if not isinstance(payload["notices"], list):
+        raise WatchlistError(f"watchlist document at {path} has invalid notices")
+    for index, row in enumerate(payload["watches"]):
+        _validate_watch_row(row, path, index)
+    for index, row in enumerate(payload["notices"]):
+        _validate_notice_row(row, path, index)
+    return payload
+
+
+def _validate_watch_row(row: Any, path: Path, index: int) -> None:
+    if not isinstance(row, dict):
+        raise WatchlistError(f"watchlist watch {index} at {path} must be an object")
+    required = ("id", "issuer", "forms", "created_at")
+    missing = [field for field in required if field not in row]
+    if missing:
+        names = ", ".join(missing)
+        raise WatchlistError(f"watchlist watch {index} at {path} is missing {names}")
+    if not isinstance(row["id"], str) or not isinstance(row["issuer"], str):
+        raise WatchlistError(f"watchlist watch {index} at {path} has invalid text")
+    if not isinstance(row["forms"], list) or not all(
+        isinstance(form, str) for form in row["forms"]
+    ):
+        raise WatchlistError(f"watchlist watch {index} at {path} has invalid forms")
+    _validate_datetime(row["created_at"], f"watchlist watch {index}", path)
+
+
+def _validate_notice_row(row: Any, path: Path, index: int) -> None:
+    if not isinstance(row, dict):
+        raise WatchlistError(f"watchlist notice {index} at {path} must be an object")
+    required = (
+        "id",
+        "watch_id",
+        "issuer",
+        "form",
+        "document_id",
+        "period",
+        "created_at",
+        "read",
+    )
+    missing = [field for field in required if field not in row]
+    if missing:
+        names = ", ".join(missing)
+        raise WatchlistError(f"watchlist notice {index} at {path} is missing {names}")
+    text_fields = ("id", "watch_id", "issuer", "form", "document_id", "period")
+    if not all(isinstance(row[field], str) for field in text_fields):
+        raise WatchlistError(f"watchlist notice {index} at {path} has invalid text")
+    if type(row["read"]) is not bool:
+        raise WatchlistError(f"watchlist notice {index} at {path} has invalid read")
+    _validate_datetime(row["created_at"], f"watchlist notice {index}", path)
+
+
+def _validate_datetime(value: Any, label: str, path: Path) -> None:
+    if not isinstance(value, str):
+        raise WatchlistError(f"{label} at {path} has invalid created_at")
+    try:
+        datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise WatchlistError(f"{label} at {path} has invalid created_at") from exc
 
 
 def _watch_to_row(entry: WatchEntry) -> dict[str, Any]:

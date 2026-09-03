@@ -179,6 +179,7 @@ export default function Composer({
         ) : null}
         <button
           type="submit"
+          data-testid="composer-send"
           disabled={busy || !draft.trim()}
           className="border border-black bg-card px-4 py-1.5 text-sm font-medium hover:bg-accent hover:text-white disabled:opacity-50"
         >

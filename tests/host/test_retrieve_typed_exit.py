@@ -83,8 +83,10 @@ def _invoke_retrieve_tool(adapter: Any, **kwargs: Any):
 def test_retrieve_tool_message_carries_error_dict_not_empty_chunks() -> None:
     """MCP-down must NOT be serialized as ``{"chunks": []}``.
 
-    ``{"chunks": []}`` is the MISS shape (empty query, unknown
-    document_id, mapper-drop). Reusing it for a transport failure
+    ``{"chunks": []}`` is the MISS shape (unknown document_id,
+    unknown filter, no hits, mapper-drop; an empty query is invalid
+    input and gets its own named code per T21). Reusing it for a
+    transport failure
     tells the model "this corpus has nothing" when the truth is
     "retrieval never ran".
     """

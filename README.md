@@ -1,6 +1,8 @@
 # fin
 
-Bounded 10-Q research agent. The model chooses tools in a loop; citation checks run in code; LangGraph is the durable runtime (checkpoint / resume), not a retrieve-then-generate flowchart.
+**Workspace knowledge-base Agent** (企业知识库 Agent): the operator asks in a **research thread**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. The first corpus on disk is operator-held SEC filings — a **source**, not the product. Citation checks run in code; LangGraph is the durable runtime (checkpoint / resume), not a retrieve-then-generate flowchart.
+
+Product identity is SSOT'd in [`docs/CONTEXT.md`](docs/CONTEXT.md); the program contract is [`specs/enterprise-kb-agent.md`](specs/enterprise-kb-agent.md), mapped by wayfinder.
 
 This repository is the SSOT. Do not keep parallel copies under `projects/test`.
 
@@ -8,8 +10,9 @@ This repository is the SSOT. Do not keep parallel copies under `projects/test`.
 
 | Path                                                     | What                                                                                 |
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `docs/CONTEXT.md`                                        | Domain terms                                                                         |
+| `docs/CONTEXT.md`                                        | Domain terms **and product identity** (SSOT)                                         |
 | `docs/adr/`                                              | Accepted decisions (0001–0027)                                                       |
+| `specs/enterprise-kb-agent.md`                           | Program contract: the five foci of the knowledge-base Agent                           |
 | `docs/research/002-demo-corpus-and-evidence-contract.md` | Inherited corpus/evidence contract (snapshot from iknow wayfinder)                   |
 | `docs/research/003-enterprise-product-research-index.md` | Enterprise-product research index (004–009; not CONTEXT/ADR SSOT)                    |
 | `data/corpus/pdf/`                                       | Frozen 12 SEC 10-Q PDFs (AAPL, MSFT, AMZN)                                           |
@@ -20,9 +23,17 @@ Upstream freeze: [docugami/private fixture source](https://github.com/docugami/p
 
 ## Status
 
-v1 host-agent ships: ingest artifacts are in git; CLI (`python -m fin`) and HTTP `POST /ask` share one compiled host graph. Default model is `MiniMax-M3` via `FIN_MODEL` + official MiniMax Chat Completions `FIN_BASE_URL` (ADR 0022). Soft-Track (ADR 0027, that pull request) routes each turn to `dialogue` / `clarify` / `off_topic` / `research`; only research binds tools and the citation verifier. Opt-in contracts: `uv run pytest -q -m soft_track`.
+v1 host-agent ships: ingest artifacts are in git; CLI (`python -m fin`) and HTTP `POST /ask` share one compiled host graph. Default model is `MiniMax-M3` via `FIN_MODEL` + official MiniMax Chat Completions `FIN_BASE_URL` (ADR 0022). Soft-Track (ADR 0027, that pull request) routes each turn to `dialogue` / `clarify` / `off_topic` / `research`; only the research track binds tools and the citation verifier. Opt-in contracts: `uv run pytest -q -m soft_track`.
 
-**NOW (2026-08-25):** harden the research vertical slice — ask filings → evidence → cited answer → reliable workspace UX. S1 corpus-retrieve landed in that pull request. Execution map: fin agent wayfinder. Recommended path memo: [`docs/research/009-optimized-agent-first-path.md`](docs/research/009-optimized-agent-first-path.md). Institutional memory / enterprise KB is later optional (the tracked change); filing research does not wait on it.
+**NOW (2026-08-30):** the destination is **fin as an enterprise knowledge-base Agent** — wayfinder, contracted by `specs/enterprise-kb-agent.md` in five foci:
+
+1. **Grounded answers in the workspace** — comparisons and numbers come from host tools, not free-prose tables; the citation verifier still gates any prose answer.
+2. **Operable corpus on Corpus 首页** — grow the library past the frozen 12 (`10-K`, `8-K`, more issuers) through `list_files` filters and ingest.
+3. **Work after the answer** — watchlist, in-app notices, comparison / citation export, stop.
+4. **Multi-issuer synthesize** — fan out in the host graph, then synthesize; every surviving claim still passes the verifier; over-cap is a typed overflow.
+5. **Trust in the workspace** — `evidence_locators` persisted on the run row, `GET /health`, and the eval count command.
+
+The workspace web UI is the only product entry; SEC filings are the first corpus, not the product name. the tracked change and the tracked change stay useful as **workstream** notes (vertical slice, quality loop) and are superseded as the product destination. Naming rule from the tracked change: the internal `research` track enum may stay (rename cost), but product copy and `docs/CONTEXT.md` must not call fin a research agent. Opt-in eval: `uv run pytest -q -m eval` (9 gold cases).
 
 ## Running the workspace server (T1)
 

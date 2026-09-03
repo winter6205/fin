@@ -8,9 +8,9 @@ Quoted from `docs/CONTEXT.md`:
 
 - **fin**: A normal conversational agent whose durable runtime is a LangGraph host graph: each turn is routed to a **track**; only the **research track** specializes in the frozen 10-Q corpus with tools and the citation verifier. Retrieve ranking stays off-graph behind the retrieve port.
 - **retrieve port**: The only retrieve dependency fin is allowed to have: `query` (+ optional filters) in, ranked chunks with `source_ref` out. Same shape as iknow-memory `retrieve`, regardless of transport.
-- **retrieve adapter**: The product retrieve implementation behind the retrieve port: an MCP client to **iknow-memory**. Hits map back to fin locators as `source_ref`. In-process BM25 is archived (ADR 0007 superseded by 0030). Retrieve chunking upgrades land in iknow-memory, not a second splitter in fin.
+- **retrieve adapter**: The product retrieve implementation behind the retrieve port: an MCP client to **iknow-memory**. Hits map back to fin locators as `source_ref`. In-process BM25 is archived (ADR 0007 superseded by 0030). Retrieve chunking (including later parent/child or section splits) is owned by fin — the retrieval service stores and returns pushed text as-is with no second splitter (ADR 0037 re-rules the ADR 0030/0032 chunking clauses).
 - **iknow-memory**: The existing TypeScript MCP memory server (separate repo). It owns vector ingest and cosine / hybrid / RRF ranking. fin v1 is an independent system with its own retrieve adapter; a later adapter may call iknow-memory over MCP without changing the host graph.
-- **ingest**: A CLI that writes frozen locator-unit text from official filings (or the existing extracted tree) into an extracted tree. Retrieve sliding windows are not fin's ranking stack (ADR 0030). The ask path does not fetch EDGAR or open source filings.
+- **ingest**: A CLI that writes frozen locator-unit text from official filings (or the existing extracted tree) into an extracted tree. Sliding-window chunking for retrieve is fin's responsibility, not the retrieval service's (ADR 0037 re-rules ADR 0030); it is not fin's ranking stack, which stays outside fin. The ask path does not fetch EDGAR or open source filings.
 - **product corpus**: The operator-selected local extracted tree of official 10-Q and 10-K primary HTML. `fin-serve` retrieve, `read_file`, and the citation verifier read this tree under the live locator contract.
 - **eval fixture**: A git-pinned snapshot of **ingest** output, same locator contract as **product corpus**. Default CI contract eval reads only this tree.
 - **locator**: Cite identity `{document_id, version, unit}`: for the frozen 12, `version` is the PDF sha256 and `unit` is the 1-based pdfplumber `page`; for live EDGAR, `version` hashes the official primary iXBRL `.htm` bytes and `unit` is a deterministic frozen partition of that HTML's stripped text, not an SEC or unofficial-PDF page. The claimed span is a quote string, not a locator field; the citation verifier checks it is a contiguous substring of that unit's frozen text; chunks carry the locator as `source_ref` and are not the identity.
@@ -42,13 +42,13 @@ Quoted from `docs/CONTEXT.md`:
     - exception: UA unset (no SEC request); `retrieve_unavailable`; `sec_http_fail`; `ocr_required_unavailable`. Workspace 409 stays an existing host contract, not a substitute for these classes.
 - **Confirms with human:** none remaining (wayfinder map fin S1 wayfinder: real EDGAR corpus you can ask and cite cleared 2026-08-25; operator ordered spec+plan+push).
 - **Out of this spec:**
-  - Universal multi-format parse (PDF/Word/PPT/Excel) in fin — **iknow-memory** ingest.
+  - Universal multi-format parse (PDF/Word/PPT/Excel) in this increment — per ADR 0037, parse and chunking are owned by fin (see specs/corpus-retrieval.md), not iknow-memory ingest.
   - Compile-time coupling or vendoring iknow-memory / a different repo named iknow into `src/fin`.
   - Moving the extracted cite tree into iknow-memory.
   - SSO / RBAC / multi-tenant; dialogue image attach; vision as evidence; web-search as citations.
   - On-demand EDGAR fetch as a host-graph node; catalog-miss as a new track.
   - Date-range filter as a hard contract; renaming `company` → `ticker`; dual gold tool schemas.
-  - Locator = whole Item 1A/MD&A; section-aware chunking in fin; hybrid/RRF implemented in fin.
+  - Locator = whole Item 1A/MD&A; section-aware chunking in this increment (chunking itself is fin's per ADR 0037); hybrid/RRF implemented in fin.
   - Watchlist, redline, peer matrix, multi-agent, LoRA, embedding fine-tune.
   - Making live SEC HTTP part of default `uv run pytest -q`.
 

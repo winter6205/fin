@@ -31,9 +31,12 @@ from unittest import mock
 import pytest
 
 from fin.corpus.errors import IngestMissingError
+from fin.corpus import live_fetch
+from fin.corpus.catalog import list_filings
 from fin.corpus.live_fetch import (
     SecHttpFailError,
     SecPrimaryDocUnresolvedError,
+    SecUaUnsetError,
     fetch_and_ingest,
 )
 
@@ -138,6 +141,215 @@ def _roots(tmp_path: Path) -> dict[str, Path]:
         "extracted_root": tmp_path / "extracted",
         "facts_root": tmp_path / "facts",
     }
+
+
+# ---------- atomic publish + catalog registration ----------
+
+
+def test_successful_live_fetch_registers_accession_in_manifest_and_catalog(
+    tmp_path: Path,
+) -> None:
+    """A successful live fetch publishes one catalog-visible accession."""
+    roots = _roots(tmp_path)
+    calls: list[str] = []
+
+    with _scripted_sec({_INDEX_URL: _AAPL_LISTING, _PRIMARY_URL: _PRIMARY_HTML}, calls):
+        fetch_and_ingest(
+            cik=_CIK,
+            accession=_ACCESSION,
+            primary_doc="aapl-20230701.htm",
+            **roots,
+        )
+
+    manifest = json.loads(roots["manifest_path"].read_text())
+    row = next(
+        document
+        for document in manifest["documents"]
+        if document["document_id"] == _ACCESSION
+    )
+    assert row["accession"] == _ACCESSION
+
+    index = json.loads(
+        (roots["extracted_root"] / "_index.json").read_text()
+    )
+    assert _ACCESSION in index["documents"]
+
+    result = list_filings(
+        manifest_path=roots["manifest_path"],
+        extracted_root=roots["extracted_root"],
+    )
+    assert [filing["document_id"] for filing in result["filings"]] == [
+        _ACCESSION
+    ]
+
+
+def test_failure_after_staged_page_write_leaves_visible_publish_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A page-write failure cannot expose an unregistered accession."""
+    roots = _roots(tmp_path)
+    roots["extracted_root"].mkdir(parents=True)
+    original_index = b'{"schema_version": 1, "documents": {}}\n'
+    (roots["extracted_root"] / "_index.json").write_bytes(original_index)
+    original_manifest = b'{"documents": []}\n'
+    roots["manifest_path"].write_bytes(original_manifest)
+
+    real_atomic_write = live_fetch._atomic_write
+
+    def fail_after_page_write(path: Path, payload: bytes) -> None:
+        real_atomic_write(path, payload)
+        if path.name == "page-001.json":
+            raise RuntimeError("injected page-write failure")
+
+    monkeypatch.setattr(live_fetch, "_atomic_write", fail_after_page_write)
+
+    with _scripted_sec({_PRIMARY_URL: _PRIMARY_HTML}, []):
+        with pytest.raises(RuntimeError, match="injected page-write failure"):
+            fetch_and_ingest(
+                cik=_CIK,
+                accession=_ACCESSION,
+                primary_doc="aapl-20230701.htm",
+                **roots,
+            )
+
+    assert not (roots["extracted_root"] / _ACCESSION).exists()
+    assert (roots["extracted_root"] / "_index.json").read_bytes() == original_index
+    assert roots["manifest_path"].read_bytes() == original_manifest
+
+
+def test_crash_mid_publish_is_recovered_before_next_live_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A process exit after one target swap restores the last generation.
+
+    The injected exit bypasses in-process rollback and cleanup, matching
+    the state a real crash leaves behind. Recovery must remove the
+    uncommitted generation before any subsequent live-fetch read.
+    """
+    roots = _roots(tmp_path)
+    with _scripted_sec({_PRIMARY_URL: _PRIMARY_HTML}, []):
+        fetch_and_ingest(
+            cik=_CIK,
+            accession=_ACCESSION,
+            primary_doc="aapl-20230701.htm",
+            **roots,
+        )
+
+    committed = {
+        "index": (roots["extracted_root"] / "_index.json").read_bytes(),
+        "manifest": roots["manifest_path"].read_bytes(),
+        "page": (
+            roots["extracted_root"] / _ACCESSION / "page-001.json"
+        ).read_bytes(),
+        "facts": (
+            roots["facts_root"] / f"{_ACCESSION}.json"
+        ).read_bytes(),
+    }
+    revised = _PRIMARY_HTML.replace(b"60,584", b"60,585")
+    real_replace = live_fetch.os.replace
+    live_doc = roots["extracted_root"] / _ACCESSION
+
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    def crash_after_doc_swap(source: str | bytes, target: str | bytes) -> None:
+        real_replace(source, target)
+        if Path(target) == live_doc:
+            raise SimulatedProcessCrash("crashed after accession swap")
+
+    def terminate_rollback(**_: object) -> None:
+        raise SimulatedProcessCrash("process terminated")
+
+    with monkeypatch.context() as crash_patch:
+        crash_patch.setattr(live_fetch.os, "replace", crash_after_doc_swap)
+        crash_patch.setattr(live_fetch, "_rollback_publish", terminate_rollback)
+        # A real process exit does not run either publish cleanup finally.
+        crash_patch.setattr(live_fetch.shutil, "rmtree", lambda *_args, **_kwargs: None)
+        with _scripted_sec({_PRIMARY_URL: revised}, []):
+            with pytest.raises(SimulatedProcessCrash):
+                fetch_and_ingest(
+                    cik=_CIK,
+                    accession=_ACCESSION,
+                    primary_doc="aapl-20230701.htm",
+                    **roots,
+                )
+
+    live_fetch._recover_interrupted_publish(
+        manifest_path=roots["manifest_path"]
+    )
+
+    assert (roots["extracted_root"] / "_index.json").read_bytes() == committed[
+        "index"
+    ]
+    assert roots["manifest_path"].read_bytes() == committed["manifest"]
+    assert (
+        roots["extracted_root"] / _ACCESSION / "page-001.json"
+    ).read_bytes() == committed["page"]
+    assert (
+        roots["facts_root"] / f"{_ACCESSION}.json"
+    ).read_bytes() == committed["facts"]
+
+
+def test_interrupted_publish_is_recovered_before_ua_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery must run before a later invocation's SEC gate."""
+    roots = _roots(tmp_path)
+    roots["extracted_root"].mkdir(parents=True)
+    original_index = b'{"schema_version": 1, "documents": {}}\n'
+    (roots["extracted_root"] / "_index.json").write_bytes(original_index)
+    original_manifest = b'{"documents": []}\n'
+    roots["manifest_path"].write_bytes(original_manifest)
+
+    real_replace = live_fetch.os.replace
+    live_doc = roots["extracted_root"] / _ACCESSION
+
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    def crash_after_doc_swap(source: str | bytes, target: str | bytes) -> None:
+        real_replace(source, target)
+        if Path(target) == live_doc:
+            raise SimulatedProcessCrash("crashed after accession swap")
+
+    def terminate_rollback(**_: object) -> None:
+        raise SimulatedProcessCrash("process terminated")
+
+    with monkeypatch.context() as crash_patch:
+        crash_patch.setattr(live_fetch.os, "replace", crash_after_doc_swap)
+        crash_patch.setattr(live_fetch, "_rollback_publish", terminate_rollback)
+        crash_patch.setattr(
+            live_fetch.shutil, "rmtree", lambda *_args, **_kwargs: None
+        )
+        with _scripted_sec({_PRIMARY_URL: _PRIMARY_HTML}, []):
+            with pytest.raises(SimulatedProcessCrash):
+                fetch_and_ingest(
+                    cik=_CIK,
+                    accession=_ACCESSION,
+                    primary_doc="aapl-20230701.htm",
+                    **roots,
+                )
+
+    assert list_filings(
+        manifest_path=roots["manifest_path"],
+        extracted_root=roots["extracted_root"],
+    ) == {"filings": []}
+
+    monkeypatch.delenv("FIN_EDGAR_USER_AGENT")
+    with pytest.raises(SecUaUnsetError):
+        fetch_and_ingest(
+            cik=_CIK,
+            accession=_ACCESSION,
+            primary_doc="aapl-20230701.htm",
+            **roots,
+        )
+
+    assert not live_doc.exists()
+    assert (roots["extracted_root"] / "_index.json").read_bytes() == original_index
+    assert roots["manifest_path"].read_bytes() == original_manifest
 
 
 # ---------- primary document resolution ----------
@@ -380,6 +592,64 @@ def test_malformed_existing_index_refuses_rather_than_overwrites(
     assert damaged.read_text() == "{ this is not json"
 
 
+def test_live_fetch_cli_reports_malformed_index_as_typed_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI must not dump a traceback for MalformedExtractedIndexError."""
+    roots = _roots(tmp_path)
+    roots["extracted_root"].mkdir(parents=True)
+    (roots["extracted_root"] / "_index.json").write_text("{ this is not json")
+    monkeypatch.setenv("FIN_EDGAR_USER_AGENT", "fin-test contact@example.com")
+
+    code = live_fetch.main(
+        [
+            "--cik",
+            _CIK,
+            "--accession",
+            _ACCESSION,
+            "--manifest",
+            str(roots["manifest_path"]),
+            "--extracted-root",
+            str(roots["extracted_root"]),
+            "--facts-root",
+            str(roots["facts_root"]),
+            "--primary-doc",
+            "aapl-20230701.htm",
+        ]
+    )
+    assert code == 1
+
+
+def test_live_fetch_cli_reports_malformed_manifest_as_typed_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed caller manifest is IngestMissingError → non-zero CLI."""
+    roots = _roots(tmp_path)
+    roots["extracted_root"].mkdir(parents=True)
+    roots["manifest_path"].write_text("{ not-json")
+    monkeypatch.setenv("FIN_EDGAR_USER_AGENT", "fin-test contact@example.com")
+
+    code = live_fetch.main(
+        [
+            "--cik",
+            _CIK,
+            "--accession",
+            _ACCESSION,
+            "--manifest",
+            str(roots["manifest_path"]),
+            "--extracted-root",
+            str(roots["extracted_root"]),
+            "--facts-root",
+            str(roots["facts_root"]),
+            "--primary-doc",
+            "aapl-20230701.htm",
+        ]
+    )
+    assert code == 1
+
+
 # ---------- the frozen unit ----------
 
 
@@ -447,3 +717,189 @@ def test_frozen_unit_is_loadable_as_an_extracted_document(
     assert len(pages) == 1
     assert pages[0].locator.version == version
     assert "Products $ 60,584 $ 63,355" in pages[0].text
+
+
+# ---------- publish staging cleanup ----------
+
+_BACKUP_PREFIX = ".live-publish-backup-"
+
+
+def _leftover_backup_dirs(*parents: Path) -> list[Path]:
+    return [
+        path
+        for parent in parents
+        for path in parent.rglob(f"{_BACKUP_PREFIX}*")
+    ]
+
+
+def _staged_publish(tmp_path: Path) -> dict[str, Path]:
+    """Four staged artifacts plus the corpus roots they publish into.
+
+    ``extracted_root`` is the parent of **two** targets (the accession
+    directory and ``_index.json``); the staging roots stay outside the
+    published tree so a leftover there cannot mask a leftover inside it.
+    """
+    staging = tmp_path / "staging"
+    doc_dir = staging / "extracted" / _ACCESSION
+    doc_dir.mkdir(parents=True)
+    (doc_dir / "page-001.json").write_text(
+        json.dumps(
+            {"document_id": _ACCESSION, "version": "v1", "text": "frozen unit"}
+        )
+    )
+    staged_index = staging / "extracted" / "_index.json"
+    staged_index.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "documents": {_ACCESSION: {"version": "v1", "page_count": 1}},
+            }
+        )
+    )
+    staged_facts = staging / "facts" / f"{_ACCESSION}.json"
+    staged_facts.parent.mkdir(parents=True, exist_ok=True)
+    staged_facts.write_text("{}")
+    staged_manifest = staging / "manifest" / "manifest.json"
+    staged_manifest.parent.mkdir(parents=True, exist_ok=True)
+    staged_manifest.write_text(
+        json.dumps({"documents": [{"document_id": _ACCESSION}]})
+    )
+
+    roots = _roots(tmp_path)
+    roots["extracted_root"].mkdir(parents=True, exist_ok=True)
+    roots["facts_root"].mkdir(parents=True, exist_ok=True)
+    roots["manifest_path"].write_text('{"documents": []}\n')
+    return {
+        **roots,
+        "staged_doc_dir": doc_dir,
+        "staged_index": staged_index,
+        "staged_facts": staged_facts,
+        "staged_manifest": staged_manifest,
+    }
+
+
+def test_publish_leaves_no_backup_directory_when_targets_share_a_parent(
+    tmp_path: Path,
+) -> None:
+    """Every temp backup dir the publish opens must be closed again.
+
+    ``_publish_staged`` publishes four targets under three parents, so
+    one parent (``extracted_root``, holding both the accession dir and
+    ``_index.json``) is visited twice. A backup dir created on that
+    repeat visit but never recorded would survive the cleanup ``finally``
+    and pile up one empty hidden dir per live fetch inside the corpus
+    tree.
+    """
+    staged = _staged_publish(tmp_path)
+
+    live_fetch._publish_staged(
+        staged_doc_dir=staged["staged_doc_dir"],
+        staged_index=staged["staged_index"],
+        staged_facts=staged["staged_facts"],
+        staged_manifest=staged["staged_manifest"],
+        extracted_root=staged["extracted_root"],
+        facts_root=staged["facts_root"],
+        manifest_path=staged["manifest_path"],
+    )
+
+    # The publish really happened, so the assertion below cannot pass by
+    # the publish refusing to run at all.
+    assert (staged["extracted_root"] / _ACCESSION / "page-001.json").exists()
+    assert json.loads(staged["manifest_path"].read_text())["documents"]
+    assert (
+        _leftover_backup_dirs(
+            staged["extracted_root"],
+            staged["facts_root"],
+            staged["manifest_path"].parent,
+        )
+        == []
+    )
+
+
+def test_successful_live_fetch_leaves_no_backup_directory_in_the_corpus(
+    tmp_path: Path,
+) -> None:
+    """The full live path (scripted SEC, no socket) leaves the published
+    tree free of publish scratch dirs."""
+    roots = _roots(tmp_path)
+    bodies = {_INDEX_URL: _AAPL_LISTING, _PRIMARY_URL: _PRIMARY_HTML}
+
+    with _scripted_sec(bodies, []):
+        fetch_and_ingest(cik=_CIK, accession=_ACCESSION, **roots)
+
+    assert (roots["extracted_root"] / _ACCESSION / "page-001.json").exists()
+    assert (
+        _leftover_backup_dirs(
+            roots["extracted_root"],
+            roots["facts_root"],
+            roots["manifest_path"].parent,
+        )
+        == []
+    )
+
+
+def test_failed_publish_rolls_back_without_leaving_a_backup_directory(
+    tmp_path: Path,
+) -> None:
+    """The rollback path must clean up scratch dirs too: a publish that
+    dies mid-swap is exactly when an unreachable target is most likely."""
+    staged = _staged_publish(tmp_path)
+    staged["staged_facts"].unlink()  # os.replace() on a missing staged file
+    original_manifest = staged["manifest_path"].read_bytes()
+
+    with pytest.raises(FileNotFoundError):
+        live_fetch._publish_staged(
+            staged_doc_dir=staged["staged_doc_dir"],
+            staged_index=staged["staged_index"],
+            staged_facts=staged["staged_facts"],
+            staged_manifest=staged["staged_manifest"],
+            extracted_root=staged["extracted_root"],
+            facts_root=staged["facts_root"],
+            manifest_path=staged["manifest_path"],
+        )
+
+    assert not (staged["extracted_root"] / _ACCESSION).exists()
+    assert not (staged["extracted_root"] / "_index.json").exists()
+    assert staged["manifest_path"].read_bytes() == original_manifest
+    assert (
+        _leftover_backup_dirs(
+            staged["extracted_root"],
+            staged["facts_root"],
+            staged["manifest_path"].parent,
+        )
+        == []
+    )
+
+
+def test_repeated_publishes_do_not_accumulate_backup_directories(
+    tmp_path: Path,
+) -> None:
+    """The unrecorded backup dir is one **per call**, so a corpus tree
+    refetched many times must not grow one hidden dir per fetch.
+
+    A single publish proves only that nothing survived this run; the
+    second publish is what separates "cleaned up" from "cleaned up by
+    luck". ``_staged_publish`` rebuilds its staging inputs each call,
+    since the previous publish moved them onto their targets.
+    """
+    for _ in range(2):
+        staged = _staged_publish(tmp_path)
+        live_fetch._publish_staged(
+            staged_doc_dir=staged["staged_doc_dir"],
+            staged_index=staged["staged_index"],
+            staged_facts=staged["staged_facts"],
+            staged_manifest=staged["staged_manifest"],
+            extracted_root=staged["extracted_root"],
+            facts_root=staged["facts_root"],
+            manifest_path=staged["manifest_path"],
+        )
+
+    assert (staged["extracted_root"] / _ACCESSION / "page-001.json").exists()
+    assert (
+        _leftover_backup_dirs(
+            staged["extracted_root"],
+            staged["facts_root"],
+            staged["manifest_path"].parent,
+        )
+        == []
+    )

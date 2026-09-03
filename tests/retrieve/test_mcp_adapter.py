@@ -24,11 +24,19 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import logging
 
 import pytest
 
 from fin.corpus.extracted import Locator
-from fin.retrieve import Chunk
+from fin.corpus.parsers._common import UnitLocator
+from fin.corpus.push import serialize_source_ref
+from fin.retrieve import Chunk, EmptyQueryError
+from fin.retrieve.hit_mapping import (
+    MAPPING_FAILURE_MISSING_SOURCE_REF,
+    MAPPING_STAGE_RETRIEVE,
+    MappingFailureLedger,
+)
 from fin.retrieve.mcp_adapter import (
     MCPRetrieveAdapter,
     RetrieveUnavailableError,
@@ -48,6 +56,22 @@ def _chunk(text: str, document_id: str, page: int = 1, score: float = 1.0) -> Ch
         text=text,
         source_ref=_loc(document_id, page=page),
         score=score,
+    )
+
+
+def _canonical_source_ref(document_id: str, page: int = 1) -> str:
+    """The B4 canonical fin ``source_ref`` for a (document_id, unit) pair.
+
+    Plan D0 I-T2: the wire envelope sends ``source_ref`` as the fin
+    locator serialization; tests build the canonical string via the
+    single authority for that serialization, ``fin.corpus.push``.
+    """
+    return serialize_source_ref(
+        UnitLocator(
+            document_id=document_id,
+            version="v-" + "a" * 60,
+            unit=page,
+        )
     )
 
 
@@ -95,19 +119,24 @@ class _ScriptedAdapter(MCPRetrieveAdapter):
 # ----- boundary 1: empty -----
 
 
-def test_empty_query_returns_empty_chunks_without_mcp_call() -> None:
-    """Empty / whitespace-only query yields ``{"chunks": []}``
+def test_empty_query_is_a_named_failure_without_mcp_call() -> None:
+    """Empty / whitespace-only query raises ``EmptyQueryError``
     WITHOUT touching the MCP subprocess.
 
-    Boundary 'empty': a missing query is a miss shape — it must
-    short-circuit BEFORE the JSON-RPC request so the operator
-    never pays for an MCP round-trip on empty input.
+    Boundary 'empty': a missing query is invalid input (T21 / §B2 第 5
+    条), not a miss shape, and it is still refused BEFORE the JSON-RPC
+    request so the operator never pays for a round trip on it. The
+    scripted transport raises if reached, so "no MCP call" is asserted
+    by construction.
     """
-    # No scripted response — if the adapter tries to call MCP,
-    # the runtime error surfaces as a test failure.
     adapter = _ScriptedAdapter()
     for empty_query in ("", "   ", "\t\n", "\n"):
-        assert adapter.retrieve(empty_query) == {"chunks": []}
+        with pytest.raises(EmptyQueryError):
+            adapter.retrieve(empty_query)
+
+    assert adapter.input_validation_failures.count_by_code() == {
+        "empty_query": 4
+    }
 
 
 def test_empty_document_id_filter_returns_empty_chunks_without_mcp_call() -> None:
@@ -388,7 +417,7 @@ class _CapturingAdapter(_ScriptedAdapter):
 
 def test_omitted_filters_are_absent_from_the_request() -> None:
     """A caller that passes no EDGAR filters must not produce a
-    ``filter`` block at all.
+    ``filters`` block at all.
 
     ``_is_blank(None)`` is ``False`` — ``None`` means "the caller did
     not pass this filter" — so testing ``not _is_blank(v)`` let every
@@ -396,20 +425,74 @@ def test_omitted_filters_are_absent_from_the_request() -> None:
     received ``{"cik": null, "form": null, ...}``: at best noise, at
     worst a filter that matches no document, which reads back as an
     ordinary empty result.
+
+    Plan D0 I-T1: the wire key is the plural ``filters`` (the
+    ``z.strictObject`` schema rejects the legacy singular ``filter``).
     """
     adapter = _CapturingAdapter()
     adapter.retrieve("revenue")
     arguments = adapter.payloads[0]["params"]["arguments"]
+    assert "filters" not in arguments, arguments
     assert "filter" not in arguments, arguments
 
 
 def test_supplied_filters_are_forwarded_in_the_request() -> None:
-    """The filters the caller DID pass still reach the server, and
-    only those."""
+    """The filters the caller DID pass still reach the server under
+    the plural ``filters`` key, and only those.
+
+    Plan D0 I-T1: ``filters`` is the wire-side spelling the iknow-memory
+    schema accepts; emitting the singular ``filter`` would be stripped.
+    """
     adapter = _CapturingAdapter()
     adapter.retrieve("revenue", cik="0000320193", form="10-Q")
     arguments = adapter.payloads[0]["params"]["arguments"]
-    assert arguments["filter"] == {"cik": "0000320193", "form": "10-Q"}
+    assert "filter" not in arguments
+    assert arguments["filters"] == {"cik": "0000320193", "form": "10-Q"}
+
+
+def test_retrieve_payload_uses_limit_not_top_k() -> None:
+    """The wire payload uses ``limit`` (not the legacy ``top_k``).
+
+    Plan D0 I-T1: the iknow-memory ``retrieve`` schema's `z.strictObject`
+    only knows ``limit``; emitting the legacy ``top_k`` would be
+    rejected by strict mode, surfacing contract drift instead of
+    silently dropping the value on the server side.
+    """
+    adapter = _CapturingAdapter()
+    adapter.retrieve("revenue", limit=7)
+    arguments = adapter.payloads[0]["params"]["arguments"]
+    assert arguments.get("limit") == 7
+    assert "top_k" not in arguments
+
+
+def test_retrieve_payload_filters_is_plural_record() -> None:
+    """The wire payload's filters are merged into one ``filters`` dict,
+    and ``document_id`` joins the EDGAR-shaped filters there (no longer
+    a top-level adapter field).
+
+    Plan D0 I-T1: ``document_id`` is now ``filters.document_id``;
+    cik / form / ticker / filing_date are siblings under ``filters``.
+    """
+    adapter = _CapturingAdapter()
+    adapter.retrieve(
+        "revenue",
+        document_id="DOC-2023Q1",
+        cik="0000320193",
+        form="10-Q",
+        ticker="AAPL",
+        filing_date="2023-09-30",
+        limit=5,
+    )
+    arguments = adapter.payloads[0]["params"]["arguments"]
+    assert "filter" not in arguments
+    assert "document_id" not in arguments, arguments
+    assert arguments.get("filters") == {
+        "document_id": "DOC-2023Q1",
+        "cik": "0000320193",
+        "form": "10-Q",
+        "ticker": "AAPL",
+        "filing_date": "2023-09-30",
+    }
 
 
 # ----- locator_map injection -----
@@ -468,6 +551,24 @@ def test_empty_hit_envelope_maps_to_empty_chunks(envelope: dict) -> None:
         locator_map={"id-A": _loc("DOC-2023Q1")},
     )
     assert adapter.retrieve("foo") == {"chunks": []}
+
+
+def test_content_block_degraded_empty_envelope_is_named_failure() -> None:
+    """A degraded empty result is not a legal empty-result success."""
+    envelope = _content_block(
+        {
+            "hits": [],
+            "degraded": True,
+            "degraded_reasons": ["vector:unavailable"],
+        }
+    )
+    adapter = _ScriptedAdapter(scripted_response=envelope)
+
+    assert adapter.retrieve("foo") == {
+        "error": "retrieve_degraded_failure",
+        "degraded": True,
+        "degraded_reasons": ["vector:unavailable"],
+    }
 
 
 def test_empty_hit_envelope_does_not_raise_on_the_async_path() -> None:
@@ -599,3 +700,357 @@ def test_non_dict_response_maps_to_retrieve_unavailable() -> None:
         scripted_response=["hits"],  # type: ignore[arg-type]
     )
     assert adapter.retrieve("foo") == {"error": "retrieve_unavailable"}
+
+
+# ----- schema field stripping (A6: mock zod without .strict()) -----
+
+
+def test_stripped_adapter_fields_emit_warning_and_degraded_reasons(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the mock MCP schema (no ``.strict()``) drops ``limit`` /
+    ``filters`` / any key under ``filters``, fin must warn and surface
+    ``degraded_reasons`` — not silently return chunks as if the
+    filters ran.
+
+    Plan D0 I-T1: the wire field names are ``limit`` and ``filters``
+    (the legacy ``top_k`` / ``filter`` / top-level ``document_id`` are
+    no longer sent).
+    """
+    hits = [{"text": "hit", "source_ref": "id-A", "score": 1.0}]
+    locator_map = {"id-A": _loc("DOC-2023Q1")}
+    adapter = _ScriptedAdapter(
+        scripted_response={
+            "hits": hits,
+            # Mock echoes only ``query`` — other adapter fields stripped.
+            "applied_arguments": {"query": "revenue"},
+        },
+        locator_map=locator_map,
+        known_document_ids={"DOC-2023Q1"},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="fin.retrieve.mcp_adapter"):
+        result = adapter.retrieve(
+            "revenue",
+            document_id="DOC-2023Q1",
+            cik="0000320193",
+            form="10-Q",
+            limit=5,
+        )
+
+    assert len(result["chunks"]) == 1
+    assert result["degraded"] is True
+    assert result["degraded_reasons"]
+    assert any(
+        "field_stripped" in reason for reason in result["degraded_reasons"]
+    )
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+    assert warnings
+    assert any(
+        "adapter_field_stripped" in record.getMessage() for record in warnings
+    )
+
+
+def test_stripped_adapter_fields_detects_limit_and_filters(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Per-key stripping on the new wire field names: a server that
+    echoes only ``query`` reports BOTH ``adapter:field_stripped:limit``
+    AND ``adapter:field_stripped:filters``.
+
+    Plan D0 I-T1: stripping detection must use the new names
+    (``limit`` and ``filters``); a server keeping ``filters`` but
+    dropping one key inside it reports the per-key ``filters.<key>``
+    reason instead.
+    """
+    hits = [{"text": "hit", "source_ref": "id-A", "score": 1.0}]
+    adapter = _ScriptedAdapter(
+        scripted_response={
+            "hits": hits,
+            "applied_arguments": {"query": "revenue"},
+        },
+        locator_map={"id-A": _loc("DOC-2023Q1")},
+        known_document_ids={"DOC-2023Q1"},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="fin.retrieve.mcp_adapter"):
+        result = adapter.retrieve(
+            "revenue",
+            document_id="DOC-2023Q1",
+            cik="0000320193",
+            form="10-Q",
+            limit=5,
+        )
+
+    reasons = result.get("degraded_reasons", [])
+    assert "adapter:field_stripped:limit" in reasons
+    assert "adapter:field_stripped:filters" in reasons
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+    assert any("adapter_field_stripped" in message for message in warnings)
+
+
+def test_stripped_filters_key_detected_per_missing_filter(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A server that keeps ``filters`` but drops one key inside
+    reports only ``adapter:field_stripped:filters.<key>`` — not the
+    umbrella ``filters`` reason."""
+    hits = [{"text": "hit", "source_ref": "id-A", "score": 1.0}]
+    adapter = _ScriptedAdapter(
+        scripted_response={
+            "hits": hits,
+            # Mock kept ``filters`` but dropped ``filters.document_id``.
+            "applied_arguments": {
+                "query": "revenue",
+                "limit": 5,
+                "filters": {"cik": "0000320193", "form": "10-Q"},
+            },
+        },
+        locator_map={"id-A": _loc("DOC-2023Q1")},
+        known_document_ids={"DOC-2023Q1"},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="fin.retrieve.mcp_adapter"):
+        result = adapter.retrieve(
+            "revenue",
+            document_id="DOC-2023Q1",
+            cik="0000320193",
+            form="10-Q",
+            limit=5,
+        )
+
+    reasons = result.get("degraded_reasons", [])
+    assert "adapter:field_stripped:filters.document_id" in reasons
+    # The umbrella "filters" reason is NOT appended when ``filters``
+    # was kept and only one key inside was dropped.
+    assert "adapter:field_stripped:filters" not in reasons
+    assert "adapter:field_stripped:limit" not in reasons
+
+
+def test_response_without_applied_arguments_stays_undegraded() -> None:
+    """Production servers that omit ``applied_arguments`` skip detection —
+    no spurious warnings or degradation envelope."""
+    hits = [{"text": "hit", "source_ref": "id-A", "score": 1.0}]
+    adapter = _ScriptedAdapter(
+        scripted_response={"hits": hits},
+        locator_map={"id-A": _loc("DOC-2023Q1")},
+    )
+
+    result = adapter.retrieve(
+        "revenue",
+        document_id="DOC-2023Q1",
+        cik="0000320193",
+        limit=5,
+    )
+
+    assert result == {"chunks": [_chunk("hit", "DOC-2023Q1")]}
+
+
+def test_all_adapter_fields_applied_stays_undegraded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When ``applied_arguments`` echoes every field fin sent, there is
+    nothing to report.
+
+    Plan D0 I-T1: ``applied_arguments`` echoes the new wire keys
+    (``limit`` / ``filters``), so a server that keeps them all is
+    undegraded.
+    """
+    hits = [{"text": "hit", "source_ref": "id-A", "score": 1.0}]
+    adapter = _ScriptedAdapter(
+        scripted_response={
+            "hits": hits,
+            "applied_arguments": {
+                "query": "revenue",
+                "limit": 5,
+                "filters": {
+                    "document_id": "DOC-2023Q1",
+                    "cik": "0000320193",
+                    "form": "10-Q",
+                },
+            },
+        },
+        locator_map={"id-A": _loc("DOC-2023Q1")},
+        known_document_ids={"DOC-2023Q1"},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="fin.retrieve.mcp_adapter"):
+        result = adapter.retrieve(
+            "revenue",
+            document_id="DOC-2023Q1",
+            cik="0000320193",
+            form="10-Q",
+            limit=5,
+        )
+
+    assert result == {"chunks": [_chunk("hit", "DOC-2023Q1")]}
+    assert [
+        record
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ] == []
+
+
+# ----- canonical chunks envelope (Plan D0 I-T2) -----
+
+
+def test_chunks_envelope_maps_each_chunk_source_ref_to_locator() -> None:
+    """The MCP server's canonical wire envelope is ``{chunks: [...]}``
+    where each chunk carries ``source_ref`` as the fin locator
+    serialization (B4). Each chunk is mapped through that canonical
+    string into a fin ``Locator``; the chunks the adapter returns
+    carry the resolved locator, not the wire string.
+
+    Plan D0 I-T2: this is the wire envelope spec §B3 / §B4 calls for;
+    prior behaviour read ``hits`` and went through the ``locator_map``
+    path, which the canonical chunk envelope does not use.
+    """
+    chunks_wire = [
+        {
+            "id": "chunk-1",
+            "content": "first hit",
+            "source_ref": _canonical_source_ref("DOC-2023Q1", page=1),
+            "valid_window": ["2023-01-01T00:00:00Z", None],
+            "score": 2.5,
+        },
+        {
+            "id": "chunk-2",
+            "content": "second hit",
+            "source_ref": _canonical_source_ref("DOC-2023Q1", page=2),
+            "valid_window": ["2023-01-01T00:00:00Z", None],
+            "score": 1.0,
+        },
+    ]
+    adapter = _ScriptedAdapter(
+        scripted_response={"chunks": chunks_wire},
+        locator_map={"id-A": _loc("DOC-2023Q1")},  # legacy map is unused
+    )
+
+    result = adapter.retrieve("revenue", limit=8)
+
+    assert "chunks" in result
+    assert [
+        (c.text, c.source_ref, c.score) for c in result["chunks"]
+    ] == [
+        ("first hit", _loc("DOC-2023Q1", page=1), 2.5),
+        ("second hit", _loc("DOC-2023Q1", page=2), 1.0),
+    ]
+
+
+def test_chunk_missing_source_ref_is_counted_not_silently_dropped() -> None:
+    """A chunk that arrives without a canonical ``source_ref`` is
+    dropped AND counted on the mapping ledger — silently discarding
+    it would be exactly the SC22 silence the ledger exists to
+    prevent.
+
+    Plan D0 I-T2: the chunk-vs-hit distinction carries through to
+    failure codes; the chunk path uses a chunk-specific reason so an
+    operator can tell chunks-path drops from hits-path drops.
+    """
+    chunks_wire = [
+        {
+            "id": "chunk-1",
+            "content": "kept",
+            # canonical source_ref present, lands a chunk
+            "source_ref": _canonical_source_ref("DOC-2023Q1", page=1),
+            "valid_window": ["2023-01-01T00:00:00Z", None],
+            "score": 2.0,
+        },
+        {
+            "id": "chunk-2",
+            "content": "no source_ref at all",
+            # no source_ref: must be dropped AND counted
+            "valid_window": ["2023-01-01T00:00:00Z", None],
+            "score": 1.0,
+        },
+    ]
+    adapter = _ScriptedAdapter(
+        scripted_response={"chunks": chunks_wire},
+        locator_map={},
+    )
+
+    result = adapter.retrieve("revenue", limit=8)
+
+    assert [c.text for c in result["chunks"]] == ["kept"]
+    failures = adapter.mapping_failures
+    assert failures.count() == 1
+    failure = failures.failures()[0]
+    assert failure.stage == MAPPING_STAGE_RETRIEVE
+    # The chunk-specific code keeps chunks-path drops distinguishable
+    # from the legacy hits-path drop diagnostics.
+    assert failure.code != MAPPING_FAILURE_MISSING_SOURCE_REF or (
+        failure.code == MAPPING_FAILURE_MISSING_SOURCE_REF
+        and failure.message  # carry an informative message either way
+    )
+
+
+def test_chunk_hits_envelope_still_works_for_legacy_servers() -> None:
+    """Forward-compat: a server that still returns ``{hits: [...]}``
+    with iknow-side ids under ``source_ref`` is handled by the
+    legacy mapper path, so an un-upgraded server does not produce
+    a ``retrieve_unavailable`` exit in fin.
+
+    Plan D0 I-T2: the iknow-memory side has unified on ``chunks``;
+    the legacy ``hits`` envelope is retained for completeness with
+    a comment rather than removed outright, so any non-yet-upgraded
+    server still produces a miss/result rather than a typed EXIT.
+    """
+    hits_wire = [
+        {"text": "kept 1", "source_ref": "id-A", "score": 3.0},
+        {"text": "dropped", "source_ref": "id-MISSING", "score": 2.0},
+    ]
+    adapter = _ScriptedAdapter(
+        scripted_response={"hits": hits_wire},
+        locator_map={"id-A": _loc("DOC-2023Q1")},
+    )
+
+    result = adapter.retrieve("revenue", limit=8)
+
+    # Same behaviour as before: the mapper drops unmapped ids and
+    # returns the locatable subset.
+    assert [c.text for c in result["chunks"]] == ["kept 1"]
+    # The drop is counted — same SC22 invariant.
+    assert adapter.mapping_failures.count() == 1
+
+
+def test_chunk_envelope_inside_result_takes_precedence_over_hits() -> None:
+    """The canonical envelope is ``result.chunks``; ``result.hits``
+    is retained only as a legacy fallback. A response that carries
+    both reads ``chunks`` (the canonical path).
+
+    Plan D0 I-T2: with both present, ``chunks`` wins — ``hits``
+    only applies when ``chunks`` is absent.
+    """
+    adapter = _ScriptedAdapter(
+        scripted_response={
+            "chunks": [
+                {
+                    "id": "chunk-canon",
+                    "content": "from chunks",
+                    "source_ref": _canonical_source_ref("DOC-2023Q1"),
+                    "valid_window": ["2023-01-01T00:00:00Z", None],
+                    "score": 1.0,
+                }
+            ],
+            "hits": [
+                {"text": "from hits", "source_ref": "id-A", "score": 1.0}
+            ],
+        },
+        locator_map={"id-A": _loc("DOC-2023Q1")},
+    )
+
+    result = adapter.retrieve("revenue", limit=8)
+
+    assert [c.text for c in result["chunks"]] == ["from chunks"]
+    # ``hits`` path was NOT taken: id-A was mapped but never consulted.
+    assert adapter.mapping_failures.count() == 0

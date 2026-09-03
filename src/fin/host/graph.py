@@ -63,10 +63,13 @@ does NOT auto-ingest.
 
 from __future__ import annotations
 
+import importlib
 import json
 import threading
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Iterable, Literal, TypedDict
+from typing import TYPE_CHECKING, Annotated, Any, Callable, Iterable, Literal, Mapping, TypedDict
 
 from langchain_core.messages import (
     AIMessage,
@@ -84,11 +87,17 @@ from langgraph.types import Command, Send
 
 from fin.corpus.errors import IngestMissingError
 from fin.corpus.extracted import Locator, load_extracted_tree
+from fin.corpus.parsers._common import UnitLocator
+from fin.corpus.push import serialize_source_ref
 from fin.host.citation_gate import (
     HIDDEN_BOUNCE_MARKER,
     Citation,
     EvidenceItem,
     verify_citations,
+)
+from fin.host.evidence_admission import (
+    admit_retrieved_chunks,
+    evidence_from_chunks,
 )
 from fin.host.state import (
     AgentState,
@@ -99,6 +108,11 @@ from fin.host.state import (
     TERMINAL_STATUSES,
 )
 from fin.host.agent_instructions import messages_for_model
+from fin.host.degradation_notice import (
+    DEGRADATION_NOTICE_FIELD,
+    consume_degradation,
+    degradation_notice_entry,
+)
 from fin.host.stream_map import (
     assemble_final_ai_message,
     format_tool_summary,
@@ -118,6 +132,12 @@ from fin.host.tools.issuer_fanout import (
 )
 from fin.host.track_decision import decide_track, snapshot_delta_for_utterance
 from fin.retrieve import MCPRetrieveAdapter, FakeRetrievePort
+from fin.retrieve.degradation import (
+    DegradationLedger,
+    degradation_ledger_from_env,
+)
+from fin.retrieve.hit_mapping import MappingFailureLedger, ledger_from_env
+from fin.retrieve.input_validation import InputValidationError
 from fin.retrieve.tool import retrieve
 from fin.retrieve.port import RetrievePort
 
@@ -188,24 +208,26 @@ def _resolve_path(value: Path | str | None, default: Path) -> Path:
 def _locator_map_from_tree(
     tree: dict[str, tuple[Any, ...]],
 ) -> dict[str, Locator]:
-    """Publish one ``iknow-memory id -> fin Locator`` entry per
-    frozen locator unit in the extracted ``tree``.
+    """Publish one canonical fin ``source_ref`` → ``Locator`` entry
+    per frozen locator unit in the extracted ``tree``.
 
-    ``MCPRetrieveAdapter`` maps each hit's ``source_ref`` through
-    this dict and DROPS whatever is missing, so the map is the
-    only thing standing between a healthy MCP server and a
-    retrieve path that returns nothing.
+    ``MCPRetrieveAdapter`` accepts this stable serialization directly,
+    so the retrieval service's internal id is never used as
+    ``source_ref`` or passed to citation evidence.
 
-    The published id spelling is ``"{document_id}#{page}"``: the
-    identity fin can address without reading iknow-memory's
-    storage. An operator whose iknow-memory corpus was ingested
-    under different ids passes an explicit ``locator_map`` to
-    ``compile_graph``; a stale mapping degrades safely because the
-    citation verifier still matches the claimed span against the
-    frozen unit's text.
+    An explicitly supplied ``locator_map`` remains a named
+    transitional compatibility seam for integrations using
+    ``retrieval_id``; auto-built product maps use only the canonical
+    ``source_ref`` spelling.
     """
     return {
-        f"{document_id}#{page.locator.page}": page.locator
+        serialize_source_ref(
+            UnitLocator(
+                document_id=page.locator.document_id,
+                version=page.locator.version,
+                unit=page.locator.page,
+            )
+        ): page.locator
         for document_id, pages in tree.items()
         for page in pages
     }
@@ -372,13 +394,34 @@ def _make_read_file_tool():
     return read_file_tool
 
 
-def _make_retrieve_tool(adapter: RetrievePort):
+def _make_retrieve_tool(
+    adapter: RetrievePort,
+    *,
+    mapping_ledger: MappingFailureLedger | None = None,
+    degradation_ledger: DegradationLedger | None = None,
+):
     """Build the ``retrieve`` host tool.
 
     The tool wraps T4's ``retrieve`` (which is the port-seam)
     with the factory's shared adapter. On a hit, each chunk
     contributes one ``EvidenceItem`` to ``AgentState``. An empty
     contract (``{"chunks": []}``) contributes nothing.
+
+    Evidence admission (T17 / SC22): a chunk whose ``source_ref``
+    is not a fin ``Locator`` never mapped back to one, so it is
+    dropped before it can become evidence or reach the serialized
+    envelope, and the drop is counted on ``mapping_ledger``. The
+    citation gate's own rules are unchanged — admission decides
+    what evidence exists, not how the gate rules on it.
+
+    Invalid input (T21 / SC42 / SC43): the port raises a named
+    ``InputValidationError`` for an empty query or a provably
+    conflicting filter set, and the tool serializes that code as
+    ``{"error": "<code>"}``. It is NOT rewritten to
+    ``{"chunks": []}`` — an empty result would answer a question
+    that was never asked — and it contributes no evidence. A
+    legal empty result (unknown filter, no hits) keeps the
+    ``{"chunks": []}`` shape it always had.
 
     Typed EXIT (spec s1-corpus-retrieve § Boundaries): when the
     port returns ``{"error": "retrieve_unavailable"}`` (product
@@ -389,9 +432,25 @@ def _make_retrieve_tool(adapter: RetrievePort):
     The error contributes no evidence and triggers no BM25
     fallback; the model can retry or say retrieval is down.
 
+    Degradation (T20 / SC39 / §B3): a response carrying
+    ``degraded`` has every one of its ``degraded_reasons``
+    recorded on ``degradation_ledger``, and the notice rides
+    onto the tool envelope so the run's tool trace tells the
+    user this answer is partial. The flag changes neither the
+    evidence a hit contributes nor the citation gate's rules —
+    a degraded result is usable but must be visible.
+
     The tool's registered name is ``retrieve`` so the model can
     call it by name.
     """
+    ledger = (
+        mapping_ledger if mapping_ledger is not None else ledger_from_env()
+    )
+    degradations = (
+        degradation_ledger
+        if degradation_ledger is not None
+        else degradation_ledger_from_env()
+    )
 
     @tool("retrieve")
     def retrieve_tool(
@@ -417,40 +476,53 @@ def _make_retrieve_tool(adapter: RetrievePort):
         is unavailable the tool returns
         ``{"error": "retrieve_unavailable"}``.
         """
-        result = retrieve(
-            query=query,
-            document_id=document_id,
-            cik=cik,
-            form=form,
-            ticker=ticker,
-            filing_date=filing_date,
-            limit=limit,
-            adapter=adapter,
-        )
+        try:
+            result = retrieve(
+                query=query,
+                document_id=document_id,
+                cik=cik,
+                form=form,
+                ticker=ticker,
+                filing_date=filing_date,
+                limit=limit,
+                adapter=adapter,
+            )
+        except InputValidationError as exc:
+            # Invalid input (T21 / §B2 第 5 条). The port already named
+            # and counted it; the tool's contract is an envelope, so the
+            # code travels as ``{"error": <code>}`` — the same named-EXIT
+            # shape as an unavailable transport, and deliberately NOT
+            # ``{"chunks": []}``, which would tell the model the corpus
+            # is empty for a call that was never askable. The model can
+            # fix its own arguments and retry; the run does not die on a
+            # blank ``query``.
+            result = {"error": exc.code}
         if isinstance(result, dict) and "error" in result:
             # Typed EXIT: surface the port's error dict verbatim.
             # Building evidence / a chunks envelope here would
-            # destroy the distinction the spec requires.
+            # destroy the distinction the spec requires. A degraded
+            # failure keeps its reasons on the same dict (§B2 第 2
+            # 条: 具名失败, not an empty result), and consuming it
+            # here is what puts them in front of the user.
+            envelope = dict(result)
+            _consume_into_envelope(envelope, result, ledger=degradations)
             return Command(
                 update={
                     "messages": [
                         ToolMessage(
-                            content=json.dumps(result, default=str),
+                            content=json.dumps(envelope, default=str),
                             tool_call_id=tool_call_id,
                             name="retrieve",
                         )
                     ]
                 }
             )
-        new_evidence: list[EvidenceItem] = []
-        chunks = result.get("chunks", []) if isinstance(result, dict) else []
-        for chunk in chunks:
-            new_evidence.append(
-                EvidenceItem(
-                    locator=chunk.source_ref,
-                    page_text=chunk.text,
-                )
-            )
+        raw_chunks = result.get("chunks", []) if isinstance(result, dict) else []
+        # SC22: hits that did not map back to a locator are dropped and
+        # counted here, so neither the evidence list nor the serialized
+        # envelope below can carry a retrieval-side identifier.
+        chunks = admit_retrieved_chunks(raw_chunks, ledger=ledger)
+        new_evidence: list[EvidenceItem] = evidence_from_chunks(chunks)
         # Serialize the chunks with their Locator as a dict so the
         # ToolMessage is JSON-friendly. The original ``Chunk`` value
         # objects live on ``page_text`` (string) for evidence;
@@ -467,8 +539,10 @@ def _make_retrieve_tool(adapter: RetrievePort):
             }
             for chunk in chunks
         ]
+        envelope: dict[str, Any] = {"chunks": serialized_chunks}
+        _consume_into_envelope(envelope, result, ledger=degradations)
         tool_message = ToolMessage(
-            content=json.dumps({"chunks": serialized_chunks}, default=str),
+            content=json.dumps(envelope, default=str),
             tool_call_id=tool_call_id,
             name="retrieve",
         )
@@ -477,6 +551,31 @@ def _make_retrieve_tool(adapter: RetrievePort):
         )
 
     return retrieve_tool
+
+
+def _consume_into_envelope(
+    envelope: dict[str, Any],
+    result: Any,
+    *,
+    ledger: DegradationLedger,
+) -> None:
+    """Record ``result``'s degradation and publish it on ``envelope``.
+
+    Publishing IS the exposure: the two verbatim §B3 fields and the
+    rendered notice ride on the envelope the tool trace summarizes, so
+    the reasons reach the user on the same row as the call. The notice
+    record is written only after they are on the envelope.
+    """
+    consume_degradation(
+        result,
+        ledger=ledger,
+        expose=lambda signal, line: envelope.update(
+            {
+                **signal.as_envelope_fields(),
+                DEGRADATION_NOTICE_FIELD: line,
+            }
+        ),
+    )
 
 
 def _make_get_xbrl_fact_tool(facts_root: Path):
@@ -542,56 +641,276 @@ def _make_get_xbrl_fact_tool(facts_root: Path):
     return get_xbrl_fact_tool
 
 
+# ----- locator-analysis tool consolidation -----
+#
+# The four plain-dict locator-analysis host tools
+# (``compare_facts`` / ``redline`` / ``extract_tables`` /
+# ``three_year_statement``) all share the same shape — ``@tool(name) +
+# inner closure + lazy import + kwargs passthrough`` — so the per-tool
+# duplication collapses into a single ``_make_locator_tool`` factory
+# driven by a ``_LocatorToolSpec`` record. ``get_xbrl_fact`` keeps its
+# own factory because its return shape (Command + ToolMessage, not a
+# plain dict) diverges from the template.
+#
+# Tool NAMES are part of the model-binding contract (the model calls
+# by name; ``_ANALYSIS_PAYLOAD_KEYS`` in ``stream_map`` maps them to
+# payload keys). Renaming any of them would silently drop a tool from
+# the prompt.
+
+
+@dataclass(frozen=True)
+class _LocatorToolSpec:
+    """One locator-analysis tool the graph binds (T6).
+
+    Bundles the public name (the model binds by it), the lazily
+    imported implementation it delegates to, and the factory kwargs
+    the graph resolved once (``manifest_path`` / ``extracted_root`` /
+    ``facts_root``). ``signature`` is the Python parameter source the
+    wrapped tool exposes — kept as a string so
+    ``_make_locator_tool`` can build the wrapper via ``exec`` and
+    preserve the live Pydantic-compatible annotations LangChain's
+    schema inference needs at @tool-decoration time. ``coerce_fn``
+    is the per-impl shim that mirrors the pre-refactor list / None
+    coercions (``list(x or [])`` etc.) so each tool's kwarg map
+    stays exactly what it was before the consolidation.
+    """
+
+    name: str
+    description: str
+    signature: str
+    impl_module: str
+    impl_attr: str
+    factory_kwargs: Mapping[str, Any]
+    coerce_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+
+
+def _extract_param_names(signature: str) -> list[str]:
+    """Parse parameter names out of a Python signature fragment.
+
+    Handles the forms the locator-analysis tools actually use:
+    ``name``, ``name: type``, ``name=default``, ``name: type = default``.
+    ``*args`` / ``**kwargs`` are skipped — none of the consolidated
+    tools use them. The names are returned in declaration order so
+    the wrapper body can mirror the source 1-to-1.
+    """
+    names: list[str] = []
+    for part in signature.split(","):
+        piece = part.strip()
+        if not piece or piece.startswith("*"):
+            continue
+        # ``name: type`` or ``name: type = default``
+        name = piece.split(":", 1)[0].strip()
+        name = name.split("=", 1)[0].strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def _make_locator_tool(spec: _LocatorToolSpec) -> Any:
+    """Build one locator-analysis host tool from a spec.
+
+    The wrapper is built via ``exec`` so its parameter types stay
+    live Pydantic-compatible annotations (LangChain's schema
+    inference calls ``validate_arguments(func)``, which reads
+    ``__annotations__`` directly — copying ``__signature__`` onto a
+    ``**kwargs`` shim would silently drop the types and produce an
+    empty schema).
+
+    The body lazy-imports ``spec.impl_attr`` from
+    ``spec.impl_module`` on first call and forwards the wrapper's
+    kwargs merged with ``spec.factory_kwargs`` (the paths the graph
+    resolved once). ``spec.coerce_fn`` runs first when present so
+    the per-impl ``list(x or [])`` shims apply before the invoke.
+
+    Returns the same ``StructuredTool`` shape the previous
+    per-tool factories produced — same name, same schema, same
+    return payload shape. The four consolidated factories below
+    are now thin spec bindings.
+    """
+    param_names = _extract_param_names(spec.signature)
+    forward_lines = "".join(
+        f"    forwarded[{name!r}] = {name}\n" for name in param_names
+    )
+    coerce_line = (
+        "    forwarded = coerce_fn(forwarded)\n"
+        if spec.coerce_fn is not None
+        else ""
+    )
+    source = (
+        f"def _wrapped({spec.signature}) -> dict:\n"
+        "    forwarded = dict(factory_kwargs)\n"
+        f"{forward_lines}"
+        f"{coerce_line}"
+        "    module = importlib.import_module(impl_module)\n"
+        "    impl = getattr(module, impl_attr)\n"
+        "    return impl(**forwarded)\n"
+    )
+    namespace = {
+        "importlib": importlib,
+        "impl_module": spec.impl_module,
+        "impl_attr": spec.impl_attr,
+        "factory_kwargs": dict(spec.factory_kwargs),
+        "coerce_fn": spec.coerce_fn,
+    }
+    exec(compile(source, f"<locator-tool:{spec.name}>", "exec"), namespace)
+    wrapped = namespace["_wrapped"]
+    wrapped.__doc__ = spec.description
+    wrapped.__name__ = f"{spec.name}_tool"
+    return tool(spec.name)(wrapped)
+
+
+# Per-impl coerce shims. Match the pre-refactor coercions exactly so
+# each tool's kwarg map stays bit-for-bit equivalent (T3 / spec Focus
+# 1 numeric gate reads ``compare_facts`` columns; the empty /
+# non-empty split is load-bearing).
+
+
+def _coerce_compare_facts(forwarded: dict[str, Any]) -> dict[str, Any]:
+    """Match ``compare_facts``'s pre-refactor list / None coercion."""
+    forwarded["periods"] = list(forwarded.get("periods") or [])
+    document_ids = forwarded.get("document_ids")
+    forwarded["document_ids"] = (
+        list(document_ids) if document_ids else None
+    )
+    issuers = forwarded.get("issuers")
+    forwarded["issuers"] = list(issuers) if issuers else None
+    return forwarded
+
+
+def _coerce_statement(forwarded: dict[str, Any]) -> dict[str, Any]:
+    """Match ``three_year_statement``'s pre-refactor list coercion."""
+    forwarded["periods"] = list(forwarded.get("periods") or [])
+    forwarded["concepts"] = list(forwarded.get("concepts") or [])
+    return forwarded
+
+
+# The four consolidated factories. Each is now a one-line spec
+# binding; the @tool + lazy-import + kwargs-passthrough template is
+# in ``_make_locator_tool``.
+
+
+_COMPARE_FACTS_DESCRIPTION = (
+    "Compare one XBRL concept across periods and/or issuers.\n"
+    "\n"
+    "``concept`` is the XBRL tag (e.g. ``us-gaap:Revenues``).\n"
+    "``periods`` are the reporting periods to use as columns\n"
+    "(e.g. ``[\"2022-Q3-YTD\", \"2023-Q3-YTD\"]``). Rows come from\n"
+    "``issuers`` (tickers, resolved across that issuer's filings —\n"
+    "use this for cross-period) or ``document_ids`` (exact\n"
+    "filings); with neither, every filing holding facts is a row.\n"
+    "Returns a structured comparison table with per-cell locators\n"
+    "and code-computed deltas. Cells with no fact row are marked\n"
+    "``missing``; an unresolvable request returns the typed\n"
+    "``empty_comparison`` / ``comparison_overflow`` dict. Never\n"
+    "raises. Quote only the values this table reports."
+)
+
+_REDLINE_DESCRIPTION = "Compare paragraph text between two frozen filings."
+
+_EXTRACT_TABLES_DESCRIPTION = (
+    "Extract pipe-delimited tables from one frozen page."
+)
+
+_STATEMENT_DESCRIPTION = (
+    "Render three requested years from XBRL fact sidecars."
+)
+
+
 def _make_compare_facts_tool(facts_root: Path):
     """Build the ``compare_facts`` host tool (T3 / spec Focus 1).
 
     Cross-period and peer comparison is a HOST TOOL result, not a
-    prose table the model writes: the tool resolves each cell against
-    the ingest-built fact table (locator per cell) and computes the
-    deltas itself. Like ``get_xbrl_fact`` it contributes NO
-    ``EvidenceItem`` — a fact row is not page text, so the citation
-    verifier still requires a read / retrieve span before any prose
-    answer passes.
+    prose table the model writes: the tool resolves each cell
+    against the ingest-built fact table (locator per cell) and
+    computes the deltas itself. Like ``get_xbrl_fact`` it
+    contributes NO ``EvidenceItem`` — a fact row is not page text,
+    so the citation verifier still requires a read / retrieve span
+    before any prose answer passes.
 
-    Returns a plain dict so the prebuilt ``ToolNode`` serializes it as
-    ToolMessage JSON; ``tool_node_with_summaries`` then lifts the
-    ``comparison`` envelope onto ``AgentState`` for the turn row, and
-    the numeric gate reads its columns as ``(concept, period)``
-    claims.
+    Returns a plain dict so the prebuilt ``ToolNode`` serializes
+    it as ToolMessage JSON; ``tool_node_with_summaries`` then
+    lifts the ``comparison`` envelope onto ``AgentState`` for the
+    turn row, and the numeric gate reads its columns as
+    ``(concept, period)`` claims.
     """
-
-    @tool("compare_facts")
-    def compare_facts_tool(
-        concept: str,
-        periods: list[str],
-        document_ids: list[str] | None = None,
-        issuers: list[str] | None = None,
-    ) -> dict:
-        """Compare one XBRL concept across periods and/or issuers.
-
-        ``concept`` is the XBRL tag (e.g. ``us-gaap:Revenues``).
-        ``periods`` are the reporting periods to use as columns
-        (e.g. ``["2022-Q3-YTD", "2023-Q3-YTD"]``). Rows come from
-        ``issuers`` (tickers, resolved across that issuer's filings —
-        use this for cross-period) or ``document_ids`` (exact
-        filings); with neither, every filing holding facts is a row.
-        Returns a structured comparison table with per-cell locators
-        and code-computed deltas. Cells with no fact row are marked
-        ``missing``; an unresolvable request returns the typed
-        ``empty_comparison`` / ``comparison_overflow`` dict. Never
-        raises. Quote only the values this table reports.
-        """
-        from fin.host.tools.compare_facts import compare_facts
-
-        return compare_facts(
-            concept=concept,
-            periods=list(periods or []),
-            document_ids=list(document_ids) if document_ids else None,
-            issuers=list(issuers) if issuers else None,
-            facts_root=facts_root,
+    return _make_locator_tool(
+        _LocatorToolSpec(
+            name="compare_facts",
+            description=_COMPARE_FACTS_DESCRIPTION,
+            signature=(
+                "concept: str, "
+                "periods: list[str], "
+                "document_ids: list[str] | None = None, "
+                "issuers: list[str] | None = None"
+            ),
+            impl_module="fin.host.tools.compare_facts",
+            impl_attr="compare_facts",
+            factory_kwargs={"facts_root": facts_root},
+            coerce_fn=_coerce_compare_facts,
         )
+    )
 
-    return compare_facts_tool
+
+def _make_redline_tool(manifest_path: Path, extracted_root: Path):
+    """Build the locator-bound paragraph redline host tool."""
+    return _make_locator_tool(
+        _LocatorToolSpec(
+            name="redline",
+            description=_REDLINE_DESCRIPTION,
+            signature=(
+                "before_document_id: str, "
+                "before_version: str, "
+                "after_document_id: str, "
+                "after_version: str"
+            ),
+            impl_module="fin.host.tools.redline",
+            impl_attr="redline",
+            factory_kwargs={
+                "manifest_path": manifest_path,
+                "extracted_root": extracted_root,
+            },
+        )
+    )
+
+
+def _make_table_extract_tool(manifest_path: Path, extracted_root: Path):
+    """Build the locator-bound page table extraction tool."""
+    return _make_locator_tool(
+        _LocatorToolSpec(
+            name="extract_tables",
+            description=_EXTRACT_TABLES_DESCRIPTION,
+            signature=(
+                "document_id: str, "
+                "version: str, "
+                "page: int = 1"
+            ),
+            impl_module="fin.host.tools.table_extract",
+            impl_attr="extract_tables",
+            factory_kwargs={
+                "manifest_path": manifest_path,
+                "extracted_root": extracted_root,
+            },
+        )
+    )
+
+
+def _make_statement_tool(facts_root: Path):
+    """Build the XBRL-backed three-year statement tool."""
+    return _make_locator_tool(
+        _LocatorToolSpec(
+            name="three_year_statement",
+            description=_STATEMENT_DESCRIPTION,
+            signature=(
+                "issuer: str, "
+                "periods: list[str], "
+                "concepts: list[str]"
+            ),
+            impl_module="fin.host.tools.statements",
+            impl_attr="three_year_statement",
+            factory_kwargs={"facts_root": facts_root},
+            coerce_fn=_coerce_statement,
+        )
+    )
 
 
 class IssuerTask(TypedDict, total=False):
@@ -696,20 +1015,24 @@ def _issuer_finding(issuer: str, status: str, **extra: Any) -> dict[str, Any]:
     }
 
 
-def _issuer_evidence(result: Any) -> list[EvidenceItem]:
+def _issuer_evidence(
+    result: Any, *, ledger: MappingFailureLedger
+) -> list[EvidenceItem]:
     """The retrieve result's chunks as ordinary ``EvidenceItem``s.
 
     Fan-out evidence is deliberately indistinguishable from a
     ``read_file`` page here, so the ONE citation verifier after the
     join treats both alike (ADR 0034). Text-less chunks are dropped:
-    they can carry no citable span.
+    they can carry no citable span. Mapping-failed chunks go through
+    the same admission as the single-issuer path (T17 / SC22), so a
+    fan-out branch cannot be the way a retrieval-side identifier
+    reaches the citation gate.
     """
     chunks = result.get("chunks", []) if isinstance(result, dict) else []
-    return [
-        EvidenceItem(locator=chunk.source_ref, page_text=chunk.text)
-        for chunk in chunks
-        if getattr(chunk, "text", "")
-    ]
+    admitted = admit_retrieved_chunks(chunks, ledger=ledger)
+    return evidence_from_chunks(
+        [chunk for chunk in admitted if getattr(chunk, "text", "")]
+    )
 
 
 def _issuer_hit_update(
@@ -893,6 +1216,35 @@ def comparison_from_tool_message(message: BaseMessage) -> dict | None:
     }
 
 
+_ANALYSIS_PAYLOAD_KEYS = {
+    "redline": "redline",
+    "extract_tables": "table_extract",
+    "three_year_statement": "statement",
+}
+
+
+def analysis_from_tool_message(message: BaseMessage) -> dict | None:
+    """Extract a structured T6 analysis result from a ToolMessage."""
+    if not isinstance(message, ToolMessage):
+        return None
+    payload_key = _ANALYSIS_PAYLOAD_KEYS.get(getattr(message, "name", ""))
+    if payload_key is None:
+        return None
+    try:
+        payload = json.loads(message.content)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    analysis = payload.get(payload_key)
+    if not isinstance(analysis, dict) or not analysis.get("schema"):
+        return None
+    return {
+        **analysis,
+        "tool_call_id": getattr(message, "tool_call_id", "") or "",
+    }
+
+
 def _collect_comparisons(messages: list[BaseMessage]) -> list[dict]:
     """Every renderable comparison in ``messages``, in call order."""
     found: list[dict] = []
@@ -900,6 +1252,16 @@ def _collect_comparisons(messages: list[BaseMessage]) -> list[dict]:
         comparison = comparison_from_tool_message(message)
         if comparison is not None:
             found.append(comparison)
+    return found
+
+
+def _collect_analysis_results(messages: list[BaseMessage]) -> list[dict]:
+    """Every structured T6 analysis result, in tool-call order."""
+    found: list[dict] = []
+    for message in messages:
+        analysis = analysis_from_tool_message(message)
+        if analysis is not None:
+            found.append(analysis)
     return found
 
 
@@ -1116,6 +1478,56 @@ def _collect_comparison_claims(
     return claimed, facts
 
 
+def _collect_statement_claims(
+    messages: list[BaseMessage],
+) -> tuple[list[tuple[str, str]], list["Fact"]]:
+    """Treat XBRL statement cells as numeric claims for this run."""
+    from fin.corpus.facts import Fact
+
+    claimed: list[tuple[str, str]] = []
+    facts: list[Fact] = []
+    for message in messages:
+        statement = analysis_from_tool_message(message)
+        if not statement or statement.get("schema") != "fin.statement.v1":
+            continue
+        periods = {
+            str((column or {}).get("key") or "")
+            for column in statement.get("columns") or ()
+            if isinstance(column, dict)
+        }
+        for row in statement.get("rows") or ():
+            if not isinstance(row, dict):
+                continue
+            concept = str(row.get("concept") or row.get("key") or "")
+            if not concept:
+                continue
+            for cell in row.get("cells") or ():
+                if not isinstance(cell, dict):
+                    continue
+                period = str(cell.get("period") or "")
+                if not period or (periods and period not in periods):
+                    continue
+                pair = (concept, period)
+                if pair not in claimed:
+                    claimed.append(pair)
+                if cell.get("status") != "hit" or cell.get("value") is None:
+                    continue
+                locator = _locator_from_payload(cell.get("locator"))
+                if locator is None:
+                    continue
+                facts.append(
+                    Fact(
+                        concept=concept,
+                        value=cell["value"],
+                        period=period,
+                        unit=str(cell.get("unit") or ""),
+                        scale=str(cell.get("scale") or ""),
+                        source_locator=locator,
+                    )
+                )
+    return claimed, facts
+
+
 def _evaluate_numeric_gate_in_node(messages: list[BaseMessage]):
     """Run the numeric gate on the run's accumulated messages.
 
@@ -1129,9 +1541,15 @@ def _evaluate_numeric_gate_in_node(messages: list[BaseMessage]):
 
     fact_claims, fact_rows = _collect_fact_tool_calls(messages)
     compare_claims, compare_rows = _collect_comparison_claims(messages)
+    statement_claims, statement_rows = _collect_statement_claims(messages)
     claimed = fact_claims + [
         pair for pair in compare_claims if pair not in fact_claims
     ]
+    claimed.extend(
+        pair
+        for pair in statement_claims
+        if pair not in claimed
+    )
     if not claimed:
         # No numeric lookup -> gate is skipped. We return ``None`` so
         # the caller can distinguish "no claim" from "claim, gate
@@ -1141,7 +1559,7 @@ def _evaluate_numeric_gate_in_node(messages: list[BaseMessage]):
     return evaluate_numeric_gate(
         answer=answer,
         claimed_concepts=claimed,
-        available_facts=fact_rows + compare_rows,
+        available_facts=fact_rows + compare_rows + statement_rows,
     )
 
 
@@ -1161,6 +1579,8 @@ def compile_graph(
     retrieve_adapter: str = RETRIEVE_ADAPTER_FAKE,
     mcp_command: list[str] | None = None,
     locator_map: dict[str, "Locator"] | None = None,
+    mapping_failure_ledger: MappingFailureLedger | None = None,
+    degradation_ledger: DegradationLedger | None = None,
 ) -> "_LockedGraph":
     """Build the v1 host graph (T6).
 
@@ -1242,14 +1662,31 @@ def compile_graph(
     mcp_command
         T3 (#76): launch command for the MCP server used when
         ``retrieve_adapter`` is ``"mcp"`` and no ``adapter`` was
-        supplied. Defaults to ``["iknow-memory", "serve"]``.
+        supplied. Defaults to ``["iknow-memory"]`` (兜底非契约).
     locator_map
-        T3 (#76): iknow-memory id → ``fin.Locator`` map passed
+        T3 (#76): explicit compatibility map from ``retrieval_id``
+        (or a legacy ``source_ref`` key) to ``fin.Locator``, passed
         to the auto-built ``MCPRetrieveAdapter``. ``None`` (the
-        default) derives the map from the extracted tree via
+        default) derives a canonical ``source_ref`` → ``Locator``
+        map from the extracted tree via
         :func:`_locator_map_from_tree`; an explicit map overrides
         that derivation. An empty effective map is refused —
         see ``RetrieveAdapterConfigError``.
+    mapping_failure_ledger
+        T17 (SC22): where hits that fail to map back to a locator
+        are counted. ``None`` (the default) resolves the ledger
+        from ``FIN_MAPPING_FAILURE_LOG`` — a path persists the
+        count, unset keeps it in memory. The same ledger is shared
+        by the auto-built MCP adapter and the host's evidence
+        admission, so one number covers both drop sites.
+    degradation_ledger
+        T20 (SC39 / §B3): where a retrieval response's
+        ``degraded_reasons`` are recorded, and where the matching
+        user-facing notice is recorded against them. ``None`` (the
+        default) resolves the ledger from ``FIN_DEGRADATION_LOG``.
+        Shared by the ``retrieve`` tool and the fan-out workers, so
+        「记录原因且暴露信号」is one count over every consumption
+        point rather than one per call site.
 
     Returns
     -------
@@ -1269,6 +1706,18 @@ def compile_graph(
         ``"mcp"`` auto-build would produce an adapter with an
         empty ``locator_map``.
     """
+    # One mapping-failure counter per graph, shared by the retrieve
+    # adapter's mapper-drop and the host's evidence admission (T17):
+    # both are the same SC22 failure, so they must not be two numbers.
+    if mapping_failure_ledger is None:
+        mapping_failure_ledger = ledger_from_env()
+
+    # One degradation ledger per graph for the same reason (T20): the
+    # single-issuer tool and every fan-out worker consume the same §B3
+    # signal, and SC39 counts reasons across the run, not per seam.
+    if degradation_ledger is None:
+        degradation_ledger = degradation_ledger_from_env()
+
     # Build the adapter if the caller did not inject one. The kind
     # comes from configuration only (``retrieve_adapter``), so a
     # test checkpointer cannot force a fake port on a production
@@ -1289,8 +1738,8 @@ def compile_graph(
             mpath = _resolve_path(manifest_path, _DEFAULT_MANIFEST_PATH)
             rpath = _resolve_path(extracted_root, _DEFAULT_EXTRACTED_ROOT)
             # The tree is the SSOT for BOTH the client-side
-            # document membership test and the iknow-id → locator
-            # map; load it once when either is missing.
+            # document membership test and the canonical source_ref
+            # → locator map; load it once when either is missing.
             if known_document_ids is None or locator_map is None:
                 tree = load_extracted_tree(mpath, rpath)
                 if known_document_ids is None:
@@ -1307,10 +1756,11 @@ def compile_graph(
                     "corpus."
                 )
             adapter = MCPRetrieveAdapter(
-                command=mcp_command or ["iknow-memory", "serve"],
+                command=mcp_command or ["iknow-memory"],  # 兜底非契约
                 locator_map=locator_map,
                 known_document_ids=known_document_ids,
                 timeout_seconds=5.0,
+                mapping_ledger=mapping_failure_ledger,
             )
 
     if known_document_ids is None:
@@ -1331,7 +1781,11 @@ def compile_graph(
 
     list_files_tool = _make_list_files_tool(mpath, rpath)
     read_file_tool = _make_read_file_tool()
-    retrieve_tool = _make_retrieve_tool(adapter)
+    retrieve_tool = _make_retrieve_tool(
+        adapter,
+        mapping_ledger=mapping_failure_ledger,
+        degradation_ledger=degradation_ledger,
+    )
     get_xbrl_fact_tool = _make_get_xbrl_fact_tool(fpath)
     # T3 (spec Focus 1): bound LAST so the four prior tools keep
     # their positions — LangChain's tool binding is order-sensitive
@@ -1341,6 +1795,9 @@ def compile_graph(
     # ToolNode below deliberately does not receive it (see
     # ``_make_research_issuers_tool``).
     research_issuers_tool = _make_research_issuers_tool(issuer_cap)
+    redline_tool = _make_redline_tool(mpath, rpath)
+    table_extract_tool = _make_table_extract_tool(mpath, rpath)
+    statement_tool = _make_statement_tool(fpath)
 
     bound_model = model.bind_tools(
         [
@@ -1350,6 +1807,9 @@ def compile_graph(
             get_xbrl_fact_tool,
             compare_facts_tool,
             research_issuers_tool,
+            redline_tool,
+            table_extract_tool,
+            statement_tool,
         ]
     )
     # T3 (#34): the off-preference binding layers the MiniMax
@@ -1375,6 +1835,9 @@ def compile_graph(
             retrieve_tool,
             get_xbrl_fact_tool,
             compare_facts_tool,
+            redline_tool,
+            table_extract_tool,
+            statement_tool,
         ],
         name="tool_node",
         handle_tool_errors=True,
@@ -1623,6 +2086,9 @@ def compile_graph(
         update["comparisons"] = list(state.get("comparisons") or []) + (
             _collect_comparisons(merged_messages)
         )
+        update["analysis_results"] = list(
+            state.get("analysis_results") or []
+        ) + _collect_analysis_results(merged_messages)
         return update
 
     def _fanout_tool_update(
@@ -1727,29 +2193,58 @@ def compile_graph(
                 ticker=issuer,
                 adapter=adapter,
             )
+        except InputValidationError as exc:
+            # Invalid input on one branch (T21). The blank-query guard
+            # above means this is a filter-level refusal; it is reported
+            # under the port's own code rather than as a transport
+            # problem, and it does not take the join down.
+            return _issuer_finding(issuer, STATUS_UNAVAILABLE, error=exc.code)
         except Exception as exc:  # noqa: BLE001 — one branch, not the run
-            # A port that raises breaks its own contract ("empty hits,
-            # not exceptions"). Letting it propagate would kill the
-            # join and take the other issuers' work with it, so the
-            # branch degrades to the typed unavailable row — which is
-            # reported in the envelope, never swallowed.
+            # A port that raises anything else breaks its own contract
+            # (a legal empty result is a value, not an exception).
+            # Letting it propagate would kill the join and take the
+            # other issuers' work with it, so the branch degrades to the
+            # typed unavailable row — reported, never swallowed.
             return _issuer_finding(
                 issuer,
                 STATUS_UNAVAILABLE,
                 error=f"retrieve_raised:{type(exc).__name__}",
             )
 
+        # T20 / SC39: a fan-out worker is a retrieval consumption point
+        # like any other, so a degraded answer here is recorded and
+        # shown too — otherwise the branch would be the one place a
+        # degradation could arrive silently. The notice rides on the
+        # run's tool trace, which is additive across branches.
+        notices: list[dict[str, str]] = []
+        consume_degradation(
+            result,
+            ledger=degradation_ledger,
+            expose=lambda signal, _line: notices.append(
+                degradation_notice_entry(
+                    signal, tool_call_id=str(task.get("issuer") or "")
+                )
+            ),
+            detail=f"issuer={issuer}",
+        )
+        summaries: dict[str, Any] = (
+            {"tool_summaries": notices} if notices else {}
+        )
+
         if isinstance(result, dict) and "error" in result:
             # Typed EXIT (ADR 0030): "retrieve is down" must not read
             # as "the corpus has nothing about this issuer".
-            return _issuer_finding(
-                issuer, STATUS_UNAVAILABLE, error=str(result["error"])
-            )
+            return {
+                **summaries,
+                **_issuer_finding(
+                    issuer, STATUS_UNAVAILABLE, error=str(result["error"])
+                ),
+            }
 
-        new_evidence = _issuer_evidence(result)
+        new_evidence = _issuer_evidence(result, ledger=mapping_failure_ledger)
         if not new_evidence:
-            return _issuer_finding(issuer, STATUS_EMPTY)
-        return _issuer_hit_update(issuer, new_evidence)
+            return {**summaries, **_issuer_finding(issuer, STATUS_EMPTY)}
+        return {**summaries, **_issuer_hit_update(issuer, new_evidence)}
 
     def issuer_join_node(state: AgentState) -> dict[str, Any]:
         """Join the branches into one ``fin.issuer_fanout.v1`` envelope.
@@ -2135,6 +2630,20 @@ class _LockedGraph:
         )
         return tuple(snapshot.next or ())
 
+    def checkpoint_run_id(self, thread_id: str) -> str | None:
+        """Return the canonical run id stored on the latest checkpoint.
+
+        LangGraph records ``configurable.run_id`` as checkpoint metadata.
+        The workspace resume route uses this seam instead of minting a
+        second id or reaching through the compiled graph internals.
+        """
+        snapshot = self._graph.get_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        metadata = snapshot.metadata or {}
+        run_id = metadata.get("run_id")
+        return run_id if isinstance(run_id, str) and run_id else None
+
     def checkpoint_message_ids(self, thread_id: str) -> set[str]:
         """Return the message ids on ``thread_id``'s latest checkpoint.
 
@@ -2159,6 +2668,28 @@ class _LockedGraph:
             for mid in (getattr(m, "id", None) for m in messages)
             if mid
         }
+
+    def checkpoint_last_human_text(self, thread_id: str) -> str | None:
+        """Return the latest HumanMessage text on the thread checkpoint.
+
+        Workspace resume persists a RunRecord for the remainder; the
+        question must match the crashed run's user text so optimistic
+        turns and history can reconcile. Empty / missing → ``None``.
+        """
+        snapshot = self._graph.get_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        messages = (snapshot.values or {}).get("messages") or []
+        for message in reversed(messages):
+            if not isinstance(message, HumanMessage):
+                continue
+            content = message.content
+            if isinstance(content, str):
+                text = content.strip()
+            else:
+                text = str(content).strip()
+            return text or None
+        return None
 
     @staticmethod
     def _release_thread(lock: threading.Lock) -> None:
@@ -2221,9 +2752,19 @@ class _LockedGraph:
         thread_id = self._extract_thread_id(config)
         lock = self._acquire_thread(thread_id)
         try:
+            effective_config = self._apply_recursion_limit(config)
+            if input is not None:
+                configurable = dict(
+                    effective_config.get("configurable") or {}
+                )
+                # Direct graph callers may omit the HTTP-owned id; mint
+                # it at the start of a fresh run so its checkpoint can
+                # still be resumed without minting on the resume path.
+                configurable.setdefault("run_id", str(uuid.uuid4()))
+                effective_config["configurable"] = configurable
             yield from self._graph.stream(
                 input,
-                self._apply_recursion_limit(config),
+                effective_config,
                 **kwargs,
             )
         finally:
@@ -2310,5 +2851,6 @@ __all__ = [
     "HostGraphError",
     "RetrieveAdapterConfigError",
     "compile_graph",
+    "analysis_from_tool_message",
     "comparison_from_tool_message",
 ]

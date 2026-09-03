@@ -12,10 +12,12 @@ it is NOT inferred from the checkpointer, so ``fin-serve`` on
 The fake port mirrors the public ``RetrievePort`` semantics on
 its ``retrieve()`` method:
 
-* empty / whitespace-only ``query`` → ``{"chunks": []}``
-  (short-circuits; never raises).
+* empty / whitespace-only ``query`` → ``EmptyQueryError`` (T21 /
+  §B2 第 5 条: invalid input, counted, never an empty result).
+* provably conflicting filters (when ``manifest_docs`` gives the
+  fake the bindings to prove it) → ``ConflictingFiltersError``.
 * unknown ``document_id`` (when ``known_document_ids`` is set) →
-  ``{"chunks": []}``.
+  ``{"chunks": []}`` — a legal empty result.
 * ``limit`` defaults to 8, hard cap 20; ``<= 0`` falls back to 8;
   ``> 20`` clamps to 20 (ADR 0009).
 * the constructor holds a static dict; ``retrieve()`` does not
@@ -30,7 +32,14 @@ or ``MCPRetrieveAdapter`` (with a scripted transport).
 
 from __future__ import annotations
 
+from typing import Any, Mapping
+
 from fin.corpus.extracted import Locator
+from fin.retrieve.input_validation import (
+    InputValidationLedger,
+    validate_filters,
+    validate_query,
+)
 from fin.retrieve.port import Chunk
 
 
@@ -67,12 +76,24 @@ class FakeRetrievePort:
         ``{"chunks": []}`` without an index lookup; when
         omitted (the default), no ``document_id`` membership
         test is performed (all filters pass through).
+    manifest_docs
+        Optional ``{document_id: {cik, form, ticker,
+        filing_date}}`` bindings, mirroring ``BM25Adapter``.
+        Supplied, they let the fake *prove* a conflicting
+        filter set (T21 / SC43); omitted, fin holds no binding
+        and does not invent a contradiction.
+    input_validation_ledger
+        Optional「输入校验失败」count (T21). Omitted, the port
+        keeps an in-memory one — quiet, never blind.
     """
 
     def __init__(
         self,
         hits_by_query: dict[str, list[Chunk]] | None = None,
         known_document_ids: set[str] | None = None,
+        *,
+        manifest_docs: Mapping[str, Mapping[str, Any]] | None = None,
+        input_validation_ledger: InputValidationLedger | None = None,
     ) -> None:
         # Defensive copy so a caller mutating the source dict
         # after construction cannot affect the fake.
@@ -86,6 +107,50 @@ class FakeRetrievePort:
             if known_document_ids is not None
             else None
         )
+        self._manifest_docs: dict[str, Mapping[str, Any]] | None = (
+            dict(manifest_docs) if manifest_docs is not None else None
+        )
+        self._input_validation_ledger = input_validation_ledger
+
+    @property
+    def input_validation_failures(self) -> InputValidationLedger:
+        """The「输入校验失败」count for this port (T21 / SC42)."""
+        ledger = self._input_validation_ledger
+        if ledger is None:
+            ledger = InputValidationLedger()
+            self._input_validation_ledger = ledger
+        return ledger
+
+    def _passes_metadata(
+        self,
+        document_id: str,
+        *,
+        cik: str | None,
+        form: str | None,
+        ticker: str | None,
+        filing_date: str | None,
+    ) -> bool:
+        """AND-evaluate the supplied filters against this doc's bindings.
+
+        Mirrors ``BM25Adapter._passes_metadata``: a document with no
+        bindings passes (only ``document_id`` is a hard membership test),
+        a bound value that differs excludes the row.
+        """
+        docs = self._manifest_docs
+        if docs is None:
+            return True
+        meta = docs.get(document_id)
+        if meta is None:
+            return True
+        for field, value in (
+            ("cik", cik),
+            ("form", form),
+            ("ticker", ticker),
+            ("filing_date", filing_date),
+        ):
+            if value is not None and meta.get(field) != value:
+                return False
+        return True
 
     def retrieve(
         self,
@@ -102,24 +167,36 @@ class FakeRetrievePort:
 
         Mirrors the ``RetrievePort`` protocol:
 
-        * empty / whitespace ``query`` → ``{"chunks": []}``
+        * empty / whitespace ``query`` → ``EmptyQueryError``
+        * provably conflicting filters (needs ``manifest_docs``)
+          → ``ConflictingFiltersError``
         * unknown ``document_id`` (when ``known_document_ids`` is
           set) → ``{"chunks": []}``
         * empty EDGAR-shaped filter values
           (``cik="" / form="" / ticker="" / filing_date=""``)
           → ``{"chunks": []}`` per spec "empty filter values
           behave as empty hits"
-        * the four additive filters are NO-OPs on the fake
-          (no manifest metadata table); callers that need
-          manifest-aware filtering use ``BM25Adapter`` (legacy)
-          or ``MCPRetrieveAdapter`` (production)
+        * the four additive filters are NO-OPs without
+          ``manifest_docs`` (there is no metadata table to
+          consult); with it they AND-narrow the hits by the
+          document's bindings, so an unknown value really does
+          answer with an empty list
         * ``limit`` defaults to 8, hard cap 20 (ADR 0009)
         """
-        # Empty / whitespace query: short-circuit before the
-        # dict lookup. The model may pass ``""`` while
-        # reasoning aloud — we must NOT treat that as a hit.
-        if not query or not query.strip():
-            return {"chunks": []}
+        # Invalid input first, before any lookup: an empty query and a
+        # provably unsatisfiable filter set are named failures (T21),
+        # never the miss shape.
+        ledger = self.input_validation_failures
+        validate_query(query, ledger=ledger)
+        validate_filters(
+            document_id=document_id,
+            cik=cik,
+            form=form,
+            ticker=ticker,
+            filing_date=filing_date,
+            manifest_docs=self._manifest_docs,
+            ledger=ledger,
+        )
 
         # Unknown document_id filter: the call is well-formed
         # but the corpus has no such document. ``None`` (the
@@ -133,13 +210,28 @@ class FakeRetrievePort:
             return {"chunks": []}
 
         # EDGAR-shaped empty filter values → miss shape per spec.
-        # Non-None values are NO-OPs on the fake (no manifest
-        # metadata table) — the dict lookup proceeds unchanged.
         if any(v == "" for v in (cik, form, ticker, filing_date)):
             return {"chunks": []}
 
         effective_limit = _resolve_limit(limit)
         chunks = self._hits.get(query, [])
+        # Without bindings the metadata filters stay NO-OPs (the fake
+        # has no metadata table to consult). With them, an unknown value
+        # must actually narrow the result to nothing — otherwise the
+        # fake could not tell an unknown filter (legal empty) apart from
+        # a conflicting one (invalid input).
+        if self._manifest_docs is not None:
+            chunks = [
+                chunk
+                for chunk in chunks
+                if self._passes_metadata(
+                    chunk.source_ref.document_id,
+                    cik=cik,
+                    form=form,
+                    ticker=ticker,
+                    filing_date=filing_date,
+                )
+            ]
         # Truncate to the resolved limit; the underlying list
         # is not mutated so the next call sees the same corpus.
         return {"chunks": list(chunks[:effective_limit])}

@@ -113,6 +113,11 @@ def test_manifest_filing_dates_match_the_frozen_signature_pages() -> None:
     whose frozen text carries no parseable signature date — the MSFT
     PDFs render theirs differently — have no local evidence to check
     and are skipped.
+
+    Plan C added 8 EDGAR iXBRL primary docs (html_live kind); the
+    live_fetch path doesn't carry a ``filing_date`` because that field
+    requires an EDGAR submissions lookup, so EDGAR rows are out of
+    scope for this local-evidence check.
     """
     import datetime
     import re
@@ -121,6 +126,11 @@ def test_manifest_filing_dates_match_the_frozen_signature_pages() -> None:
     documents = json.loads((data_dir / "manifest.json").read_text())["documents"]
     checked = 0
     for doc in documents:
+        if not doc.get("filing_date"):
+            # EDGAR iXBRL primary docs do not carry a filing_date in
+            # the catalog (the live-fetch path leaves it for the
+            # submissions lookup); skip them.
+            continue
         document_id = doc["document_id"]
         pages = sorted((data_dir / "extracted" / document_id).glob("page-*.json"))
         signature_date: datetime.date | None = None

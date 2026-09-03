@@ -20,7 +20,7 @@ class DuplicateJobError(IngestStateError):
 
 
 class InvalidStateError(IngestStateError, ValueError):
-    """A state value is not a valid :class:`IngestState`."""
+    """A state value is not a valid ingest state."""
 
 
 class IllegalTransitionError(IngestStateError):
@@ -55,7 +55,12 @@ class IngestBusyError(IngestStateError):
 class IngestStepError(IngestStateError):
     """A pipeline step failed and the job was marked failed."""
 
-    def __init__(self, document_id: str, step: str, cause: BaseException) -> None:
+    def __init__(
+        self,
+        document_id: str,
+        step: str,
+        cause: BaseException,
+    ) -> None:
         self.document_id = document_id
         self.step = step
         self.cause = cause
@@ -66,7 +71,7 @@ class IngestStepError(IngestStateError):
 
 
 class AuditOverflowError(IngestStateError):
-    """The configured in-memory audit capacity has been exhausted."""
+    """The configured audit capacity has been exhausted."""
 
     def __init__(self, max_entries: int) -> None:
         self.max_entries = max_entries

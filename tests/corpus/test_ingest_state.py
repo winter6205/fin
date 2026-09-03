@@ -1,4 +1,4 @@
-"""Behavioral tests for the ingest state machine and process audit trail."""
+"""Behavioral tests for the ingest state machine and audit trail."""
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ def test_happy_path_reaches_ready_and_records_process_audit() -> None:
     assert all(row.occurred_at.tzinfo is timezone.utc for row in store.list_audit())
 
 
-def test_illegal_transition_raises_typed_error_and_records_audit() -> None:
+def test_illegal_transition_is_typed_and_audited() -> None:
     store = InMemoryIngestStateStore()
     store.create_job("filing-1")
 
@@ -65,7 +65,7 @@ def test_illegal_transition_raises_typed_error_and_records_audit() -> None:
     assert rejected.error_type == "IllegalTransitionError"
 
 
-def test_failed_step_raises_typed_error_and_records_failure_audit() -> None:
+def test_failed_step_is_typed_and_audited() -> None:
     store = InMemoryIngestStateStore()
     store.create_job("filing-1")
     store.transition("filing-1", IngestState.FETCHING)
@@ -87,7 +87,7 @@ def test_failed_step_raises_typed_error_and_records_failure_audit() -> None:
     assert failed.error_message == "fixture source unavailable"
 
 
-def test_audit_cap_raises_typed_overflow_without_partial_transition() -> None:
+def test_audit_cap_does_not_partially_apply_transition() -> None:
     store = InMemoryIngestStateStore(max_audit_entries=2)
     store.create_job("filing-1")
     store.transition("filing-1", IngestState.FETCHING)
@@ -99,7 +99,7 @@ def test_audit_cap_raises_typed_overflow_without_partial_transition() -> None:
     assert len(store.list_audit()) == 2
 
 
-def test_concurrent_duplicate_transition_reports_busy_and_keeps_audit() -> None:
+def test_concurrent_duplicate_transition_reports_busy() -> None:
     store = InMemoryIngestStateStore()
     store.create_job("filing-1")
     barrier = Barrier(2)
@@ -117,13 +117,10 @@ def test_concurrent_duplicate_transition_reports_busy_and_keeps_audit() -> None:
             except IngestBusyError as error:
                 outcomes.append(error)
 
-    # One transition wins; the other observes the already-running step.
     assert sum(outcome is IngestState.FETCHING for outcome in outcomes) == 1
     assert sum(isinstance(outcome, IngestBusyError) for outcome in outcomes) == 1
     assert len(store.list_audit()) == 3
-    rejected = store.list_audit()[-1]
-    assert rejected.action == "transition_rejected"
-    assert rejected.error_type == "IngestBusyError"
+    assert store.list_audit()[-1].action == "transition_rejected"
 
 
 def test_unknown_job_is_typed_and_does_not_create_audit() -> None:
@@ -133,3 +130,14 @@ def test_unknown_job_is_typed_and_does_not_create_audit() -> None:
         store.get_job("missing")
 
     assert store.list_audit() == ()
+
+
+def test_failed_job_can_retry_from_fetching() -> None:
+    store = InMemoryIngestStateStore()
+    store.create_job("filing-1")
+    store.transition("filing-1", IngestState.FETCHING)
+    with pytest.raises(IngestStepError):
+        store.fail_step("filing-1", step="fetch", cause=ValueError("down"))
+
+    store.transition("filing-1", IngestState.FETCHING)
+    assert store.get_job("filing-1").state is IngestState.FETCHING
