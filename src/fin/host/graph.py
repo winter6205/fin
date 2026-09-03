@@ -63,11 +63,13 @@ does NOT auto-ingest.
 
 from __future__ import annotations
 
+import importlib
 import json
 import threading
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Iterable, Literal, TypedDict
+from typing import TYPE_CHECKING, Annotated, Any, Callable, Iterable, Literal, Mapping, TypedDict
 
 from langchain_core.messages import (
     AIMessage,
@@ -639,126 +641,276 @@ def _make_get_xbrl_fact_tool(facts_root: Path):
     return get_xbrl_fact_tool
 
 
+# ----- locator-analysis tool consolidation -----
+#
+# The four plain-dict locator-analysis host tools
+# (``compare_facts`` / ``redline`` / ``extract_tables`` /
+# ``three_year_statement``) all share the same shape — ``@tool(name) +
+# inner closure + lazy import + kwargs passthrough`` — so the per-tool
+# duplication collapses into a single ``_make_locator_tool`` factory
+# driven by a ``_LocatorToolSpec`` record. ``get_xbrl_fact`` keeps its
+# own factory because its return shape (Command + ToolMessage, not a
+# plain dict) diverges from the template.
+#
+# Tool NAMES are part of the model-binding contract (the model calls
+# by name; ``_ANALYSIS_PAYLOAD_KEYS`` in ``stream_map`` maps them to
+# payload keys). Renaming any of them would silently drop a tool from
+# the prompt.
+
+
+@dataclass(frozen=True)
+class _LocatorToolSpec:
+    """One locator-analysis tool the graph binds (T6).
+
+    Bundles the public name (the model binds by it), the lazily
+    imported implementation it delegates to, and the factory kwargs
+    the graph resolved once (``manifest_path`` / ``extracted_root`` /
+    ``facts_root``). ``signature`` is the Python parameter source the
+    wrapped tool exposes — kept as a string so
+    ``_make_locator_tool`` can build the wrapper via ``exec`` and
+    preserve the live Pydantic-compatible annotations LangChain's
+    schema inference needs at @tool-decoration time. ``coerce_fn``
+    is the per-impl shim that mirrors the pre-refactor list / None
+    coercions (``list(x or [])`` etc.) so each tool's kwarg map
+    stays exactly what it was before the consolidation.
+    """
+
+    name: str
+    description: str
+    signature: str
+    impl_module: str
+    impl_attr: str
+    factory_kwargs: Mapping[str, Any]
+    coerce_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+
+
+def _extract_param_names(signature: str) -> list[str]:
+    """Parse parameter names out of a Python signature fragment.
+
+    Handles the forms the locator-analysis tools actually use:
+    ``name``, ``name: type``, ``name=default``, ``name: type = default``.
+    ``*args`` / ``**kwargs`` are skipped — none of the consolidated
+    tools use them. The names are returned in declaration order so
+    the wrapper body can mirror the source 1-to-1.
+    """
+    names: list[str] = []
+    for part in signature.split(","):
+        piece = part.strip()
+        if not piece or piece.startswith("*"):
+            continue
+        # ``name: type`` or ``name: type = default``
+        name = piece.split(":", 1)[0].strip()
+        name = name.split("=", 1)[0].strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def _make_locator_tool(spec: _LocatorToolSpec) -> Any:
+    """Build one locator-analysis host tool from a spec.
+
+    The wrapper is built via ``exec`` so its parameter types stay
+    live Pydantic-compatible annotations (LangChain's schema
+    inference calls ``validate_arguments(func)``, which reads
+    ``__annotations__`` directly — copying ``__signature__`` onto a
+    ``**kwargs`` shim would silently drop the types and produce an
+    empty schema).
+
+    The body lazy-imports ``spec.impl_attr`` from
+    ``spec.impl_module`` on first call and forwards the wrapper's
+    kwargs merged with ``spec.factory_kwargs`` (the paths the graph
+    resolved once). ``spec.coerce_fn`` runs first when present so
+    the per-impl ``list(x or [])`` shims apply before the invoke.
+
+    Returns the same ``StructuredTool`` shape the previous
+    per-tool factories produced — same name, same schema, same
+    return payload shape. The four consolidated factories below
+    are now thin spec bindings.
+    """
+    param_names = _extract_param_names(spec.signature)
+    forward_lines = "".join(
+        f"    forwarded[{name!r}] = {name}\n" for name in param_names
+    )
+    coerce_line = (
+        "    forwarded = coerce_fn(forwarded)\n"
+        if spec.coerce_fn is not None
+        else ""
+    )
+    source = (
+        f"def _wrapped({spec.signature}) -> dict:\n"
+        "    forwarded = dict(factory_kwargs)\n"
+        f"{forward_lines}"
+        f"{coerce_line}"
+        "    module = importlib.import_module(impl_module)\n"
+        "    impl = getattr(module, impl_attr)\n"
+        "    return impl(**forwarded)\n"
+    )
+    namespace = {
+        "importlib": importlib,
+        "impl_module": spec.impl_module,
+        "impl_attr": spec.impl_attr,
+        "factory_kwargs": dict(spec.factory_kwargs),
+        "coerce_fn": spec.coerce_fn,
+    }
+    exec(compile(source, f"<locator-tool:{spec.name}>", "exec"), namespace)
+    wrapped = namespace["_wrapped"]
+    wrapped.__doc__ = spec.description
+    wrapped.__name__ = f"{spec.name}_tool"
+    return tool(spec.name)(wrapped)
+
+
+# Per-impl coerce shims. Match the pre-refactor coercions exactly so
+# each tool's kwarg map stays bit-for-bit equivalent (T3 / spec Focus
+# 1 numeric gate reads ``compare_facts`` columns; the empty /
+# non-empty split is load-bearing).
+
+
+def _coerce_compare_facts(forwarded: dict[str, Any]) -> dict[str, Any]:
+    """Match ``compare_facts``'s pre-refactor list / None coercion."""
+    forwarded["periods"] = list(forwarded.get("periods") or [])
+    document_ids = forwarded.get("document_ids")
+    forwarded["document_ids"] = (
+        list(document_ids) if document_ids else None
+    )
+    issuers = forwarded.get("issuers")
+    forwarded["issuers"] = list(issuers) if issuers else None
+    return forwarded
+
+
+def _coerce_statement(forwarded: dict[str, Any]) -> dict[str, Any]:
+    """Match ``three_year_statement``'s pre-refactor list coercion."""
+    forwarded["periods"] = list(forwarded.get("periods") or [])
+    forwarded["concepts"] = list(forwarded.get("concepts") or [])
+    return forwarded
+
+
+# The four consolidated factories. Each is now a one-line spec
+# binding; the @tool + lazy-import + kwargs-passthrough template is
+# in ``_make_locator_tool``.
+
+
+_COMPARE_FACTS_DESCRIPTION = (
+    "Compare one XBRL concept across periods and/or issuers.\n"
+    "\n"
+    "``concept`` is the XBRL tag (e.g. ``us-gaap:Revenues``).\n"
+    "``periods`` are the reporting periods to use as columns\n"
+    "(e.g. ``[\"2022-Q3-YTD\", \"2023-Q3-YTD\"]``). Rows come from\n"
+    "``issuers`` (tickers, resolved across that issuer's filings —\n"
+    "use this for cross-period) or ``document_ids`` (exact\n"
+    "filings); with neither, every filing holding facts is a row.\n"
+    "Returns a structured comparison table with per-cell locators\n"
+    "and code-computed deltas. Cells with no fact row are marked\n"
+    "``missing``; an unresolvable request returns the typed\n"
+    "``empty_comparison`` / ``comparison_overflow`` dict. Never\n"
+    "raises. Quote only the values this table reports."
+)
+
+_REDLINE_DESCRIPTION = "Compare paragraph text between two frozen filings."
+
+_EXTRACT_TABLES_DESCRIPTION = (
+    "Extract pipe-delimited tables from one frozen page."
+)
+
+_STATEMENT_DESCRIPTION = (
+    "Render three requested years from XBRL fact sidecars."
+)
+
+
 def _make_compare_facts_tool(facts_root: Path):
     """Build the ``compare_facts`` host tool (T3 / spec Focus 1).
 
     Cross-period and peer comparison is a HOST TOOL result, not a
-    prose table the model writes: the tool resolves each cell against
-    the ingest-built fact table (locator per cell) and computes the
-    deltas itself. Like ``get_xbrl_fact`` it contributes NO
-    ``EvidenceItem`` — a fact row is not page text, so the citation
-    verifier still requires a read / retrieve span before any prose
-    answer passes.
+    prose table the model writes: the tool resolves each cell
+    against the ingest-built fact table (locator per cell) and
+    computes the deltas itself. Like ``get_xbrl_fact`` it
+    contributes NO ``EvidenceItem`` — a fact row is not page text,
+    so the citation verifier still requires a read / retrieve span
+    before any prose answer passes.
 
-    Returns a plain dict so the prebuilt ``ToolNode`` serializes it as
-    ToolMessage JSON; ``tool_node_with_summaries`` then lifts the
-    ``comparison`` envelope onto ``AgentState`` for the turn row, and
-    the numeric gate reads its columns as ``(concept, period)``
-    claims.
+    Returns a plain dict so the prebuilt ``ToolNode`` serializes
+    it as ToolMessage JSON; ``tool_node_with_summaries`` then
+    lifts the ``comparison`` envelope onto ``AgentState`` for the
+    turn row, and the numeric gate reads its columns as
+    ``(concept, period)`` claims.
     """
-
-    @tool("compare_facts")
-    def compare_facts_tool(
-        concept: str,
-        periods: list[str],
-        document_ids: list[str] | None = None,
-        issuers: list[str] | None = None,
-    ) -> dict:
-        """Compare one XBRL concept across periods and/or issuers.
-
-        ``concept`` is the XBRL tag (e.g. ``us-gaap:Revenues``).
-        ``periods`` are the reporting periods to use as columns
-        (e.g. ``["2022-Q3-YTD", "2023-Q3-YTD"]``). Rows come from
-        ``issuers`` (tickers, resolved across that issuer's filings —
-        use this for cross-period) or ``document_ids`` (exact
-        filings); with neither, every filing holding facts is a row.
-        Returns a structured comparison table with per-cell locators
-        and code-computed deltas. Cells with no fact row are marked
-        ``missing``; an unresolvable request returns the typed
-        ``empty_comparison`` / ``comparison_overflow`` dict. Never
-        raises. Quote only the values this table reports.
-        """
-        from fin.host.tools.compare_facts import compare_facts
-
-        return compare_facts(
-            concept=concept,
-            periods=list(periods or []),
-            document_ids=list(document_ids) if document_ids else None,
-            issuers=list(issuers) if issuers else None,
-            facts_root=facts_root,
+    return _make_locator_tool(
+        _LocatorToolSpec(
+            name="compare_facts",
+            description=_COMPARE_FACTS_DESCRIPTION,
+            signature=(
+                "concept: str, "
+                "periods: list[str], "
+                "document_ids: list[str] | None = None, "
+                "issuers: list[str] | None = None"
+            ),
+            impl_module="fin.host.tools.compare_facts",
+            impl_attr="compare_facts",
+            factory_kwargs={"facts_root": facts_root},
+            coerce_fn=_coerce_compare_facts,
         )
-
-    return compare_facts_tool
+    )
 
 
 def _make_redline_tool(manifest_path: Path, extracted_root: Path):
     """Build the locator-bound paragraph redline host tool."""
-
-    @tool("redline")
-    def redline_tool(
-        before_document_id: str,
-        before_version: str,
-        after_document_id: str,
-        after_version: str,
-    ) -> dict:
-        """Compare paragraph text between two frozen filings."""
-        from fin.host.tools.redline import redline
-
-        return redline(
-            before_document_id=before_document_id,
-            before_version=before_version,
-            after_document_id=after_document_id,
-            after_version=after_version,
-            manifest_path=manifest_path,
-            extracted_root=extracted_root,
+    return _make_locator_tool(
+        _LocatorToolSpec(
+            name="redline",
+            description=_REDLINE_DESCRIPTION,
+            signature=(
+                "before_document_id: str, "
+                "before_version: str, "
+                "after_document_id: str, "
+                "after_version: str"
+            ),
+            impl_module="fin.host.tools.redline",
+            impl_attr="redline",
+            factory_kwargs={
+                "manifest_path": manifest_path,
+                "extracted_root": extracted_root,
+            },
         )
-
-    return redline_tool
+    )
 
 
 def _make_table_extract_tool(manifest_path: Path, extracted_root: Path):
     """Build the locator-bound page table extraction tool."""
-
-    @tool("extract_tables")
-    def extract_tables_tool(
-        document_id: str,
-        version: str,
-        page: int = 1,
-    ) -> dict:
-        """Extract pipe-delimited tables from one frozen page."""
-        from fin.host.tools.table_extract import extract_tables
-
-        return extract_tables(
-            document_id=document_id,
-            version=version,
-            page=page,
-            manifest_path=manifest_path,
-            extracted_root=extracted_root,
+    return _make_locator_tool(
+        _LocatorToolSpec(
+            name="extract_tables",
+            description=_EXTRACT_TABLES_DESCRIPTION,
+            signature=(
+                "document_id: str, "
+                "version: str, "
+                "page: int = 1"
+            ),
+            impl_module="fin.host.tools.table_extract",
+            impl_attr="extract_tables",
+            factory_kwargs={
+                "manifest_path": manifest_path,
+                "extracted_root": extracted_root,
+            },
         )
-
-    return extract_tables_tool
+    )
 
 
 def _make_statement_tool(facts_root: Path):
     """Build the XBRL-backed three-year statement tool."""
-
-    @tool("three_year_statement")
-    def three_year_statement_tool(
-        issuer: str,
-        periods: list[str],
-        concepts: list[str],
-    ) -> dict:
-        """Render three requested years from XBRL fact sidecars."""
-        from fin.host.tools.statements import three_year_statement
-
-        return three_year_statement(
-            issuer=issuer,
-            periods=list(periods or []),
-            concepts=list(concepts or []),
-            facts_root=facts_root,
+    return _make_locator_tool(
+        _LocatorToolSpec(
+            name="three_year_statement",
+            description=_STATEMENT_DESCRIPTION,
+            signature=(
+                "issuer: str, "
+                "periods: list[str], "
+                "concepts: list[str]"
+            ),
+            impl_module="fin.host.tools.statements",
+            impl_attr="three_year_statement",
+            factory_kwargs={"facts_root": facts_root},
+            coerce_fn=_coerce_statement,
         )
-
-    return three_year_statement_tool
+    )
 
 
 class IssuerTask(TypedDict, total=False):
