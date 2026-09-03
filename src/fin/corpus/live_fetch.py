@@ -65,11 +65,14 @@ import html.parser
 import json
 import os
 import re
+import shutil
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-from fin.corpus.errors import IngestMissingError
+from fin.corpus.errors import IngestMissingError, MalformedExtractedIndexError
+from fin.corpus.normalization import normalize_frozen_text
 
 
 # Import at module level so tests can mock
@@ -330,22 +333,20 @@ class _TextExtractor(html.parser.HTMLParser):
 
 
 def _strip_html(body: bytes) -> str:
-    """Render the official HTML down to its visible text.
+    """Render the official HTML down to its visible frozen text.
 
     Deterministic by construction: decoding errors are replaced rather
-    than guessed at, non-breaking spaces collapse to ordinary ones,
-    and blank lines are dropped — so the same bytes always freeze to
-    the same unit text, which is what the citation verifier's
-    substring check depends on.
+    than guessed at, and the same bytes always freeze to the same unit
+    text, which is what the citation verifier's substring check depends
+    on. All character-level rules (whitespace, Unicode compatibility,
+    hyphens, soft line breaks) come from the single normalization
+    authority ``fin.corpus.normalization`` (SC17) — none are restated
+    here; this function only does the HTML-specific tag rendering.
     """
     parser = _TextExtractor()
     parser.feed(body.decode("utf-8", errors="replace"))
     parser.close()
-    lines = (
-        re.sub(r"[^\S\n]+", " ", line).strip()
-        for line in parser.text().replace("\xa0", " ").split("\n")
-    )
-    return "\n".join(line for line in lines if line)
+    return normalize_frozen_text(parser.text())
 
 
 def _chunk_unit_text(text: str) -> list[dict[str, object]]:
@@ -387,26 +388,14 @@ def _dump(payload: object) -> bytes:
 def _read_index_documents(index_path: Path) -> dict[str, dict[str, object]]:
     """Read the per-document records out of an existing ``_index.json``.
 
-    A missing index is an empty catalog. A present-but-unreadable one
-    is an EXIT: overwriting it would turn a damaged index into a
-    single-entry index and quietly drop every other document from the
-    query SSOT (ADR 0020).
+    Callers that treat a missing index as an empty catalog must probe
+    ``exists()`` first. A present-but-unreadable file is an EXIT:
+    overwriting it would turn a damaged index into a single-entry index
+    and quietly drop every other document from the query SSOT (ADR 0020).
     """
-    if not index_path.is_file():
-        return {}
-    try:
-        payload = json.loads(index_path.read_text())
-    except (json.JSONDecodeError, OSError) as exc:
-        raise IngestMissingError(
-            f"refusing to merge into an unreadable index: {index_path}"
-        ) from exc
-    documents = payload.get("documents") if isinstance(payload, dict) else None
-    if not isinstance(documents, dict):
-        raise IngestMissingError(
-            f"refusing to merge into an index with no 'documents' object: "
-            f"{index_path}"
-        )
-    return documents
+    from fin.corpus.extracted_index import parse_extracted_index_documents
+
+    return parse_extracted_index_documents(index_path)
 
 
 def _write_live_unit(
@@ -416,6 +405,7 @@ def _write_live_unit(
     source_url: str,
     extracted_root: Path,
     facts_root: Path,
+    existing_documents: dict[str, dict[str, object]] | None = None,
 ) -> str:
     """Freeze the primary document into the extracted tree.
 
@@ -429,7 +419,11 @@ def _write_live_unit(
 
     index_path = extracted_root / "_index.json"
     extracted_root.mkdir(parents=True, exist_ok=True)
-    documents = _read_index_documents(index_path)
+    documents = (
+        dict(existing_documents)
+        if existing_documents is not None
+        else _read_index_documents(index_path)
+    )
 
     doc_dir = extracted_root / accession
     doc_dir.mkdir(parents=True, exist_ok=True)
@@ -476,6 +470,320 @@ def _write_live_unit(
     return version
 
 
+def _read_manifest_payload(manifest_path: Path) -> dict[str, object]:
+    """Read the catalog manifest before staging any live artifacts.
+
+    A missing manifest is the initialization case. A present malformed
+    manifest is corruption, not an empty catalog, because treating it as
+    empty would discard rows owned by another ingest path.
+    """
+    if not manifest_path.exists():
+        return {"documents": []}
+    try:
+        payload = json.loads(manifest_path.read_text())
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        raise IngestMissingError(
+            f"refusing to merge into an unreadable manifest: {manifest_path}"
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(
+        payload.get("documents"), list
+    ):
+        raise IngestMissingError(
+            f"manifest has no 'documents' list: {manifest_path}"
+        )
+    if any(not isinstance(document, dict) for document in payload["documents"]):
+        raise IngestMissingError(
+            f"manifest has an invalid document record: {manifest_path}"
+        )
+    return payload
+
+
+def _live_manifest_payload(
+    *,
+    manifest_payload: dict[str, object],
+    cik: str,
+    accession: str,
+    primary_url: str,
+    body: bytes,
+    version: str,
+) -> dict[str, object]:
+    """Return a manifest copy with the live accession registered.
+
+    Existing metadata for the same accession is reused when available.
+    A fetch with no prior catalog row gets explicit placeholder values
+    for fields that cannot be inferred from the two live-fetch inputs.
+    """
+    documents = list(manifest_payload["documents"])
+    template: dict[str, object] = {}
+    for document in documents:
+        if document.get("document_id") == accession or document.get(
+            "accession"
+        ) == accession:
+            template = dict(document)
+            break
+
+    filename = primary_url.rsplit("/", 1)[-1]
+    row = {
+        **template,
+        "document_id": accession,
+        "source_id": template.get("source_id", f"EDGAR-{cik}"),
+        "company": template.get("company", cik),
+        "ticker": template.get("ticker"),
+        "cik": cik,
+        "accession": accession,
+        "filing_date": template.get("filing_date"),
+        "form": template.get("form"),
+        "period": template.get("period", "live"),
+        "doc_type": template.get("doc_type", template.get("form")),
+        "filename": filename,
+        "upstream_name": template.get("upstream_name", filename),
+        "bytes": len(body),
+        "sha256": version,
+    }
+    documents = [
+        document
+        for document in documents
+        if document.get("document_id") != accession
+    ]
+    documents.append(row)
+    return {**manifest_payload, "documents": documents}
+
+
+def _move_to_backup(target: Path, backup: Path) -> bool:
+    """Move an existing publish target aside on the same filesystem."""
+    if not target.exists() and not target.is_symlink():
+        return False
+    os.replace(target, backup)
+    return True
+
+
+_PUBLISH_JOURNAL_NAME = ".live-fetch-publish.json"
+
+
+def _publish_journal_path(manifest_path: Path) -> Path:
+    return manifest_path.parent / _PUBLISH_JOURNAL_NAME
+
+
+def _remove_publish_target(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def _read_publish_journal(journal_path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(journal_path.read_text())
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        raise IngestMissingError(
+            f"malformed live publish journal: {journal_path}"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("state") not in {"prepared", "committed"}
+        or not isinstance(payload.get("entries"), list)
+        or not isinstance(payload.get("cleanup_dirs"), list)
+    ):
+        raise IngestMissingError(
+            f"invalid live publish journal: {journal_path}"
+        )
+    return payload
+
+
+def _decode_publish_journal_entries(
+    raw_entries: object,
+    *,
+    journal_path: Path,
+) -> list[tuple[Path, Path, Path, bool]]:
+    """Decode journal entry rows into typed path tuples."""
+    if not isinstance(raw_entries, list):
+        raise IngestMissingError(
+            f"invalid live publish journal entries: {journal_path}"
+        )
+    entries: list[tuple[Path, Path, Path, bool]] = []
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict):
+            raise IngestMissingError(
+                f"invalid live publish journal entry: {journal_path}"
+            )
+        staged = raw_entry.get("staged")
+        target = raw_entry.get("target")
+        backup = raw_entry.get("backup")
+        target_existed = raw_entry.get("target_existed")
+        if (
+            not all(isinstance(path, str) for path in (staged, target, backup))
+            or not isinstance(target_existed, bool)
+        ):
+            raise IngestMissingError(
+                f"invalid live publish journal entry: {journal_path}"
+            )
+        entries.append(
+            (Path(staged), Path(target), Path(backup), target_existed)
+        )
+    return entries
+
+
+def _rollback_uncommitted_publish_entries(
+    entries: list[tuple[Path, Path, Path, bool]],
+) -> None:
+    """Restore or discard targets for a journal still in ``prepared``."""
+    for staged, target, backup, target_existed in reversed(entries):
+        if backup.exists():
+            _remove_publish_target(target)
+            os.replace(backup, target)
+        elif not staged.exists() and not target_existed:
+            _remove_publish_target(target)
+
+
+def _cleanup_publish_journal(
+    *,
+    journal_path: Path,
+    raw_cleanup_dirs: object,
+) -> None:
+    """Remove staging/backup dirs recorded by the journal, then the journal."""
+    if not isinstance(raw_cleanup_dirs, list):
+        raise IngestMissingError(
+            f"invalid live publish cleanup path: {journal_path}"
+        )
+    for raw_dir in raw_cleanup_dirs:
+        if not isinstance(raw_dir, str):
+            raise IngestMissingError(
+                f"invalid live publish cleanup path: {journal_path}"
+            )
+        shutil.rmtree(raw_dir, ignore_errors=True)
+    journal_path.unlink(missing_ok=True)
+
+
+def _recover_interrupted_publish(*, manifest_path: Path) -> None:
+    """Complete or roll back a publish left by a process crash.
+
+    The manifest is the catalog's commit pointer: it is replaced last.
+    The journal makes that pointer durable across a crash, so a later
+    live-fetch operation can discard every uncommitted target before it
+    reads the manifest or extracted index.
+    """
+    journal_path = _publish_journal_path(manifest_path)
+    if not journal_path.is_file():
+        return
+
+    payload = _read_publish_journal(journal_path)
+    entries = _decode_publish_journal_entries(
+        payload["entries"], journal_path=journal_path
+    )
+    committed = payload["state"] == "committed" or all(
+        not staged.exists() for staged, _target, _backup, _existed in entries
+    )
+    if not committed:
+        _rollback_uncommitted_publish_entries(entries)
+    _cleanup_publish_journal(
+        journal_path=journal_path,
+        raw_cleanup_dirs=payload["cleanup_dirs"],
+    )
+
+
+def _rollback_publish(
+    *,
+    published: list[Path],
+    backups: list[tuple[Path, Path]],
+) -> None:
+    """Restore targets after a failed multi-file publish attempt."""
+    for target in reversed(published):
+        _remove_publish_target(target)
+    for target, backup in reversed(backups):
+        if backup.exists():
+            os.replace(backup, target)
+
+
+def _publish_staged(
+    *,
+    staged_doc_dir: Path,
+    staged_index: Path,
+    staged_facts: Path,
+    staged_manifest: Path,
+    extracted_root: Path,
+    facts_root: Path,
+    manifest_path: Path,
+) -> None:
+    """Publish prepared artifacts with crash recovery across four targets.
+
+    Page and passage files are only written below staging directories.
+    A durable journal records the generation before any target is
+    replaced. The manifest is the catalog commit pointer and is last,
+    so catalog readers never discover an accession before its extracted
+    artifacts.
+    """
+    targets = [
+        (staged_doc_dir, extracted_root / staged_doc_dir.name, extracted_root),
+        (staged_facts, facts_root / staged_facts.name, facts_root),
+        (staged_index, extracted_root / "_index.json", extracted_root),
+        (staged_manifest, manifest_path, manifest_path.parent),
+    ]
+    backup_dirs: dict[Path, Path] = {}
+    for _staged, target, parent in targets:
+        # ``setdefault`` would evaluate its default on every visit, and a
+        # parent visited twice (``extracted_root`` holds both the
+        # accession dir and ``_index.json``) would then leak one backup
+        # dir the cleanup below never learns about.
+        if parent not in backup_dirs:
+            backup_dirs[parent] = Path(
+                tempfile.mkdtemp(prefix=".live-publish-backup-", dir=parent)
+            )
+
+    journal_path = _publish_journal_path(manifest_path)
+    journal_entries = [
+        {
+            "staged": str(staged),
+            "target": str(target),
+            "backup": str(backup_dirs[parent] / target.name),
+            "target_existed": target.exists(),
+        }
+        for staged, target, parent in targets
+    ]
+    cleanup_dirs = [
+        str(staged_doc_dir.parent),
+        str(staged_facts.parent),
+        str(staged_manifest.parent),
+        *(str(backup_dir) for backup_dir in backup_dirs.values()),
+    ]
+    published: list[Path] = []
+    backups: list[tuple[Path, Path]] = []
+    try:
+        _atomic_write(
+            journal_path,
+            _dump(
+                {
+                    "cleanup_dirs": cleanup_dirs,
+                    "entries": journal_entries,
+                    "state": "prepared",
+                }
+            ),
+        )
+        for staged, target, parent in targets:
+            backup = backup_dirs[parent] / target.name
+            if _move_to_backup(target, backup):
+                backups.append((target, backup))
+            published.append(target)
+            os.replace(staged, target)
+        _atomic_write(
+            journal_path,
+            _dump(
+                {
+                    "cleanup_dirs": cleanup_dirs,
+                    "entries": journal_entries,
+                    "state": "committed",
+                }
+            ),
+        )
+        journal_path.unlink(missing_ok=True)
+    except BaseException:
+        _rollback_publish(published=published, backups=backups)
+        journal_path.unlink(missing_ok=True)
+        raise
+    finally:
+        for backup_dir in backup_dirs.values():
+            shutil.rmtree(backup_dir, ignore_errors=True)
+
+
 def fetch_and_ingest(
     *,
     cik: str,
@@ -503,25 +811,77 @@ def fetch_and_ingest(
         The accession listing names no primary document. Nothing was
         written; re-run with ``primary_doc``.
     """
+    _recover_interrupted_publish(manifest_path=manifest_path)
+    # Validate an existing extracted index before resolving or fetching the
+    # remote document. A caller-supplied primary_doc skips the SEC listing,
+    # but it must not skip the local corruption guard.
+    existing_documents = (
+        _read_index_documents(extracted_root / "_index.json")
+        if (extracted_root / "_index.json").exists()
+        else {}
+    )
+    # Validate the local catalog before any network call. A malformed
+    # caller-owned manifest is a typed local failure, not permission to
+    # contact SEC while trying to report that failure.
+    manifest_payload = _read_manifest_payload(manifest_path)
     ua = _read_ua()
     base_url = _accession_base_url(cik, accession)
     primary_url = _resolve_primary_url(
         base_url=base_url, ua=ua, accession=accession, primary_doc=primary_doc
     )
     body = _sec_get(primary_url, ua, accession=accession)
-    _write_live_unit(
-        accession=accession,
-        body=body,
-        source_url=primary_url,
-        extracted_root=extracted_root,
-        facts_root=facts_root,
+    version = _sha256_bytes(body)
+
+    extracted_root.parent.mkdir(parents=True, exist_ok=True)
+    facts_root.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    staged_extracted = Path(
+        tempfile.mkdtemp(prefix=".live-fetch-", dir=extracted_root.parent)
     )
-    # The ``manifest_path`` argument is part of the public API; the
-    # full manifest update (a catalog row keyed by ``accession``) lands
-    # when the live path can supply the row's company / period fields
-    # the frozen-12 rows carry. Until then the live tree is
-    # reachable by locator but not listed by ``list_files``.
-    _ = manifest_path
+    staged_facts_root = Path(
+        tempfile.mkdtemp(prefix=".live-fetch-facts-", dir=facts_root.parent)
+    )
+    staged_manifest_root = Path(
+        tempfile.mkdtemp(prefix=".live-fetch-manifest-", dir=manifest_path.parent)
+    )
+    try:
+        _write_live_unit(
+            accession=accession,
+            body=body,
+            source_url=primary_url,
+            extracted_root=staged_extracted,
+            facts_root=staged_facts_root,
+            existing_documents=existing_documents,
+        )
+        staged_manifest = staged_manifest_root / manifest_path.name
+        _atomic_write(
+            staged_manifest,
+            _dump(
+                _live_manifest_payload(
+                    manifest_payload=manifest_payload,
+                    cik=cik,
+                    accession=accession,
+                    primary_url=primary_url,
+                    body=body,
+                    version=version,
+                )
+            ),
+        )
+        extracted_root.mkdir(parents=True, exist_ok=True)
+        facts_root.mkdir(parents=True, exist_ok=True)
+        _publish_staged(
+            staged_doc_dir=staged_extracted / accession,
+            staged_index=staged_extracted / "_index.json",
+            staged_facts=staged_facts_root / f"{accession}.json",
+            staged_manifest=staged_manifest,
+            extracted_root=extracted_root,
+            facts_root=facts_root,
+            manifest_path=manifest_path,
+        )
+    finally:
+        shutil.rmtree(staged_extracted, ignore_errors=True)
+        shutil.rmtree(staged_facts_root, ignore_errors=True)
+        shutil.rmtree(staged_manifest_root, ignore_errors=True)
     return body
 
 
@@ -601,6 +961,14 @@ def main(argv: list[str] | None = None) -> int:
     except SecPrimaryDocUnresolvedError as exc:
         print(f"live_fetch: primary_doc_unresolved: {exc}", file=sys.stderr)
         return 4
+    except MalformedExtractedIndexError as exc:
+        print(f"live_fetch: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    except IngestMissingError as exc:
+        # Journal / manifest / catalog typed failures (and any other
+        # IngestMissingError subclass not matched above).
+        print(f"live_fetch: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     print(
         f"live_fetch: accession={args.accession} "
         f"version={_sha256_bytes(body)} bytes={len(body)}"

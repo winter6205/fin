@@ -1,0 +1,16 @@
+{
+  "schema": "fin.retrieve.capability_keys/1",
+  "published_by": "iknow-memory (retrieval service holds the naming authority, ADR 0039)",
+  "transcribed_from": "specs/corpus-retrieval.md §B4 row 「消融的 8 个能力项」",
+  "sync_point": "fin.retrieve.capabilities.assert_snapshot_matches_published",
+  "keys": [
+    "vector",
+    "keyword_bm25",
+    "cjk_segmentation",
+    "phrase",
+    "field_boost",
+    "graph_ppr",
+    "rrf",
+    "rerank"
+  ]
+}

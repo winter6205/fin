@@ -85,9 +85,9 @@ def _record_bound_adapter(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
     bound: list[Any] = []
     real_builder = graph_module._make_retrieve_tool
 
-    def _recording(adapter: Any):
+    def _recording(adapter: Any, **kwargs: Any):
         bound.append(adapter)
-        return real_builder(adapter)
+        return real_builder(adapter, **kwargs)
 
     monkeypatch.setattr(graph_module, "_make_retrieve_tool", _recording)
     return bound

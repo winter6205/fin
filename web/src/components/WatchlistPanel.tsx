@@ -20,6 +20,7 @@ import {
 export default function WatchlistPanel() {
   const watchlist = useWorkspaceStore((s) => s.watchlist);
   const notices = useWorkspaceStore((s) => s.notices);
+  const filingMonitorStatus = useWorkspaceStore((s) => s.filingMonitorStatus);
   const addWatch = useWorkspaceStore((s) => s.addWatch);
   const removeWatch = useWorkspaceStore((s) => s.removeWatch);
   const dismissNotice = useWorkspaceStore((s) => s.dismissNotice);
@@ -73,6 +74,12 @@ export default function WatchlistPanel() {
           </span>
         ) : null}
       </h2>
+
+      {filingMonitorStatus === "degraded" ? (
+        <p data-testid="filing-monitor-degraded" role="alert" className="mt-1 text-gray-700">
+          filing 监控源暂不可用；已保存的通知仍然保留。
+        </p>
+      ) : null}
 
       {unread.length > 0 ? (
         <ul data-testid="notice-list" className="mt-1.5 space-y-1">

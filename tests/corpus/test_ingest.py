@@ -18,11 +18,17 @@ import concurrent.futures
 import hashlib
 import json
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from fin.corpus.errors import IngestMissingError, ManifestShaMismatchError
+from fin.corpus.errors import (
+    IngestMissingError,
+    MalformedExtractedIndexError,
+    ManifestShaMismatchError,
+)
 from fin.corpus.extracted import Locator, load_extracted_tree
 from fin.corpus.ingest import run_ingest
 
@@ -108,9 +114,23 @@ def real_ingested_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
     exercising the public ``run_ingest`` entry point over the actual
     frozen data. Tests that need to mutate the tree restore files in a
     ``finally`` block so the next test sees an intact tree.
+
+    Plan C added 8 EDGAR iXBRL primary documents (html_live kind,
+    frozen by ``fin.corpus.live_fetch``); they are not in scope for the
+    local re-ingest path. Copy their already-frozen artifacts from the
+    committed extracted tree into the fixture's tmp root before
+    ``run_ingest`` so the merged tree still satisfies the catalog.
     """
     manifest_path, pdf_dir, _ = _real_manifest()
     extracted_root = tmp_path_factory.mktemp("real-ingest") / "extracted"
+    extracted_root.mkdir(parents=True, exist_ok=True)
+    committed_extracted = _project_data_dir() / "extracted"
+    for entry in committed_extracted.iterdir():
+        target = extracted_root / entry.name
+        if entry.is_dir():
+            shutil.copytree(entry, target)
+        elif entry.is_file():
+            shutil.copyfile(entry, target)
     run_ingest(
         manifest_path=manifest_path,
         pdf_dir=pdf_dir,
@@ -197,16 +217,92 @@ def test_run_ingest_missing_pdf_raises_typed_error(tmp_path: Path) -> None:
     assert not (extracted_root / "TEST-2023Q1").exists()
 
 
+def test_run_ingest_malformed_existing_index_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """A present malformed index is corruption, not a missing index.
+
+    Ingest must raise before it computes or writes a replacement index.
+    The original bytes are the evidence needed to repair the extracted
+    tree, so they must remain untouched.
+    """
+    manifest_path = tmp_path / "manifest.json"
+    pdf_dir = tmp_path / "pdf"
+    extracted_root = tmp_path / "extracted"
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    _write_manifest(manifest_path, documents=[])
+
+    extracted_root.mkdir()
+    damaged = extracted_root / "_index.json"
+    original = b"{ this is not valid json"
+    damaged.write_bytes(original)
+
+    with pytest.raises(MalformedExtractedIndexError):
+        run_ingest(
+            manifest_path=manifest_path,
+            pdf_dir=pdf_dir,
+            extracted_root=extracted_root,
+        )
+
+    assert damaged.read_bytes() == original
+
+
+def test_ingest_process_returns_nonzero_for_malformed_existing_index(
+    tmp_path: Path,
+) -> None:
+    """The ingest CLI exposes the typed corruption failure as non-zero."""
+    manifest_path = tmp_path / "manifest.json"
+    pdf_dir = tmp_path / "pdf"
+    extracted_root = tmp_path / "extracted"
+    facts_root = tmp_path / "facts"
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+    _write_manifest(manifest_path, documents=[])
+
+    extracted_root.mkdir()
+    damaged = extracted_root / "_index.json"
+    original = b"{ this is not valid json"
+    damaged.write_bytes(original)
+
+    process = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "fin.corpus.ingest",
+            "--manifest",
+            str(manifest_path),
+            "--pdf-dir",
+            str(pdf_dir),
+            "--extracted-root",
+            str(extracted_root),
+            "--facts-root",
+            str(facts_root),
+            "--ocr-engine",
+            "none",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert process.returncode != 0
+    assert "MalformedExtractedIndexError" in process.stderr
+    assert damaged.read_bytes() == original
+
+
 def test_run_ingest_sha_drift_raises_typed_error(tmp_path: Path) -> None:
     """Manifest sha256 does not match the on-disk PDF.
 
     Boundary class "negative": the operator's ``data/corpus/pdf/`` has
     drifted (a byte was added or modified). ``run_ingest`` must refuse
     to extract from the drifted source rather than silently re-extract.
+
+    Plan C added 8 EDGAR iXBRL primary docs (html_live kind); the
+    local re-ingest path only owns PDF-kind entries, so pick a PDF.
     """
     _, pdf_dir, real_docs = _real_manifest()
+    pdf_docs = [d for d in real_docs if str(d.get("filename", "")).lower().endswith(".pdf")]
     # Copy the first real PDF into the temp pdf_dir.
-    sample = real_docs[0]
+    sample = pdf_docs[0]
     src_pdf = pdf_dir / sample["filename"]
     test_pdf_dir = tmp_path / "pdf"
     test_pdf_dir.mkdir(parents=True, exist_ok=True)
@@ -248,9 +344,22 @@ def test_load_extracted_tree_missing_page_raises_typed_error(
     Boundary "overflow": delete one page file from a populated tree,
     then ask the loader to validate. The loader must refuse with the
     typed error and not silently produce a truncated tree.
+
+    Plan C added EDGAR iXBRL primary docs (single-page html_live
+    kind); pick the first multi-page PDF kind instead so the test
+    can still delete a mid-range page.
     """
-    manifest_path, _, _ = _real_manifest()
-    doc_id = sorted(p.name for p in real_ingested_tree.iterdir() if p.is_dir())[0]
+    manifest_path, _, real_docs = _real_manifest()
+    pdf_doc_ids = {
+        d["document_id"]
+        for d in real_docs
+        if str(d.get("filename", "")).lower().endswith(".pdf")
+    }
+    doc_id = sorted(
+        p.name
+        for p in real_ingested_tree.iterdir()
+        if p.is_dir() and p.name in pdf_doc_ids
+    )[0]
     doc_dir = real_ingested_tree / doc_id
     page_files = sorted(p for p in doc_dir.glob("page-*.json"))
     assert len(page_files) >= 2
@@ -326,8 +435,17 @@ def test_load_extracted_tree_malformed_json_raises_typed_error(
     so callers can rely on ``IngestMissingError`` as the single
     recovery signal.
     """
-    manifest_path, _, _ = _real_manifest()
-    doc_id = sorted(p.name for p in real_ingested_tree.iterdir() if p.is_dir())[0]
+    manifest_path, _, real_docs = _real_manifest()
+    pdf_doc_ids = {
+        d["document_id"]
+        for d in real_docs
+        if str(d.get("filename", "")).lower().endswith(".pdf")
+    }
+    doc_id = sorted(
+        p.name
+        for p in real_ingested_tree.iterdir()
+        if p.is_dir() and p.name in pdf_doc_ids
+    )[0]
     doc_dir = real_ingested_tree / doc_id
     page_files = sorted(p for p in doc_dir.glob("page-*.json"))
     victim = page_files[len(page_files) // 2]

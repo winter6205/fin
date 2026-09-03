@@ -71,7 +71,9 @@ from typing import Any, Iterable, Mapping
 
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 
+from fin.host.degradation_notice import DEGRADATION_NOTICE_FIELD
 from fin.host.tools.issuer_fanout import ISSUER_FANOUT_TOOL
+from fin.retrieve.degradation import degraded_reasons_for_display
 
 
 # ----- chunk assembly -----
@@ -803,11 +805,31 @@ def _retrieve_error_line(args: dict[str, Any], error: str) -> str:
     )
 
 
+def _degradation_clause(result: dict[str, Any] | None) -> str:
+    """The visible degradation note for one ``retrieve`` row (T20 / SC39).
+
+    Prefers the notice the host already rendered; falls back to expanding
+    the verbatim ``degraded_reasons`` so a result that reached this
+    renderer another way still names every reason rather than passing as
+    an ordinary hit count.
+    """
+    if not isinstance(result, dict):
+        return ""
+    notice = result.get(DEGRADATION_NOTICE_FIELD)
+    if isinstance(notice, str) and notice:
+        return f" | {notice}"
+    reasons = degraded_reasons_for_display(result)
+    if not reasons:
+        return ""
+    return f" | degraded: {'; '.join(reasons)}"
+
+
 def summarize_retrieve(
     *,
     chunks: list[Any] | None = None,
     args: dict[str, Any] | None = None,
     error: str | None = None,
+    degradation: str = "",
 ) -> str:
     """Human-readable one-liner for ``retrieve`` calls.
 
@@ -822,10 +844,14 @@ def summarize_retrieve(
     ``error`` is the tool's typed EXIT token (``retrieve_unavailable``);
     when set it replaces the hit count with prose, and an unmapped
     token still renders readably rather than blank.
+
+    ``degradation`` is the §B3 note (T20): appended to either shape,
+    because a degraded response is neither an ordinary hit count nor an
+    ordinary outage and must say so where the operator reads the run.
     """
     args = args or {}
     if error:
-        return _retrieve_error_line(args, error)
+        return _retrieve_error_line(args, error) + degradation
 
     hits = len(chunks) if chunks else 0
     query_value = args.get("query")
@@ -840,7 +866,7 @@ def summarize_retrieve(
     locator_suffix = _retrieve_locator_suffix(chunks)
     hits_noun = "hit" if hits == 1 else "hits"
     head = f"{query!r}: {hits} {hits_noun}" if query else f"{hits} {hits_noun}"
-    return f"{head}{doc_filter}{locator_suffix}"
+    return f"{head}{doc_filter}{locator_suffix}{degradation}"
 
 
 def summarize_read_file(
@@ -1007,6 +1033,54 @@ def summarize_compare_facts(
     )
 
 
+def _analysis_result(
+    result: dict[str, Any] | None, key: str
+) -> tuple[dict[str, Any], str | None]:
+    src = result if isinstance(result, dict) else {}
+    value = src.get(key)
+    return (value if isinstance(value, dict) else {}), (
+        str(src["error"]) if src.get("error") else None
+    )
+
+
+def summarize_redline(
+    *, result: dict[str, Any] | None = None, args: dict[str, Any] | None = None
+) -> str:
+    """Summarize a structured paragraph redline without raw JSON."""
+    redline, error = _analysis_result(result, "redline")
+    if error:
+        return f"redline ({error})"
+    changes = redline.get("changes")
+    if not isinstance(changes, list):
+        return "redline"
+    return f"redline · {len(changes)} paragraphs"
+
+
+def summarize_table_extract(
+    *, result: dict[str, Any] | None = None, args: dict[str, Any] | None = None
+) -> str:
+    """Summarize a locator-bound table extraction."""
+    table_extract, error = _analysis_result(result, "table_extract")
+    if error:
+        return f"tables ({error})"
+    tables = table_extract.get("tables")
+    return f"tables · {len(tables)} extracted" if isinstance(tables, list) else "tables"
+
+
+def summarize_statement(
+    *, result: dict[str, Any] | None = None, args: dict[str, Any] | None = None
+) -> str:
+    """Summarize an XBRL-backed three-year statement."""
+    statement, error = _analysis_result(result, "statement")
+    if error:
+        return f"statement ({error})"
+    rows = statement.get("rows")
+    periods = statement.get("periods")
+    if isinstance(rows, list) and isinstance(periods, list):
+        return f"statement · {len(rows)} rows × {len(periods)} years"
+    return "statement"
+
+
 def summarize_research_issuers(
     *,
     result: dict[str, Any] | None = None,
@@ -1089,13 +1163,24 @@ def format_tool_summary(
         return summarize_list_files(filings=filings, args=args)
     if name == "retrieve":
         chunks, error = _retrieve_chunks_error(result_dict)
-        return summarize_retrieve(chunks=chunks, args=args, error=error)
+        return summarize_retrieve(
+            chunks=chunks,
+            args=args,
+            error=error,
+            degradation=_degradation_clause(result_dict),
+        )
     if name == "read_file":
         return summarize_read_file(result=result_dict, args=args)
     if name == "get_xbrl_fact":
         return summarize_get_xbrl_fact(result=result_dict, args=args)
     if name == "compare_facts":
         return summarize_compare_facts(result=result_dict, args=args)
+    if name == "redline":
+        return summarize_redline(result=result_dict, args=args)
+    if name == "extract_tables":
+        return summarize_table_extract(result=result_dict, args=args)
+    if name == "three_year_statement":
+        return summarize_statement(result=result_dict, args=args)
     if name == ISSUER_FANOUT_TOOL:
         return summarize_research_issuers(result=result_dict, args=args)
     return name or "tool"
@@ -1117,6 +1202,9 @@ __all__ = [
     "strip_thinking_from_answer",
     "summarize_compare_facts",
     "summarize_get_xbrl_fact",
+    "summarize_redline",
+    "summarize_statement",
+    "summarize_table_extract",
     "summarize_list_files",
     "summarize_read_file",
     "summarize_research_issuers",

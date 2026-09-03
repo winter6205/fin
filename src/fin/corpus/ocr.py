@@ -60,6 +60,8 @@ class OcrRequiredUnavailableError(OCRError):
     shape so the host graph / CLI can refuse cleanly.
     """
 
+    code = "ocr_required_unavailable"
+
 
 class TesseractEngine:
     """Production OCR engine backed by ``pytesseract``.

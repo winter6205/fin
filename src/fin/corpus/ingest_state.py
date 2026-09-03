@@ -1,23 +1,15 @@
 """Ingest state machine and process-level audit trail.
 
-The ingest pipeline owns the following state graph::
+The ingest pipeline follows::
 
     PENDING -> FETCHING -> EXTRACTING -> OCR -> CATALOGING -> READY
                    |            |          |
                    +------------+----------+----> FAILED
 
-``EXTRACTING`` may also transition directly to ``CATALOGING`` when OCR
-is not required. Any non-terminal state may transition to ``FAILED``.
-A failed job may be retried by transitioning it to ``FETCHING``. ``READY``
-is terminal.
-
-``InMemoryIngestStateStore`` is deliberately an interface-shaped local
-implementation. Later wiring can replace it with a Postgres-backed store
-without changing the ingest caller: create a job, call ``transition`` for
-successful steps, and call ``fail_step`` from the step exception boundary.
-Each accepted or rejected operation produces an audit row containing the
-process-level actor, action, and UTC timestamp. There is no authentication
-or user identity assumption in this local implementation.
+``EXTRACTING`` may transition directly to ``CATALOGING`` when OCR is not
+required. A failed job may retry from ``FAILED`` to ``FETCHING``. ``READY``
+is terminal. Every accepted or rejected operation records an audit row
+with a process actor, action, metadata, and UTC timestamp.
 """
 
 from __future__ import annotations
@@ -25,10 +17,11 @@ from __future__ import annotations
 import os
 import socket
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Mapping, NoReturn
+from typing import Any, NoReturn, Protocol, runtime_checkable
 
 from fin.corpus.ingest_state_errors import (
     AuditOverflowError,
@@ -42,7 +35,7 @@ from fin.corpus.ingest_state_errors import (
 
 
 class IngestState(str, Enum):
-    """Persistable states for one document ingest job."""
+    """Persistable state for one document ingest job."""
 
     PENDING = "pending"
     FETCHING = "fetching"
@@ -65,6 +58,40 @@ class IngestJob:
     error_message: str | None = None
 
 
+@runtime_checkable
+class IngestStateStore(Protocol):
+    """Persistence port used by the ingest step orchestrator."""
+
+    def create_job(
+        self,
+        document_id: str,
+        *,
+        actor: str | None = None,
+    ) -> IngestJob: ...
+
+    def transition(
+        self,
+        document_id: str,
+        to_state: IngestState | str,
+        *,
+        actor: str | None = None,
+        expected_state: IngestState | str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> IngestState: ...
+
+    def get_job(self, document_id: str) -> IngestJob: ...
+
+    def fail_step(
+        self,
+        document_id: str,
+        *,
+        step: str,
+        cause: BaseException,
+        actor: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> NoReturn: ...
+
+
 @dataclass(frozen=True)
 class IngestAuditRow:
     """One process-level state-machine audit record."""
@@ -82,14 +109,18 @@ class IngestAuditRow:
 
 
 _ALLOWED_TRANSITIONS: dict[IngestState, frozenset[IngestState]] = {
-    IngestState.PENDING: frozenset({IngestState.FETCHING, IngestState.FAILED}),
+    IngestState.PENDING: frozenset(
+        {IngestState.FETCHING, IngestState.FAILED}
+    ),
     IngestState.FETCHING: frozenset(
         {IngestState.EXTRACTING, IngestState.FAILED}
     ),
     IngestState.EXTRACTING: frozenset(
         {IngestState.OCR, IngestState.CATALOGING, IngestState.FAILED}
     ),
-    IngestState.OCR: frozenset({IngestState.CATALOGING, IngestState.FAILED}),
+    IngestState.OCR: frozenset(
+        {IngestState.CATALOGING, IngestState.FAILED}
+    ),
     IngestState.CATALOGING: frozenset({IngestState.READY, IngestState.FAILED}),
     IngestState.FAILED: frozenset({IngestState.FETCHING}),
     IngestState.READY: frozenset(),
@@ -97,9 +128,9 @@ _ALLOWED_TRANSITIONS: dict[IngestState, frozenset[IngestState]] = {
 
 
 def _process_actor() -> str:
-    """Return a stable-enough local actor identity without auth."""
-    username = os.environ.get("USER") or "unknown-user"
-    return f"{username}@{socket.gethostname()} pid={os.getpid()}"
+    """Return a local process identity without assuming authentication."""
+    username = os.environ.get("USER") or os.environ.get("USERNAME")
+    return f"{username or 'unknown-user'}@{socket.gethostname()} pid={os.getpid()}"
 
 
 def _coerce_state(value: IngestState | str) -> IngestState:
@@ -112,11 +143,10 @@ def _coerce_state(value: IngestState | str) -> IngestState:
 
 
 class InMemoryIngestStateStore:
-    """Thread-safe in-memory state and audit store for local ingest.
+    """Thread-safe local state and audit store.
 
-    The lock makes the read/validate/write transition atomic. In a race,
-    exactly one caller can move a job into a state; a duplicate attempt is
-    reported as ``IngestBusyError`` and remains auditable.
+    The read/validate/write transition is atomic. A concurrent duplicate
+    transition is rejected as a typed busy error and remains auditable.
     """
 
     def __init__(self, *, max_audit_entries: int | None = None) -> None:
@@ -127,7 +157,12 @@ class InMemoryIngestStateStore:
         self._max_audit_entries = max_audit_entries
         self._lock = threading.RLock()
 
-    def create_job(self, document_id: str, *, actor: str | None = None) -> IngestJob:
+    def create_job(
+        self,
+        document_id: str,
+        *,
+        actor: str | None = None,
+    ) -> IngestJob:
         """Create a pending job and audit its creation."""
         self._validate_document_id(document_id)
         with self._lock:
@@ -167,8 +202,11 @@ class InMemoryIngestStateStore:
                 for document_id in sorted(self._jobs)
             )
 
-    def list_audit(self, document_id: str | None = None) -> tuple[IngestAuditRow, ...]:
-        """Return a deterministic snapshot of all or one job's audit rows."""
+    def list_audit(
+        self,
+        document_id: str | None = None,
+    ) -> tuple[IngestAuditRow, ...]:
+        """Return all audit rows or only rows for one document."""
         with self._lock:
             if document_id is None:
                 return tuple(self._audit)
@@ -185,12 +223,7 @@ class InMemoryIngestStateStore:
         expected_state: IngestState | str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> IngestState:
-        """Atomically transition a job and return its new state.
-
-        ``expected_state`` is an optional optimistic-concurrency guard.
-        A mismatch is typed as busy, and the attempted operation still
-        receives a rejection audit row.
-        """
+        """Atomically transition a job and return its new state."""
         target = _coerce_state(to_state)
         expected = (
             _coerce_state(expected_state)
@@ -250,8 +283,8 @@ class InMemoryIngestStateStore:
         actor: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> NoReturn:
-        """Mark a non-ready job failed, audit it, and raise a typed error."""
-        if not step.strip():
+        """Mark a non-terminal job failed, audit it, and raise typed."""
+        if not isinstance(step, str) or not step.strip():
             raise ValueError("step must not be empty")
         with self._lock:
             job = self._require_job(document_id)
@@ -350,7 +383,7 @@ class InMemoryIngestStateStore:
         self,
         job: IngestJob,
         target: IngestState,
-        error: IngestStateErrorLike,
+        error: IllegalTransitionError | IngestBusyError,
         *,
         actor: str | None,
         metadata: Mapping[str, Any] | None,
@@ -370,7 +403,21 @@ class InMemoryIngestStateStore:
         )
 
 
-IngestStateErrorLike = IllegalTransitionError | IngestBusyError
+def ingest_state_store_from_env(
+    environ: Mapping[str, str] | None = None,
+) -> InMemoryIngestStateStore:
+    """Return the local state/audit implementation.
+
+    The environment argument is accepted so a future durable adapter can
+    be selected without changing the ingest caller. The default remains
+    in-memory and offline, as required by the test contract.
+    """
+    del environ
+    return InMemoryIngestStateStore()
+
+
+default_ingest_state_store = ingest_state_store_from_env
+create_ingest_state_store = ingest_state_store_from_env
 
 
 __all__ = [
@@ -378,4 +425,8 @@ __all__ = [
     "IngestAuditRow",
     "IngestJob",
     "IngestState",
+    "IngestStateStore",
+    "create_ingest_state_store",
+    "default_ingest_state_store",
+    "ingest_state_store_from_env",
 ]

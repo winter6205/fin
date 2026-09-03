@@ -10,7 +10,7 @@ The workspace routes sit on the same FastAPI app as the v1
   ``text/event-stream`` with terminal ``status`` / ``citations`` /
   ``answer`` events (T1 is sync invoke wrapped in an event stream
   - T3 will replace this with token-by-token streaming);
-* corpus list: ``GET /api/corpus`` returns the real 12 filings.
+* corpus list: ``GET /api/corpus`` returns the expanded filing library.
 
 Pattern
 -------
@@ -862,17 +862,17 @@ def test_create_thread_lets_store_mint_the_id(client: TestClient, fresh_store) -
 # ----- corpus endpoint -----
 
 
-def test_get_corpus_returns_twelve_filings_with_required_keys(
+def test_get_corpus_returns_library_filings_with_required_keys(
     client: TestClient, fresh_store
 ) -> None:
-    """``GET /api/corpus`` returns the frozen 12 filings with the
+    """``GET /api/corpus`` returns the expanded library with the
     ADR 0009 shape."""
     r = client.get("/api/corpus")
     assert r.status_code == 200
     body = r.json()
     assert "filings" in body
     filings = body["filings"]
-    assert len(filings) == 12
+    assert len(filings) >= 21
 
     for f in filings:
         # SC3 adds ``form`` to the card; the rest of the EDGAR-shaped
@@ -887,11 +887,16 @@ def test_get_corpus_returns_twelve_filings_with_required_keys(
         }
         assert isinstance(f["page_count"], int)
         assert f["page_count"] >= 1
-        assert f["form"] == "10-Q"
+        assert f["form"] in {"10-Q", "10-K"}
 
     ids = sorted(f["document_id"] for f in filings)
     expected_substrings = {"AAPL-2022Q3", "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
     assert expected_substrings.issubset(set(ids))
+    assert "GOOG-2023FY" in ids
+    goog = next(f for f in filings if f["document_id"] == "GOOG-2023FY")
+    assert goog["company"] == "GOOG"
+    assert goog["period"] == "2023 FY"
+    assert goog["form"] == "10-K"
     # Defensive: never return prototype-style ids.
     assert not any("Q3-2024" in fid for fid in ids)
 
@@ -1865,6 +1870,90 @@ def test_resume_after_complete_aimessage_does_not_regenerate_that_message(
     assert next(d for n, d in events if n == "status")["status"] == "done"
     # Exactly ONE new model call after resume (the post-tool answer).
     assert model.call_count == 2, model.call_count
+
+
+def test_resume_reuses_checkpoint_run_id_for_sse_and_persisted_turn(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """Crash resume continues the in-flight run, not a new run.
+
+    The checkpoint metadata carries the canonical id minted for the
+    original send. Resume must use that same id on its status frame and
+    on the persisted remainder row so the optimistic turn can reconcile
+    with storage without an unreconcilable UUID.
+    """
+    g, _model = _install_crash_graph(http_app, aapl_page1_text)
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    tid = created["id"]
+    canonical_run_id = "7f4a8c2e-2c4e-4f7e-9e47-8d8f8c6b1a2d"
+
+    cfg = {
+        "configurable": {
+            "thread_id": tid,
+            "run_id": canonical_run_id,
+        }
+    }
+    gen = g.stream(
+        reset_input_state("q1"),
+        config=cfg,
+        stream_mode="values",
+    )
+    for state in gen:
+        messages = state.get("messages", []) or []
+        if messages and getattr(messages[-1], "tool_calls", None):
+            break
+    gen.close()
+    assert g._graph.get_state(cfg).metadata["run_id"] == canonical_run_id
+
+    events = _post_resume_events(client, tid)
+    status_event = next(data for name, data in events if name == "status")
+    assert status_event["run_id"] == canonical_run_id
+
+    turns = client.get(f"/api/threads/{tid}").json()["turns"]
+    assert len(turns) == 1
+    assert turns[0]["run_id"] == canonical_run_id
+
+
+def test_resume_persists_checkpoint_human_question_not_synthetic_title(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """Resume row must reconcile to the crashed run's HumanMessage text.
+
+    A synthetic ``[resumed] {title}`` breaks optimistic-turn matching
+    against the original question and leaves process-death history with
+    the wrong user text.
+    """
+    g, _model = _install_crash_graph(http_app, aapl_page1_text)
+    created = client.post("/api/threads", json={"first_message": "seed"}).json()
+    tid = created["id"]
+    original_question = "what is Apple revenue for 2023 Q3?"
+    canonical_run_id = "a1b2c3d4-1111-2222-3333-444455556666"
+
+    cfg = {
+        "configurable": {
+            "thread_id": tid,
+            "run_id": canonical_run_id,
+        }
+    }
+    gen = g.stream(
+        reset_input_state(original_question),
+        config=cfg,
+        stream_mode="values",
+    )
+    for state in gen:
+        messages = state.get("messages", []) or []
+        if messages and getattr(messages[-1], "tool_calls", None):
+            break
+    gen.close()
+
+    events = _post_resume_events(client, tid)
+    assert any(name == "status" for name, _ in events)
+
+    turns = client.get(f"/api/threads/{tid}").json()["turns"]
+    assert len(turns) == 1
+    assert turns[0]["run_id"] == canonical_run_id
+    assert turns[0]["question"] == original_question
+    assert not turns[0]["question"].startswith("[resumed]")
 
 
 def test_get_thread_in_flight_true_while_lock_held(

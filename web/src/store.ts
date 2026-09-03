@@ -52,6 +52,8 @@ interface WorkspaceState {
   // filings raised. Both are workspace-local — no outbound delivery.
   watchlist: WatchEntry[];
   notices: Notice[];
+  filingMonitorStatus: "healthy" | "degraded";
+  filingMonitorError: string | null;
   // ``true`` while a Stop request for the active thread is in flight,
   // so the button cannot be pressed twice before the wire closes.
   stoppingThreadId: string | null;
@@ -105,6 +107,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   resumingThreadId: null,
   watchlist: [],
   notices: [],
+  filingMonitorStatus: "healthy",
+  filingMonitorError: null,
   stoppingThreadId: null,
 
   async refreshThreads() {
@@ -545,8 +549,20 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 
   async loadNotices() {
     try {
-      set({ notices: await api.listNotices() });
-    } catch {
+      set({
+        notices: await api.listNotices(),
+        filingMonitorStatus: "healthy",
+        filingMonitorError: null,
+      });
+    } catch (error) {
+      if (error instanceof api.FilingMonitorDegradedError) {
+        set({
+          notices: error.notices,
+          filingMonitorStatus: "degraded",
+          filingMonitorError: error.code,
+        });
+        return;
+      }
       set({ notices: [] });
     }
   },

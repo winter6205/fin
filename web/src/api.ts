@@ -91,6 +91,18 @@ export async function getStatus(): Promise<WorkspaceStatus> {
   return parsed;
 }
 
+export class FilingMonitorDegradedError extends Error {
+  readonly code: string;
+  readonly notices: Notice[];
+
+  constructor(code: string, notices: Notice[]) {
+    super(`filing monitor degraded: ${code}`);
+    this.name = "FilingMonitorDegradedError";
+    this.code = code;
+    this.notices = notices;
+  }
+}
+
 // ----- T4 workflow (#138): watchlist, notices, stop -----
 
 export async function listWatchlist(): Promise<WatchEntry[]> {
@@ -121,11 +133,19 @@ export async function deleteWatch(watchId: string): Promise<void> {
 }
 
 export async function listNotices(): Promise<Notice[]> {
-  // The host reconciles the watchlist against the local catalog on
-  // this read — the read IS the delivery, so there is no poller and
-  // nothing leaves the process.
+  // The host reconciles the watchlist against both the local catalog
+  // and the configured filing source on this read. The response stays
+  // an array for compatibility; headers carry the source health.
   const res = await fetch("/api/notices");
-  return parseNotices(await jsonOrThrow<unknown>(res));
+  const notices = parseNotices(await jsonOrThrow<unknown>(res));
+  const monitorStatus = res.headers.get("x-filing-monitor-status");
+  if (monitorStatus === "degraded") {
+    throw new FilingMonitorDegradedError(
+      res.headers.get("x-filing-monitor-error") ?? "filing_monitor_error",
+      notices,
+    );
+  }
+  return notices;
 }
 
 export async function markNoticeRead(noticeId: string): Promise<void> {

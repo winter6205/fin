@@ -13,11 +13,13 @@ dependencies = [
     "langgraph-checkpoint-postgres>=2.0.0",
     "pdfplumber>=0.11.10",
     "psycopg[binary]>=3.2.0",
+    "psycopg-pool>=3.2.0",
     "rank-bm25>=0.2.2",
     "uvicorn>=0.30.0",
 ]
 
 [project.optional-dependencies]
+object-store = ["boto3>=1.43.83"]  # required for CLI S3/MinIO client creation
 ocr = ["pytesseract>=0.3.10"]  # requires system tesseract binary
 
 [build-system]

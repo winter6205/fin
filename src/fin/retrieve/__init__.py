@@ -26,19 +26,36 @@ Public surface (T3 — ADR 0030: MCP is product, BM25 archived):
 * ``retrieve`` — the plain-Python host tool wrapper. Accepts
   any ``RetrievePort`` via the ``adapter`` keyword; it does NOT
   re-implement scoring.
+* ``InputValidationError`` and its two retrieve-side subclasses
+  ``EmptyQueryError`` / ``ConflictingFiltersError`` — the named
+  failures every adapter raises for invalid input, kept apart
+  from a legal empty result (T21 / §B2 第 5 条). The count lives
+  on each adapter's ``input_validation_failures`` ledger.
 """
 
 from fin.retrieve.bm25 import BM25Adapter
 from fin.retrieve.fake_port import FakeRetrievePort
+from fin.retrieve.input_validation import (
+    ConflictingFiltersError,
+    EmptyQueryError,
+    InputValidationError,
+    InputValidationLedger,
+)
 from fin.retrieve.mcp_adapter import MCPRetrieveAdapter, RetrieveUnavailableError
+from fin.retrieve.mcp_session import MCPStdioSession
 from fin.retrieve.port import Chunk, RetrievePort
 from fin.retrieve.tool import retrieve
 
 __all__ = [
     "BM25Adapter",
     "Chunk",
+    "ConflictingFiltersError",
+    "EmptyQueryError",
     "FakeRetrievePort",
+    "InputValidationError",
+    "InputValidationLedger",
     "MCPRetrieveAdapter",
+    "MCPStdioSession",
     "RetrievePort",
     "RetrieveUnavailableError",
     "retrieve",
