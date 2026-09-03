@@ -590,7 +590,17 @@ def test_gc_hard_deletes_transported_rows_past_the_retention_window() -> None:
     buffer = _buffer_with_useful_memories(backend=_RecordingBackend())
     buffer.dream()
 
-    buffer.gc(now=NOW + timedelta(days=TRANSPORT_RETENTION_DAYS + 1))
+    transported_at = [
+        datetime.fromisoformat(str(row["disabled_at"]))
+        for row in buffer.entries()
+        if row.get("disabled_reason") == "transported"
+        and row.get("disabled_at") is not None
+    ]
+    assert transported_at
+    buffer.gc(
+        now=max(transported_at)
+        + timedelta(days=TRANSPORT_RETENTION_DAYS + 1)
+    )
 
     assert buffer.entries() == []
 

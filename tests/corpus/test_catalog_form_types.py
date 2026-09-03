@@ -2,9 +2,9 @@
 
 Two halves, both binary:
 
-* negative — ``form=10-K`` and ``form=8-K`` against the frozen-12-only
-  fixture return ``{"filings": []}``. The frozen 12 are 10-Q, so a
-  catalog that answered anything else would be inventing rows;
+* negative — ``form=10-K`` and ``form=8-K`` against the frozen AAPL
+  rows return ``{"filings": []}``. Those rows are 10-Q, so a catalog
+  that answered either alternate form would be inventing rows;
 * positive — the same filters over a test corpus that DOES hold those
   forms return the matching rows.
 
@@ -33,13 +33,16 @@ def _frozen_twelve() -> dict[str, Path]:
     }
 
 
-# ===== negative: the frozen-12-only fixture holds neither form =====
+# ===== negative: the frozen AAPL rows hold neither alternate form =====
 
 
 @pytest.mark.parametrize("form", ["10-K", "8-K"])
 def test_form_filter_on_frozen_twelve_returns_empty_hits(form: str) -> None:
-    """``form=10-K`` / ``form=8-K`` on the frozen 12 -> ``{"filings": []}``."""
-    assert list_files(form=form, **_frozen_twelve()) == {"filings": []}
+    """The frozen AAPL 10-Q rows have neither alternate form."""
+    assert (
+        list_files(form=form, ticker="AAPL", **_frozen_twelve())
+        == {"filings": []}
+    )
 
 
 # ===== positive: a test corpus that holds those forms =====
@@ -74,12 +77,12 @@ def test_unfiltered_listing_spans_every_form_in_the_corpus(
 
 
 def test_frozen_twelve_hits_carry_their_form() -> None:
-    """Every committed hit reports the 10-Q it actually is.
+    """Every committed 10-Q hit reports the form it actually is.
 
     Plan C expanded the tier-1 corpus via 8 EDGAR iXBRL primary docs
-    (all marked ``form="10-Q"`` by the catalog patch), so the floor is
-    now >= 20, not exactly 12."""
-    result = list_files(**_frozen_twelve())
+    (all marked ``form="10-Q"`` by the catalog patch), and SC6 adds a
+    separate GOOG 10-K row."""
+    result = list_files(form="10-Q", **_frozen_twelve())
 
     assert len(result["filings"]) >= 20
     for filing in result["filings"]:

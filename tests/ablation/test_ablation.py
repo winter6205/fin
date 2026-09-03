@@ -25,6 +25,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
+import re
 from pathlib import Path
 
 import pytest
@@ -189,7 +190,12 @@ def test_metric_fields_are_read_back_out_of_spec_b1(tmp_path):
     spec_text = published_spec_path().read_text(encoding="utf-8")
     drifted = tmp_path / "drifted-spec.md"
     drifted.write_text(
-        spec_text.replace("| 指标集 | P@5、R@5", "| 指标集 | P@5、R@7"),
+        re.sub(
+            r"(\|\s*指标集\s*\|[^|\n]*P@5、)R@5",
+            r"\1R@7",
+            spec_text,
+            count=1,
+        ),
         encoding="utf-8",
     )
     with pytest.raises(MetricEnumerationDriftError) as excinfo:
@@ -203,7 +209,12 @@ def test_run_refuses_when_published_metric_set_drifts(monkeypatch, tmp_path):
     spec_text = published_spec_path().read_text(encoding="utf-8")
     drifted = tmp_path / "drifted-metric-spec.md"
     drifted.write_text(
-        spec_text.replace("| 指标集 | P@5、R@5", "| 指标集 | P@5、R@7"),
+        re.sub(
+            r"(\|\s*指标集\s*\|[^|\n]*P@5、)R@5",
+            r"\1R@7",
+            spec_text,
+            count=1,
+        ),
         encoding="utf-8",
     )
     monkeypatch.setattr(metrics_module, "published_spec_path", lambda: drifted)

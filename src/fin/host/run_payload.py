@@ -74,6 +74,7 @@ class RunResponsePayload(TypedDict):
     track: str
     track_decision: dict[str, Any]
     comparisons: list[dict[str, Any]]
+    analysis_results: list[dict[str, Any]]
     evidence_locators: list[dict[str, Any]]
 
 
@@ -230,6 +231,11 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
     if isinstance(raw_comparisons, list):
         comparisons_value = [c for c in raw_comparisons if isinstance(c, dict)]
 
+    raw_analysis = raw.get("analysis_results", ()) or ()
+    analysis_value: list[dict[str, Any]] = []
+    if isinstance(raw_analysis, list):
+        analysis_value = [entry for entry in raw_analysis if isinstance(entry, dict)]
+
     locators_value = _evidence_locators(raw)
 
     raw_td = raw.get("track_decision") or {}
@@ -266,6 +272,7 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
             track=track_value,
             track_decision=track_decision_value,
             comparisons=comparisons_value,
+            analysis_results=analysis_value,
             evidence_locators=locators_value,
         )
 
@@ -299,6 +306,7 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
         # citations): a ``numeric_gate_fail`` row that hid the fact
         # table would hide the evidence for its own refusal.
         comparisons=comparisons_value,
+        analysis_results=analysis_value,
         # SC8: a refused run still records the locators it read.
         # ``citations`` is empty here BECAUSE the verifier said no;
         # the two fields answer different questions.

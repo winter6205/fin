@@ -116,11 +116,11 @@ def test_unknown_form_returns_empty_hits() -> None:
     """Unknown ``form`` returns ``{"filings": []}``.
 
     Per spec acceptance: ``form`` is NOT hard-coded to demo 10-Q when
-    other form rows exist. In the demo corpus every row is 10-Q, so
-    a non-10-Q form (e.g. ``10-K``) returns the empty contract.
+    other form rows exist. The expanded corpus holds a 10-K, so an
+    actually unknown form (e.g. ``8-K``) returns the empty contract.
     """
     result = list_files(
-        form="10-K",
+        form="8-K",
         manifest_path=_manifest_path(),
         extracted_root=_extracted_root(),
     )
@@ -360,16 +360,15 @@ def test_list_files_aapl_preserves_hit_shape() -> None:
             )
 
 
-def test_list_files_default_returns_all_12_with_hit_shape() -> None:
+def test_list_files_default_returns_full_library_with_hit_shape() -> None:
     """``list_files()`` returns every committed filing with the hit shape.
 
-    Plan C expanded the tier-1 corpus via 8 EDGAR iXBRL primary docs,
-    so the floor is now >= 20, not exactly 12."""
+    The SC6 GOOG 10-K fixture is part of that committed library."""
     result = list_files(
         manifest_path=_manifest_path(),
         extracted_root=_extracted_root(),
     )
-    assert len(result["filings"]) >= 20
+    assert len(result["filings"]) >= 21
     for filing in result["filings"]:
         assert set(filing.keys()) == _HIT_KEYS
         for forbidden in _FILTER_ONLY_FIELDS:

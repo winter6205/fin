@@ -68,6 +68,29 @@ from fin.corpus.ocr import (
     OcrRequiredUnavailableError,
     detect_ocr_required,
 )
+from fin.corpus.metadata_store import (
+    MetadataStore,
+    default_metadata_store,
+)
+from fin.corpus.ingest_state import (
+    IngestState,
+    IngestStateStore,
+    default_ingest_state_store,
+)
+from fin.corpus.ingest_state_errors import (
+    DuplicateJobError,
+    IngestStepError,
+)
+from fin.corpus.object_store import ObjectStore
+from fin.corpus.object_store_errors import (
+    ObjectStoreError,
+    ObjectStoreUnavailableError,
+)
+from fin.corpus.structure_units import (
+    StructureParser,
+    StructureUnit,
+    parse_structure_units,
+)
 
 
 _PASSAGE_SIZE = 512
@@ -118,6 +141,7 @@ class IngestResult:
     pages_written: int
     pages_skipped: int
     catalog_updated: int = 0
+    raw_storage: str = "local_fallback"
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -518,6 +542,49 @@ def update_catalog_fields(
     return changed_rows
 
 
+def _prepare_state_job(
+    state_store: IngestStateStore,
+    document_id: str,
+) -> bool:
+    """Create a job, or identify an already-ready job for a rerun."""
+    try:
+        state_store.create_job(document_id)
+    except DuplicateJobError:
+        state = state_store.get_job(document_id).state
+        if state is IngestState.READY:
+            return True
+        if state is IngestState.FAILED:
+            return False
+        # An active job belongs to another caller. Keep the original
+        # duplicate/busy signal instead of claiming it.
+        raise
+    return False
+
+
+def _structure_units_payload(units: tuple[StructureUnit, ...]) -> bytes:
+    """Serialize structure units without changing their frozen text."""
+    return json.dumps(
+        {
+            "units": [
+                {
+                    "locator": {
+                        "document_id": unit.locator.document_id,
+                        "version": unit.locator.version,
+                        "unit": unit.locator.unit,
+                    },
+                    "text": unit.text,
+                    "title": unit.title,
+                    "parent_unit": unit.parent_unit,
+                }
+                for unit in units
+            ]
+        },
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ).encode("utf-8")
+
+
 def run_ingest(
     *,
     manifest_path: Path,
@@ -528,6 +595,11 @@ def run_ingest(
     ocr_required_marker: str | None = None,
     catalog_seed: Mapping[str, Mapping[str, str]] | None = None,
     catalog_seed_path: Path | None = None,
+    object_store: ObjectStore | None = None,
+    metadata_store: MetadataStore | None = None,
+    ingest_state_store: IngestStateStore | None = None,
+    structure_parser: StructureParser | None = None,
+    max_structure_units: int = 1000,
 ) -> IngestResult:
     """Run the idempotent ingest command.
 
@@ -567,6 +639,27 @@ def run_ingest(
     catalog_seed_path:
         Path to the operator's ``--catalog-seed`` JSON file. Mutually
         exclusive with ``catalog_seed``.
+    object_store:
+        Optional raw-byte store. When supplied, verified PDF bytes are
+        written under ``filings/<document_id>/<filename>`` and the
+        resulting pointer is recorded in the manifest and metadata
+        store. When omitted, the local PDF directory is the documented
+        fallback and remains the source for extraction.
+    metadata_store:
+        Store for the durable document-to-object pointer. When raw
+        object storage is enabled and this is omitted, the configured
+        Postgres store is selected from the environment, or an
+        in-memory store is used for local tests.
+    ingest_state_store:
+        Optional state/audit store. When omitted, an offline in-memory
+        store is used. Each local PDF job is advanced through the
+        documented state machine to ``READY``.
+    structure_parser:
+        Optional parser adapter for structure-aware units. When omitted,
+        the existing PDF extraction stack supplies the default parser;
+        no alternate splitter is introduced.
+    max_structure_units:
+        Positive cap on structure units emitted per document.
 
     Raises
     ------
@@ -596,6 +689,12 @@ def run_ingest(
         )
     if catalog_seed_path is not None:
         catalog_seed = load_catalog_seed(catalog_seed_path)
+    pointer_store = (
+        metadata_store or default_metadata_store()
+        if object_store is not None
+        else None
+    )
+    state_store = ingest_state_store or default_ingest_state_store()
 
     # Import here so this module's pdfplumber dep does not transitively
     # leak into the ask path if the facts module is reached via
@@ -619,6 +718,7 @@ def run_ingest(
     pages_total = 0
     pages_written = 0
     pages_skipped = 0
+    manifest_updated = False
     # Start from the entries this run has no authority over. The
     # manifest is the SSOT for the frozen PDFs only; documents the
     # gated live path froze into the same tree (keyed by accession)
@@ -632,20 +732,105 @@ def run_ingest(
 
     # Sort by document_id so on-disk ordering is deterministic across
     # runs and machines.
+    reused_ready_jobs: dict[str, bool] = {}
     for doc in sorted(documents, key=lambda d: d["document_id"]):
         document_id: str = doc["document_id"]
         filename: str = doc["filename"]
         expected_sha: str = doc["sha256"]
         pdf_path = pdf_dir / filename
+        doc_dir = extracted_root / document_id
+        doc_dir_existed = doc_dir.exists()
+        reused_ready = _prepare_state_job(state_store, document_id)
+        reused_ready_jobs[document_id] = reused_ready
+        if not reused_ready:
+            state_store.transition(
+                document_id,
+                IngestState.FETCHING,
+                metadata={"filename": filename},
+            )
 
-        if not pdf_path.exists():
-            # The local re-ingest path doesn't own EDGAR iXBRL primary
-            # docs (filename ends with .htm/.html, catalog carries the
-            # accession); those were frozen by ``fin.corpus.live_fetch``
-            # into the extracted tree. Preserve any existing entry
-            # there so the rewritten ``_index.json`` doesn't silently
-            # drop the live path's catalog row, and refuse (typed error)
-            # when nothing exists to preserve — never silently skip.
+        try:
+            if not pdf_path.exists():
+                # The local re-ingest path does not own EDGAR iXBRL
+                # primary documents. Preserve a matching live entry
+                # already frozen by ``fin.corpus.live_fetch``.
+                existing_doc = (
+                    existing_index.get(document_id) if existing_index else None
+                )
+                if (
+                    existing_doc is not None
+                    and existing_doc.get("version") == expected_sha
+                    and isinstance(existing_doc.get("page_count"), int)
+                ):
+                    index[document_id] = {
+                        "version": expected_sha,
+                        "page_count": int(existing_doc["page_count"]),
+                    }
+                    pages_total += int(existing_doc["page_count"])
+                    pages_skipped += int(existing_doc["page_count"])
+                    if not reused_ready:
+                        state_store.transition(
+                            document_id, IngestState.EXTRACTING
+                        )
+                        state_store.transition(
+                            document_id, IngestState.CATALOGING
+                        )
+                    continue
+                raise ManifestShaMismatchError(
+                    f"missing frozen PDF for {document_id}: {pdf_path}"
+                )
+
+            raw_bytes: bytes | None = None
+            if object_store is not None:
+                # Hash and upload the same buffer so the pointer cannot
+                # describe bytes other than those verified for parsing.
+                raw_bytes = pdf_path.read_bytes()
+                actual_sha = _sha256_bytes(raw_bytes)
+            else:
+                actual_sha = _sha256_file(pdf_path)
+            if actual_sha != expected_sha:
+                raise ManifestShaMismatchError(
+                    f"sha256 mismatch for {document_id}: "
+                    f"manifest={expected_sha} actual={actual_sha}"
+                )
+            if object_store is not None:
+                assert raw_bytes is not None
+                raw_key = f"filings/{document_id}/{filename}"
+                pointer = object_store.put(
+                    raw_key,
+                    raw_bytes,
+                    content_type="application/pdf",
+                )
+                if pointer.sha256 != expected_sha or pointer.size_bytes != len(
+                    raw_bytes
+                ):
+                    raise ObjectStoreUnavailableError(
+                        f"object store returned an invalid pointer for "
+                        f"{document_id}: key={pointer.key!r}"
+                    )
+                if pointer_store is None:
+                    raise ObjectStoreUnavailableError(
+                        "raw object storage has no metadata pointer store"
+                    )
+                pointer_store.put_pointer(document_id, pointer)
+                raw_object = {
+                    "key": pointer.key,
+                    "size_bytes": pointer.size_bytes,
+                    "sha256": pointer.sha256,
+                    "content_type": pointer.content_type,
+                }
+                if doc.get("raw_object") != raw_object:
+                    doc["raw_object"] = raw_object
+                    manifest_updated = True
+
+            if not reused_ready:
+                state_store.transition(
+                    document_id,
+                    IngestState.EXTRACTING,
+                    metadata={"sha256": expected_sha},
+                )
+            doc_dir.mkdir(parents=True, exist_ok=True)
+
             existing_doc = (
                 existing_index.get(document_id) if existing_index else None
             )
@@ -653,51 +838,25 @@ def run_ingest(
                 existing_doc is not None
                 and existing_doc.get("version") == expected_sha
                 and isinstance(existing_doc.get("page_count"), int)
+                and isinstance(existing_doc.get("unit_count"), int)
+                and (doc_dir / "units.json").is_file()
+                and _artifacts_present(doc_dir, int(existing_doc["page_count"]))
             ):
+                # Fast-skip: trust the index and existence checks.
+                page_count = int(existing_doc["page_count"])
                 index[document_id] = {
                     "version": expected_sha,
-                    "page_count": int(existing_doc["page_count"]),
+                    "page_count": page_count,
+                    "unit_count": int(existing_doc["unit_count"]),
                 }
-                pages_total += int(existing_doc["page_count"])
-                pages_skipped += int(existing_doc["page_count"])
+                pages_total += page_count
+                pages_skipped += page_count
+                if not reused_ready:
+                    state_store.transition(
+                        document_id, IngestState.CATALOGING
+                    )
                 continue
-            raise ManifestShaMismatchError(
-                f"missing frozen PDF for {document_id}: {pdf_path}"
-            )
-        actual_sha = _sha256_file(pdf_path)
-        if actual_sha != expected_sha:
-            raise ManifestShaMismatchError(
-                f"sha256 mismatch for {document_id}: "
-                f"manifest={expected_sha} actual={actual_sha}"
-            )
 
-        doc_dir = extracted_root / document_id
-        doc_dir.mkdir(parents=True, exist_ok=True)
-
-        existing_doc = (
-            existing_index.get(document_id) if existing_index else None
-        )
-        if (
-            existing_doc is not None
-            and existing_doc.get("version") == expected_sha
-            and isinstance(existing_doc.get("page_count"), int)
-            and _artifacts_present(doc_dir, int(existing_doc["page_count"]))
-        ):
-            # Fast-skip: trust the index and the existence check. We
-            # still account for the pages as "skipped" so the CLI
-            # surface reflects the no-op nature of this run.
-            page_count = int(existing_doc["page_count"])
-            index[document_id] = {
-                "version": expected_sha,
-                "page_count": page_count,
-            }
-            pages_total += page_count
-            pages_skipped += page_count
-            continue
-
-        pages_this_doc = 0
-        ocr_applied_pages: list[int] = []
-        try:
             (
                 pages_this_doc,
                 ocr_applied_pages,
@@ -711,25 +870,50 @@ def run_ingest(
                 ocr_engine=ocr_engine,
                 ocr_required_marker=ocr_required_marker,
             )
-        except OcrRequiredUnavailableError:
-            # EXIT: OCR failure on any page -> clean partial doc_dir,
-            # propagate typed EXIT so the CLI exits non-zero.
-            if doc_dir.exists():
+            units = parse_structure_units(
+                document_id=document_id,
+                version=expected_sha,
+                source=pdf_path,
+                parser=structure_parser,
+                max_units=max_structure_units,
+            )
+            _write_if_drifted(
+                doc_dir / "units.json",
+                _structure_units_payload(units),
+            )
+
+            pages_written += pages_written_delta
+            pages_skipped += pages_skipped_delta
+            pages_total += pages_this_doc
+
+            doc_index_entry: dict[str, object] = {
+                "version": expected_sha,
+                "page_count": pages_this_doc,
+                "unit_count": len(units),
+            }
+            if ocr_applied_pages:
+                doc_index_entry["ocr_applied"] = True
+                doc_index_entry["ocr_applied_pages"] = sorted(ocr_applied_pages)
+            index[document_id] = doc_index_entry
+            if not reused_ready:
+                if ocr_applied_pages:
+                    state_store.transition(document_id, IngestState.OCR)
+                state_store.transition(document_id, IngestState.CATALOGING)
+        except Exception as exc:
+            # Remove only a newly-created partial tree. Existing committed
+            # artifacts must survive a failed verification retry.
+            if not doc_dir_existed and doc_dir.exists():
                 shutil.rmtree(doc_dir)
+            if not reused_ready:
+                try:
+                    state_store.fail_step(
+                        document_id, step="ingest", cause=exc
+                    )
+                except IngestStepError as state_error:
+                    # Keep the established ingest error as the public
+                    # failure while retaining the audit row.
+                    raise exc from state_error
             raise
-
-        pages_written += pages_written_delta
-        pages_skipped += pages_skipped_delta
-        pages_total += pages_this_doc
-
-        doc_index_entry: dict[str, object] = {
-            "version": expected_sha,
-            "page_count": pages_this_doc,
-        }
-        if ocr_applied_pages:
-            doc_index_entry["ocr_applied"] = True
-            doc_index_entry["ocr_applied_pages"] = sorted(ocr_applied_pages)
-        index[document_id] = doc_index_entry
 
     # Rewrite the index deterministically (sorted by document_id).
     index_payload = json.dumps(
@@ -743,12 +927,37 @@ def run_ingest(
     ).encode("utf-8")
     _write_if_drifted(extracted_root / "_index.json", index_payload)
 
+    if manifest_updated:
+        _atomic_write(
+            manifest_path,
+            json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+            + b"\n",
+        )
+
     # Catalog step: only after every document extracted cleanly, so a
     # run that dies on a sha mismatch or an OCR-required unit does not
     # leave a catalog row claiming a filing this run never wrote.
-    catalog_updated = update_catalog_fields(
-        manifest_path=manifest_path, catalog_seed=catalog_seed
-    )
+    try:
+        catalog_updated = update_catalog_fields(
+            manifest_path=manifest_path, catalog_seed=catalog_seed
+        )
+    except Exception as exc:
+        failures: list[IngestStepError] = []
+        for doc in sorted(documents, key=lambda d: d["document_id"]):
+            document_id = str(doc["document_id"])
+            if reused_ready_jobs.get(document_id):
+                continue
+            try:
+                state_store.fail_step(
+                    document_id,
+                    step="catalog",
+                    cause=exc,
+                )
+            except IngestStepError as state_error:
+                failures.append(state_error)
+        if failures:
+            raise failures[0] from exc
+        raise
 
     # Seed the fact table for every document. The seed list is a
     # per-document static mapping in ``facts_seed`` — T1 only ships
@@ -759,13 +968,24 @@ def run_ingest(
     for doc in sorted(documents, key=lambda d: d["document_id"]):
         document_id: str = doc["document_id"]
         expected_sha: str = doc["sha256"]
-        seed = seed_facts_for_document(
-            document_id=document_id, version=expected_sha
-        )
-        if seed is not None:
-            write_facts(
-                document_id=document_id, facts=seed, facts_root=facts_root
+        try:
+            seed = seed_facts_for_document(
+                document_id=document_id, version=expected_sha
             )
+            if seed is not None:
+                write_facts(
+                    document_id=document_id, facts=seed, facts_root=facts_root
+                )
+        except Exception as exc:
+            if not reused_ready_jobs.get(document_id):
+                state_store.fail_step(
+                    document_id,
+                    step="fact_seeding",
+                    cause=exc,
+                )
+            raise
+        if not reused_ready_jobs.get(document_id):
+            state_store.transition(document_id, IngestState.READY)
 
     return IngestResult(
         documents=len(documents),
@@ -773,6 +993,9 @@ def run_ingest(
         pages_written=pages_written,
         pages_skipped=pages_skipped,
         catalog_updated=catalog_updated,
+        raw_storage=(
+            "object_store" if object_store is not None else "local_fallback"
+        ),
     )
 
 
@@ -832,6 +1055,23 @@ def _resolve_ocr_engine(name: str) -> OCREngine | None:
     raise ValueError(f"unknown --ocr-engine choice: {name!r}")
 
 
+def _resolve_object_store() -> ObjectStore | None:
+    """Resolve raw storage when its endpoint and bucket are configured."""
+    endpoint = (
+        os.environ.get("FIN_OBJECT_STORE_URL")
+        or os.environ.get("FIN_OBJECT_STORE_ENDPOINT")
+        or ""
+    ).strip()
+    bucket = os.environ.get("FIN_OBJECT_STORE_BUCKET", "").strip()
+    if not endpoint and not bucket:
+        # Documented local fallback: the verified local PDF remains the
+        # extraction source and no raw bytes are silently discarded.
+        return None
+    from fin.corpus.object_store import object_store_from_env
+
+    return object_store_from_env(environ=os.environ)
+
+
 def main(argv: list[str] | None = None) -> int:
     default_manifest, default_pdf_dir, default_extracted, default_facts = (
         _default_paths()
@@ -881,6 +1121,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     ocr_engine = _resolve_ocr_engine(args.ocr_engine)
     try:
+        object_store = _resolve_object_store()
+        pointer_store = (
+            default_metadata_store() if object_store is not None else None
+        )
+    except ObjectStoreError as exc:
+        print(f"ingest: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    try:
         result = run_ingest(
             manifest_path=args.manifest,
             pdf_dir=args.pdf_dir,
@@ -888,8 +1136,10 @@ def main(argv: list[str] | None = None) -> int:
             facts_root=args.facts_root,
             ocr_engine=ocr_engine,
             catalog_seed_path=args.catalog_seed,
+            object_store=object_store,
+            metadata_store=pointer_store,
         )
-    except MalformedExtractedIndexError as exc:
+    except (MalformedExtractedIndexError, ObjectStoreError) as exc:
         print(f"ingest: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     print(
@@ -897,7 +1147,8 @@ def main(argv: list[str] | None = None) -> int:
         f"pages={result.pages} "
         f"written={result.pages_written} "
         f"skipped={result.pages_skipped} "
-        f"catalog_updated={result.catalog_updated}"
+        f"catalog_updated={result.catalog_updated} "
+        f"raw_storage={result.raw_storage}"
     )
     return 0
 
@@ -911,6 +1162,7 @@ __all__ = [
     "update_catalog_fields",
     "main",
     "_resolve_ocr_engine",
+    "_resolve_object_store",
 ]
 
 

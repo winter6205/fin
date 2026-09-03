@@ -48,6 +48,7 @@ from fin.corpus.dataset.exporters import (
 from fin.corpus.dataset.manifest import (
     B1_MAX_CHUNKS,
     B1_MIN_CHUNKS,
+    B1_MIN_SAMPLES_PER_FORMAT,
     CHUNK_TOTAL_STATUS_SPLIT,
     DATASET_ID,
     MANIFEST_SCHEMA_VERSION,
@@ -84,18 +85,47 @@ LICENSE_DERIVED_TEMPLATE = (
     load_private_fixture("1550a026344ee5f62f8080898a54d965195ddf599fcc51edfa52789ea4a12faa")
 )
 
-# Plan C closes every gap the corpus-build surface can close: tier-1
-# primary floor via EDGAR iXBRL expansion, and the chunk band [20000,
-# 120000] via the new primary docs feeding the derived export pipeline.
-# The pdf per-format floor (12 < 20) is a structural limit: only the 12
-# frozen private fixture source 10-Q PDFs in data/corpus/pdf/ count toward format=pdf,
-# because EDGAR's primary documents are iXBRL HTML (the builder
-# classifies them as format=html) and synthesizing is prohibited by
-# T10 / plan C's own ACR. Closing pdf >= 20 requires the upstream
-# private fixture source package to be extended with 8 more real PDFs — that
-# is out of the corpus-build surface's scope and is reported in the
-# per-format threshold entry (marked unenforceable) rather than here.
-KNOWN_GAPS: list[dict] = []
+PRIMARY_PDF_GAP = "primary_pdf_below_per_format_floor"
+
+# The B1 per-format floor requires >= 20 samples per format.
+# Currently format 'pdf' has 12 frozen private fixture source 10-Q PDFs.
+# Synthesizing PDFs is strictly prohibited by §B1 / ACR.
+# Until the upstream package is extended with real 10-Q PDFs,
+# the gap must be honestly reported in known_gaps.
+KNOWN_GAPS: list[dict] = [
+    {
+        "gap": PRIMARY_PDF_GAP,
+        "criterion": f"samples per format >= {B1_MIN_SAMPLES_PER_FORMAT}",
+        "detail": (
+            "format 'pdf' (tier 1) holds 12 countable samples (< 20); "
+            "the >= 20 floor requires real upstream 10-Q PDFs (never synthesized)"
+        ),
+        "remediation": (
+            "extend the upstream tier-1 package with real 10-Q PDFs with source and license, "
+            "then rebuild the dataset"
+        ),
+    }
+]
+
+
+def _pdf_gaps(counts: dict) -> list[dict]:
+    pdf_count = counts.get("by_format", {}).get("pdf", 0)
+    if pdf_count >= B1_MIN_SAMPLES_PER_FORMAT:
+        return []
+    return [
+        {
+            "gap": PRIMARY_PDF_GAP,
+            "criterion": f"samples per format >= {B1_MIN_SAMPLES_PER_FORMAT}",
+            "detail": (
+                f"format 'pdf' (tier 1) holds {pdf_count} countable samples (< {B1_MIN_SAMPLES_PER_FORMAT}); "
+                "the >= 20 floor requires real upstream 10-Q PDFs (never synthesized)"
+            ),
+            "remediation": (
+                "extend the upstream tier-1 package with real 10-Q PDFs with source and license, "
+                "then rebuild the dataset"
+            ),
+        }
+    ]
 
 # The T11 splitter computes chunk counts deterministically; the B1
 # chunk band [20000, 120000] scales with the tier-1 corpus size, so
@@ -172,6 +202,8 @@ def _load_registry(corpus_dir: Path) -> tuple[dict[str, dict], dict[str, str]]:
     manifest = json.loads((corpus_dir / "manifest.json").read_text(encoding="utf-8"))
     registry: dict[str, dict] = {}
     for doc in manifest["documents"]:
+        if doc.get("form") and doc.get("form") != "10-Q":
+            continue
         pdf_path = corpus_dir / "pdf" / doc["filename"]
         if pdf_path.is_file():
             actual = sha256_bytes(pdf_path.read_bytes())
@@ -611,7 +643,7 @@ def _manifest_payload(
         },
         "chunk_total": chunk_total,
         "chunk_total_status": CHUNK_TOTAL_STATUS_SPLIT,
-        "known_gaps": KNOWN_GAPS + _chunk_gaps(chunk_total),
+        "known_gaps": _pdf_gaps(counts) + _chunk_gaps(chunk_total),
         "counts": counts,
         "queries": queries_payload,
         "documents": samples,
