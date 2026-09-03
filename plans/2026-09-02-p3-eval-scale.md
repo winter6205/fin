@@ -37,7 +37,7 @@ minimal-change-verifier: yes — 不改 §B1–§B6 数字正文；不改引用�
    - **Surface:** 既有 `dataset build / verify / report` 与切分入口
    - **Acceptance:** 连续两次重建哈希一致；verify 不一致样本数 = 0；`-m eval` 切分契约全绿；默认 pytest 仍不读 `data/corpus`。
    - **Completion:** 重建命令沿用既有入口。
-   - Status: [ ] pending
+   - Status: [x] complete
    - [blocks: T1]
 
 3. **Live 消融矩阵按 B1 配置落盘** — tag: `[implementation]`
