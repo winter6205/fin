@@ -1033,6 +1033,54 @@ def summarize_compare_facts(
     )
 
 
+def _analysis_result(
+    result: dict[str, Any] | None, key: str
+) -> tuple[dict[str, Any], str | None]:
+    src = result if isinstance(result, dict) else {}
+    value = src.get(key)
+    return (value if isinstance(value, dict) else {}), (
+        str(src["error"]) if src.get("error") else None
+    )
+
+
+def summarize_redline(
+    *, result: dict[str, Any] | None = None, args: dict[str, Any] | None = None
+) -> str:
+    """Summarize a structured paragraph redline without raw JSON."""
+    redline, error = _analysis_result(result, "redline")
+    if error:
+        return f"redline ({error})"
+    changes = redline.get("changes")
+    if not isinstance(changes, list):
+        return "redline"
+    return f"redline · {len(changes)} paragraphs"
+
+
+def summarize_table_extract(
+    *, result: dict[str, Any] | None = None, args: dict[str, Any] | None = None
+) -> str:
+    """Summarize a locator-bound table extraction."""
+    table_extract, error = _analysis_result(result, "table_extract")
+    if error:
+        return f"tables ({error})"
+    tables = table_extract.get("tables")
+    return f"tables · {len(tables)} extracted" if isinstance(tables, list) else "tables"
+
+
+def summarize_statement(
+    *, result: dict[str, Any] | None = None, args: dict[str, Any] | None = None
+) -> str:
+    """Summarize an XBRL-backed three-year statement."""
+    statement, error = _analysis_result(result, "statement")
+    if error:
+        return f"statement ({error})"
+    rows = statement.get("rows")
+    periods = statement.get("periods")
+    if isinstance(rows, list) and isinstance(periods, list):
+        return f"statement · {len(rows)} rows × {len(periods)} years"
+    return "statement"
+
+
 def summarize_research_issuers(
     *,
     result: dict[str, Any] | None = None,
@@ -1127,6 +1175,12 @@ def format_tool_summary(
         return summarize_get_xbrl_fact(result=result_dict, args=args)
     if name == "compare_facts":
         return summarize_compare_facts(result=result_dict, args=args)
+    if name == "redline":
+        return summarize_redline(result=result_dict, args=args)
+    if name == "extract_tables":
+        return summarize_table_extract(result=result_dict, args=args)
+    if name == "three_year_statement":
+        return summarize_statement(result=result_dict, args=args)
     if name == ISSUER_FANOUT_TOOL:
         return summarize_research_issuers(result=result_dict, args=args)
     return name or "tool"
@@ -1148,6 +1202,9 @@ __all__ = [
     "strip_thinking_from_answer",
     "summarize_compare_facts",
     "summarize_get_xbrl_fact",
+    "summarize_redline",
+    "summarize_statement",
+    "summarize_table_extract",
     "summarize_list_files",
     "summarize_read_file",
     "summarize_research_issuers",

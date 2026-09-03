@@ -691,6 +691,76 @@ def _make_compare_facts_tool(facts_root: Path):
     return compare_facts_tool
 
 
+def _make_redline_tool(manifest_path: Path, extracted_root: Path):
+    """Build the locator-bound paragraph redline host tool."""
+
+    @tool("redline")
+    def redline_tool(
+        before_document_id: str,
+        before_version: str,
+        after_document_id: str,
+        after_version: str,
+    ) -> dict:
+        """Compare paragraph text between two frozen filings."""
+        from fin.host.tools.redline import redline
+
+        return redline(
+            before_document_id=before_document_id,
+            before_version=before_version,
+            after_document_id=after_document_id,
+            after_version=after_version,
+            manifest_path=manifest_path,
+            extracted_root=extracted_root,
+        )
+
+    return redline_tool
+
+
+def _make_table_extract_tool(manifest_path: Path, extracted_root: Path):
+    """Build the locator-bound page table extraction tool."""
+
+    @tool("extract_tables")
+    def extract_tables_tool(
+        document_id: str,
+        version: str,
+        page: int = 1,
+    ) -> dict:
+        """Extract pipe-delimited tables from one frozen page."""
+        from fin.host.tools.table_extract import extract_tables
+
+        return extract_tables(
+            document_id=document_id,
+            version=version,
+            page=page,
+            manifest_path=manifest_path,
+            extracted_root=extracted_root,
+        )
+
+    return extract_tables_tool
+
+
+def _make_statement_tool(facts_root: Path):
+    """Build the XBRL-backed three-year statement tool."""
+
+    @tool("three_year_statement")
+    def three_year_statement_tool(
+        issuer: str,
+        periods: list[str],
+        concepts: list[str],
+    ) -> dict:
+        """Render three requested years from XBRL fact sidecars."""
+        from fin.host.tools.statements import three_year_statement
+
+        return three_year_statement(
+            issuer=issuer,
+            periods=list(periods or []),
+            concepts=list(concepts or []),
+            facts_root=facts_root,
+        )
+
+    return three_year_statement_tool
+
+
 class IssuerTask(TypedDict, total=False):
     """The payload one ``Send`` carries to a fan-out worker (T6).
 
@@ -994,6 +1064,35 @@ def comparison_from_tool_message(message: BaseMessage) -> dict | None:
     }
 
 
+_ANALYSIS_PAYLOAD_KEYS = {
+    "redline": "redline",
+    "extract_tables": "table_extract",
+    "three_year_statement": "statement",
+}
+
+
+def analysis_from_tool_message(message: BaseMessage) -> dict | None:
+    """Extract a structured T6 analysis result from a ToolMessage."""
+    if not isinstance(message, ToolMessage):
+        return None
+    payload_key = _ANALYSIS_PAYLOAD_KEYS.get(getattr(message, "name", ""))
+    if payload_key is None:
+        return None
+    try:
+        payload = json.loads(message.content)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    analysis = payload.get(payload_key)
+    if not isinstance(analysis, dict) or not analysis.get("schema"):
+        return None
+    return {
+        **analysis,
+        "tool_call_id": getattr(message, "tool_call_id", "") or "",
+    }
+
+
 def _collect_comparisons(messages: list[BaseMessage]) -> list[dict]:
     """Every renderable comparison in ``messages``, in call order."""
     found: list[dict] = []
@@ -1001,6 +1100,16 @@ def _collect_comparisons(messages: list[BaseMessage]) -> list[dict]:
         comparison = comparison_from_tool_message(message)
         if comparison is not None:
             found.append(comparison)
+    return found
+
+
+def _collect_analysis_results(messages: list[BaseMessage]) -> list[dict]:
+    """Every structured T6 analysis result, in tool-call order."""
+    found: list[dict] = []
+    for message in messages:
+        analysis = analysis_from_tool_message(message)
+        if analysis is not None:
+            found.append(analysis)
     return found
 
 
@@ -1217,6 +1326,56 @@ def _collect_comparison_claims(
     return claimed, facts
 
 
+def _collect_statement_claims(
+    messages: list[BaseMessage],
+) -> tuple[list[tuple[str, str]], list["Fact"]]:
+    """Treat XBRL statement cells as numeric claims for this run."""
+    from fin.corpus.facts import Fact
+
+    claimed: list[tuple[str, str]] = []
+    facts: list[Fact] = []
+    for message in messages:
+        statement = analysis_from_tool_message(message)
+        if not statement or statement.get("schema") != "fin.statement.v1":
+            continue
+        periods = {
+            str((column or {}).get("key") or "")
+            for column in statement.get("columns") or ()
+            if isinstance(column, dict)
+        }
+        for row in statement.get("rows") or ():
+            if not isinstance(row, dict):
+                continue
+            concept = str(row.get("concept") or row.get("key") or "")
+            if not concept:
+                continue
+            for cell in row.get("cells") or ():
+                if not isinstance(cell, dict):
+                    continue
+                period = str(cell.get("period") or "")
+                if not period or (periods and period not in periods):
+                    continue
+                pair = (concept, period)
+                if pair not in claimed:
+                    claimed.append(pair)
+                if cell.get("status") != "hit" or cell.get("value") is None:
+                    continue
+                locator = _locator_from_payload(cell.get("locator"))
+                if locator is None:
+                    continue
+                facts.append(
+                    Fact(
+                        concept=concept,
+                        value=cell["value"],
+                        period=period,
+                        unit=str(cell.get("unit") or ""),
+                        scale=str(cell.get("scale") or ""),
+                        source_locator=locator,
+                    )
+                )
+    return claimed, facts
+
+
 def _evaluate_numeric_gate_in_node(messages: list[BaseMessage]):
     """Run the numeric gate on the run's accumulated messages.
 
@@ -1230,9 +1389,15 @@ def _evaluate_numeric_gate_in_node(messages: list[BaseMessage]):
 
     fact_claims, fact_rows = _collect_fact_tool_calls(messages)
     compare_claims, compare_rows = _collect_comparison_claims(messages)
+    statement_claims, statement_rows = _collect_statement_claims(messages)
     claimed = fact_claims + [
         pair for pair in compare_claims if pair not in fact_claims
     ]
+    claimed.extend(
+        pair
+        for pair in statement_claims
+        if pair not in claimed
+    )
     if not claimed:
         # No numeric lookup -> gate is skipped. We return ``None`` so
         # the caller can distinguish "no claim" from "claim, gate
@@ -1242,7 +1407,7 @@ def _evaluate_numeric_gate_in_node(messages: list[BaseMessage]):
     return evaluate_numeric_gate(
         answer=answer,
         claimed_concepts=claimed,
-        available_facts=fact_rows + compare_rows,
+        available_facts=fact_rows + compare_rows + statement_rows,
     )
 
 
@@ -1478,6 +1643,9 @@ def compile_graph(
     # ToolNode below deliberately does not receive it (see
     # ``_make_research_issuers_tool``).
     research_issuers_tool = _make_research_issuers_tool(issuer_cap)
+    redline_tool = _make_redline_tool(mpath, rpath)
+    table_extract_tool = _make_table_extract_tool(mpath, rpath)
+    statement_tool = _make_statement_tool(fpath)
 
     bound_model = model.bind_tools(
         [
@@ -1487,6 +1655,9 @@ def compile_graph(
             get_xbrl_fact_tool,
             compare_facts_tool,
             research_issuers_tool,
+            redline_tool,
+            table_extract_tool,
+            statement_tool,
         ]
     )
     # T3 (#34): the off-preference binding layers the MiniMax
@@ -1512,6 +1683,9 @@ def compile_graph(
             retrieve_tool,
             get_xbrl_fact_tool,
             compare_facts_tool,
+            redline_tool,
+            table_extract_tool,
+            statement_tool,
         ],
         name="tool_node",
         handle_tool_errors=True,
@@ -1760,6 +1934,9 @@ def compile_graph(
         update["comparisons"] = list(state.get("comparisons") or []) + (
             _collect_comparisons(merged_messages)
         )
+        update["analysis_results"] = list(
+            state.get("analysis_results") or []
+        ) + _collect_analysis_results(merged_messages)
         return update
 
     def _fanout_tool_update(
@@ -2522,5 +2699,6 @@ __all__ = [
     "HostGraphError",
     "RetrieveAdapterConfigError",
     "compile_graph",
+    "analysis_from_tool_message",
     "comparison_from_tool_message",
 ]

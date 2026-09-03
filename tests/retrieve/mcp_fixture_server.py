@@ -92,8 +92,10 @@ _TOOLS: tuple[dict[str, Any], ...] = (
             "properties": {
                 "query": {"type": "string"},
                 "top_k": {"type": "integer", "minimum": 1},
+                "limit": {"type": "integer", "minimum": 1},
                 "document_id": {"type": "string"},
                 "filter": {"type": "object"},
+                "filters": {"type": "object"},
             },
             "required": ["query"],
         },
@@ -240,15 +242,16 @@ class FixtureServer:
         query = arguments.get("query")
         if not isinstance(query, str):
             return _error(request_id, INVALID_PARAMS, "query must be a string")
-        top_k = arguments.get("top_k", 8)
+        top_k = arguments.get("limit", arguments.get("top_k", 8))
         if not isinstance(top_k, int) or isinstance(top_k, bool):
-            return _error(request_id, INVALID_PARAMS, "top_k must be an integer")
-        document_id = arguments.get("document_id")
+            return _error(request_id, INVALID_PARAMS, "limit must be an integer")
+        raw_filters = arguments.get("filters", arguments.get("filter"))
+        if raw_filters is not None and not isinstance(raw_filters, dict):
+            return _error(request_id, INVALID_PARAMS, "filters must be an object")
+        filters = dict(raw_filters or {})
+        document_id = filters.pop("document_id", arguments.get("document_id"))
         if document_id is not None and not isinstance(document_id, str):
             return _error(request_id, INVALID_PARAMS, "document_id must be a string")
-        filters = arguments.get("filter")
-        if filters is not None and not isinstance(filters, dict):
-            return _error(request_id, INVALID_PARAMS, "filter must be an object")
         hits = search(
             query,
             top_k=top_k,

@@ -1,10 +1,11 @@
-"""Watchlist + in-app notice storage for the workspace (T4, the tracked change).
+"""Watchlist + in-app notice storage for the workspace (T4).
 
 Spec Focus 3 / SC4: the operator watches an issuer (optionally
 narrowed to form types) from the workspace, the list survives a
-restart, and a watched filing appearing in the LOCAL catalog raises an
-in-app notice. Nothing leaves the process — no email, no Slack, no
-outbound webhook (spec Focus 3: "no outbound email/Slack").
+restart, and a watched filing appearing in the LOCAL catalog or the
+configured filing monitor raises an in-app notice. Nothing leaves the
+process — no email, no Slack, no outbound webhook (spec Focus 3:
+"no outbound email/Slack").
 
 Why a side file rather than a ``fin_run``-style table: the plan leaves
 storage open ("Postgres 表 vs 侧文件，只要 reload 后仍在"). A watchlist

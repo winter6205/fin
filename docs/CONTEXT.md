@@ -45,7 +45,6 @@ _Avoid_: requiring MCP for memory ON, storing cite-tree pages as memory entries,
 A rule-gated consolidate step that selects useful local buffer memory and transports it to the configured **memory backend** MCP for durable persistence. With memory OFF or MCP absent it skips or stops at the Postgres buffer; it must not fail the foreground turn.
 _Avoid_: running dream inside model_node, auto-writing every turn to MCP, using dream to move filing locator units out of fin
 
-
 ### Seams
 
 **retrieve port**:
@@ -199,6 +198,10 @@ _Avoid_: current catalog, gold SSOT, demo FAQ
 **ingest**:
 A CLI that writes frozen locator-unit text from official filings (or the existing extracted tree) into an extracted tree. 滑动窗口式**切分**是 fin 的职责而非排序栈（ADR 0037），排序仍留在 fin 之外；the ask path does not fetch EDGAR or open source filings.
 _Avoid_: extract-on-query, host-graph ingest node, putting filing bytes in the checkpointer database
+
+**object store**:
+MinIO/S3-compatible storage for raw filing (and later multi-format) bytes. Postgres holds metadata and pointers; the extracted cite tree stays in fin. Git is not the byte warehouse once configured.
+_Avoid_: Postgres bytea as the primary raw store, putting raw PDFs in the checkpointer, treating object keys as citation locators
 
 **contract eval**:
 Default CI harness: scripted model, **eval fixture** only. Required classes: HTML-unit citation pass, unknown locator refuse, catalog miss, cross-period on the fixture. Nine v1 gold cases are not the ceiling.

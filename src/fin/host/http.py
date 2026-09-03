@@ -40,6 +40,7 @@ from fin.host.operator_env import apply_dotenv, warn_if_mcp_retrieve_unreachable
 from fin.host.run_payload import _run_to_response_payload
 from fin.host.state import EVIDENCE_RESET, reset_input_state
 from fin.host.thread_store import default_thread_store
+from fin.host.filing_monitor import default_filing_monitor
 from fin.host.watchlist import default_watchlist_store
 
 
@@ -238,6 +239,11 @@ def get_watchlist_store() -> Any:
     return default_watchlist_store()
 
 
+def get_filing_monitor() -> Any:
+    """FastAPI dependency for the optional real filing monitor."""
+    return default_filing_monitor()
+
+
 # Mount the workspace routes (T1, #28) on the same FastAPI app.
 # Done at module load so ``uvicorn fin.host.http:app`` exposes the
 # workspace surface out of the box (spec / ADR 0013 / ADR 0024).
@@ -249,6 +255,7 @@ _mount_workspace_routes(
     get_thread_store=get_thread_store,
     get_watchlist_store=get_watchlist_store,
     get_memory_port=get_memory_port,
+    get_filing_monitor=get_filing_monitor,
 )
 
 # ``GET /health`` (the tracked change, SC9): checkpoint reachability, separate from
@@ -491,6 +498,7 @@ __all__ = [
     "CitationSchema",
     "app",
     "compile_for_http",
+    "get_filing_monitor",
     "get_graph",
     "get_thread_store",
     "get_watchlist_store",
