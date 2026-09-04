@@ -131,3 +131,78 @@ def test_individual_ask_path_module_does_not_load_pdfplumber(
     assert leaked_list == [], (
         f"{module_name!r} transitively loads {leaked_list}"
     )
+
+
+# ---------------------------------------------------------------------------
+# SC6 (corpus-serve-ingest): the research graph must not expose 切分.
+#
+# ADR 0047: the research model must never call 切分 on arbitrary
+# strings — chunking happens ONLY on the ingest endpoint. The bound
+# tool set of a compiled host graph is the contract surface here: no
+# tool name may carry the chunk / split / ingest vocabulary.
+# ---------------------------------------------------------------------------
+
+
+_CHUNK_TOOL_NAME_MARKERS = ("chunk", "split", "ingest", "切分")
+
+
+def _bound_research_tool_names() -> list[str]:
+    """Compile the host graph with the scripted model and return the
+    bound tool names (``ScriptedChatModel.bind_tools`` records them)."""
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from fin.host import ScriptedChatModel, compile_graph
+
+    model = ScriptedChatModel(script=[])
+    compile_graph(checkpointer=InMemorySaver(), model=model)
+    return [getattr(tool, "name", repr(tool)) for tool in model.bound_tools]
+
+
+def test_research_graph_binds_no_chunking_tool() -> None:
+    """No bound research tool may be a 切分 / chunk / ingest tool (SC6)."""
+    names = _bound_research_tool_names()
+    assert names, "the host graph must bind its research tools"
+    offending = {
+        name
+        for name in names
+        for marker in _CHUNK_TOOL_NAME_MARKERS
+        if marker in name.lower() or marker in name
+    }
+    assert offending == set(), (
+        f"the research graph binds chunking-shaped tool(s) {sorted(offending)}; "
+        "切分 must only run on the corpus ingest endpoint (ADR 0047 / SC6). "
+        "Remove the tool from the graph's bind_tools list."
+    )
+
+
+def test_research_graph_tool_names_are_the_known_research_set() -> None:
+    """The graph toolset stays the known research tools — the ingest
+    endpoint is a corpus/host capability, not a model tool."""
+    names = set(_bound_research_tool_names())
+    assert "retrieve" in names  # the research evidence tool is present
+    assert not names & {"corpus_ingest", "ingest", "chunk", "split_document"}
+
+
+def test_ask_path_does_not_import_the_eval_dataset_stack() -> None:
+    """The serve path must not drag in the eval dataset build stack.
+
+    ``fin.corpus.dataset.__init__`` pulls the exporters and the gated
+    live-fetch module; the ingest endpoint classifies document types
+    through the neutral ``fin.corpus.doc_type`` module instead, so
+    importing the workspace HTTP surface never lands the eval stack in
+    ``sys.modules``.
+    """
+    snippet = """
+        import sys
+        import json
+        for name in {modules!r}:
+            __import__(name)
+        loaded = sorted(m for m in sys.modules if m == 'fin.corpus.dataset')
+        sys.stdout.write(json.dumps(loaded))
+    """.format(modules=list(_ASK_PATH_MODULES))
+    import json
+    loaded = json.loads(_run_in_subprocess(snippet))
+    assert loaded == [], (
+        f"the ask path imports the eval dataset stack via {loaded}; "
+        "classify document types through fin.corpus.doc_type instead."
+    )

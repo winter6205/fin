@@ -56,7 +56,7 @@ minimal-change-verifier: yes — one logical program, not one commit; writing-pl
    - **Surface:** corpus ingest + host HTTP + tests
    - **Acceptance:** supported fixture ingest is observable as push (or Fake record); unsupported type named failure; MCP down typed; no research-graph 切分 tool; `uv run pytest -q` exits 0。
    - **Completion:** HTTP path vs CLI-only first slice open if HTTP lands in T5.
-   - Status: [ ]
+   - Status: [x]
    - [blocks: T1]
 
 4. **Thread attach does not push** — tag: `[implementation]`
