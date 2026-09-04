@@ -78,6 +78,16 @@ Routes
                                           handler with no dependencies
                                           — never a branch inside send
                                           or GET-thread.
+* ``GET    /api/observability``         - the per-process counters
+                                          surface (T9): terminal-status
+                                          counts (``done`` / ``refuse``
+                                          / ``step_cap``), latency
+                                          aggregates, and empty-hit
+                                          rewrite-retry counters.
+                                          Counters only — never per-run
+                                          data, never question / answer
+                                          text, never credentials
+                                          (ADR 0033 spirit).
 
 Why one module, not per-route modules? Each route is small, they
 share the request schema (``thread_id`` resolution, empty-question
@@ -107,6 +117,7 @@ import copy
 import json
 import logging
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Final, Iterator, Literal
@@ -144,6 +155,10 @@ from fin.host.graph import (
 )
 from fin.host.memory_dream import run_dream_after_turn
 from fin.host.memory_port import build_memory_port
+from fin.host.observability import (
+    ObservabilityCollector,
+    ObservabilityError,
+)
 from fin.host.operator_env import (
     probe_retrieve_reachability,
     resolve_retrieve_adapter_kind,
@@ -1232,6 +1247,7 @@ def build_router(
     get_memory_port=None,
     get_filing_monitor=None,
     get_feedback_store=None,
+    get_observability_collector=None,
 ) -> APIRouter:
     """Build the workspace APIRouter.
 
@@ -1241,7 +1257,11 @@ def build_router(
     an existing caller that predates T4 still mounts; ``get_memory_port``
     does the same for callers that predate dream; ``get_filing_monitor``
     defaults to the process default monitor; ``get_feedback_store``
-    (T8) does the same for callers that predate thumbs feedback.
+    (T8) does the same for callers that predate thumbs feedback;
+    ``get_observability_collector`` (T9) defaults to a collector built
+    HERE — one per mounted router, mirroring the ``RunControl`` registry
+    so two apps in one test session cannot record into each other's
+    counters. The prod app injects the per-process singleton.
 
     The stop registry (:class:`RunControl`) is created HERE rather than
     at module level: one registry per mounted router means two apps in
@@ -1257,6 +1277,9 @@ def build_router(
         get_filing_monitor = default_filing_monitor
     if get_feedback_store is None:
         get_feedback_store = default_feedback_store
+    if get_observability_collector is None:
+        router_collector = ObservabilityCollector()
+        get_observability_collector = lambda: router_collector  # noqa: E731
 
     @router.get("/threads")
     def list_threads(store: ThreadStore = Depends(get_thread_store)) -> list[dict]:
@@ -1395,6 +1418,9 @@ def build_router(
         graph: Any = Depends(get_graph),
         store: ThreadStore = Depends(get_thread_store),
         memory_port: Any = Depends(get_memory_port),
+        collector: ObservabilityCollector = Depends(
+            get_observability_collector
+        ),
     ) -> Response:
         """Run one v1 host-graph run on the thread over SSE (T1 #33).
 
@@ -1512,6 +1538,31 @@ def build_router(
             resurrected (a row for a deleted thread is never
             wanted) and a single refuse-status frame explains it.
             """
+            # T9: the turn's wall-clock latency starts when the wire
+            # starts carrying the run (same anchor as thinking_ms —
+            # the streaming window IS the turn the operator sees).
+            turn_started = time.perf_counter()
+
+            def record_terminal(status: str) -> None:
+                """Record one terminal turn on the observability collector.
+
+                Counters only — the status enum plus elapsed
+                milliseconds; no question / answer / URL text ever
+                reaches the collector. A recording failure is a
+                WARNING, never a broken wire or a lost turn row
+                (same tolerance as the feedback store on GET-thread).
+                """
+                elapsed_ms = (time.perf_counter() - turn_started) * 1000.0
+                try:
+                    collector.record(status, latency_ms=elapsed_ms)
+                except ObservabilityError:
+                    logger.warning(
+                        "send: failed to record terminal status %r on the "
+                        "observability collector",
+                        status,
+                        exc_info=True,
+                    )
+
             seen_message_ids: set[str] = set()
             # Seed the dedup set with the pre-run checkpoint's
             # message ids: a follow-up send's first ``values`` frame
@@ -1539,6 +1590,9 @@ def build_router(
                 run_control.end(stop_token)
 
             if outcome.stopped:
+                # A stop is a terminal turn (persisted as ``refuse`` /
+                # stopped), so it counts on the observability wire too.
+                record_terminal("refuse")
                 yield from _persist_and_close_stopped_run(
                     graph,
                     store=store,
@@ -1564,6 +1618,7 @@ def build_router(
                 # — without the row, the SPA's openThread reconcile
                 # replaces its optimistic turn with the server's
                 # empty list and the failed exchange vanishes.
+                record_terminal("refuse")
                 try:
                     store.append_run(
                         RunRecord(
@@ -1606,6 +1661,10 @@ def build_router(
                     )
                 return
             payload = _run_to_response_payload(outcome.final_state)
+            # T9: the turn's terminal status (done / refuse / step_cap)
+            # and wall-clock latency land on the observability collector
+            # exactly where the turn row is built.
+            record_terminal(payload["status"])
             # Persist the run record so the GET turn table surfaces
             # it without re-invoking the graph. T4 (#37): the
             # thinking duration rides the row so a reload restores
@@ -1640,7 +1699,9 @@ def build_router(
             except ThreadNotFoundError:
                 # The thread was deleted mid-stream; do NOT
                 # resurrect metadata. Yield a single error frame
-                # so the SPA surfaces the state, then stop.
+                # so the SPA surfaces the state, then stop. The
+                # turn still ended on a terminal refuse.
+                record_terminal("refuse")
                 yield _format_sse("status", {
                     "run_id": run_id,
                     "status": "refuse",
@@ -2119,6 +2180,31 @@ def build_router(
             "corpus_filing_count": _corpus_filing_count(),
         }
 
+    @router.get("/observability")
+    def observability(
+        collector: ObservabilityCollector = Depends(
+            get_observability_collector
+        ),
+    ) -> dict:
+        """The per-process counters surface (T9).
+
+        Terminal-status counts (``done`` / ``refuse`` / ``step_cap``),
+        latency aggregates over those turns, and empty-hit
+        rewrite-retry counters — nothing else. Deliberately NOT on
+        ``GET /api/status`` (boot-scoped per ADR 0033) and NOT on
+        ``GET /health`` (process-scoped): those surfaces grow no
+        run-scoped counters, so observability gets its own route.
+
+        The payload is counters only by construction: the collector's
+        contract rejects anything that is not a typed status plus a
+        latency number, and no question, answer, URL, error text, or
+        credential ever enters it. Every state is a 200 — an empty
+        collector is a valid answer, not a failure.
+        """
+        payload = collector.snapshot()
+        payload["rewrite_retry"] = collector.retry_snapshot()
+        return payload
+
     return router
 
 
@@ -2134,6 +2220,7 @@ def mount(
     get_memory_port=None,
     get_filing_monitor=None,
     get_feedback_store=None,
+    get_observability_collector=None,
 ) -> None:
     """Mount the workspace routes onto an existing FastAPI app."""
     app.include_router(
@@ -2144,6 +2231,7 @@ def mount(
             get_memory_port=get_memory_port,
             get_filing_monitor=get_filing_monitor,
             get_feedback_store=get_feedback_store,
+            get_observability_collector=get_observability_collector,
         )
     )
 

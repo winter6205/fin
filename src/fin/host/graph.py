@@ -113,6 +113,12 @@ from fin.host.degradation_notice import (
     consume_degradation,
     degradation_notice_entry,
 )
+from fin.host.observability import default_collector
+from fin.host.rewrite_retry import (
+    RetrieveCallError,
+    RewriteRetryResult,
+    retrieve_with_rewrite_retry,
+)
 from fin.host.stream_map import (
     assemble_final_ai_message,
     format_tool_summary,
@@ -394,11 +400,27 @@ def _make_read_file_tool():
     return read_file_tool
 
 
+def _default_empty_hit_rewrite(query: str) -> str:
+    """Deterministic lightweight rewrite for an exact empty retrieve hit.
+
+    T9 headroom: a model-backed rewriter can replace this via
+    ``_make_retrieve_tool(rewriter=...)`` without touching the retry
+    contract — the helper only requires a non-empty string different
+    from the input. Keeping the original terms and appending one
+    broadening marker is cheap, deterministic, and never collapses to
+    the original query, so the lexical port can re-score the same
+    terms with the retry visibly bounded at one attempt.
+    """
+    return f"{query} (broadened)"
+
+
 def _make_retrieve_tool(
     adapter: RetrievePort,
     *,
     mapping_ledger: MappingFailureLedger | None = None,
     degradation_ledger: DegradationLedger | None = None,
+    rewriter: Callable[[str], str] | None = None,
+    retry_observer: Callable[[RewriteRetryResult], None] | None = None,
 ):
     """Build the ``retrieve`` host tool.
 
@@ -432,6 +454,20 @@ def _make_retrieve_tool(
     The error contributes no evidence and triggers no BM25
     fallback; the model can retry or say retrieval is down.
 
+    Empty-hit rewrite retry (T9): an exact miss shape
+    (``{"chunks": []}``) is retried ONCE through
+    ``retrieve_with_rewrite_retry`` with a rewritten query —
+    never a fixed pipeline. Hits, memory recall shapes, and
+    typed error dicts pass through untouched (no rewrite), the
+    retry is bounded at one rewrite (``max_retries=1``), and the
+    port's ``InputValidationError`` envelope (``{"error": code}``)
+    is likewise never rewritten. The rewrite strategy is
+    deterministic by default (``_default_empty_hit_rewrite``); a
+    model-backed rewriter can be injected via ``rewriter`` without
+    touching this contract. Every PERFORMED rewrite is recorded on
+    the process default observability collector (or the injected
+    ``retry_observer``) so the retry stays measurable.
+
     Degradation (T20 / SC39 / §B3): a response carrying
     ``degraded`` has every one of its ``degraded_reasons``
     recorded on ``degradation_ledger``, and the notice rides
@@ -451,6 +487,7 @@ def _make_retrieve_tool(
         if degradation_ledger is not None
         else degradation_ledger_from_env()
     )
+    rewrite = rewriter if rewriter is not None else _default_empty_hit_rewrite
 
     @tool("retrieve")
     def retrieve_tool(
@@ -476,27 +513,62 @@ def _make_retrieve_tool(
         is unavailable the tool returns
         ``{"error": "retrieve_unavailable"}``.
         """
+        def _port_call(retry_query: str) -> dict[str, Any]:
+            """One adapter-bound retrieve call for the retry helper.
+
+            The ``InputValidationError`` envelope is built HERE, before
+            the retry helper can see it: a named input error is NOT an
+            empty hit, so it must flow through as an error dict and
+            never trigger a rewrite (T21 contract, unchanged).
+            """
+            try:
+                return retrieve(
+                    query=retry_query,
+                    document_id=document_id,
+                    cik=cik,
+                    form=form,
+                    ticker=ticker,
+                    filing_date=filing_date,
+                    limit=limit,
+                    adapter=adapter,
+                )
+            except InputValidationError as exc:
+                # Invalid input (T21 / §B2 第 5 条). The port already named
+                # and counted it; the tool's contract is an envelope, so the
+                # code travels as ``{"error": <code>}`` — the same named-EXIT
+                # shape as an unavailable transport, and deliberately NOT
+                # ``{"chunks": []}``, which would tell the model the corpus
+                # is empty for a call that was never askable. The model can
+                # fix its own arguments and retry; the run does not die on a
+                # blank ``query``.
+                return {"error": exc.code}
+
         try:
-            result = retrieve(
-                query=query,
-                document_id=document_id,
-                cik=cik,
-                form=form,
-                ticker=ticker,
-                filing_date=filing_date,
-                limit=limit,
-                adapter=adapter,
+            retry_outcome = retrieve_with_rewrite_retry(
+                query, _port_call, rewrite, max_retries=1
             )
-        except InputValidationError as exc:
-            # Invalid input (T21 / §B2 第 5 条). The port already named
-            # and counted it; the tool's contract is an envelope, so the
-            # code travels as ``{"error": <code>}`` — the same named-EXIT
-            # shape as an unavailable transport, and deliberately NOT
-            # ``{"chunks": []}``, which would tell the model the corpus
-            # is empty for a call that was never askable. The model can
-            # fix its own arguments and retry; the run does not die on a
-            # blank ``query``.
-            result = {"error": exc.code}
+        except RetrieveCallError as exc:
+            # Pre-retry behavior (T6): an unexpected exception from the
+            # port propagated out of the tool unchanged. The retry helper
+            # types it as ``RetrieveCallError``; unwrap the cause so the
+            # run's error surface stays exactly what it was before T9.
+            cause = exc.__cause__
+            if cause is not None:
+                raise cause from exc
+            raise
+        if retry_outcome.retry_count:
+            if retry_observer is not None:
+                retry_observer(retry_outcome)
+            else:
+                # Default: the process observability singleton records
+                # every performed rewrite (``fin.host.http`` exposes it
+                # on GET /api/observability). Resolved lazily so a
+                # collector built later in the process is still the one
+                # that counts.
+                default_collector().record_rewrite_retry(
+                    exhausted=retry_outcome.exhausted
+                )
+        result = dict(retry_outcome.result)
         if isinstance(result, dict) and "error" in result:
             # Typed EXIT: surface the port's error dict verbatim.
             # Building evidence / a chunks envelope here would
