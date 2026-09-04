@@ -1,8 +1,10 @@
 # Plan: PR #225 follow-up — Plan A（fin 侧可独立推进项收口，2026-09-01）
 
+**Status（2026-09-04）：** 文中「跨仓缺口 1–6 / 对侧无基线」已过期（见 `docs/handoff/2026-09-04-cross-repo-status.md`）。本文件只还覆盖 **retrieve 内部 maintainability**（ledger 抽取等），不是跨仓主线。跨仓提案 stub：`docs/cross-repo/alignment-proposal.md`。
+
 **Goal:** 把 PR #225 合 main 之后 fin 侧**不依赖跨仓 wire** 即可推进的事项收口为单一 plan，避免继续追加到 `plans/retrieve-maintainability-followup.md` 造成单点膨胀。本 plan 是「fin 侧 follow-up」轮次的第一刀。
 
-**Approach:** 本轮会话已知跨仓契约 6 项缺口（见 `docs/handoff/2026-09-01-pr225-merged.md` 与 `docs/cross-repo/alignment-proposal.md`），且当前 iknow-memory 仓侧 spec/`plans/` 下尚无任何「跨仓对齐基线」章节、SC41 校验器事实单边跑过。因此本 plan **冻结**如下边界（任何越界改动都需另开 plan 并经 explicit 授权）：
+**Approach:** 本轮会话已知跨仓契约 6 项缺口（见 `docs/handoff/archive/2026-09/2026-09-01-pr225-merged.md` 与 `docs/cross-repo/alignment-proposal.md`），且当前 iknow-memory 仓侧 spec/`plans/` 下尚无任何「跨仓对齐基线」章节、SC41 校验器事实单边跑过。因此本 plan **冻结**如下边界（任何越界改动都需另开 plan 并经 explicit 授权）：
 
 - 不动跨仓契约字段名：`source_ref` / `retrieval_id` / `degraded` / `degraded_reasons` / 8 能力键（`vector` / `keyword_bm25` / `cjk_segmentation` / `phrase` / `field_boost` / `graph_ppr` / `rrf` / `rerank`）
 - 不动 `specs/corpus-retrieval.md` §B1–§B6
@@ -94,7 +96,7 @@
 
 ### A6. fin 侧缺口 1 静默失败监控 — tag: `[implementation]`
 
-- **Inherits:** `docs/handoff/2026-09-01-pr225-merged.md` 风险与已知 gap 节（缺口 1 静默失败随 fin 上 main）；`docs/cross-repo/alignment-proposal.md` 缺口 1；T16 (`tests/retrieve/test_push_failures.py`) 既有静默失败检测路径
+- **Inherits:** `docs/handoff/archive/2026-09/2026-09-01-pr225-merged.md` 风险与已知 gap 节（缺口 1 静默失败随 fin 上 main）；`docs/cross-repo/alignment-proposal.md` 缺口 1；T16 (`tests/retrieve/test_push_failures.py`) 既有静默失败检测路径
 - **Surface:** `tests/retrieve/test_mcp_adapter.py` 新增集成测试 + `src/fin/retrieve/mcp_adapter.py` 内警告日志（若需）
 - **Acceptance:**
   - mock zod schema **无 `.strict()`**（与 iknow-memory 仓当前实情一致），断言 fin 发送 `top_k` / `filter` / `document_id` 后被剥键时 fin 侧记录警告日志
@@ -105,7 +107,7 @@
 
 ### A7. fin 侧缺口 3 serve 入口放宽 — tag: `[implementation]`
 
-- **Inherits:** `docs/handoff/2026-09-01-pr225-merged.md` 风险节（缺口 3 入口不存在）；`docs/cross-repo/alignment-proposal.md` 缺口 3
+- **Inherits:** `docs/handoff/archive/2026-09/2026-09-01-pr225-merged.md` 风险节（缺口 3 入口不存在）；`docs/cross-repo/alignment-proposal.md` 缺口 3
 - **Surface:** `src/fin/host/compile.py:130` 与 `src/fin/host/graph.py:1442` 的 `DEFAULT_MCP_COMMAND = ("iknow-memory", "serve")` → `("iknow-memory",)`
 - **Acceptance:**
   - 两处常量值同步更新；先走 stdio MCP（让 `npm start` 形态可启动）；纯兜底
@@ -157,7 +159,7 @@ CHECKPOINT 闭合之前，A8（数据集会涨到 §B1 上限，且 A8 触及真
 
 | 类型             | 路径                                                                         |
 | ---------------- | ---------------------------------------------------------------------------- |
-| 上版 handoff     | `docs/handoff/2026-09-01-pr225-merged.md`                                    |
+| 上版 handoff     | `docs/handoff/archive/2026-09/2026-09-01-pr225-merged.md`                    |
 | 跨仓对齐提案     | `docs/cross-repo/alignment-proposal.md`                                      |
 | 维护性 follow-up | `plans/retrieve-maintainability-followup.md`（T1–T5 pending，由 A1–A5 承接） |
 | 总计划           | `plans/retrieval-upgrade.md`                                                 |
