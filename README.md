@@ -12,7 +12,7 @@ This repository is the SSOT. Do not keep parallel copies under `projects/test`.
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------ |
 | `docs/CONTEXT.md`                                        | Domain terms **and product identity** (SSOT)                                         |
 | `docs/adr/`                                              | Accepted decisions (0001–0027)                                                       |
-| `specs/enterprise-kb-agent.md`                           | Program contract: the five foci of the knowledge-base Agent                           |
+| `specs/enterprise-kb-agent.md`                           | Program contract: the five foci of the knowledge-base Agent                          |
 | `docs/research/002-demo-corpus-and-evidence-contract.md` | Inherited corpus/evidence contract (snapshot from iknow wayfinder)                   |
 | `docs/research/003-enterprise-product-research-index.md` | Enterprise-product research index (004–009; not CONTEXT/ADR SSOT)                    |
 | `data/corpus/pdf/`                                       | Frozen 12 SEC 10-Q PDFs (AAPL, MSFT, AMZN)                                           |
@@ -121,9 +121,16 @@ The count command prints exactly two lines on stdout (`done=6`, `refuse=3`) and 
 `GET /health` reports whether this process can reach the Postgres behind `FIN_CHECKPOINT_URL` (LangGraph's `PostgresSaver`, ADR 0015, and the workspace thread store):
 
 ```json
-{ "status": "degraded", "checkpoint": { "state": "unconfigured", "reason": "checkpoint_url_unset", "detail": "..." } }
+{
+  "status": "degraded",
+  "checkpoint": {
+    "state": "unconfigured",
+    "reason": "checkpoint_url_unset",
+    "detail": "..."
+  }
+}
 ```
 
-`state` is `reachable` / `unconfigured` (URL unset — the process serves, run state lives in memory) / `unreachable` (URL set, Postgres did not answer). Both degraded states are a 200 with operator copy: a monitoring probe can tell "fin is down" from "fin is up without a database", which a blank 500 cannot. The body never echoes the URL — that string carries the operator's password.
+`state` is `reachable` / `unconfigured` (URL unset) / `unreachable` (URL set, Postgres did not answer). Product `fin-serve` does not start when the URL is unset (`MissingCheckpointURLError`); `unconfigured` remains for tests and for a process that imported the app without going through `serve()`. Both degraded states are a 200 with operator copy: a monitoring probe can tell "fin is down" from "fin is up without a database", which a blank 500 cannot. The body never echoes the URL — that string carries the operator's password.
 
 This is a separate route from `GET /api/status`, which stays boot-scoped per ADR 0033 (retrieve reachability, adapter kind, model slug, corpus filing count) and grows no per-request database probe.

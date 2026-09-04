@@ -130,8 +130,8 @@ LangGraph compiled around the agent loop plus code gates (verifier, caps, interr
 _Avoid_: retrieval graph
 
 **checkpointer**:
-v1 durable runs use LangGraph `PostgresSaver` via `FIN_CHECKPOINT_URL`. Pytest uses `InMemorySaver` only; it does not survive process exit.
-_Avoid_: SqliteSaver as the product default, InMemorySaver in CLI/HTTP, LangSmith-hosted persistence
+v1 durable runs use LangGraph `PostgresSaver` via `FIN_CHECKPOINT_URL`; product HTTP/CLI raise if that URL is unset. Pytest uses `InMemorySaver` only (plus explicit `FIN_SCRIPTED_MODEL` e2e); it does not survive process exit.
+_Avoid_: SqliteSaver as the product default, InMemorySaver as a silent CLI/HTTP fallback, LangSmith-hosted persistence
 
 **thread_id**:
 A conversation session: follow-up questions reuse this id so checkpoints and messages accumulate. Omitting it creates a new session before invoke; it is not a user_id.

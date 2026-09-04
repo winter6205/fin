@@ -131,28 +131,21 @@ def compile_for_http(
 
     Production path (``checkpointer=None``, ``model=None``)
     lazy-imports T8's ``compile_for_runtime`` and caches the
-    resulting graph. If ``FIN_CHECKPOINT_URL`` is unset (typical
-    WSL / laptop dev boot without Postgres), falls back to
-    ``compile_for_runtime_dev`` which uses ``InMemorySaver`` and
-    emits a WARNING that state is non-persistent. The fallback is
-    one-way per process: a single dev-mode boot stays dev-mode
-    for its lifetime. Tests pass explicit ``checkpointer`` +
-    ``model`` args and bypass both paths entirely.
+    resulting graph. A missing ``FIN_CHECKPOINT_URL`` raises
+    ``MissingCheckpointURLError`` — there is no InMemorySaver
+    fallback (ADR 0015). Tests pass explicit ``checkpointer`` +
+    ``model`` args and bypass this path entirely.
 
     ``FIN_SCRIPTED_MODEL`` (T7) selects the scripted-provider boot
     for the browser e2e lane instead. It is an explicit operator
-    opt-in checked BEFORE the provider paths — never a fallback
+    opt-in checked BEFORE the provider path — never a fallback
     reached by a missing credential or an absent checkpoint URL.
     """
     if checkpointer is None and model is None:
         global _http_graph_singleton
         with _http_singleton_lock:
             if _http_graph_singleton is None:
-                from fin.host.compile import (
-                    MissingCheckpointURLError,
-                    compile_for_runtime,
-                    compile_for_runtime_dev,
-                )
+                from fin.host.compile import compile_for_runtime
                 from fin.host import scripted_boot
 
                 if scripted_boot.scripted_boot_requested():
@@ -160,10 +153,7 @@ def compile_for_http(
                         scripted_boot.compile_for_scripted_e2e()
                     )
                     return _http_graph_singleton
-                try:
-                    _http_graph_singleton = compile_for_runtime()
-                except MissingCheckpointURLError:
-                    _http_graph_singleton = compile_for_runtime_dev()
+                _http_graph_singleton = compile_for_runtime()
             return _http_graph_singleton
     return compile_graph(
         checkpointer=checkpointer,
@@ -476,17 +466,17 @@ def serve() -> None:
     short-circuits the second call correctly.
 
     ``apply_dotenv`` runs first so ``FIN_*`` from a local ``.env``
-    are in ``os.environ`` before the first request compiles the
-    graph. Explicit process env still wins.
+    are in ``os.environ`` before compile. Explicit process env
+    still wins.
 
     The retrieve preflight runs on the assembled env, before
-    uvicorn binds: the graph compiles lazily on the first request,
-    so without this the "retrieve is wired to a server you do not
-    have" signal would only reach the operator as an unexplained
-    evidence-free answer.
+    uvicorn binds. The host graph compiles at this same moment:
+    a missing ``FIN_CHECKPOINT_URL`` must fail boot, not the
+    first ``/ask``.
     """
     apply_dotenv()
     warn_if_mcp_retrieve_unreachable()
+    compile_for_http()
     import uvicorn
 
     uvicorn.run("fin.host.http:app", host="0.0.0.0", port=8000, log_level="info")
