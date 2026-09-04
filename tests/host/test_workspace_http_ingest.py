@@ -225,6 +225,45 @@ def test_oversize_upload_is_a_named_413(
     assert fake.block_total() == 0
 
 
+def test_oversize_content_length_refused_before_the_service_runs(
+    http_app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Input-boundary fix (route layer): a DECLARED oversize
+    Content-Length is the named 413 BEFORE the spooled upload is read
+    into memory and BEFORE the service runs — the ingest tripwire
+    below must never fire."""
+    fake = FakePushPort()
+    service = _service(fake, max_bytes=16)
+
+    def _tripwire(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(
+            "service.ingest ran despite oversize Content-Length"
+        )
+
+    monkeypatch.setattr(service, "ingest", _tripwire)
+    _install(http_app, service)
+    response = client.post(
+        "/api/corpus/ingest",
+        files={"file": ("big.txt", b"x" * 512, "text/plain")},
+    )
+    assert response.status_code == 413
+    assert response.json()["error"] == "ingest_upload_too_large"
+    assert fake.block_total() == 0
+
+
+def test_ingest_bounded_read_stops_at_the_cap() -> None:
+    """Input-boundary fix (chunked uploads, no Content-Length): the
+    route reads the spooled upload in bounded segments and refuses at
+    cap+1 bytes — never one full ``read()`` of an unbounded body."""
+    import io
+
+    from fin.host.workspace_http import _read_bounded_upload
+
+    assert _read_bounded_upload(io.BytesIO(b"x" * 17), 16) is None
+    assert _read_bounded_upload(io.BytesIO(b"x" * 16), 16) == b"x" * 16
+    assert _read_bounded_upload(io.BytesIO(b"x" * 4096), 0) == b"x" * 4096
+
+
 # ----- exception class (SC8: MCP down typed) ----------------------------
 
 

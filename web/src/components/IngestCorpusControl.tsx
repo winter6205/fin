@@ -7,7 +7,7 @@
 // NOT live in the Composer and is never a drag-to-thread affordance.
 // The home corpus area is where the operator already sees what is in
 // the corpus — and where the empty-corpus copy says "请运行 ingest
-// 后再提问" — so the door sits here, above the corpus cards.
+// 入库后再提问" — so the door sits here, above the corpus cards.
 //
 // Minimal on purpose: no metadata form. The endpoint derives
 // document_id from company/period or the filename and classifies

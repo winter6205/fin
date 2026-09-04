@@ -1,7 +1,7 @@
 """The corpus ingest endpoint service (corpus-serve-ingest T3, ADR 0047).
 
 This is the ONE product entry where company documents are parsed and
-切分s for storage on the retrieval backend. The chain is fully
+chunked for storage on the retrieval backend. The chain is fully
 deterministic — no model participates in any split decision:
 
 1. **format recognition** — the format is named by the caller (an
@@ -354,26 +354,39 @@ class IngestEndpoint:
         """The push port behind this endpoint (diagnostics / tests)."""
         return self._push_port
 
-    def ingest(
+    @property
+    def max_bytes(self) -> int:
+        """The configured upload cap (overflow class; ``0`` = no cap).
+
+        The HTTP route's pre-buffer gate reads this so the route and
+        the endpoint refuse the SAME oversize boundary from one value.
+        """
+        return self._max_bytes
+
+    def _validate_upload(
         self,
         data: bytes,
         *,
-        filename: str | None = None,
-        declared_format: str | None = None,
-        document_id: str | None = None,
-        company: str | None = None,
-        period: str | None = None,
-        doc_type: str | None = None,
-        previous_records: Callable[[], Sequence[PushRecord]] | None = None,
-    ) -> IngestEndpointResult:
-        """Run the full chain on one upload (see module docstring).
+        filename: str | None,
+        declared_format: str | None,
+        document_id: str | None,
+        company: str | None,
+        period: str | None,
+        doc_type: str | None,
+    ) -> tuple[str, str, str | None, str | None]:
+        """Run every pre-parse named validation; resolve the locator.
 
-        Every failure is typed: the endpoint families above, the
-        parser's ``ParseError`` family, the push ``PushError`` family
-        and the invalidation ``InvalidationError`` family. A failure
-        before the push writes nothing; a failure after it (invalidation,
-        hook) leaves the idempotent push in place and is the caller's
-        signal to retry.
+        The failure classes that must never reach a parse or a push
+        are decided HERE, in order: upload overflow
+        (``ingest_upload_too_large``, checked on the raw bytes before
+        anything else), format recognition (``unsupported_format`` /
+        ``format_unspecified``), document-id derivation
+        (``document_id_missing``) and the doc_type vocabulary
+        (``invalid_doc_type``).
+
+        Returns ``(fmt, doc_id, company, period)`` with the metadata
+        fields normalized (``None`` when blank) so the whole chain —
+        including the ``on_ingested`` row — shares one value.
         """
         if self._max_bytes > 0 and len(data) > self._max_bytes:
             raise IngestUploadTooLargeError(
@@ -395,6 +408,39 @@ class IngestEndpoint:
                 f"unknown doc_type {doc_type!r}; the params table's "
                 f"document types are: {', '.join(DOC_TYPES)}"
             )
+        return fmt, doc_id, company or None, period or None
+
+    def ingest(
+        self,
+        data: bytes,
+        *,
+        filename: str | None = None,
+        declared_format: str | None = None,
+        document_id: str | None = None,
+        company: str | None = None,
+        period: str | None = None,
+        doc_type: str | None = None,
+        previous_records: Callable[[], Sequence[PushRecord]] | None = None,
+    ) -> IngestEndpointResult:
+        """Run the full chain on one upload (see module docstring).
+
+        Every failure is typed: the endpoint families above, the
+        parser's ``ParseError`` family, the push ``PushError`` family
+        and the invalidation ``InvalidationError`` family. A failure
+        before the push writes nothing; a failure after it (invalidation,
+        hook) leaves the idempotent push in place and is the caller's
+        signal to retry. The pre-parse validations live in
+        :meth:`_validate_upload`.
+        """
+        fmt, doc_id, company, period = self._validate_upload(
+            data,
+            filename=filename,
+            declared_format=declared_format,
+            document_id=document_id,
+            company=company,
+            period=period,
+            doc_type=doc_type,
+        )
 
         version = hashlib.sha256(data).hexdigest()
         parsed = parse_document(
@@ -427,8 +473,8 @@ class IngestEndpoint:
             self._on_ingested(
                 IngestedDocument(
                     document_id=doc_id,
-                    company=company or None,
-                    period=period or None,
+                    company=company,
+                    period=period,
                     version=version,
                     page_count=len(parsed.units),
                     fmt=fmt,

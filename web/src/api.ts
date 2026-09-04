@@ -604,7 +604,7 @@ async function namedErrorCode(res: Response): Promise<string> {
     const body = (await res.json()) as { error?: unknown };
     if (typeof body?.error === "string" && body.error) return body.error;
   } catch {
-    // fall through to the status-derived code.
+    return `http_${res.status}`;
   }
   return `http_${res.status}`;
 }
@@ -649,10 +649,12 @@ export async function ingestCorpus(
 
 /**
  * The thread-attach door (ADR 0047): raw-bytes POST with the filename
- * as a query parameter — deliberately NOT multipart (the host serves
- * this door without the python-multipart dependency). The returned
- * ``attachment_id`` is referenced ONCE on the next send via
- * ``SendRequest.attachment_ids``; nothing is pushed to the corpus.
+ * as a query parameter — deliberately NOT multipart: this door ships
+ * ONE undecorated turn blob (no form fields), so a plain ``fetch``
+ * body is the whole contract and neither side needs multipart
+ * parsing. The returned ``attachment_id`` is referenced ONCE on the
+ * next send via ``SendRequest.attachment_ids``; nothing is pushed to
+ * the corpus.
  */
 export async function attachToThread(
   threadId: string,
