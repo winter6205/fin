@@ -9,9 +9,11 @@ import type {
   Citation,
   Comparison,
   Filing,
+  IngestResult,
   Notice,
   SoftTrack,
   StreamErrorKind,
+  ThreadAttachment,
   ThreadDetail,
   ThreadListItem,
   TrackDecision,
@@ -259,6 +261,11 @@ export class IngestMissingError extends Error {}
 export interface SendRequest {
   question: string;
   thinking?: boolean;
+  // corpus-serve-ingest T5 (ADR 0047 **thread attach**): ids minted
+  // by POST /threads/{id}/attachments, referenced ONCE by this send.
+  // This is the attach door's only downstream — the attach path must
+  // never touch /api/corpus/ingest.
+  attachment_ids?: string[];
 }
 
 /**
@@ -550,4 +557,116 @@ export async function resumeThread(
   }
 
   return consumeSseStream(res.body, onEvent);
+}
+
+// ----- corpus-serve-ingest T5: the two upload doors (ADR 0047) -----
+
+/**
+ * Named failure of the corpus-ingest door. Every ingest failure
+ * answers a stable ``error`` code (4xx input, 413 too large, 415
+ * unsupported format, 503 push/invalidation outage) with NO
+ * partial-success 200 (SC7/SC8); the SPA renders copy keyed off
+ * ``code`` (see ingestFailure.ts) instead of a bare enum.
+ */
+export class IngestFailedError extends Error {
+  readonly code: string;
+  readonly status: number;
+
+  constructor(code: string, status: number) {
+    super(`HTTP ${status}: ${code}`);
+    this.name = "IngestFailedError";
+    this.code = code;
+    this.status = status;
+  }
+}
+
+/** Named failure of the thread-attach door (``empty_attachment`` /
+ * ``attachment_too_large`` / ``attachment_not_text`` / ...). Kept a
+ * DISTINCT class from IngestFailedError so an attach failure can
+ * never render as ingest business (SC4). */
+export class AttachFailedError extends Error {
+  readonly code: string;
+  readonly status: number;
+
+  constructor(code: string, status: number) {
+    super(`HTTP ${status}: ${code}`);
+    this.name = "AttachFailedError";
+    this.code = code;
+    this.status = status;
+  }
+}
+
+/** Read the named ``error`` code off a failed response body; an
+ * unparseable body still yields a non-empty code (statusText is
+ * often empty on fetch errors, so the status itself is the code). */
+async function namedErrorCode(res: Response): Promise<string> {
+  try {
+    const body = (await res.json()) as { error?: unknown };
+    if (typeof body?.error === "string" && body.error) return body.error;
+  } catch {
+    // fall through to the status-derived code.
+  }
+  return `http_${res.status}`;
+}
+
+/** Optional locator metadata for the ingest door. All optional: the
+ * endpoint derives ``document_id`` from company+period or the
+ * filename, and classifies doc_type per unit when omitted. */
+export interface IngestMeta {
+  document_id?: string;
+  company?: string;
+  period?: string;
+  doc_type?: string;
+  format?: string;
+}
+
+/**
+ * The corpus-ingest door (ADR 0047): multipart POST /api/corpus/ingest
+ * — the ONLY client surface that triggers 切分 + MCP push. Named
+ * failures throw ``IngestFailedError`` with the wire code; success
+ * resolves the push summary (the store refreshes the corpus list).
+ */
+export async function ingestCorpus(
+  file: File,
+  meta: IngestMeta = {},
+): Promise<IngestResult> {
+  const form = new FormData();
+  form.append("file", file, file.name);
+  if (meta.document_id) form.append("document_id", meta.document_id);
+  if (meta.company) form.append("company", meta.company);
+  if (meta.period) form.append("period", meta.period);
+  if (meta.doc_type) form.append("doc_type", meta.doc_type);
+  if (meta.format) form.append("format", meta.format);
+  const res = await fetch("/api/corpus/ingest", {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) {
+    throw new IngestFailedError(await namedErrorCode(res), res.status);
+  }
+  return (await res.json()) as IngestResult;
+}
+
+/**
+ * The thread-attach door (ADR 0047): raw-bytes POST with the filename
+ * as a query parameter — deliberately NOT multipart (the host serves
+ * this door without the python-multipart dependency). The returned
+ * ``attachment_id`` is referenced ONCE on the next send via
+ * ``SendRequest.attachment_ids``; nothing is pushed to the corpus.
+ */
+export async function attachToThread(
+  threadId: string,
+  file: File,
+): Promise<ThreadAttachment> {
+  // Raw bytes, not file.text(): the host decodes UTF-8 itself and
+  // answers the named 400 attachment_not_text for undecodable bytes.
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const url =
+    `/api/threads/${encodeURIComponent(threadId)}/attachments` +
+    `?filename=${encodeURIComponent(file.name)}`;
+  const res = await fetch(url, { method: "POST", body: bytes });
+  if (!res.ok) {
+    throw new AttachFailedError(await namedErrorCode(res), res.status);
+  }
+  return (await res.json()) as ThreadAttachment;
 }

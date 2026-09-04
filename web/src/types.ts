@@ -275,3 +275,41 @@ export interface Filing {
   // T1 does not render these; they exist in the payload.
   [key: string]: unknown;
 }
+
+// ----- corpus-serve-ingest T5: the two upload doors (ADR 0047) -----
+
+// Success body of POST /api/corpus/ingest (the corpus-ingest door).
+// Mirrors fin.host.workspace_http.corpus_ingest's 200 payload. The
+// push is observable here as written / duplicates / block_ids;
+// ``invalidation`` is non-null only on a re-ingest that closed stale
+// blocks. Every ingest failure is a named ``error`` code instead of
+// a partial-success 200 (SC7/SC8) — see api.IngestFailedError.
+export interface IngestResult {
+  status: "ingested";
+  document_id: string;
+  version: string;
+  fmt: string;
+  doc_type: string;
+  unit_count: number;
+  block_count: number;
+  written: number;
+  duplicates: number;
+  block_ids: string[];
+  invalidation: {
+    block_ids: string[];
+    closed: number;
+    already_closed: number;
+    closed_at: [string, string][];
+  } | null;
+}
+
+// Success body of POST /api/threads/{id}/attachments (the
+// thread-attach door). ``scope`` is always "thread_attach": the model
+// may read the text on THIS turn only; nothing is pushed, nothing is
+// ingested (SC4). Mirrors the route's return dict.
+export interface ThreadAttachment {
+  attachment_id: string;
+  filename: string;
+  size_bytes: number;
+  scope: "thread_attach";
+}

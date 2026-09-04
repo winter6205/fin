@@ -9,7 +9,9 @@ import * as api from "./api";
 import { forgetLastThreadIf, rememberLastThread } from "./lastThread";
 import type {
   Filing,
+  IngestResult,
   Notice,
+  ThreadAttachment,
   ThreadDetail,
   ThreadListItem,
   ToolSummary,
@@ -70,6 +72,7 @@ interface WorkspaceState {
     threadId: string,
     question: string,
     thinkingOn?: boolean,
+    attachmentIds?: string[],
   ) => Promise<api.SendResult | null>;
   // T4 (spec line 39): resume an interrupted run from the last
   // complete node. Mirrors ``sendQuestion``'s streaming-event
@@ -92,6 +95,15 @@ interface WorkspaceState {
   // resolves with the terminal stopped frames, so this action only has
   // to signal and refresh the turn table.
   stopRun: (threadId: string) => Promise<void>;
+  // corpus-serve-ingest T5 (ADR 0047 **corpus ingest**): the ingest
+  // door. The ONLY action that triggers 切分 + push; a success
+  // refreshes the corpus list the operator is looking at, a named
+  // failure rethrows for the control to render (ingestFailure.ts).
+  ingestFile: (file: File) => Promise<IngestResult>;
+  // corpus-serve-ingest T5 (ADR 0047 **thread attach**): the attach
+  // door. Mints a turn-scoped attachment id; NEVER touches the
+  // ingest endpoint — the doors must not cross.
+  attachFile: (threadId: string, file: File) => Promise<ThreadAttachment>;
 }
 
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
@@ -177,7 +189,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }));
   },
 
-  async sendQuestion(threadId, question, thinkingOn = true) {
+  async sendQuestion(threadId, question, thinkingOn = true, attachmentIds) {
     if (!question.trim()) return null; // Empty submit is a no-op.
     if (get().sendingQuestion) return null; // No queue in T1.
     set({ sendingQuestion: true });
@@ -249,10 +261,17 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // bounce retry accumulates behind the visible draft.
     let statusSeen = false;
     let answerFold: LiveAnswerState = EMPTY_LIVE_ANSWER;
+    // corpus-serve-ingest T5 (ADR 0047 thread attach): the ids the
+    // attach door minted ride THIS send and are consumed by it
+    // (single use). The attach path never touches /api/corpus/ingest.
+    const request: api.SendRequest = { question, thinking: thinkingOn };
+    if (attachmentIds && attachmentIds.length > 0) {
+      request.attachment_ids = attachmentIds;
+    }
     try {
       const result = await api.sendMessage(
         threadId,
-        { question, thinking: thinkingOn },
+        request,
         (event) => {
           switch (event.type) {
             case "thinking":
@@ -586,6 +605,23 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         set({ stoppingThreadId: null });
       }
     }
+  },
+
+  async ingestFile(file: File) {
+    // The corpus-ingest door (ADR 0047): the ONLY action that
+    // triggers 切分 + MCP push. Named failures rethrow so the control
+    // can render them (ingestFailure.ts) — no half-success here; the
+    // corpus list refresh happens only after a fully successful push.
+    const result = await api.ingestCorpus(file);
+    await get().loadCorpus();
+    return result;
+  },
+
+  async attachFile(threadId: string, file: File) {
+    // The thread-attach door (ADR 0047): mints a turn-scoped
+    // attachment the NEXT send references once. Deliberately does
+    // NOT touch /api/corpus/ingest — the two doors must not cross.
+    return api.attachToThread(threadId, file);
   },
 }));
 
