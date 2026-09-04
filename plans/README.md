@@ -4,7 +4,7 @@
 
 **总计划（阶段表，不再当实施队列）：** [`retrieval-upgrade.md`](retrieval-upgrade.md)
 
-**下一刀实施（未开工）：** [`memory-dialogue-platform.md`](memory-dialogue-platform.md)
+**下一刀实施：** [`session-compaction.md`](session-compaction.md)（worktree `feat/session-compaction`；MDP T4 执行权在本文件）。MDP 其余波在 `/home/winner/projects/fin-wt-memory-dialogue-platform` 的 [`memory-dialogue-platform.md`](memory-dialogue-platform.md)，该树不改压缩。
 
 **仍开着的 retrieve 内部债（非跨仓主线）：** [`retrieve-maintainability-followup.md`](retrieve-maintainability-followup.md)、[`2026-09-01-pr225-followup-plan-a.md`](2026-09-01-pr225-followup-plan-a.md)
 
