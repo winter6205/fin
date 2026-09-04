@@ -2826,6 +2826,99 @@ class _LockedGraph:
     def _release_thread(lock: threading.Lock) -> None:
         lock.release()
 
+    def compact_thread(self, thread_id: str) -> dict[str, Any]:
+        """Run the ADR 0044 compaction gate against ``thread_id``'s
+        checkpoint — the ``/compact`` command path (plan T2).
+
+        WHY a proxy method (mirrors ``finalize_abandoned_run`` /
+        ``delete_thread``): the graph proxy must remain the ONLY
+        writer to the checkpointer, and the write-back needs
+        ``update_state`` — reaching into ``self._graph`` from the
+        HTTP layer would couple the route to compiled-graph
+        internals.
+
+        Semantics:
+
+        * Acquires the SAME per-thread lock as ``invoke`` / ``stream``
+          (raises ``ConcurrentRunError`` when a run is in flight — the
+          409 contract is unchanged; the route probes ``is_locked``
+          first for the before-headers 409, this acquire is the
+          belt-and-suspenders writer lock).
+        * ``force=True`` on the compactor: the gate runs WITHOUT the
+          90% trigger (a thread under 90% may still compact when the
+          operator asked), with the same eviction units, summary
+          write, and ``RemoveMessage`` write-back as the auto path.
+        * Returns a receipt dict:
+          ``{"outcome": "compacted", "before_tokens", "after_tokens",
+          "messages_removed"}`` when the gate produced an update;
+          ``{"outcome": "pending_run"}`` when the thread has a
+          resumable mid-run checkpoint (never clobbered — resume or
+          stop the run first); ``{"outcome": "noop"}`` when the
+          thread has no checkpoint or the gate produced no update.
+        * Write-back is ``update_state(..., as_node="dialogue")``:
+          the ``dialogue`` leaf routes straight to END, so the
+          checkpoint stays terminal (``pending_nodes() == ()``) —
+          verified against the compiled graph (a pending checkpoint
+          is rejected before this point by the ``pending_nodes``
+          guard).
+        * Summary failure is typed (:class:`SessionSummaryError`) and
+          surfaces to the caller as ``{"outcome": "summary_failed"}``
+          — the caller turns it into a graceful receipt, never a 500
+          (ADR 0044: must not refuse the operator turn). The
+          checkpoint is untouched on that path.
+        """
+        lock = self._acquire_thread(thread_id)
+        try:
+            if self._compactor is None:
+                # ``compactor`` is optional only for direct
+                # ``_LockedGraph`` construction outside the factory;
+                # ``/compact`` cannot run without the shared gate
+                # compactor (ADR 0044 T2), so fail typed and clear.
+                raise ConcurrentRunError(
+                    "this graph has no session compactor (compile_graph "
+                    "always provides one); /compact is unavailable"
+                )
+            config = {"configurable": {"thread_id": thread_id}}
+            snapshot = self._graph.get_state(config)
+            values = snapshot.values or {}
+            messages = list(values.get("messages") or [])
+            if not messages:
+                # No checkpoint (never-sent thread) — nothing to compact.
+                return {"outcome": "noop"}
+            if tuple(snapshot.next or ()):
+                # Mid-run (resumable) checkpoint — never clobbered.
+                return {"outcome": "pending_run"}
+            before_tokens = count_tokens_approximately(messages)
+            try:
+                update = self._compactor.compact_update(
+                    messages,
+                    status_snapshots=list(values.get("status_snapshots") or []),
+                    force=True,
+                )
+            except SessionSummaryError:
+                # Typed summary failure BEFORE any write: the
+                # checkpoint is untouched, the turn continues
+                # (ADR 0044: must not refuse the operator turn).
+                return {"outcome": "summary_failed"}
+            if not update:
+                # Under the floor already (nothing evictable) — no-op.
+                return {"outcome": "noop"}
+            self._graph.update_state(config, {"messages": update}, as_node="dialogue")
+            return {
+                "outcome": "compacted",
+                "before_tokens": before_tokens,
+                "after_tokens": count_tokens_approximately(
+                    [m for m in update if not isinstance(m, RemoveMessage)]
+                ),
+                "messages_removed": max(
+                    0,
+                    len(messages)
+                    - len([m for m in update if not isinstance(m, RemoveMessage)]),
+                ),
+            }
+        finally:
+            self._release_thread(lock)
+
     # ---- public surface ----
 
     @staticmethod
