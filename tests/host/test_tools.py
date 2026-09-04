@@ -7,10 +7,13 @@ gate rely on: tools return dicts (not exceptions), and the model can
 distinguish a known-unknown ``unknown_locator`` from a tool that
 crashed mid-run.
 
-The committed extracted tree at ``data/corpus/extracted/`` (T2) is the
-fixture for every happy-path test. No real LLM is invoked; no corpus
-is mocked. The one exception test monkey-patches
-``load_extracted_tree`` to verify the typed-error translation rule.
+The committed catalog metadata table at ``data/corpus/catalog.json``
+(T2 / ADR 0047) is the fixture for the ``list_files`` happy-path
+tests; the committed extracted tree still backs the ``read_file``
+tests via the explicitly injected tree port. No real LLM is invoked;
+no corpus is mocked. The one ``read_file`` exception test
+monkey-patches ``load_extracted_tree`` to verify the typed-error
+translation rule.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+from fin.corpus.catalog import record_filings
 from fin.corpus.errors import IngestMissingError
 from fin.corpus.extracted import load_extracted_tree
 from fin.host.tools import list_files, read_file
@@ -42,6 +46,10 @@ def _manifest_path() -> Path:
 
 def _extracted_root() -> Path:
     return _project_data_dir() / "extracted"
+
+
+def _catalog_path() -> Path:
+    return _project_data_dir() / "catalog.json"
 
 
 def _tree_reader() -> ExtractedTreeReadPort:
@@ -158,8 +166,7 @@ def test_list_files_empty_returns_full_library_list() -> None:
     """``list_files()`` returns every committed filing with the contract
     shape."""
     result = list_files(
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        catalog_path=_catalog_path(),
     )
     assert isinstance(result, dict)
     # Exactly one top-level key per ADR 0009.
@@ -218,8 +225,7 @@ def test_list_files_unknown_company_returns_empty() -> None:
     """Unknown ``company`` filter returns ``{"filings": []}`` (not error)."""
     result = list_files(
         company="FOO",
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        catalog_path=_catalog_path(),
     )
     assert result == {"filings": []}
 
@@ -228,8 +234,7 @@ def test_list_files_unknown_period_returns_empty() -> None:
     """Unknown ``period`` filter returns ``{"filings": []}``."""
     result = list_files(
         period="2099 Q4",
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        catalog_path=_catalog_path(),
     )
     assert result == {"filings": []}
 
@@ -463,8 +468,7 @@ def test_list_files_with_aapl_filter_returns_7_documents() -> None:
     """
     result = list_files(
         company="AAPL",
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        catalog_path=_catalog_path(),
     )
     assert len(result["filings"]) == 7
     for filing in result["filings"]:
@@ -475,8 +479,7 @@ def test_list_files_with_period_filter_returns_3_documents() -> None:
     """``list_files(period='2023 Q1')`` returns 3 cross-company docs."""
     result = list_files(
         period="2023 Q1",
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        catalog_path=_catalog_path(),
     )
     assert len(result["filings"]) == 3
     for filing in result["filings"]:
@@ -488,23 +491,35 @@ def test_list_files_with_combined_filter_returns_1_document() -> None:
     result = list_files(
         company="AAPL",
         period="2023 Q1",
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        catalog_path=_catalog_path(),
     )
     assert len(result["filings"]) == 1
     assert result["filings"][0]["document_id"] == "AAPL-2023Q1"
 
 
-def test_list_files_with_synthetic_3page_tree_reports_page_count(
+def test_list_files_with_synthetic_3page_row_reports_page_count(
     tmp_path: Path,
 ) -> None:
-    """``list_files`` over a synthetic 3-page tree reports ``page_count=3``."""
-    manifest_path, extracted_root, _ = _build_synthetic_3page_tree(tmp_path)
+    """``list_files`` over a synthetic catalog row reports ``page_count=3``.
 
-    result = list_files(
-        manifest_path=manifest_path,
-        extracted_root=extracted_root,
+    The page_count comes from the catalog metadata table row (ADR
+    0047) — the extracted tree is not consulted on the catalog path.
+    """
+    catalog_path = tmp_path / "catalog.json"
+    record_filings(
+        [
+            {
+                "document_id": "TEST-2023Q1",
+                "company": "TEST",
+                "period": "2023 Q1",
+                "version": "a" * 64,
+                "page_count": 3,
+            }
+        ],
+        catalog_path=catalog_path,
     )
+
+    result = list_files(catalog_path=catalog_path)
     assert len(result["filings"]) == 1
     assert result["filings"][0]["page_count"] == 3
     assert result["filings"][0]["document_id"] == "TEST-2023Q1"

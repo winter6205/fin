@@ -45,6 +45,7 @@ per session via the ``corpus_tree`` module-level fixture.
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import threading
 import time
 from pathlib import Path
@@ -53,6 +54,7 @@ import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+from fin.corpus.catalog import record_filings
 from fin.corpus.extracted import Locator, load_extracted_tree
 from fin.host import (
     AgentState,
@@ -676,6 +678,104 @@ def test_list_files_tool_does_not_contribute_evidence():
     assert out["status"] in {"refuse", "step_cap"}
     # No evidence was added by ``list_files``.
     assert out["evidence"] == []
+
+
+# ----- list_files catalog injection (T2 / ADR 0047) -----
+
+
+def _catalog_row() -> dict[str, object]:
+    return {
+        "document_id": "INJECTED-2023Q1",
+        "company": "INJECTED",
+        "period": "2023 Q1",
+        "version": "a" * 64,
+        "page_count": 2,
+    }
+
+
+def _script_list_files(args: dict[str, object]) -> list[AIMessage]:
+    return [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "list_files",
+                    "args": args,
+                    "id": "c-lf",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        AIMessage(content="I checked the catalog. Done."),
+    ]
+
+
+def _list_files_tool_output(out: dict) -> dict:
+    """Parse the ``list_files`` ToolMessage payload out of a run."""
+    payloads = [
+        json.loads(m.content)
+        for m in out["messages"]
+        if getattr(m, "name", None) == "list_files"
+        and isinstance(getattr(m, "content", None), str)
+    ]
+    assert len(payloads) == 1, f"expected one list_files ToolMessage: {payloads}"
+    return payloads[0]
+
+
+def test_list_files_tool_reads_the_injected_catalog_table(tmp_path: Path):
+    """``compile_graph(catalog_path=...)`` injects the catalog table the
+    tool reads (T1 read_port injection style): the ``company="INJECTED"``
+    filter can only be satisfied by the injected tmp table — the
+    committed library holds no such issuer."""
+    catalog_path = tmp_path / "catalog.json"
+    record_filings([_catalog_row()], catalog_path=catalog_path)
+
+    model = ScriptedChatModel(script=_script_list_files({"company": "INJECTED"}))
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+        catalog_path=catalog_path,
+    )
+    out = g.invoke(
+        {
+            "messages": [HumanMessage("What was AAPL net sales in 2023 Q3?")],
+            "evidence": [],
+            "repair_count": 0,
+            "step_count": 0,
+        },
+        config=_thread_config("t-lf-injected"),
+    )
+
+    payload = _list_files_tool_output(out)
+    assert [f["document_id"] for f in payload["filings"]] == ["INJECTED-2023Q1"]
+    assert payload["filings"][0]["page_count"] == 2
+
+
+def test_list_files_tool_with_missing_catalog_table_is_empty_filings(
+    tmp_path: Path,
+):
+    """A ``catalog_path`` with no table file is the empty catalog
+    ``{"filings": []}`` — not a boot failure, not a tree scan (ADR
+    0047: no serve-time extracted-tree SSOT)."""
+    model = ScriptedChatModel(script=_script_list_files({}))
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+        catalog_path=tmp_path / "absent" / "catalog.json",
+    )
+    out = g.invoke(
+        {
+            "messages": [HumanMessage("What was AAPL net sales in 2023 Q3?")],
+            "evidence": [],
+            "repair_count": 0,
+            "step_count": 0,
+        },
+        config=_thread_config("t-lf-miss"),
+    )
+
+    assert _list_files_tool_output(out) == {"filings": []}
 
 
 # ----- boundary cases: malformed evidence -----

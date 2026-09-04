@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from fin.corpus.catalog import record_filings
 from fin.corpus.structure_units import (
     ParsedSection,
     StructureLocator,
@@ -178,52 +179,24 @@ def test_parser_failure_and_unit_overflow_are_typed(tmp_path: Path) -> None:
 def test_unknown_form_filter_remains_empty_catalog_result(
     tmp_path: Path,
 ) -> None:
-    document_id = "TEST-2026"
-    version = "a" * 64
-    extracted_root = tmp_path / "extracted" / document_id
-    extracted_root.mkdir(parents=True)
-    (extracted_root / "page-001.json").write_text(
-        json.dumps(
+    """A row whose form does not match the filter is an empty catalog
+    result, not an error — the filter semantics do not depend on how
+    the row was registered."""
+    catalog_path = tmp_path / "catalog.json"
+    record_filings(
+        [
             {
-                "document_id": document_id,
-                "version": version,
-                "page": 1,
-                "text": "fixture",
+                "document_id": "TEST-2026",
+                "company": "TEST",
+                "period": "2026 Q1",
+                "version": "a" * 64,
+                "page_count": 1,
+                "form": "10-Q",
             }
-        )
-    )
-    (extracted_root / "passages-001.json").write_text(
-        json.dumps({"passages": []})
-    )
-    (extracted_root.parent / "_index.json").write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "documents": {
-                    document_id: {"version": version, "page_count": 1}
-                },
-            }
-        )
-    )
-    manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "documents": [
-                    {
-                        "document_id": document_id,
-                        "company": "TEST",
-                        "period": "2026 Q1",
-                        "sha256": version,
-                        "form": "10-Q",
-                    }
-                ]
-            }
-        )
+        ],
+        catalog_path=catalog_path,
     )
 
-    assert list_files(
-        form="8-K",
-        manifest_path=manifest_path,
-        extracted_root=extracted_root.parent,
-    ) == {"filings": []}
+    assert list_files(form="8-K", catalog_path=catalog_path) == {
+        "filings": []
+    }
