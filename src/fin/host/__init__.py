@@ -22,6 +22,13 @@ from fin.host.citation_gate import (
 )
 from fin.host.graph import ConcurrentRunError, compile_graph
 from fin.host.scripted_model import ScriptedChatModel
+from fin.host.session_compaction import (
+    SESSION_TOKEN_BUDGET,
+    OccupancyCompactor,
+    SessionSummaryError,
+    count_tokens_approximately,
+    session_budget_tokens,
+)
 from fin.host.state import (
     AgentState,
     EVIDENCE_RESET,
@@ -46,14 +53,19 @@ __all__ = [
     "EvidenceItem",
     "GateResult",
     "MalformedEvidenceError",
+    "OccupancyCompactor",
     "REPAIR_CAP",
     "RECURSION_LIMIT",
     "RefuseResult",
+    "SESSION_TOKEN_BUDGET",
     "STEP_CAP",
     "ScriptedChatModel",
+    "SessionSummaryError",
     "Status",
     "TERMINAL_STATUSES",
     "compile_graph",
+    "count_tokens_approximately",
+    "session_budget_tokens",
     "list_files",
     "read_file",
     "verify_citations",

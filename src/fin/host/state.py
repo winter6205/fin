@@ -186,16 +186,18 @@ MIN_SPAN_LEN: Final[int] = 32
 
 # LangGraph's recursion limit counts SUPERSTEPS (one node execution
 # per superstep), while ``STEP_CAP`` counts ``model_node`` entries.
-# One agent-loop iteration that calls a tool costs TWO supersteps
-# (model_node, then tool_node); the citation gate adds one more on
-# the final turn. So the worst case before the fin fuse fires is
-# ~``2 * STEP_CAP`` supersteps. The default must therefore exceed
-# ``2 * STEP_CAP`` — a bare ``STEP_CAP + margin`` would let
-# ``GraphRecursionError`` preempt the fin-owned ``step_cap`` fuse,
-# which the spec forbids (success criteria item 5: "LangGraph
-# ``recursion_limit`` is > 32 so this fuse fires first" — fires
-# first means AFTER the fin fuse, never instead of it).
-RECURSION_LIMIT: Final[int] = 2 * STEP_CAP + 6  # = 70
+# One agent-loop iteration that calls a tool costs THREE supersteps
+# in T1: ``model_node``, ``tool_node``, then the new
+# ``compaction_gate`` (ADR 0044 / plan T1); the citation gate adds
+# one more on the final turn. So the worst case before the fin
+# fuse fires is ~``3 * STEP_CAP`` supersteps. The default must
+# therefore exceed ``3 * STEP_CAP`` — a bare ``STEP_CAP + margin``
+# would let ``GraphRecursionError`` preempt the fin-owned
+# ``step_cap`` fuse, which the spec forbids (success criteria item
+# 5: "LangGraph ``recursion_limit`` is > 32 so this fuse fires
+# first" — fires first means AFTER the fin fuse, never instead of
+# it).
+RECURSION_LIMIT: Final[int] = 3 * STEP_CAP + 9  # = 105
 
 
 # ----- Soft-Track status snapshot (T3) -----

@@ -142,12 +142,17 @@ LangGraph compiled around the agent loop plus code gates (verifier, caps, interr
 _Avoid_: retrieval graph
 
 **session compaction**:
+<<<<<<< HEAD
 A host gate on the **research thread**: occupancy is estimated tokens of the model-facing payload (track prompt, messages, research tool schemas, and when memory is ON any **recall injection**) against a 256_000 session budget; at ≥90% occupancy, or when the operator sends `/compact`, old checkpoint `messages` are summarized and removed, aiming at ~40% occupancy. The summarizer is injectable (v1 the **v1 model**); occupancy may render on the thread, not on `GET /api/status`.
 _Avoid_: message-count windows, treating `/compact` as a research tool, putting occupancy on the boot status strip, using the vendor 1M window as the compact threshold, treating a memory row-count cap as the occupancy gate
 
 **recall injection**:
 When memory is ON, advisory recall text placed in the model-facing payload. It counts toward the same occupancy ledger as **session compaction**; a row-count limit is only a fuse, not the budget.
 _Avoid_: last-N memory window as the token budget, using recall as retrieve/`read_file` evidence
+=======
+A host gate on the **research thread**: occupancy is estimated tokens of the model-facing payload (track prompt, messages, research tool schemas) against a 256_000 session budget; at ≥90% occupancy, or when the operator sends `/compact`, old checkpoint `messages` are summarized and removed, aiming at ~40% occupancy. The summarizer is injectable (v1 the **v1 model**); occupancy may render on the thread, not on `GET /api/status`.
+_Avoid_: message-count windows, treating `/compact` as a research tool, putting occupancy on the boot status strip, using the vendor 1M window as the compact threshold
+>>>>>>> origin/main
 
 **checkpointer**:
 v1 durable runs use LangGraph `PostgresSaver` via `FIN_CHECKPOINT_URL`; product HTTP/CLI raise if that URL is unset. Pytest uses `InMemorySaver` only (plus explicit `FIN_SCRIPTED_MODEL` e2e); it does not survive process exit.

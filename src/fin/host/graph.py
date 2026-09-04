@@ -36,7 +36,7 @@ The two fuses live in ``AgentState``:
   ``status == "step_cap"``. ``STEP_CAP`` is in fin state — NOT in
   LangGraph ``recursion_limit``. The graph factory sets
   LangGraph's recursion limit strictly higher (see
-  ``RECURSION_LIMIT`` in ``state.py``, currently 70) so the
+  ``RECURSION_LIMIT`` in ``state.py``, currently 105) so the
   agent-loop fuse always fires first (ADR 0008 + spec success
   criteria item 5).
 * ``repair_count`` is the citation-repair counter the gate uses to
@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import threading
 import uuid
 from dataclasses import dataclass
@@ -77,16 +78,19 @@ from langchain_core.messages import (
     AIMessageChunk,
     BaseMessage,
     HumanMessage,
+    RemoveMessage,
     SystemMessage,
     ToolMessage,
 )
 from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.prebuilt import ToolNode
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command, Send
 
 from fin.corpus.extracted import Locator
+from fin.host.compaction import CompactionInputError
 from fin.host.citation_gate import (
     HIDDEN_BOUNCE_MARKER,
     Citation,
@@ -96,6 +100,12 @@ from fin.host.citation_gate import (
 from fin.host.evidence_admission import (
     admit_retrieved_chunks,
     evidence_from_chunks,
+)
+from fin.host.session_compaction import (
+    OccupancyCompactor,
+    SessionSummaryError,
+    count_tokens_approximately,
+    session_budget_tokens,
 )
 from fin.host.state import (
     AgentState,
@@ -140,9 +150,15 @@ from fin.retrieve.degradation import (
 )
 from fin.retrieve.hit_mapping import MappingFailureLedger, ledger_from_env
 from fin.retrieve.input_validation import InputValidationError
-from fin.retrieve.tool import retrieve
 from fin.retrieve.port import RetrievePort
 from fin.retrieve.read_port import MissReadPort, ReadPort
+from fin.retrieve.tool import retrieve
+
+
+# Module logger for typed, catchable failures the gate swallows (a
+# summary model outage must never refuse the operator turn; the
+# graph layer logs and continues un-compacted).
+_LOG = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # ``fin.corpus.facts`` is imported lazily at call time
     from fin.corpus.facts import Fact
@@ -1565,6 +1581,7 @@ def compile_graph(
     read_port: ReadPort | None = None,
     mapping_failure_ledger: MappingFailureLedger | None = None,
     degradation_ledger: DegradationLedger | None = None,
+    summarizer: Any | None = None,
 ) -> "_LockedGraph":
     """Build the v1 host graph (T6).
 
@@ -1635,7 +1652,7 @@ def compile_graph(
         reason rather than fanning out and dropping the remainder.
     recursion_limit
         LangGraph's recursion limit. Default ``RECURSION_LIMIT``
-        from ``fin.host.state`` (currently ``2 * STEP_CAP + 6 = 70``).
+        from ``fin.host.state`` (currently ``3 * STEP_CAP + 9 = 105``).
         Strictly greater than ``step_cap`` so the agent-loop fuse
         fires first (spec success criteria item 5).
     facts_root
@@ -1699,6 +1716,16 @@ def compile_graph(
         Shared by the ``retrieve`` tool and the fan-out workers, so
         「记录原因且暴露信号」is one count over every consumption
         point rather than one per call site.
+    summarizer
+        ADR 0044 / plan T1: the injectable seam for the session-
+        compaction gate. ``None`` (the default) uses the v1 chat
+        model — the same ``model`` object this function received —
+        so the live host compacts with the production model. Tests
+        inject a stub. Mirrors ``fin.host.compaction.SummaryModel``
+        Protocol DI shape (``.invoke`` or callable). The gate
+        catches ``SessionSummaryError`` so a model outage cannot
+        refuse the operator turn (ADR 0044: "summary failure is
+        typed and must not refuse the operator turn").
 
     Returns
     -------
@@ -2399,16 +2426,82 @@ def compile_graph(
             "repair_count": gate_result.repair_count,
         }
 
+    # ----- session compaction gate (ADR 0044 / plan T1) -----
+
+    # The injectable seam: ``None`` -> the v1 chat model. Mirrors
+    # ``fin.host.compaction.SummaryModel`` Protocol DI shape; tests
+    # pass a stub. Held in a closure so the gate node picks up the
+    # operator override (``session_token_budget`` ContextVar) at
+    # call time.
+    _effective_summarizer = summarizer if summarizer is not None else model
+    _compactor = OccupancyCompactor(summarizer=_effective_summarizer)
+
+    def compaction_gate_node(state: AgentState) -> dict[str, Any]:
+        """Compact before the next LLM call (ADR 0044).
+
+        The gate runs on EVERY entry path that would otherwise call
+        the model: ``tools -> gate``, ``issuer_join -> gate``,
+        ``from_classify -> gate``, ``from_issuer_fanout (fallback)
+        -> gate``, and ``from_gate (bounce) -> gate``. It is NOT
+        nested inside ``model_node`` (separate graph node).
+
+        On a summary failure, the typed :class:`SessionSummaryError`
+        is logged and the node returns ``{}`` so the operator turn
+        continues un-compacted (ADR 0044: typed, not silent empty
+        catch; must not refuse the operator turn). A malformed
+        snapshot (``CompactionInputError`` from ``copy_snapshot``)
+        is handled the same way — logged and skipped, never a
+        blown-up run.
+        """
+        messages = list(state.get("messages") or [])
+        snapshots = list(state.get("status_snapshots") or [])
+        try:
+            update = _compactor.compact_update(
+                messages, status_snapshots=snapshots
+            )
+        except (SessionSummaryError, CompactionInputError) as exc:
+            _LOG.warning("session compaction skipped: %s", exc)
+            return {}
+        if not update:
+            return {}
+        # ``compact_update`` returns ``[RemoveMessage(REMOVE_ALL),
+        # summary, *kept]`` so the ``add_messages`` reducer shrinks
+        # the checkpointer. We pass the SAME ``messages`` list back
+        # to the channel so the rebuild pattern actually replaces
+        # history rather than appending duplicates.
+        return {"messages": update}
+
     # ----- conditional edges -----
 
     def from_classify(
         state: AgentState,
+    ) -> Literal["compaction_gate"]:
+        """Route EVERY track through the compaction gate (ADR 0044).
+
+        The gate must run before EVERY LLM call — the research
+        ``model`` AND the non-research leaves (dialogue / clarify /
+        off_topic are LLM calls too). The gate is a no-op under
+        budget; :func:`from_compaction_gate` then applies the track
+        decision.
+
+        Recorded deviation: ``decide_track``'s own LLM tier (the
+        ambiguous ``classify`` call) runs BEFORE this gate. It is
+        safe because the classifier never sees the fat history —
+        ``decide_track`` sends only the LAST human utterance to the
+        classify model, so no evictable context reaches that call
+        and there is nothing for the gate to compact first.
+        """
+        return "compaction_gate"
+
+    def from_compaction_gate(
+        state: AgentState,
     ) -> Literal["dialogue", "clarify", "off_topic", "model"]:
-        """Route Soft-Track leaves after classify."""
-        # No single global default track (specs/soft-track.md):
-        # missing track defaults to the dialogue leaf rather than
-        # the research model so the conditional edge mirrors the
-        # residual branch in ``decide_track``.
+        """Apply the Soft-Track track decision after the gate.
+
+        Mirrors the residual branch in ``decide_track``: a missing
+        track defaults to the dialogue leaf rather than the research
+        model (specs/soft-track.md — no single global default track).
+        """
         track = state.get("track", "dialogue")
         if track == "dialogue":
             return "dialogue"
@@ -2464,21 +2557,21 @@ def compile_graph(
         issuers = [str(issuer) for issuer in (plan.get("issuers") or ())]
         query = str(plan.get("query") or "")
         if plan.get("error") or not issuers or not query:
-            return "model"
+            return "compaction_gate"
         return [
             Send("issuer_research", {"issuer": issuer, "query": query})
             for issuer in issuers
         ]
 
-    def from_gate(state: AgentState) -> Literal["model", "__end__"]:
+    def from_gate(state: AgentState) -> Literal["compaction_gate", "__end__"]:
         # Status-based routing out of the citation gate. Done /
         # refuse / step_cap all END; ``"running"`` (after a bounce)
-        # routes back to the model with the hidden template
-        # already injected.
+        # routes back through the compaction gate so the next LLM
+        # call sees a possibly-compacted history.
         status = state.get("status", "running")
         if status in ("done", "refuse", "step_cap"):
             return END
-        return "model"
+        return "compaction_gate"
 
     # ----- assemble the graph -----
 
@@ -2488,6 +2581,12 @@ def compile_graph(
     graph.add_node("clarify", clarify_node)
     graph.add_node("off_topic", off_topic_node)
     graph.add_node("model", model_node)
+    # ADR 0044 / plan T1: the compaction gate is a SEPARATE graph
+    # node (NOT nested inside ``model_node``). It runs before every
+    # entry that would otherwise call the model: tools, issuer_join,
+    # classify's research branch, the citation-gate bounce, and
+    # the issuer_fanout typed-fallback.
+    graph.add_node("compaction_gate", compaction_gate_node)
     # ``tool_node_with_summaries`` wraps ``tool_dispatcher`` so the
     # graph executor still emits ``ToolMessage``s unchanged; the
     # wrapper only ADDS the ``tool_summaries`` field to the state
@@ -2510,13 +2609,23 @@ def compile_graph(
     graph.add_edge("clarify", END)
     graph.add_edge("off_topic", END)
     graph.add_conditional_edges("model", from_model)
-    graph.add_edge("tools", "model")
+    # ADR 0044: every LLM entry goes through the gate — tools and
+    # issuer_join enter it for the next agent-loop iteration, and
+    # classify routes ALL tracks (research AND non-research leaves)
+    # through it so the gate runs before EVERY LLM call. The gate
+    # is a no-op under budget; it never refuses a turn.
+    graph.add_edge("tools", "compaction_gate")
     graph.add_conditional_edges(
-        "issuer_fanout", from_issuer_fanout, ["issuer_research", "model", END]
+        "issuer_fanout",
+        from_issuer_fanout,
+        ["issuer_research", "compaction_gate", END],
     )
     graph.add_edge("issuer_research", "issuer_join")
-    graph.add_edge("issuer_join", "model")
+    graph.add_edge("issuer_join", "compaction_gate")
     graph.add_conditional_edges("citation_gate", from_gate)
+    # The gate applies the track decision AFTER compacting, so the
+    # non-research leaves are also reached post-gate.
+    graph.add_conditional_edges("compaction_gate", from_compaction_gate)
 
     compiled = graph.compile(checkpointer=checkpointer)
 
@@ -2527,7 +2636,12 @@ def compile_graph(
         step_cap=step_cap,
         issuer_cap=issuer_cap,
         recursion_limit=recursion_limit,
+        summarizer=summarizer,
         compiled_graph=compiled,
+        # T2 (ADR 0044): the SAME compactor instance the graph gate
+        # uses, so ``/compact`` and the >=90% auto path share one
+        # eviction unit walker, one summarizer seam, one floor.
+        compactor=_compactor,
     )
 
 
@@ -2559,6 +2673,8 @@ def _make_locked_graph(
     step_cap: int,
     classify_model: Any | None = None,
     issuer_cap: int = MAX_ISSUERS,
+    summarizer: Any | None = None,
+    compactor: OccupancyCompactor | None = None,
 ) -> "_LockedGraph":
     key = (
         id(checkpointer),
@@ -2570,12 +2686,18 @@ def _make_locked_graph(
         # tuning the cap the previously-compiled default.
         int(issuer_cap),
         int(recursion_limit),
+        # T1 (ADR 0044): the summarizer seam affects the compiled
+        # graph's ``compaction_gate`` node, so two graphs that differ
+        # only in ``summarizer`` are two different graphs.
+        id(summarizer) if summarizer is not None else 0,
     )
     cached = _IDEMPOTENCE_CACHE.get(key)
     if cached is not None:
         return cached
     proxy = _LockedGraph(
-        compiled_graph=compiled_graph, recursion_limit=recursion_limit
+        compiled_graph=compiled_graph,
+        recursion_limit=recursion_limit,
+        compactor=compactor,
     )
     _IDEMPOTENCE_CACHE[key] = proxy
     return proxy
@@ -2597,11 +2719,20 @@ class _LockedGraph:
     ``ConcurrentRunError`` immediately instead of deadlocking.
     """
 
-    def __init__(self, *, compiled_graph: Any, recursion_limit: int) -> None:
+    def __init__(
+        self,
+        *,
+        compiled_graph: Any,
+        recursion_limit: int,
+        compactor: OccupancyCompactor | None = None,
+    ) -> None:
         self._graph = compiled_graph
         # ``recursion_limit`` is exposed via the public attribute
         # ``recursion_limit`` so tests can assert it directly.
         self.recursion_limit = int(recursion_limit)
+        # T2 (ADR 0044): the compactor shared with the graph's
+        # ``compaction_gate`` node; ``/compact`` runs the same gate.
+        self._compactor = compactor
         self._thread_locks: dict[str, threading.Lock] = {}
         self._meta_lock = threading.Lock()
 
@@ -2739,9 +2870,130 @@ class _LockedGraph:
             return text or None
         return None
 
+    def occupancy(self, thread_id: str) -> dict[str, float | int] | None:
+        """T3 (ADR 0044): token occupancy for ``thread_id``'s latest
+        checkpoint, from the SAME figure the compaction gate computes.
+
+        ``self._compactor.occupancy`` over the checkpointed
+        messages (the model-facing base the gate measures) vs the
+        active session budget — one shared estimator, no second
+        number, and the SAME compactor instance the gate node uses
+        (no throwaway per-call construction). ``None`` when the
+        thread has no checkpoint (a
+        freshly created thread has no model-facing payload, so the
+        UI stays neutral rather than showing a fabricated 0%).
+
+        Read-only path: does NOT acquire the per-thread lock,
+        mirroring :meth:`pending_nodes` / :meth:`checkpoint_message_ids`.
+        """
+        snapshot = self._graph.get_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        messages = (snapshot.values or {}).get("messages") or []
+        if not messages:
+            return None
+        return {
+            "estimated_tokens": count_tokens_approximately(messages),
+            "budget_tokens": session_budget_tokens(),
+            "ratio": self._compactor.occupancy(messages),
+        }
+
     @staticmethod
     def _release_thread(lock: threading.Lock) -> None:
         lock.release()
+
+    def compact_thread(self, thread_id: str) -> dict[str, Any]:
+        """Run the ADR 0044 compaction gate against ``thread_id``'s
+        checkpoint — the ``/compact`` command path (plan T2).
+
+        WHY a proxy method (mirrors ``finalize_abandoned_run`` /
+        ``delete_thread``): the graph proxy must remain the ONLY
+        writer to the checkpointer, and the write-back needs
+        ``update_state`` — reaching into ``self._graph`` from the
+        HTTP layer would couple the route to compiled-graph
+        internals.
+
+        Semantics:
+
+        * Acquires the SAME per-thread lock as ``invoke`` / ``stream``
+          (raises ``ConcurrentRunError`` when a run is in flight — the
+          409 contract is unchanged; the route probes ``is_locked``
+          first for the before-headers 409, this acquire is the
+          belt-and-suspenders writer lock).
+        * ``force=True`` on the compactor: the gate runs WITHOUT the
+          90% trigger (a thread under 90% may still compact when the
+          operator asked), with the same eviction units, summary
+          write, and ``RemoveMessage`` write-back as the auto path.
+        * Returns a receipt dict:
+          ``{"outcome": "compacted", "before_tokens", "after_tokens",
+          "messages_removed"}`` when the gate produced an update;
+          ``{"outcome": "pending_run"}`` when the thread has a
+          resumable mid-run checkpoint (never clobbered — resume or
+          stop the run first); ``{"outcome": "noop"}`` when the
+          thread has no checkpoint or the gate produced no update.
+        * Write-back is ``update_state(..., as_node="dialogue")``:
+          the ``dialogue`` leaf routes straight to END, so the
+          checkpoint stays terminal (``pending_nodes() == ()``) —
+          verified against the compiled graph (a pending checkpoint
+          is rejected before this point by the ``pending_nodes``
+          guard).
+        * Summary failure is typed (:class:`SessionSummaryError`) and
+          surfaces to the caller as ``{"outcome": "summary_failed"}``
+          — the caller turns it into a graceful receipt, never a 500
+          (ADR 0044: must not refuse the operator turn). The
+          checkpoint is untouched on that path.
+        """
+        lock = self._acquire_thread(thread_id)
+        try:
+            if self._compactor is None:
+                # ``compactor`` is optional only for direct
+                # ``_LockedGraph`` construction outside the factory;
+                # ``/compact`` cannot run without the shared gate
+                # compactor (ADR 0044 T2), so fail typed and clear.
+                raise ConcurrentRunError(
+                    "this graph has no session compactor (compile_graph "
+                    "always provides one); /compact is unavailable"
+                )
+            config = {"configurable": {"thread_id": thread_id}}
+            snapshot = self._graph.get_state(config)
+            values = snapshot.values or {}
+            messages = list(values.get("messages") or [])
+            if not messages:
+                # No checkpoint (never-sent thread) — nothing to compact.
+                return {"outcome": "noop"}
+            if tuple(snapshot.next or ()):
+                # Mid-run (resumable) checkpoint — never clobbered.
+                return {"outcome": "pending_run"}
+            before_tokens = count_tokens_approximately(messages)
+            try:
+                update = self._compactor.compact_update(
+                    messages,
+                    status_snapshots=list(values.get("status_snapshots") or []),
+                    force=True,
+                )
+            except SessionSummaryError:
+                # Typed summary failure BEFORE any write: the
+                # checkpoint is untouched, the turn continues
+                # (ADR 0044: must not refuse the operator turn).
+                return {"outcome": "summary_failed"}
+            if not update:
+                # Under the floor already (nothing evictable) — no-op.
+                return {"outcome": "noop"}
+            self._graph.update_state(config, {"messages": update}, as_node="dialogue")
+            return {
+                "outcome": "compacted",
+                "before_tokens": before_tokens,
+                "after_tokens": count_tokens_approximately(
+                    [m for m in update if not isinstance(m, RemoveMessage)]
+                ),
+                "messages_removed": max(
+                    0,
+                    len(messages)
+                    - len([m for m in update if not isinstance(m, RemoveMessage)]),
+                ),
+            }
+        finally:
+            self._release_thread(lock)
 
     # ---- public surface ----
 
