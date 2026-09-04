@@ -2,8 +2,18 @@
 
 Pure function: takes ``document_id`` + ``version`` (and optional
 ``page`` / ``page_limit``) and returns either a happy-path page-text
-dict or ``{"error": "unknown_locator"}``. Reads only from the
-committed extracted tree; never opens a PDF.
+dict or ``{"error": "unknown_locator"}``. The body fetch goes through
+an injected :class:`~fin.retrieve.read_port.ReadPort` (ADR 0046 /
+0047) — the tool itself owns NO storage path:
+
+* the product MCP path injects the ``MCPRetrieveAdapter``'s own
+  ``read`` (currently the named ``read_unavailable`` EXIT — iknow
+  has no read tool yet);
+* the fake path injects ``FakeRetrievePort.read``, which serves
+  bodies from the fake's ``pages_by_doc`` manifest;
+* offline / committed-corpus tests may inject
+  ``ExtractedTreeReadPort``; the serve path never builds one, so the
+  local extracted tree is not a company-corpus SSOT.
 
 The happy-path shape is::
 
@@ -14,27 +24,17 @@ where ``text`` is the joined page text of
 model paginates by calling again with a higher ``page``.
 
 ``page_limit`` is silently clamped to 3 (ADR 0009 cap); ``page < 1``
-or ``page > page_count`` returns the miss dict. ``IngestMissingError``
-from ``load_extracted_tree`` is converted to the miss dict so the
-model never sees a typed exception from this tool (T6 catches
-``IngestMissingError`` separately at boot, ADR 0020).
+or ``page > page_count`` returns the miss dict. The reader converts
+every lookup failure to the miss dict, so the model never sees a
+typed exception from this tool (T6 catches ``IngestMissingError``
+separately at boot, ADR 0020).
 """
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
-from fin.corpus.errors import IngestMissingError
-from fin.corpus.extracted import load_extracted_tree
-
-
-_DEFAULT_DATA_DIR = Path(__file__).resolve().parents[4] / "data" / "corpus"
-_DEFAULT_MANIFEST_PATH = _DEFAULT_DATA_DIR / "manifest.json"
-_DEFAULT_EXTRACTED_ROOT = _DEFAULT_DATA_DIR / "extracted"
-
-_PAGE_LIMIT_CAP = 3
-_UNKNOWN_LOCATOR: dict[str, str] = {"error": "unknown_locator"}
+from fin.retrieve.read_port import ReadPort
 
 
 def read_file(
@@ -43,68 +43,23 @@ def read_file(
     page: int = 1,
     page_limit: int = 1,
     *,
-    manifest_path: Path | None = None,
-    extracted_root: Path | None = None,
+    reader: ReadPort,
 ) -> dict[str, Any]:
-    """Read a page (or short page range) from a frozen 10-Q filing.
+    """Read a page (or short page range) of a known locator.
 
     Returns one of:
 
     * happy-path dict ``{"document_id", "version", "page", "text",
       "page_count"}``;
     * miss dict ``{"error": "unknown_locator"}`` for an unknown id,
-      a version mismatch, a page out of range, a malformed extracted
-      tree, or ``page_limit < 1``.
+      a version mismatch, a page out of range, a broken body source,
+      or ``page_limit < 1``.
 
-    Never raises.
+    Never raises. The ``reader`` is the injected read port — there is
+    deliberately no default body source (ADR 0047: MCP when that is
+    where the bytes live; never the local extracted tree by accident).
     """
-    if manifest_path is None:
-        manifest_path = _DEFAULT_MANIFEST_PATH
-    if extracted_root is None:
-        extracted_root = _DEFAULT_EXTRACTED_ROOT
-
-    # Lower-bound rejections happen before loading the tree; the upper
-    # cap on ``page_limit`` clamps silently per ADR 0009.
-    if page < 1 or page_limit < 1:
-        return dict(_UNKNOWN_LOCATOR)
-    if page_limit > _PAGE_LIMIT_CAP:
-        page_limit = _PAGE_LIMIT_CAP
-
-    try:
-        pages_by_doc = load_extracted_tree(manifest_path, extracted_root)
-    except IngestMissingError:
-        # Typed error from a broken tree: convert to the model-facing
-        # miss dict so the model can decide. T6 catches
-        # ``IngestMissingError`` separately at graph boot for
-        # diagnostics (ADR 0020).
-        return dict(_UNKNOWN_LOCATOR)
-
-    pages = pages_by_doc.get(document_id)
-    if not pages:
-        return dict(_UNKNOWN_LOCATOR)
-
-    page_count = len(pages)
-    if page > page_count:
-        return dict(_UNKNOWN_LOCATOR)
-
-    # The tree's per-page ``version`` is validated by
-    # ``load_extracted_tree`` against the manifest sha256; comparing
-    # the caller's ``version`` against the first page is enough to
-    # reject any drift without re-reading the manifest.
-    expected_version = pages[0].locator.version
-    if version != expected_version:
-        return dict(_UNKNOWN_LOCATOR)
-
-    end_page = min(page + page_limit - 1, page_count)
-    text = "\n\n".join(pages[i - 1].text for i in range(page, end_page + 1))
-
-    return {
-        "document_id": document_id,
-        "version": version,
-        "page": page,
-        "text": text,
-        "page_count": page_count,
-    }
+    return reader.read(document_id, version, page, page_limit)
 
 
 __all__ = ["read_file"]

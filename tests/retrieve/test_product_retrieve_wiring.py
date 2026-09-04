@@ -141,12 +141,21 @@ def test_compile_for_runtime_dev_selects_mcp(
     assert calls[0]["retrieve_adapter"] == "mcp"
 
 
-def test_compile_for_runtime_dev_really_builds_mcp_adapter(
+def test_compile_for_runtime_dev_builds_mcp_adapter_without_extracted_tree(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """End-to-end through the real factory: ``compile_for_runtime_dev``
-    binds an ``MCPRetrieveAdapter`` carrying a NON-EMPTY
-    locator map, so hits can actually map back to fin locators."""
+    binds an ``MCPRetrieveAdapter`` WITHOUT reading the extracted tree
+    (ADR 0046 / 0047 — the serve path has no on-disk SSOT). Canonical
+    ``source_ref`` hits need no locator map; the client-side allow-list
+    defers to the MCP server when none is configured."""
+
+    def _boom(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("runtime compile consulted the extracted tree")
+
+    monkeypatch.setattr("fin.retrieve.read_port.load_extracted_tree", _boom)
+    monkeypatch.setattr("fin.corpus.extracted.load_extracted_tree", _boom)
+
     _install_fake_chat_model(monkeypatch)
     monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
     built = _record_mcp_construction(monkeypatch)
@@ -156,11 +165,8 @@ def test_compile_for_runtime_dev_really_builds_mcp_adapter(
 
     assert graph is not None
     assert len(built) == 1
-    assert built[0]["locator_map"], (
-        "fin-serve bound an MCP adapter with an empty locator map; "
-        "every hit would be dropped"
-    )
-    assert built[0]["known_document_ids"]
+    assert built[0]["locator_map"] == {}
+    assert built[0]["known_document_ids"] is None
 
 
 def test_fin_retrieve_adapter_env_can_force_the_fake_port(

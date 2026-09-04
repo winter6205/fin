@@ -41,7 +41,7 @@ minimal-change-verifier: yes — one logical program, not one commit; writing-pl
    - **Surface:** host retrieve/`read_file` / citation verifier + tests
    - **Acceptance:** scripted research can cite only from this-run payloads; missing local tree does not silent-succeed as if the tree were SSOT; `uv run pytest -q` exits 0。
    - **Completion:** Fake adapter shape open.
-   - Status: [ ]
+   - Status: [x]
 
 2. **list_files catalogs pushed/ingested filings** — tag: `[implementation]`
    - **Inherits:** spec Focus 1；CONTEXT **list_files**。

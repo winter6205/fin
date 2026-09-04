@@ -32,15 +32,16 @@ or ``MCPRetrieveAdapter`` (with a scripted transport).
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
-from fin.corpus.extracted import Locator
+from fin.corpus.extracted import ExtractedPage, Locator
 from fin.retrieve.input_validation import (
     InputValidationLedger,
     validate_filters,
     validate_query,
 )
 from fin.retrieve.port import Chunk
+from fin.retrieve.read_port import read_from_pages
 
 
 _DEFAULT_LIMIT = 8
@@ -82,6 +83,15 @@ class FakeRetrievePort:
         Supplied, they let the fake *prove* a conflicting
         filter set (T21 / SC43); omitted, fin holds no binding
         and does not invent a contradiction.
+    pages_by_doc
+        Optional ``{document_id: ExtractedPage pages}`` read
+        manifest (ADR 0046 / ADR 0047): the fake answers
+        ``read()`` (the ``read_file`` body fetch) from this
+        table, so a scripted serve test can provide readable
+        bodies without any on-disk extracted tree. Omitted (the
+        default), the fake corpus has no readable objects and
+        every ``read()`` is the typed
+        ``{"error": "unknown_locator"}`` miss.
     input_validation_ledger
         Optional「输入校验失败」count (T21). Omitted, the port
         keeps an in-memory one — quiet, never blind.
@@ -93,6 +103,7 @@ class FakeRetrievePort:
         known_document_ids: set[str] | None = None,
         *,
         manifest_docs: Mapping[str, Mapping[str, Any]] | None = None,
+        pages_by_doc: Mapping[str, Sequence[ExtractedPage]] | None = None,
         input_validation_ledger: InputValidationLedger | None = None,
     ) -> None:
         # Defensive copy so a caller mutating the source dict
@@ -109,6 +120,11 @@ class FakeRetrievePort:
         )
         self._manifest_docs: dict[str, Mapping[str, Any]] | None = (
             dict(manifest_docs) if manifest_docs is not None else None
+        )
+        # Defensive copy so a caller mutating the source mapping after
+        # construction cannot change what ``read()`` serves.
+        self._pages_by_doc: dict[str, Sequence[ExtractedPage]] = (
+            dict(pages_by_doc) if pages_by_doc is not None else {}
         )
         self._input_validation_ledger = input_validation_ledger
 
@@ -235,6 +251,27 @@ class FakeRetrievePort:
         # Truncate to the resolved limit; the underlying list
         # is not mutated so the next call sees the same corpus.
         return {"chunks": list(chunks[:effective_limit])}
+
+    def read(
+        self,
+        document_id: str,
+        version: str,
+        page: int = 1,
+        page_limit: int = 1,
+    ) -> dict[str, Any]:
+        """Answer a ``read_file`` body fetch from ``pages_by_doc``.
+
+        Mirrors the ``ReadPort`` contract (ADR 0046 / ADR 0047): the
+        happy dict ``{document_id, version, page, text, page_count}``
+        or the ``{"error": "unknown_locator"}`` miss. Without a
+        ``pages_by_doc`` manifest every read misses — the fake corpus
+        has no readable objects, which is a named answer, never a
+        fallback to a local tree. Concurrent calls share the read-only
+        page table and are safe.
+        """
+        return read_from_pages(
+            self._pages_by_doc, document_id, version, page, page_limit
+        )
 
 
 __all__ = ["FakeRetrievePort"]

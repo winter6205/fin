@@ -25,12 +25,7 @@ import pytest
 from fin.corpus.errors import IngestMissingError
 from fin.corpus.extracted import load_extracted_tree
 from fin.host.tools import list_files, read_file
-
-# The read_file module is imported via importlib because the package's
-# ``__init__`` rebinds ``fin.host.tools.read_file`` to the callable,
-# shadowing the module attribute lookup that ``monkeypatch`` needs.
-import importlib
-read_file_mod = importlib.import_module("fin.host.tools.read_file")
+from fin.retrieve import ExtractedTreeReadPort
 
 
 # ----- paths -----
@@ -47,6 +42,18 @@ def _manifest_path() -> Path:
 
 def _extracted_root() -> Path:
     return _project_data_dir() / "extracted"
+
+
+def _tree_reader() -> ExtractedTreeReadPort:
+    """The legacy tree-backed read adapter over the committed corpus.
+
+    These unit tests exercise the ``read_file`` boundary contract
+    against real page text, so they inject the tree port explicitly.
+    Product compile paths never build one (ADR 0046 / 0047) — the
+    graph injects the retrieve adapter's ``read`` or a typed-miss
+    port instead.
+    """
+    return ExtractedTreeReadPort(_manifest_path(), _extracted_root())
 
 
 # sha256 of the AAPL 2022-Q3 PDF (manifest SSOT)
@@ -194,8 +201,7 @@ def test_read_file_happy_path_returns_first_page() -> None:
         AAPL_2022Q3_SHA,
         page=1,
         page_limit=1,
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        reader=_tree_reader(),
     )
     assert "error" not in result
     assert result["document_id"] == "AAPL-2022Q3"
@@ -235,8 +241,7 @@ def test_read_file_unknown_document_id_returns_unknown_locator() -> None:
         AAPL_2022Q3_SHA,
         page=1,
         page_limit=1,
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        reader=_tree_reader(),
     )
     assert result == {"error": "unknown_locator"}
 
@@ -249,8 +254,7 @@ def test_read_file_version_mismatch_returns_unknown_locator() -> None:
         "0" * 64,
         page=1,
         page_limit=1,
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        reader=_tree_reader(),
     )
     assert result == {"error": "unknown_locator"}
 
@@ -262,8 +266,7 @@ def test_read_file_empty_version_returns_unknown_locator() -> None:
         "",
         page=1,
         page_limit=1,
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        reader=_tree_reader(),
     )
     assert result == {"error": "unknown_locator"}
 
@@ -276,8 +279,7 @@ def test_read_file_page_below_one_returns_unknown_locator(bad_page: int) -> None
         AAPL_2022Q3_SHA,
         page=bad_page,
         page_limit=1,
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        reader=_tree_reader(),
     )
     assert result == {"error": "unknown_locator"}
 
@@ -290,8 +292,7 @@ def test_read_file_page_beyond_returns_unknown_locator() -> None:
             AAPL_2022Q3_SHA,
             page=bad_page,
             page_limit=1,
-            manifest_path=_manifest_path(),
-            extracted_root=_extracted_root(),
+            reader=_tree_reader(),
         )
         assert result == {"error": "unknown_locator"}
 
@@ -306,8 +307,7 @@ def test_read_file_page_limit_below_one_returns_unknown_locator(
         AAPL_2022Q3_SHA,
         page=1,
         page_limit=bad_limit,
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        reader=_tree_reader(),
     )
     assert result == {"error": "unknown_locator"}
 
@@ -319,16 +319,14 @@ def test_read_file_page_limit_above_cap_clamps_to_three() -> None:
         AAPL_2022Q3_SHA,
         page=1,
         page_limit=10,
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        reader=_tree_reader(),
     )
     result_limit_3 = read_file(
         "AAPL-2022Q3",
         AAPL_2022Q3_SHA,
         page=1,
         page_limit=3,
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        reader=_tree_reader(),
     )
     # Same text as a clean ``page_limit=3`` call.
     assert result_limit_10["text"] == result_limit_3["text"]
@@ -350,8 +348,7 @@ def test_read_file_three_page_doc_with_page_limit_3_returns_all_three(
         version,
         page=1,
         page_limit=3,
-        manifest_path=manifest_path,
-        extracted_root=extracted_root,
+        reader=ExtractedTreeReadPort(manifest_path, extracted_root),
     )
     assert "error" not in result
     assert result["page_count"] == 3
@@ -366,8 +363,7 @@ def test_read_file_page_beyond_with_page_limit_3_clamps_to_existing_pages() -> N
         AAPL_2022Q3_SHA,
         page=page,
         page_limit=3,
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        reader=_tree_reader(),
     )
     assert "error" not in result
     assert result["page"] == page
@@ -388,8 +384,7 @@ def test_read_file_page2_with_page_limit_2_joins_pages_2_and_3() -> None:
         AAPL_2022Q3_SHA,
         page=2,
         page_limit=2,
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        reader=_tree_reader(),
     )
     assert "error" not in result
     assert result["page"] == 2
@@ -415,8 +410,7 @@ def test_concurrent_read_file_returns_identical_text() -> None:
             AAPL_2022Q3_SHA,
             page=1,
             page_limit=1,
-            manifest_path=_manifest_path(),
-            extracted_root=_extracted_root(),
+            reader=_tree_reader(),
         )
         return result["text"]
 
@@ -433,17 +427,17 @@ def test_concurrent_read_file_returns_identical_text() -> None:
 def test_read_file_ingest_missing_returns_unknown_locator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``read_file`` converts ``IngestMissingError`` from
-    ``load_extracted_tree`` into the ``unknown_locator`` dict instead of
-    propagating the typed error to the model (ADR 0009 + ADR 0020).
-    """
+    """A broken body source converts to the ``unknown_locator`` dict
+    instead of propagating a typed error to the model (ADR 0009 +
+    ADR 0020): the tree port's ``IngestMissingError`` is caught inside
+    the read port, and a reader that itself raises is out of contract —
+    here we drive the tree-port path with a simulated missing tree."""
 
     def _raise_ingest_missing(*args, **kwargs):
         raise IngestMissingError("simulated missing tree")
 
     monkeypatch.setattr(
-        read_file_mod,
-        "load_extracted_tree",
+        "fin.retrieve.read_port.load_extracted_tree",
         _raise_ingest_missing,
     )
 
@@ -452,8 +446,7 @@ def test_read_file_ingest_missing_returns_unknown_locator(
         AAPL_2022Q3_SHA,
         page=1,
         page_limit=1,
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        reader=_tree_reader(),
     )
     assert result == {"error": "unknown_locator"}
 
