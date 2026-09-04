@@ -234,6 +234,33 @@ def get_filing_monitor() -> Any:
     return default_filing_monitor()
 
 
+# The feedback store owns a Postgres pool when the checkpoint URL is
+# set, so it is built once per process too (see ``get_feedback_store``).
+_http_feedback_singleton: Any | None = None
+_http_feedback_lock = threading.Lock()
+
+
+def get_feedback_store() -> Any:
+    """FastAPI dependency that returns the thumbs-feedback store.
+
+    T8 (#T8): backs ``POST /api/threads/{id}/runs/{run_id}/feedback``
+    and the ``feedback`` field on GET history. Selection mirrors
+    ``get_thread_store`` exactly: ``FIN_CHECKPOINT_URL`` set ->
+    Postgres-backed store (ADR 0035/0036 SSOT); unset -> in-memory.
+    Built once per process because the Postgres path owns a
+    connection pool.
+
+    Tests override this via ``app.dependency_overrides[get_feedback_store]``.
+    """
+    global _http_feedback_singleton
+    with _http_feedback_lock:
+        if _http_feedback_singleton is None:
+            from fin.host.feedback import default_feedback_store
+
+            _http_feedback_singleton = default_feedback_store()
+        return _http_feedback_singleton
+
+
 # Mount the workspace routes (T1, #28) on the same FastAPI app.
 # Done at module load so ``uvicorn fin.host.http:app`` exposes the
 # workspace surface out of the box (spec / ADR 0013 / ADR 0024).
@@ -246,6 +273,7 @@ _mount_workspace_routes(
     get_watchlist_store=get_watchlist_store,
     get_memory_port=get_memory_port,
     get_filing_monitor=get_filing_monitor,
+    get_feedback_store=get_feedback_store,
 )
 
 # ``GET /health`` (the tracked change, SC9): checkpoint reachability, separate from
@@ -488,6 +516,7 @@ __all__ = [
     "CitationSchema",
     "app",
     "compile_for_http",
+    "get_feedback_store",
     "get_filing_monitor",
     "get_graph",
     "get_thread_store",

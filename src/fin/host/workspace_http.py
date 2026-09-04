@@ -50,6 +50,13 @@ Routes
                                           Comparison exports bind to
                                           ``fin.comparison.v1``; a
                                           missing run is a typed 404.
+* ``POST   /api/threads/{id}/runs/{run_id}/feedback``
+                                       - the operator's thumbs
+                                          up/down for one run (T8).
+                                          A side record keyed by
+                                          ``run_id``; flipping a thumb
+                                          never touches the run's
+                                          citations (ADR 0035/0036).
 * ``GET    /api/watchlist``             - watched issuers (+ form
                                           types); ``POST`` adds,
                                           ``DELETE /{watch_id}``
@@ -121,6 +128,12 @@ from fin.host.export import (
     ExportError,
     UnsupportedExportError,
     build_export,
+)
+from fin.host.feedback import (
+    FeedbackPersistenceError,
+    InvalidFeedbackError,
+    MAX_RUN_ID_LENGTH,
+    default_feedback_store,
 )
 from fin.host.filing_monitor import FilingMonitor, default_filing_monitor
 from fin.host.filing_monitor_errors import FilingSourceUnavailableError
@@ -425,6 +438,19 @@ class CreateWatchRequest(BaseModel):
     forms: list[str] = Field(default_factory=list)
 
 
+class FeedbackRequest(BaseModel):
+    """T8 thumbs feedback body: ``{"value": "up" | "down"}``.
+
+    ``value`` is typed as ``str`` and validated IN the route (not by
+    Pydantic) so an out-of-enum value answers the typed 400
+    ``{"error": "invalid_feedback"}`` the SPA's error path renders —
+    the same shape every other workspace route answers with — instead
+    of FastAPI's generic 422 envelope.
+    """
+
+    value: str
+
+
 class CitationPayload(BaseModel):
     document_id: str
     version: str
@@ -504,6 +530,13 @@ class TurnRow(BaseModel):
     evidence_locators: list[dict[str, Any]] = Field(default_factory=list)
     # T6: structured host analysis envelopes persisted for reload.
     analysis_results: list[dict[str, Any]] = Field(default_factory=list)
+    # T8: the operator's latest thumb for this run (``"up"`` /
+    # ``"down"``). ``None`` when no thumb was ever set — additive and
+    # nullable, so pre-T8 clients that ignore the field keep working.
+    # Side record keyed by ``run_id`` (``fin.host.feedback``): it is
+    # never part of the run's citations or evidence, so setting or
+    # flipping a thumb cannot move the verified answer (ADR 0035/0036).
+    feedback: str | None = None
 
 
 class WorkspaceStatusResponse(BaseModel):
@@ -587,13 +620,22 @@ def _serialize_thread(thread: ThreadRecord) -> dict[str, str]:
     }
 
 
-def _serialize_run(run: RunRecord, *, in_flight: bool = False) -> dict[str, Any]:
+def _serialize_run(
+    run: RunRecord,
+    *,
+    in_flight: bool = False,
+    feedback: str | None = None,
+) -> dict[str, Any]:
     """Translate a ``RunRecord`` into the turn-table JSON shape.
 
     T4: ``in_flight`` carries the live lock-probe result for the
     thread. Only the newest row can legitimately be ``True`` — the
     GET route passes the probe result for the last row and
     ``False`` for all earlier ones.
+
+    T8: ``feedback`` is the latest thumb for ``run.id`` looked up
+    from the feedback store (one ``list_feedback()`` for the whole
+    turn table, not a query per row).
     """
     return {
         "run_id": run.id,
@@ -625,6 +667,8 @@ def _serialize_run(run: RunRecord, *, in_flight: bool = False) -> dict[str, Any]
         # list through the serialized view.
         "evidence_locators": [dict(loc) for loc in run.evidence_locators],
         "analysis_results": copy.deepcopy(list(run.analysis_results or [])),
+        # T8: the latest thumb for this run (``None`` when unset).
+        "feedback": feedback,
     }
 
 
@@ -1187,6 +1231,7 @@ def build_router(
     get_watchlist_store=None,
     get_memory_port=None,
     get_filing_monitor=None,
+    get_feedback_store=None,
 ) -> APIRouter:
     """Build the workspace APIRouter.
 
@@ -1195,7 +1240,8 @@ def build_router(
     app). ``get_watchlist_store`` defaults to the env-selected store so
     an existing caller that predates T4 still mounts; ``get_memory_port``
     does the same for callers that predate dream; ``get_filing_monitor``
-    defaults to the process default monitor.
+    defaults to the process default monitor; ``get_feedback_store``
+    (T8) does the same for callers that predate thumbs feedback.
 
     The stop registry (:class:`RunControl`) is created HERE rather than
     at module level: one registry per mounted router means two apps in
@@ -1209,6 +1255,8 @@ def build_router(
         get_memory_port = build_memory_port
     if get_filing_monitor is None:
         get_filing_monitor = default_filing_monitor
+    if get_feedback_store is None:
+        get_feedback_store = default_feedback_store
 
     @router.get("/threads")
     def list_threads(store: ThreadStore = Depends(get_thread_store)) -> list[dict]:
@@ -1234,6 +1282,7 @@ def build_router(
         thread_id: str,
         graph: Any = Depends(get_graph),
         store: ThreadStore = Depends(get_thread_store),
+        feedback_store: Any = Depends(get_feedback_store),
     ) -> dict:
         thread = store.get_thread(thread_id)
         if thread is None:
@@ -1241,6 +1290,21 @@ def build_router(
                 status_code=404, content={"error": "thread_not_found"}
             )
         runs = store.list_runs(thread_id)
+        # T8: ONE ``list_feedback()`` for the whole turn table (never a
+        # query per row), then matched by run id at serialization time.
+        # A thumbs outage must not blank the operator's history: the
+        # table still serves, with ``feedback`` simply null on every
+        # row and a WARNING left in the log.
+        feedback_by_run: dict[str, str] = {}
+        try:
+            for record in feedback_store.list_feedback():
+                feedback_by_run[record.run_id] = record.value
+        except Exception:
+            logger.warning(
+                "get_thread: feedback store unreadable; history serves "
+                "without thumbs",
+                exc_info=True,
+            )
         # T4 (spec line 38): GET while a lock is held reports
         # running. The probe is the live signal; only the newest
         # row can be in flight because a stored RunRecord is
@@ -1268,7 +1332,11 @@ def build_router(
             "in_flight": is_locked,
             "pending_checkpoint": pending_checkpoint,
             "turns": [
-                _serialize_run(r, in_flight=(is_locked and i == len(runs) - 1))
+                _serialize_run(
+                    r,
+                    in_flight=(is_locked and i == len(runs) - 1),
+                    feedback=feedback_by_run.get(r.id),
+                )
                 for i, r in enumerate(runs)
             ],
         }
@@ -1874,6 +1942,82 @@ def build_router(
             },
         )
 
+    @router.post("/threads/{thread_id}/runs/{run_id}/feedback")
+    def set_run_feedback(
+        thread_id: str,
+        run_id: str,
+        body: FeedbackRequest,
+        store: ThreadStore = Depends(get_thread_store),
+        feedback_store: Any = Depends(get_feedback_store),
+    ) -> Response:
+        """Record (or flip) the operator's thumb for one run (T8).
+
+        Feedback is a SIDE record keyed by ``run_id``
+        (``fin.host.feedback``, table ``fin_run_feedback``): it carries
+        no answer, citation, or evidence fields, so setting or flipping
+        a thumb can never mutate the run's persisted citations
+        (ADR 0035/0036, spec SC10 — pinned by
+        ``tests/host/test_feedback_route.py``).
+
+        Typed failures, all with a stable ``error`` code:
+
+        * ``invalid_feedback`` (400) — value outside ``up``/``down``,
+          or an empty / oversized run id (``MAX_RUN_ID_LENGTH``);
+        * ``thread_not_found`` / ``run_not_found`` (404) — same shapes
+          the export route answers with;
+        * ``feedback_persistence_failed`` (503) — the store could not
+          complete the write (a storage outage, not a client error).
+        """
+        # Boundary classes first (400 before 404): a malformed id is a
+        # client error regardless of whether the thread exists, and the
+        # store would normalize/validate the same values a second time.
+        normalized_run_id = run_id.strip()
+        if (
+            not normalized_run_id
+            or len(normalized_run_id) > MAX_RUN_ID_LENGTH
+        ):
+            return JSONResponse(
+                status_code=400, content={"error": "invalid_feedback"}
+            )
+        if body.value not in ("up", "down"):
+            return JSONResponse(
+                status_code=400, content={"error": "invalid_feedback"}
+            )
+        if store.get_thread(thread_id) is None:
+            return JSONResponse(
+                status_code=404, content={"error": "thread_not_found"}
+            )
+        if not any(r.id == run_id for r in store.list_runs(thread_id)):
+            return JSONResponse(
+                status_code=404, content={"error": "run_not_found"}
+            )
+        try:
+            record = feedback_store.set_feedback(run_id, body.value)
+        except InvalidFeedbackError:
+            # Defense in depth: the store re-validates what the route
+            # already checked.
+            return JSONResponse(
+                status_code=400, content={"error": "invalid_feedback"}
+            )
+        except FeedbackPersistenceError:
+            logger.exception(
+                "set_run_feedback: persistence failed for run_id=%s", run_id
+            )
+            return JSONResponse(
+                status_code=503,
+                content={"error": "feedback_persistence_failed"},
+            )
+        return JSONResponse(
+            status_code=200,
+            content={
+                # Snake_case exactly as web/src/feedback.ts parses.
+                "run_id": record.run_id,
+                "value": record.value,
+                "created_at": record.created_at.isoformat(),
+                "updated_at": record.updated_at.isoformat(),
+            },
+        )
+
     @router.get("/watchlist")
     def list_watchlist(
         watchlist: JsonFileWatchlistStore = Depends(get_watchlist_store),
@@ -1989,6 +2133,7 @@ def mount(
     get_watchlist_store=None,
     get_memory_port=None,
     get_filing_monitor=None,
+    get_feedback_store=None,
 ) -> None:
     """Mount the workspace routes onto an existing FastAPI app."""
     app.include_router(
@@ -1998,6 +2143,7 @@ def mount(
             get_watchlist_store=get_watchlist_store,
             get_memory_port=get_memory_port,
             get_filing_monitor=get_filing_monitor,
+            get_feedback_store=get_feedback_store,
         )
     )
 

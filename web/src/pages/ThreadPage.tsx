@@ -22,6 +22,11 @@ import {
   shouldRenderStreamErrorKind,
   streamErrorKindRowText,
 } from "../streamErrorKind";
+import {
+  canSubmitFeedback,
+  isFeedbackActive,
+  type FeedbackValue,
+} from "../turnFeedback";
 import { useWorkspaceStore } from "../store";
 
 // T4 (spec line 38-39): the interrupted-run banner. Shown when
@@ -123,7 +128,7 @@ export default function ThreadPage() {
         {activeThread.turns.map((turn, index) => (
           // Turn rows are append-only; a stable index key avoids
           // remounting when the server-minted ``run_id`` reconciles.
-          <TurnView key={index} turn={turn} />
+          <TurnView key={index} turn={turn} threadId={thread_id} />
         ))}
 
         {/* Spec #2: a freshly-created (zero-turn) thread must still
@@ -220,7 +225,7 @@ function EmptyThreadCorpusGrid() {
   );
 }
 
-function TurnView({ turn }: { turn: Turn }) {
+function TurnView({ turn, threadId }: { turn: Turn; threadId: string }) {
   // T4 (#37): while THIS turn is live (optimistic send or a
   // lock-held latest row) the tool rows stay open and the thinking
   // region line-clamps; after the run both collapse.
@@ -331,7 +336,61 @@ function TurnView({ turn }: { turn: Turn }) {
           ) : null}
         </div>
       )}
+      {/* T8: the thumbs tail card — the operator's verdict on this
+          turn, rendered after the answer card so it reads as a
+          per-turn action, not part of the answer. Gated to terminal
+          rows (canSubmitFeedback) so a live optimistic turn — whose
+          run_id is still a client placeholder — shows nothing. */}
+      {canSubmitFeedback(turn) ? (
+        <FeedbackControls threadId={threadId} turn={turn} />
+      ) : null}
     </article>
+  );
+}
+
+// T8: thumbs up/down for one terminal run. Clicking submits through
+// the store's ``setTurnFeedback`` (response-driven: the row's
+// ``feedback`` updates only after the host confirms the persisted
+// value) and re-clicking the active thumb re-affirms it — the host
+// has no "clear" verb, last write wins.
+function FeedbackControls({
+  threadId,
+  turn,
+}: {
+  threadId: string;
+  turn: Turn;
+}) {
+  const setTurnFeedback = useWorkspaceStore((s) => s.setTurnFeedback);
+  const submit = (value: FeedbackValue) => {
+    void setTurnFeedback(threadId, turn.run_id, value).catch(
+      () => undefined,
+    );
+  };
+  const buttonClass = (active: boolean) =>
+    active
+      ? "border border-black bg-accent px-2 py-1 text-xs text-white"
+      : "border border-black bg-card px-2 py-1 text-xs hover:bg-accent hover:text-white";
+  return (
+    <div className="flex max-w-3xl mx-auto justify-end gap-2" data-testid="turn-feedback">
+      <button
+        type="button"
+        data-testid="feedback-up"
+        aria-pressed={isFeedbackActive(turn, "up")}
+        onClick={() => submit("up")}
+        className={buttonClass(isFeedbackActive(turn, "up"))}
+      >
+        有帮助
+      </button>
+      <button
+        type="button"
+        data-testid="feedback-down"
+        aria-pressed={isFeedbackActive(turn, "down")}
+        onClick={() => submit("down")}
+        className={buttonClass(isFeedbackActive(turn, "down"))}
+      >
+        没帮助
+      </button>
+    </div>
   );
 }
 
