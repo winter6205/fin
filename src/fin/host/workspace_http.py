@@ -62,6 +62,24 @@ Routes
                                           is emailed or posted out.
 * ``GET    /api/corpus``                - real ``list_filings()`` over
                                           the frozen manifest.
+* ``POST   /api/corpus/ingest``         - the corpus-ingest door
+                                          (corpus-serve-ingest T3 /
+                                          ADR 0047): multipart upload
+                                          -> parse -> 切分 (params
+                                          table) -> push via the
+                                          PushPort -> invalidate stale
+                                          blocks. Named failures:
+                                          ``missing_file`` /
+                                          ``empty_source`` (4xx empty),
+                                          ``format_unspecified`` (422),
+                                          ``unsupported_format`` (415),
+                                          ``ingest_upload_too_large``
+                                          (413), ``invalid_doc_type`` /
+                                          ``document_id_missing`` (422),
+                                          push/invalidation outage
+                                          codes (503). The ONLY product
+                                          surface that calls 切分;
+                                          never a research tool.
 * ``GET    /api/status``                - the boot-scoped status
                                           surface the Sidebar strip
                                           renders (T10 / ADR 0033):
@@ -100,11 +118,21 @@ import copy
 import json
 import logging
 import re
+import threading
 import uuid
 from dataclasses import dataclass
 from typing import Any, Final, Iterator, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, HTTPException
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+)
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from langchain_core.messages import (
     AIMessage,
@@ -116,6 +144,14 @@ from langchain_core.messages import (
 from pydantic import BaseModel, Field
 
 from fin.corpus.catalog import list_filings
+from fin.corpus.errors import ParseError, UnsupportedFormatParseError
+from fin.corpus.ingest_endpoint import (
+    IngestDocumentIdMissingError,
+    IngestEndpoint,
+    IngestFormatUnspecifiedError,
+    IngestInvalidDocTypeError,
+    IngestUploadTooLargeError,
+)
 from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER, strip_hidden_bounce_marker
 from fin.host.export import (
     ExportError,
@@ -162,6 +198,9 @@ from fin.host.watchlist import (
     default_watchlist_store,
     refresh_notices,
 )
+from fin.retrieve.fake_push_port import FakePushPort
+from fin.retrieve.invalidation_port.errors import InvalidationError
+from fin.retrieve.push_port import PushError
 
 
 logger = logging.getLogger(__name__)
@@ -1180,6 +1219,74 @@ def _corpus_filing_count() -> int:
 # ----- route factory -----
 
 
+# Push-failure codes that mean the retrieval backend was unreachable or
+# answered off-contract — a dependency outage (503). The remaining
+# ``PushError`` codes (empty batch / empty document / incomplete
+# metadata) cannot be induced by an uploader: they mean the endpoint's
+# own pipeline produced an invalid batch, which is a 500, never a
+# client-facing 4xx.
+_PUSH_UNAVAILABLE_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "push_service_unavailable",
+        "push_protocol_error",
+        "push_batch_failed",
+        "push_journal_unwritable",
+        "push_journal_unreadable",
+        "push_journal_corrupt",
+    }
+)
+
+# One ingest service per process: the fake boot shares one observable
+# store across requests; the MCP boot's adapters are stateless enough
+# (one subprocess per push call) that sharing changes nothing.
+_ingest_service_singleton: IngestEndpoint | None = None
+_ingest_service_lock = threading.Lock()
+
+
+def _build_default_ingest_service() -> IngestEndpoint:
+    """Build the env-selected ingest service (``get_ingest_service``).
+
+    The backend selection mirrors the retrieve adapter's
+    (``FIN_RETRIEVE_ADAPTER``, via
+    :func:`fin.host.operator_env.resolve_retrieve_adapter_kind`): a
+    fake retrieve boot gets a process-local ``FakePushPort`` serving
+    both the push and invalidation faces (observable, no network); the
+    product default gets the MCP ``push`` / ``invalidation`` adapters
+    (ADR 0047: ingest enters search only through MCP). The MCP
+    adapters are imported lazily so the workspace import surface stays
+    free of the stdio transport (and its psycopg-heavy compile import)
+    until an ingest actually happens.
+    """
+    from fin.host.operator_env import resolve_retrieve_adapter_kind
+
+    if resolve_retrieve_adapter_kind() == "fake":
+        shared: FakePushPort = FakePushPort()
+        return IngestEndpoint(push_port=shared, invalidation_port=shared)
+    from fin.retrieve.mcp_invalidation_port import MCPInvalidationPort
+    from fin.retrieve.mcp_push_port import MCPPushPort
+
+    return IngestEndpoint(
+        push_port=MCPPushPort(),
+        invalidation_port=MCPInvalidationPort(),
+    )
+
+
+def get_ingest_service() -> IngestEndpoint:
+    """FastAPI dependency returning the corpus ingest endpoint service.
+
+    Tests override this via
+    ``app.dependency_overrides[get_ingest_service]`` to inject a
+    service built on ``FakePushPort`` (no live MCP). Production gets
+    the env-selected ports from ``_build_default_ingest_service``,
+    built once per process.
+    """
+    global _ingest_service_singleton
+    with _ingest_service_lock:
+        if _ingest_service_singleton is None:
+            _ingest_service_singleton = _build_default_ingest_service()
+        return _ingest_service_singleton
+
+
 def build_router(
     *,
     get_graph,
@@ -1975,6 +2082,129 @@ def build_router(
             "corpus_filing_count": _corpus_filing_count(),
         }
 
+    @router.post("/corpus/ingest")
+    def corpus_ingest(
+        file: UploadFile | None = File(default=None),
+        document_id: str | None = Form(default=None),
+        company: str | None = Form(default=None),
+        period: str | None = Form(default=None),
+        doc_type: str | None = Form(default=None),
+        format: str | None = Form(default=None),
+        service: IngestEndpoint = Depends(get_ingest_service),
+    ) -> Response:
+        """Corpus-ingest door: parse + 切分 + push/invalidate (T3).
+
+        The ONLY product surface that triggers 切分 (ADR 0047); the
+        research graph binds no such tool (SC6 contract test). The
+        split decisions are the deterministic params table — no model
+        runs on this path.
+
+        Multipart upload + optional metadata form fields:
+        ``format`` (explicit declaration; otherwise the filename
+        extension names the format), ``document_id`` / ``company`` /
+        ``period`` (locator metadata; ``company``+``period`` also
+        derive the default document id), ``doc_type`` (optional
+        params-table scene override).
+
+        Every failure is a named code with no partial-success 200
+        (SC7 / SC8): the four endpoint codes and the parser family
+        map to 4xx (nothing was written); push/invalidation outage
+        codes map to 503. A 503 after the push landed means the push
+        is already in place (idempotent) and the retry is the
+        recovery — the code names invalidation, never a clean
+        success.
+        """
+        if file is None:
+            return JSONResponse(
+                status_code=422, content={"error": "missing_file"}
+            )
+        # Sync handler: read the underlying SpooledTemporaryFile (the
+        # async ``file.read()`` coroutine would need an ``async def``
+        # route, putting the whole parse+push chain on the event loop).
+        data = file.file.read()
+        try:
+            result = service.ingest(
+                data,
+                filename=file.filename,
+                declared_format=format,
+                document_id=document_id,
+                company=company,
+                period=period,
+                doc_type=doc_type,
+            )
+        except IngestUploadTooLargeError:
+            return JSONResponse(
+                status_code=413,
+                content={"error": "ingest_upload_too_large"},
+            )
+        except IngestFormatUnspecifiedError:
+            return JSONResponse(
+                status_code=422, content={"error": "format_unspecified"}
+            )
+        except IngestDocumentIdMissingError:
+            return JSONResponse(
+                status_code=422, content={"error": "document_id_missing"}
+            )
+        except IngestInvalidDocTypeError:
+            return JSONResponse(
+                status_code=422, content={"error": "invalid_doc_type"}
+            )
+        except UnsupportedFormatParseError as exc:
+            return JSONResponse(
+                status_code=415,
+                content={"error": exc.code, "detail": str(exc)},
+            )
+        except ParseError as exc:
+            # empty_source / malformed_source / encrypted_source /
+            # format_mismatch / no_units / metadata_incomplete — the
+            # uploader's bytes are unusable; nothing was written.
+            return JSONResponse(
+                status_code=400, content={"error": exc.code}
+            )
+        except PushError as exc:
+            return JSONResponse(
+                status_code=(
+                    503 if exc.code in _PUSH_UNAVAILABLE_CODES else 500
+                ),
+                content={"error": exc.code},
+            )
+        except InvalidationError as exc:
+            # Push landed; the stale-block closure failed typed (SC8).
+            # Idempotent push makes a retry the recovery.
+            return JSONResponse(
+                status_code=503, content={"error": exc.code}
+            )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "ingested",
+                "document_id": result.document_id,
+                "version": result.version,
+                "fmt": result.fmt,
+                "doc_type": result.doc_type,
+                "unit_count": result.unit_count,
+                "block_count": result.block_count,
+                "written": result.written,
+                "duplicates": result.duplicates,
+                "block_ids": list(result.block_ids),
+                "invalidation": (
+                    None
+                    if result.invalidation is None
+                    else {
+                        "block_ids": list(result.invalidation.block_ids),
+                        "closed": result.invalidation.closed,
+                        "already_closed": result.invalidation.already_closed,
+                        "closed_at": [
+                            [block_id, instant]
+                            for block_id, instant in (
+                                result.invalidation.closed_at
+                            )
+                        ],
+                    }
+                ),
+            },
+        )
+
     return router
 
 
@@ -2004,5 +2234,6 @@ def mount(
 
 __all__ = [
     "build_router",
+    "get_ingest_service",
     "mount",
 ]
