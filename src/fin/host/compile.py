@@ -251,8 +251,8 @@ def _build_default_model(
     """Construct the production ``ChatOpenAI`` instance.
 
     Used by both :func:`compile_for_runtime` (production Postgres
-    path) and :func:`compile_for_runtime_dev` (local-dev InMemorySaver
-    path) so model defaults stay single-sourced. Lazy-imports
+    path) and :func:`compile_for_runtime_dev` (InMemorySaver helper)
+    so model defaults stay single-sourced. Lazy-imports
     ``ChatOpenAI`` so the module stays importable without the heavy
     runtime dep.
 
@@ -432,7 +432,7 @@ def compile_for_runtime(
     return compiled
 
 
-# ----- local-dev (in-memory) path -----
+# ----- InMemorySaver helper (tests / eval only) -----
 
 
 def compile_for_runtime_dev(
@@ -441,32 +441,23 @@ def compile_for_runtime_dev(
     base_url: str | None = None,
     env: Mapping[str, str] | None = None,
 ) -> Any:
-    """Build the local-dev host graph with ``InMemorySaver``.
+    """Build a host graph with ``InMemorySaver`` for tests and eval.
 
-    Used by ``fin-serve`` (``compile_for_http``) when the operator
-    has NOT set ``FIN_CHECKPOINT_URL`` — typical for WSL / laptop
-    boots where Postgres is not configured. Differs from
+    Product ``fin-serve`` / ``compile_for_http`` must not call this
+    when ``FIN_CHECKPOINT_URL`` is unset (ADR 0015). Explicit
+    ``FIN_SCRIPTED_MODEL`` e2e is a separate opt-in. Differs from
     :func:`compile_for_runtime` in two ways:
 
     * **No Postgres.** ``InMemorySaver`` keeps state in process
-      memory. Threads and runs are lost on restart. The warning
-      below surfaces this loudly so an operator in prod does not
-      mistake the dev path for durable state.
-    * **No model-name URL plumbing.** Same defaults as the prod
-      path (``_build_default_model``), so behavior is consistent
-      apart from the checkpointer.
+      memory. Threads and runs are lost on restart.
+    * **Same model defaults** as the prod path
+      (``_build_default_model``).
 
-    Retrieve is NOT downgraded here. ``fin-serve`` on this path
-    still reads the product corpus over MCP (spec line 14), the
-    same as the durable path: the checkpointer decides where
-    threads persist, not where evidence comes from. Selecting the
-    adapter from the saver class is what previously bound the
-    always-empty ``FakeRetrievePort`` to every laptop boot.
+    Retrieve is NOT downgraded here: the checkpointer decides where
+    threads persist, not where evidence comes from.
 
-    The contract kept on :func:`compile_for_runtime` — raise
-    ``MissingCheckpointURLError`` when no URL — is INTACT. The dev
-    path is a separate, opt-in (by absence) entry so tests asserting
-    the prod contract stay green.
+    The contract on :func:`compile_for_runtime` — raise
+    ``MissingCheckpointURLError`` when no URL — is INTACT.
 
     The model side is **NOT** auto-faked here. If
     ``FIN_BASE_URL`` is unset, the prod default (``DEFAULT_BASE_URL``
@@ -483,9 +474,9 @@ def compile_for_runtime_dev(
         "runs will NOT persist across restarts. Set FIN_CHECKPOINT_URL "
         "to enable durable Postgres-backed state."
     )
-    # Two channels: ``warnings.warn`` so the operator sees it at the
-    # console on every dev-mode import, and ``logging.warning`` so the
-    # boot log captures it for postmortem. Tests suppress both.
+    # Two channels: ``warnings.warn`` so callers of this helper see
+    # it, and ``logging.warning`` so a log capture can assert it.
+    # Tests suppress both.
     warnings.warn(message, stacklevel=2)
     logging.getLogger("fin.host.compile").warning(message)
 

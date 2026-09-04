@@ -114,13 +114,16 @@ def test_serve_applies_dotenv_before_uvicorn(monkeypatch) -> None:
         order.append("uvicorn")
 
     monkeypatch.setattr("fin.host.http.apply_dotenv", _dotenv)
+    monkeypatch.setattr(
+        "fin.host.http.compile_for_http", lambda: order.append("compile")
+    )
     import uvicorn
 
     monkeypatch.setattr(uvicorn, "run", _run)
     from fin.host.http import serve
 
     serve()
-    assert order == ["dotenv", "uvicorn"]
+    assert order == ["dotenv", "compile", "uvicorn"]
 
 
 def _path_without_mcp(tmp_path: Path) -> dict[str, str]:
@@ -200,6 +203,7 @@ def test_serve_warns_about_unreachable_mcp_and_still_serves(
     served: list[str] = []
 
     monkeypatch.setattr("fin.host.http.apply_dotenv", lambda: None)
+    monkeypatch.setattr("fin.host.http.compile_for_http", lambda: None)
     import uvicorn
 
     monkeypatch.setattr(uvicorn, "run", lambda *a, **k: served.append("uvicorn"))

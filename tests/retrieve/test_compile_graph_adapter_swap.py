@@ -282,9 +282,9 @@ class _StubSaver(InMemorySaver):
     Before the fix, ``compile_graph`` duck-typed the checkpointer's
     module + class name to decide fake-vs-MCP, so anything else —
     ``PostgresSaver``, or this stand-in — meant "production". The
-    inverse bit hurt more: ``fin-serve`` booting on ``InMemorySaver``
-    (no ``FIN_CHECKPOINT_URL``) silently got the always-empty fake
-    port. Selection must read configuration instead.
+    inverse bit hurt more: compiling on ``InMemorySaver`` used to
+    silently get the always-empty fake port. Selection must read
+    configuration instead.
     """
 
 
@@ -338,7 +338,7 @@ def test_in_memory_checkpointer_does_not_block_mcp_selection(
     """The inverse: ``retrieve_adapter="mcp"`` builds the product
     adapter even on ``InMemorySaver``.
 
-    This is the ``fin-serve``-without-Postgres case (spec line 14:
+    This is the in-memory checkpointer case (spec line 14:
     "``fin-serve`` retrieve ... read this tree"). Binding the fake
     port there made every product retrieve return no hits.
     """
