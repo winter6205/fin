@@ -64,7 +64,7 @@ minimal-change-verifier: yes — one logical program, not one commit; writing-pl
    - **Surface:** host workspace HTTP + tests
    - **Acceptance:** attaching a fixture file exposes text this turn and does not ingest/push; `uv run pytest -q` exits 0。
    - **Completion:** attach storage (turn blob vs temp) open.
-   - Status: [ ]
+   - Status: [x]
    - [blocks: T1]
 
 5. **Corpus-ingest control on workspace** — tag: `[implementation]`

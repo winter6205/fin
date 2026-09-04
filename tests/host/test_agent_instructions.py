@@ -78,3 +78,52 @@ def test_host_prompt_drops_stale_bm25_mention() -> None:
 def test_host_prompt_describes_retrieve_as_the_retrieve_port() -> None:
     """The seam wording stays ``retrieve port`` (ADR 0032)."""
     assert "retrieve port" in HOST_SYSTEM_PROMPT
+
+
+# ----- corpus-serve-ingest T4: attachment context block -----
+
+
+def test_attachment_context_message_empty_returns_none() -> None:
+    """No attachments -> no SystemMessage at all: a non-attach turn
+    must not carry an empty attachment block in its model calls."""
+    from fin.host.agent_instructions import attachment_context_message
+
+    assert attachment_context_message(None) is None
+    assert attachment_context_message([]) is None
+
+
+def test_attachment_context_message_carries_marker_filename_and_text() -> None:
+    """The block is marker-tagged, call-scoped-only by contract, and
+    carries each attachment's filename and full text."""
+    from fin.host.agent_instructions import (
+        THREAD_ATTACHMENTS_MARKER,
+        attachment_context_message,
+    )
+
+    msg = attachment_context_message(
+        [
+            {"attachment_id": "a1", "filename": "note.md", "text": "rev 42.7"},
+            {"attachment_id": "a2", "filename": "b.md", "text": "line two"},
+        ]
+    )
+    assert msg is not None
+    content = str(msg.content)
+    assert THREAD_ATTACHMENTS_MARKER in content
+    assert "note.md" in content and "rev 42.7" in content
+    assert "b.md" in content and "line two" in content
+
+
+def test_attachment_context_message_states_not_citable_discipline() -> None:
+    """ADR 0046 discipline is stated to the model: attachment text is
+    NOT citable corpus; the gate only accepts this-run retrieve /
+    read_file spans. (The structural guarantee is that attachment text
+    never enters the ``evidence`` channel.)"""
+    from fin.host.agent_instructions import attachment_context_message
+
+    msg = attachment_context_message(
+        [{"attachment_id": "a1", "filename": "n.md", "text": "x"}]
+    )
+    assert msg is not None
+    content = str(msg.content)
+    assert "NOT part of the citable corpus" in content
+    assert "retrieve" in content
