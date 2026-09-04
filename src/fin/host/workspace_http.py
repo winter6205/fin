@@ -104,7 +104,14 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Final, Iterator, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, HTTPException
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Request,
+)
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from langchain_core.messages import (
     AIMessage,
@@ -387,6 +394,34 @@ _TITLE_MAX_CHARS: int = 50
 _DEFAULT_TITLE: str = "New thread"
 
 
+# corpus-serve-ingest T4 (ADR 0047 thread attach): hard cap on one
+# attachment upload, in bytes. Attach is a THIS-TURN read affordance
+# (model context), not storage — the cap keeps a drag-and-drop from
+# ballooning the process heap and the model context. Oversize is a
+# named 413, never a silent truncate. Module-level so operators can
+# tune it and tests can shrink it.
+ATTACHMENT_MAX_BYTES: Final[int] = 2 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class AttachmentBlob:
+    """One turn-scoped attachment (ADR 0047 **thread attach**).
+
+    Storage is the turn blob: an in-memory dict on the mounted router
+    (same lifecycle as :class:`RunControl`), keyed by attachment id.
+    Deliberately NOT a file, NOT the corpus object store, NOT an
+    extracted tree — the attach door stores nothing durable and never
+    pushes; when the process ends the blobs end. The send that
+    references the id consumes it (single use).
+    """
+
+    attachment_id: str
+    thread_id: str
+    filename: str
+    text: str
+    size_bytes: int
+
+
 # ----- request / response schemas -----
 
 
@@ -411,6 +446,15 @@ class SendMessageRequest(BaseModel):
     # The proxy keeps ``reasoning_split=True`` regardless — only the
     # thinking TYPE toggles; reasoning_details round-trip remains on.
     thinking: bool = True
+    # corpus-serve-ingest T4 (ADR 0047 **thread attach**): ids returned
+    # by ``POST /threads/{id}/attachments`` to expose on THIS run.
+    # Referencing an unknown id (or another thread's id) is a named
+    # 400 ``attachment_not_found`` BEFORE any graph invoke; the send
+    # that runs consumes the blobs (single use), and a send rejected
+    # 409 does NOT consume them. Attach never pushes: the resolved
+    # text rides ``reset_input_state(attachments=...)`` as turn-scoped
+    # context and never enters the corpus/ingest path.
+    attachment_ids: list[str] = Field(default_factory=list)
 
 
 class CreateWatchRequest(BaseModel):
@@ -1203,6 +1247,12 @@ def build_router(
     """
     router = APIRouter(prefix="/api")
     run_control = RunControl()
+    # corpus-serve-ingest T4 (ADR 0047): the turn-blob attachment
+    # registry, created HERE (per mounted router) for the same reason
+    # as ``run_control`` — two apps in one test session must not share
+    # attachments. Nothing in this dict is ever written to disk or to
+    # the corpus store; the attach door never pushes.
+    attachment_store: dict[str, AttachmentBlob] = {}
     if get_watchlist_store is None:
         get_watchlist_store = default_watchlist_store
     if get_memory_port is None:
@@ -1360,6 +1410,32 @@ def build_router(
                 status_code=404, content={"error": "thread_not_found"}
             )
 
+        # corpus-serve-ingest T4 (ADR 0047 thread attach): resolve the
+        # referenced attachments BEFORE the lock probe and BEFORE the
+        # title rewrite, so a bad reference is a named 400 with zero
+        # side effects. Resolution is read-only — consumption happens
+        # only after the 409 probe passes, so a send rejected with
+        # ``concurrent_run`` keeps its attachments for the retry.
+        # Unknown OR other-thread ids are the same named error (no
+        # existence leak across threads).
+        referenced_ids = list(dict.fromkeys(body.attachment_ids or []))
+        resolved_attachments: list[dict[str, str]] = []
+        if referenced_ids:
+            for attachment_id in referenced_ids:
+                blob = attachment_store.get(attachment_id)
+                if blob is None or blob.thread_id != thread_id:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": "attachment_not_found"},
+                    )
+                resolved_attachments.append(
+                    {
+                        "attachment_id": blob.attachment_id,
+                        "filename": blob.filename,
+                        "text": blob.text,
+                    }
+                )
+
         # T2: title update on the first real send. The T1 path
         # set the title from ``first_message`` at create time;
         # when the user created the thread empty (corpus-card
@@ -1407,6 +1483,17 @@ def build_router(
             raise ConcurrentRunError(
                 f"another run is already in flight on thread_id={thread_id!r}"
             )
+
+        # corpus-serve-ingest T4: the run is definitely starting, so
+        # NOW the referenced blobs are consumed (turn-blob single-use
+        # semantics). A later send replaying the same id is the named
+        # 400, not a silently stale re-read; a send rejected 409 above
+        # did NOT reach this point, so the retry keeps the attachment.
+        # If the stream itself fails mid-flight the blobs stay
+        # consumed — the operator re-attaches, the same contract as
+        # any dropped turn.
+        for attachment_id in referenced_ids:
+            attachment_store.pop(attachment_id, None)
 
         # T2: the input state ALWAYS resets the run-scoped fields
         # (``reset_input_state`` clears ``evidence`` — impossible
@@ -1461,7 +1548,10 @@ def build_router(
                 outcome = yield from _stream_run_frames(
                     graph,
                     run_id=run_id,
-                    input_value=reset_input_state(body.question),
+                    input_value=reset_input_state(
+                        body.question,
+                        attachments=resolved_attachments,
+                    ),
                     config=config,
                     seen_message_ids=seen_message_ids,
                     thread_id=thread_id,
@@ -1605,6 +1695,99 @@ def build_router(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
         )
+
+    @router.post("/threads/{thread_id}/attachments")
+    async def attach_to_thread(
+        thread_id: str,
+        request: Request,
+        store: ThreadStore = Depends(get_thread_store),
+    ) -> dict:
+        """corpus-serve-ingest T4 (ADR 0047 **thread attach**).
+
+        The FIRST door of the two upload doors: a file dropped into
+        the open research thread. The bytes are decoded as UTF-8 text,
+        held as a turn blob in this router's memory, and returned as
+        an ``attachment_id`` the next ``POST .../messages`` may
+        reference via ``attachment_ids``. The model reads the text on
+        THAT turn only; nothing is pushed, nothing is ingested,
+        nothing lands in the corpus store or any extracted tree.
+
+        Wire shape: raw bytes body with the filename as the
+        ``filename`` query parameter. Deliberately NOT multipart
+        ``UploadFile``: that would pull in the ``python-multipart``
+        dependency for a surface the web client (T5) can serve with a
+        plain ``fetch`` body, and T3 is adding the ingest route to
+        this same file in parallel. Binary handling stays OUT of this
+        door by contract — PDF/DOCX/... belong to the corpus-ingest
+        endpoint, where 切分 runs deterministically (ADR 0047) — so
+        undecodable bytes are a named rejection, not a best-effort
+        parse.
+
+        Named boundaries (no silent success, and every failure key is
+        attach-namespaced, never ingest vocabulary):
+
+        * unknown thread            -> 404 ``thread_not_found``
+        * empty body                -> 400 ``empty_attachment``
+        * body over the byte cap    -> 413 ``attachment_too_large``
+        * non-UTF-8 bytes           -> 400 ``attachment_not_text``
+        * blob-store write fails    -> 500 ``attachment_store_failed``
+          (exception boundary; the send-side read has no failure mode
+          beyond a missing/consumed id, which is the named 400
+          ``attachment_not_found``)
+        """
+        if store.get_thread(thread_id) is None:
+            return JSONResponse(
+                status_code=404, content={"error": "thread_not_found"}
+            )
+        body = await request.body()
+        if not body:
+            return JSONResponse(
+                status_code=400, content={"error": "empty_attachment"}
+            )
+        if len(body) > ATTACHMENT_MAX_BYTES:
+            return JSONResponse(
+                status_code=413, content={"error": "attachment_too_large"}
+            )
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            # Text-only is the CONTRACT, not a missing feature: the
+            # attach door must never parse binaries (切分 belongs to
+            # the ingest endpoint, ADR 0047).
+            return JSONResponse(
+                status_code=400, content={"error": "attachment_not_text"}
+            )
+        attachment_id = str(uuid.uuid4())
+        filename = (request.query_params.get("filename") or "").strip()
+        if not filename:
+            filename = "attachment.txt"
+        try:
+            attachment_store[attachment_id] = AttachmentBlob(
+                attachment_id=attachment_id,
+                thread_id=thread_id,
+                filename=filename,
+                text=text,
+                size_bytes=len(body),
+            )
+        except Exception:
+            # Exception boundary: a blob-store write failure (e.g. a
+            # MemoryError on the turn blob) is a TYPED named error —
+            # never a half-stored 200 the caller could reference, and
+            # never ingest vocabulary on the attach door.
+            logger.exception(
+                "attach_to_thread: blob store write failed for thread_id=%s",
+                thread_id,
+            )
+            return JSONResponse(
+                status_code=500,
+                content={"error": "attachment_store_failed"},
+            )
+        return {
+            "attachment_id": attachment_id,
+            "filename": filename,
+            "size_bytes": len(body),
+            "scope": "thread_attach",
+        }
 
     @router.post("/threads/{thread_id}/resume")
     def resume_thread(

@@ -105,7 +105,10 @@ from fin.host.state import (
     STEP_CAP,
     TERMINAL_STATUSES,
 )
-from fin.host.agent_instructions import messages_for_model
+from fin.host.agent_instructions import (
+    attachment_context_message,
+    messages_for_model,
+)
 from fin.host.degradation_notice import (
     DEGRADATION_NOTICE_FIELD,
     consume_degradation,
@@ -1862,6 +1865,43 @@ def compile_graph(
             return unbound_model_no_thinking
         return model
 
+    def _with_turn_attachments(
+        state: AgentState, model_messages: list[BaseMessage]
+    ) -> list[BaseMessage]:
+        """Prepend the turn-scoped attachment block, or return as-is.
+
+        corpus-serve-ingest T4 (ADR 0047 thread attach): attachment
+        context is injected CALL-SCOPED like the track prompt —
+        prepended at model time and never written back to the
+        checkpoint. ``reset_input_state`` clears the ``attachments``
+        channel on the next send, so the text is visible on this
+        run's model calls only. The block goes right after the track
+        prompt (position 1) so the model reads the instructions
+        before the attachment body.
+
+        ADR 0047's visibility contract is unconditional for the turn
+        ("gives the model that file for this turn only"), so EVERY
+        leaf's model call gets it — the research ``model_node`` and
+        the ``_non_research_leaf`` tracks alike; an attach turn that
+        Soft-Track routes to dialogue must still expose the file.
+
+        The attachment text never enters the ``evidence`` channel
+        (tool_node owns it), so an attachment-only span cannot pass
+        the citation gate (ADR 0046 / SC9).
+        """
+        attachment_message = attachment_context_message(
+            state.get("attachments")
+        )
+        if attachment_message is None:
+            return model_messages
+        if not model_messages:
+            return [attachment_message]
+        return [
+            model_messages[0],
+            attachment_message,
+            *model_messages[1:],
+        ]
+
     def _non_research_leaf(
         state: AgentState,
         config: RunnableConfig,
@@ -1874,8 +1914,11 @@ def compile_graph(
             _clarify_missing_slots(state) if track == "clarify" else None
         )
         stream = selected.stream(
-            messages_for_model(
-                state["messages"], track=track, missing_slots=missing_slots
+            _with_turn_attachments(
+                state,
+                messages_for_model(
+                    state["messages"], track=track, missing_slots=missing_slots
+                ),
             )
         )
         answer_message = assemble_final_ai_message(stream)
@@ -1963,9 +2006,14 @@ def compile_graph(
         # inline ``<thinking>`` block stripped out of content. It is
         # stored on state for the turn row; it NEVER merges into the
         # answer content (SC60).
-        stream = selected_model.stream(
-            messages_for_model(state["messages"], track="research")
+        # corpus-serve-ingest T4 (ADR 0047 thread attach): turn-scoped
+        # attachment context, injected CALL-SCOPED like the track
+        # prompt — see ``_with_turn_attachments`` for the full
+        # contract (this-turn-only, checkpoint-clean, never evidence).
+        model_messages = _with_turn_attachments(
+            state, messages_for_model(state["messages"], track="research")
         )
+        stream = selected_model.stream(model_messages)
         answer_message = assemble_final_ai_message(stream)
         # T4 (#37): ``thinking_text`` ACCUMULATES across this run's
         # model calls (each call's prose joined with a newline) so
