@@ -32,7 +32,6 @@ import pytest
 
 from fin.corpus.errors import IngestMissingError
 from fin.corpus import live_fetch
-from fin.corpus.catalog import list_filings
 from fin.corpus.live_fetch import (
     SecHttpFailError,
     SecPrimaryDocUnresolvedError,
@@ -143,13 +142,19 @@ def _roots(tmp_path: Path) -> dict[str, Path]:
     }
 
 
-# ---------- atomic publish + catalog registration ----------
+# ---------- atomic publish + manifest/tree registration ----------
 
 
-def test_successful_live_fetch_registers_accession_in_manifest_and_catalog(
+def test_successful_live_fetch_registers_accession_in_manifest_and_tree(
     tmp_path: Path,
 ) -> None:
-    """A successful live fetch publishes one catalog-visible accession."""
+    """A successful live fetch publishes one registered accession.
+
+    Registration covers the committed manifest row and the extracted
+    index entry. The catalog metadata table (ADR 0047) is written by
+    the ingest endpoint's ``record_filings`` seam (T3); live fetch
+    does not write it, so nothing here asserts catalog visibility.
+    """
     roots = _roots(tmp_path)
     calls: list[str] = []
 
@@ -173,14 +178,6 @@ def test_successful_live_fetch_registers_accession_in_manifest_and_catalog(
         (roots["extracted_root"] / "_index.json").read_text()
     )
     assert _ACCESSION in index["documents"]
-
-    result = list_filings(
-        manifest_path=roots["manifest_path"],
-        extracted_root=roots["extracted_root"],
-    )
-    assert [filing["document_id"] for filing in result["filings"]] == [
-        _ACCESSION
-    ]
 
 
 def test_failure_after_staged_page_write_leaves_visible_publish_unchanged(
@@ -333,11 +330,10 @@ def test_interrupted_publish_is_recovered_before_ua_gate(
                     **roots,
                 )
 
-    assert list_filings(
-        manifest_path=roots["manifest_path"],
-        extracted_root=roots["extracted_root"],
-    ) == {"filings": []}
-
+    # The visible-publish invariant lives on the committed manifest
+    # and extracted index: both must be byte-identical to before the
+    # crash. (Catalog-table registration is the ingest endpoint's
+    # ``record_filings`` seam, T3 — live fetch does not write it.)
     monkeypatch.delenv("FIN_EDGAR_USER_AGENT")
     with pytest.raises(SecUaUnsetError):
         fetch_and_ingest(
