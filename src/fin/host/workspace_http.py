@@ -61,7 +61,8 @@ Routes
                                           one. Workspace-only — nothing
                                           is emailed or posted out.
 * ``GET    /api/corpus``                - real ``list_filings()`` over
-                                          the frozen manifest.
+                                          the catalog metadata table
+                                          (ADR 0047).
 * ``GET    /api/status``                - the boot-scoped status
                                           surface the Sidebar strip
                                           renders (T10 / ADR 0033):
@@ -1156,11 +1157,14 @@ def _model_identity() -> str:
 def _corpus_filing_count() -> int:
     """Filing count from the catalog that serves ``GET /api/corpus``.
 
-    A corpus that was never ingested raises ``IngestMissingError``
-    here. On this route that is a zero count, not a failure: ADR
-    0033 makes zero a valid rendered value, and a 500 would blank a
-    strip whose other three fields are still true. The warning keeps
-    the state out of the silent-swallow class — ``GET /api/corpus``
+    An empty or missing catalog table is a zero count by construction
+    (ADR 0047: the empty catalog is ``{"filings": []}``, not a
+    failure). A table file that exists but is corrupt raises
+    ``CatalogCorruptError`` — an ``IngestMissingError`` subclass. On
+    this route that is still a zero count, not a failure: ADR 0033
+    makes zero a valid rendered value, and a 500 would blank a strip
+    whose other three fields are still true. The warning keeps the
+    state out of the silent-swallow class — ``GET /api/corpus``
     itself still surfaces the typed error to whoever asks for the
     filings.
     """
@@ -1914,14 +1918,17 @@ def build_router(
         """In-app notices for watched filings in the LOCAL catalog and
         configured real filing source.
 
-        Reconcile-on-read: the catalog is a committed tree, not an
-        event source, so the read IS the delivery. Nothing leaves the
+        Reconcile-on-read: the catalog metadata table is not an event
+        source, so the read IS the delivery. Nothing leaves the
         process — spec Focus 3 forbids outbound email / Slack.
 
-        A corpus that was never ingested raises ``IngestMissingError``,
-        which the shared handler turns into the typed 503 the rest of
-        the corpus surface already uses. A monitor outage leaves the
-        persisted rows in the response and adds typed degraded headers.
+        A missing or empty catalog table refreshes against no local
+        filings (ADR 0047: the empty catalog is ``{"filings": []}``,
+        not a failure). A corrupt table file raises the typed
+        ``CatalogCorruptError``, which the shared handler turns into
+        the typed 503 the rest of the corpus surface already uses. A
+        monitor outage leaves the persisted rows in the response and
+        adds typed degraded headers.
         """
         refresh_notices(watchlist, filings=list_filings()["filings"])
         headers = {"X-Filing-Monitor-Status": "healthy"}
@@ -1951,7 +1958,13 @@ def build_router(
 
     @router.get("/corpus")
     def corpus() -> dict:
-        """List the frozen 12 filings from the real catalog."""
+        """List the catalog's ingested filings (metadata table, ADR 0047).
+
+        An empty or missing table is ``{"filings": []}`` — the empty
+        catalog, not an error. A corrupt table file raises the typed
+        ``CatalogCorruptError`` (→ 503 ``ingest_missing`` via the
+        shared handler).
+        """
         return list_filings()
 
     @router.get("/status", response_model=WorkspaceStatusResponse)

@@ -918,12 +918,8 @@ def test_get_corpus_shows_each_form_the_corpus_actually_holds(
     what is in the library.
     """
     monkeypatch.setattr(
-        "fin.corpus.catalog._DEFAULT_MANIFEST_PATH",
-        multi_form_corpus["manifest_path"],
-    )
-    monkeypatch.setattr(
-        "fin.corpus.catalog._DEFAULT_EXTRACTED_ROOT",
-        multi_form_corpus["extracted_root"],
+        "fin.corpus.catalog.DEFAULT_CATALOG_PATH",
+        multi_form_corpus["catalog_path"],
     )
 
     filings = client.get("/api/corpus").json()["filings"]
@@ -933,6 +929,43 @@ def test_get_corpus_shows_each_form_the_corpus_actually_holds(
         "ZEUS-2023-8K": "8-K",
         "ZEUS-2023Q1": "10-Q",
     }
+
+
+def test_get_corpus_with_missing_catalog_table_is_empty_filings(
+    client: TestClient, fresh_store, tmp_path: Path, monkeypatch
+) -> None:
+    """ADR 0047: a serve process whose corpus was never ingested has
+    no catalog table file at all — ``GET /api/corpus`` answers 200
+    ``{"filings": []}``, not a 503 and not an extracted-tree scan."""
+    monkeypatch.setattr(
+        "fin.corpus.catalog.DEFAULT_CATALOG_PATH",
+        tmp_path / "absent" / "catalog.json",
+    )
+
+    r = client.get("/api/corpus")
+
+    assert r.status_code == 200
+    assert r.json() == {"filings": []}
+
+
+def test_get_corpus_with_corrupt_catalog_table_is_typed_503(
+    client: TestClient, fresh_store, tmp_path: Path, monkeypatch
+) -> None:
+    """A table file that exists but violates the catalog schema raises
+    ``CatalogCorruptError`` (an ``IngestMissingError`` subclass) — the
+    shared handler's typed 503 ``ingest_missing``, never an empty 200
+    success and never a bare 500."""
+    corrupt = tmp_path / "catalog.json"
+    corrupt.write_text("{ not json")
+    monkeypatch.setattr(
+        "fin.corpus.catalog.DEFAULT_CATALOG_PATH",
+        corrupt,
+    )
+
+    r = client.get("/api/corpus")
+
+    assert r.status_code == 503
+    assert r.json() == {"error": "ingest_missing"}
 
 
 # ----- run persistence: GET turn table reflects POST history -----
