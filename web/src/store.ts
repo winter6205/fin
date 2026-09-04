@@ -4,6 +4,8 @@
 
 import { create } from "zustand";
 import * as api from "./api";
+// T8: the thumbs-feedback boundary (POST .../runs/{run_id}/feedback).
+import { submitFeedback, type FeedbackValue } from "./feedback";
 // T5 (#35): the last opened thread id, persisted so a returning
 // visit lands back on that thread.
 import { forgetLastThreadIf, rememberLastThread } from "./lastThread";
@@ -92,6 +94,16 @@ interface WorkspaceState {
   // resolves with the terminal stopped frames, so this action only has
   // to signal and refresh the turn table.
   stopRun: (threadId: string) => Promise<void>;
+  // T8: record (or flip) the operator's thumb for one run. Response-
+  // driven (matching ``dismissNotice``'s convention): the turn row is
+  // patched only after the host confirms the persisted value, so the
+  // UI never shows a thumb the store rejected. Rejects so the caller
+  // can surface a failure; the optimistic row is not touched.
+  setTurnFeedback: (
+    threadId: string,
+    runId: string,
+    value: FeedbackValue,
+  ) => Promise<void>;
 }
 
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
@@ -586,6 +598,23 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         set({ stoppingThreadId: null });
       }
     }
+  },
+
+  async setTurnFeedback(threadId, runId, value) {
+    // The host is authoritative for the persisted value (last write
+    // wins on a flip), so the confirmed record patches the row — not
+    // the optimistic request value.
+    const record = await submitFeedback(threadId, runId, value);
+    const current = get().activeThread;
+    if (!current || current.id !== threadId) return;
+    set({
+      activeThread: {
+        ...current,
+        turns: current.turns.map((t) =>
+          t.run_id === runId ? { ...t, feedback: record.value } : t,
+        ),
+      },
+    });
   },
 }));
 
