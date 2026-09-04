@@ -4,8 +4,8 @@ Spec `specs/enterprise-kb-agent.md` Focus 5 / SC9: ``GET /health``
 reports Postgres reachability when ``FIN_CHECKPOINT_URL`` is set.
 Both failure shapes are payload data, never a blank 500:
 
-* URL unset -> typed degraded (``unconfigured``): the process runs,
-  it just keeps run state in memory;
+* URL unset -> typed degraded (``unconfigured``);
+  product ``fin-serve`` refuses boot in this state.
 * URL pointing at a socket nobody listens on -> typed degraded
   (``unreachable``).
 
@@ -156,6 +156,7 @@ def test_health_with_unset_url_is_typed_degraded_not_blank_500(
     assert body["checkpoint"]["reason"] == "checkpoint_url_unset"
     # Typed degraded means the operator gets copy, not an empty body.
     assert body["checkpoint"]["detail"].strip()
+    assert "memory" not in body["checkpoint"]["detail"].lower()
 
 
 def test_health_with_url_to_a_down_socket_is_typed_degraded(

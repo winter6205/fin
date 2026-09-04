@@ -263,7 +263,7 @@ def test_scripted_boot_builds_no_provider_client(monkeypatch) -> None:
 
 def test_compile_for_http_uses_scripted_graph_only_on_optin(monkeypatch) -> None:
     """``compile_for_http`` picks the scripted graph when the operator
-    opted in, and keeps the production/dev boot otherwise."""
+    opted in, and keeps the production boot otherwise."""
     import fin.host.compile as compile_module
     import fin.host.http as http_module
     import fin.host.scripted_boot as scripted_module
@@ -286,4 +286,54 @@ def test_compile_for_http_uses_scripted_graph_only_on_optin(monkeypatch) -> None
     assert http_module.compile_for_http() is sentinel_scripted
 
     # Leave no scripted singleton behind for the rest of the session.
+    monkeypatch.setattr(http_module, "_http_graph_singleton", None, raising=False)
+
+
+def test_compile_for_http_unset_checkpoint_url_raises(
+    monkeypatch,
+) -> None:
+    """Product HTTP compile must not fall back to InMemorySaver.
+
+    ``compile_for_runtime_dev`` stays a test/eval helper; missing
+    ``FIN_CHECKPOINT_URL`` is ``MissingCheckpointURLError``, same as
+    ``compile_for_runtime``. Explicit ``FIN_SCRIPTED_MODEL`` is the
+    only InMemory product-shaped boot.
+    """
+    from fin.host.compile import MissingCheckpointURLError
+    import fin.host.compile as compile_module
+    import fin.host.http as http_module
+
+    def _dev_must_not_run() -> None:
+        raise AssertionError("InMemory fallback must not run")
+
+    monkeypatch.setattr(http_module, "_http_graph_singleton", None, raising=False)
+    monkeypatch.delenv(SCRIPTED_BOOT_ENV_VAR, raising=False)
+    monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
+    monkeypatch.setattr(compile_module, "compile_for_runtime_dev", _dev_must_not_run)
+
+    with pytest.raises(MissingCheckpointURLError):
+        http_module.compile_for_http()
+
+    monkeypatch.setattr(http_module, "_http_graph_singleton", None, raising=False)
+
+
+def test_serve_refuses_boot_when_checkpoint_url_is_unset(monkeypatch) -> None:
+    """``fin-serve`` must not bind the port, then fail on first ask."""
+    from fin.host.compile import MissingCheckpointURLError
+    import fin.host.http as http_module
+    import uvicorn
+
+    served: list[str] = []
+    monkeypatch.setattr(http_module, "apply_dotenv", lambda: None)
+    monkeypatch.setattr(
+        http_module, "warn_if_mcp_retrieve_unreachable", lambda: None
+    )
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: served.append("uvicorn"))
+    monkeypatch.setattr(http_module, "_http_graph_singleton", None, raising=False)
+    monkeypatch.delenv(SCRIPTED_BOOT_ENV_VAR, raising=False)
+    monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
+
+    with pytest.raises(MissingCheckpointURLError):
+        http_module.serve()
+    assert served == []
     monkeypatch.setattr(http_module, "_http_graph_singleton", None, raising=False)

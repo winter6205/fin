@@ -619,13 +619,11 @@ class _BrokenPostgresCM:
 def test_compile_for_runtime_dev_uses_in_memory_saver(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The dev-mode helper exists so ``fin-serve`` can boot when
-    the operator has NOT set ``FIN_CHECKPOINT_URL`` (typical WSL /
-    laptop setup). It MUST use ``InMemorySaver`` (no Postgres) and
-    emit a loud WARNING so the operator does not mistake the dev
-    path for durable state. The contract on ``compile_for_runtime``
-    — raise ``MissingCheckpointURLError`` when no URL — is INTACT;
-    this test asserts the dev path is a separate entry point.
+    """The helper exists so pytest and eval can compile without
+    Postgres. It MUST use ``InMemorySaver`` (no Postgres) and
+    emit a loud WARNING. Product ``fin-serve`` must not call it
+    when the URL is unset — that is ``MissingCheckpointURLError``.
+    The contract on ``compile_for_runtime`` stays INTACT.
     """
     captured: dict[str, object] = {}
     _install_fake_langchain_openai(monkeypatch, captured)

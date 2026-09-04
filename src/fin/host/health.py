@@ -17,8 +17,9 @@ the Sidebar strip pay for a connection attempt on every poll.
 Three typed states, two of them degraded:
 
 * ``reachable``    — the URL is set and Postgres answered.
-* ``unconfigured`` — the URL is unset. The process still serves; run
-  state lives in memory and dies with it.
+* ``unconfigured`` — the URL is unset. Product ``fin-serve`` does
+  not boot in this state; the probe still names it for tests and
+  for an app imported without ``serve()``.
 * ``unreachable``  — the URL is set and the connection attempt
   failed.
 
@@ -67,8 +68,8 @@ CONNECT_TIMEOUT_SECONDS: Final[int] = 2
 _CHECKPOINT_DETAIL: Final[dict[str, str]] = {
     "": "Postgres answered the health probe on FIN_CHECKPOINT_URL.",
     REASON_CHECKPOINT_URL_UNSET: (
-        "FIN_CHECKPOINT_URL is not set: this process keeps run state in "
-        "memory and loses it on exit. Set the URL to run durably."
+        "FIN_CHECKPOINT_URL is not set. Product fin-serve refuses to "
+        "boot without it. This probe reports unconfigured."
     ),
     REASON_CHECKPOINT_UNREACHABLE: (
         "FIN_CHECKPOINT_URL is set but Postgres did not answer: runs are "
