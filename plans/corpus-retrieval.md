@@ -1,5 +1,7 @@
 # Plan: corpus-retrieval（fin 侧 tracer bullets）
 
+**Status（2026-09-04）：** 全部 tracer 已勾完。本文件留作已交付切片的 tracker，不是实施入口。进度：`docs/handoff/2026-09-04-cross-repo-status.md`。闭合队列归档：`plans/archive/2026-09-retrieve-queue/`。
+
 **Goal:** fin 成为语料的唯一解析与切分权威：多格式文档产出冻结单元文本、按确定性查表切成父子块、以幂等方式推送给检索服务 **iknow-memory**，且推送出去的每段文本都能被引用门在同一冻结单元上逐字符命中。
 
 **Approach:** 先收口阶段 0 的共享基线（数字口径定稿、缺失 ADR 补齐、切分改判同步），因为它是全部后续线的入口。随后三条线并行：解析与切分（T5–T9、T11–T13）、评测数据集（T10）、以及住在 **iknow-memory** 仓库的检索栈。数据集先于"全量断言"落地，因为子串关系与确定性两条硬约束要在**评测数据集全量样本**上断言，而不是在脚本化样本上。推送对接（T14 起）串在解析切分与检索栈都可用之后；评测收口（T22–T24）最后。**引用门、意图识别、编排、短期记忆的规则本轮一字不改**，本计划只保证不被破坏。
@@ -36,32 +38,32 @@
 
 下面是本轮 tracker 的汇总索引：全部 bullet 一览、依赖与状态。状态以各 bullet 自己的 `Status` 复选框为准（两者同步维护），阻塞关系即文件内的 `[blocks:]` 标记，标了 `[parallel]` 的可与同阶段其他弹并行。
 
-| # | 标题 | Tag | 阻塞于 | 可并行 | 状态 |
-| --- | --- | --- | --- | --- | --- |
-| T1 | 假设清单 F1–F4 定稿：数字口径从建议值变成契约 | `[decision]` | — | — | 已完成 |
-| T2 | 补齐三份缺失 ADR：跨仓对齐基线 / 降级信号与部分失败语义 / 评测量化与并发基线 | `[decision]` | T1 | — | 待办 |
-| T3 | 切分归属改判同步进既有 ADR 与三份 spec | `[decision]` | T1 | 是 | 待办 |
-| T4 | 跨仓基线章节逐字一致的校验入口 | `[implementation]` | T2, T3 | — | 待办 |
-| T5 | 冻结文本归一化规则单一权威 | `[implementation]` | T4 | 是 | 待办 |
-| T6 | 七格式解析：冻结单元文本 + 结构化元数据 | `[implementation]` | T5 | — | 待办 |
-| T7 | 扫描件 OCR 分支与具名失败 | `[implementation]` | T6 | 是 | 待办 |
-| T8 | 异常输入的具名失败面 | `[implementation]` | T6 | 是 | 待办 |
-| T9 | 场景适配颗粒度：确定性参数查表 + 版本化 | `[implementation]` | T6 | — | 待办 |
-| T10 | 评测数据集：真实语料注入 + 多格式覆盖 + 可一键重建 | `[implementation]` | T1 | 是 | 待办 |
-| T11 | 父子分块与引用门连续子串硬约束 | `[implementation]` | T5, T9, T10 | — | 待办 |
-| T12 | 切分确定性可复现：全量 sha256 逐字节比对 | `[implementation]` | T11 | — | 待办 |
-| T13 | 规则 / 参数表版本变更触发就地全量重建 | `[implementation]` | T9, T11 | 是 | 待办 |
-| T14 | 幂等推送：`source_ref` + 幂等键 + 块标识 + 结构化元数据 | `[implementation]` | T11, T12 | — | 待办 |
-| T15 | 批量分批与断点续传 | `[implementation]` | T14 | 是 | 待办 |
-| T16 | 推送与协议失败的具名返回 | `[implementation]` | T14 | 是 | 待办 |
-| T17 | 命中映射失败：丢弃 + 计数，不静默 | `[implementation]` | T14 | 是 | 待办 |
-| T18 | 内容失效触发：版本变更即发起，幂等且具名 | `[implementation]` | T14, T13 | 是 | 待办 |
-| T19 | 能力默认全启用：8 键快照 + 静态检查 | `[implementation]` | T14 | 是 | 待办 |
-| T20 | 降级信号消费：`degraded` 不当空结果 | `[implementation]` | T14 | 是 | 待办 |
-| T21 | 无效输入与合法空结果的二分 | `[implementation]` | T14 | 是 | 待办 |
-| T22 | 消融矩阵与量化报告：绝对值 + 百分比 + 逐项贡献度 | `[implementation]` | T14, T10 | — | 待办 |
-| T23 | 并发评测：L1 检索路径场景 + L2 含 LLM 完整 run 场景 + 全写幂等场景 + 四个补充维度 | `[implementation]` | T14, T10 | 是 | 待办 |
-| T24 | 静默失败清零：失败清单逐条具名且留痕 | `[implementation]` | T16, T18, T20, T21 | — | 待办 |
+| #   | 标题                                                                              | Tag                | 阻塞于             | 可并行 | 状态   |
+| --- | --------------------------------------------------------------------------------- | ------------------ | ------------------ | ------ | ------ |
+| T1  | 假设清单 F1–F4 定稿：数字口径从建议值变成契约                                     | `[decision]`       | —                  | —      | 已完成 |
+| T2  | 补齐三份缺失 ADR：跨仓对齐基线 / 降级信号与部分失败语义 / 评测量化与并发基线      | `[decision]`       | T1                 | —      | 已完成 |
+| T3  | 切分归属改判同步进既有 ADR 与三份 spec                                            | `[decision]`       | T1                 | 是     | 已完成 |
+| T4  | 跨仓基线章节逐字一致的校验入口                                                    | `[implementation]` | T2, T3             | —      | 已完成 |
+| T5  | 冻结文本归一化规则单一权威                                                        | `[implementation]` | T4                 | 是     | 已完成 |
+| T6  | 七格式解析：冻结单元文本 + 结构化元数据                                           | `[implementation]` | T5                 | —      | 已完成 |
+| T7  | 扫描件 OCR 分支与具名失败                                                         | `[implementation]` | T6                 | 是     | 已完成 |
+| T8  | 异常输入的具名失败面                                                              | `[implementation]` | T6                 | 是     | 已完成 |
+| T9  | 场景适配颗粒度：确定性参数查表 + 版本化                                           | `[implementation]` | T6                 | —      | 已完成 |
+| T10 | 评测数据集：真实语料注入 + 多格式覆盖 + 可一键重建                                | `[implementation]` | T1                 | 是     | 已完成 |
+| T11 | 父子分块与引用门连续子串硬约束                                                    | `[implementation]` | T5, T9, T10        | —      | 已完成 |
+| T12 | 切分确定性可复现：全量 sha256 逐字节比对                                          | `[implementation]` | T11                | —      | 已完成 |
+| T13 | 规则 / 参数表版本变更触发就地全量重建                                             | `[implementation]` | T9, T11            | 是     | 已完成 |
+| T14 | 幂等推送：`source_ref` + 幂等键 + 块标识 + 结构化元数据                           | `[implementation]` | T11, T12           | —      | 已完成 |
+| T15 | 批量分批与断点续传                                                                | `[implementation]` | T14                | 是     | 已完成 |
+| T16 | 推送与协议失败的具名返回                                                          | `[implementation]` | T14                | 是     | 已完成 |
+| T17 | 命中映射失败：丢弃 + 计数，不静默                                                 | `[implementation]` | T14                | 是     | 已完成 |
+| T18 | 内容失效触发：版本变更即发起，幂等且具名                                          | `[implementation]` | T14, T13           | 是     | 已完成 |
+| T19 | 能力默认全启用：8 键快照 + 静态检查                                               | `[implementation]` | T14                | 是     | 已完成 |
+| T20 | 降级信号消费：`degraded` 不当空结果                                               | `[implementation]` | T14                | 是     | 已完成 |
+| T21 | 无效输入与合法空结果的二分                                                        | `[implementation]` | T14                | 是     | 已完成 |
+| T22 | 消融矩阵与量化报告：绝对值 + 百分比 + 逐项贡献度                                  | `[implementation]` | T14, T10           | —      | 已完成 |
+| T23 | 并发评测：L1 检索路径场景 + L2 含 LLM 完整 run 场景 + 全写幂等场景 + 四个补充维度 | `[implementation]` | T14, T10           | 是     | 已完成 |
+| T24 | 静默失败清零：失败清单逐条具名且留痕                                              | `[implementation]` | T16, T18, T20, T21 | —      | 已完成 |
 
 每个编号项是一颗 tracer bullet：一条可演示的端到端结果、一个 tag、一个 commit、给 implementer 留 headroom。Acceptance 只写可观察性质，不写复杂度门槛数字（那些 gate 归 `complexity-anti-drift` `references/thresholds.md`）。
 
@@ -163,7 +165,8 @@
     - **Acceptance:** 全量样本连续两次解析 + 切分的产物序列化后 sha256 不一致样本数 = 0；断言覆盖块文本、块标识、顺序与元数据四项，不只比块文本；注入任意非确定性来源（如集合迭代序、字典序、时钟、随机）后该断言即失败——即以该断言本身作为"无隐藏非确定性"的见证；`uv run pytest -q` exits 0。
     - **Completion:** 产物的序列化格式与比对粒度由实现者定，只要四项全比且非确定性来源能被该断言捕获。
     - [blocks: T11]
-   - Status: [x] done —— 全量 234 样本连续两次解析+切分的规范化产物（sort_keys JSON，覆盖块文本/块标识/顺序/元数据四项）sha256 不一致样本数 = 0（`-m eval` 4 passed, 920s）；时钟/随机/数组序/集合迭代序四类注入均被断言捕获（含跨进程见证），小样用例锁 canonical 序列化对键序/迭代序不敏感。
+
+    - Status: [x] done —— 全量 234 样本连续两次解析+切分的规范化产物（sort_keys JSON，覆盖块文本/块标识/顺序/元数据四项）sha256 不一致样本数 = 0（`-m eval` 4 passed, 920s）；时钟/随机/数组序/集合迭代序四类注入均被断言捕获（含跨进程见证），小样用例锁 canonical 序列化对键序/迭代序不敏感。
 
 13. **[parallel] 规则 / 参数表版本变更触发就地全量重建** — tag: `[implementation]`
     - **Inherits:** spec「已定稿、不再作为开放问题」："解析规则或参数表升版本时**就地全量重建**，不做双版本并存"；ADR 0038 的 fin 侧义务："任意时点都能用同一规则版本与参数表版本从权威源重建全部推送内容"；版本变更同时是内容失效的触发条件之一（见 T18）。
@@ -171,7 +174,8 @@
     - **Acceptance:** 解析规则版本或参数表版本变更时，存在一条命令以新版本就地全量重建全部冻结单元与块，重建后不存在新旧两个版本并存的状态；重建产物满足 T12 的确定性断言；重建过程本身是可重入的（中断后重跑不产生半套新旧混合）；`uv run pytest -q` exits 0。
     - **Completion:** 重建命令的形态（CLI 子命令 / 脚本）、版本号的载体与推进规则由实现者定；不做双版本并存是硬约束。
     - [blocks: T9, T11]
-   - Status: [x] done —— 入口 `uv run python -m fin.corpus.rebuild rebuild|check`：staging 构建 + 原子交换，交换前后双次 `validate_no_mixed_versions`（版本字段 + 逐文件 sha256 对账，违例抛 `mixed_version_state`）；中断模拟测试证明旧产物原样可见、重跑逐字节恢复基线；全量双跑 `find data/corpus/blocks | sha256sum` 一致（235 文件 / 97MB，已 gitignore）；`check` 输出 `parse_changed`/`params_changed` 信号供 T18 消费。
+
+    - Status: [x] done —— 入口 `uv run python -m fin.corpus.rebuild rebuild|check`：staging 构建 + 原子交换，交换前后双次 `validate_no_mixed_versions`（版本字段 + 逐文件 sha256 对账，违例抛 `mixed_version_state`）；中断模拟测试证明旧产物原样可见、重跑逐字节恢复基线；全量双跑 `find data/corpus/blocks | sha256sum` 一致（235 文件 / 97MB，已 gitignore）；`check` 输出 `parse_changed`/`params_changed` 信号供 T18 消费。
 
 ### 阶段 2 — 入库推送对接（依赖线 A 与线 B 都完成）
 
