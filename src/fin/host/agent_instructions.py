@@ -8,13 +8,14 @@ copies and GET history never dumps them as a turn.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Literal
+from typing import Any, Literal
 
 from langchain_core.messages import BaseMessage, SystemMessage
 
 from fin.host.track_decision import Track
 
 HOST_INSTRUCTIONS_MARKER: str = "[FIN_HOST_INSTRUCTIONS]"
+THREAD_ATTACHMENTS_MARKER: str = "[FIN_THREAD_ATTACHMENTS]"
 DIALOGUE_INSTRUCTIONS_MARKER: str = "[FIN_DIALOGUE_INSTRUCTIONS]"
 OFF_TOPIC_INSTRUCTIONS_MARKER: str = "[FIN_OFF_TOPIC_INSTRUCTIONS]"
 CLARIFY_INSTRUCTIONS_MARKER: str = "[FIN_CLARIFY_INSTRUCTIONS]"
@@ -119,6 +120,46 @@ def clarify_prompt(missing_slots: Sequence[str] | None = None) -> str:
     )
 
 
+def attachment_context_message(
+    attachments: Sequence[dict[str, Any]] | None,
+) -> SystemMessage | None:
+    """Return the call-scoped attachment block, or ``None`` for none.
+
+    corpus-serve-ingest T4 (ADR 0047 **thread attach**): the operator
+    may drag a file into the open research thread; the model may read
+    it on THIS turn only. Like the track prompts, the returned
+    ``SystemMessage`` is prepended at model call time and must never
+    be written back to the checkpoint — the caller drops it after the
+    call, and ``reset_input_state`` clears the ``attachments`` state
+    channel on the next run, so the text disappears next turn.
+
+    Citation discipline (ADR 0046): the block says explicitly that
+    attachments are NOT citable corpus. The gate's real protection is
+    structural, not prompt-level — attachment text never enters the
+    ``evidence`` channel, so an attachment-only span cannot match.
+    """
+    if not attachments:
+        return None
+    sections = []
+    for attachment in attachments:
+        filename = str(attachment.get("filename") or "attachment")
+        text = str(attachment.get("text") or "")
+        sections.append(f"--- attached file: {filename} ---\n{text}")
+    joined = "\n\n".join(sections)
+    return SystemMessage(
+        content=(
+            f"{THREAD_ATTACHMENTS_MARKER}\n"
+            "The operator attached the following file(s) to THIS turn. "
+            "They are readable context for this turn only and vanish "
+            "on the next turn. They are NOT part of the citable "
+            "corpus: the citation gate only accepts spans copied from "
+            "this run's retrieve / read_file tool text, so never "
+            "present attachment content as retrieved evidence.\n\n"
+            f"{joined}"
+        )
+    )
+
+
 _TRACK_PROMPTS: dict[str, tuple[str, str]] = {
     "research": (HOST_INSTRUCTIONS_MARKER, HOST_SYSTEM_PROMPT),
     "dialogue": (DIALOGUE_INSTRUCTIONS_MARKER, DIALOGUE_SYSTEM_PROMPT),
@@ -172,6 +213,8 @@ __all__ = [
     "HOST_SYSTEM_PROMPT",
     "OFF_TOPIC_INSTRUCTIONS_MARKER",
     "OFF_TOPIC_SYSTEM_PROMPT",
+    "THREAD_ATTACHMENTS_MARKER",
+    "attachment_context_message",
     "clarify_prompt",
     "messages_for_model",
     "messages_for_track",
