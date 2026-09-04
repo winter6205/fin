@@ -71,12 +71,11 @@ function stubSendStatus(status: number, body: unknown): void {
 
 /** SSE body that emits a terminal ``status`` frame, then breaks. */
 function stubSendStreamThatBreaksAfterStatus(): void {
-  const frame =
-    `event: status\ndata: ${JSON.stringify({
-      run_id: "22222222-2222-4222-8222-222222222222",
-      status: "done",
-      assistant_message: "",
-    })}\n\n`;
+  const frame = `event: status\ndata: ${JSON.stringify({
+    run_id: "22222222-2222-4222-8222-222222222222",
+    status: "done",
+    assistant_message: "",
+  })}\n\n`;
   vi.stubGlobal(
     "fetch",
     vi.fn(async () => {
@@ -574,6 +573,42 @@ describe("openThread GET reconcile", () => {
     expect(active?.turns).toHaveLength(1);
     expect(active?.turns[0].answer).toBe("半段草稿");
     expect(active?.turns[0].in_flight).toBe(true);
+  });
+
+  // T3 (ADR 0044): the detail GET carries the occupancy figure the
+  // auto-compact gate computes. ``openThread`` stores it verbatim
+  // (reconcile never drops a server field it does not know).
+  it("stores the server occupancy figure on the active thread", async () => {
+    seedStreamedThread([]);
+    stubGetThread(
+      threadWith([], {
+        occupancy: {
+          estimated_tokens: 3072,
+          budget_tokens: 256000,
+          ratio: 0.012,
+        },
+      }),
+    );
+
+    await useWorkspaceStore.getState().openThread(THREAD_ID);
+
+    const active = useWorkspaceStore.getState().activeThread;
+    expect(active?.occupancy).toEqual({
+      estimated_tokens: 3072,
+      budget_tokens: 256000,
+      ratio: 0.012,
+    });
+  });
+
+  it("keeps occupancy absent for a thread with no checkpoint", async () => {
+    seedStreamedThread([]);
+    stubGetThread(threadWith([]));
+
+    await useWorkspaceStore.getState().openThread(THREAD_ID);
+
+    expect(
+      useWorkspaceStore.getState().activeThread?.occupancy,
+    ).toBeUndefined();
   });
 });
 

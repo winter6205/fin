@@ -64,12 +64,11 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
    - [parallel]
 
 4. **Session sliding window + incremental summary** — tag: `[implementation]`
-   - **Inherits:** spec Focus 2 / SC5：超阈值压缩；company/period 等 snapshot 槽位保留。
-   - **Surface:** host graph/checkpointer + tests（soft_track as needed）
-   - **Acceptance:** 长 scripted thread 压缩后 classify/inherit 仍见槽位；模型可见历史相对基线缩短可测；不写 MCP；`uv run pytest -q` exits 0。
-   - **Completion:** 阈值与摘要模型调用方式开放。
-   - Status: [ ] pending
-   - [blocks: T1]
+   - **Inherits:** superseded by ADR 0044 and `plans/session-compaction.md`（token occupancy, not message count）.
+   - **Surface:** see session-compaction plan
+   - **Acceptance:** do not implement this bullet; implement `plans/session-compaction.md` T1–T3.
+   - Status: [x] superseded 2026-09-04
+   - [unblocked: T1 pooling closed on main by ADR 0036]
 
 5. **Local memory buffer: extract / recall / GC** — tag: `[implementation]`
    - **Inherits:** spec Focus 3 / SC6–SC8；ADR 0035：PG 缓冲；recall advisory；不能单靠记忆 cite。
