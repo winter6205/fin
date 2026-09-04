@@ -44,6 +44,13 @@ from fin.retrieve.input_validation import (
 from fin.retrieve.mcp_adapter import MCPRetrieveAdapter, RetrieveUnavailableError
 from fin.retrieve.mcp_session import MCPStdioSession
 from fin.retrieve.port import Chunk, RetrievePort
+from fin.retrieve.read_port import (
+    READ_UNAVAILABLE,
+    ExtractedTreeReadPort,
+    MissReadPort,
+    ReadPort,
+    read_from_pages,
+)
 from fin.retrieve.tool import retrieve
 
 __all__ = [
@@ -51,12 +58,17 @@ __all__ = [
     "Chunk",
     "ConflictingFiltersError",
     "EmptyQueryError",
+    "ExtractedTreeReadPort",
     "FakeRetrievePort",
     "InputValidationError",
     "InputValidationLedger",
     "MCPRetrieveAdapter",
     "MCPStdioSession",
+    "MissReadPort",
+    "READ_UNAVAILABLE",
+    "ReadPort",
     "RetrievePort",
     "RetrieveUnavailableError",
+    "read_from_pages",
     "retrieve",
 ]

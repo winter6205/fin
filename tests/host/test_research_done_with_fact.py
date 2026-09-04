@@ -55,6 +55,16 @@ SEED_VERSION = (
 )
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
+# Legacy tree-backed read adapter over the committed corpus. Only the
+# scripted ``read_file`` transcripts need it; the default graph no
+# longer reads the tree on its own (ADR 0046 / 0047).
+from fin.retrieve import ExtractedTreeReadPort
+
+_TREE_READ_PORT = ExtractedTreeReadPort(
+    Path("data/corpus/manifest.json"),
+    Path("data/corpus/extracted"),
+)
+
 
 def _thread_config(thread_id: str) -> dict:
     return {"configurable": {"thread_id": thread_id}}
@@ -160,6 +170,7 @@ def test_research_done_passes_when_fact_matches_answer() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
         facts_root=_facts_root(),
     )
     out = g.invoke(
@@ -219,6 +230,7 @@ def test_research_done_refuses_when_claim_unmatched() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
         facts_root=_facts_root(),
     )
     out = g.invoke(
@@ -275,6 +287,7 @@ def test_research_done_no_fact_call_skips_numeric_gate() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
         facts_root=_facts_root(),
     )
     out = g.invoke(
@@ -347,6 +360,7 @@ def test_compile_graph_binds_get_xbrl_fact_tool() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
         facts_root=_facts_root(),
     )
     # ``bind_tools`` records the tool list on the scripted model.

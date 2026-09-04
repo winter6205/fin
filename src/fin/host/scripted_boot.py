@@ -50,6 +50,7 @@ from langchain_core.outputs import ChatGenerationChunk
 from pydantic import Field
 
 from fin.corpus.errors import IngestMissingError
+from fin.retrieve import ExtractedTreeReadPort
 from fin.host.scripted_model import ScriptedChatModel
 
 
@@ -447,6 +448,12 @@ def compile_for_scripted_e2e(
         manifest_path=mpath,
         extracted_root=rpath,
         retrieve_adapter=RETRIEVE_ADAPTER_FAKE,
+        # The lane's transcript quotes the frozen corpus by design (see
+        # "Why the transcript reads the corpus" above), so its scripted
+        # ``read_file`` call is served by the legacy tree-backed read
+        # port — an explicit fixture choice, typed-error at boot when
+        # the tree is absent, never a serve-path SSOT (ADR 0046/0047).
+        read_port=ExtractedTreeReadPort(mpath, rpath),
     )
 
 

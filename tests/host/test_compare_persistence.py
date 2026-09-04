@@ -45,6 +45,16 @@ AAPL_2022Q3_VERSION = (
 )
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "AAPL-2023Q3", "MSFT-2023Q3"}
 
+# Legacy tree-backed read adapter over the committed corpus. Only the
+# scripted ``read_file`` transcripts need it; the default graph no
+# longer reads the tree on its own (ADR 0046 / 0047).
+from fin.retrieve import ExtractedTreeReadPort
+
+_TREE_READ_PORT = ExtractedTreeReadPort(
+    Path("data/corpus/manifest.json"),
+    Path("data/corpus/extracted"),
+)
+
 # Digit-free verbatim slice of the committed AAPL-2022Q3 page 1: the
 # citation gate needs a >=32-char extractive span, and a number
 # inside the span would itself be a claim for the numeric gate.
@@ -87,6 +97,7 @@ def _install_graph(
         checkpointer=InMemorySaver(),
         model=ScriptedChatModel(script=script),
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
         facts_root=facts_root,
     )
     http_app.dependency_overrides[get_graph] = lambda: graph

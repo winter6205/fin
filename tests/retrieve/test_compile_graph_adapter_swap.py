@@ -384,23 +384,25 @@ def test_explicit_adapter_wins_over_retrieve_adapter_kind(
     assert graph is not None
 
 
-# ----- 6. the product MCP adapter gets a usable locator map -----
+# ----- 6. the product MCP adapter is built WITHOUT the extracted tree -----
 
 
-def test_mcp_auto_build_derives_locator_map_from_extracted_tree(
+def test_mcp_auto_build_does_not_need_the_extracted_tree(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``locator_map=None`` used to mean "every MCP hit is dropped":
-    the adapter mapped iknow ids through an empty dict, so product
-    retrieve could only ever return ``{"chunks": []}``.
+    """ADR 0046 / 0047 (spec corpus-serve-ingest SC3): the serve path
+    no longer treats the local extracted tree as the company-corpus
+    SSOT. The ``"mcp"`` auto-build therefore builds the product adapter
+    with an empty locator map and no client-side allow-list — canonical
+    ``source_ref`` hits need no map, and unmapped hits are dropped and
+    counted on the mapping ledger instead of hidden behind a healthy
+    -looking miss. Any tree load during the build fails the test."""
 
-    The auto-build must publish one id per frozen locator unit,
-    derived from the same extracted tree ``read_file`` and the
-    citation verifier read.
-    """
-    tree = _corpus_tree()
-    if not tree:
-        pytest.skip("no committed extracted tree available")
+    def _boom(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("mcp auto-build consulted the extracted tree")
+
+    monkeypatch.setattr("fin.retrieve.read_port.load_extracted_tree", _boom)
+    monkeypatch.setattr("fin.corpus.extracted.load_extracted_tree", _boom)
 
     built = _record_mcp_construction(monkeypatch)
     compile_graph(
@@ -409,33 +411,26 @@ def test_mcp_auto_build_derives_locator_map_from_extracted_tree(
         retrieve_adapter="mcp",
     )
     assert len(built) == 1
-    locator_map = built[0]["locator_map"]
-    known_ids = built[0]["known_document_ids"]
-
-    # One entry per frozen unit across the whole tree.
-    assert len(locator_map) == sum(len(pages) for pages in tree.values())
-    assert set(known_ids) == set(tree)
-
-    # Every published id resolves to a locator that is really in the
-    # tree — an id that mapped to a fabricated locator would sail
-    # past the mapper-drop and fail only at the citation gate.
-    tree_locators = {
-        page.locator for pages in tree.values() for page in pages
-    }
-    assert set(locator_map.values()) == tree_locators
+    assert built[0]["locator_map"] == {}
+    assert built[0]["known_document_ids"] is None
 
 
-def test_mcp_auto_build_with_empty_locator_map_fails_loudly() -> None:
-    """An MCP adapter with no usable map is a retrieve path that
-    cannot return a single hit. Refuse to build it rather than
-    serve silent misses (error-handling-enforcer: no
-    success-shaped result for a broken configuration)."""
-    with pytest.raises(RetrieveAdapterConfigError) as excinfo:
-        compile_graph(
-            checkpointer=InMemorySaver(),
-            model=ScriptedChatModel(script=[]),
-            retrieve_adapter="mcp",
-            known_document_ids={"DOC-2023Q1"},
-            locator_map={},
-        )
-    assert "locator_map" in str(excinfo.value)
+def test_mcp_auto_build_with_empty_locator_map_builds_and_counts_drops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicitly empty ``locator_map`` is a legal product shape now
+    (ADR 0047: canonical source_ref is the wire contract). The adapter
+    is built as configured; a non-canonical hit would be counted on the
+    mapping ledger — visible, never silent."""
+    built = _record_mcp_construction(monkeypatch)
+    graph = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=ScriptedChatModel(script=[]),
+        retrieve_adapter="mcp",
+        known_document_ids={"DOC-2023Q1"},
+        locator_map={},
+    )
+    assert graph is not None
+    assert len(built) == 1
+    assert built[0]["locator_map"] == {}
+    assert built[0]["known_document_ids"] == {"DOC-2023Q1"}

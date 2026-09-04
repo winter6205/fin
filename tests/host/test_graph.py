@@ -65,7 +65,7 @@ from fin.host import (
     ScriptedChatModel,
     compile_graph,
 )
-from fin.retrieve import BM25Adapter
+from fin.retrieve import BM25Adapter, ExtractedTreeReadPort
 
 
 # ----- corpus fixtures -----
@@ -82,6 +82,15 @@ AAPL_2022Q3_VERSION = (
 MSFT_2023Q1 = "MSFT-2023Q1"
 
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
+
+# Legacy tree-backed read adapter over the committed corpus. Only the
+# tests that script a ``read_file`` call inject it — the default graph
+# no longer reads the tree on its own (ADR 0046 / 0047; see
+# ``test_serve_path_no_tree_ssot.py``).
+_TREE_READ_PORT = ExtractedTreeReadPort(
+    Path("data/corpus/manifest.json"),
+    Path("data/corpus/extracted"),
+)
 
 
 @pytest.fixture(scope="session")
@@ -161,6 +170,7 @@ def _invoke_done(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     return g.invoke(
         {
@@ -218,6 +228,7 @@ def test_bounce_loop_ends_at_repair_cap_refuse(aapl_page1_text):
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         {
@@ -608,6 +619,7 @@ def test_read_file_tool_appends_evidence(aapl_page1_text):
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         {
@@ -1035,6 +1047,7 @@ def test_tool_summaries_appended_by_tool_node(aapl_page1_text):
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         reset_input_state_for_test("What was AAPL net sales in 2023 Q3?"),

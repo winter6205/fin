@@ -33,6 +33,16 @@ AAPL_2022Q3_VERSION = (
 )
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "AAPL-2023Q3", "MSFT-2023Q3"}
 
+# Legacy tree-backed read adapter over the committed corpus. Only the
+# scripted ``read_file`` transcripts need it; the default graph no
+# longer reads the tree on its own (ADR 0046 / 0047).
+from fin.retrieve import ExtractedTreeReadPort
+
+_TREE_READ_PORT = ExtractedTreeReadPort(
+    Path("data/corpus/manifest.json"),
+    Path("data/corpus/extracted"),
+)
+
 # A verbatim slice of the committed AAPL-2022Q3 page 1. The citation
 # gate needs a >=32-char extractive span before any prose answer can
 # pass; without it we would be pinning the bounce path, not the
@@ -96,6 +106,7 @@ def _run(script: list[AIMessage], *, facts_root: Path, thread_id: str) -> dict:
         checkpointer=InMemorySaver(),
         model=ScriptedChatModel(script=script),
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
         facts_root=facts_root,
     )
     return graph.invoke(
@@ -123,6 +134,7 @@ def test_compile_graph_binds_compare_facts_after_get_xbrl_fact(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
         facts_root=compare_seed.root,
     )
     names = [getattr(t, "name", repr(t)) for t in model.bound_tools]
