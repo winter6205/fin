@@ -1292,6 +1292,136 @@ _PUSH_UNAVAILABLE_CODES: Final[frozenset[str]] = frozenset(
     }
 )
 
+
+def _push_error_status(exc: PushError) -> int:
+    """Push outages are dependency failures (503); the rest are 500."""
+    return 503 if exc.code in _PUSH_UNAVAILABLE_CODES else 500
+
+
+# ----- ingest route: exception -> named HTTP answer (table-driven) -----
+#
+# Complexity-gate remediation: the ``corpus_ingest`` handler kept one
+# ``except`` branch per failure family. The mapping is data, not
+# control flow — each row is (exception family, status, detail flag)
+# and :func:`_ingest_error_response` dispatches ONCE, isinstance-style,
+# in table order. Order matters: a family must precede a base it must
+# shadow (``UnsupportedFormatParseError`` before ``ParseError``).
+# Every row's family carries a stable ``code`` class attribute; the
+# body is always ``{"error": code}``, plus ``detail`` (str(exc)) only
+# on the 415 that names the received format (SC7).
+_INGEST_ERROR_TABLE: Final[
+    tuple[tuple[type[BaseException], Any, bool], ...]
+] = (
+    (UnsupportedFormatParseError, 415, True),
+    (IngestUploadTooLargeError, 413, False),
+    (IngestFormatUnspecifiedError, 422, False),
+    (IngestDocumentIdMissingError, 422, False),
+    (IngestInvalidDocTypeError, 422, False),
+    (ParseError, 400, False),
+    (InvalidationError, 503, False),
+    # PushError's status depends on the code: resolver, not a constant.
+    (PushError, _push_error_status, False),
+)
+
+
+def _ingest_error_response(exc: Exception) -> JSONResponse:
+    """Answer an ingest failure with its named HTTP response.
+
+    One dispatch replaces the ingest handler's per-family ``except``
+    branches: walk :data:`_INGEST_ERROR_TABLE` in order, take the
+    row's status (a plain int, or a resolver for families whose status
+    depends on the error code) and answer ``{"error": exc.code}`` —
+    every table family declares ``code``. A family OUTSIDE the table
+    is not this route's named contract: re-raise typed so it stays an
+    unhandled 500, never a fabricated answer.
+    """
+    for family, status, with_detail in _INGEST_ERROR_TABLE:
+        if not isinstance(exc, family):
+            continue
+        resolved = status(exc) if callable(status) else status
+        content: dict[str, Any] = {"error": exc.code}
+        if with_detail:
+            content["detail"] = str(exc)
+        return JSONResponse(status_code=resolved, content=content)
+    raise exc
+
+
+# ----- route-layer upload gate (input boundary) -----
+#
+# Both upload doors (thread attach, corpus ingest) used to buffer the
+# WHOLE body before consulting the byte cap — an unbounded allocation
+# on a lying or chunked uploader. Now the route consults the declared
+# Content-Length first and, when the length is unknown, reads in
+# bounded segments and refuses at cap+1 bytes. The service-level cap
+# checks stay (defense in depth); this is the route's own gate.
+
+# Segment size of the bounded read for the multipart ingest door.
+_INGEST_READ_SEGMENT: Final[int] = 1024 * 1024
+
+
+def _declared_upload_over(request: Request, cap: int) -> bool:
+    """True when the request's declared Content-Length exceeds ``cap``.
+
+    The pre-buffer gate: a declared oversize body is refused before a
+    single byte is read. A missing (chunked) or unparseable header is
+    NOT oversize by declaration — the bounded read decides. A
+    ``cap <= 0`` means unlimited (the service cap's own convention).
+    """
+    if cap <= 0:
+        return False
+    declared = request.headers.get("content-length")
+    if declared is None:
+        return False
+    try:
+        return int(declared) > cap
+    except ValueError:
+        return False
+
+
+async def _read_bounded_body(request: Request, cap: int) -> bytes | None:
+    """Read the attach body in segments; ``None`` once over ``cap``.
+
+    The no-Content-Length (chunked) leg of the attach gate: segments
+    accumulate only while the running total fits ``cap``, so an
+    unbounded stream can never balloon process memory past cap+1
+    bytes. ``cap <= 0`` (unlimited) degrades to the plain full read.
+    """
+    if cap <= 0:
+        return await request.body()
+    chunks: list[bytes] = []
+    total = 0
+    async for segment in request.stream():
+        total += len(segment)
+        if total > cap:
+            return None
+        chunks.append(segment)
+    return b"".join(chunks)
+
+
+def _read_bounded_upload(file: Any, cap: int) -> bytes | None:
+    """Read the spooled multipart upload in segments; ``None`` over cap.
+
+    The ingest leg of the gate (no Content-Length, or a declared one
+    that already passed): the sync SpooledTemporaryFile is read segment
+    by segment and the read stops at cap+1 bytes — the route never
+    materializes an oversized upload in memory. ``cap <= 0`` means
+    unlimited.
+    """
+    if cap <= 0:
+        return file.read()
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        segment = file.read(_INGEST_READ_SEGMENT)
+        if not segment:
+            break
+        total += len(segment)
+        if total > cap:
+            return None
+        chunks.append(segment)
+    return b"".join(chunks)
+
+
 # One ingest service per process: the fake boot shares one observable
 # store across requests; the MCP boot's adapters are stateless enough
 # (one subprocess per push call) that sharing changes nothing.
@@ -1452,6 +1582,11 @@ def build_router(
     # as ``run_control`` — two apps in one test session must not share
     # attachments. Nothing in this dict is ever written to disk or to
     # the corpus store; the attach door never pushes.
+    #
+    # Known limitation (deliberate): no total-size cap and NO
+    # eviction — blobs are in-process memory held until the send that
+    # references them consumes them (single-use pop) or the process
+    # exits. This is a turn-blob registry, not a durable store.
     attachment_store: dict[str, AttachmentBlob] = {}
     if get_watchlist_store is None:
         get_watchlist_store = default_watchlist_store
@@ -1914,10 +2049,11 @@ def build_router(
 
         Wire shape: raw bytes body with the filename as the
         ``filename`` query parameter. Deliberately NOT multipart
-        ``UploadFile``: that would pull in the ``python-multipart``
-        dependency for a surface the web client (T5) can serve with a
-        plain ``fetch`` body, and T3 is adding the ingest route to
-        this same file in parallel. Binary handling stays OUT of this
+        ``UploadFile``: this door ships ONE undecorated turn blob —
+        no form fields, nothing to parse — so the web client's plain
+        ``fetch`` body is the entire contract and neither side pays
+        for multipart handling (the ingest route is the only
+        multipart surface). Binary handling stays OUT of this
         door by contract — PDF/DOCX/... belong to the corpus-ingest
         endpoint, where 切分 runs deterministically (ADR 0047) — so
         undecodable bytes are a named rejection, not a best-effort
@@ -1934,19 +2070,29 @@ def build_router(
           (exception boundary; the send-side read has no failure mode
           beyond a missing/consumed id, which is the named 400
           ``attachment_not_found``)
+
+        The 413 is decided at the ROUTE layer before the body is
+        buffered: a declared oversize Content-Length is refused
+        unread, and a chunked body is read in bounded segments
+        (:func:`_read_bounded_body`) — the cap is never discovered
+        after a full-buffer allocation.
         """
         if store.get_thread(thread_id) is None:
             return JSONResponse(
                 status_code=404, content={"error": "thread_not_found"}
             )
-        body = await request.body()
+        if _declared_upload_over(request, ATTACHMENT_MAX_BYTES):
+            return JSONResponse(
+                status_code=413, content={"error": "attachment_too_large"}
+            )
+        body = await _read_bounded_body(request, ATTACHMENT_MAX_BYTES)
+        if body is None:
+            return JSONResponse(
+                status_code=413, content={"error": "attachment_too_large"}
+            )
         if not body:
             return JSONResponse(
                 status_code=400, content={"error": "empty_attachment"}
-            )
-        if len(body) > ATTACHMENT_MAX_BYTES:
-            return JSONResponse(
-                status_code=413, content={"error": "attachment_too_large"}
             )
         try:
             text = body.decode("utf-8")
@@ -2369,6 +2515,7 @@ def build_router(
 
     @router.post("/corpus/ingest")
     def corpus_ingest(
+        request: Request,
         file: UploadFile | None = File(default=None),
         document_id: str | None = Form(default=None),
         company: str | None = Form(default=None),
@@ -2397,7 +2544,8 @@ def build_router(
         codes map to 503. A 503 after the push landed means the push
         is already in place (idempotent) and the retry is the
         recovery — the code names invalidation, never a clean
-        success.
+        success. The exception -> answer mapping lives in
+        :func:`_ingest_error_response` (table-driven).
 
         After a fully successful chain the service's ``on_ingested``
         hook registers the filing in the catalog (T2
@@ -2410,10 +2558,27 @@ def build_router(
             return JSONResponse(
                 status_code=422, content={"error": "missing_file"}
             )
+        # Route-layer upload gate (input boundary): refuse a declared
+        # oversize body BEFORE the spooled upload is read into memory,
+        # and bound the read when no Content-Length is declared. The
+        # cap is the service's own (single source of truth; the
+        # service cap check stays as defense in depth).
+        cap = service.max_bytes
+        if _declared_upload_over(request, cap):
+            return JSONResponse(
+                status_code=413,
+                content={"error": "ingest_upload_too_large"},
+            )
         # Sync handler: read the underlying SpooledTemporaryFile (the
         # async ``file.read()`` coroutine would need an ``async def``
-        # route, putting the whole parse+push chain on the event loop).
-        data = file.file.read()
+        # route, putting the whole parse+push chain on the event loop)
+        # — bounded, so an unbounded upload never materializes here.
+        data = _read_bounded_upload(file.file, cap)
+        if data is None:
+            return JSONResponse(
+                status_code=413,
+                content={"error": "ingest_upload_too_large"},
+            )
         # Reset BEFORE the call so a previous ingest on this threadpool
         # thread can never leak its warning into this response.
         _catalog_hook_slot.warning = None
@@ -2427,48 +2592,8 @@ def build_router(
                 period=period,
                 doc_type=doc_type,
             )
-        except IngestUploadTooLargeError:
-            return JSONResponse(
-                status_code=413,
-                content={"error": "ingest_upload_too_large"},
-            )
-        except IngestFormatUnspecifiedError:
-            return JSONResponse(
-                status_code=422, content={"error": "format_unspecified"}
-            )
-        except IngestDocumentIdMissingError:
-            return JSONResponse(
-                status_code=422, content={"error": "document_id_missing"}
-            )
-        except IngestInvalidDocTypeError:
-            return JSONResponse(
-                status_code=422, content={"error": "invalid_doc_type"}
-            )
-        except UnsupportedFormatParseError as exc:
-            return JSONResponse(
-                status_code=415,
-                content={"error": exc.code, "detail": str(exc)},
-            )
-        except ParseError as exc:
-            # empty_source / malformed_source / encrypted_source /
-            # format_mismatch / no_units / metadata_incomplete — the
-            # uploader's bytes are unusable; nothing was written.
-            return JSONResponse(
-                status_code=400, content={"error": exc.code}
-            )
-        except PushError as exc:
-            return JSONResponse(
-                status_code=(
-                    503 if exc.code in _PUSH_UNAVAILABLE_CODES else 500
-                ),
-                content={"error": exc.code},
-            )
-        except InvalidationError as exc:
-            # Push landed; the stale-block closure failed typed (SC8).
-            # Idempotent push makes a retry the recovery.
-            return JSONResponse(
-                status_code=503, content={"error": exc.code}
-            )
+        except Exception as exc:
+            return _ingest_error_response(exc)
         # The hook ran last (only on a fully successful chain); read
         # the slot ON this thread — the reset above guarantees no
         # stale warning from an earlier request is echoed here.

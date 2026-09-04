@@ -32,7 +32,7 @@ import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import pytest
 from fastapi import FastAPI
@@ -203,6 +203,98 @@ def test_attach_oversize_named_413(
     r = _attach(client, thread_id, b"x" * 16, filename="big.md")
     assert r.status_code == 413
     assert r.json() == {"error": "attachment_too_large"}
+
+
+def test_attach_oversize_content_length_refused_without_buffering(
+    client: TestClient, fresh_store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Input-boundary fix: a DECLARED oversize Content-Length is the
+    named 413 BEFORE a single body byte is read into memory. The
+    raising stream below is the tripwire — any full-body buffering
+    surfaces its error instead of the named 413."""
+    from fin.host import workspace_http
+
+    monkeypatch.setattr(workspace_http, "ATTACHMENT_MAX_BYTES", 8)
+    thread_id = _new_thread(client)
+
+    def _never_buffered() -> Iterator[bytes]:
+        raise AssertionError(
+            "route buffered the body despite oversize Content-Length"
+        )
+        yield b""  # pragma: no cover - generator marker only
+
+    r = client.post(
+        f"/api/threads/{thread_id}/attachments",
+        content=_never_buffered(),
+        params={"filename": "big.md"},
+        headers={"Content-Length": "9999"},
+    )
+    assert r.status_code == 413
+    assert r.json() == {"error": "attachment_too_large"}
+
+
+def test_attach_chunked_oversize_refused_by_bounded_read(
+    client: TestClient, fresh_store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Input-boundary fix: with NO Content-Length (chunked) the route
+    reads in bounded segments and refuses at cap+1 bytes instead of
+    buffering the whole body. (The mid-stream refusal itself is pinned
+    by ``test_attach_bounded_body_read_stops_at_the_cap`` — the
+    TestClient materializes a generator body on first receive, so the
+    end-to-end probe can only pin the named 413 outcome.)"""
+    from fin.host import workspace_http
+
+    monkeypatch.setattr(workspace_http, "ATTACHMENT_MAX_BYTES", 8)
+    thread_id = _new_thread(client)
+
+    r = client.post(
+        f"/api/threads/{thread_id}/attachments",
+        content=iter([b"x" * 16]),  # chunked: no Content-Length header
+        params={"filename": "big.md"},
+    )
+    assert r.status_code == 413
+    assert r.json() == {"error": "attachment_too_large"}
+
+
+def test_attach_bounded_body_read_stops_at_the_cap() -> None:
+    """Unit pin of the chunked leg: the bounded reader stops pulling
+    from the stream once the running total passes the cap (three
+    4-byte segments against cap 8 = refuse on the third), and joins
+    the whole body when it fits."""
+    import asyncio
+
+    from fastapi import Request as FastAPIRequest
+
+    from fin.host.workspace_http import _read_bounded_body
+
+    def _request_from_segments(
+        segments: list[bytes],
+    ) -> tuple[FastAPIRequest, list[int]]:
+        pulls: list[int] = []
+        messages: list[dict[str, Any]] = [
+            {"type": "http.request", "body": seg, "more_body": True}
+            for seg in segments
+        ] + [{"type": "http.request", "body": b"", "more_body": False}]
+
+        async def receive() -> dict[str, Any]:
+            pulls.append(1)
+            return messages.pop(0)
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/",
+            "headers": [],
+            "query_string": b"",
+        }
+        return FastAPIRequest(scope, receive=receive), pulls
+
+    over, over_pulls = _request_from_segments([b"x" * 4] * 4)
+    assert asyncio.run(_read_bounded_body(over, 8)) is None
+    assert len(over_pulls) == 3  # 4+4 fit; the third segment trips it
+
+    within, _ = _request_from_segments([b"x" * 4, b"x" * 4])
+    assert asyncio.run(_read_bounded_body(within, 8)) == b"x" * 8
 
 
 def test_attach_non_text_named_400(client: TestClient, fresh_store) -> None:
