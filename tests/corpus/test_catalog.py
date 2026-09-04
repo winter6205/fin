@@ -1,31 +1,30 @@
-"""Boundary tests for the catalog's EDGAR-shaped optional filters (T2 / ADR 0031).
+"""Boundary tests for the catalog metadata table (T2 / ADR 0047).
 
-The catalog (``fin.corpus.catalog.list_filings``) gained additive
-optional kwargs (``cik`` / ``form`` / ``ticker`` / ``filing_date``)
-alongside the v1 ``company`` / ``period`` filters. These tests cover
-the five boundary classes from the defensive-contract-validator axis:
-empty, negative, overflow, concurrent, exception. Together they lock
-the contract that the host graph's ``list_files`` tool and the
-retrieve port share.
+The catalog (``fin.corpus.catalog``) is a host metadata table at
+``data/corpus/catalog.json``: ingested/pushed filings are registered
+as rows of the cross-ticket contract ``{document_id, company, period,
+version, page_count}`` (optional ``source_sha256``). ``list_filings``
+reads the table; it never opens ``manifest.json`` or the extracted
+tree — the serve-time HTML tree is not the catalog SSOT (ADR 0046 /
+0047). Writes go through ``record_filings`` (upsert keyed by
+``document_id`` + ``version``), the seam the ingest endpoint (T3)
+will call.
 
-Filter semantics under test (per ADR 0031 / spec):
+These tests cover the five boundary classes from the
+defensive-contract-validator axis: empty, negative, overflow,
+concurrent, exception. Filter semantics under test (per ADR 0031 /
+spec):
 
 * Empty filter values (e.g. ``cik=""``) MUST behave as empty hits —
-  NOT "match anything" and NOT an exception. The spec calls this out
-  explicitly under the "empty hits not exceptions" rule.
+  NOT "match anything" and NOT an exception.
 * Unknown ``cik`` / ``ticker`` / ``form`` / ``filing_date`` MUST
   return ``{"filings": []}``.
-* Conflicting filters (``ticker="AAPL"`` + ``cik="0000789019"``
-  which is MSFT's CIK) MUST return ``{"filings": []}`` — the
-  filters are AND-combined, so a row that passes one but fails the
-  other is dropped.
+* Conflicting filters MUST return ``{"filings": []}`` — filters are
+  AND-combined.
 * The output hit shape is ``{document_id, company, period, version,
-  page_count, form}``. ``form`` was the "later ticket extends the
-  output keys" case, opened by spec SC3 of
-  ``specs/enterprise-kb-agent.md`` (the Corpus 首页 card shows the
-  form); ``cik`` / ``accession`` / ``filing_date`` / ``ticker`` remain
-  filter inputs only. The SC3 form behaviour itself lives in
-  ``test_catalog_form_types.py``.
+  page_count, form}``. ``cik`` / ``accession`` / ``filing_date`` /
+  ``ticker`` / ``source_sha256`` remain stored-only fields and MUST
+  NOT leak onto the hit.
 """
 
 from __future__ import annotations
@@ -36,7 +35,8 @@ from pathlib import Path
 
 import pytest
 
-from fin.corpus.errors import IngestMissingError
+from fin.corpus.catalog import DEFAULT_CATALOG_PATH, list_filings, record_filings
+from fin.corpus.errors import CatalogCorruptError, CatalogRowError
 from fin.host.tools.list_files import list_files
 
 
@@ -48,20 +48,15 @@ def _project_data_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "data" / "corpus"
 
 
-def _manifest_path() -> Path:
-    return _project_data_dir() / "manifest.json"
+def _catalog_path() -> Path:
+    return _project_data_dir() / "catalog.json"
 
 
-def _extracted_root() -> Path:
-    return _project_data_dir() / "extracted"
-
-
-# Real EDGAR-shaped values from the committed manifest. Anchored here
-# so a manifest edit that breaks the assumption surfaces as a
+# Real EDGAR-shaped values from the committed catalog. Anchored here
+# so a catalog edit that breaks the assumption surfaces as a
 # well-named fixture failure, not a misleading test result.
 AAPL_CIK = "0000320193"
 MSFT_CIK = "0000789019"
-AMZN_CIK = "0001018724"
 
 
 # ===== boundary 1: empty =====
@@ -78,103 +73,154 @@ def test_empty_filter_value_returns_empty_hits(field: str) -> None:
     value is NOT "match anything" and NOT an exception — it is a
     well-formed call that simply has no row matching it.
     """
-    result = list_files(
-        **{field: ""},
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
-    )
+    result = list_files(**{field: ""}, catalog_path=_catalog_path())
     assert result == {"filings": []}, (
         f"empty {field}='' must yield empty hits (per ADR 0031); "
         f"got {result!r}"
     )
 
 
-# ===== boundary 2: negative =====
+def test_missing_catalog_table_is_an_empty_catalog(tmp_path: Path) -> None:
+    """A missing table file is the empty catalog, NOT an error.
+
+    ADR 0047: the catalog is the metadata table over ingested/pushed
+    filings. A serve process whose corpus was never ingested has no
+    table file at all — that is ``{"filings": []}``, not a 503 and
+    not a tree scan.
+    """
+    assert list_filings(catalog_path=tmp_path / "absent" / "catalog.json") == {
+        "filings": []
+    }
+
+
+def test_record_filings_empty_input_records_nothing(tmp_path: Path) -> None:
+    """``record_filings([])`` is a no-op: 0 recorded, no file created."""
+    catalog_path = tmp_path / "catalog.json"
+
+    assert record_filings([], catalog_path=catalog_path) == 0
+    assert not catalog_path.exists()
+    assert list_filings(catalog_path=catalog_path) == {"filings": []}
+
+
+# ===== boundary 2: negative (bad rows are named failures) =====
+
+
+def _valid_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "document_id": "TEST-2023Q1",
+        "company": "TEST",
+        "period": "2023 Q1",
+        "version": "a" * 64,
+        "page_count": 3,
+    }
+    row.update(overrides)
+    return row
+
+
+@pytest.mark.parametrize(
+    "bad_row",
+    [
+        pytest.param({"company": "TEST", "period": "2023 Q1", "version": "a" * 64, "page_count": 1}, id="missing_document_id"),
+        pytest.param({"document_id": "TEST-2023Q1", "period": "2023 Q1", "version": "a" * 64, "page_count": 1}, id="missing_company"),
+        pytest.param({"document_id": "TEST-2023Q1", "company": "TEST", "period": "2023 Q1", "page_count": 1}, id="missing_version"),
+        pytest.param(_valid_row(page_count="3"), id="page_count_not_int"),
+        pytest.param(_valid_row(page_count=True), id="page_count_bool"),
+        pytest.param(_valid_row(page_count=-1), id="page_count_negative"),
+        pytest.param(_valid_row(document_id=""), id="empty_document_id"),
+        pytest.param(_valid_row(version=None), id="version_none"),
+        pytest.param("not-a-mapping", id="not_a_mapping"),
+        pytest.param(_valid_row(source_sha256=7), id="source_sha256_not_str"),
+    ],
+)
+def test_record_filings_rejects_bad_rows_with_named_failure(
+    tmp_path: Path, bad_row: object
+) -> None:
+    """A row violating the contract raises ``CatalogRowError``.
+
+    Never a silent skip-as-success: the write does not happen and the
+    existing table is untouched.
+    """
+    catalog_path = tmp_path / "catalog.json"
+    assert record_filings([_valid_row()], catalog_path=catalog_path) == 1
+    before = catalog_path.read_bytes()
+
+    with pytest.raises(CatalogRowError):
+        record_filings([bad_row], catalog_path=catalog_path)
+
+    assert catalog_path.read_bytes() == before, (
+        "a rejected row must not partially mutate the table"
+    )
+    assert len(list_filings(catalog_path=catalog_path)["filings"]) == 1
+
+
+def test_record_filings_names_the_offending_row(tmp_path: Path) -> None:
+    """The error message names the row index and the offending field."""
+    catalog_path = tmp_path / "catalog.json"
+
+    with pytest.raises(CatalogRowError) as exc_info:
+        record_filings(
+            [_valid_row(), _valid_row(document_id="OTHER"), {"company": "X"}],
+            catalog_path=catalog_path,
+        )
+
+    message = str(exc_info.value)
+    assert "#2" in message
+    assert "document_id" in message
+
+
+# ===== negative: unknown filters (committed catalog) =====
 
 
 def test_unknown_cik_returns_empty_hits() -> None:
     """Unknown ``cik`` returns ``{"filings": []}`` — NOT an error."""
-    result = list_files(
-        cik="9999999999",
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
-    )
-    assert result == {"filings": []}
+    assert list_files(cik="9999999999", catalog_path=_catalog_path()) == {
+        "filings": []
+    }
 
 
 def test_unknown_ticker_returns_empty_hits() -> None:
     """Unknown ``ticker`` returns ``{"filings": []}``."""
-    result = list_files(
-        ticker="ZZZZ",
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
-    )
-    assert result == {"filings": []}
+    assert list_files(ticker="ZZZZ", catalog_path=_catalog_path()) == {
+        "filings": []
+    }
 
 
 def test_unknown_form_returns_empty_hits() -> None:
-    """Unknown ``form`` returns ``{"filings": []}``.
-
-    Per spec acceptance: ``form`` is NOT hard-coded to demo 10-Q when
-    other form rows exist. The expanded corpus holds a 10-K, so an
-    actually unknown form (e.g. ``8-K``) returns the empty contract.
-    """
-    result = list_files(
-        form="8-K",
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
-    )
-    assert result == {"filings": []}
+    """Unknown ``form`` returns ``{"filings": []}``."""
+    assert list_files(form="8-K", catalog_path=_catalog_path()) == {
+        "filings": []
+    }
 
 
 def test_unknown_filing_date_returns_empty_hits() -> None:
     """Unknown exact ``filing_date`` returns ``{"filings": []}``."""
-    result = list_files(
-        filing_date="2099-12-31",
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
-    )
-    assert result == {"filings": []}
+    assert list_files(
+        filing_date="2099-12-31", catalog_path=_catalog_path()
+    ) == {"filings": []}
 
 
 def test_conflicting_ticker_and_cik_returns_empty_hits() -> None:
     """Conflicting ``ticker``+``cik`` returns ``{"filings": []}``.
 
-    AAPL's ticker (``AAPL``) paired with MSFT's CIK
-    (``0000789019``) — no row satisfies both. Filters are
-    AND-combined, so a row that passes one and fails the other is
-    dropped; the empty hits path is the contract, NOT an exception.
+    AAPL's ticker paired with MSFT's CIK — no row satisfies both.
+    Filters are AND-combined, so a row that passes one but fails the
+    other is dropped; the empty hits path is the contract, NOT an
+    exception.
     """
-    result = list_files(
-        ticker="AAPL",
-        cik=MSFT_CIK,
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
-    )
-    assert result == {"filings": []}, (
-        f"conflicting ticker=MSFT cik={AAPL_CIK}? filters must yield "
-        f"empty hits; got {result!r}"
-    )
+    assert list_files(
+        ticker="AAPL", cik=MSFT_CIK, catalog_path=_catalog_path()
+    ) == {"filings": []}
 
 
 def test_matching_ticker_and_cik_returns_hits() -> None:
     """Matching ``ticker``+``cik`` returns the AND-combined hits.
 
-    AAPL's ticker (``AAPL``) paired with AAPL's CIK
-    (``0000320193``) — 4 rows in the demo corpus (one per period).
-    The AND of two filters that agree on the same ticker must equal
-    the single-filter result.
-
-    Plan C added 3 EDGAR iXBRL AAPL primary docs; they carry
-    ``ticker="EDGAR-<cik>"`` (set by ``fin.corpus.live_fetch``), so
-    they match the ``cik`` filter alone but not the ``ticker="AAPL"``
-    filter. The ticker+cik AND therefore stays at 4 rows.
+    The 4 frozen private fixture source AAPL PDFs carry ``ticker="AAPL"``; the
+    EDGAR iXBRL primary docs carry ``ticker="EDGAR-<cik>"``, so the
+    ticker+cik AND stays at 4 rows.
     """
     result = list_files(
-        ticker="AAPL",
-        cik=AAPL_CIK,
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        ticker="AAPL", cik=AAPL_CIK, catalog_path=_catalog_path()
     )
     assert len(result["filings"]) == 4
     for filing in result["filings"]:
@@ -182,140 +228,253 @@ def test_matching_ticker_and_cik_returns_hits() -> None:
 
 
 def test_cik_filter_alone_returns_one_issuer_hits() -> None:
-    """``cik`` alone narrows to the issuer's filings.
-
-    Plan C added 3 EDGAR iXBRL AAPL primary docs (CIK 0000320193) on
-    top of the 4 frozen private fixture source PDFs, so AAPL now has 7 filings
-    rather than 4.
-    """
-    result = list_files(
-        cik=AAPL_CIK,
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
-    )
+    """``cik`` alone narrows to the issuer's filings (7 AAPL rows)."""
+    result = list_files(cik=AAPL_CIK, catalog_path=_catalog_path())
     assert len(result["filings"]) == 7
     for filing in result["filings"]:
         assert filing["company"] == "AAPL"
 
 
 def test_form_filter_alone_returns_all_10Q_hits() -> None:
-    """``form="10-Q"`` returns every 10-Q row in the corpus.
-
-    Plan C expanded the tier-1 corpus via 8 EDGAR iXBRL 10-Q primary
-    docs (all marked ``form="10-Q"`` by the catalog patch), so the
-    floor is now >= 20 (12 frozen private fixture source PDFs + 8 live-fetched
-    iXBRL HTMLs), not exactly 12."""
-    result = list_files(
-        form="10-Q",
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
-    )
+    """``form="10-Q"`` returns every 10-Q row in the corpus (floor 20)."""
+    result = list_files(form="10-Q", catalog_path=_catalog_path())
     assert len(result["filings"]) >= 20
 
 
 def test_filing_date_filter_alone_returns_single_hit() -> None:
     """Exact ``filing_date`` returns exactly the one matching row."""
-    # AAPL-2022Q3's filing_date is 2022-07-29 per the manifest — the
-    # EDGAR filing date of the 10-Q for the quarter ended 2022-06-25.
-    result = list_files(
-        filing_date="2022-07-29",
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
-    )
+    result = list_files(filing_date="2022-07-29", catalog_path=_catalog_path())
     assert len(result["filings"]) == 1
     assert result["filings"][0]["document_id"] == "AAPL-2022Q3"
 
 
 def test_company_and_cik_filters_are_and_combined() -> None:
-    """``company`` + ``cik`` agree on AAPL → 4 hits; cross-issuer → empty."""
+    """``company`` + ``cik`` agree on AAPL → 7 hits; cross-issuer → empty."""
     matching = list_files(
-        company="AAPL",
-        cik=AAPL_CIK,
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        company="AAPL", cik=AAPL_CIK, catalog_path=_catalog_path()
     )
-    # Plan C added 3 EDGAR iXBRL AAPL primary docs; floor is now 7.
     assert len(matching["filings"]) == 7
 
     cross = list_files(
-        company="AAPL",
-        cik=MSFT_CIK,
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+        company="AAPL", cik=MSFT_CIK, catalog_path=_catalog_path()
     )
     assert cross == {"filings": []}
 
 
-# ===== boundary 3: overflow (large manifest round-trip) =====
+# ===== boundary 3: overflow (large table round-trip) =====
 
 
-def test_default_returns_all_12_filings() -> None:
-    """No filters → all 12 demo filings, in deterministic document_id order.
+def test_large_table_round_trips_completely(tmp_path: Path) -> None:
+    """300 recorded rows all come back, in deterministic key order.
 
-    Boundary "overflow" stand-in for catalog: the catalog has no
-    internal cap, but a large manifest must still round-trip without
-    dropping rows.
+    The catalog has no internal cap: a large table must round-trip
+    without dropping rows or losing the sort.
     """
-    result = list_files(
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
+    catalog_path = tmp_path / "catalog.json"
+    rows = [
+        {
+            "document_id": f"DOC-{index:04d}",
+            "company": f"CO{index % 7}",
+            "period": "2023 Q1",
+            "version": f"{index:064d}",
+            "page_count": index % 13,
+        }
+        for index in range(300)
+    ]
+    assert record_filings(rows, catalog_path=catalog_path) == 300
+
+    result = list_filings(catalog_path=catalog_path)
+    assert len(result["filings"]) == 300
+    keys = [(f["document_id"], f["version"]) for f in result["filings"]]
+    assert keys == sorted(keys)
+
+
+def test_upsert_same_document_same_version_updates_in_place(
+    tmp_path: Path,
+) -> None:
+    """Same ``(document_id, version)`` upserts — no duplicate rows."""
+    catalog_path = tmp_path / "catalog.json"
+    record_filings([_valid_row(page_count=3)], catalog_path=catalog_path)
+    record_filings([_valid_row(page_count=9)], catalog_path=catalog_path)
+
+    filings = list_filings(catalog_path=catalog_path)["filings"]
+    assert len(filings) == 1
+    assert filings[0]["page_count"] == 9
+
+
+def test_upsert_same_document_new_version_keeps_both_rows(
+    tmp_path: Path,
+) -> None:
+    """A new version of the same document is a second row."""
+    catalog_path = tmp_path / "catalog.json"
+    record_filings([_valid_row(version="a" * 64)], catalog_path=catalog_path)
+    record_filings([_valid_row(version="b" * 64)], catalog_path=catalog_path)
+
+    filings = list_filings(catalog_path=catalog_path)["filings"]
+    assert [f["version"] for f in filings] == ["a" * 64, "b" * 64]
+
+
+def test_optional_source_sha256_is_stored_but_not_emitted(
+    tmp_path: Path,
+) -> None:
+    """``source_sha256`` round-trips in the table but stays off the hit.
+
+    The hit shape is the ADR 0009 contract plus ``form`` (SC3); the
+    optional contract field is storage metadata for the ingest side.
+    """
+    catalog_path = tmp_path / "catalog.json"
+    record_filings(
+        [_valid_row(source_sha256="c" * 64)], catalog_path=catalog_path
     )
-    assert len(result["filings"]) >= 20
-    document_ids = [f["document_id"] for f in result["filings"]]
-    assert document_ids == sorted(document_ids)
+    # The stored row keeps it...
+    stored = json.loads(catalog_path.read_text())["filings"][0]
+    assert stored["source_sha256"] == "c" * 64
+    # ...the emitted hit does not.
+    filings = list_filings(catalog_path=catalog_path)["filings"]
+    assert filings[0] == {
+        "document_id": "TEST-2023Q1",
+        "company": "TEST",
+        "period": "2023 Q1",
+        "version": "a" * 64,
+        "page_count": 3,
+        "form": None,
+    }
 
 
-# ===== boundary 4: concurrent (parallel catalog reads) =====
+# ===== boundary 4: concurrent (parallel upserts do not corrupt) =====
 
 
-def test_concurrent_list_files_calls_are_safe() -> None:
-    """Two threads call ``list_files`` concurrently with overlapping
-    filters; both return the same correct shape, no deadlock, no
-    exception.
+def test_concurrent_record_filings_do_not_corrupt_or_lose_rows(
+    tmp_path: Path,
+) -> None:
+    """8 threads upsert distinct rows on the same table concurrently.
 
-    The catalog is a read-only pure function over the committed
-    manifest and extracted tree, so concurrent calls must be safe
-    by construction. We verify that the safety stays safe.
+    Every row must survive (read-modify-write is serialized by a
+    file lock) and the file must stay valid JSON of the catalog
+    shape. Atomic ``os.replace`` means even an unsynchronized reader
+    never sees a torn file.
     """
-    def _call() -> dict:
-        return list_files(
-            ticker="AAPL",
-            cik=AAPL_CIK,
-            manifest_path=_manifest_path(),
-            extracted_root=_extracted_root(),
-        )
+    catalog_path = tmp_path / "catalog.json"
+    record_filings([_valid_row(document_id="SEED")], catalog_path=catalog_path)
+
+    def _record(worker: int) -> int:
+        rows = [
+            {
+                "document_id": f"W{worker}-DOC-{index:03d}",
+                "company": f"W{worker}",
+                "period": "2023 Q1",
+                "version": f"{worker:02d}" * 32,
+                "page_count": index,
+            }
+            for index in range(10)
+        ]
+        return record_filings(rows, catalog_path=catalog_path)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(lambda _: _call(), range(8)))
+        futures = [pool.submit(_record, worker) for worker in range(8)]
+        assert [f.result() for f in futures] == [10] * 8
 
-    for i, result in enumerate(results):
-        assert result == {"filings": results[0]["filings"]}, (
-            f"call #{i} returned {result!r}, expected the same shape "
-            f"as call #0 {results[0]!r}"
+    payload = json.loads(catalog_path.read_text())
+    document_ids = [row["document_id"] for row in payload["filings"]]
+    assert len(document_ids) == 81  # 1 seed + 8 workers x 10 rows
+    assert len(set(document_ids)) == 81
+    assert document_ids == sorted(document_ids)
+    assert len(list_filings(catalog_path=catalog_path)["filings"]) == 81
+
+
+def test_concurrent_list_reads_during_record_are_intact(
+    tmp_path: Path,
+) -> None:
+    """Readers running against a table being rewritten never see a
+    torn file — they see either the old or the new complete table."""
+    catalog_path = tmp_path / "catalog.json"
+    record_filings(
+        [_valid_row(document_id=f"SEED-{index}") for index in range(50)],
+        catalog_path=catalog_path,
+    )
+
+    def _flip(_: int) -> None:
+        record_filings(
+            [_valid_row(document_id=f"FLIP-{_:04d}", company="FLIP")],
+            catalog_path=catalog_path,
         )
 
-
-# ===== boundary 5: exception =====
-
-
-def test_missing_manifest_raises_typed_error() -> None:
-    """Non-existent ``manifest_path`` raises ``IngestMissingError``."""
-    bogus = Path("/nonexistent/manifest.json")
-    with pytest.raises(IngestMissingError):
-        list_files(
-            manifest_path=bogus,
-            extracted_root=_extracted_root(),
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        writer = pool.submit(lambda: [_flip(i) for i in range(25)])
+        reader = pool.submit(
+            lambda: [
+                list_filings(catalog_path=catalog_path)["filings"]
+                for _ in range(40)
+            ]
         )
+        writer.result()
+        snapshots = reader.result()
+
+    for snapshot in snapshots:
+        assert snapshot, "a read must never observe the empty torn state"
+        keys = [(f["document_id"], f["version"]) for f in snapshot]
+        assert keys == sorted(keys)
 
 
-def test_missing_extracted_root_raises_typed_error() -> None:
-    """Non-existent ``extracted_root`` raises ``IngestMissingError``."""
-    bogus = Path("/nonexistent/extracted-root")
-    with pytest.raises(IngestMissingError):
-        list_files(
-            manifest_path=_manifest_path(),
-            extracted_root=bogus,
-        )
+# ===== boundary 5: exception (corrupt table is a typed error) =====
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param("{ not json", id="invalid_json"),
+        pytest.param('["a", "b"]', id="top_level_list"),
+        pytest.param('{"rows": []}', id="missing_filings_key"),
+        pytest.param(
+            '{"filings": [{"document_id": "X"}]}', id="row_missing_fields"
+        ),
+        pytest.param('{"filings": ["not-a-mapping"]}', id="row_not_mapping"),
+    ],
+)
+def test_corrupt_catalog_table_raises_typed_error(
+    tmp_path: Path, content: str
+) -> None:
+    """A table file that exists but violates the schema is
+    ``CatalogCorruptError`` — NOT an empty success, NOT a bare
+    ``ValueError``/``FileNotFoundError``.
+
+    A *missing* file stays the empty catalog (boundary 1); only an
+    existing-but-broken table is corruption.
+    """
+    catalog_path = tmp_path / "catalog.json"
+    catalog_path.write_text(content)
+
+    with pytest.raises(CatalogCorruptError):
+        list_filings(catalog_path=catalog_path)
+
+
+def test_record_filings_over_corrupt_table_raises_typed_error(
+    tmp_path: Path,
+) -> None:
+    """An upsert refuses to build on a corrupt table."""
+    catalog_path = tmp_path / "catalog.json"
+    catalog_path.write_text("{ not json")
+
+    with pytest.raises(CatalogCorruptError):
+        record_filings([_valid_row()], catalog_path=catalog_path)
+
+
+def test_catalog_corrupt_error_is_in_the_ingest_missing_family() -> None:
+    """``CatalogCorruptError`` inherits ``IngestMissingError`` so the
+    host's 503 ``ingest_missing`` mapping and the status strip's
+    zero-count fallback treat a broken table as the same known-bad
+    corpus-state family (ADR 0020 / ADR 0033)."""
+    from fin.corpus.errors import IngestMissingError
+
+    assert issubclass(CatalogCorruptError, IngestMissingError)
+
+
+# ===== committed-catalog defaults =====
+
+
+def test_default_catalog_path_points_at_the_committed_table() -> None:
+    """The module default is ``data/corpus/catalog.json``."""
+    assert DEFAULT_CATALOG_PATH == _project_data_dir() / "catalog.json"
 
 
 # ===== v1-shape preservation =====
@@ -332,21 +491,17 @@ _HIT_KEYS = {
 
 # The EDGAR-shaped fields that stay filter inputs. Named so a later
 # ticket that wants one of them on the wire has to say so out loud.
-_FILTER_ONLY_FIELDS = ("cik", "accession", "filing_date", "ticker")
+_FILTER_ONLY_FIELDS = ("cik", "accession", "filing_date", "ticker", "source_sha256")
 
 
 def test_list_files_aapl_preserves_hit_shape() -> None:
     """``list_files(company="AAPL")`` returns the documented hit shape.
 
     ``form`` is on the hit per spec SC3; the remaining EDGAR-shaped
-    fields (``cik``, ``accession``, ``filing_date``, ``ticker``) are
-    filter inputs and MUST NOT appear in the output dict.
+    fields (``cik``, ``accession``, ``filing_date``, ``ticker``) and
+    the optional ``source_sha256`` MUST NOT appear in the output dict.
     """
-    result = list_files(
-        company="AAPL",
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
-    )
+    result = list_files(company="AAPL", catalog_path=_catalog_path())
     assert result["filings"], "expected at least one AAPL hit"
     for filing in result["filings"]:
         assert set(filing.keys()) == _HIT_KEYS, (
@@ -364,113 +519,58 @@ def test_list_files_default_returns_full_library_with_hit_shape() -> None:
     """``list_files()`` returns every committed filing with the hit shape.
 
     The SC6 GOOG 10-K fixture is part of that committed library."""
-    result = list_files(
-        manifest_path=_manifest_path(),
-        extracted_root=_extracted_root(),
-    )
+    result = list_files(catalog_path=_catalog_path())
     assert len(result["filings"]) >= 21
     for filing in result["filings"]:
         assert set(filing.keys()) == _HIT_KEYS
         for forbidden in _FILTER_ONLY_FIELDS:
             assert forbidden not in filing
 
+    # Deterministic order: sorted by document_id.
+    document_ids = [f["document_id"] for f in result["filings"]]
+    assert document_ids == sorted(document_ids)
 
-# ===== synthetic manifest: form rows other than 10-Q =====
+    # Every filing has a positive page_count from the table row.
+    for filing in result["filings"]:
+        assert filing["page_count"] > 0
+
+
+# ===== synthetic catalog: form rows other than 10-Q =====
 
 
 def test_list_files_form_filter_accepts_non_demo_form(tmp_path: Path) -> None:
-    """A synthetic manifest with 10-K rows: ``form='10-K'`` returns
-    only 10-K rows, ``form='10-Q'`` returns only 10-Q rows.
+    """A synthetic table with 10-K rows: ``form='10-K'`` returns only
+    10-K rows, ``form='10-Q'`` returns only 10-Q rows.
 
     Per spec acceptance: ``form`` is NOT hard-coded to the demo
     10-Q. We assert the filter accepts other values when rows for
     those values exist.
     """
-    version = "a" * 64
-    documents: list[dict] = []
-    for doc_id, form in (
-        ("TEST-10K-2023Q1", "10-K"),
-        ("TEST-10Q-2023Q1", "10-Q"),
-    ):
-        documents.append(
+    catalog_path = tmp_path / "catalog.json"
+    record_filings(
+        [
             {
-                "document_id": doc_id,
-                "source_id": "TEST",
+                "document_id": "TEST-10K-2023Q1",
                 "company": "TEST",
-                "ticker": "TEST",
-                "cik": "0000000001",
-                "accession": "0000000001-23-000001",
-                "filing_date": "2023-02-01",
-                "form": form,
                 "period": "2023 Q1",
-                "doc_type": form,
-                "filename": f"{doc_id}.pdf",
-                "upstream_name": f"{doc_id}.pdf",
-                "bytes": 0,
-                "sha256": version,
-            }
-        )
-
-    manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(
+                "version": "a" * 64,
+                "page_count": 1,
+                "form": "10-K",
+            },
             {
-                "upstream": {"repo": "test", "commit": "test", "path": "test", "license": "test"},
-                "tickers": ["TEST"],
-                "periods": ["2023 Q1"],
-                "note": "synthetic test fixture with mixed forms",
-                "documents": documents,
-            }
-        )
+                "document_id": "TEST-10Q-2023Q1",
+                "company": "TEST",
+                "period": "2023 Q1",
+                "version": "a" * 64,
+                "page_count": 1,
+                "form": "10-Q",
+            },
+        ],
+        catalog_path=catalog_path,
     )
 
-    extracted_root = tmp_path / "extracted"
-    extracted_root.mkdir()
-    for doc in documents:
-        doc_dir = extracted_root / doc["document_id"]
-        doc_dir.mkdir()
-        text = f"{doc['document_id']} page 1 body"
-        (doc_dir / "page-001.json").write_text(
-            json.dumps(
-                {
-                    "document_id": doc["document_id"],
-                    "version": version,
-                    "page": 1,
-                    "text": text,
-                }
-            )
-        )
-        (doc_dir / "passages-001.json").write_text(
-            json.dumps(
-                {
-                    "passages": [
-                        {"text": text, "char_start": 0, "char_end": len(text)}
-                    ]
-                }
-            )
-        )
-    (extracted_root / "_index.json").write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "documents": {
-                    doc["document_id"]: {"page_count": 1, "version": version}
-                    for doc in documents
-                },
-            }
-        )
-    )
-
-    ten_k = list_files(
-        form="10-K",
-        manifest_path=manifest_path,
-        extracted_root=extracted_root,
-    )
-    ten_q = list_files(
-        form="10-Q",
-        manifest_path=manifest_path,
-        extracted_root=extracted_root,
-    )
+    ten_k = list_files(form="10-K", catalog_path=catalog_path)
+    ten_q = list_files(form="10-Q", catalog_path=catalog_path)
     assert len(ten_k["filings"]) == 1
     assert ten_k["filings"][0]["document_id"] == "TEST-10K-2023Q1"
     assert len(ten_q["filings"]) == 1

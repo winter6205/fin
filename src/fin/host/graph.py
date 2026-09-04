@@ -117,6 +117,7 @@ from fin.host.stream_map import (
     inline_thinking_segments,
     strip_thinking_from_answer,
 )
+from fin.corpus.catalog import DEFAULT_CATALOG_PATH
 from fin.host.tools import list_files, read_file
 from fin.host.tools.issuer_fanout import (
     ISSUER_FANOUT_TOOL,
@@ -181,6 +182,7 @@ _DEFAULT_DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "corpus"
 _DEFAULT_MANIFEST_PATH = _DEFAULT_DATA_DIR / "manifest.json"
 _DEFAULT_EXTRACTED_ROOT = _DEFAULT_DATA_DIR / "extracted"
 _DEFAULT_FACTS_ROOT = _DEFAULT_DATA_DIR / "facts"
+_DEFAULT_CATALOG_PATH = DEFAULT_CATALOG_PATH
 
 # The two retrieve adapter kinds ``compile_graph`` can auto-build.
 # ``BM25Adapter`` is deliberately absent: ADR 0030 archived it from
@@ -243,12 +245,14 @@ def _format_bounce_template(template: str) -> str:
 # ----- tool wrappers -----
 
 
-def _make_list_files_tool(manifest_path: Path, extracted_root: Path):
+def _make_list_files_tool(catalog_path: Path):
     """Build the ``list_files`` host tool.
 
     Returns a LangChain ``BaseTool`` whose function calls T3's
-    ``list_files`` with the factory's resolved paths. The tool does
-    NOT contribute evidence — it returns catalog metadata only.
+    ``list_files`` with the factory's injected catalog path (ADR
+    0047: the tool catalogs the metadata table over ingested/pushed
+    filings — never a serve-time extracted tree). The tool does NOT
+    contribute evidence — it returns catalog metadata only.
     The tool's registered name is ``list_files`` (matching the
     ADR 0009 contract) so the model can call it by name.
     """
@@ -266,12 +270,13 @@ def _make_list_files_tool(manifest_path: Path, extracted_root: Path):
         """List available 10-Q filings in the corpus.
 
         Optional ``company`` and ``period`` filters match the
-        manifest's ``company`` and ``period`` fields exactly.
+        catalog row's ``company`` and ``period`` fields exactly.
         Additive EDGAR-shaped filters (``cik``, ``form``,
         ``ticker``, exact ``filing_date``) per ADR 0031 are
         forwarded through. Returns ``{"filings": [...]}`; unknown
-        filters, conflicting filters, and empty filter values
-        all return ``{"filings": []}``.
+        filters, conflicting filters, empty filter values, and an
+        empty or missing catalog table all return
+        ``{"filings": []}``.
         """
         return list_files(
             company=company,
@@ -280,8 +285,7 @@ def _make_list_files_tool(manifest_path: Path, extracted_root: Path):
             form=form,
             ticker=ticker,
             filing_date=filing_date,
-            manifest_path=manifest_path,
-            extracted_root=extracted_root,
+            catalog_path=catalog_path,
         )
 
     return list_files_tool
@@ -1545,6 +1549,7 @@ def compile_graph(
     adapter: RetrievePort | None = None,
     manifest_path: Path | str | None = None,
     extracted_root: Path | str | None = None,
+    catalog_path: Path | str | None = None,
     facts_root: Path | str | None = None,
     known_document_ids: set[str] | None = None,
     step_cap: int = STEP_CAP,
@@ -1602,6 +1607,14 @@ def compile_graph(
         Path to ``data/corpus/extracted/``. Defaults to the
         repo's canonical location. Same scope as
         ``manifest_path``: legacy tool wiring only.
+    catalog_path
+        T2 (ADR 0047): path to the catalog metadata table
+        ``data/corpus/catalog.json`` over ingested/pushed filings.
+        Defaults to the repo's canonical location. The
+        ``list_files`` tool reads ONLY this table — a missing or
+        empty table is the empty catalog ``{"filings": []}``, never
+        a tree scan. Tests inject a ``tmp_path``-rooted table
+        (built via ``fin.corpus.catalog.record_filings``).
     known_document_ids
         Optional static locator allow-list for the citation
         verifier. ``None`` (the default, the product boot shape)
@@ -1753,8 +1766,9 @@ def compile_graph(
     mpath = _resolve_path(manifest_path, _DEFAULT_MANIFEST_PATH)
     rpath = _resolve_path(extracted_root, _DEFAULT_EXTRACTED_ROOT)
     fpath = _resolve_path(facts_root, _DEFAULT_FACTS_ROOT)
+    cpath = _resolve_path(catalog_path, _DEFAULT_CATALOG_PATH)
 
-    list_files_tool = _make_list_files_tool(mpath, rpath)
+    list_files_tool = _make_list_files_tool(cpath)
     read_file_tool = _make_read_file_tool(read_port)
     retrieve_tool = _make_retrieve_tool(
         adapter,

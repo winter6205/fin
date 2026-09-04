@@ -5,7 +5,7 @@ Two halves, both binary:
 * negative — ``form=10-K`` and ``form=8-K`` against the frozen AAPL
   rows return ``{"filings": []}``. Those rows are 10-Q, so a catalog
   that answered either alternate form would be inventing rows;
-* positive — the same filters over a test corpus that DOES hold those
+* positive — the same filters over a test catalog that DOES hold those
   forms return the matching rows.
 
 Plus the output half of SC3: a hit carries ``form``, so the workspace
@@ -17,20 +17,17 @@ for the whole submission header on every hit.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
 
+from fin.corpus.catalog import record_filings
 from fin.host.tools.list_files import list_files
 
 
 def _frozen_twelve() -> dict[str, Path]:
     data_dir = Path(__file__).resolve().parents[2] / "data" / "corpus"
-    return {
-        "manifest_path": data_dir / "manifest.json",
-        "extracted_root": data_dir / "extracted",
-    }
+    return {"catalog_path": data_dir / "catalog.json"}
 
 
 # ===== negative: the frozen AAPL rows hold neither alternate form =====
@@ -45,7 +42,7 @@ def test_form_filter_on_frozen_twelve_returns_empty_hits(form: str) -> None:
     )
 
 
-# ===== positive: a test corpus that holds those forms =====
+# ===== positive: a test catalog that holds those forms =====
 
 
 @pytest.mark.parametrize(
@@ -80,8 +77,8 @@ def test_frozen_twelve_hits_carry_their_form() -> None:
     """Every committed 10-Q hit reports the form it actually is.
 
     Plan C expanded the tier-1 corpus via 8 EDGAR iXBRL primary docs
-    (all marked ``form="10-Q"`` by the catalog patch), and SC6 adds a
-    separate GOOG 10-K row."""
+    (all marked ``form="10-Q"``), and SC6 adds a separate GOOG 10-K
+    row."""
     result = list_files(form="10-Q", **_frozen_twelve())
 
     assert len(result["filings"]) >= 20
@@ -89,65 +86,35 @@ def test_frozen_twelve_hits_carry_their_form() -> None:
         assert filing["form"] == "10-Q"
 
 
-def test_hit_form_is_none_when_the_manifest_row_has_no_form(
-    tmp_path: Path,
-) -> None:
+def test_hit_form_is_none_when_the_row_has_no_form(tmp_path: Path) -> None:
     """A row with no form reports ``None`` rather than dropping the key.
 
     A missing key would make the card blank for a reason the operator
     cannot distinguish from a rendering bug; an explicit ``None`` says
     "this corpus row was never given a form".
     """
-    version = "f" * 64
-    manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "documents": [
-                    {
-                        "document_id": "NOFORM-2023Q1",
-                        "company": "NOFORM",
-                        "period": "2023 Q1",
-                        "sha256": version,
-                    }
-                ]
-            }
-        )
-    )
-    doc_dir = tmp_path / "extracted" / "NOFORM-2023Q1"
-    doc_dir.mkdir(parents=True)
-    text = "NOFORM-2023Q1 page 1 body"
-    (doc_dir / "page-001.json").write_text(
-        json.dumps(
+    catalog_path = tmp_path / "catalog.json"
+    record_filings(
+        [
             {
                 "document_id": "NOFORM-2023Q1",
-                "version": version,
-                "page": 1,
-                "text": text,
+                "company": "NOFORM",
+                "period": "2023 Q1",
+                "version": "f" * 64,
+                "page_count": 1,
             }
-        )
-    )
-    (doc_dir / "passages-001.json").write_text(
-        json.dumps(
-            {
-                "passages": [
-                    {"text": text, "char_start": 0, "char_end": len(text)}
-                ]
-            }
-        )
+        ],
+        catalog_path=catalog_path,
     )
 
-    result = list_files(
-        manifest_path=manifest_path,
-        extracted_root=tmp_path / "extracted",
-    )
+    result = list_files(catalog_path=catalog_path)
 
     assert result["filings"] == [
         {
             "document_id": "NOFORM-2023Q1",
             "company": "NOFORM",
             "period": "2023 Q1",
-            "version": version,
+            "version": "f" * 64,
             "page_count": 1,
             "form": None,
         }

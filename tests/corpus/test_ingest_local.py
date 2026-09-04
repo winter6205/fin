@@ -512,8 +512,9 @@ def test_local_ingest_emits_catalog_fields_without_opening_a_socket(
 
 def test_catalog_fields_land_in_list_filings_filters(tmp_path: Path) -> None:
     """The fields ingest writes are the ones ``list_filings`` filters
-    on — the catalog reads the manifest ingest just updated."""
-    from fin.corpus.catalog import list_filings
+    on — the ingest side registers them via the ``record_filings``
+    seam (T3), carrying the EDGAR-shaped fields as catalog metadata."""
+    from fin.corpus.catalog import list_filings, record_filings
 
     manifest_path, pdf_dir = _stage_aapl_2023q3(tmp_path)
     extracted_root = tmp_path / "extracted"
@@ -525,12 +526,32 @@ def test_catalog_fields_land_in_list_filings_filters(tmp_path: Path) -> None:
         catalog_seed=_AAPL_2023Q3_SEED,
     )
 
+    doc = json.loads(manifest_path.read_text())["documents"][0]
+    index = json.loads((extracted_root / "_index.json").read_text())
+    record_filings(
+        [
+            {
+                "document_id": doc["document_id"],
+                "company": doc["company"],
+                "period": doc["period"],
+                "version": doc["sha256"],
+                "page_count": index["documents"][doc["document_id"]][
+                    "page_count"
+                ],
+                "cik": doc.get("cik"),
+                "form": doc.get("form"),
+                "ticker": doc.get("ticker"),
+                "filing_date": doc.get("filing_date"),
+            }
+        ],
+        catalog_path=tmp_path / "catalog.json",
+    )
+
     hits = list_filings(
         cik="0000320193",
         form="10-Q",
         filing_date="2023-08-04",
-        manifest_path=manifest_path,
-        extracted_root=extracted_root,
+        catalog_path=tmp_path / "catalog.json",
     )
 
     assert [hit["document_id"] for hit in hits["filings"]] == ["AAPL-2023Q3"]
