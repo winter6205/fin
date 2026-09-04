@@ -382,6 +382,88 @@ def test_tool_preserves_unexpected_port_exception_surface() -> None:
         _invoke_retrieve(_BrokenPort(), rewriter=lambda q: q + " x", mapping_ledger=_ledger())
 
 
+def test_tool_records_the_performed_rewrite_even_when_the_retry_call_fails() -> None:
+    # Finding (T9 review): the rewrite HAPPENED (the port saw the
+    # rewritten query) before the follow-up call exploded. The retry
+    # counter must still move — the recording is not allowed to sit
+    # after a raise that skips it.
+    before = default_collector().retry_snapshot()
+
+    class _EmptyThenBrokenPort:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def retrieve(self, query: str, **kwargs: Any) -> dict[str, Any]:
+            self.calls += 1
+            if self.calls == 1:
+                return {"chunks": []}
+            raise RuntimeError("retry transport exploded")
+
+    with pytest.raises(RuntimeError, match="retry transport exploded"):
+        _invoke_retrieve(
+            _EmptyThenBrokenPort(),
+            rewriter=lambda query: query + " x",
+            mapping_ledger=_ledger(),
+        )
+
+    after = default_collector().retry_snapshot()
+    assert after["count"] == before["count"] + 1
+    # The rewritten attempt produced no hit, so the retry counts as
+    # exhausted: it definitively did not turn the miss into a hit.
+    assert after["exhausted"] == before["exhausted"] + 1
+
+
+def test_tool_degrades_a_throwing_rewriter_to_the_empty_hit_envelope() -> None:
+    # Finding (T9 review): a typed retry failure (here: the injected
+    # rewriter raising) must NOT escape the tool as a run-level
+    # refuse. The tool keeps its envelope contract and degrades to
+    # exactly the shape it would have returned for ``{"chunks": []}``.
+    before = default_collector().retry_snapshot()
+
+    class _AlwaysEmptyPort:
+        def retrieve(self, query: str, **kwargs: Any) -> dict[str, Any]:
+            return {"chunks": []}
+
+    def broken_rewriter(_query: str) -> str:
+        raise RuntimeError("rewriter exploded")
+
+    command = _invoke_retrieve(
+        _AlwaysEmptyPort(),
+        rewriter=broken_rewriter,
+        mapping_ledger=_ledger(),
+    )
+
+    envelope = json.loads(command.update["messages"][0].content)
+    assert envelope == {"chunks": []}
+    assert command.update["evidence"] == []
+    # The rewriter threw before any rewritten retrieve happened, so
+    # no rewrite was PERFORMED and the retry counter stays put.
+    after = default_collector().retry_snapshot()
+    assert after["count"] == before["count"]
+
+
+def test_tool_degrades_a_malformed_retry_result_and_still_counts_the_rewrite() -> None:
+    # The degrade path and the retry counter meet here: the rewrite
+    # WAS performed (port called twice), then the follow-up result
+    # was malformed. Degrade to the empty-hit envelope AND count the
+    # performed rewrite.
+    before = default_collector().retry_snapshot()
+
+    port = _ScriptedRetryPort(results=[{"chunks": []}, ["not-a-mapping"]])
+
+    command = _invoke_retrieve(
+        port,
+        rewriter=lambda query: query + " x",
+        mapping_ledger=_ledger(),
+    )
+
+    envelope = json.loads(command.update["messages"][0].content)
+    assert envelope == {"chunks": []}
+    assert port.queries == ["annual sales", "annual sales x"]
+    after = default_collector().retry_snapshot()
+    assert after["count"] == before["count"] + 1
+
+
 def test_tool_records_performed_retries_on_the_process_default_collector() -> None:
     before = default_collector().retry_snapshot()
 

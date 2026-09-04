@@ -115,7 +115,9 @@ from fin.host.degradation_notice import (
 )
 from fin.host.observability import default_collector
 from fin.host.rewrite_retry import (
+    RetryAttempt,
     RetrieveCallError,
+    RewriteRetryError,
     RewriteRetryResult,
     retrieve_with_rewrite_retry,
 )
@@ -466,7 +468,12 @@ def _make_retrieve_tool(
     model-backed rewriter can be injected via ``rewriter`` without
     touching this contract. Every PERFORMED rewrite is recorded on
     the process default observability collector (or the injected
-    ``retry_observer``) so the retry stays measurable.
+    ``retry_observer``) — including one whose follow-up retrieve
+    raised, so the error path cannot un-count a performed rewrite.
+    A typed retry failure raised by the helper itself (e.g. an
+    injected rewriter that throws) does NOT escape the tool: the
+    tool keeps its envelope contract and degrades to the exact
+    ``{"chunks": []}`` envelope it would have returned for a miss.
 
     Degradation (T20 / SC39 / §B3): a response carrying
     ``degraded`` has every one of its ``degraded_reasons``
@@ -543,32 +550,77 @@ def _make_retrieve_tool(
                 # blank ``query``.
                 return {"error": exc.code}
 
+        # Every port call is counted so "a rewrite was PERFORMED"
+        # is observable even on the paths where the helper raises
+        # and never returns its attempts: the port is called a
+        # second time exactly when one rewrite was performed.
+        port_calls = 0
+
+        def _counted_port_call(retry_query: str) -> dict[str, Any]:
+            nonlocal port_calls
+            port_calls += 1
+            return _port_call(retry_query)
+
+        def _record_retry(outcome: RewriteRetryResult) -> None:
+            """Record one performed rewrite on the retry observer.
+
+            Default: the process observability singleton (``fin.host.http``
+            exposes it on GET /api/observability). Resolved lazily so a
+            collector built later in the process is still the one that
+            counts.
+            """
+            if retry_observer is not None:
+                retry_observer(outcome)
+            else:
+                default_collector().record_rewrite_retry(
+                    exhausted=outcome.exhausted
+                )
+
+        retry_outcome: RewriteRetryResult | None = None
+        degraded_to_empty_hit = False
         try:
             retry_outcome = retrieve_with_rewrite_retry(
-                query, _port_call, rewrite, max_retries=1
+                query, _counted_port_call, rewrite, max_retries=1
             )
-        except RetrieveCallError as exc:
-            # Pre-retry behavior (T6): an unexpected exception from the
-            # port propagated out of the tool unchanged. The retry helper
-            # types it as ``RetrieveCallError``; unwrap the cause so the
-            # run's error surface stays exactly what it was before T9.
-            cause = exc.__cause__
-            if cause is not None:
-                raise cause from exc
-            raise
-        if retry_outcome.retry_count:
-            if retry_observer is not None:
-                retry_observer(retry_outcome)
-            else:
-                # Default: the process observability singleton records
-                # every performed rewrite (``fin.host.http`` exposes it
-                # on GET /api/observability). Resolved lazily so a
-                # collector built later in the process is still the one
-                # that counts.
-                default_collector().record_rewrite_retry(
-                    exhausted=retry_outcome.exhausted
+        except RewriteRetryError as exc:
+            # A rewrite that actually happened must be counted even on
+            # the error path: the recording can never sit after the
+            # re-raise. The synthesized outcome marks the retry
+            # exhausted — the rewritten attempt produced no hit, so it
+            # definitively did not turn the miss into one.
+            if port_calls > 1:
+                _record_retry(
+                    RewriteRetryResult(
+                        result={},
+                        attempts=tuple(
+                            RetryAttempt(query=query, empty_hit=True)
+                            for _ in range(port_calls)
+                        ),
+                    )
                 )
-        result = dict(retry_outcome.result)
+            if isinstance(exc, RetrieveCallError):
+                # Pre-retry behavior (T6): an unexpected exception from the
+                # port propagated out of the tool unchanged. The retry helper
+                # types it as ``RetrieveCallError``; unwrap the cause so the
+                # run's error surface stays exactly what it was before T9.
+                cause = exc.__cause__
+                if cause is not None:
+                    raise cause from exc
+                raise
+            # Typed retry failure with no port exception behind it
+            # (e.g. an injected rewriter that throws): the tool keeps
+            # its envelope contract and degrades to the exact shape it
+            # would have returned for ``{"chunks": []}`` instead of
+            # refusing the whole run. The port's typed error dict
+            # never takes this path (it is not an empty hit).
+            degraded_to_empty_hit = True
+        if retry_outcome is not None and retry_outcome.retry_count:
+            _record_retry(retry_outcome)
+        result = (
+            {"chunks": []}
+            if degraded_to_empty_hit or retry_outcome is None
+            else dict(retry_outcome.result)
+        )
         if isinstance(result, dict) and "error" in result:
             # Typed EXIT: surface the port's error dict verbatim.
             # Building evidence / a chunks envelope here would
