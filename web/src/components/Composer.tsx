@@ -1,9 +1,20 @@
 // Composer: textarea; Enter sends, Shift+Enter newline; disabled while
 // the active run is in flight; empty submit is a no-op (server also
 // enforces 204).
+//
+// corpus-serve-ingest T5 (ADR 0047): the thread-attach door lives
+// here — a file picker button AND a drop on the composer both upload
+// the file to POST /threads/{id}/attachments and reference the minted
+// id on the NEXT send. This door never touches /api/corpus/ingest;
+// corpus ingest lives in the home corpus area (IngestCorpusControl).
 
 import { useRef, useState } from "react";
+import {
+  describeAttachFailure,
+  type AttachFailureNotice,
+} from "../attachFailure";
 import { describeSendFailure, type SendFailureNotice } from "../sendFailure";
+import type { ThreadAttachment } from "../types";
 import { useWorkspaceStore } from "../store";
 
 interface ComposerProps {
@@ -54,6 +65,34 @@ export default function Composer({
   const [failure, setFailure] = useState<SendFailureNotice | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+  // ----- T5 (ADR 0047): the thread-attach door -----
+  // Files attached here are turn-scoped: uploaded to the attach
+  // route, referenced once by the next send, never pushed. Pending
+  // state is Composer-local (they are this-turn UI, not workspace
+  // state); on a rejected send they are KEPT — a 409/503 send does
+  // not consume them server-side, so the retry can still carry them.
+  const attachFile = useWorkspaceStore((s) => s.attachFile);
+  const [pending, setPending] = useState<ThreadAttachment[]>([]);
+  const [attachBusy, setAttachBusy] = useState(false);
+  const [attachFailure, setAttachFailure] =
+    useState<AttachFailureNotice | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const attachInputRef = useRef<HTMLInputElement>(null);
+
+  const attach = async (file: File) => {
+    if (attachBusy) return;
+    setAttachBusy(true);
+    setAttachFailure(null);
+    try {
+      const attachment = await attachFile(threadId, file);
+      setPending((current) => [...current, attachment]);
+    } catch (error) {
+      setAttachFailure(describeAttachFailure(error));
+    } finally {
+      setAttachBusy(false);
+    }
+  };
+
   const toggleThinking = () => {
     setThinkingOn((v) => {
       const next = !v;
@@ -80,12 +119,17 @@ export default function Composer({
     if (!q) return; // Empty submit no-op.
     setDraft("");
     setFailure(null);
+    // T5: reference the attach door's ids on THIS send (consumed
+    // server-side, single use).
+    const attachmentIds = pending.map((a) => a.attachment_id);
     try {
-      await sendQuestion(threadId, q, thinkingOn);
+      await sendQuestion(threadId, q, thinkingOn, attachmentIds);
+      setPending([]); // The send consumed them (single use).
     } catch (error) {
       // The draft was cleared optimistically and the textarea held
       // the only copy of the question — put it back so the operator
-      // can retry once the 409 / 503 cause clears.
+      // can retry once the 409 / 503 cause clears. Pending
+      // attachments stay: a rejected send did not consume them.
       setFailure(describeSendFailure(error));
       setDraft((current) => (current === "" ? q : current));
       textareaRef.current?.focus();
@@ -99,7 +143,36 @@ export default function Composer({
         e.preventDefault();
         void submit();
       }}
+      onDragOver={(e) => {
+        e.preventDefault();
+        setDragOver(true);
+      }}
+      onDragLeave={() => setDragOver(false)}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragOver(false);
+        const file = e.dataTransfer.files?.[0];
+        if (file) void attach(file);
+      }}
     >
+      {attachFailure ? (
+        <div
+          role="alert"
+          data-testid="attach-failure"
+          data-failure-kind={attachFailure.kind}
+          className="mb-2 flex items-start justify-between gap-3 border border-black bg-tool px-2 py-1.5 text-sm text-gray-800"
+        >
+          <span>{attachFailure.message}</span>
+          <button
+            type="button"
+            aria-label="关闭附件提示"
+            onClick={() => setAttachFailure(null)}
+            className="shrink-0 text-xs text-gray-500 hover:text-black"
+          >
+            ✕
+          </button>
+        </div>
+      ) : null}
       {failure ? (
         <div
           role="alert"
@@ -117,6 +190,38 @@ export default function Composer({
             ✕
           </button>
         </div>
+      ) : null}
+      {pending.length > 0 ? (
+        <ul
+          data-testid="pending-attachments"
+          className="mb-2 flex flex-wrap gap-1"
+        >
+          {pending.map((a) => (
+            <li
+              key={a.attachment_id}
+              className="flex items-center gap-1 border border-black bg-tool px-2 py-0.5 text-xs"
+            >
+              <span className="font-mono">{a.filename}</span>
+              <button
+                type="button"
+                aria-label={`移除附件 ${a.filename}`}
+                onClick={() =>
+                  setPending((current) =>
+                    current.filter((p) => p.attachment_id !== a.attachment_id),
+                  )
+                }
+                className="text-gray-500 hover:text-black"
+              >
+                ✕
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      {dragOver ? (
+        <p data-testid="attach-drop-hint" className="mb-2 text-xs text-gray-500">
+          松开以上传为本轮附件（仅本轮可读，不入库）
+        </p>
       ) : null}
       <textarea
         ref={textareaRef}
@@ -160,6 +265,32 @@ export default function Composer({
           {!thinkingOn ? (
             <span className="text-xs text-gray-500">本轮将跳过推理轨迹</span>
           ) : null}
+          {/* T5 (ADR 0047): the thread-attach door's picker. This
+              button is attach ONLY — corpus ingest lives in the home
+              corpus area and is never reachable from the composer. */}
+          <span className="flex items-center gap-2">
+            <input
+              ref={attachInputRef}
+              type="file"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                e.target.value = "";
+                if (file) void attach(file);
+              }}
+            />
+            <button
+              type="button"
+              data-testid="attach-file"
+              disabled={attachBusy}
+              title="附加文本文件（仅本轮可读，不入库）"
+              onClick={() => attachInputRef.current?.click()}
+              className="border border-black bg-card px-2 py-0.5 text-xs hover:bg-tool disabled:opacity-50"
+            >
+              {attachBusy ? "上传中…" : "附加文件…"}
+            </button>
+            <span className="text-xs text-gray-400">仅本轮可读，不入库</span>
+          </span>
         </div>
         <span className="text-xs text-gray-500">
           Enter 发送 · Shift+Enter 换行
