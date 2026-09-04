@@ -9,12 +9,10 @@ Spec ``specs/s1-corpus-retrieve.md``:
   behind the retrieve port (ADR 0030). ... Default pytest uses a
   fake RetrievePort".
 
-Both production entry points — ``compile_for_runtime`` (Postgres)
-and ``compile_for_runtime_dev`` (``fin-serve`` without
-``FIN_CHECKPOINT_URL``) — must therefore select the MCP adapter.
-The dev path used to inherit ``FakeRetrievePort`` purely because it
-passes an ``InMemorySaver``, which made every ``fin-serve`` retrieve
-return zero hits with no error anywhere.
+Both production-shaped compilers — ``compile_for_runtime`` (Postgres)
+and ``compile_for_runtime_dev`` (tests/eval InMemory) — must therefore
+select the MCP adapter. The in-memory helper used to inherit
+``FakeRetrievePort`` purely because it passes an ``InMemorySaver``.
 
 ``ChatOpenAI`` and ``PostgresSaver`` are stubbed; no network, no
 database, and no MCP subprocess is started (the adapter spawns its
@@ -124,14 +122,14 @@ def test_product_default_retrieve_adapter_is_mcp() -> None:
     assert DEFAULT_RETRIEVE_ADAPTER == "mcp"
 
 
-# ----- fin-serve without Postgres -----
+# ----- compile_for_runtime_dev still uses product retrieve -----
 
 
 def test_compile_for_runtime_dev_selects_mcp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``fin-serve`` on the in-memory checkpointer still serves the
-    product corpus over MCP."""
+    """``compile_for_runtime_dev`` still serves the product corpus
+    over MCP; checkpointer kind does not pick the retrieve adapter."""
     _install_fake_chat_model(monkeypatch)
     monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
     calls = _capture_compile_graph(monkeypatch)
@@ -146,8 +144,8 @@ def test_compile_for_runtime_dev_selects_mcp(
 def test_compile_for_runtime_dev_really_builds_mcp_adapter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """End-to-end through the real factory: the graph ``fin-serve``
-    boots binds an ``MCPRetrieveAdapter`` carrying a NON-EMPTY
+    """End-to-end through the real factory: ``compile_for_runtime_dev``
+    binds an ``MCPRetrieveAdapter`` carrying a NON-EMPTY
     locator map, so hits can actually map back to fin locators."""
     _install_fake_chat_model(monkeypatch)
     monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
