@@ -405,6 +405,11 @@ def test_compact_empty_thread_noop_receipt_no_crash(
     events = _parse_sse_events(body)
     answer = next(data for name, data in events if name == "answer")
     assert "暂不需要压缩" in answer["text"]
+    # No compaction write happened -> still no checkpoint.
+    from fin.host.http import get_graph
+
+    graph = http_app.dependency_overrides[get_graph]()
+    assert graph.occupancy(tid) is None
 
 
 def test_compact_checkpoint_shrinks_and_stays_terminal(
