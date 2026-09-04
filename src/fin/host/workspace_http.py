@@ -69,7 +69,10 @@ Routes
                                           -> parse -> 切分 (params
                                           table) -> push via the
                                           PushPort -> invalidate stale
-                                          blocks. Named failures:
+                                          blocks -> register the
+                                          filing in the T2 catalog
+                                          (``record_filings``). Named
+                                          failures:
                                           ``missing_file`` /
                                           ``empty_source`` (4xx empty),
                                           ``format_unspecified`` (422),
@@ -78,7 +81,12 @@ Routes
                                           (413), ``invalid_doc_type`` /
                                           ``document_id_missing`` (422),
                                           push/invalidation outage
-                                          codes (503). The ONLY product
+                                          codes (503). A catalog
+                                          registration failure after
+                                          the push lands is the named
+                                          ``catalog_warning`` field on
+                                          the 200 — never rolled back,
+                                          never silent. The ONLY product
                                           surface that calls 切分;
                                           never a research tool.
 * ``GET    /api/status``                - the boot-scoped status
@@ -145,11 +153,17 @@ from langchain_core.messages import (
 )
 from pydantic import BaseModel, Field
 
-from fin.corpus.catalog import list_filings
-from fin.corpus.errors import ParseError, UnsupportedFormatParseError
+from fin.corpus.catalog import list_filings, record_filings
+from fin.corpus.errors import (
+    CatalogCorruptError,
+    CatalogRowError,
+    ParseError,
+    UnsupportedFormatParseError,
+)
 from fin.corpus.ingest_endpoint import (
     IngestDocumentIdMissingError,
     IngestEndpoint,
+    IngestedDocument,
     IngestFormatUnspecifiedError,
     IngestInvalidDocTypeError,
     IngestUploadTooLargeError,
@@ -1285,6 +1299,77 @@ _ingest_service_singleton: IngestEndpoint | None = None
 _ingest_service_lock = threading.Lock()
 
 
+# ----- ingest -> catalog registration (T2 x T3 wiring) -----
+#
+# Why a thread-local slot: the ``on_ingested`` hook runs INSIDE
+# ``service.ingest`` (after the push landed), so a hook failure cannot
+# become the route's error answer without denying an already-successful
+# push — and it must not vanish either (error-handling-enforcer: no
+# silent skip-as-success). The hook records the named failure on this
+# thread's slot; the ingest route resets the slot before the call,
+# reads it after, and surfaces it as the response's named
+# ``catalog_warning`` field. Thread-local because the service is a
+# process-wide singleton while sync routes run on a threadpool:
+# concurrent ingests must never read each other's warnings.
+_catalog_hook_slot = threading.local()
+
+# The named warning code the response carries when the catalog
+# registration failed after a successful push. The detail (str(exc))
+# follows the code and names the drifted field / broken table, so the
+# operator can act without reading server logs.
+CATALOG_RECORD_FAILED: Final[str] = "catalog_record_failed"
+
+# The failure families the hook converts into the named warning:
+# ``CatalogRowError`` / ``CatalogCorruptError`` are the catalog's own
+# contract failures (bad row / unreadable table); ``OSError`` covers
+# the filesystem outages ``record_filings`` cannot type (mkdir, lock,
+# fsync, replace). Anything else is a bug and keeps propagating typed
+# (T3 contract: the hook's own failures propagate).
+_CATALOG_FAILURES: Final[tuple[type[BaseException], ...]] = (
+    CatalogRowError,
+    CatalogCorruptError,
+    OSError,
+)
+
+
+def _record_ingested_filing(doc: IngestedDocument) -> None:
+    """Product ``on_ingested`` hook: register the pushed filing.
+
+    Maps the :class:`IngestedDocument` onto the T2 row contract and
+    upserts it into the default catalog table (``record_filings``'
+    own default — the ``data/corpus/catalog.json`` the ``GET
+    /api/corpus`` route reads). ``source_sha256`` is left out: the
+    ingest version IS the sha256 of the source bytes, so storing it
+    twice would duplicate one value under two keys.
+
+    A catalog-side failure never rolls the push back and never fails
+    the request: it is logged with traceback and recorded on the
+    thread slot so the ingest route answers 200 with the named
+    ``catalog_warning``.
+    """
+    try:
+        # One row: ``record_filings`` takes an iterable of rows.
+        record_filings(
+            [
+                {
+                    "document_id": doc.document_id,
+                    "company": doc.company,
+                    "period": doc.period,
+                    "version": doc.version,
+                    "page_count": doc.page_count,
+                }
+            ]
+        )
+    except _CATALOG_FAILURES as exc:
+        _catalog_hook_slot.warning = f"{CATALOG_RECORD_FAILED}: {exc}"
+        logger.warning(
+            "ingest: catalog registration failed for %s "
+            "(the push stands)",
+            doc.document_id,
+            exc_info=True,
+        )
+
+
 def _build_default_ingest_service() -> IngestEndpoint:
     """Build the env-selected ingest service (``get_ingest_service``).
 
@@ -1298,18 +1383,28 @@ def _build_default_ingest_service() -> IngestEndpoint:
     adapters are imported lazily so the workspace import surface stays
     free of the stdio transport (and its psycopg-heavy compile import)
     until an ingest actually happens.
+
+    Both kinds wire ``on_ingested`` to :func:`_record_ingested_filing`
+    so a pushed filing is registered in the same catalog table the
+    ``GET /api/corpus`` route lists — a fake boot is a real product
+    mode, not a second contract.
     """
     from fin.host.operator_env import resolve_retrieve_adapter_kind
 
     if resolve_retrieve_adapter_kind() == "fake":
         shared: FakePushPort = FakePushPort()
-        return IngestEndpoint(push_port=shared, invalidation_port=shared)
+        return IngestEndpoint(
+            push_port=shared,
+            invalidation_port=shared,
+            on_ingested=_record_ingested_filing,
+        )
     from fin.retrieve.mcp_invalidation_port import MCPInvalidationPort
     from fin.retrieve.mcp_push_port import MCPPushPort
 
     return IngestEndpoint(
         push_port=MCPPushPort(),
         invalidation_port=MCPInvalidationPort(),
+        on_ingested=_record_ingested_filing,
     )
 
 
@@ -2303,6 +2398,13 @@ def build_router(
         is already in place (idempotent) and the retry is the
         recovery — the code names invalidation, never a clean
         success.
+
+        After a fully successful chain the service's ``on_ingested``
+        hook registers the filing in the catalog (T2
+        ``record_filings``). A catalog-side failure there is NOT a
+        failed ingest (the push stands) and NOT a silent success: the
+        200 body carries the named ``catalog_warning``
+        (``catalog_record_failed: ...``); ``None`` on a clean ingest.
         """
         if file is None:
             return JSONResponse(
@@ -2312,6 +2414,9 @@ def build_router(
         # async ``file.read()`` coroutine would need an ``async def``
         # route, putting the whole parse+push chain on the event loop).
         data = file.file.read()
+        # Reset BEFORE the call so a previous ingest on this threadpool
+        # thread can never leak its warning into this response.
+        _catalog_hook_slot.warning = None
         try:
             result = service.ingest(
                 data,
@@ -2364,6 +2469,10 @@ def build_router(
             return JSONResponse(
                 status_code=503, content={"error": exc.code}
             )
+        # The hook ran last (only on a fully successful chain); read
+        # the slot ON this thread — the reset above guarantees no
+        # stale warning from an earlier request is echoed here.
+        catalog_warning = getattr(_catalog_hook_slot, "warning", None)
         return JSONResponse(
             status_code=200,
             content={
@@ -2377,6 +2486,7 @@ def build_router(
                 "written": result.written,
                 "duplicates": result.duplicates,
                 "block_ids": list(result.block_ids),
+                "catalog_warning": catalog_warning,
                 "invalidation": (
                     None
                     if result.invalidation is None

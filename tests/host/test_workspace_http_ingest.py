@@ -97,6 +97,9 @@ def test_ingest_route_pushes_and_answers_the_outcome(
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "ingested"
+    # The field is always present; an overridden hook-less service has
+    # no catalog concern, so a clean ingest stays warning-free.
+    assert body["catalog_warning"] is None
     assert body["fmt"] == "md"
     assert body["document_id"] == "AAPL-2023Q3"  # company + period
     assert body["version"]  # sha256 of the source bytes
@@ -286,6 +289,131 @@ def test_ingest_service_dependency_defaults_to_env_kind(
     monkeypatch.setenv("FIN_RETRIEVE_ADAPTER", "mcp")
     service = _build_default_ingest_service()
     assert isinstance(service._push_port, MCPPushPort)
+
+
+def test_default_ingest_service_wires_the_catalog_hook_in_both_kinds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The product assembly wires ``on_ingested`` -> ``record_filings``
+    for BOTH adapter kinds — a fake boot registers into the same
+    catalog the ``GET /api/corpus`` route reads."""
+    from fin.host.workspace_http import _build_default_ingest_service
+
+    monkeypatch.setenv("FIN_RETRIEVE_ADAPTER", "fake")
+    fake_service = _build_default_ingest_service()
+    assert fake_service._on_ingested is not None
+
+    monkeypatch.setenv("FIN_RETRIEVE_ADAPTER", "mcp")
+    mcp_service = _build_default_ingest_service()
+    assert mcp_service._on_ingested is not None
+
+
+# ----- T2 x T3 wiring: the real product dependency registers the catalog
+#
+# These tests drive the route WITHOUT a dependency override, so the
+# request flows through ``get_ingest_service`` -> the product assembly
+# -> the ``on_ingested`` hook -> ``record_filings``. The catalog module
+# default is pointed at a temp table so the committed
+# ``data/corpus/catalog.json`` is never touched.
+
+
+@pytest.fixture
+def product_catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the product ingest wiring at a temp catalog table.
+
+    Patches the catalog module default (both the hook's write path and
+    ``GET /api/corpus``'s read path read it at call time), selects the
+    fake adapter boot (no MCP subprocess), and starts from a fresh
+    ingest-service singleton so the test owns its own service.
+    """
+    catalog_path = tmp_path / "corpus" / "catalog.json"
+    monkeypatch.setattr(
+        "fin.corpus.catalog.DEFAULT_CATALOG_PATH", catalog_path
+    )
+    monkeypatch.setenv("FIN_RETRIEVE_ADAPTER", "fake")
+    monkeypatch.setattr(
+        "fin.host.workspace_http._ingest_service_singleton", None
+    )
+    return catalog_path
+
+
+def test_product_ingest_registers_the_filing_in_the_catalog(
+    client: TestClient, product_catalog: Path
+) -> None:
+    """A metadata-complete upload through the REAL product wiring
+    registers the pushed filing: ``GET /api/corpus`` then lists the
+    row with the matching (document_id, version) pair."""
+    response = client.post(
+        "/api/corpus/ingest",
+        files={"file": ("sample.md", _MD_BYTES, "text/markdown")},
+        data={"company": "AAPL", "period": "2023Q3"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ingested"
+    assert body["catalog_warning"] is None  # clean success stays clean
+
+    rows = [
+        f
+        for f in client.get("/api/corpus").json()["filings"]
+        if f["document_id"] == "AAPL-2023Q3"
+    ]
+    assert len(rows) == 1
+    assert rows[0]["version"] == body["version"]
+    assert rows[0]["company"] == "AAPL"
+    assert rows[0]["period"] == "2023Q3"
+    assert rows[0]["page_count"] == body["unit_count"]
+
+
+def test_product_ingest_push_survives_catalog_write_failure(
+    client: TestClient, product_catalog: Path
+) -> None:
+    """Push success + catalog write failure is neither a failed ingest
+    nor a silent success: the answer stays 200 ``ingested`` carrying
+    the named ``catalog_warning``, the pushed blocks stand, and the
+    corrupt table is left untouched."""
+    product_catalog.parent.mkdir(parents=True, exist_ok=True)
+    product_catalog.write_text("{ not json")  # corrupt table
+
+    response = client.post(
+        "/api/corpus/ingest",
+        files={"file": ("sample.md", _MD_BYTES, "text/markdown")},
+        data={"company": "AAPL", "period": "2023Q3"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ingested"
+    assert body["catalog_warning"].startswith("catalog_record_failed")
+    # The push landed and was not rolled back (blocks observable on
+    # the fake port behind the product singleton).
+    fake = get_ingest_service().push_port
+    assert fake.block_total() == body["block_count"] > 0
+    # The upsert refused to build on the unreadable table: no partial
+    # rewrite of the corrupt file.
+    assert product_catalog.read_text() == "{ not json"
+
+
+def test_product_ingest_without_metadata_warns_row_contract(
+    client: TestClient, product_catalog: Path
+) -> None:
+    """A metadata-less upload cannot satisfy the catalog row contract
+    (``company`` / ``period`` are required non-empty strings): the
+    push still lands and the response carries the named warning —
+    never a fabricated row and never a silent skip-as-success."""
+    response = client.post(
+        "/api/corpus/ingest",
+        files={"file": ("solo.md", _MD_BYTES, "text/markdown")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ingested"
+    assert body["catalog_warning"].startswith("catalog_record_failed")
+    assert "company" in body["catalog_warning"]
+    # Nothing was registered: the catalog stays empty.
+    assert client.get("/api/corpus").json()["filings"] == []
 
 
 # ----- on_ingested hook wiring survives the route -----------------------
