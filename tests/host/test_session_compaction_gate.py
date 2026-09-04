@@ -42,7 +42,7 @@ from langchain_core.messages import (
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
-from fin.corpus.extracted import load_extracted_tree
+from fin.corpus.extracted import ExtractedPage, Locator, load_extracted_tree
 from fin.host.compaction import _SUMMARY_MARKER, render_summary_message
 from fin.host.graph import compile_graph
 from fin.host.scripted_model import ScriptedChatModel
@@ -54,6 +54,7 @@ from fin.host.session_compaction import (
     session_token_budget,
     summary_max_chars,
 )
+from fin.retrieve import FakeRetrievePort
 
 # Bound applied to the session-compaction summary text (mirrors the
 # ``fin.host.compaction`` bounded-summary pattern).
@@ -90,6 +91,29 @@ def aapl_page1_text() -> str:
     extracted = _REPO_ROOT / "data" / "corpus" / "extracted"
     tree = load_extracted_tree(manifest, extracted)
     return tree[AAPL_2022Q3][0].text
+
+
+def _serving_adapter(aapl_page1_text: str) -> FakeRetrievePort:
+    """Fake retrieve port whose ``pages_by_doc`` manifest serves the
+    AAPL-2022Q3 page 1 as THIS-RUN ``read_file`` evidence.
+
+    ADR 0046 / 0047: no compile path boots a tree-backed read port —
+    the read body comes from the bound adapter's own ``read``. These
+    gate tests target compaction semantics, not the citation
+    contract, so the scripted research turn carries its own payload
+    source (the same pattern as ``test_serve_path_no_tree_ssot``)
+    and the scripted answer cites what the run actually read.
+    """
+    page = ExtractedPage(
+        locator=Locator(
+            document_id=AAPL_2022Q3,
+            version=AAPL_2022Q3_VERSION,
+            page=1,
+        ),
+        text=aapl_page1_text,
+        passages=(),
+    )
+    return FakeRetrievePort(pages_by_doc={AAPL_2022Q3: [page]})
 
 
 def _thread_config(thread_id: str) -> dict:
@@ -495,6 +519,7 @@ def test_gate_compacts_before_next_llm_call(aapl_page1_text: str) -> None:
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
+        adapter=_serving_adapter(aapl_page1_text),
         known_document_ids=KNOWN_IDS,
         summarizer=summarizer,
     )
@@ -602,6 +627,7 @@ def test_snapshot_slots_survive_for_classify_inherit(
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
+        adapter=_serving_adapter(aapl_page1_text),
         known_document_ids=KNOWN_IDS,
         summarizer=summarizer,
     )
@@ -700,6 +726,7 @@ def test_summary_failure_leaves_turn_uncompacted_and_continues(
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
+        adapter=_serving_adapter(aapl_page1_text),
         known_document_ids=KNOWN_IDS,
         summarizer=ExplodingSummarizer(),
     )
