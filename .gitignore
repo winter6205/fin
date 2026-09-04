@@ -59,3 +59,6 @@ data/corpus/blocks/
 # ablation eval products (T22, rebuildable via `python -m fin.eval.ablation run`;
 # carries per-run latency numbers, so committing it would churn every run)
 data/eval/
+
+# Worktree-local: tests reuse the main checkout node_modules via a symlink
+web/node_modules
