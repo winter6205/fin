@@ -4,7 +4,7 @@
 
 **总计划（阶段表，不再当实施队列）：** [`retrieval-upgrade.md`](retrieval-upgrade.md)
 
-**下一刀实施（未开工）：** [`memory-dialogue-platform.md`](memory-dialogue-platform.md)
+**本 worktree 执行：** [`memory-dialogue-platform.md`](memory-dialogue-platform.md)。不含 Task 4 压缩（由 `/home/winner/projects/fin-wt-session-compaction` 接手）。资料入库在 `/home/winner/projects/fin-wt-corpus-serve-ingest`，不要在本树做。
 
 **仍开着的 retrieve 内部债（非跨仓主线）：** [`retrieve-maintainability-followup.md`](retrieve-maintainability-followup.md)、[`2026-09-01-pr225-followup-plan-a.md`](2026-09-01-pr225-followup-plan-a.md)
 
