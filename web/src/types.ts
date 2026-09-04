@@ -205,6 +205,16 @@ export interface ThreadDetail extends ThreadListItem {
   // it is needed). The server derives this from
   // ``pending_nodes(thread_id) and not is_locked``.
   pending_checkpoint?: boolean;
+  // T3 (ADR 0044): token occupancy from the SAME host figure the
+  // auto-compact gate computes. Undefined for a thread with no
+  // checkpoint — the indicator renders nothing rather than a
+  // fabricated 0%. Never mirrors onto ``WorkspaceStatus``:
+  // ADR 0033 keeps ``GET /api/status`` boot-scoped.
+  occupancy?: {
+    estimated_tokens: number;
+    budget_tokens: number;
+    ratio: number;
+  };
 }
 
 // ----- T4 workflow (#138): watchlist + in-app notices -----

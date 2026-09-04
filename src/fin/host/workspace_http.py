@@ -537,6 +537,20 @@ class WorkspaceStatusResponse(BaseModel):
     corpus_filing_count: int
 
 
+class Occupancy(BaseModel):
+    """Thread-detail token occupancy (ADR 0044 T3).
+
+    ``ratio`` is the shared compactor figure (the compactor clamps
+    to [0, 1]); ``estimated_tokens`` and ``budget_tokens`` are
+    exposed so the UI can render an absolute figure without
+    re-deriving the budget.
+    """
+
+    estimated_tokens: int
+    budget_tokens: int
+    ratio: float
+
+
 class ThreadDetailResponse(BaseModel):
     id: str
     title: str
@@ -556,6 +570,15 @@ class ThreadDetailResponse(BaseModel):
     # needed). ``pending_checkpoint`` derives from
     # ``pending_nodes(thread_id) and not is_locked``.
     pending_checkpoint: bool = False
+    # T3 (ADR 0044): token occupancy from the SAME figure the
+    # compaction gate computes (``graph.occupancy(thread_id)`` ->
+    # ``OccupancyCompactor.occupancy`` over the checkpointed
+    # messages vs the session budget). ``None`` for a thread with
+    # no checkpoint (never sent on) — the UI stays neutral rather
+    # than showing a fabricated 0%. This is the thread-scoped
+    # surface ONLY: ADR 0033 keeps ``GET /api/status`` free of any
+    # occupancy / context-window figure.
+    occupancy: Occupancy | None = None
     turns: list[TurnRow]
 
 
@@ -1393,10 +1416,18 @@ def build_router(
             and bool(graph.pending_nodes(thread_id))
         ):
             pending_checkpoint = True
+        # T3 (ADR 0044): occupancy from the same compactor figure the
+        # gate uses. Defensive ``hasattr`` mirrors the ``is_locked`` /
+        # ``pending_nodes`` wiring-bug tolerance for graph stand-ins
+        # without the seam.
+        occupancy = None
+        if hasattr(graph, "occupancy"):
+            occupancy = graph.occupancy(thread_id)
         return {
             **_serialize_thread(thread),
             "in_flight": is_locked,
             "pending_checkpoint": pending_checkpoint,
+            "occupancy": occupancy,
             "turns": [
                 _serialize_run(r, in_flight=(is_locked and i == len(runs) - 1))
                 for i, r in enumerate(runs)
@@ -1506,6 +1537,7 @@ def build_router(
                 store=store,
                 thread_id=thread_id,
             )
+
         # T2: title update on the first real send. The T1 path
         # set the title from ``first_message`` at create time;
         # when the user created the thread empty (corpus-card

@@ -2822,6 +2822,34 @@ class _LockedGraph:
             return text or None
         return None
 
+    def occupancy(self, thread_id: str) -> dict[str, float | int] | None:
+        """T3 (ADR 0044): token occupancy for ``thread_id``'s latest
+        checkpoint, from the SAME figure the compaction gate computes.
+
+        ``self._compactor.occupancy`` over the checkpointed
+        messages (the model-facing base the gate measures) vs the
+        active session budget — one shared estimator, no second
+        number, and the SAME compactor instance the gate node uses
+        (no throwaway per-call construction). ``None`` when the
+        thread has no checkpoint (a
+        freshly created thread has no model-facing payload, so the
+        UI stays neutral rather than showing a fabricated 0%).
+
+        Read-only path: does NOT acquire the per-thread lock,
+        mirroring :meth:`pending_nodes` / :meth:`checkpoint_message_ids`.
+        """
+        snapshot = self._graph.get_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        messages = (snapshot.values or {}).get("messages") or []
+        if not messages:
+            return None
+        return {
+            "estimated_tokens": count_tokens_approximately(messages),
+            "budget_tokens": session_budget_tokens(),
+            "ratio": self._compactor.occupancy(messages),
+        }
+
     @staticmethod
     def _release_thread(lock: threading.Lock) -> None:
         lock.release()
