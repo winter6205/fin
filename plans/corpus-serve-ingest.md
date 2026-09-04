@@ -71,6 +71,6 @@ minimal-change-verifier: yes — one logical program, not one commit; writing-pl
    - **Inherits:** spec Focus 3 / SC5；ADR 0047 **corpus ingest**。
    - **Surface:** web + host HTTP + tests
    - **Acceptance:** ingest door triggers endpoint from T3; drag-to-thread still does not; `uv run pytest -q` exits 0；`web/` `tsc --noEmit` exits 0。
-   - **Completion:** control placement open (not composer drag).
-   - Status: [ ]
+   - **Completion:** control placement open (not composer drag) — resolved: 首页 corpus 区（HomePage corpusLoaded 后、empty 卡 / 卡片网格上方）常驻 `IngestCorpusControl` file-picker，成功刷新 corpus 列表、具名失败按码呈现（`web/src/ingestFailure.ts`）；不加 metadata 表单（document_id 由文件名/公司+期间派生、doc_type 自动分类）。Composer 只保留 attach 门（picker + drop → `POST /threads/{id}/attachments` raw bytes + filename query → send 带 `attachment_ids`），两门在 web seam 测试里显式断言互不串线（`web/src/uploadDoors.test.ts`）。
+   - Status: [x]
    - [blocks: T3, T4]
