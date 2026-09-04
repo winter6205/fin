@@ -5,7 +5,11 @@
 import { describe, expect, it } from "vitest";
 
 import type { Turn } from "./types";
-import { canSubmitFeedback, isFeedbackActive } from "./turnFeedback";
+import {
+  canSubmitFeedback,
+  feedbackErrorVisible,
+  isFeedbackActive,
+} from "./turnFeedback";
 
 function makeTurn(overrides: Partial<Turn> = {}): Turn {
   return {
@@ -52,5 +56,20 @@ describe("isFeedbackActive", () => {
     expect(isFeedbackActive(none, "up")).toBe(false);
     expect(isFeedbackActive(none, "down")).toBe(false);
     expect(isFeedbackActive(makeTurn({}), "up")).toBe(false);
+  });
+});
+
+// Finding (T8 review): the store's setTurnFeedback rejects on 400/503
+// and the control must surface it — the hint shows on "failure" and
+// clears on the next "submit" so a stale failure never lingers.
+describe("feedbackErrorVisible", () => {
+  it("shows the hint when a submit fails", () => {
+    expect(feedbackErrorVisible(false, "failure")).toBe(true);
+    expect(feedbackErrorVisible(true, "failure")).toBe(true);
+  });
+
+  it("clears the hint when a new submit starts", () => {
+    expect(feedbackErrorVisible(true, "submit")).toBe(false);
+    expect(feedbackErrorVisible(false, "submit")).toBe(false);
   });
 });

@@ -24,6 +24,7 @@ import {
 } from "../streamErrorKind";
 import {
   canSubmitFeedback,
+  feedbackErrorVisible,
   isFeedbackActive,
   type FeedbackValue,
 } from "../turnFeedback";
@@ -352,7 +353,10 @@ function TurnView({ turn, threadId }: { turn: Turn; threadId: string }) {
 // the store's ``setTurnFeedback`` (response-driven: the row's
 // ``feedback`` updates only after the host confirms the persisted
 // value) and re-clicking the active thumb re-affirms it — the host
-// has no "clear" verb, last write wins.
+// has no "clear" verb, last write wins. A rejected submit (400/503)
+// surfaces as an inline "提交失败，请重试" hint next to the thumbs;
+// the hint clears on the next submit (transition pinned in
+// ``turnFeedback.feedbackErrorVisible``).
 function FeedbackControls({
   threadId,
   turn,
@@ -361,17 +365,24 @@ function FeedbackControls({
   turn: Turn;
 }) {
   const setTurnFeedback = useWorkspaceStore((s) => s.setTurnFeedback);
+  const [submitFailed, setSubmitFailed] = useState(false);
   const submit = (value: FeedbackValue) => {
-    void setTurnFeedback(threadId, turn.run_id, value).catch(
-      () => undefined,
-    );
+    setSubmitFailed((current) => feedbackErrorVisible(current, "submit"));
+    setTurnFeedback(threadId, turn.run_id, value).catch(() => {
+      setSubmitFailed((current) => feedbackErrorVisible(current, "failure"));
+    });
   };
   const buttonClass = (active: boolean) =>
     active
       ? "border border-black bg-accent px-2 py-1 text-xs text-white"
       : "border border-black bg-card px-2 py-1 text-xs hover:bg-accent hover:text-white";
   return (
-    <div className="flex max-w-3xl mx-auto justify-end gap-2" data-testid="turn-feedback">
+    <div className="flex max-w-3xl mx-auto justify-end gap-2 items-center" data-testid="turn-feedback">
+      {submitFailed ? (
+        <span data-testid="feedback-error" className="text-xs text-red-700">
+          提交失败，请重试
+        </span>
+      ) : null}
       <button
         type="button"
         data-testid="feedback-up"

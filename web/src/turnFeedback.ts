@@ -29,3 +29,21 @@ export function isFeedbackActive(
 ): boolean {
   return turn.feedback === value;
 }
+
+// Finding (T8 review): the store's ``setTurnFeedback`` rejects so the
+// caller can surface a failure — this tiny state machine is that
+// surface for the inline "提交失败，请重试" hint next to the thumbs.
+
+export type FeedbackSubmitEvent = "submit" | "failure";
+
+/** Whether the submit-failure hint should be visible.
+ *
+ * "failure" shows the hint; "submit" clears it — a new attempt is
+ * under way, so a stale failure must not linger next to the thumbs.
+ */
+export function feedbackErrorVisible(
+  _current: boolean,
+  event: FeedbackSubmitEvent,
+): boolean {
+  return event === "failure";
+}

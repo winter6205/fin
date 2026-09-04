@@ -235,12 +235,6 @@ def get_filing_monitor() -> Any:
     return default_filing_monitor()
 
 
-# The feedback store owns a Postgres pool when the checkpoint URL is
-# set, so it is built once per process too (see ``get_feedback_store``).
-_http_feedback_singleton: Any | None = None
-_http_feedback_lock = threading.Lock()
-
-
 def get_feedback_store() -> Any:
     """FastAPI dependency that returns the thumbs-feedback store.
 
@@ -248,18 +242,16 @@ def get_feedback_store() -> Any:
     and the ``feedback`` field on GET history. Selection mirrors
     ``get_thread_store`` exactly: ``FIN_CHECKPOINT_URL`` set ->
     Postgres-backed store (ADR 0035/0036 SSOT); unset -> in-memory.
-    Built once per process because the Postgres path owns a
-    connection pool.
+    Process-lifetime singleton behavior (the Postgres path owns a
+    connection pool) is owned by ``fin.host.feedback``'s own cache —
+    one caching layer, one owner — so this dependency delegates
+    exactly like ``get_thread_store`` does.
 
     Tests override this via ``app.dependency_overrides[get_feedback_store]``.
     """
-    global _http_feedback_singleton
-    with _http_feedback_lock:
-        if _http_feedback_singleton is None:
-            from fin.host.feedback import default_feedback_store
+    from fin.host.feedback import default_feedback_store
 
-            _http_feedback_singleton = default_feedback_store()
-        return _http_feedback_singleton
+    return default_feedback_store()
 
 
 def get_observability_collector() -> ObservabilityCollector:
