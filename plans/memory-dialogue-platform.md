@@ -55,10 +55,10 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
 | T5  | `memory_buffer.py` / `memory_store.py` + tests                                             | 无 host 记忆 tool；ON 时模型调不到 extract/recall               | 库+单测在；图未接                                |
 | T6  | `memory_dream.py`；SSE 结束后 `run_dream_after_turn`；`FIN_MEMORY_DREAM_BACKEND` 仅 `null` | 无 fixture/真 MCP transport（注释 T6d）                         | HTTP 调度在；SC7 MCP 写出未做                    |
 | T7  | `track_decision.py` 置信度阈值；`test_track_decision_t7.py`                                | compile 把主模型当 `classify_model`；无独立 Qwen                | **基本闭合**（小模型可选）                       |
-| T8  | `feedback.py` + PG store；`web/src/feedback.ts` helper                                     | **无** workspace 路由；无 UI 控件                               | 持久化库在；GET 历史/翻转未接到产品              |
-| T9  | `observability.py`；`rewrite_retry.py`；`test_observability_retry_contracts.py`            | 未进 `/health`；retrieve tool loop 未调用 rewrite               | 库+单测在；未暴露、未进 loop                     |
+| T8  | `feedback.py` + PG store；`web/src/feedback.ts` helper                                     | `POST .../runs/{run_id}/feedback` 路由；`TurnRow.feedback`；web 控件 | **闭合**（`eb2d24a`）                            |
+| T9  | `observability.py`；`rewrite_retry.py`；`test_observability_retry_contracts.py`            | `GET /api/observability`；retrieve tool loop 已接 rewrite retry | **闭合**（`9baaf02`；model-backed rewriter 仍开放） |
 
-**下一刀（本 worktree，仍非 iknow、不含压缩）：** T8 HTTP+UI、T9 接线。T5 图上记忆工具与 T6 dream 不当公司知识入库（ADR 0045）；需要时仅显式 extract。T4 压缩不在本树做。
+**下一刀（本 worktree，仍非 iknow、不含压缩）：** ~~T8 HTTP+UI、T9 接线~~ 已完成（2026-09-04：T8 `eb2d24a`，T9 `9baaf02`）。T5 图上记忆工具与 T6 dream 不当公司知识入库（ADR 0045）；需要时仅显式 extract。T4 压缩不在本树做。**本树剩余：T5/T6 的产品接线仍按 ADR 0045 不作为必做波，见各 task Status。**
 
 ## Tasks (ordered by dependency)
 
@@ -123,7 +123,7 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
    - **Surface:** host workspace HTTP + web + tests
    - **Acceptance:** 👍/👎 出现在 GET 历史；翻转不改变该 run citations；`uv run pytest -q` exits 0；`web/` `tsc --noEmit` exits 0。
    - **Completion:** UI 控件位置开放（尾卡片）。
-   - Status: [ ] remaining — store + `feedback.ts`; **no HTTP route / UI**
+   - Status: [x] closed 2026-09-04 — `POST /api/threads/{thread_id}/runs/{run_id}/feedback` + `TurnRow.feedback` on GET history + web thumbs control (`eb2d24a`)
    - [unblocked: T1 closed]
 
 9. **Observability + empty-hit/rewrite retry** — tag: `[implementation]`
@@ -131,5 +131,5 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
    - **Surface:** host + tests
    - **Acceptance:** 文档化命令或路由暴露 refuse/done 或 latency 且无 secret；空结果重试可测且不变成固定 pipeline；`uv run pytest -q` exits 0。
    - **Completion:** 暴露面与重试次数开放。
-   - Status: [ ] remaining — helpers exist; **not on /health or retrieve loop**
+   - Status: [x] closed 2026-09-04 — `GET /api/observability` + per-turn status/latency 记录；empty-hit rewrite retry 接入 `retrieve_tool`（`9baaf02`）
    - [blocks: T3]
