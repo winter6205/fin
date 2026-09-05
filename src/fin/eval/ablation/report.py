@@ -26,6 +26,20 @@ to overwrite a metric either side already produced — fin never
 recomputes the retrieval side's dimensions, and 长文档召回 /
 跨文档多跳召回 are not fin's to compute at all (SC38).
 
+Citation-gate finite discipline (T4 / SC5)
+-----------------------------------------
+
+The citation-gate pass rate (``citation_gate_pass_rate``) is fin's
+own production (ADR 0042 / 0046). On the merged live report it must
+be a **finite** number — a ``NaN`` or ``inf`` would read like a
+measured zero and silently corrupt the §B1 pass-rate column.
+:func:`validate_report` enforces finiteness on every metric in
+:data:`METRIC_FIELDS`; :func:`merge_with_retrieval_report` extends
+the same discipline to values the retrieval side hands in, refusing
+to copy through a non-finite ``citation_gate_pass_rate`` (or any
+other fin-owned metric) under the typed code
+``ablation_merge_citation_gate_non_finite``.
+
 Atomic write (T3 / ADR 0042)
 ----------------------------
 
@@ -44,6 +58,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -81,6 +96,13 @@ DIMENSIONS_NOT_COMPUTED_BY_FIN: tuple[str, ...] = (
     "跨文档多跳召回",
 )
 
+#: Metric names fin owns end to end. The merge refuses to accept any of
+#: them on the retrieval-side report (SC38, mirrored for the inverse
+#: direction): the citation-gate pass rate is fin's gate over the run's
+#: own retrieved chunks, not a number the retrieval service hands in
+#: (T4 / SC5).
+MERGE_FIN_OWNED_METRICS: tuple[str, ...] = FIN_OWNED_METRICS
+
 PERCENT_COMPUTED = "computed"
 PERCENT_UNDEFINED_ZERO_BASELINE = "undefined_zero_baseline"
 
@@ -101,6 +123,16 @@ class AblationMergeMetricConflictError(AblationReportError):
     """The other side recomputed a metric this side already produced."""
 
     code = "ablation_merge_metric_conflict"
+
+
+class AblationMergeCitationGateNonFiniteError(AblationReportError):
+    """A retrieval-side value the merge would have copied through is
+    not a finite number (NaN / inf). The merge refuses so a silent
+    false zero cannot land on the merged report's citation-gate column
+    (T4 / SC5).
+    """
+
+    code = "ablation_merge_citation_gate_non_finite"
 
 
 def query_subset_hash(query_ids: Sequence[str]) -> str:
@@ -338,8 +370,18 @@ def validate_report(report: Mapping[str, Any]) -> list[str]:
                     f"{cid}: metric {metric} has {len(raw) if isinstance(raw, list) else 0} "
                     f"raw values, §B1 requires >= {B1_MIN_REPEATS}"
                 )
-            if not isinstance(series.get("median"), (int, float)):
-                problems.append(f"{cid}: metric {metric} has no median")
+            elif not all(
+                isinstance(v, (int, float)) and math.isfinite(float(v))
+                for v in raw
+            ):
+                problems.append(
+                    f"{cid}: metric {metric} raw list contains a non-finite value"
+                )
+            median = series.get("median")
+            if not isinstance(median, (int, float)) or not math.isfinite(float(median)):
+                problems.append(
+                    f"{cid}: metric {metric} median is not a finite number"
+                )
 
     claims = report.get("improvement_claims")
     if not isinstance(claims, list) or not claims:
@@ -386,6 +428,19 @@ def validate_report(report: Mapping[str, Any]) -> list[str]:
     return problems
 
 
+def _is_finite_number(value: Any) -> bool:
+    """A scalar is "finite" when it is a real ``int`` / ``float`` that
+    is not ``NaN`` and not ``+inf`` / ``-inf``.
+
+    Booleans, ``None``, strings, and non-numeric types all return
+    ``False``; the caller is expected to translate that into a typed
+    rejection with a stable ``code``.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(float(value))
+
+
 def merge_with_retrieval_report(
     fin_report: Mapping[str, Any],
     retrieval_report: Mapping[str, Any],
@@ -395,6 +450,14 @@ def merge_with_retrieval_report(
     Neither side's metrics are recomputed: a metric present on both
     sides is a named conflict, because two numbers for one 口径 is
     exactly the ambiguity the merge is supposed to prevent.
+
+    The retrieval side is also forbidden from carrying any of the
+    fin-owned metrics (currently ``citation_gate_pass_rate``) and
+    forbidden from handing in a non-finite value for any metric it
+    contributes. The cite-gate pass rate is fin's gate over the run's
+    own retrieved chunks (ADR 0042 / 0046); a non-finite value would
+    read as a measured zero and silently corrupt the §B1 pass-rate
+    column on the merged report (T4 / SC5).
     """
     fin_merge = fin_report.get("merge", {})
     for key in ("dataset_id", "query_subset_hash"):
@@ -421,6 +484,19 @@ def merge_with_retrieval_report(
                 raise AblationMergeMetricConflictError(
                     f"{configuration_id}: retrieval side recomputed {metric!r}, "
                     "which fin already produced on this run"
+                )
+            if metric in MERGE_FIN_OWNED_METRICS:
+                raise AblationMergeMetricConflictError(
+                    f"{configuration_id}: retrieval side supplies "
+                    f"{metric!r}, which is fin-owned (T4 / SC5); fin never "
+                    "reads this column from the retrieval service"
+                )
+            if not _is_finite_number(value):
+                raise AblationMergeCitationGateNonFiniteError(
+                    f"{configuration_id}: retrieval side supplies a non-finite "
+                    f"value for {metric!r} ({value!r}); the merge refuses "
+                    "so the merged report's citation-gate column cannot "
+                    "land on a silent false zero (T4 / SC5)"
                 )
             merged_metrics[metric] = value
         merged = dict(config)
@@ -516,10 +592,12 @@ def write_report_atomically(
 __all__ = [
     "ABLATION_REPORT_VERSION",
     "DIMENSIONS_NOT_COMPUTED_BY_FIN",
+    "MERGE_FIN_OWNED_METRICS",
     "MERGE_KEYS",
     "PERCENT_COMPUTED",
     "PERCENT_UNDEFINED_ZERO_BASELINE",
     "REPORT_FILENAME",
+    "AblationMergeCitationGateNonFiniteError",
     "AblationMergeKeyMismatchError",
     "AblationMergeMetricConflictError",
     "AblationReportError",
