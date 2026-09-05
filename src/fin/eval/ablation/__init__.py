@@ -58,10 +58,6 @@ from fin.eval.ablation.runner import (
 from fin.eval.ablation.live_set import (
     LIVE_BACKEND_KIND,
     LIVE_DATASET_ID,
-    LiveEvalSeamWrapper,
-    LiveEvalSetError,
-    LiveSeamUnavailableError,
-    live_document_ids,
     live_eval_set,
 )
 
@@ -81,9 +77,6 @@ __all__ = [
     "AblationMatrixError",
     "ConcurrencySpecDriftError",
     "ConcurrencySpecRowMissingError",
-    "LiveEvalSeamWrapper",
-    "LiveEvalSetError",
-    "LiveSeamUnavailableError",
     "PublishedConcurrencyContract",
     "PublishedIdempotencyConcurrency",
     "PublishedL1Concurrency",
@@ -103,7 +96,6 @@ __all__ = [
     "build_ablation_matrix",
     "build_report",
     "evaluate_outcomes",
-    "live_document_ids",
     "live_eval_set",
     "merge_with_retrieval_report",
     "published_concurrency_contract",
