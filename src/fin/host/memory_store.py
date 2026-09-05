@@ -14,6 +14,7 @@ here rather than in Redis for the same reason (``CONTEXT.md:42``).
 from __future__ import annotations
 
 import copy
+import re
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -32,10 +33,25 @@ CURSOR_TABLE = "fin_memory_dream_cursor"
 # The cursor is a singleton row: one dream timeline per fin deployment.
 CURSOR_ID = "default"
 
+# A memory fact's hook is the first non-empty body line, with internal
+# whitespace runs folded to a single space and the line truncated to
+# ``HOOK_MAX_CHARS`` characters. Single-line bodies equal the hook.
+HOOK_MAX_CHARS = 80
+
+# ``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` is idempotent against a
+# legacy ``fin_memory`` table that predates the memory-fact columns
+# (spec: title + body + workspace isolation, ADR 0048). The CREATE form
+# below already names the new columns, so a fresh deployment skips the
+# ALTERs; a backfilled deployment keeps working without a manual script.
+_HOOK_FOLD_RE = re.compile(r"\s+")
+
 MEMORY_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS fin_memory (
     id TEXT PRIMARY KEY,
     text TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
+    workspace TEXT NOT NULL DEFAULT '',
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL,
     expires_at TIMESTAMPTZ,
@@ -46,6 +62,10 @@ CREATE TABLE IF NOT EXISTS fin_memory (
     transported_at TIMESTAMPTZ
 );
 
+ALTER TABLE fin_memory ADD COLUMN IF NOT EXISTS title TEXT NOT NULL DEFAULT '';
+ALTER TABLE fin_memory ADD COLUMN IF NOT EXISTS body TEXT NOT NULL DEFAULT '';
+ALTER TABLE fin_memory ADD COLUMN IF NOT EXISTS workspace TEXT NOT NULL DEFAULT '';
+
 CREATE TABLE IF NOT EXISTS fin_memory_dream_cursor (
     id TEXT PRIMARY KEY,
     last_dream_at TIMESTAMPTZ,
@@ -55,8 +75,8 @@ CREATE TABLE IF NOT EXISTS fin_memory_dream_cursor (
 """
 
 _MEMORY_COLUMNS = (
-    "id, text, metadata, created_at, expires_at, hit_count, status, "
-    "disabled_reason, disabled_at, transported_at"
+    "id, text, title, body, workspace, metadata, created_at, expires_at, "
+    "hit_count, status, disabled_reason, disabled_at, transported_at"
 )
 
 
@@ -65,7 +85,15 @@ MemoryStatus = Literal["active", "disabled"]
 
 @dataclass
 class MemoryRow:
-    """One advisory memory row as the store sees it."""
+    """One advisory memory row as the store sees it.
+
+    The evolving ``fin_memory`` shape (``specs/cross-session-operator-memory.md``
+    SC5, SC6, ADR 0048) treats a memory as **title + body** with a derived
+    **hook**. The legacy ``text`` column is preserved so older callers
+    keep compiling, but ``body`` is the new canonical payload — empty
+    ``body`` defaults to ``text`` so a row written with the old ``text=``
+    argument still has a usable body and a non-empty hook.
+    """
 
     id: str
     text: str
@@ -77,6 +105,34 @@ class MemoryRow:
     disabled_reason: str | None = None
     disabled_at: datetime | None = None
     transported_at: datetime | None = None
+    title: str = ""
+    body: str | None = None
+    workspace: str = ""
+
+    def __post_init__(self) -> None:
+        # ``body`` defaults to ``None`` (not ``""``) so an explicit empty
+        # body — used by tests and by callers persisting title-only
+        # facts — is distinguishable from "body not supplied". Legacy
+        # callers and the on-disk column keep using ``text=``, so when
+        # the caller did not pass ``body`` we mirror ``text`` into it.
+        if self.body is None:
+            self.body = self.text
+
+    @property
+    def hook(self) -> str:
+        """The first non-empty body line, folded and truncated.
+
+        Returns an empty string when the body has no non-empty lines.
+        Internal whitespace runs collapse to a single space, and the
+        result is truncated to ``HOOK_MAX_CHARS`` characters per spec
+        SC5. Single-line bodies equal the hook.
+        """
+        for line in self.body.splitlines():
+            stripped = line.strip()
+            if stripped:
+                folded = _HOOK_FOLD_RE.sub(" ", stripped)
+                return folded[:HOOK_MAX_CHARS]
+        return ""
 
     @property
     def thread_id(self) -> str | None:
@@ -99,8 +155,19 @@ class MemoryStore(Protocol):
         """Insert one row."""
         ...
 
-    def rows(self, *, include_disabled: bool = True) -> list[MemoryRow]:
-        """Return row copies ordered by creation time."""
+    def rows(
+        self,
+        *,
+        include_disabled: bool = True,
+        workspace: str | None = None,
+    ) -> list[MemoryRow]:
+        """Return row copies ordered by creation time.
+
+        ``workspace`` scopes the read to one workspace when provided
+        (spec SC6: rows are isolated per workspace). ``None`` returns
+        every workspace — the dream read path needs the whole store so
+        it can score across workspaces.
+        """
         ...
 
     def bump_hit_counts(self, ids: Sequence[str]) -> None:
@@ -145,11 +212,18 @@ class InProcessMemoryStore:
         with self._lock:
             self._rows[row.id] = copy.deepcopy(row)
 
-    def rows(self, *, include_disabled: bool = True) -> list[MemoryRow]:
+    def rows(
+        self,
+        *,
+        include_disabled: bool = True,
+        workspace: str | None = None,
+    ) -> list[MemoryRow]:
         with self._lock:
             rows = list(self._rows.values())
         if not include_disabled:
             rows = [row for row in rows if row.status == "active"]
+        if workspace is not None:
+            rows = [row for row in rows if row.workspace == workspace]
         rows.sort(key=lambda row: (row.created_at, row.id))
         return [copy.deepcopy(row) for row in rows]
 
@@ -213,11 +287,14 @@ class PostgresMemoryStore:
                 cur.execute(
                     "INSERT INTO fin_memory "
                     f"({_MEMORY_COLUMNS}) VALUES "
-                    "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                     "ON CONFLICT (id) DO NOTHING",
                     (
                         row.id,
                         row.text,
+                        row.title,
+                        row.body,
+                        row.workspace,
                         Jsonb(row.metadata),
                         row.created_at,
                         row.expires_at,
@@ -230,15 +307,27 @@ class PostgresMemoryStore:
                 )
             conn.commit()
 
-    def rows(self, *, include_disabled: bool = True) -> list[MemoryRow]:
-        sql = f"SELECT {_MEMORY_COLUMNS} FROM fin_memory"
+    def rows(
+        self,
+        *,
+        include_disabled: bool = True,
+        workspace: str | None = None,
+    ) -> list[MemoryRow]:
+        clauses: list[str] = []
+        params: list[object] = []
         if not include_disabled:
-            sql += " WHERE status = 'active'"
+            clauses.append("status = 'active'")
+        if workspace is not None:
+            clauses.append("workspace = %s")
+            params.append(workspace)
+        sql = f"SELECT {_MEMORY_COLUMNS} FROM fin_memory"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY created_at, id"
 
         with self._pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(sql)
+                cur.execute(sql, params)
                 records = cur.fetchall()
         return [_row_from_record(record) for record in records]
 
@@ -299,6 +388,9 @@ def _row_from_record(record: dict[str, object]) -> MemoryRow:
     return MemoryRow(
         id=str(record["id"]),
         text=str(record["text"]),
+        title=_as_optional_str(record["title"]) or "",
+        body=_as_optional_str(record["body"]) or "",
+        workspace=_as_optional_str(record["workspace"]) or "",
         metadata=dict(metadata),
         created_at=_as_created_at(record["created_at"]),
         expires_at=_as_datetime(record["expires_at"]),
@@ -599,6 +691,7 @@ __all__ = [
     "CURSOR_TABLE",
     "DreamCursor",
     "DreamCursorStore",
+    "HOOK_MAX_CHARS",
     "InProcessDreamCursorStore",
     "InProcessMemoryStore",
     "MEMORY_SCHEMA_SQL",
