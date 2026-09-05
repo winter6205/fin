@@ -25,7 +25,13 @@ third eval set:
   the configuration on the seam and consumes it only for arm
   attribution. The product path stays clean.
 
-This module is imported by the CLI only, never by the product path.
+Product code must not import this module. The wrapper is the seam
+between the live MCP retrieve path (only the live eval-set CLI uses
+it) and the ablation runner; importing it on the product path would
+drag :class:`MCPRetrieveAdapter` and the ``fin.retrieve.degradation``
+machinery into a context that should stay hermetic. The package-level
+``__all__`` only re-exports what the CLI and tests need (the factory
+``live_eval_set``); everything else stays at module scope.
 """
 
 from __future__ import annotations
@@ -43,9 +49,9 @@ from fin.corpus.dataset.t1 import (
     is_t1_countable,
     load_t1_manifest,
 )
-from fin.corpus.extracted import Locator
 from fin.eval.ablation.metrics import EvalQuery
 from fin.eval.ablation.scripted_set import ARMS_BY_QUERY_CLASS
+from fin.retrieve.degradation import DegradedEnvelopeInvalidError
 from fin.retrieve.mcp_adapter import (
     MCPRetrieveAdapter,
     RetrieveDegradedFailureError,
@@ -144,7 +150,12 @@ class LiveEvalSeamWrapper:
             )
         if payload.get("degraded") and not chunks:
             # Per ADR 0041 §B2 第 2 条: degraded + zero chunks is a
-            # named partial failure, never a legal empty miss.
+            # named partial failure, never a legal empty miss. Reading
+            # the envelope through the strict reader first guarantees
+            # that ``degraded: true`` with no / non-list
+            # ``degraded_reasons`` does NOT silently resolve to
+            # NOT_DEGRADED — the §B3禁止的静默形态 the envelope reader
+            # is the single authority against.
             raise RetrieveDegradedFailureError(
                 "MCP returned a degraded response without usable chunks",
                 signal=_signal_from_envelope(payload),
@@ -168,21 +179,30 @@ class LiveEvalSeamWrapper:
 
 
 def _signal_from_envelope(payload: Mapping[str, Any]) -> Any:
-    """Build a ``DegradationSignal`` from a raw envelope, if present."""
-    from fin.retrieve.degradation import (
-        DegradationSignal,
-        NOT_DEGRADED,
-    )
+    """Build a ``DegradationSignal`` from a raw envelope, strictly.
 
-    if not payload.get("degraded"):
-        return NOT_DEGRADED
-    reasons = payload.get("degraded_reasons") or ()
-    if not isinstance(reasons, list) or not reasons:
-        return NOT_DEGRADED
-    return DegradationSignal(
-        degraded=True,
-        degraded_reasons=tuple(str(reason) for reason in reasons),
-    )
+    Delegates to :func:`fin.retrieve.degradation.read_degradation_signal`
+    — the single authority for §B3 envelope parsing. That reader refuses
+    a ``degraded: true`` flag without a non-empty list of non-blank
+    reason strings: it raises :class:`DegradedEnvelopeInvalidError`
+    instead of falling back to ``NOT_DEGRADED``, because "unreadable
+    flag treated as healthy" is the silent shape §B3 forbids.
+
+    The wrapper translates that named failure into
+    :class:`RetrieveDegradedFailureError` (carrying the named reason
+    ``degraded_reasons_missing_or_invalid``) so the ablation runner
+    counts the query as a typed failure rather than silently passing
+    through as a clean zero hit.
+    """
+    from fin.retrieve.degradation import NOT_DEGRADED, read_degradation_signal
+
+    try:
+        return read_degradation_signal(payload)
+    except DegradedEnvelopeInvalidError as exc:
+        raise RetrieveDegradedFailureError(
+            "degraded_reasons_missing_or_invalid: " + str(exc),
+            signal=NOT_DEGRADED,
+        ) from exc
 
 
 def live_document_ids(project_root: Path | None = None) -> set[str]:

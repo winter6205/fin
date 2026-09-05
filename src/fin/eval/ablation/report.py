@@ -370,15 +370,12 @@ def validate_report(report: Mapping[str, Any]) -> list[str]:
                     f"{cid}: metric {metric} has {len(raw) if isinstance(raw, list) else 0} "
                     f"raw values, §B1 requires >= {B1_MIN_REPEATS}"
                 )
-            elif not all(
-                isinstance(v, (int, float)) and math.isfinite(float(v))
-                for v in raw
-            ):
+            elif not all(_is_finite_number(v) for v in raw):
                 problems.append(
                     f"{cid}: metric {metric} raw list contains a non-finite value"
                 )
             median = series.get("median")
-            if not isinstance(median, (int, float)) or not math.isfinite(float(median)):
+            if not _is_finite_number(median):
                 problems.append(
                     f"{cid}: metric {metric} median is not a finite number"
                 )

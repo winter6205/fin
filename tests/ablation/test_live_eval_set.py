@@ -181,6 +181,86 @@ def test_live_wrapper_translates_a_degraded_envelope_without_chunks_to_unavailab
     assert excinfo.value.code == "retrieve_degraded_failure"
 
 
+def test_live_wrapper_raises_named_failure_when_degraded_reasons_are_empty() -> None:
+    """ADR 0041: ``degraded_reasons`` is a non-empty finite enum list when
+    ``degraded`` is true. An envelope that flips the flag but drops the
+    reasons (or hands in a non-list) must NOT silently fall back to
+    NOT_DEGRADED — the §B3禁止的静默形态 the envelope reader forbids.
+    The wrapper raises the typed ``RetrieveDegradedFailureError`` so the
+    runner records the query as a named failure rather than passing
+    through as a healthy zero hit."""
+
+    class _DegradedEmptyReasonsAdapter:
+        def retrieve(self, query, *, limit=8, **kwargs):
+            return {
+                "chunks": [],
+                "degraded": True,
+                "degraded_reasons": [],
+            }
+
+    wrapper = LiveEvalSeamWrapper(
+        adapter=_DegradedEmptyReasonsAdapter(), query_class_by_question={}
+    )
+    with pytest.raises(RetrieveUnavailableError) as excinfo:
+        wrapper.retrieve_for_eval_with_arms("q", capabilities={}, limit=8)
+    assert excinfo.value.code == "retrieve_degraded_failure"
+    message = str(excinfo.value)
+    assert "degraded_reasons_missing_or_invalid" in message
+
+
+def test_live_wrapper_raises_named_failure_when_degraded_reasons_are_not_a_list() -> None:
+    """Same §B3 / §B2 invariant, applied to a non-list reasons value: a
+    string passed where the contract asks for a list must NOT resolve
+    to NOT_DEGRADED. The wrapper raises the typed failure."""
+
+    class _DegradedBadReasonsAdapter:
+        def retrieve(self, query, *, limit=8, **kwargs):
+            return {
+                "chunks": [],
+                "degraded": True,
+                "degraded_reasons": "adapter:field_stripped:limit",
+            }
+
+    wrapper = LiveEvalSeamWrapper(
+        adapter=_DegradedBadReasonsAdapter(), query_class_by_question={}
+    )
+    with pytest.raises(RetrieveUnavailableError) as excinfo:
+        wrapper.retrieve_for_eval_with_arms("q", capabilities={}, limit=8)
+    assert excinfo.value.code == "retrieve_degraded_failure"
+
+
+def test_live_wrapper_preserves_degraded_signal_with_legitimate_reasons() -> None:
+    """ADR 0041 happy path: degraded + non-empty reasons + chunks →
+    chunks are returned (partial result is usable). This test pins the
+    unchanged invariant: the §B2 fix must NOT over-trigger on a
+    well-formed degraded envelope."""
+
+    class _DegradedWithChunksAdapter:
+        def retrieve(self, query, *, limit=8, **kwargs):
+            return {
+                "chunks": [
+                    {
+                        "text": "x" * 40,
+                        "source_ref": {
+                            "document_id": "t1-onboarding-001",
+                            "version": "v" * 64,
+                            "page": 1,
+                        },
+                        "score": 0.9,
+                    }
+                ],
+                "degraded": True,
+                "degraded_reasons": ["adapter:field_stripped:limit"],
+            }
+
+    wrapper = LiveEvalSeamWrapper(
+        adapter=_DegradedWithChunksAdapter(), query_class_by_question={"q": "narrative"}
+    )
+    on = {"vector": True}
+    result = wrapper.retrieve_for_eval_with_arms("q", capabilities=on, limit=8)
+    assert len(result["chunks"]) == 1
+
+
 def test_live_wrapper_transports_unavailable_into_the_seam() -> None:
     """The MCP-side ``retrieve_unavailable`` MUST be re-raised so the
     ablation runner records it as a named error (SC4), not a quiet

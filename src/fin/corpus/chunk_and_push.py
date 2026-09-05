@@ -4,7 +4,11 @@ from fin.corpus.chunking import split_document
 from fin.corpus.dataset.t1 import load_t1_manifest
 from fin.corpus.parsers import parse_document
 from fin.corpus.push import document_push_records
-from fin.retrieve.push_port import MAX_PUSH_BATCH_RECORDS, PushPort
+from fin.retrieve.push_port import (
+    MAX_PUSH_BATCH_RECORDS,
+    PushError,
+    PushPort,
+)
 
 
 def push_t1_corpus(*, manifest_path: Path, text_dir: Path, port: PushPort) -> dict:
@@ -13,6 +17,20 @@ def push_t1_corpus(*, manifest_path: Path, text_dir: Path, port: PushPort) -> di
     The caller supplies the port, making the default test path entirely
     in-process. Each sample is one atomic push batch; failures are retained
     by sample id and re-raised only after all independent samples are tried.
+
+    The per-sample catch is narrowed to the **expected** exception family:
+
+    * :class:`PushError` subclasses (typed push failures — SC21);
+    * :class:`ValueError` (parse / chunk-shape errors above; in this
+      function the only :class:`ValueError` raised is the explicit
+      ``t1_empty_chunks`` / ``push_batch_overflow`` guards);
+    * :class:`OSError` (filesystem errors reading the sample text).
+
+    Anything else (e.g. a programming bug surfacing as ``KeyError``) is
+    recorded with the named code ``unexpected_error`` and the exception
+    class name, so the operator sees a traceable failure rather than a
+    silent ``t1_push_failed`` swallow. The CLI exits non-zero on any
+    failure, including the unexpected-error path.
     """
     manifest = load_t1_manifest(manifest_path)
     report = {"samples": 0, "blocks": 0, "written": 0, "duplicates": 0, "failures": []}
@@ -40,8 +58,18 @@ def push_t1_corpus(*, manifest_path: Path, text_dir: Path, port: PushPort) -> di
             report["blocks"] += len(enriched)
             report["written"] += int(outcome.get("written", 0))
             report["duplicates"] += int(outcome.get("duplicates", 0))
+        except (PushError, ValueError, OSError) as exc:
+            report["failures"].append({
+                "sample_id": sample_id,
+                "code": getattr(exc, "code", "t1_push_failed"),
+                "error": str(exc),
+            })
         except Exception as exc:
-            report["failures"].append({"sample_id": sample_id, "code": getattr(exc, "code", "t1_push_failed"), "error": str(exc)})
+            report["failures"].append({
+                "sample_id": sample_id,
+                "code": "unexpected_error",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
     return report
 
 
