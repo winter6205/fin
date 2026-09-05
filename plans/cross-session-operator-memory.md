@@ -1,7 +1,7 @@
 # Plan: cross-session-operator-memory
 
-**Goal:** Product-default cross-session private memory: facts + hook prefetch + two-layer user profile; research cites stay retrieve-only; default pytest stays memory OFF.
-**Approach:** First supersede the leftover MDP T5/T6 and dream→MCP contracts so implementers do not follow them. Then evolve the store, flip boot defaults, assemble prefetch/existence-pointer, wire explicit tools, gate auto-extract and dream, prove memory cannot cite, then run the over-attention gold set.
+**Goal:** Cross-session private memory behind a default-OFF switch: facts + hook prefetch + two-layer user profile; this checkout opts in via project env; research cites stay retrieve-only; default pytest stays memory OFF.
+**Approach:** First supersede the leftover MDP T5/T6 and dream→MCP contracts so implementers do not follow them. Then evolve the store, keep code default OFF while documenting this-checkout ON, assemble prefetch/existence-pointer, wire explicit tools, gate auto-extract and dream, prove memory cannot cite, then run the over-attention gold set.
 **Spec link:** `specs/cross-session-operator-memory.md`
 **Worktree:** `/home/winner/projects/fin-wt-cross-session-memory` · branch `feat/cross-session-operator-memory`
 **Tracker:** FALLBACK — local markdown. Operator ruled no GitHub issues for [公司操作者跨会话私人记忆](../docs/wayfinder/cross-session-operator-memory-map.md); do not `gh issue create`.
@@ -24,7 +24,7 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
 
 **已决（quote spec / ADR 0048）：**
 
-- Product boot ON; default pytest OFF unless the case is about memory.
+- Code boot OFF; this checkout’s project env ON for local eval; default pytest OFF even if that env is set.
 - Facts in `fin_memory`; hook = first body line ≤80; prefetch ≤3 lexical; zero hits → 0.
 - System: existence pointer only; no catalog; no promote.
 - Tools: save / recall / edit user profile; no dream tool.
@@ -58,11 +58,11 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
    - Status: [ ] pending
    - [parallel with T3]
 
-3. **Product boot ON; default pytest OFF** — tag: `[implementation]`
-   - **Inherits:** spec SC2–SC4; CONTEXT **memory port**; ADR 0035 2026-09-06: pytest still OFF; ON without `FIN_CHECKPOINT_URL` stays typed.
-   - **Surface:** host memory port / compile / test harness
-   - **Acceptance:** unset `FIN_MEMORY_ENABLED` + set checkpoint URL → ON port; default pytest → OFF (zero tools, zero prefetch, zero extract, zero dream LLM); garbage enabled value stays typed; `uv run pytest -q` exits 0.
-   - **Completion:** how pytest injects OFF is open.
+3. **Code default OFF; this checkout env ON; pytest stays OFF** — tag: `[implementation]`
+   - **Inherits:** spec SC2–SC4; CONTEXT **memory port**; ADR 0035 2026-09-06: pytest still OFF and does not inherit operator `.env`; ON without `FIN_CHECKPOINT_URL` stays typed.
+   - **Surface:** host memory port / compile / test harness / `.env.example`
+   - **Acceptance:** unset `FIN_MEMORY_ENABLED` → OFF port; `.env.example` documents ON for this checkout; default pytest → OFF even if operator `.env` is ON (zero tools, zero prefetch, zero extract, zero dream LLM); garbage enabled value stays typed; `uv run pytest -q` exits 0.
+   - **Completion:** how pytest ignores operator-env ON is open.
    - Status: [ ] pending
    - [parallel with T2]
 

@@ -2,11 +2,11 @@
 
 ## Assumption gate (confirmed 2026-09-06)
 
-Operator confirmed map G1–G4 and product auto-memory default ON (for current-product eval). This contract freezes the remaining PLAN-blocking items; correct them before implementation if any is wrong:
+Operator confirmed map G1–G4, then corrected boot: code default OFF, this checkout’s project env ON for local eval. This contract freezes the remaining PLAN-blocking items; correct them before implementation if any is wrong:
 
 1. Workspace is the only product entry; same **host graph**; **citation verifier** stays a code gate; company corpus stays behind the **retrieve port** (ADR 0045).
-2. Product CLI / workspace boot: **memory port** ON (auto-extract + **memory prefetch**) without setting `FIN_MEMORY_ENABLED`. Default `uv run pytest -q` injects OFF unless the case is about memory. Explicit OFF still yields zero tools / zero prefetch / zero extract / zero dream.
-3. Product ON still requires `FIN_CHECKPOINT_URL` (existing loud fail; no silent InMemory). Pytest does not inherit product ON.
+2. Code boot: **memory port** OFF when `FIN_MEMORY_ENABLED` is unset. This checkout’s `.env` / `.env.example` sets it ON so local workspace evals see auto-extract + **memory prefetch**. Default `uv run pytest -q` stays OFF even if operator `.env` has ON, unless the case is about memory. Explicit OFF still yields zero tools / zero prefetch / zero extract / zero dream.
+3. ON still requires `FIN_CHECKPOINT_URL` (existing loud fail; no silent InMemory). Pytest does not inherit operator-env ON.
 4. **user profile** files: `$HOME/.fin/user.md` (global) and `<workspace>/.fin/user.md` (workspace overlay). Tool calls name which layer they write. One natural person; no multi-account.
 5. Auto-extract fires only after **3** completed turns on that `thread_id`; at most **one** new **memory fact** per firing; this-turn explicit save skips extract.
 6. Over-attention gold set is acceptance, not an enable-gate. Gold cases use a scripted model; they are not live LLM in default pytest.
@@ -28,7 +28,7 @@ Success is: relevant habits persist across threads; unrelated turns inject no me
 Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 
 - **fin**: A **workspace** knowledge-base Agent: the operator asks in a **research thread**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held SEC filings; retrieve ranking stays off-graph behind the **retrieve port**.
-- **memory port**: The only dependency fin is allowed for switchable session/buffer memory (extract, recall, GC, dream): port in, typed results out. Product boot is **ON** (auto-extract + **memory prefetch**) so evals measure the shipped path; default pytest / contract eval stays **OFF** unless the case is about memory (ADR 0035, ADR 0048).
+- **memory port**: The only dependency fin is allowed for switchable session/buffer memory (extract, recall, GC, dream): port in, typed results out. Boot default is **OFF**; this checkout turns it **ON** in project env so local evals see auto-extract and **memory prefetch**; default pytest stays **OFF** even when that env is set (ADR 0035, ADR 0048).
 - **memory fact**: One atomic cross-session note from a single extract or explicit save: title plus body. The first non-empty body line is the **memory hook**. It is not a filing claim.
 - **memory hook**: The ≤80-character first body line of a **memory fact**; the only payload **memory prefetch** injects.
 - **memory prefetch**: When auto-extract is on, a per-turn user-side overlay of at most three **memory hooks** whose title or body lexically hits the current user utterance; zero hits inject nothing. Already-shown ids in the same thread are skipped.
@@ -55,7 +55,7 @@ Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 
   **Write path**
   - Graph tools when ON: explicit save, recall, edit **user profile** (named layer). No dream tool.
-  - Auto-extract: product default ON; N=3 completed turns; skip if this turn already saved; deny archive/retrieve-able claims and profile-already-said; at most one fact per firing.
+  - Auto-extract: code default OFF; this checkout opts in via project env; N=3 completed turns; skip if this turn already saved; deny archive/retrieve-able claims and profile-already-said; at most one fact per firing.
   - **dream**: merge facts only; 24h cooldown from last success or skip; then threshold (active facts ≥2 and (distinct `thread_id` ≥5 **or** completed turns since last dream ≥6 **or** new facts ≥3)). Facts &lt;2: no LLM call and do not treat that as a skip that refreshes 24h. Not inside `model_node`. Not unconditional post-SSE `run_dream_after_turn`. Not a memory-MCP write.
 
   **Gates**
@@ -84,9 +84,9 @@ Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 Each line is binary. Default `uv run pytest -q` stays green with no live SEC and with memory OFF unless the case is about memory.
 
 1. `uv run pytest -q` exits 0; `web/` `tsc --noEmit` exits 0 if this change touches web (this spec does not require web).
-2. Product compile/serve with `FIN_MEMORY_ENABLED` unset and `FIN_CHECKPOINT_URL` set builds an ON **memory port** (auto-extract + prefetch assembled).
-3. Default pytest (no memory mark, `FIN_MEMORY_ENABLED` unset in the test process) builds OFF: zero memory tools, zero prefetch rows, zero auto-extract writes, zero dream LLM calls.
-4. Explicit OFF (`FIN_MEMORY_ENABLED` false) matches SC3 on a scripted turn.
+2. Unset `FIN_MEMORY_ENABLED` builds OFF (`OffMemoryAdapter`), even when `FIN_CHECKPOINT_URL` is set.
+3. Default pytest (no memory mark) builds OFF even if operator `.env` has `FIN_MEMORY_ENABLED=true`: zero memory tools, zero prefetch rows, zero auto-extract writes, zero dream LLM calls.
+4. Explicit ON (`FIN_MEMORY_ENABLED` true) plus `FIN_CHECKPOINT_URL` builds an ON port; this checkout’s `.env.example` documents ON for local eval. Explicit false matches SC3 on a scripted turn.
 5. A saved **memory fact** round-trips title + body; the injected hook equals the first non-empty body line, whitespace-folded, ≤80 characters (single-line body is the hook).
 6. Facts written in workspace A are not prefetched or recalled in workspace B.
 7. A user utterance with zero lexical overlap on title and body injects 0 prefetch rows.
@@ -122,7 +122,7 @@ Each line is binary. Default `uv run pytest -q` stays green with no live SEC and
 
 **Inherits:** Soft-Track ADR 0027; **retrieve port** ADR 0032 / 0045 / 0046; **session compaction** ADR 0044; Postgres checkpointer ADR 0015; **memory port** seam and `fin_memory` / `fin_memory_dream_cursor` tables; `FIN_MEMORY_ENABLED` / `FIN_MEMORY_DREAM_BACKEND` env names; `OffMemoryAdapter`; `uv run pytest -q`; map [公司操作者跨会话私人记忆](../docs/wayfinder/cross-session-operator-memory-map.md); `docs/guides/prompt-development.md`.
 
-**Changes this spec adds:** product boot ON; fact+hook prefetch; existence pointer only in system; two-layer **user profile** files; graph tools = save / recall / edit profile; gated auto-extract N=3 cap 1; dream local merge with 24h + threshold, no MCP write, no per-turn SSE; gold set as acceptance; supersedes remaining MDP T5/T6 product wiring and `specs/memory-dream.md` MCP/SSE clauses.
+**Changes this spec adds:** code boot OFF + this-checkout env ON; fact+hook prefetch; existence pointer only in system; two-layer **user profile** files; graph tools = save / recall / edit profile; gated auto-extract N=3 cap 1; dream local merge with 24h + threshold, no MCP write, no per-turn SSE; gold set as acceptance; supersedes remaining MDP T5/T6 product wiring and `specs/memory-dream.md` MCP/SSE clauses.
 
 **Contradicts (reopened, already recorded in ADR 0048 2026-09-06):** `specs/memory-dialogue-platform.md` assumption 5 (default OFF) and 6 (dream transports to MCP); `specs/memory-dream.md` SC17 (post-SSE dream) and SC18 (transported MCP then disable). This spec wins; those files get a pointer (SC30), they are not silently edited as if still in force.
 

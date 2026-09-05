@@ -34,8 +34,8 @@ A separate TypeScript MCP server (own repo). After ingest/push, product **compan
 _Avoid_: treating fin as the long-term vector backend, lockstep releases with fin, collapsing retrieve MCP and memory MCP into one config key, mirroring fin consumer ADRs into that repo, using dream to ingest filings
 
 **memory port**:
-The only dependency fin is allowed for switchable session/buffer memory (extract, recall, GC, dream): port in, typed results out. Product boot is **ON** (auto-extract + **memory prefetch**) so evals measure the shipped path; default pytest / contract eval stays **OFF** unless the case is about memory (ADR 0035, ADR 0048).
-_Avoid_: stuffing memory into the retrieve port, dual-writing memory bodies into the checkpointer as SSOT, treating memory recall as citation evidence, keeping product auto-extract OFF until evals exist, promoting frequently recalled facts into the system prompt
+The only dependency fin is allowed for switchable session/buffer memory (extract, recall, GC, dream): port in, typed results out. Boot default is **OFF**; this checkout turns it **ON** in project env so local evals see auto-extract and **memory prefetch**; default pytest stays **OFF** even when that env is set (ADR 0035, ADR 0048).
+_Avoid_: stuffing memory into the retrieve port, dual-writing memory bodies into the checkpointer as SSOT, treating memory recall as citation evidence, shipping always-on with no env switch, letting pytest inherit operator-env ON, promoting frequently recalled facts into the system prompt
 
 **memory backend**:
 The implementation behind the memory port. Local Postgres is the working store for **memory facts**. A memory MCP is not the product write path for auto-extract or dream (ADR 0048).

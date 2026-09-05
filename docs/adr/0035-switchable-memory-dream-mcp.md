@@ -9,6 +9,6 @@ Amended 2026-09-04: a knowledge-base research thread stays retrieve + cite; dial
 
 Amended 2026-09-05: read path, auto-extract deny list, fact-level store, and dream-as-local-merge (not MCP upload) are ADR 0048. This ADR still owns: memory port vs retrieve port, recall is not citation evidence.
 
-Amended 2026-09-06: product boot default is **ON** so evals measure the current product; default pytest / contract eval stays **OFF** unless the case is about memory. Dream does not transport to a memory MCP (ADR 0048). Always-on inside default pytest is still rejected.
+Amended 2026-09-06: boot default is **OFF**; this checkout opts in via project env for local eval. Default pytest stays **OFF** even when that env is set. Dream does not transport to a memory MCP (ADR 0048). Always-on inside default pytest is still rejected.
 
-Considered Options: memory-only-in-MCP (fin cannot run complete memory offline); always-on memory in default pytest (breaks citation fixtures — still rejected); product default OFF until evals exist (superseded by ADR 0048 2026-09-06); allowing memory spans as cites (hollows out the product gate); every-turn auto-extract of filing answers into biography (rejected — filing answers stay grounded in retrieve/`read_file`).
+Considered Options: memory-only-in-MCP (fin cannot run complete memory offline); always-on memory in default pytest (breaks citation fixtures — still rejected); product boot always ON with no env switch (rejected — ADR 0048 2026-09-06); allowing memory spans as cites (hollows out the product gate); every-turn auto-extract of filing answers into biography (rejected — filing answers stay grounded in retrieve/`read_file`).
