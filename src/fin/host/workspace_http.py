@@ -68,7 +68,34 @@ Routes
                                           one. Workspace-only — nothing
                                           is emailed or posted out.
 * ``GET    /api/corpus``                - real ``list_filings()`` over
-                                          the frozen manifest.
+                                          the catalog metadata table
+                                          (ADR 0047).
+* ``POST   /api/corpus/ingest``         - the corpus-ingest door
+                                          (corpus-serve-ingest T3 /
+                                          ADR 0047): multipart upload
+                                          -> parse -> 切分 (params
+                                          table) -> push via the
+                                          PushPort -> invalidate stale
+                                          blocks -> register the
+                                          filing in the T2 catalog
+                                          (``record_filings``). Named
+                                          failures:
+                                          ``missing_file`` /
+                                          ``empty_source`` (4xx empty),
+                                          ``format_unspecified`` (422),
+                                          ``unsupported_format`` (415),
+                                          ``ingest_upload_too_large``
+                                          (413), ``invalid_doc_type`` /
+                                          ``document_id_missing`` (422),
+                                          push/invalidation outage
+                                          codes (503). A catalog
+                                          registration failure after
+                                          the push lands is the named
+                                          ``catalog_warning`` field on
+                                          the 200 — never rolled back,
+                                          never silent. The ONLY product
+                                          surface that calls 切分;
+                                          never a research tool.
 * ``GET    /api/status``                - the boot-scoped status
                                           surface the Sidebar strip
                                           renders (T10 / ADR 0033):
@@ -117,12 +144,23 @@ import copy
 import json
 import logging
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Final, Iterator, Literal
 
-from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, HTTPException
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from langchain_core.messages import (
     AIMessage,
@@ -133,7 +171,21 @@ from langchain_core.messages import (
 )
 from pydantic import BaseModel, Field
 
-from fin.corpus.catalog import list_filings
+from fin.corpus.catalog import list_filings, record_filings
+from fin.corpus.errors import (
+    CatalogCorruptError,
+    CatalogRowError,
+    ParseError,
+    UnsupportedFormatParseError,
+)
+from fin.corpus.ingest_endpoint import (
+    IngestDocumentIdMissingError,
+    IngestEndpoint,
+    IngestedDocument,
+    IngestFormatUnspecifiedError,
+    IngestInvalidDocTypeError,
+    IngestUploadTooLargeError,
+)
 from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER, strip_hidden_bounce_marker
 from fin.host.export import (
     ExportError,
@@ -190,6 +242,9 @@ from fin.host.watchlist import (
     default_watchlist_store,
     refresh_notices,
 )
+from fin.retrieve.fake_push_port import FakePushPort
+from fin.retrieve.invalidation_port.errors import InvalidationError
+from fin.retrieve.push_port import PushError
 
 
 logger = logging.getLogger(__name__)
@@ -415,6 +470,34 @@ _TITLE_MAX_CHARS: int = 50
 _DEFAULT_TITLE: str = "New thread"
 
 
+# corpus-serve-ingest T4 (ADR 0047 thread attach): hard cap on one
+# attachment upload, in bytes. Attach is a THIS-TURN read affordance
+# (model context), not storage — the cap keeps a drag-and-drop from
+# ballooning the process heap and the model context. Oversize is a
+# named 413, never a silent truncate. Module-level so operators can
+# tune it and tests can shrink it.
+ATTACHMENT_MAX_BYTES: Final[int] = 2 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class AttachmentBlob:
+    """One turn-scoped attachment (ADR 0047 **thread attach**).
+
+    Storage is the turn blob: an in-memory dict on the mounted router
+    (same lifecycle as :class:`RunControl`), keyed by attachment id.
+    Deliberately NOT a file, NOT the corpus object store, NOT an
+    extracted tree — the attach door stores nothing durable and never
+    pushes; when the process ends the blobs end. The send that
+    references the id consumes it (single use).
+    """
+
+    attachment_id: str
+    thread_id: str
+    filename: str
+    text: str
+    size_bytes: int
+
+
 # ----- request / response schemas -----
 
 
@@ -439,6 +522,15 @@ class SendMessageRequest(BaseModel):
     # The proxy keeps ``reasoning_split=True`` regardless — only the
     # thinking TYPE toggles; reasoning_details round-trip remains on.
     thinking: bool = True
+    # corpus-serve-ingest T4 (ADR 0047 **thread attach**): ids returned
+    # by ``POST /threads/{id}/attachments`` to expose on THIS run.
+    # Referencing an unknown id (or another thread's id) is a named
+    # 400 ``attachment_not_found`` BEFORE any graph invoke; the send
+    # that runs consumes the blobs (single use), and a send rejected
+    # 409 does NOT consume them. Attach never pushes: the resolved
+    # text rides ``reset_input_state(attachments=...)`` as turn-scoped
+    # context and never enters the corpus/ingest path.
+    attachment_ids: list[str] = Field(default_factory=list)
 
 
 class CreateWatchRequest(BaseModel):
@@ -1368,11 +1460,14 @@ def _model_identity() -> str:
 def _corpus_filing_count() -> int:
     """Filing count from the catalog that serves ``GET /api/corpus``.
 
-    A corpus that was never ingested raises ``IngestMissingError``
-    here. On this route that is a zero count, not a failure: ADR
-    0033 makes zero a valid rendered value, and a 500 would blank a
-    strip whose other three fields are still true. The warning keeps
-    the state out of the silent-swallow class — ``GET /api/corpus``
+    An empty or missing catalog table is a zero count by construction
+    (ADR 0047: the empty catalog is ``{"filings": []}``, not a
+    failure). A table file that exists but is corrupt raises
+    ``CatalogCorruptError`` — an ``IngestMissingError`` subclass. On
+    this route that is still a zero count, not a failure: ADR 0033
+    makes zero a valid rendered value, and a 500 would blank a strip
+    whose other three fields are still true. The warning keeps the
+    state out of the silent-swallow class — ``GET /api/corpus``
     itself still surfaces the typed error to whoever asks for the
     filings.
     """
@@ -1390,6 +1485,285 @@ def _corpus_filing_count() -> int:
 
 
 # ----- route factory -----
+
+
+# Push-failure codes that mean the retrieval backend was unreachable or
+# answered off-contract — a dependency outage (503). The remaining
+# ``PushError`` codes (empty batch / empty document / incomplete
+# metadata) cannot be induced by an uploader: they mean the endpoint's
+# own pipeline produced an invalid batch, which is a 500, never a
+# client-facing 4xx.
+_PUSH_UNAVAILABLE_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "push_service_unavailable",
+        "push_protocol_error",
+        "push_batch_failed",
+        "push_journal_unwritable",
+        "push_journal_unreadable",
+        "push_journal_corrupt",
+    }
+)
+
+
+def _push_error_status(exc: PushError) -> int:
+    """Push outages are dependency failures (503); the rest are 500."""
+    return 503 if exc.code in _PUSH_UNAVAILABLE_CODES else 500
+
+
+# ----- ingest route: exception -> named HTTP answer (table-driven) -----
+#
+# Complexity-gate remediation: the ``corpus_ingest`` handler kept one
+# ``except`` branch per failure family. The mapping is data, not
+# control flow — each row is (exception family, status, detail flag)
+# and :func:`_ingest_error_response` dispatches ONCE, isinstance-style,
+# in table order. Order matters: a family must precede a base it must
+# shadow (``UnsupportedFormatParseError`` before ``ParseError``).
+# Every row's family carries a stable ``code`` class attribute; the
+# body is always ``{"error": code}``, plus ``detail`` (str(exc)) only
+# on the 415 that names the received format (SC7).
+_INGEST_ERROR_TABLE: Final[
+    tuple[tuple[type[BaseException], Any, bool], ...]
+] = (
+    (UnsupportedFormatParseError, 415, True),
+    (IngestUploadTooLargeError, 413, False),
+    (IngestFormatUnspecifiedError, 422, False),
+    (IngestDocumentIdMissingError, 422, False),
+    (IngestInvalidDocTypeError, 422, False),
+    (ParseError, 400, False),
+    (InvalidationError, 503, False),
+    # PushError's status depends on the code: resolver, not a constant.
+    (PushError, _push_error_status, False),
+)
+
+
+def _ingest_error_response(exc: Exception) -> JSONResponse:
+    """Answer an ingest failure with its named HTTP response.
+
+    One dispatch replaces the ingest handler's per-family ``except``
+    branches: walk :data:`_INGEST_ERROR_TABLE` in order, take the
+    row's status (a plain int, or a resolver for families whose status
+    depends on the error code) and answer ``{"error": exc.code}`` —
+    every table family declares ``code``. A family OUTSIDE the table
+    is not this route's named contract: re-raise typed so it stays an
+    unhandled 500, never a fabricated answer.
+    """
+    for family, status, with_detail in _INGEST_ERROR_TABLE:
+        if not isinstance(exc, family):
+            continue
+        resolved = status(exc) if callable(status) else status
+        content: dict[str, Any] = {"error": exc.code}
+        if with_detail:
+            content["detail"] = str(exc)
+        return JSONResponse(status_code=resolved, content=content)
+    raise exc
+
+
+# ----- route-layer upload gate (input boundary) -----
+#
+# Both upload doors (thread attach, corpus ingest) used to buffer the
+# WHOLE body before consulting the byte cap — an unbounded allocation
+# on a lying or chunked uploader. Now the route consults the declared
+# Content-Length first and, when the length is unknown, reads in
+# bounded segments and refuses at cap+1 bytes. The service-level cap
+# checks stay (defense in depth); this is the route's own gate.
+
+# Segment size of the bounded read for the multipart ingest door.
+_INGEST_READ_SEGMENT: Final[int] = 1024 * 1024
+
+
+def _declared_upload_over(request: Request, cap: int) -> bool:
+    """True when the request's declared Content-Length exceeds ``cap``.
+
+    The pre-buffer gate: a declared oversize body is refused before a
+    single byte is read. A missing (chunked) or unparseable header is
+    NOT oversize by declaration — the bounded read decides. A
+    ``cap <= 0`` means unlimited (the service cap's own convention).
+    """
+    if cap <= 0:
+        return False
+    declared = request.headers.get("content-length")
+    if declared is None:
+        return False
+    try:
+        return int(declared) > cap
+    except ValueError:
+        return False
+
+
+async def _read_bounded_body(request: Request, cap: int) -> bytes | None:
+    """Read the attach body in segments; ``None`` once over ``cap``.
+
+    The no-Content-Length (chunked) leg of the attach gate: segments
+    accumulate only while the running total fits ``cap``, so an
+    unbounded stream can never balloon process memory past cap+1
+    bytes. ``cap <= 0`` (unlimited) degrades to the plain full read.
+    """
+    if cap <= 0:
+        return await request.body()
+    chunks: list[bytes] = []
+    total = 0
+    async for segment in request.stream():
+        total += len(segment)
+        if total > cap:
+            return None
+        chunks.append(segment)
+    return b"".join(chunks)
+
+
+def _read_bounded_upload(file: Any, cap: int) -> bytes | None:
+    """Read the spooled multipart upload in segments; ``None`` over cap.
+
+    The ingest leg of the gate (no Content-Length, or a declared one
+    that already passed): the sync SpooledTemporaryFile is read segment
+    by segment and the read stops at cap+1 bytes — the route never
+    materializes an oversized upload in memory. ``cap <= 0`` means
+    unlimited.
+    """
+    if cap <= 0:
+        return file.read()
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        segment = file.read(_INGEST_READ_SEGMENT)
+        if not segment:
+            break
+        total += len(segment)
+        if total > cap:
+            return None
+        chunks.append(segment)
+    return b"".join(chunks)
+
+
+# One ingest service per process: the fake boot shares one observable
+# store across requests; the MCP boot's adapters are stateless enough
+# (one subprocess per push call) that sharing changes nothing.
+_ingest_service_singleton: IngestEndpoint | None = None
+_ingest_service_lock = threading.Lock()
+
+
+# ----- ingest -> catalog registration (T2 x T3 wiring) -----
+#
+# Why a thread-local slot: the ``on_ingested`` hook runs INSIDE
+# ``service.ingest`` (after the push landed), so a hook failure cannot
+# become the route's error answer without denying an already-successful
+# push — and it must not vanish either (error-handling-enforcer: no
+# silent skip-as-success). The hook records the named failure on this
+# thread's slot; the ingest route resets the slot before the call,
+# reads it after, and surfaces it as the response's named
+# ``catalog_warning`` field. Thread-local because the service is a
+# process-wide singleton while sync routes run on a threadpool:
+# concurrent ingests must never read each other's warnings.
+_catalog_hook_slot = threading.local()
+
+# The named warning code the response carries when the catalog
+# registration failed after a successful push. The detail (str(exc))
+# follows the code and names the drifted field / broken table, so the
+# operator can act without reading server logs.
+CATALOG_RECORD_FAILED: Final[str] = "catalog_record_failed"
+
+# The failure families the hook converts into the named warning:
+# ``CatalogRowError`` / ``CatalogCorruptError`` are the catalog's own
+# contract failures (bad row / unreadable table); ``OSError`` covers
+# the filesystem outages ``record_filings`` cannot type (mkdir, lock,
+# fsync, replace). Anything else is a bug and keeps propagating typed
+# (T3 contract: the hook's own failures propagate).
+_CATALOG_FAILURES: Final[tuple[type[BaseException], ...]] = (
+    CatalogRowError,
+    CatalogCorruptError,
+    OSError,
+)
+
+
+def _record_ingested_filing(doc: IngestedDocument) -> None:
+    """Product ``on_ingested`` hook: register the pushed filing.
+
+    Maps the :class:`IngestedDocument` onto the T2 row contract and
+    upserts it into the default catalog table (``record_filings``'
+    own default — the ``data/corpus/catalog.json`` the ``GET
+    /api/corpus`` route reads). ``source_sha256`` is left out: the
+    ingest version IS the sha256 of the source bytes, so storing it
+    twice would duplicate one value under two keys.
+
+    A catalog-side failure never rolls the push back and never fails
+    the request: it is logged with traceback and recorded on the
+    thread slot so the ingest route answers 200 with the named
+    ``catalog_warning``.
+    """
+    try:
+        # One row: ``record_filings`` takes an iterable of rows.
+        record_filings(
+            [
+                {
+                    "document_id": doc.document_id,
+                    "company": doc.company,
+                    "period": doc.period,
+                    "version": doc.version,
+                    "page_count": doc.page_count,
+                }
+            ]
+        )
+    except _CATALOG_FAILURES as exc:
+        _catalog_hook_slot.warning = f"{CATALOG_RECORD_FAILED}: {exc}"
+        logger.warning(
+            "ingest: catalog registration failed for %s "
+            "(the push stands)",
+            doc.document_id,
+            exc_info=True,
+        )
+
+
+def _build_default_ingest_service() -> IngestEndpoint:
+    """Build the env-selected ingest service (``get_ingest_service``).
+
+    The backend selection mirrors the retrieve adapter's
+    (``FIN_RETRIEVE_ADAPTER``, via
+    :func:`fin.host.operator_env.resolve_retrieve_adapter_kind`): a
+    fake retrieve boot gets a process-local ``FakePushPort`` serving
+    both the push and invalidation faces (observable, no network); the
+    product default gets the MCP ``push`` / ``invalidation`` adapters
+    (ADR 0047: ingest enters search only through MCP). The MCP
+    adapters are imported lazily so the workspace import surface stays
+    free of the stdio transport (and its psycopg-heavy compile import)
+    until an ingest actually happens.
+
+    Both kinds wire ``on_ingested`` to :func:`_record_ingested_filing`
+    so a pushed filing is registered in the same catalog table the
+    ``GET /api/corpus`` route lists — a fake boot is a real product
+    mode, not a second contract.
+    """
+    from fin.host.operator_env import resolve_retrieve_adapter_kind
+
+    if resolve_retrieve_adapter_kind() == "fake":
+        shared: FakePushPort = FakePushPort()
+        return IngestEndpoint(
+            push_port=shared,
+            invalidation_port=shared,
+            on_ingested=_record_ingested_filing,
+        )
+    from fin.retrieve.mcp_invalidation_port import MCPInvalidationPort
+    from fin.retrieve.mcp_push_port import MCPPushPort
+
+    return IngestEndpoint(
+        push_port=MCPPushPort(),
+        invalidation_port=MCPInvalidationPort(),
+        on_ingested=_record_ingested_filing,
+    )
+
+
+def get_ingest_service() -> IngestEndpoint:
+    """FastAPI dependency returning the corpus ingest endpoint service.
+
+    Tests override this via
+    ``app.dependency_overrides[get_ingest_service]`` to inject a
+    service built on ``FakePushPort`` (no live MCP). Production gets
+    the env-selected ports from ``_build_default_ingest_service``,
+    built once per process.
+    """
+    global _ingest_service_singleton
+    with _ingest_service_lock:
+        if _ingest_service_singleton is None:
+            _ingest_service_singleton = _build_default_ingest_service()
+        return _ingest_service_singleton
 
 
 def build_router(
@@ -1422,6 +1796,17 @@ def build_router(
     """
     router = APIRouter(prefix="/api")
     run_control = RunControl()
+    # corpus-serve-ingest T4 (ADR 0047): the turn-blob attachment
+    # registry, created HERE (per mounted router) for the same reason
+    # as ``run_control`` — two apps in one test session must not share
+    # attachments. Nothing in this dict is ever written to disk or to
+    # the corpus store; the attach door never pushes.
+    #
+    # Known limitation (deliberate): no total-size cap and NO
+    # eviction — blobs are in-process memory held until the send that
+    # references them consumes them (single-use pop) or the process
+    # exits. This is a turn-blob registry, not a durable store.
+    attachment_store: dict[str, AttachmentBlob] = {}
     if get_watchlist_store is None:
         get_watchlist_store = default_watchlist_store
     if get_memory_port is None:
@@ -1632,6 +2017,32 @@ def build_router(
                 thread_id=thread_id,
             )
 
+        # corpus-serve-ingest T4 (ADR 0047 thread attach): resolve the
+        # referenced attachments BEFORE the lock probe and BEFORE the
+        # title rewrite, so a bad reference is a named 400 with zero
+        # side effects. Resolution is read-only — consumption happens
+        # only after the 409 probe passes, so a send rejected with
+        # ``concurrent_run`` keeps its attachments for the retry.
+        # Unknown OR other-thread ids are the same named error (no
+        # existence leak across threads).
+        referenced_ids = list(dict.fromkeys(body.attachment_ids or []))
+        resolved_attachments: list[dict[str, str]] = []
+        if referenced_ids:
+            for attachment_id in referenced_ids:
+                blob = attachment_store.get(attachment_id)
+                if blob is None or blob.thread_id != thread_id:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": "attachment_not_found"},
+                    )
+                resolved_attachments.append(
+                    {
+                        "attachment_id": blob.attachment_id,
+                        "filename": blob.filename,
+                        "text": blob.text,
+                    }
+                )
+
         # T2: title update on the first real send. The T1 path
         # set the title from ``first_message`` at create time;
         # when the user created the thread empty (corpus-card
@@ -1679,6 +2090,17 @@ def build_router(
             raise ConcurrentRunError(
                 f"another run is already in flight on thread_id={thread_id!r}"
             )
+
+        # corpus-serve-ingest T4: the run is definitely starting, so
+        # NOW the referenced blobs are consumed (turn-blob single-use
+        # semantics). A later send replaying the same id is the named
+        # 400, not a silently stale re-read; a send rejected 409 above
+        # did NOT reach this point, so the retry keeps the attachment.
+        # If the stream itself fails mid-flight the blobs stay
+        # consumed — the operator re-attaches, the same contract as
+        # any dropped turn.
+        for attachment_id in referenced_ids:
+            attachment_store.pop(attachment_id, None)
 
         # T2: the input state ALWAYS resets the run-scoped fields
         # (``reset_input_state`` clears ``evidence`` — impossible
@@ -1758,7 +2180,10 @@ def build_router(
                 outcome = yield from _stream_run_frames(
                     graph,
                     run_id=run_id,
-                    input_value=reset_input_state(body.question),
+                    input_value=reset_input_state(
+                        body.question,
+                        attachments=resolved_attachments,
+                    ),
                     config=config,
                     seen_message_ids=seen_message_ids,
                     thread_id=thread_id,
@@ -1912,6 +2337,110 @@ def build_router(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
         )
+
+    @router.post("/threads/{thread_id}/attachments")
+    async def attach_to_thread(
+        thread_id: str,
+        request: Request,
+        store: ThreadStore = Depends(get_thread_store),
+    ) -> dict:
+        """corpus-serve-ingest T4 (ADR 0047 **thread attach**).
+
+        The FIRST door of the two upload doors: a file dropped into
+        the open research thread. The bytes are decoded as UTF-8 text,
+        held as a turn blob in this router's memory, and returned as
+        an ``attachment_id`` the next ``POST .../messages`` may
+        reference via ``attachment_ids``. The model reads the text on
+        THAT turn only; nothing is pushed, nothing is ingested,
+        nothing lands in the corpus store or any extracted tree.
+
+        Wire shape: raw bytes body with the filename as the
+        ``filename`` query parameter. Deliberately NOT multipart
+        ``UploadFile``: this door ships ONE undecorated turn blob —
+        no form fields, nothing to parse — so the web client's plain
+        ``fetch`` body is the entire contract and neither side pays
+        for multipart handling (the ingest route is the only
+        multipart surface). Binary handling stays OUT of this
+        door by contract — PDF/DOCX/... belong to the corpus-ingest
+        endpoint, where 切分 runs deterministically (ADR 0047) — so
+        undecodable bytes are a named rejection, not a best-effort
+        parse.
+
+        Named boundaries (no silent success, and every failure key is
+        attach-namespaced, never ingest vocabulary):
+
+        * unknown thread            -> 404 ``thread_not_found``
+        * empty body                -> 400 ``empty_attachment``
+        * body over the byte cap    -> 413 ``attachment_too_large``
+        * non-UTF-8 bytes           -> 400 ``attachment_not_text``
+        * blob-store write fails    -> 500 ``attachment_store_failed``
+          (exception boundary; the send-side read has no failure mode
+          beyond a missing/consumed id, which is the named 400
+          ``attachment_not_found``)
+
+        The 413 is decided at the ROUTE layer before the body is
+        buffered: a declared oversize Content-Length is refused
+        unread, and a chunked body is read in bounded segments
+        (:func:`_read_bounded_body`) — the cap is never discovered
+        after a full-buffer allocation.
+        """
+        if store.get_thread(thread_id) is None:
+            return JSONResponse(
+                status_code=404, content={"error": "thread_not_found"}
+            )
+        if _declared_upload_over(request, ATTACHMENT_MAX_BYTES):
+            return JSONResponse(
+                status_code=413, content={"error": "attachment_too_large"}
+            )
+        body = await _read_bounded_body(request, ATTACHMENT_MAX_BYTES)
+        if body is None:
+            return JSONResponse(
+                status_code=413, content={"error": "attachment_too_large"}
+            )
+        if not body:
+            return JSONResponse(
+                status_code=400, content={"error": "empty_attachment"}
+            )
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            # Text-only is the CONTRACT, not a missing feature: the
+            # attach door must never parse binaries (切分 belongs to
+            # the ingest endpoint, ADR 0047).
+            return JSONResponse(
+                status_code=400, content={"error": "attachment_not_text"}
+            )
+        attachment_id = str(uuid.uuid4())
+        filename = (request.query_params.get("filename") or "").strip()
+        if not filename:
+            filename = "attachment.txt"
+        try:
+            attachment_store[attachment_id] = AttachmentBlob(
+                attachment_id=attachment_id,
+                thread_id=thread_id,
+                filename=filename,
+                text=text,
+                size_bytes=len(body),
+            )
+        except Exception:
+            # Exception boundary: a blob-store write failure (e.g. a
+            # MemoryError on the turn blob) is a TYPED named error —
+            # never a half-stored 200 the caller could reference, and
+            # never ingest vocabulary on the attach door.
+            logger.exception(
+                "attach_to_thread: blob store write failed for thread_id=%s",
+                thread_id,
+            )
+            return JSONResponse(
+                status_code=500,
+                content={"error": "attachment_store_failed"},
+            )
+        return {
+            "attachment_id": attachment_id,
+            "filename": filename,
+            "size_bytes": len(body),
+            "scope": "thread_attach",
+        }
 
     @router.post("/threads/{thread_id}/resume")
     def resume_thread(
@@ -2297,14 +2826,17 @@ def build_router(
         """In-app notices for watched filings in the LOCAL catalog and
         configured real filing source.
 
-        Reconcile-on-read: the catalog is a committed tree, not an
-        event source, so the read IS the delivery. Nothing leaves the
+        Reconcile-on-read: the catalog metadata table is not an event
+        source, so the read IS the delivery. Nothing leaves the
         process — spec Focus 3 forbids outbound email / Slack.
 
-        A corpus that was never ingested raises ``IngestMissingError``,
-        which the shared handler turns into the typed 503 the rest of
-        the corpus surface already uses. A monitor outage leaves the
-        persisted rows in the response and adds typed degraded headers.
+        A missing or empty catalog table refreshes against no local
+        filings (ADR 0047: the empty catalog is ``{"filings": []}``,
+        not a failure). A corrupt table file raises the typed
+        ``CatalogCorruptError``, which the shared handler turns into
+        the typed 503 the rest of the corpus surface already uses. A
+        monitor outage leaves the persisted rows in the response and
+        adds typed degraded headers.
         """
         refresh_notices(watchlist, filings=list_filings()["filings"])
         headers = {"X-Filing-Monitor-Status": "healthy"}
@@ -2334,7 +2866,13 @@ def build_router(
 
     @router.get("/corpus")
     def corpus() -> dict:
-        """List the frozen 12 filings from the real catalog."""
+        """List the catalog's ingested filings (metadata table, ADR 0047).
+
+        An empty or missing table is ``{"filings": []}`` — the empty
+        catalog, not an error. A corrupt table file raises the typed
+        ``CatalogCorruptError`` (→ 503 ``ingest_missing`` via the
+        shared handler).
+        """
         return list_filings()
 
     @router.get("/status", response_model=WorkspaceStatusResponse)
@@ -2357,6 +2895,123 @@ def build_router(
             "model_identity": _model_identity(),
             "corpus_filing_count": _corpus_filing_count(),
         }
+
+    @router.post("/corpus/ingest")
+    def corpus_ingest(
+        request: Request,
+        file: UploadFile | None = File(default=None),
+        document_id: str | None = Form(default=None),
+        company: str | None = Form(default=None),
+        period: str | None = Form(default=None),
+        doc_type: str | None = Form(default=None),
+        format: str | None = Form(default=None),
+        service: IngestEndpoint = Depends(get_ingest_service),
+    ) -> Response:
+        """Corpus-ingest door: parse + 切分 + push/invalidate (T3).
+
+        The ONLY product surface that triggers 切分 (ADR 0047); the
+        research graph binds no such tool (SC6 contract test). The
+        split decisions are the deterministic params table — no model
+        runs on this path.
+
+        Multipart upload + optional metadata form fields:
+        ``format`` (explicit declaration; otherwise the filename
+        extension names the format), ``document_id`` / ``company`` /
+        ``period`` (locator metadata; ``company``+``period`` also
+        derive the default document id), ``doc_type`` (optional
+        params-table scene override).
+
+        Every failure is a named code with no partial-success 200
+        (SC7 / SC8): the four endpoint codes and the parser family
+        map to 4xx (nothing was written); push/invalidation outage
+        codes map to 503. A 503 after the push landed means the push
+        is already in place (idempotent) and the retry is the
+        recovery — the code names invalidation, never a clean
+        success. The exception -> answer mapping lives in
+        :func:`_ingest_error_response` (table-driven).
+
+        After a fully successful chain the service's ``on_ingested``
+        hook registers the filing in the catalog (T2
+        ``record_filings``). A catalog-side failure there is NOT a
+        failed ingest (the push stands) and NOT a silent success: the
+        200 body carries the named ``catalog_warning``
+        (``catalog_record_failed: ...``); ``None`` on a clean ingest.
+        """
+        if file is None:
+            return JSONResponse(
+                status_code=422, content={"error": "missing_file"}
+            )
+        # Route-layer upload gate (input boundary): refuse a declared
+        # oversize body BEFORE the spooled upload is read into memory,
+        # and bound the read when no Content-Length is declared. The
+        # cap is the service's own (single source of truth; the
+        # service cap check stays as defense in depth).
+        cap = service.max_bytes
+        if _declared_upload_over(request, cap):
+            return JSONResponse(
+                status_code=413,
+                content={"error": "ingest_upload_too_large"},
+            )
+        # Sync handler: read the underlying SpooledTemporaryFile (the
+        # async ``file.read()`` coroutine would need an ``async def``
+        # route, putting the whole parse+push chain on the event loop)
+        # — bounded, so an unbounded upload never materializes here.
+        data = _read_bounded_upload(file.file, cap)
+        if data is None:
+            return JSONResponse(
+                status_code=413,
+                content={"error": "ingest_upload_too_large"},
+            )
+        # Reset BEFORE the call so a previous ingest on this threadpool
+        # thread can never leak its warning into this response.
+        _catalog_hook_slot.warning = None
+        try:
+            result = service.ingest(
+                data,
+                filename=file.filename,
+                declared_format=format,
+                document_id=document_id,
+                company=company,
+                period=period,
+                doc_type=doc_type,
+            )
+        except Exception as exc:
+            return _ingest_error_response(exc)
+        # The hook ran last (only on a fully successful chain); read
+        # the slot ON this thread — the reset above guarantees no
+        # stale warning from an earlier request is echoed here.
+        catalog_warning = getattr(_catalog_hook_slot, "warning", None)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "ingested",
+                "document_id": result.document_id,
+                "version": result.version,
+                "fmt": result.fmt,
+                "doc_type": result.doc_type,
+                "unit_count": result.unit_count,
+                "block_count": result.block_count,
+                "written": result.written,
+                "duplicates": result.duplicates,
+                "block_ids": list(result.block_ids),
+                "catalog_warning": catalog_warning,
+                "invalidation": (
+                    None
+                    if result.invalidation is None
+                    else {
+                        "block_ids": list(result.invalidation.block_ids),
+                        "closed": result.invalidation.closed,
+                        "already_closed": result.invalidation.already_closed,
+                        "closed_at": [
+                            [block_id, instant]
+                            for block_id, instant in (
+                                result.invalidation.closed_at
+                            )
+                        ],
+                    }
+                ),
+            },
+        )
 
     @router.get("/observability")
     def observability(
@@ -2416,5 +3071,6 @@ def mount(
 
 __all__ = [
     "build_router",
+    "get_ingest_service",
     "mount",
 ]

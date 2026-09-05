@@ -54,11 +54,12 @@ itself is idempotent (LRU-cached): two calls with identical args
 return the SAME proxy object — T9 will assert object identity
 between the CLI helper's graph and the HTTP handler's graph.
 
-The factory propagates ``IngestMissingError`` from
-``load_extracted_tree`` (ADR 0020): if the committed extracted tree
-is missing or incomplete the operator must restore the frozen PDF
-(or refresh the manifest) and re-run ingest. ``compile_graph``
-does NOT auto-ingest.
+The factory does NOT auto-ingest and does NOT read a local extracted
+tree on the serve path (ADR 0046 / 0047): citation evidence and
+``read_file`` bodies come from this run's retrieve / read port
+payloads, and the ``read_file`` body source is the injected read port
+(``adapter.read`` when the adapter offers one, an explicit
+``read_port=``, otherwise a typed-miss port).
 """
 
 from __future__ import annotations
@@ -88,10 +89,7 @@ from langgraph.prebuilt import ToolNode
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command, Send
 
-from fin.corpus.errors import IngestMissingError
-from fin.corpus.extracted import Locator, load_extracted_tree
-from fin.corpus.parsers._common import UnitLocator
-from fin.corpus.push import serialize_source_ref
+from fin.corpus.extracted import Locator
 from fin.host.compaction import CompactionInputError
 from fin.host.citation_gate import (
     HIDDEN_BOUNCE_MARKER,
@@ -117,7 +115,10 @@ from fin.host.state import (
     STEP_CAP,
     TERMINAL_STATUSES,
 )
-from fin.host.agent_instructions import messages_for_model
+from fin.host.agent_instructions import (
+    attachment_context_message,
+    messages_for_model,
+)
 from fin.host.degradation_notice import (
     DEGRADATION_NOTICE_FIELD,
     consume_degradation,
@@ -137,6 +138,7 @@ from fin.host.stream_map import (
     inline_thinking_segments,
     strip_thinking_from_answer,
 )
+from fin.corpus.catalog import DEFAULT_CATALOG_PATH
 from fin.host.tools import list_files, read_file
 from fin.host.tools.issuer_fanout import (
     ISSUER_FANOUT_TOOL,
@@ -157,6 +159,7 @@ from fin.retrieve.degradation import (
 from fin.retrieve.hit_mapping import MappingFailureLedger, ledger_from_env
 from fin.retrieve.input_validation import InputValidationError
 from fin.retrieve.port import RetrievePort
+from fin.retrieve.read_port import MissReadPort, ReadPort
 from fin.retrieve.tool import retrieve
 
 
@@ -190,13 +193,12 @@ class ConcurrentRunError(HostGraphError):
 class RetrieveAdapterConfigError(HostGraphError):
     """The requested retrieve adapter cannot be built as configured.
 
-    Raised for an unknown ``retrieve_adapter`` kind, and for a
-    product MCP adapter that would be built with no usable
-    ``locator_map`` — a map-less MCP adapter drops every hit
-    (ADR 0030 mapper-drop), so it would answer every query with
-    ``{"chunks": []}`` while looking perfectly healthy. Refusing
-    to build it turns a silent always-empty retrieve into a boot
-    failure the operator can act on.
+    Raised for an unknown ``retrieve_adapter`` kind. (The former
+    empty-``locator_map`` refusal is gone with ADR 0046 / 0047:
+    canonical ``source_ref`` hits need no map, the factory no longer
+    derives one from the extracted tree, and unmapped hits are dropped
+    and counted on the mapping ledger instead of hiding behind a
+    healthy-looking miss.)
     """
 
 
@@ -207,6 +209,7 @@ _DEFAULT_DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "corpus"
 _DEFAULT_MANIFEST_PATH = _DEFAULT_DATA_DIR / "manifest.json"
 _DEFAULT_EXTRACTED_ROOT = _DEFAULT_DATA_DIR / "extracted"
 _DEFAULT_FACTS_ROOT = _DEFAULT_DATA_DIR / "facts"
+_DEFAULT_CATALOG_PATH = DEFAULT_CATALOG_PATH
 
 # The two retrieve adapter kinds ``compile_graph`` can auto-build.
 # ``BM25Adapter`` is deliberately absent: ADR 0030 archived it from
@@ -227,34 +230,6 @@ def _resolve_path(value: Path | str | None, default: Path) -> Path:
     if value is None:
         return default
     return Path(value)
-
-
-def _locator_map_from_tree(
-    tree: dict[str, tuple[Any, ...]],
-) -> dict[str, Locator]:
-    """Publish one canonical fin ``source_ref`` → ``Locator`` entry
-    per frozen locator unit in the extracted ``tree``.
-
-    ``MCPRetrieveAdapter`` accepts this stable serialization directly,
-    so the retrieval service's internal id is never used as
-    ``source_ref`` or passed to citation evidence.
-
-    An explicitly supplied ``locator_map`` remains a named
-    transitional compatibility seam for integrations using
-    ``retrieval_id``; auto-built product maps use only the canonical
-    ``source_ref`` spelling.
-    """
-    return {
-        serialize_source_ref(
-            UnitLocator(
-                document_id=page.locator.document_id,
-                version=page.locator.version,
-                unit=page.locator.page,
-            )
-        ): page.locator
-        for document_id, pages in tree.items()
-        for page in pages
-    }
 
 
 def _last_ai_text(messages: list[BaseMessage]) -> str:
@@ -297,12 +272,14 @@ def _format_bounce_template(template: str) -> str:
 # ----- tool wrappers -----
 
 
-def _make_list_files_tool(manifest_path: Path, extracted_root: Path):
+def _make_list_files_tool(catalog_path: Path):
     """Build the ``list_files`` host tool.
 
     Returns a LangChain ``BaseTool`` whose function calls T3's
-    ``list_files`` with the factory's resolved paths. The tool does
-    NOT contribute evidence — it returns catalog metadata only.
+    ``list_files`` with the factory's injected catalog path (ADR
+    0047: the tool catalogs the metadata table over ingested/pushed
+    filings — never a serve-time extracted tree). The tool does NOT
+    contribute evidence — it returns catalog metadata only.
     The tool's registered name is ``list_files`` (matching the
     ADR 0009 contract) so the model can call it by name.
     """
@@ -320,12 +297,13 @@ def _make_list_files_tool(manifest_path: Path, extracted_root: Path):
         """List available 10-Q filings in the corpus.
 
         Optional ``company`` and ``period`` filters match the
-        manifest's ``company`` and ``period`` fields exactly.
+        catalog row's ``company`` and ``period`` fields exactly.
         Additive EDGAR-shaped filters (``cik``, ``form``,
         ``ticker``, exact ``filing_date``) per ADR 0031 are
         forwarded through. Returns ``{"filings": [...]}`; unknown
-        filters, conflicting filters, and empty filter values
-        all return ``{"filings": []}``.
+        filters, conflicting filters, empty filter values, and an
+        empty or missing catalog table all return
+        ``{"filings": []}``.
         """
         return list_files(
             company=company,
@@ -334,23 +312,25 @@ def _make_list_files_tool(manifest_path: Path, extracted_root: Path):
             form=form,
             ticker=ticker,
             filing_date=filing_date,
-            manifest_path=manifest_path,
-            extracted_root=extracted_root,
+            catalog_path=catalog_path,
         )
 
     return list_files_tool
 
 
-def _make_read_file_tool():
+def _make_read_file_tool(read_port: ReadPort):
     """Build the ``read_file`` host tool.
 
-    The tool wraps T3's ``read_file`` and, on a successful page
-    read, contributes one ``EvidenceItem`` to ``AgentState`` per
-    page in the joined ``text`` slice. A miss dict
-    (``{"error": "unknown_locator"}``) contributes nothing.
+    The tool wraps T3's ``read_file`` with the factory's injected read
+    port (ADR 0046 / 0047: the body fetch is a port call — MCP when the
+    bytes live there, the fake manifest on the fake path, never a local
+    extracted tree) and, on a successful page read, contributes one
+    ``EvidenceItem`` to ``AgentState`` per page in the joined ``text``
+    slice. A miss dict (``{"error": "unknown_locator"}`` or the named
+    ``read_unavailable`` failure) contributes nothing.
 
-    The tool's registered name is ``read_file`` so the model can
-    call it by name.
+    The tool's registered name is ``read_file`` so the model can call
+    it by name.
     """
 
     @tool("read_file")
@@ -361,19 +341,21 @@ def _make_read_file_tool():
         page_limit: int = 1,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
     ) -> Command:
-        """Read a page from a frozen 10-Q filing.
+        """Read a page from a known locator.
 
         ``document_id`` matches the manifest's ``document_id``
         (e.g. ``AAPL-2022Q3``). ``version`` is the manifest
         sha256. ``page`` is 1-based; ``page_limit`` is clamped to
         3 (ADR 0009). Misses return ``{"error": "unknown_locator"}``
-        and contribute no evidence.
+        (or ``{"error": "read_unavailable"}`` when the corpus
+        backend exposes no read tool) and contribute no evidence.
         """
         result = read_file(
             document_id=document_id,
             version=version,
             page=page,
             page_limit=page_limit,
+            reader=read_port,
         )
         new_evidence: list[EvidenceItem] = []
         if isinstance(result, dict) and "text" in result:
@@ -1710,6 +1692,7 @@ def compile_graph(
     adapter: RetrievePort | None = None,
     manifest_path: Path | str | None = None,
     extracted_root: Path | str | None = None,
+    catalog_path: Path | str | None = None,
     facts_root: Path | str | None = None,
     known_document_ids: set[str] | None = None,
     step_cap: int = STEP_CAP,
@@ -1719,6 +1702,7 @@ def compile_graph(
     retrieve_adapter: str = RETRIEVE_ADAPTER_FAKE,
     mcp_command: list[str] | None = None,
     locator_map: dict[str, "Locator"] | None = None,
+    read_port: ReadPort | None = None,
     mapping_failure_ledger: MappingFailureLedger | None = None,
     degradation_ledger: DegradationLedger | None = None,
     summarizer: Any | None = None,
@@ -1752,18 +1736,36 @@ def compile_graph(
         ``BM25Adapter`` is no longer the product default
         (ADR 0030); it remains importable for legacy / offline
         tests but the factory does not auto-build it.
+
+        When the adapter offers a ``read`` method (both
+        ``FakeRetrievePort`` and ``MCPRetrieveAdapter`` do, ADR
+        0047), it is the default ``read_file`` body source unless
+        ``read_port`` is supplied explicitly.
     manifest_path
         Path to ``data/corpus/manifest.json``. Defaults to the
-        repo's canonical location.
+        repo's canonical location. Used by the ``list_files`` /
+        ``redline`` / ``table_extract`` tool wiring only — the
+        retrieve and ``read_file`` evidence paths never touch it
+        (ADR 0046 / 0047).
     extracted_root
         Path to ``data/corpus/extracted/``. Defaults to the
-        repo's canonical location. ``IngestMissingError`` from
-        ``load_extracted_tree`` propagates to the caller
-        (ADR 0020).
+        repo's canonical location. Same scope as
+        ``manifest_path``: legacy tool wiring only.
+    catalog_path
+        T2 (ADR 0047): path to the catalog metadata table
+        ``data/corpus/catalog.json`` over ingested/pushed filings.
+        Defaults to the repo's canonical location. The
+        ``list_files`` tool reads ONLY this table — a missing or
+        empty table is the empty catalog ``{"filings": []}``, never
+        a tree scan. Tests inject a ``tmp_path``-rooted table
+        (built via ``fin.corpus.catalog.record_filings``).
     known_document_ids
-        The corpus manifest's ``document_id`` set. ``None`` (the
-        default) reads it from the manifest on disk; tests inject a
-        smaller fixture set.
+        Optional static locator allow-list for the citation
+        verifier. ``None`` (the default, the product boot shape)
+        means the verifier's allow-list is THIS run's evidence
+        set (ADR 0046: cite only from this-run payloads). When
+        supplied, it is unioned with the run's evidence — never
+        read from a manifest or extracted tree.
     step_cap
         The agent-loop step fuse. Default ``STEP_CAP`` (32).
     issuer_cap
@@ -1807,12 +1809,22 @@ def compile_graph(
     locator_map
         T3 (#76): explicit compatibility map from ``retrieval_id``
         (or a legacy ``source_ref`` key) to ``fin.Locator``, passed
-        to the auto-built ``MCPRetrieveAdapter``. ``None`` (the
-        default) derives a canonical ``source_ref`` → ``Locator``
-        map from the extracted tree via
-        :func:`_locator_map_from_tree`; an explicit map overrides
-        that derivation. An empty effective map is refused —
-        see ``RetrieveAdapterConfigError``.
+        to the auto-built ``MCPRetrieveAdapter``. Canonical
+        ``source_ref`` hits (ADR 0047's wire contract) need no map,
+        so ``None`` (the default) builds the adapter with an empty
+        map and never reads the extracted tree; hits that cannot
+        map are dropped and counted on the mapping ledger —
+        visible, never silent.
+    read_port
+        T1 (ADR 0046 / 0047): the ``read_file`` body source.
+        ``None`` (the default) resolves in order: the bound
+        adapter's own ``read`` when it has one (``FakeRetrievePort``
+        serves its ``pages_by_doc`` manifest, ``MCPRetrieveAdapter``
+        answers the named ``read_unavailable`` EXIT until iknow
+        grows a read tool), otherwise a typed-miss port. An
+        explicit port wins over both. The factory never builds a
+        tree-backed read port itself — the local extracted tree is
+        not a serve-path SSOT.
     mapping_failure_ledger
         T17 (SC22): where hits that fail to map back to a locator
         are counted. ``None`` (the default) resolves the ledger
@@ -1847,15 +1859,8 @@ def compile_graph(
 
     Raises
     ------
-    IngestMissingError
-        If the ``"mcp"`` auto-build needs the extracted tree and
-        ``load_extracted_tree`` cannot find it. The factory does
-        NOT swallow this — the operator must restore the tree and
-        re-run ingest.
     RetrieveAdapterConfigError
-        If ``retrieve_adapter`` names an unknown kind, or the
-        ``"mcp"`` auto-build would produce an adapter with an
-        empty ``locator_map``.
+        If ``retrieve_adapter`` names an unknown kind.
     """
     # One mapping-failure counter per graph, shared by the retrieve
     # adapter's mapper-drop and the host's evidence admission (T17):
@@ -1886,52 +1891,39 @@ def compile_graph(
                 known_document_ids = set()
             adapter = FakeRetrievePort(known_document_ids=known_document_ids)
         else:
-            mpath = _resolve_path(manifest_path, _DEFAULT_MANIFEST_PATH)
-            rpath = _resolve_path(extracted_root, _DEFAULT_EXTRACTED_ROOT)
-            # The tree is the SSOT for BOTH the client-side
-            # document membership test and the canonical source_ref
-            # → locator map; load it once when either is missing.
-            if known_document_ids is None or locator_map is None:
-                tree = load_extracted_tree(mpath, rpath)
-                if known_document_ids is None:
-                    known_document_ids = set(tree.keys())
-                if locator_map is None:
-                    locator_map = _locator_map_from_tree(tree)
-            if not locator_map:
-                raise RetrieveAdapterConfigError(
-                    "the product MCP retrieve adapter needs a non-empty "
-                    "locator_map: unmapped hits are dropped, so a "
-                    "map-less adapter answers every query with no "
-                    "chunks. Pass locator_map= or point "
-                    "manifest_path / extracted_root at an ingested "
-                    "corpus."
-                )
+            # Product MCP adapter (ADR 0030), built WITHOUT the
+            # extracted tree (ADR 0046 / 0047): canonical
+            # ``source_ref`` hits need no locator map, the client-side
+            # document membership test defers to the MCP server when
+            # no allow-list is configured, and unmapped hits are
+            # dropped and counted on the mapping ledger — visible,
+            # never silent.
             adapter = MCPRetrieveAdapter(
                 command=mcp_command or ["iknow-memory"],  # 兜底非契约
-                locator_map=locator_map,
+                locator_map=locator_map or {},
                 known_document_ids=known_document_ids,
                 timeout_seconds=5.0,
                 mapping_ledger=mapping_failure_ledger,
             )
 
-    if known_document_ids is None:
-        # Defensive: a caller passing an external adapter but no
-        # known_document_ids set must declare the set explicitly.
-        # The auto-build path always sets this above, so a None
-        # reaching this branch means the caller passed an external
-        # adapter without declaring the corpus.
-        raise ValueError(
-            "compile_graph requires either `adapter` or "
-            "`known_document_ids` (or `manifest_path` + "
-            "`extracted_root` so the factory can derive it)."
-        )
+    # Resolve the read_file body source (ADR 0046 / 0047): the most
+    # explicit port wins; otherwise the adapter's own ``read`` (the
+    # fake's pages manifest / the MCP named-exit); otherwise a typed
+    # -miss port for adapters without a read face (legacy BM25). The
+    # factory never reads the extracted tree here — the tree is not a
+    # serve-path SSOT.
+    if read_port is None and hasattr(adapter, "read"):
+        read_port = adapter  # type: ignore[assignment]
+    if read_port is None:
+        read_port = MissReadPort()
 
     mpath = _resolve_path(manifest_path, _DEFAULT_MANIFEST_PATH)
     rpath = _resolve_path(extracted_root, _DEFAULT_EXTRACTED_ROOT)
     fpath = _resolve_path(facts_root, _DEFAULT_FACTS_ROOT)
+    cpath = _resolve_path(catalog_path, _DEFAULT_CATALOG_PATH)
 
-    list_files_tool = _make_list_files_tool(mpath, rpath)
-    read_file_tool = _make_read_file_tool()
+    list_files_tool = _make_list_files_tool(cpath)
+    read_file_tool = _make_read_file_tool(read_port)
     retrieve_tool = _make_retrieve_tool(
         adapter,
         mapping_ledger=mapping_failure_ledger,
@@ -2038,6 +2030,43 @@ def compile_graph(
             return unbound_model_no_thinking
         return model
 
+    def _with_turn_attachments(
+        state: AgentState, model_messages: list[BaseMessage]
+    ) -> list[BaseMessage]:
+        """Prepend the turn-scoped attachment block, or return as-is.
+
+        corpus-serve-ingest T4 (ADR 0047 thread attach): attachment
+        context is injected CALL-SCOPED like the track prompt —
+        prepended at model time and never written back to the
+        checkpoint. ``reset_input_state`` clears the ``attachments``
+        channel on the next send, so the text is visible on this
+        run's model calls only. The block goes right after the track
+        prompt (position 1) so the model reads the instructions
+        before the attachment body.
+
+        ADR 0047's visibility contract is unconditional for the turn
+        ("gives the model that file for this turn only"), so EVERY
+        leaf's model call gets it — the research ``model_node`` and
+        the ``_non_research_leaf`` tracks alike; an attach turn that
+        Soft-Track routes to dialogue must still expose the file.
+
+        The attachment text never enters the ``evidence`` channel
+        (tool_node owns it), so an attachment-only span cannot pass
+        the citation gate (ADR 0046 / SC9).
+        """
+        attachment_message = attachment_context_message(
+            state.get("attachments")
+        )
+        if attachment_message is None:
+            return model_messages
+        if not model_messages:
+            return [attachment_message]
+        return [
+            model_messages[0],
+            attachment_message,
+            *model_messages[1:],
+        ]
+
     def _non_research_leaf(
         state: AgentState,
         config: RunnableConfig,
@@ -2050,8 +2079,11 @@ def compile_graph(
             _clarify_missing_slots(state) if track == "clarify" else None
         )
         stream = selected.stream(
-            messages_for_model(
-                state["messages"], track=track, missing_slots=missing_slots
+            _with_turn_attachments(
+                state,
+                messages_for_model(
+                    state["messages"], track=track, missing_slots=missing_slots
+                ),
             )
         )
         answer_message = assemble_final_ai_message(stream)
@@ -2139,9 +2171,14 @@ def compile_graph(
         # inline ``<thinking>`` block stripped out of content. It is
         # stored on state for the turn row; it NEVER merges into the
         # answer content (SC60).
-        stream = selected_model.stream(
-            messages_for_model(state["messages"], track="research")
+        # corpus-serve-ingest T4 (ADR 0047 thread attach): turn-scoped
+        # attachment context, injected CALL-SCOPED like the track
+        # prompt — see ``_with_turn_attachments`` for the full
+        # contract (this-turn-only, checkpoint-clean, never evidence).
+        model_messages = _with_turn_attachments(
+            state, messages_for_model(state["messages"], track="research")
         )
+        stream = selected_model.stream(model_messages)
         answer_message = assemble_final_ai_message(stream)
         # T4 (#37): ``thinking_text`` ACCUMULATES across this run's
         # model calls (each call's prose joined with a newline) so
@@ -2426,11 +2463,22 @@ def compile_graph(
         evidence = list(state.get("evidence", []))
         repair_count = int(state.get("repair_count", 0))
 
+        # ADR 0046: the verifier's locator allow-list is THIS run's
+        # evidence set — the document ids the run actually retrieved
+        # or read — unioned with any static allow-list the caller
+        # configured. It is never derived from a manifest or a local
+        # extracted tree, so a locator claim nothing brought in this
+        # run refuses immediately (SC9).
+        known_ids = set(known_document_ids or ())
+        known_ids.update(
+            item.locator.document_id for item in evidence
+        )
+
         gate_result = verify_citations(
             answer=candidate_answer,
             evidence=evidence,
             repair_count=repair_count,
-            known_document_ids=set(known_document_ids or ()),
+            known_document_ids=known_ids,
             repair_cap=REPAIR_CAP,
         )
 

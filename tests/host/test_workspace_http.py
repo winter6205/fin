@@ -95,6 +95,7 @@ def fresh_store(http_app: FastAPI):
         checkpointer=InMemorySaver(),
         model=ScriptedChatModel(script=[AIMessage(content="never reached")]),
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: default_graph
     return store
@@ -118,6 +119,7 @@ def _install_graph(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=known_document_ids or KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
     return g
@@ -275,6 +277,7 @@ def test_delete_thread_calls_saver_delete_thread(
             script=_read_then_answer_script(f"Per the filing: {aapl_page1_text[:80]}")
         ),
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     from fin.host.http import get_graph
 
@@ -477,6 +480,7 @@ def test_send_message_concurrent_returns_409_no_event_stream_body(
         checkpointer=InMemorySaver(),
         model=blocking,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     from fin.host.http import get_graph
 
@@ -616,6 +620,7 @@ def test_send_message_streaming_emits_thinking_and_tool_call_frames(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -721,6 +726,7 @@ def test_send_message_thinking_frame_emitted_with_stripped_prose(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -775,6 +781,7 @@ def test_delete_thread_saver_failure_returns_500_not_silent_200(
         checkpointer=ExplodingSaver(),
         model=ScriptedChatModel(script=[AIMessage(content="x")]),
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     from fin.host.http import get_graph
 
@@ -911,12 +918,8 @@ def test_get_corpus_shows_each_form_the_corpus_actually_holds(
     what is in the library.
     """
     monkeypatch.setattr(
-        "fin.corpus.catalog._DEFAULT_MANIFEST_PATH",
-        multi_form_corpus["manifest_path"],
-    )
-    monkeypatch.setattr(
-        "fin.corpus.catalog._DEFAULT_EXTRACTED_ROOT",
-        multi_form_corpus["extracted_root"],
+        "fin.corpus.catalog.DEFAULT_CATALOG_PATH",
+        multi_form_corpus["catalog_path"],
     )
 
     filings = client.get("/api/corpus").json()["filings"]
@@ -926,6 +929,43 @@ def test_get_corpus_shows_each_form_the_corpus_actually_holds(
         "ZEUS-2023-8K": "8-K",
         "ZEUS-2023Q1": "10-Q",
     }
+
+
+def test_get_corpus_with_missing_catalog_table_is_empty_filings(
+    client: TestClient, fresh_store, tmp_path: Path, monkeypatch
+) -> None:
+    """ADR 0047: a serve process whose corpus was never ingested has
+    no catalog table file at all — ``GET /api/corpus`` answers 200
+    ``{"filings": []}``, not a 503 and not an extracted-tree scan."""
+    monkeypatch.setattr(
+        "fin.corpus.catalog.DEFAULT_CATALOG_PATH",
+        tmp_path / "absent" / "catalog.json",
+    )
+
+    r = client.get("/api/corpus")
+
+    assert r.status_code == 200
+    assert r.json() == {"filings": []}
+
+
+def test_get_corpus_with_corrupt_catalog_table_is_typed_503(
+    client: TestClient, fresh_store, tmp_path: Path, monkeypatch
+) -> None:
+    """A table file that exists but violates the catalog schema raises
+    ``CatalogCorruptError`` (an ``IngestMissingError`` subclass) — the
+    shared handler's typed 503 ``ingest_missing``, never an empty 200
+    success and never a bare 500."""
+    corrupt = tmp_path / "catalog.json"
+    corrupt.write_text("{ not json")
+    monkeypatch.setattr(
+        "fin.corpus.catalog.DEFAULT_CATALOG_PATH",
+        corrupt,
+    )
+
+    r = client.get("/api/corpus")
+
+    assert r.status_code == 503
+    assert r.json() == {"error": "ingest_missing"}
 
 
 # ----- run persistence: GET turn table reflects POST history -----
@@ -1031,6 +1071,16 @@ REAL_DIST = Path(__file__).resolve().parents[2] / "web" / "dist"
 SPA_SHELL = (
     "<!doctype html>\n<html><head><title>fin</title></head>"
     '<body><div id="root"></div></body></html>\n'
+)
+
+# Legacy tree-backed read adapter over the committed corpus. Only the
+# scripted ``read_file`` transcripts need it; the default graph no
+# longer reads the tree on its own (ADR 0046 / 0047).
+from fin.retrieve import ExtractedTreeReadPort
+
+_TREE_READ_PORT = ExtractedTreeReadPort(
+    Path("data/corpus/manifest.json"),
+    Path("data/corpus/extracted"),
 )
 
 
@@ -1184,6 +1234,7 @@ def _install_graph_with_model(
         "checkpointer": InMemorySaver(),
         "model": model,
         "known_document_ids": known_ids or KNOWN_IDS,
+        "read_port": _TREE_READ_PORT,
     }
     if step_cap is not None:
         kwargs["step_cap"] = step_cap
@@ -1518,6 +1569,7 @@ def test_send_message_refuse_emits_status_with_ordinary_person_copy(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -1577,6 +1629,7 @@ def test_send_message_step_cap_emits_status_with_ordinary_person_copy(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -1733,6 +1786,7 @@ def _install_crash_graph(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
     return g, model
@@ -1979,6 +2033,7 @@ def test_get_thread_in_flight_true_while_lock_held(
         checkpointer=InMemorySaver(),
         model=blocking,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2046,6 +2101,7 @@ def test_resume_concurrent_returns_409_before_stream(
         checkpointer=InMemorySaver(),
         model=blocking,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2114,6 +2170,7 @@ def test_switching_threads_does_not_paint_deltas_to_other_thread(
         checkpointer=InMemorySaver(),
         model=blocking,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2229,6 +2286,7 @@ def test_send_message_token_deltas_stream_before_node_completion(
         checkpointer=InMemorySaver(),
         model=_two_step_streaming_model(answer),
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2322,6 +2380,7 @@ def test_send_message_inline_thinking_stream_never_reaches_answer_frames(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2402,6 +2461,7 @@ def test_research_answer_deltas_match_the_persisted_row(
         checkpointer=InMemorySaver(),
         model=_two_step_streaming_model(answer),
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2453,6 +2513,7 @@ def test_research_answer_with_inline_thinking_matches_persisted_row(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2488,6 +2549,7 @@ def test_soft_track_answer_deltas_match_the_persisted_row(
         checkpointer=InMemorySaver(),
         model=_soft_track_streaming_model(answer),
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2568,6 +2630,7 @@ def test_resume_streams_remainder_deltas_on_same_wire(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2651,6 +2714,7 @@ def test_resume_does_not_replay_checkpointed_frames(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2698,6 +2762,7 @@ def test_send_message_thinking_false_applies_disabled_extra_body(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2777,6 +2842,7 @@ def test_send_message_persists_thinking_duration_and_echoes_on_status(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2851,6 +2917,7 @@ def test_bounce_retry_emits_answer_reset_between_attempts(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2925,6 +2992,7 @@ def test_bounce_then_tools_then_answer_has_no_empty_reset(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2995,6 +3063,7 @@ def test_multi_bounce_attaches_reset_to_each_retry_first_chunk(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -3039,6 +3108,7 @@ def test_bounce_pending_reset_flushes_on_terminal_empty_refuse(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -3091,6 +3161,7 @@ def test_scripted_model_raises_emits_terminal_status(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -3214,6 +3285,7 @@ def test_send_message_soft_track_reply_streams_deltas_before_status(
         checkpointer=InMemorySaver(),
         model=_soft_track_streaming_model(answer),
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -3292,6 +3364,7 @@ def test_send_message_classify_deltas_never_reach_the_wire(
         model=_soft_track_streaming_model(reply),
         classify_model=classify_model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 

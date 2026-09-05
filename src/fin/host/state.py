@@ -326,6 +326,19 @@ class AgentState(TypedDict, total=False):
         trace narrates and the citation gate reads to enforce
         "every contributing issuer keeps a citation" (SC7). Overwrite
         semantics; run scoped via ``reset_input_state``.
+    attachments
+        corpus-serve-ingest T4 (ADR 0047 **thread attach**): the
+        turn-scoped, read-only attachment blobs the operator attached
+        to THIS send — one ``{attachment_id, filename, text}`` dict
+        per file. Overwrite semantics; ``reset_input_state`` carries
+        the incoming list on the new run and clears it (``[]``) on
+        every run without attachments, so the text is gone from the
+        next turn. The text is INJECTED CALL-SCOPED at model time
+        (see ``fin.host.agent_instructions``) and NEVER enters the
+        ``evidence`` channel — an attachment-only span cannot pass
+        the citation gate (ADR 0046). Storage is a turn blob in the
+        workspace router's memory; nothing is written to the corpus
+        store or any extracted tree, and nothing is pushed.
     """
 
     messages: Annotated[list[BaseMessage], add_messages]
@@ -381,17 +394,25 @@ class AgentState(TypedDict, total=False):
     issuer_plan: dict[str, Any]
     issuer_findings: Annotated[list[dict[str, Any]], _issuer_findings_reducer]
     issuer_fanout: dict[str, Any]
+    # corpus-serve-ingest T4 (ADR 0047): turn-scoped attachment blobs.
+    # Overwrite semantics (single writer: the run input); see the
+    # field docstring above for the citation/isolation contract.
+    attachments: list[dict[str, str]]
 
 
-def reset_input_state(question: str) -> dict[str, Any]:
+def reset_input_state(
+    question: str,
+    attachments: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
     """Build the standard run-scoped reset input for ``graph.invoke``.
 
-    Every invoke resets the eight run-scoped fields (ADR 0016, spec
-    line 34 - the six v1 fields plus T3's ``thinking_text`` /
-    ``tool_summaries``) while leaving ``messages`` to
-    ``add_messages`` accumulation. Centralised so the three call
-    sites (``/ask``, ``/api/threads/{id}/messages``, CLI ``run``)
-    cannot drift on which fields are reset.
+    Every invoke resets the run-scoped fields (ADR 0016, spec line 34
+    - the six v1 fields plus T3's ``thinking_text`` /
+    ``tool_summaries`` and the later comparison / fan-out channels)
+    while leaving ``messages`` to ``add_messages`` accumulation.
+    Centralised so the three call sites (``/ask``,
+    ``/api/threads/{id}/messages``, CLI ``run``) cannot drift on which
+    fields are reset.
 
     Returns a dict suitable for ``graph.invoke(state, config=...)``
     that clears ``evidence`` (via the ``EVIDENCE_RESET`` sentinel),
@@ -399,6 +420,14 @@ def reset_input_state(question: str) -> dict[str, Any]:
     ``answer`` / ``citations`` / ``status``. ``messages`` carries
     only the new ``HumanMessage(question)``; the checkpointer's
     ``add_messages`` reducer merges it with prior conversation.
+
+    ``attachments`` (corpus-serve-ingest T4, ADR 0047): the caller
+    passes the turn-scoped attachment blobs (``{attachment_id,
+    filename, text}``) referenced by THIS send; the default ``None``
+    yields ``[]`` so a follow-up send without attachments genuinely
+    clears the channel — the previous turn's attachment text cannot
+    leak into the next run. The text is injected call-scoped at model
+    time and never enters ``evidence`` (ADR 0046).
     """
     return {
         "messages": [HumanMessage(content=question)],
@@ -431,6 +460,11 @@ def reset_input_state(question: str) -> dict[str, Any]:
         # rewrites track + track_decision on the new run.
         # status_snapshots are durable thread history (T3) — omit.
         "track_decision": {},
+        # corpus-serve-ingest T4 (ADR 0047): the incoming attachment
+        # blobs ride THIS run's input; every run without attachments
+        # (default ``None``) clears the channel so attachment text is
+        # this-turn only.
+        "attachments": list(attachments or []),
     }
 
 

@@ -24,6 +24,16 @@ AAPL_2022Q3_VERSION = (
 )
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
+# Legacy tree-backed read adapter over the committed corpus. Only the
+# scripted ``read_file`` transcripts need it; the default graph no
+# longer reads the tree on its own (ADR 0046 / 0047).
+from fin.retrieve import ExtractedTreeReadPort
+
+_TREE_READ_PORT = ExtractedTreeReadPort(
+    Path("data/corpus/manifest.json"),
+    Path("data/corpus/extracted"),
+)
+
 
 @pytest.fixture(scope="module")
 def aapl_page1_text():
@@ -53,6 +63,7 @@ def test_greeting_dialogue_skips_citation_gate_and_does_not_checkpoint_prompt():
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         {
@@ -101,6 +112,7 @@ def test_off_domain_soft_done_not_refuse():
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         {
@@ -158,6 +170,7 @@ def test_research_fact_script_still_done_with_citation(aapl_page1_text):
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         {
@@ -181,11 +194,13 @@ def test_compile_graph_identity_unchanged_under_soft_track():
         checkpointer=checkpointer,
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     g2 = compile_graph(
         checkpointer=checkpointer,
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     assert g1 is g2
 
@@ -210,6 +225,7 @@ def test_dialogue_model_sees_dialogue_prompt_not_research_prompt():
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     g.invoke(
         {

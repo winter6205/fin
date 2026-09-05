@@ -11,7 +11,9 @@ import { submitFeedback, type FeedbackValue } from "./feedback";
 import { forgetLastThreadIf, rememberLastThread } from "./lastThread";
 import type {
   Filing,
+  IngestResult,
   Notice,
+  ThreadAttachment,
   ThreadDetail,
   ThreadListItem,
   ToolSummary,
@@ -72,6 +74,7 @@ interface WorkspaceState {
     threadId: string,
     question: string,
     thinkingOn?: boolean,
+    attachmentIds?: string[],
   ) => Promise<api.SendResult | null>;
   // T4 (spec line 39): resume an interrupted run from the last
   // complete node. Mirrors ``sendQuestion``'s streaming-event
@@ -94,6 +97,15 @@ interface WorkspaceState {
   // resolves with the terminal stopped frames, so this action only has
   // to signal and refresh the turn table.
   stopRun: (threadId: string) => Promise<void>;
+  // corpus-serve-ingest T5 (ADR 0047 **corpus ingest**): the ingest
+  // door. The ONLY action that triggers 切分 + push; a success
+  // refreshes the corpus list the operator is looking at, a named
+  // failure rethrows for the control to render (ingestFailure.ts).
+  ingestFile: (file: File) => Promise<IngestResult>;
+  // corpus-serve-ingest T5 (ADR 0047 **thread attach**): the attach
+  // door. Mints a turn-scoped attachment id; NEVER touches the
+  // ingest endpoint — the doors must not cross.
+  attachFile: (threadId: string, file: File) => Promise<ThreadAttachment>;
   // T8: record (or flip) the operator's thumb for one run. Response-
   // driven (matching ``dismissNotice``'s convention): the turn row is
   // patched only after the host confirms the persisted value, so the
@@ -189,7 +201,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }));
   },
 
-  async sendQuestion(threadId, question, thinkingOn = true) {
+  async sendQuestion(threadId, question, thinkingOn = true, attachmentIds) {
     if (!question.trim()) return null; // Empty submit is a no-op.
     if (get().sendingQuestion) return null; // No queue in T1.
     set({ sendingQuestion: true });
@@ -261,99 +273,101 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // bounce retry accumulates behind the visible draft.
     let statusSeen = false;
     let answerFold: LiveAnswerState = EMPTY_LIVE_ANSWER;
+    // corpus-serve-ingest T5 (ADR 0047 thread attach): the ids the
+    // attach door minted ride THIS send and are consumed by it
+    // (single use). The attach path never touches /api/corpus/ingest.
+    const request: api.SendRequest = { question, thinking: thinkingOn };
+    if (attachmentIds && attachmentIds.length > 0) {
+      request.attachment_ids = attachmentIds;
+    }
     try {
-      const result = await api.sendMessage(
-        threadId,
-        { question, thinking: thinkingOn },
-        (event) => {
-          switch (event.type) {
-            case "thinking":
-              patchTurn((t) => ({
-                ...t,
-                thinking_text: t.thinking_text + event.text,
-              }));
-              break;
-            case "tool_call": {
-              // Append a placeholder row so the operator sees a
-              // running indicator while the tool executes. The
-              // matching ``tool_result`` replaces it with the
-              // server-formatted one-liner.
-              const placeholder: ToolSummary = {
-                name: event.name,
-                summary: "运行中…",
-                tool_call_id: event.tool_call_id,
-              };
-              patchTurn((t) => ({
-                ...t,
-                tool_summaries: [...(t.tool_summaries ?? []), placeholder],
-              }));
-              break;
-            }
-            case "tool_result": {
-              // The server already formatted the summary (spec line
-              // 32); replace the "running…" placeholder with it.
-              patchTurn((t) => ({
-                ...t,
-                tool_summaries: (t.tool_summaries ?? []).map((s) =>
-                  s.tool_call_id === event.tool_call_id
-                    ? { ...s, summary: event.summary }
-                    : s,
-                ),
-              }));
-              break;
-            }
-            case "status": {
-              statusSeen = true;
-              // Patch by the CLIENT placeholder id first — updating
-              // ``optimisticRunId`` before the patch would orphan the
-              // optimistic row and freeze the live view until GET.
-              const priorRunId = optimisticRunId;
-              patchTurnByRunId(priorRunId, (t) => ({
-                ...t,
-                run_id: event.run_id,
-                status: event.status,
-                status_reason: event.reason ?? "",
-                assistant_message: event.assistant_message,
-                // Soft-Track: optional until host SSE includes track.
-                track: event.track ?? t.track,
-                track_decision: event.track_decision ?? t.track_decision,
-                // Mid-flight stream taxonomy: only set on refuse
-                // rows whose refusal came from the stream engine;
-                // an empty value from the wire keeps the prior
-                // row's value (a fresh turn starts as ``""``).
-                status_classified:
-                  event.status_classified !== undefined
-                    ? event.status_classified
-                    : t.status_classified,
-                // T4 (#37): the run ended — thinking collapses to the
-                // duration label, tool rows collapse.
-                in_flight: false,
-                thinking_duration_ms:
-                  event.thinking_ms ?? t.thinking_duration_ms,
-              }));
-              optimisticRunId = event.run_id;
-              break;
-            }
-            case "answer":
-              answerFold = foldLiveAnswer(answerFold, {
-                text: event.text,
-                reset: event.reset,
-                statusSeen,
-              });
-              patchTurn((t) => ({ ...t, answer: answerFold.visible }));
-              break;
-            case "citations":
-              patchTurn((t) => ({ ...t, citations: event.citations }));
-              break;
-            case "comparison":
-              patchTurn((t) => ({
-                ...t,
-                comparisons: [...(t.comparisons ?? []), event.comparison],
-              }));
-              break;
+      const result = await api.sendMessage(threadId, request, (event) => {
+        switch (event.type) {
+          case "thinking":
+            patchTurn((t) => ({
+              ...t,
+              thinking_text: t.thinking_text + event.text,
+            }));
+            break;
+          case "tool_call": {
+            // Append a placeholder row so the operator sees a
+            // running indicator while the tool executes. The
+            // matching ``tool_result`` replaces it with the
+            // server-formatted one-liner.
+            const placeholder: ToolSummary = {
+              name: event.name,
+              summary: "运行中…",
+              tool_call_id: event.tool_call_id,
+            };
+            patchTurn((t) => ({
+              ...t,
+              tool_summaries: [...(t.tool_summaries ?? []), placeholder],
+            }));
+            break;
           }
-        },
-      );
+          case "tool_result": {
+            // The server already formatted the summary (spec line
+            // 32); replace the "running…" placeholder with it.
+            patchTurn((t) => ({
+              ...t,
+              tool_summaries: (t.tool_summaries ?? []).map((s) =>
+                s.tool_call_id === event.tool_call_id
+                  ? { ...s, summary: event.summary }
+                  : s,
+              ),
+            }));
+            break;
+          }
+          case "status": {
+            statusSeen = true;
+            // Patch by the CLIENT placeholder id first — updating
+            // ``optimisticRunId`` before the patch would orphan the
+            // optimistic row and freeze the live view until GET.
+            const priorRunId = optimisticRunId;
+            patchTurnByRunId(priorRunId, (t) => ({
+              ...t,
+              run_id: event.run_id,
+              status: event.status,
+              status_reason: event.reason ?? "",
+              assistant_message: event.assistant_message,
+              // Soft-Track: optional until host SSE includes track.
+              track: event.track ?? t.track,
+              track_decision: event.track_decision ?? t.track_decision,
+              // Mid-flight stream taxonomy: only set on refuse
+              // rows whose refusal came from the stream engine;
+              // an empty value from the wire keeps the prior
+              // row's value (a fresh turn starts as ``""``).
+              status_classified:
+                event.status_classified !== undefined
+                  ? event.status_classified
+                  : t.status_classified,
+              // T4 (#37): the run ended — thinking collapses to the
+              // duration label, tool rows collapse.
+              in_flight: false,
+              thinking_duration_ms: event.thinking_ms ?? t.thinking_duration_ms,
+            }));
+            optimisticRunId = event.run_id;
+            break;
+          }
+          case "answer":
+            answerFold = foldLiveAnswer(answerFold, {
+              text: event.text,
+              reset: event.reset,
+              statusSeen,
+            });
+            patchTurn((t) => ({ ...t, answer: answerFold.visible }));
+            break;
+          case "citations":
+            patchTurn((t) => ({ ...t, citations: event.citations }));
+            break;
+          case "comparison":
+            patchTurn((t) => ({
+              ...t,
+              comparisons: [...(t.comparisons ?? []), event.comparison],
+            }));
+            break;
+        }
+      });
       // The SSE stream already delivered terminal status, answer, and
       // citations. Re-GET'ing here used to replace the live turn row
       // and caused a visible retract/repop even when merge logic ran
@@ -598,6 +612,23 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         set({ stoppingThreadId: null });
       }
     }
+  },
+
+  async ingestFile(file: File) {
+    // The corpus-ingest door (ADR 0047): the ONLY action that
+    // triggers 切分 + MCP push. Named failures rethrow so the control
+    // can render them (ingestFailure.ts) — no half-success here; the
+    // corpus list refresh happens only after a fully successful push.
+    const result = await api.ingestCorpus(file);
+    await get().loadCorpus();
+    return result;
+  },
+
+  async attachFile(threadId: string, file: File) {
+    // The thread-attach door (ADR 0047): mints a turn-scoped
+    // attachment the NEXT send references once. Deliberately does
+    // NOT touch /api/corpus/ingest — the two doors must not cross.
+    return api.attachToThread(threadId, file);
   },
 
   async setTurnFeedback(threadId, runId, value) {

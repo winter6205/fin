@@ -27,6 +27,16 @@ AAPL_2023Q3_VERSION = (
     "7b9b54830f070aab56cd842b391dd81d21613aacda2cb92234f43b997930b0ea"
 )
 KNOWN_IDS = {"AAPL-2022Q3", "AAPL-2023Q3"}
+
+# Legacy tree-backed read adapter over the committed corpus. Only the
+# scripted ``read_file`` transcripts need it; the default graph no
+# longer reads the tree on its own (ADR 0046 / 0047).
+from fin.retrieve import ExtractedTreeReadPort
+
+_TREE_READ_PORT = ExtractedTreeReadPort(
+    Path("data/corpus/manifest.json"),
+    Path("data/corpus/extracted"),
+)
 PAGE_SPAN = "UNITED STATES SECURITIES AND EXCHANGE COMMISSION"
 
 
@@ -56,6 +66,7 @@ def test_compile_graph_registers_t6_analysis_tools() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
         manifest_path=DATA_DIR / "manifest.json",
         extracted_root=DATA_DIR / "extracted",
         facts_root=DATA_DIR / "facts",
@@ -73,6 +84,7 @@ def test_redline_tool_result_lands_on_graph_state() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
         manifest_path=DATA_DIR / "manifest.json",
         extracted_root=DATA_DIR / "extracted",
         facts_root=DATA_DIR / "facts",
@@ -144,6 +156,7 @@ def test_workspace_get_history_contains_structured_redline(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
         manifest_path=DATA_DIR / "manifest.json",
         extracted_root=DATA_DIR / "extracted",
         facts_root=DATA_DIR / "facts",
@@ -230,6 +243,7 @@ def test_statement_numbers_are_checked_by_numeric_gate(tmp_path: Path) -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
         manifest_path=DATA_DIR / "manifest.json",
         extracted_root=DATA_DIR / "extracted",
         facts_root=facts_root,

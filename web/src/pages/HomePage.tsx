@@ -5,6 +5,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import CorpusCard from "../components/CorpusCard";
+import IngestCorpusControl from "../components/IngestCorpusControl";
 import { corpusSummary } from "../corpusCards";
 import {
   decideLastThreadRestore,
@@ -102,24 +103,37 @@ export default function HomePage() {
               <CorpusSkeletonCard />
             </div>
           </>
-        ) : corpus.length === 0 ? (
-          <div className="border border-black bg-card p-4 max-w-md">
-            <h3 className="text-base font-semibold mb-1">Corpus 尚未 ingest</h3>
-            <p className="text-sm text-gray-600 mb-3">
-              索引已就绪，但提取树为空。请运行 ingest 后再提问。
-            </p>
-            <StartEmptyThreadButton />
-          </div>
         ) : (
           <>
-            <h3 className="text-base font-semibold mb-2">
-              Corpus（{corpusSummary(corpus)}）
-            </h3>
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-              {corpus.map((f) => (
-                <CorpusCard key={f.document_id} filing={f} />
-              ))}
-            </div>
+            {/* T5 (ADR 0047): the corpus-ingest door. One placement
+                for both corpus states — the empty-corpus copy below
+                says "请运行 ingest 入库后再提问", and the door IS
+                that answer; the loaded grid keeps it so re-ingest
+                stays reachable without leaving the page. Never a
+                Composer control, never drag-to-thread. */}
+            <IngestCorpusControl />
+            {corpus.length === 0 ? (
+              <div className="border border-black bg-card p-4 max-w-md">
+                <h3 className="text-base font-semibold mb-1">
+                  Corpus 尚未 ingest
+                </h3>
+                <p className="text-sm text-gray-600 mb-3">
+                  语料 catalog 为空。请运行 ingest 入库后再提问。
+                </p>
+                <StartEmptyThreadButton />
+              </div>
+            ) : (
+              <>
+                <h3 className="text-base font-semibold mb-2">
+                  Corpus（{corpusSummary(corpus)}）
+                </h3>
+                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                  {corpus.map((f) => (
+                    <CorpusCard key={f.document_id} filing={f} />
+                  ))}
+                </div>
+              </>
+            )}
           </>
         )}
       </section>

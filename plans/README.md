@@ -4,7 +4,7 @@
 
 **总计划（阶段表，不再当实施队列）：** [`retrieval-upgrade.md`](retrieval-upgrade.md)
 
-**下一刀实施：** [`memory-dialogue-platform.md`](memory-dialogue-platform.md)（worktree `docs/memory-dialogue-platform`）。压缩已闭合：session-compaction 合入 main（that pull request）。资料入库在 `/home/winner/projects/fin-wt-corpus-serve-ingest`，不要在本树做。
+**下一刀实施：** [`corpus-serve-ingest.md`](corpus-serve-ingest.md)（本树）。MDP 其余波见 [`memory-dialogue-platform.md`](memory-dialogue-platform.md)——T8/T9 已闭合（that pull request）；压缩已闭合（that pull request，ADR 0044）。
 
 **仍开着的 retrieve 内部债（非跨仓主线）：** [`retrieve-maintainability-followup.md`](retrieve-maintainability-followup.md)、[`2026-09-01-pr225-followup-plan-a.md`](2026-09-01-pr225-followup-plan-a.md)
 

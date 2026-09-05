@@ -7,4 +7,6 @@ S1 product retrieve is an MCP client to **iknow-memory** behind the existing ret
 
 Amended 2026-08-31 (ADR 0037): the chunking clause above is re-ruled at the clause level — chunking for retrieve (including later parent/child or section splits) is owned by **fin**, and the retrieval service stores and returns the pushed text as-is without any re-splitting; ranking, fusion, and rerank still stay outside fin. The rest of this record's decisions (and its superseded status) are unchanged.
 
+Amended 2026-09-04 (ADR 0046): the clause "do not move the extracted cite tree into iknow-memory" no longer means serve-time dual SSOT. Pushed chunk text in the retrieve backend is the serve-time evidence body; ingest-time freeze/切分 stay in fin.
+
 Considered Options: keep BM25 as fallback (two ranking stacks); hybrid implemented inside fin (duplicates iknow-memory).

@@ -33,6 +33,16 @@ AAPL_2022Q3_VERSION = (
 )
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
+# Legacy tree-backed read adapter over the committed corpus. Only the
+# scripted ``read_file`` transcripts need it; the default graph no
+# longer reads the tree on its own (ADR 0046 / 0047).
+from fin.retrieve import ExtractedTreeReadPort
+
+_TREE_READ_PORT = ExtractedTreeReadPort(
+    Path("data/corpus/manifest.json"),
+    Path("data/corpus/extracted"),
+)
+
 
 @pytest.fixture(scope="module")
 def aapl_page1_text() -> str:
@@ -107,6 +117,7 @@ def test_must_greeting_dialogue_no_tools_no_gate_done_empty_cites() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         {**reset_input_state("Hi!"), "evidence": []},
@@ -127,6 +138,7 @@ def test_must_greeting_boundary_thanks_is_dialogue() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         {**reset_input_state("Thanks!"), "evidence": []},
@@ -146,6 +158,7 @@ def test_must_greeting_boundary_no_durable_dialogue_system() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     g.invoke(
         {**reset_input_state("Hello"), "evidence": []},
@@ -180,6 +193,7 @@ def test_must_underspec_clarify_no_tools_done_empty_cites() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         {**reset_input_state("What was revenue?"), "evidence": []},
@@ -202,6 +216,7 @@ def test_must_clarify_boundary_metric_only_stays_clarify() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         {**reset_input_state("What was operating income?"), "evidence": []},
@@ -218,6 +233,7 @@ def test_must_clarify_boundary_never_enters_citation_gate() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         {**reset_input_state("net sales?"), "evidence": []},
@@ -248,6 +264,7 @@ def test_must_off_topic_soft_done_not_refuse() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         {
@@ -272,6 +289,7 @@ def test_must_off_topic_boundary_recipe_soft_done() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         {
@@ -292,6 +310,7 @@ def test_must_off_topic_boundary_empty_cites_and_answer() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         {**reset_input_state("Tell me a joke about cats"), "evidence": []},
@@ -334,6 +353,7 @@ def test_must_research_tools_span_done_with_citation(aapl_page1_text: str) -> No
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         {
@@ -377,6 +397,7 @@ def test_must_research_boundary_bare_q_is_dialogue(aapl_page1_text: str) -> None
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         {**reset_input_state("q"), "evidence": []},
@@ -419,6 +440,7 @@ def test_must_research_boundary_workspace_sse_track_and_history(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     store = InMemoryThreadStore()
     app.dependency_overrides[get_graph] = lambda: g
@@ -468,6 +490,7 @@ def test_must_prior_snapshot_short_followup_inherits_research() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     tid = "ship-inherit"
     g.invoke(
@@ -524,6 +547,7 @@ def test_matrix_empty_blank_underspec_or_empty_snapshot() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         {**reset_input_state("revenue"), "evidence": []},
@@ -544,6 +568,7 @@ def test_matrix_negative_off_domain_wrong_track() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         {**reset_input_state("What's the weather in Seattle today?"), "evidence": []},
@@ -569,6 +594,7 @@ def test_matrix_overflow_caps_research_only_snapshots_retained(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     tid = "ship-overflow-repair"
     out = g.invoke(
@@ -598,6 +624,7 @@ def test_matrix_overflow_caps_research_only_snapshots_retained(
         checkpointer=InMemorySaver(),
         model=model2,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     tid2 = "ship-overflow-snap"
     g2.invoke(
@@ -640,6 +667,7 @@ def test_matrix_concurrent_soft_track_send_409() -> None:
         checkpointer=InMemorySaver(),
         model=blocking,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     store = InMemoryThreadStore()
     app.dependency_overrides[get_graph] = lambda: g
@@ -704,6 +732,7 @@ def test_matrix_exception_classify_exit_defined_track() -> None:
         model=model,
         classify_model=stub,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     out = g.invoke(
         {
