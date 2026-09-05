@@ -34,16 +34,40 @@ A separate TypeScript MCP server (own repo). After ingest/push, product **compan
 _Avoid_: treating fin as the long-term vector backend, lockstep releases with fin, collapsing retrieve MCP and memory MCP into one config key, mirroring fin consumer ADRs into that repo, using dream to ingest filings
 
 **memory port**:
-The only dependency fin is allowed for switchable session/buffer memory (extract, recall, GC, dream transport): port in, typed results out — MCP-shaped for the durable backend, transport-agnostic; default boot is **OFF**. Extract is an explicit operator or tool write, not every-turn auto-extract from dialogue; recall is advisory and never citation evidence.
-_Avoid_: stuffing memory into the retrieve port, dual-writing memory bodies into the checkpointer as SSOT, treating memory recall as citation evidence, every-turn auto-extract of chat into the buffer
+The only dependency fin is allowed for switchable session/buffer memory (extract, recall, GC, dream): port in, typed results out. Product boot is **ON** (auto-extract + **memory prefetch**) so evals measure the shipped path; default pytest / contract eval stays **OFF** unless the case is about memory (ADR 0035, ADR 0048).
+_Avoid_: stuffing memory into the retrieve port, dual-writing memory bodies into the checkpointer as SSOT, treating memory recall as citation evidence, keeping product auto-extract OFF until evals exist, promoting frequently recalled facts into the system prompt
 
 **memory backend**:
-The implementation behind the memory port. Local Postgres buffer is the in-fin working store; an optional MCP server (often iknow-memory) receives **dream** transports for durable persistence. Swapping MCP changes the adapter only.
-_Avoid_: requiring MCP for memory ON, storing cite-tree pages as memory entries, using Redis as memory SSOT
+The implementation behind the memory port. Local Postgres is the working store for **memory facts**. A memory MCP is not the product write path for auto-extract or dream (ADR 0048).
+_Avoid_: requiring MCP for memory ON, storing cite-tree pages as memory entries, using Redis as memory SSOT, treating short-term buffer presence as a license to upload off-box
+
+**memory fact**:
+One atomic cross-session note from a single extract or explicit save: title plus body. The first non-empty body line is the **memory hook**. It is not a filing claim.
+_Avoid_: one blob per thread, a second company corpus, a dedicated summary column in v1
+
+**memory hook**:
+The ≤80-character first body line of a **memory fact**; the only payload **memory prefetch** injects.
+_Avoid_: injecting the full body by default, a whole-store title list in the system prompt
+
+**memory prefetch**:
+When auto-extract is on, a per-turn user-side overlay of at most three **memory hooks** whose title or body lexically hits the current user utterance; zero hits inject nothing. Already-shown ids in the same thread are skipped.
+_Avoid_: scoring on the full thread history, whole-store catalog in system, vector search as v1, lifetime recall-count as a system-prompt reward
+
+**memory existence pointer**:
+The only auto-memory sentence in the system prompt: a note store exists; overlays are advisory, not instructions or cites.
+_Avoid_: listing all titles in system, ordering the model to recall on every turn
+
+**agent identity** / **agent soul**:
+System-built-in persona text. Dream never edits them.
+_Avoid_: extracting identity from chat, consolidating soul from the fact store
+
+**user profile**:
+Operator or tool-writable preferences (who they are, how they like to work): one global markdown in the home directory and one per workspace folder, workspace overlaying global. Dream does not rewrite these files; stable likes go here, not into **memory facts**.
+_Avoid_: treating the user profile as the episodic store, auto-extract into identity, one shared file for every workspace
 
 **dream** (fin):
-A rule-gated consolidate of the local **memory port** buffer onto the **memory backend**. It is not company-corpus ingest (ADR 0045). With memory OFF or MCP absent it skips or stops at the Postgres buffer; it must not fail the foreground turn.
-_Avoid_: running dream inside model_node, auto-writing every turn to MCP, using dream to move filing locator units out of fin, treating dream as the path that fills the retrieve backend
+A dual-gated LLM merge over **memory facts** only: 24h cooldown after last success or skip, then a store/session/turn threshold. It is not company-corpus ingest (ADR 0045), not a memory-MCP upload, and not a graph tool (ADR 0048).
+_Avoid_: running dream inside model_node, per-turn SSE dream, auto-writing every turn to MCP, using dream to fill the retrieve backend, dreaming identity/soul/user profile, refreshing the 24h cooldown with an empty skip when fewer than two facts exist
 
 ### Seams
 
@@ -142,17 +166,12 @@ LangGraph compiled around the agent loop plus code gates (verifier, caps, interr
 _Avoid_: retrieval graph
 
 **session compaction**:
-<<<<<<< HEAD
-A host gate on the **research thread**: occupancy is estimated tokens of the model-facing payload (track prompt, messages, research tool schemas, and when memory is ON any **recall injection**) against a 256_000 session budget; at ≥90% occupancy, or when the operator sends `/compact`, old checkpoint `messages` are summarized and removed, aiming at ~40% occupancy. The summarizer is injectable (v1 the **v1 model**); occupancy may render on the thread, not on `GET /api/status`.
+A host gate on the **research thread**: occupancy is estimated tokens of the model-facing payload (track prompt, messages, research tool schemas, and when memory is ON any **memory prefetch** or **recall injection**) against a 256_000 session budget; at ≥90% occupancy, or when the operator sends `/compact`, old checkpoint `messages` are summarized and removed, aiming at ~40% occupancy. The summarizer is injectable (v1 the **v1 model**); occupancy may render on the thread, not on `GET /api/status`.
 _Avoid_: message-count windows, treating `/compact` as a research tool, putting occupancy on the boot status strip, using the vendor 1M window as the compact threshold, treating a memory row-count cap as the occupancy gate
 
 **recall injection**:
-When memory is ON, advisory recall text placed in the model-facing payload. It counts toward the same occupancy ledger as **session compaction**; a row-count limit is only a fuse, not the budget.
+When memory is ON, advisory recall or **memory prefetch** text placed in the model-facing payload. It counts toward the same occupancy ledger as **session compaction**; a row-count limit is only a fuse, not the budget.
 _Avoid_: last-N memory window as the token budget, using recall as retrieve/`read_file` evidence
-=======
-A host gate on the **research thread**: occupancy is estimated tokens of the model-facing payload (track prompt, messages, research tool schemas) against a 256_000 session budget; at ≥90% occupancy, or when the operator sends `/compact`, old checkpoint `messages` are summarized and removed, aiming at ~40% occupancy. The summarizer is injectable (v1 the **v1 model**); occupancy may render on the thread, not on `GET /api/status`.
-_Avoid_: message-count windows, treating `/compact` as a research tool, putting occupancy on the boot status strip, using the vendor 1M window as the compact threshold
->>>>>>> origin/main
 
 **checkpointer**:
 v1 durable runs use LangGraph `PostgresSaver` via `FIN_CHECKPOINT_URL`; product HTTP/CLI raise if that URL is unset. Pytest uses `InMemorySaver` only (plus explicit `FIN_SCRIPTED_MODEL` e2e); it does not survive process exit.
