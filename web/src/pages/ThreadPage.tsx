@@ -29,6 +29,7 @@ import {
   type FeedbackValue,
 } from "../turnFeedback";
 import { useWorkspaceStore } from "../store";
+import { occupancyPercent, parseThreadOccupancy } from "../threadOccupancy";
 
 // T4 (spec line 38-39): the interrupted-run banner. Shown when
 // the latest turn row reports ``in_flight`` after a reload —
@@ -49,6 +50,26 @@ function InterruptedRunBanner({ threadId }: { threadId: string }) {
         正在 Resume…
       </span>
     </div>
+  );
+}
+
+// T3 (ADR 0044): thread token occupancy, from the SAME host figure
+// the auto-compact gate computes. A thin unobtrusive percentage
+// chip in the thread header; renders nothing for a thread with no
+// checkpoint (never sent on) rather than a fabricated 0%.
+function OccupancyBadge({
+  occupancy,
+}: {
+  occupancy: ReturnType<typeof parseThreadOccupancy>;
+}) {
+  if (!occupancy) return null;
+  return (
+    <span
+      className="text-xs font-mono text-gray-500 whitespace-nowrap"
+      title="会话上下文占用（与自动压缩门同一口径）"
+    >
+      {occupancyPercent(occupancy)}
+    </span>
   );
 }
 
@@ -113,6 +134,7 @@ export default function ThreadPage() {
             创建于 {new Date(activeThread.created_at).toLocaleString()}
           </p>
         </div>
+        <OccupancyBadge occupancy={parseThreadOccupancy(activeThread)} />
         <ExportLinks threadId={thread_id} turns={activeThread.turns} />
       </header>
 

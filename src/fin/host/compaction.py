@@ -96,7 +96,15 @@ def _validate_limits(
         )
 
 
-def _copy_snapshot(status_snapshots: Sequence[Mapping[str, Any]] | None) -> dict[str, Any]:
+def copy_snapshot(
+    status_snapshots: Sequence[Mapping[str, Any]] | None,
+) -> dict[str, Any]:
+    """Public copy of the latest status snapshot's known slots.
+
+    Shared with ``fin.host.session_compaction`` (Std-M3). Raises
+    :class:`CompactionInputError` on malformed input so callers can
+    catch it typed.
+    """
     if status_snapshots is None or len(status_snapshots) == 0:
         return {}
     latest = status_snapshots[-1]
@@ -116,6 +124,11 @@ def _copy_snapshot(status_snapshots: Sequence[Mapping[str, Any]] | None) -> dict
     return snapshot
 
 
+# Backward-compat alias (existing call sites inside this module and
+# potential external users of the underscore name).
+_copy_snapshot = copy_snapshot
+
+
 def _validate_messages(messages: Sequence[BaseMessage] | None) -> list[BaseMessage]:
     if messages is None:
         raise CompactionInputError("messages must be a sequence, not None")
@@ -132,10 +145,14 @@ def _message_text(message: BaseMessage) -> str:
     return str(content)
 
 
-def _extract_existing_compaction(
+def extract_existing_compaction(
     messages: list[BaseMessage],
 ) -> tuple[list[BaseMessage], str, dict[str, Any]]:
-    """Remove a leading marker and recover state for the next pass."""
+    """Public form of :func:`_extract_existing_compaction` — remove a
+    leading summary marker and recover state for the next pass.
+
+    Shared with ``fin.host.session_compaction`` (Std-M3).
+    """
     if not messages or not isinstance(messages[0], SystemMessage):
         return messages, "", {}
     message = messages[0]
@@ -155,13 +172,20 @@ def _extract_existing_compaction(
     return messages[1:], summary, dict(embedded_snapshot)
 
 
+# Backward-compat alias.
+_extract_existing_compaction = extract_existing_compaction
+
+
 def _bounded_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1].rstrip() + "…"
 
 
-def _snapshot_text(snapshot: Mapping[str, Any]) -> str:
+def snapshot_text(snapshot: Mapping[str, Any]) -> str:
+    """Public form of :func:`_snapshot_text` — render the snapshot
+    slots as ``key=value`` text (Std-M3: shared with
+    ``fin.host.session_compaction``)."""
     if not snapshot:
         return ""
     fields: list[str] = []
@@ -173,9 +197,18 @@ def _snapshot_text(snapshot: Mapping[str, Any]) -> str:
     return "; ".join(fields)
 
 
-def _render_summary_message(summary: str, snapshot: Mapping[str, Any]) -> SystemMessage:
+# Backward-compat alias.
+_snapshot_text = snapshot_text
+
+
+def render_summary_message(
+    summary: str, snapshot: Mapping[str, Any]
+) -> SystemMessage:
+    """Public form of :func:`_render_summary_message` — build the
+    leading ``SystemMessage`` carrying the summary + snapshot slots
+    (Std-M3: shared with ``fin.host.session_compaction``)."""
     lines = [_SUMMARY_MARKER, summary or "(earlier conversation omitted)"]
-    slots = _snapshot_text(snapshot)
+    slots = snapshot_text(snapshot)
     if slots:
         lines.append(f"Active status snapshot: {slots}")
     return SystemMessage(
@@ -188,10 +221,17 @@ def _render_summary_message(summary: str, snapshot: Mapping[str, Any]) -> System
     )
 
 
-def _default_summary(
+# Backward-compat alias.
+_render_summary_message = render_summary_message
+
+
+def default_summary(
     evicted: Sequence[BaseMessage],
     previous_summary: str,
 ) -> str:
+    """Public form of :func:`_default_summary` — the no-model
+    fallback summary (Std-M3: shared with
+    ``fin.host.session_compaction``)."""
     pieces: list[str] = []
     if previous_summary:
         pieces.append(f"Earlier summary: {previous_summary}")
@@ -202,13 +242,34 @@ def _default_summary(
     return " | ".join(pieces) or "(earlier conversation omitted)"
 
 
-def _response_text(response: Any) -> str:
+# Backward-compat alias.
+_default_summary = default_summary
+
+
+def response_text(
+    response: Any,
+    *,
+    error: type[Exception] = SummaryModelError,
+) -> str:
+    """Extract stripped text from a summarizer response.
+
+    Shared by ``fin.host.compaction`` and
+    ``fin.host.session_compaction`` (Std-M4: one copy of the
+    response-shape handling). Accepts a plain string or a message
+    with a string ``content``; anything else raises ``error`` (each
+    module passes its own typed failure so the seam stays typed).
+    """
     if isinstance(response, str):
         return response.strip()
     content = getattr(response, "content", None)
     if isinstance(content, str):
         return content.strip()
-    raise SummaryModelError("summary model must return text or a message with text")
+    raise error("summary model must return text or a message with text")
+
+
+def _response_text(response: Any) -> str:
+    """Backward-compat alias for :func:`response_text`."""
+    return response_text(response)
 
 
 class SessionCompactor:
@@ -354,10 +415,17 @@ __all__ = [
     "DEFAULT_KEEP_LAST",
     "DEFAULT_MAX_SUMMARY_CHARS",
     "DEFAULT_WINDOW_SIZE",
+    "MAX_SUMMARY_CHARS",
     "SessionCompactionError",
     "SessionCompactor",
     "SlidingWindowCompactor",
     "SummaryModelError",
     "compact_messages",
     "compact_session",
+    "copy_snapshot",
+    "default_summary",
+    "extract_existing_compaction",
+    "render_summary_message",
+    "response_text",
+    "snapshot_text",
 ]

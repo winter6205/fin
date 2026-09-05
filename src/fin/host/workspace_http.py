@@ -585,6 +585,20 @@ class WorkspaceStatusResponse(BaseModel):
     corpus_filing_count: int
 
 
+class Occupancy(BaseModel):
+    """Thread-detail token occupancy (ADR 0044 T3).
+
+    ``ratio`` is the shared compactor figure (the compactor clamps
+    to [0, 1]); ``estimated_tokens`` and ``budget_tokens`` are
+    exposed so the UI can render an absolute figure without
+    re-deriving the budget.
+    """
+
+    estimated_tokens: int
+    budget_tokens: int
+    ratio: float
+
+
 class ThreadDetailResponse(BaseModel):
     id: str
     title: str
@@ -604,6 +618,15 @@ class ThreadDetailResponse(BaseModel):
     # needed). ``pending_checkpoint`` derives from
     # ``pending_nodes(thread_id) and not is_locked``.
     pending_checkpoint: bool = False
+    # T3 (ADR 0044): token occupancy from the SAME figure the
+    # compaction gate computes (``graph.occupancy(thread_id)`` ->
+    # ``OccupancyCompactor.occupancy`` over the checkpointed
+    # messages vs the session budget). ``None`` for a thread with
+    # no checkpoint (never sent on) — the UI stays neutral rather
+    # than showing a fabricated 0%. This is the thread-scoped
+    # surface ONLY: ADR 0033 keeps ``GET /api/status`` free of any
+    # occupancy / context-window figure.
+    occupancy: Occupancy | None = None
     turns: list[TurnRow]
 
 
@@ -1198,6 +1221,136 @@ def _persist_and_close_stopped_run(
     yield from _stopped_terminal_frames(run_id, thinking_ms=thinking_ms)
 
 
+# T2 (ADR 0044 / plan session-compaction T2): operator receipt copy for
+# the ``/compact`` command. Plain-prose Chinese like every other
+# operator-facing copy in this file; states what happened and what is
+# possible next — never an error sentence on the summary-failure path
+# (ADR 0044: the failure must not refuse the operator turn).
+COMPACT_DONE_COPY: Final[str] = (
+    "已压缩会话历史，较早的检索过程已归入摘要。"
+    " 可以继续提问，摘要会保留此前的工作脉络。"
+)
+COMPACT_NOOP_COPY: Final[str] = (
+    "当前会话暂不需要压缩，历史保持不变。"
+)
+COMPACT_PENDING_COPY: Final[str] = (
+    "本线程有一个未完成的回合，暂不压缩。"
+    " 可以先恢复或停止该回合，再重试压缩。"
+)
+COMPACT_SUMMARY_FAILED_COPY: Final[str] = (
+    "本次压缩未完成：生成会话摘要时出现问题。"
+    " 会话未受影响，可以直接重试或继续提问。"
+)
+
+
+def _run_compact_command(
+    *,
+    graph: Any,
+    store: ThreadStore,
+    thread_id: str,
+) -> Response:
+    """Run the ``/compact`` command and stream its receipt (T2).
+
+    Placement: called from ``send_message`` AFTER the unknown-thread
+    404 and BEFORE any graph stream — Soft-Track classify is the
+    first graph node (START -> classify), so a command handled here
+    is never classified as a user question and never reaches the
+    research tools (ADR 0044).
+
+    Concurrency: ``graph.compact_thread`` acquires the SAME
+    per-thread lock as ``invoke`` / ``stream`` (raises
+    ``ConcurrentRunError`` -> 409 ``application/json`` — but the
+    synchronously-raised exception from ``compact_thread`` here
+    happens BEFORE the StreamingResponse is returned, so the 409
+    body keeps the plain ``application/json`` shape, same as the
+    ``is_locked`` probe on the ordinary send path).
+
+    Wire: the SAME fixed-order terminal triple as every other run
+    end (``status`` -> ``answer`` -> ``citations``) so the SPA's
+    reader closes on ``citations`` with no client-side changes and
+    no research-run frames (``tool_call`` / ``tool_result`` /
+    streamed ``answer`` deltas) ever appear. The status frame
+    carries ``status="done"``, no ``track`` — this turn never went
+    through classify.
+
+    Receipt outcomes (copy in this module's constants):
+
+    * ``compacted`` — eviction happened; the answer copy says so.
+    * ``noop`` — empty payload or nothing evictable (gate produced
+      no update); the checkpoint is untouched.
+    * ``summary_failed`` — typed :class:`SessionSummaryError` from
+      the gate; graceful receipt, NOT a 500, NOT a refuse; the
+      checkpoint is untouched and the thread stays usable.
+
+    Persistence: one ``RunRecord`` row (``status="done"``, empty
+    ``track_decision`` — the command never reached classify) so GET
+    history shows the receipt turn exactly like any other turn.
+
+    Resume path (``POST .../resume``) deliberately does NOT handle
+    ``/compact``: a resume continues an already-pending run whose
+    own compaction gate fires before its next LLM call, and a
+    crashed run should be resumed or stopped, not compacted under
+    its pending checkpoint.
+
+    ``ConcurrentRunError`` from ``compact_thread`` (a run in flight)
+    propagates untouched — the plain 409 contract, identical to the
+    ``is_locked`` probe on the ordinary send path.
+    """
+    run_id = str(uuid.uuid4())
+    receipt = graph.compact_thread(thread_id)
+
+    if receipt.get("outcome") == "compacted":
+        copy = COMPACT_DONE_COPY
+    elif receipt.get("outcome") == "summary_failed":
+        copy = COMPACT_SUMMARY_FAILED_COPY
+        logger.warning(
+            "compact command: summary failed on thread_id=%s", thread_id
+        )
+    elif receipt.get("outcome") == "pending_run":
+        copy = COMPACT_PENDING_COPY
+    else:
+        copy = COMPACT_NOOP_COPY
+
+    def event_stream() -> Iterator[str]:
+        try:
+            store.append_run(
+                RunRecord(
+                    id=run_id,
+                    thread_id=thread_id,
+                    question="/compact",
+                    status="done",
+                    answer=copy,
+                    citations=[],
+                    thinking_text="",
+                    assistant_message=copy,
+                    track_decision={},
+                )
+            )
+        except ThreadNotFoundError:
+            # Thread deleted mid-command; the frames below still
+            # close the wire (mirrors the stopped-run path).
+            logger.debug(
+                "compact command on thread %s raced a delete", thread_id
+            )
+        yield _format_sse(
+            "status",
+            {
+                "run_id": run_id,
+                "status": "done",
+                "reason": None,
+                "assistant_message": copy,
+            },
+        )
+        yield _format_sse("answer", {"text": copy})
+        yield _format_sse("citations", _citations_wire_payload([]))
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
 def _model_identity() -> str:
     """The resolved ``FIN_MODEL`` slug, or the ADR 0022 default.
 
@@ -1350,10 +1503,18 @@ def build_router(
             and bool(graph.pending_nodes(thread_id))
         ):
             pending_checkpoint = True
+        # T3 (ADR 0044): occupancy from the same compactor figure the
+        # gate uses. Defensive ``hasattr`` mirrors the ``is_locked`` /
+        # ``pending_nodes`` wiring-bug tolerance for graph stand-ins
+        # without the seam.
+        occupancy = None
+        if hasattr(graph, "occupancy"):
+            occupancy = graph.occupancy(thread_id)
         return {
             **_serialize_thread(thread),
             "in_flight": is_locked,
             "pending_checkpoint": pending_checkpoint,
+            "occupancy": occupancy,
             "turns": [
                 _serialize_run(
                     r,
@@ -1452,6 +1613,23 @@ def build_router(
         if thread is None:
             return JSONResponse(
                 status_code=404, content={"error": "thread_not_found"}
+            )
+
+        # T2 (ADR 0044 / plan session-compaction T2): ``/compact`` is
+        # intercepted BEFORE Soft-Track classify — Soft-Track classify
+        # is the first graph node (START -> classify), so this branch
+        # runs before any stream run; the string is never classified
+        # as a user question and never a research tool. Match is exact
+        # on the stripped, case-folded text: ``" /Compact "`` is the
+        # command, ``"/compact now"`` is an ordinary question. The
+        # unknown-thread 404 above still wins (contract preserved), and
+        # the title rewrite below is deliberately skipped — the command
+        # must not become the thread title.
+        if body.question.strip().casefold() == "/compact":
+            return _run_compact_command(
+                graph=graph,
+                store=store,
+                thread_id=thread_id,
             )
 
         # T2: title update on the first real send. The T1 path
