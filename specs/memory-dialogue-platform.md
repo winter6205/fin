@@ -1,5 +1,7 @@
 # Spec: memory-dialogue-platform
 
+> **Supersede notice (2026-09-06, ADR 0048):** assumption 5, assumption 6, and the **dream** clause under Focus 3 are superseded for the remaining memory product wiring by [`specs/cross-session-operator-memory.md`](cross-session-operator-memory.md) / [`plans/cross-session-operator-memory.md`](../plans/cross-session-operator-memory.md). Default boot is **OFF** with this checkout’s project env **ON**; dream is a local fact merge with 24h + threshold gates, never a memory-MCP upload, never an unconditional post-SSE step. This spec is not silently rewritten; the surviving clauses (Postgres pool, optional Redis skeleton, session compaction carve-out, DST confidence, feedback, observability, rewrite retry) stay in force.
+
 ## Assumption gate (confirmed 2026-08-29)
 
 Operator confirmed the numbered gate in-thread (`/spec-driven-development`). These are in force:
@@ -8,8 +10,8 @@ Operator confirmed the numbered gate in-thread (`/spec-driven-development`). The
 2. **Postgres = only authority store**; **Redis = optional** (unset URL → single-process degrade); Redis never holds memory bodies, citations, or checkpoints.
 3. This file is a **coarse program contract**, independently shippable from `specs/corpus-ops-depth.md` (no EDGAR bulk / redline required).
 4. Default `uv run pytest -q` stays green with no live SEC and no live memory MCP hard dependency.
-5. Full **memory subsystem in fin**, **default OFF**; ON assembles extract / recall / GC / dream.
-6. **dream** consolidates useful memory then **transports it to MCP for durable persistence**; without MCP or with memory OFF, dream skips or stops at Postgres buffer; swapping MCP = swap **memory** adapter only.
+5. Full **memory subsystem in fin**, **default OFF**; ON assembles extract / recall / GC / dream. — **superseded for the dream half** by [`specs/cross-session-operator-memory.md`](cross-session-operator-memory.md) (ADR 0048 2026-09-06): dream is a local fact merge with 24h + threshold gates, not assembled on ON, not unconditional.
+6. **dream** consolidates useful memory then **transports it to MCP for durable persistence**; without MCP or with memory OFF, dream skips or stops at Postgres buffer; swapping MCP = swap **memory** adapter only. — **superseded** by [`specs/cross-session-operator-memory.md`](cross-session-operator-memory.md) (ADR 0048 2026-09-06): dream never writes to memory MCP; no MCP transport is in force.
 7. Retrieve MCP ≠ memory MCP (separate configs/channels); memory recall is **advisory only** and must not become citation evidence.
 8. Session sliding window + incremental summary live in this spec; they compress the current thread and do not default-write to MCP.
 9. DST / intent upgrade (confidence + optional Qwen3-1.7B on classify) keeps Soft-Track four tracks and rules tier; does not rewrite the track set.
@@ -50,7 +52,7 @@ Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
   **Focus 3 — Switchable memory subsystem**
   - `memory port` with local Postgres buffer backend; default OFF = zero memory tools, zero dream, pytest green.
   - ON: extract / recall / GC over local buffer; recall is advisory (dialogue or gated tracks per implementer headroom) and never citation evidence.
-  - **dream**: rule-gated consolidate of useful buffer entries → transport to **memory MCP** for durable persistence; failures typed; must not fail the operator's foreground turn.
+  - **dream**: rule-gated consolidate of useful buffer entries → transport to **memory MCP** for durable persistence; failures typed; must not fail the operator's foreground turn. — **superseded** by [`specs/cross-session-operator-memory.md`](cross-session-operator-memory.md) / [`plans/cross-session-operator-memory.md`](../plans/cross-session-operator-memory.md) (ADR 0048 2026-09-06): dream is a local fact merge with 24h + threshold gates; no memory-MCP transport is in force; unconditional post-SSE dream is removed. Remaining Focus 3 T5/T6 wiring follows the cross-session spec/plan, not this clause.
 
   **Focus 4 — Intent / DST upgrade**
   - Confidence tiers on Soft-Track decisions; low confidence → clarify (existing leaf).
@@ -116,4 +118,3 @@ Affected surfaces (declared):
 - `src/fin/` new memory package or `host/memory/` — buffer/GC/extract (implementer chooses name under capability slicing)
 - `web/src/` — thumbs, optional memory/status copy
 - `tests/host/`, opt-in memory/mcp marks
-
