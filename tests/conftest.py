@@ -22,6 +22,15 @@ from pathlib import Path
 import pytest
 
 from fin.corpus.catalog import record_filings
+from fin.host.operator_env import apply_dotenv
+
+# Load the operator ``.env`` (``FIN_CHECKPOINT_URL`` &c.) before any
+# fixture reads ``os.environ``, so Postgres-backed tests are not
+# skipped just because the shell session did not export the vars.
+# Product boot uses the same ``apply_dotenv`` (SSOT), which is a
+# ``setdefault`` fill: an explicitly exported var still wins, and a
+# missing ``.env`` is a no-op (CI stays hermetic).
+apply_dotenv(start=Path(__file__).resolve().parent.parent)
 
 
 # One row per form the operator should be able to see in the library.
