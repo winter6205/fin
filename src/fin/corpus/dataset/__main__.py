@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from fin.corpus.dataset.manifest import validate_manifest
 from fin.corpus.dataset.build import (
@@ -31,6 +32,14 @@ from fin.corpus.dataset.build import (
     build_dataset,
     default_paths,
     verify_dataset,
+)
+from fin.corpus.dataset.t1 import (
+    T1_DATASET_ID,
+    T1_MANIFEST_REL,
+    T1_SCHEMA_VERSION,
+    T1_TEXT_DIR_REL,
+    load_t1_manifest,
+    verify_t1_manifest,
 )
 
 
@@ -75,6 +84,20 @@ def main(argv: list[str] | None = None) -> int:
     expand.add_argument(
         "--accession", action="append", required=True, help="accession no. (repeatable, parallel to --cik)"
     )
+    verify_t1_p = sub.add_parser(
+        "verify-t1",
+        help="verify the T1 public-source frozen corpus (provenance + sha256 + queries)",
+    )
+    verify_t1_p.add_argument(
+        "--manifest",
+        default=str(Path(__file__).resolve().parents[4] / T1_MANIFEST_REL),
+        help="path to t1_manifest.json (defaults to the committed manifest)",
+    )
+    verify_t1_p.add_argument(
+        "--text-dir",
+        default=str(Path(__file__).resolve().parents[4] / T1_TEXT_DIR_REL),
+        help="path to the frozen-text directory (defaults to data/corpus/dataset/t1)",
+    )
     args = parser.parse_args(argv)
 
     corpus_dir, _, dataset_dir = default_paths()
@@ -112,6 +135,41 @@ def main(argv: list[str] | None = None) -> int:
             mark = "MET " if entry["met"] else "MISS"
             print(f"  [{mark}] {entry['criterion']} — {entry['detail']}")
         return 0 if report.ok else 1
+
+    if args.command == "verify-t1":
+        manifest_path = Path(args.manifest)
+        text_dir = Path(args.text_dir)
+        if not manifest_path.is_file():
+            print(f"verify-t1: FAILED — manifest not found at {manifest_path}")
+            return 2
+        manifest = load_t1_manifest(manifest_path)
+        print(f"verify-t1: manifest={manifest_path} text_dir={text_dir}")
+        print(f"verify-t1: dataset_id={manifest.get('dataset_id')} "
+              f"schema={manifest.get('schema_version')}")
+        report = verify_t1_manifest(manifest, text_dir=text_dir)
+        counts = manifest.get("counts", {})
+        if counts:
+            print(f"verify-t1: countable={counts.get('total')} "
+                  f"by_scene={counts.get('by_scene')}")
+        else:
+            print(f"verify-t1: queries={len(manifest.get('queries', []))}")
+        if report.mismatches:
+            print(f"verify-t1: mismatches ({len(report.mismatches)})")
+            for m in report.mismatches:
+                print(f"  MISMATCH {m}")
+        if report.excluded:
+            print(f"verify-t1: excluded samples ({len(report.excluded)})")
+            for exc in report.excluded:
+                print(f"  excluded {exc['sample_id']}: {exc['reason']}")
+        if report.problems:
+            print(f"verify-t1: problems ({len(report.problems)})")
+            for p in report.problems:
+                print(f"  PROBLEM {p}")
+        if report.ok:
+            print("verify-t1: OK (provenance + sha256 + per-scene queries all green)")
+            return 0
+        print("verify-t1: FAILED")
+        return 1
 
     if args.command == "expand-primary":
         from fin.corpus.dataset.expand_primary import run_expand_primary
