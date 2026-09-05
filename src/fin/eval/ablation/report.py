@@ -25,13 +25,28 @@ The report is built to be merged with the retrieval side's report
 to overwrite a metric either side already produced — fin never
 recomputes the retrieval side's dimensions, and 长文档召回 /
 跨文档多跳召回 are not fin's to compute at all (SC38).
+
+Atomic write (T3 / ADR 0042)
+----------------------------
+
+The baseline ``report.json`` is the canonical §B1 artifact, so a half-
+written document on a crash — or two simultaneous ``run`` invocations
+tearing each other's writes — would silently lower the numbers the
+operator reads. :func:`write_report_atomically` serializes through a
+sibling lock file (``fcntl.flock``) and then writes to a temp file
+before renaming onto the target, so the document on disk is always a
+whole one or the previous whole one.
 """
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
-from typing import Any, Mapping, Sequence
+import os
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
 
 from fin.eval.ablation.matrix import (
     B1_CONFIGURATION_TOTAL,
@@ -422,6 +437,82 @@ def merge_with_retrieval_report(
     return merged_report
 
 
+# ---------------------------------------------------------------------------
+# Atomic write
+# ---------------------------------------------------------------------------
+
+
+def _default_report_serializer(payload: Mapping[str, Any]) -> str:
+    """Canonical JSON shape the operator's tooling reads back."""
+    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def _lock_path_for(target: Path) -> Path:
+    """Sibling lock file path used to serialize write access."""
+    return target.with_name(target.name + ".lock")
+
+
+@contextlib.contextmanager
+def _report_lock(target: Path):
+    """Hold an exclusive ``fcntl.flock`` on the sibling lock file.
+
+    Shared with ``fin.corpus.catalog._table_lock`` so the same
+    ``flock`` discipline is used wherever two processes may write to
+    the same JSON artifact.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _lock_path_for(target)
+    with open(lock_path, "a+", encoding="utf-8") as lock_fd:
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+
+
+def write_report_atomically(
+    target: Path,
+    payload: Mapping[str, Any] | Callable[[], str],
+) -> Path:
+    """Write ``payload`` to ``target`` under a flock, atomically.
+
+    The contract is: a reader of ``target`` always sees either the
+    previous whole document or a freshly-written whole document —
+    never a half-written one. Two writers serialize through the
+    sibling lock file (T3 / ADR 0042). The temp file is renamed over
+    ``target`` so a crash mid-write leaves the previous document
+    intact.
+
+    ``payload`` may be a mapping (serialized via the canonical
+    formatter) or a zero-argument callable that returns the encoded
+    string. The callable form lets callers defer expensive work until
+    the lock is held, and lets tests inject serializers that raise
+    mid-write.
+    """
+    encoded: str | None = None
+    if isinstance(payload, Mapping):
+        encoded = _default_report_serializer(payload)
+    elif callable(payload):
+        # ``callable`` covers lambdas / functions; the Mapping branch
+        # above already handled dicts.
+        encoded = payload()
+    else:
+        raise TypeError(
+            "write_report_atomically payload must be a mapping or a "
+            f"callable, got {type(payload).__name__}"
+        )
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_name(target.name + ".tmp")
+    with _report_lock(target):
+        with open(tmp_path, "w", encoding="utf-8") as tmp_file:
+            tmp_file.write(encoded)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.replace(tmp_path, target)
+    return target
+
+
 __all__ = [
     "ABLATION_REPORT_VERSION",
     "DIMENSIONS_NOT_COMPUTED_BY_FIN",
@@ -436,4 +527,5 @@ __all__ = [
     "merge_with_retrieval_report",
     "query_subset_hash",
     "validate_report",
+    "write_report_atomically",
 ]
