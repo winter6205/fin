@@ -151,12 +151,12 @@ def _run(args: argparse.Namespace) -> int:
 
     report = build_report(run)
     problems = validate_report(report)
-    _print_summary(report)
     if problems:
         for problem in problems:
             print(f"  PROBLEM {problem}")
         print("ablation: FAILED")
         return 1
+    _print_summary(report)
 
     out_dir = Path(args.output)
     report_path = out_dir / REPORT_FILENAME
