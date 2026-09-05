@@ -244,6 +244,51 @@ def set_feedback(
     return store.set_feedback(run_id, value)
 
 
+# Module-level cache so ``default_feedback_store()`` returns the same
+# instance for the life of the process. Mirrors
+# ``fin.host.thread_store._DEFAULT_STORE_CACHE``: the Postgres path owns
+# a connection pool, so constructing one per request would exhaust the
+# database's connections.
+_DEFAULT_FEEDBACK_STORE_CACHE: dict[str, FeedbackStore] = {}
+
+
+def default_feedback_store(env: Any = None) -> FeedbackStore:
+    """Pick the feedback store implementation from the environment.
+
+    Mirrors ``default_thread_store``'s degradation semantics exactly:
+    ``FIN_CHECKPOINT_URL`` set -> Postgres store over a
+    process-lifetime pool; unset -> in-memory store. ADR 0035/0036
+    make Postgres the SSOT when the checkpoint URL is configured, so
+    thumbs ride the same storage the runs they point at do — there is
+    no third "file" option to invent. Tests inject via FastAPI's
+    ``dependency_overrides`` so neither branch matters there.
+    """
+    import os
+
+    source = env if env is not None else os.environ
+    url = (source.get("FIN_CHECKPOINT_URL") or "").strip()
+    cache_key = url or "<memory>"
+    cached = _DEFAULT_FEEDBACK_STORE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    if not url:
+        cached = InMemoryFeedbackStore()
+    else:
+        # Imported lazily so the in-memory path (and every import of
+        # this module) never pulls psycopg in.
+        from fin.host.db_pool import create_postgres_pool
+
+        pool = create_postgres_pool(url)
+        # The pool ships closed by design (db_pool); the feedback
+        # store is a process-lifetime singleton, so it is the owner
+        # of the pool's open lifecycle. ``initialize=True`` then
+        # creates ``fin_run_feedback`` on this same connection pool.
+        pool.open()
+        cached = PostgresFeedbackStore(pool)
+    _DEFAULT_FEEDBACK_STORE_CACHE[cache_key] = cached
+    return cached
+
+
 __all__ = [
     "FeedbackError",
     "FeedbackPersistenceError",
@@ -254,5 +299,6 @@ __all__ = [
     "InMemoryFeedbackStore",
     "MAX_RUN_ID_LENGTH",
     "PostgresFeedbackStore",
+    "default_feedback_store",
     "set_feedback",
 ]

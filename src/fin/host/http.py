@@ -41,6 +41,7 @@ from fin.host.run_payload import _run_to_response_payload
 from fin.host.state import EVIDENCE_RESET, reset_input_state
 from fin.host.thread_store import default_thread_store
 from fin.host.filing_monitor import default_filing_monitor
+from fin.host.observability import ObservabilityCollector, default_collector
 from fin.host.watchlist import default_watchlist_store
 
 
@@ -234,6 +235,44 @@ def get_filing_monitor() -> Any:
     return default_filing_monitor()
 
 
+def get_feedback_store() -> Any:
+    """FastAPI dependency that returns the thumbs-feedback store.
+
+    T8 (#T8): backs ``POST /api/threads/{id}/runs/{run_id}/feedback``
+    and the ``feedback`` field on GET history. Selection mirrors
+    ``get_thread_store`` exactly: ``FIN_CHECKPOINT_URL`` set ->
+    Postgres-backed store (ADR 0035/0036 SSOT); unset -> in-memory.
+    Process-lifetime singleton behavior (the Postgres path owns a
+    connection pool) is owned by ``fin.host.feedback``'s own cache —
+    one caching layer, one owner — so this dependency delegates
+    exactly like ``get_thread_store`` does.
+
+    Tests override this via ``app.dependency_overrides[get_feedback_store]``.
+    """
+    from fin.host.feedback import default_feedback_store
+
+    return default_feedback_store()
+
+
+def get_observability_collector() -> ObservabilityCollector:
+    """FastAPI dependency that returns the per-process observability
+    collector.
+
+    T9: backs ``GET /api/observability`` and per-turn terminal-status
+    recording on the SSE send route. The singleton itself is built
+    once per process by ``fin.host.observability.default_collector``
+    (lock-guarded, same pattern as the other singletons in this
+    module) — it lives below ``graph`` because the retrieve tool
+    records empty-hit rewrite retries on the SAME collector, and
+    ``graph`` cannot import this module (``http`` imports ``graph``).
+
+    Tests override this via
+    ``app.dependency_overrides[get_observability_collector]`` with a
+    fresh ``ObservabilityCollector`` for hermetic counter assertions.
+    """
+    return default_collector()
+
+
 # Mount the workspace routes (T1, #28) on the same FastAPI app.
 # Done at module load so ``uvicorn fin.host.http:app`` exposes the
 # workspace surface out of the box (spec / ADR 0013 / ADR 0024).
@@ -246,6 +285,8 @@ _mount_workspace_routes(
     get_watchlist_store=get_watchlist_store,
     get_memory_port=get_memory_port,
     get_filing_monitor=get_filing_monitor,
+    get_feedback_store=get_feedback_store,
+    get_observability_collector=get_observability_collector,
 )
 
 # ``GET /health`` (the tracked change, SC9): checkpoint reachability, separate from
@@ -488,8 +529,10 @@ __all__ = [
     "CitationSchema",
     "app",
     "compile_for_http",
+    "get_feedback_store",
     "get_filing_monitor",
     "get_graph",
+    "get_observability_collector",
     "get_thread_store",
     "get_watchlist_store",
     "mount_spa",
