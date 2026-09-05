@@ -152,6 +152,7 @@ class T1VerifyReport:
     mismatches: list[dict] = field(default_factory=list)
     excluded: list[dict] = field(default_factory=list)
     per_scene_counts: dict[str, int] = field(default_factory=dict)
+    known_gaps: list[dict] = field(default_factory=list)
 
     @property
     def problem_count(self) -> int:
@@ -275,11 +276,26 @@ def verify_t1_manifest(manifest: dict, *, text_dir: Path) -> T1VerifyReport:
     * each scene with at least one countable sample has
       ``>= T1_MIN_QUERY_PER_SCENE`` query.
 
+    Honesty discipline (SC6 / Focus 1)
+    ----------------------------------
+
+    Scenes that have no countable samples are NOT a problem — they are
+    a documented gap. Each such scene is recorded in
+    :attr:`T1VerifyReport.known_gaps` under
+    :data:`T1_GAP_SCENE_MISSING_FROZEN_TEXT` so the report never
+    silently says "all six scenes covered" when only some were. The
+    run stays ``ok`` because the gap is honest, not fabricated; it is
+    the operator's job to either fetch text for the scene or accept
+    the gap. A scene that DOES have frozen text but is missing its
+    human-checked query is a problem — that gap is a contract failure,
+    not a missing-text gap.
+
     Returns :class:`T1VerifyReport`. ``report.ok`` is True iff no
     problem surfaced.
     """
     problems: list[str] = []
     mismatches: list[dict] = []
+    known_gaps: list[dict] = []
 
     if manifest.get("schema_version") != T1_SCHEMA_VERSION:
         problems.append(
@@ -381,8 +397,8 @@ def verify_t1_manifest(manifest: dict, *, text_dir: Path) -> T1VerifyReport:
                     f"{qid}: evidence_span not found in frozen text {sample['path']}"
                 )
         # Scene coverage: each scene with countable samples must have
-        # at least one query; missing scenes go into known_gaps but
-        # also surface as a problem so the B1-pass path is loud.
+        # at least one query; a missing query is a contract failure,
+        # not a known gap.
         for scene_str, n in per_scene_counts.items():
             if n <= 0:
                 continue
@@ -393,6 +409,33 @@ def verify_t1_manifest(manifest: dict, *, text_dir: Path) -> T1VerifyReport:
                     f"(need >= {T1_MIN_QUERY_PER_SCENE})"
                 )
 
+    # Honesty discipline: every scene in the T1 scope that has no
+    # countable sample is recorded as a known gap so the report
+    # never silently says "all six scenes covered" when only some
+    # were. This is NOT a problem — the gap is honest, not fabricated.
+    for scene in T1_SCENES:
+        scene_str = str(int(scene))
+        if per_scene_counts.get(scene_str, 0) > 0:
+            continue
+        known_gaps.append(
+            {
+                "gap": T1_GAP_SCENE_MISSING_FROZEN_TEXT,
+                "scene": scene_str,
+                "criterion": (
+                    f"scene {scene_str} has >= 1 countable sample with frozen text"
+                ),
+                "detail": (
+                    f"no countable T1 sample was committed for scene {scene_str}; "
+                    "no eval question can be asked on it (verify will not invent one)"
+                ),
+                "remediation": (
+                    "fetch a public source for this scene with provenance + license, "
+                    "commit its frozen text under data/corpus/dataset/t1/, and add "
+                    "the sample + a human-checked query to the manifest"
+                ),
+            }
+        )
+
     ok = not problems and not mismatches
     return T1VerifyReport(
         ok=ok,
@@ -400,4 +443,5 @@ def verify_t1_manifest(manifest: dict, *, text_dir: Path) -> T1VerifyReport:
         mismatches=mismatches,
         excluded=excluded,
         per_scene_counts=per_scene_counts,
+        known_gaps=known_gaps,
     )

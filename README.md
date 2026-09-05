@@ -114,6 +114,23 @@ uv run pytest -q -m eval               # the nine cases, pass/fail
 uv run python scripts/eval_counts.py   # the same lane, plus done / refuse integers
 ```
 
+### Live retrieve 评测（opt-in）
+
+The `live-retrieve-eval-wave` ([spec](../specs/live-retrieve-eval-wave.md), [plan](../plans/live-retrieve-eval-wave.md)) opt-in chain runs the existing ablation / concurrency harness against a real `iknow-memory` MCP retrieve port and a real LLM. Default `uv run pytest -q`, default ablation, and default scripted eval all stay on `contract_fake` / Fake adapters — none of these commands are reached by `pytest`, none auto-start iknow, and none inherit live credentials from operator `.env`. Every step below is a separate explicit invocation:
+
+| Step                                    | Command                                                    | Pre-req                                                  | Behavior on failure                                                                                                                                                                           |
+| --------------------------------------- | ---------------------------------------------------------- | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. Verify T1 corpus provenance          | `uv run python -m fin.corpus.dataset verify-t1`            | `data/corpus/dataset/t1/` + `t1_manifest.json` committed | exit 1 (drift / missing text / query contract); exit 2 (manifest missing)                                                                                                                     |
+| 2. Push T1 corpus into retrieve backend | `uv run python -m fin.corpus.chunk_and_push --adapter mcp` | reachable `iknow-memory` MCP server                      | typed per-sample failures recorded in `report.json`; the run never silently writes Fake results                                                                                               |
+| 3. Live ablation                        | `uv run python -m fin.eval.ablation run --eval-set live`   | reachable iknow + T1 pushed (steps 1–2)                  | iknow unreachable → exit code `retrieve_unavailable` (named EXIT, never `{chunks: []}`)                                                                                                       |
+| 4. L2 real concurrency                  | `uv run python -m fin.eval.concurrency l2 --llm real`      | `FIN_API_KEY` set + reachable iknow                      | missing `FIN_API_KEY` → exit 3 with skip JSON `{ "status": "skipped", "skip": { "code": "l2_credentials_missing" } }`; the run never falls back to Fake LLM and never reports as a green pass |
+
+`--adapter` / `--llm` / `--eval-set` are the explicit opt-ins. `FIN_RETRIEVE_ADAPTER` is honored by the chunk-and-push step but not by ablation / concurrency, which gate on their own flags so the live path can never be reached through environment drift alone.
+
+The verify step records an honest `known_gaps` list: every scene in the T1 scope (1–6) that has no committed frozen text is recorded under `t1_scene_missing_frozen_text` so the report never silently claims "all six scenes covered". A scene that DOES have text but is missing its human-checked query is a problem, not a gap — verify exits non-zero. The committed T1 manifest covers all six scenes, so the verify step currently reports zero gaps; the gap channel exists for the future addition of more scenes or the loss of one.
+
+Product compile path (ADR 0039) is unaffected: the capability-off switches remain absent from production code, and live-mode opt-ins sit behind the same `--eval-set live` / `--llm real` gate that the existing eval lane already owns.
+
 The count command prints exactly two lines on stdout (`done=6`, `refuse=3`) and forwards pytest's own report to stderr, so a CI step can read the integers without parsing test output. The numbers are **observed**: `tests/eval/conftest.py` wraps the graph each case invokes and records that run's terminal status, so the tally reflects what the runs did, not what the assertions expect. No live LLM and no LLM-as-judge are involved — the lane runs `ScriptedChatModel` against the frozen corpus. Exit code is pytest's, so a red eval suite fails the command; a lane that reports no count line exits `2` rather than printing zeros.
 
 ### Process health (`GET /health`)
@@ -141,9 +158,9 @@ This is a separate route from `GET /api/status`, which stays boot-scoped per ADR
 
 ```json
 {
-  "counts": {"done": 12, "refuse": 2},
-  "latency_ms": {"count": 14, "total": 91234.5, "average": 6516.75},
-  "rewrite_retry": {"count": 3, "exhausted": 1}
+  "counts": { "done": 12, "refuse": 2 },
+  "latency_ms": { "count": 14, "total": 91234.5, "average": 6516.75 },
+  "rewrite_retry": { "count": 3, "exhausted": 1 }
 }
 ```
 

@@ -161,6 +161,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"verify-t1: excluded samples ({len(report.excluded)})")
             for exc in report.excluded:
                 print(f"  excluded {exc['sample_id']}: {exc['reason']}")
+        if report.known_gaps:
+            print(f"verify-t1: known gaps ({len(report.known_gaps)})")
+            for gap in report.known_gaps:
+                scene = gap.get("scene", "")
+                print(f"  GAP {gap['gap']} scene={scene}: {gap['detail']}")
         if report.problems:
             print(f"verify-t1: problems ({len(report.problems)})")
             for p in report.problems:
