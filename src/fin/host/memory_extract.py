@@ -666,6 +666,16 @@ def _propose_candidate(
     if not candidate.title.strip() or not candidate.body.strip():
         return ExtractResult(status="skipped", reason="empty_candidate", fact=None)
 
+    # SC16 cap-1 invariant: a single ``propose`` call surfaces at most
+    # ``EXTRACT_MAX_PER_FIRING`` candidate. The protocol type already
+    # returns a single ``FactCandidate | None``; this assert is the
+    # named-constant post-condition so a future protocol change to a
+    # sequence lands here, not silently.
+    assert EXTRACT_MAX_PER_FIRING == 1, (
+        "EXTRACT_MAX_PER_FIRING must remain 1 — a change requires "
+        "updating the cap-1 invariant in the gate pipeline"
+    )
+
     return candidate
 
 

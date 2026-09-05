@@ -95,6 +95,8 @@ class MemoryPort(Protocol):
         text: str,
         *,
         metadata: Mapping[str, object] | None = None,
+        title: str = "",
+        workspace: str = "",
     ) -> dict[str, object]:
         """Extract candidate memories from dialogue text."""
         ...
@@ -104,6 +106,7 @@ class MemoryPort(Protocol):
         query: str,
         *,
         limit: int = DEFAULT_MEMORY_LIMIT,
+        workspace: str = "",
     ) -> dict[str, object]:
         """Return advisory memories relevant to ``query``."""
         ...
@@ -133,8 +136,10 @@ class OffMemoryAdapter:
         text: str,
         *,
         metadata: Mapping[str, object] | None = None,
+        title: str = "",
+        workspace: str = "",
     ) -> dict[str, object]:
-        del text, metadata
+        del text, metadata, title, workspace
         return {"status": "disabled", "memories": []}
 
     def recall(
@@ -142,8 +147,9 @@ class OffMemoryAdapter:
         query: str,
         *,
         limit: int = DEFAULT_MEMORY_LIMIT,
+        workspace: str = "",
     ) -> dict[str, object]:
-        del query
+        del query, workspace
         _resolve_limit(limit)
         return {"status": "disabled", "memories": []}
 
