@@ -2,13 +2,17 @@
 
 **Goal:** 在 workspace 上交付可开关的完整记忆与对话平台：会话压缩、DST 升级、dream→MCP 持久化、👍/👎、Postgres 池与可选 Redis——不依赖语料扩库/redline。
 **Approach:** 粗颗粒度九波：数据面（池+Redis）与记忆空壳并行；会话压缩；本地缓冲；dream→MCP；DST；反馈与可观测/重试收尾。默认 `uv run pytest -q` 记忆 OFF。
+
+> **Supersede notice (2026-09-06, ADR 0048):** T5 (Local memory buffer) and T6 (dream → memory MCP) are **superseded for the remaining memory product wiring** by [`plans/cross-session-operator-memory.md`](cross-session-operator-memory.md) / [`specs/cross-session-operator-memory.md`](../specs/cross-session-operator-memory.md). Default boot is **OFF** with this checkout’s project env **ON**; dream is a local fact merge with 24h + threshold gates, never a memory-MCP upload, never an unconditional post-SSE step. Surviving waves (T1 pool, T2 Redis skeleton, T3 OFF shell, T4 carve-out to session-compaction, T7 DST, T8 feedback, T9 observability + retry) stay as historical record. This plan is not silently rewritten.
+
 **Spec link:** `specs/memory-dialogue-platform.md`
-**Map:** local program B (`memory-dialogue-platform`); tracker issues live on GitHub separately — not embedded here.
-**Tracker:** local `plans/memory-dialogue-platform.md` only — do not embed GitHub issue numbers in this file.
-**Out of this worktree:** Task 4（session compaction）执行权在 `plans/session-compaction.md`（worktree `/home/winner/projects/fin-wt-session-compaction`，分支 `feat/session-compaction`；ADR 0044 occupancy，取代本文件 T4 的条数窗）。本树不要改压缩模块、不要把 T4 当下一刀。
-**Per-ticket loop (all bullets, header 声明一次):** test-driven-development → typecheck+tests（`uv run pytest -q`；触及 Soft-Track 时加 `-m soft_track`；eval 弹加 `-m eval`；web：`npx tsc --noEmit`）→ verification-before-completion → one commit on the ticket branch
-**End-of-round:** 九波都落地后对整轮 diff 做一次 code-review（Standards + Spec）；单弹 loop 不重复整轮 review。
-**待写入:** empty — CONTEXT + ADR 0035/0036 already flushed with the spec persist.
+
+> **Map:** local program B (`memory-dialogue-platform`); tracker issues live on GitHub separately — not embedded here.
+> **Tracker:** local `plans/memory-dialogue-platform.md` only — do not embed GitHub issue numbers in this file.
+> **Out of this worktree:** Task 4（session compaction）执行权在 `plans/session-compaction.md`（worktree `/home/winner/projects/fin-wt-session-compaction`，分支 `feat/session-compaction`；ADR 0044 occupancy，取代本文件 T4 的条数窗）。本树不要改压缩模块、不要把 T4 当下一刀。
+> **Per-ticket loop (all bullets, header 声明一次):** test-driven-development → typecheck+tests（`uv run pytest -q`；触及 Soft-Track 时加 `-m soft_track`；eval 弹加 `-m eval`；web：`npx tsc --noEmit`）→ verification-before-completion → one commit on the ticket branch
+> **End-of-round:** 九波都落地后对整轮 diff 做一次 code-review（Standards + Spec）；单弹 loop 不重复整轮 review。
+> **待写入:** empty — CONTEXT + ADR 0035/0036 already flushed with the spec persist.
 
 ## ACR（自 `specs/memory-dialogue-platform.md` 原样粘贴）
 
@@ -98,7 +102,7 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
    - **Surface:** memory port local backend + host tools + tests
    - **Acceptance:** ON 时 extract≥1 条；recall 返回；GC 软禁 fixture；仅记忆文本不能 `done` 出记忆 citations；`uv run pytest -q` exits 0。
    - **Completion:** 条目 schema 开放。
-   - Status: [ ] remaining — buffer/store exist; **no graph memory tools**
+   - Status: [x] **superseded 2026-09-06** by [`plans/cross-session-operator-memory.md`](cross-session-operator-memory.md) (ADR 0048): remaining wiring = atomic **memory fact** + ≤3 lexical **memory hook** prefetch + explicit save/recall/edit-user-profile tools (no dream tool, no buffer-as-extract graph tool); auto-extract N=3 cap 1 with deny categories.
    - [blocks: T3]
 
 6. **dream → memory MCP persistence** — tag: `[implementation]`
@@ -106,7 +110,7 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
    - **Surface:** host dream + memory MCP adapter + tests（fixture MCP）
    - **Acceptance:** fixture MCP 上 dream 写出可观察；无 MCP 时 skip/仅缓冲且前台正常；`uv run pytest -q` exits 0。
    - **Completion:** 规则阈值与 MCP tool 名开放。
-   - Status: [ ] remaining — `null` backend + post-SSE dream; **no MCP transport** (parallel with iknow)
+   - Status: [x] **superseded 2026-09-06** by [`plans/cross-session-operator-memory.md`](cross-session-operator-memory.md) (ADR 0048): dream is a **local fact merge** with 24h + threshold gates; **no memory-MCP write**; **no unconditional post-SSE `run_dream_after_turn`**; dream is not a graph tool; foreground-turn failure isolation is preserved.
    - [blocks: T5]
 
 7. **DST confidence + optional small classify model** — tag: `[implementation]`
