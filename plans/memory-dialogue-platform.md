@@ -42,21 +42,21 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
 - 可观测暴露在 `/health` 扩展 vs 独立路由 vs 脚本。
 - Qwen 是否单独加载（当前 classify 复用主模型）。
 
-**代码对照（2026-09-04 harvest；GitHub T1–T9 勾选仍可能过期）：**
+**代码对照（2026-09-05 harvest；GitHub tracer #154–#157 / #160–#162 已关，#158/#159 仍开）：**
 
 对照物是各波 Acceptance，不是「文件在不在」。相关单测 `160 passed, 35 skipped`（skip 因本机未设 `FIN_CHECKPOINT_URL`）；未跑全仓 pytest、未跑 web `tsc`、未打 live MCP。
 
-| 波  | 模块/测试                                                                                  | 产品路径                                                             | 相对 Acceptance                                     |
-| --- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------- | --------------------------------------------------- |
-| T1  | `db_pool.py`；`test_postgres_pool_t1.py`                                                   | 池只给 memory ON；saver 长连接、thread_store 短连接（ADR 0036）      | **决策闭合**；不要再接线 saver                      |
-| T2  | `redis_client.py`；`test_redis_skeleton.py`                                                | 未进 `http`/`health`；无限流实现                                     | **骨架闭合**；排队 wont-do                          |
-| T3  | `memory_port.py` `OffMemoryAdapter`；`test_memory_off_port.py`；HTTP `get_memory_port`     | 默认 OFF；图上无记忆 tools                                           | **闭合**                                            |
-| T4  | 条数窗库仍在；接线形状以 ADR 0044 为准                                                     | 本树不接 graph                                                       | **划出本队列**；见 `plans/session-compaction.md`    |
-| T5  | `memory_buffer.py` / `memory_store.py` + tests                                             | 无 host 记忆 tool；ON 时模型调不到 extract/recall                    | 库+单测在；图未接                                   |
-| T6  | `memory_dream.py`；SSE 结束后 `run_dream_after_turn`；`FIN_MEMORY_DREAM_BACKEND` 仅 `null` | 无 fixture/真 MCP transport（注释 T6d）                              | HTTP 调度在；SC7 MCP 写出未做                       |
-| T7  | `track_decision.py` 置信度阈值；`test_track_decision_t7.py`                                | compile 把主模型当 `classify_model`；无独立 Qwen                     | **基本闭合**（小模型可选）                          |
-| T8  | `feedback.py` + PG store；`web/src/feedback.ts` helper                                     | `POST .../runs/{run_id}/feedback` 路由；`TurnRow.feedback`；web 控件 | **闭合**（`eb2d24a`）                               |
-| T9  | `observability.py`；`rewrite_retry.py`；`test_observability_retry_contracts.py`            | `GET /api/observability`；retrieve tool loop 已接 rewrite retry      | **闭合**（`9baaf02`；model-backed rewriter 仍开放） |
+| 波  | 模块/测试                                                                                  | 产品路径                                                             | 相对 Acceptance                                         |
+| --- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------- | ------------------------------------------------------- |
+| T1  | `db_pool.py`；`test_postgres_pool_t1.py`                                                   | 池只给 memory ON；saver 长连接、thread_store 短连接（ADR 0036）      | **决策闭合**；不要再接线 saver                          |
+| T2  | `redis_client.py`；`test_redis_skeleton.py`                                                | 未进 `http`/`health`；无限流实现                                     | **骨架闭合**；排队 wont-do                              |
+| T3  | `memory_port.py` `OffMemoryAdapter`；`test_memory_off_port.py`；HTTP `get_memory_port`     | 默认 OFF；图上无记忆 tools                                           | **闭合**                                                |
+| T4  | 条数窗库仍在；接线形状以 ADR 0044 为准                                                     | occupancy 压缩已合 main                                              | **划出并闭合**；`plans/session-compaction.md` · PR #236 |
+| T5  | `memory_buffer.py` / `memory_store.py` + tests                                             | 无 host 记忆 tool；ON 时模型调不到 extract/recall                    | 库+单测在；图未接                                       |
+| T6  | `memory_dream.py`；SSE 结束后 `run_dream_after_turn`；`FIN_MEMORY_DREAM_BACKEND` 仅 `null` | 无 fixture/真 MCP transport（注释 T6d）                              | HTTP 调度在；SC7 MCP 写出未做                           |
+| T7  | `track_decision.py` 置信度阈值；`test_track_decision_t7.py`                                | compile 把主模型当 `classify_model`；无独立 Qwen                     | **基本闭合**（小模型可选）                              |
+| T8  | `feedback.py` + PG store；`web/src/feedback.ts` helper                                     | `POST .../runs/{run_id}/feedback` 路由；`TurnRow.feedback`；web 控件 | **闭合**（`eb2d24a`）                                   |
+| T9  | `observability.py`；`rewrite_retry.py`；`test_observability_retry_contracts.py`            | `GET /api/observability`；retrieve tool loop 已接 rewrite retry      | **闭合**（`9baaf02`；model-backed rewriter 仍开放）     |
 
 **下一刀（本 worktree，仍非 iknow、不含压缩）：** ~~T8 HTTP+UI、T9 接线~~ 已完成（2026-09-04：T8 `eb2d24a`，T9 `9baaf02`）。T5 图上记忆工具与 T6 dream 不当公司知识入库（ADR 0045）；需要时仅显式 extract。T4 压缩不在本树做。**本树剩余：T5/T6 的产品接线仍按 ADR 0045 不作为必做波，见各 task Status。**
 
