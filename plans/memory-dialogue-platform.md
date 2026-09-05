@@ -46,17 +46,17 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
 
 对照物是各波 Acceptance，不是「文件在不在」。相关单测 `160 passed, 35 skipped`（skip 因本机未设 `FIN_CHECKPOINT_URL`）；未跑全仓 pytest、未跑 web `tsc`、未打 live MCP。
 
-| 波  | 模块/测试                                                                                  | 产品路径                                                        | 相对 Acceptance                                  |
-| --- | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------- | ------------------------------------------------ |
-| T1  | `db_pool.py`；`test_postgres_pool_t1.py`                                                   | 池只给 memory ON；saver 长连接、thread_store 短连接（ADR 0036） | **决策闭合**；不要再接线 saver                   |
-| T2  | `redis_client.py`；`test_redis_skeleton.py`                                                | 未进 `http`/`health`；无限流实现                                | **骨架闭合**；排队 wont-do                       |
-| T3  | `memory_port.py` `OffMemoryAdapter`；`test_memory_off_port.py`；HTTP `get_memory_port`     | 默认 OFF；图上无记忆 tools                                      | **闭合**                                         |
-| T4  | 条数窗库仍在；接线形状以 ADR 0044 为准                                                     | 本树不接 graph                                                  | **划出本队列**；见 `plans/session-compaction.md` |
-| T5  | `memory_buffer.py` / `memory_store.py` + tests                                             | 无 host 记忆 tool；ON 时模型调不到 extract/recall               | 库+单测在；图未接                                |
-| T6  | `memory_dream.py`；SSE 结束后 `run_dream_after_turn`；`FIN_MEMORY_DREAM_BACKEND` 仅 `null` | 无 fixture/真 MCP transport（注释 T6d）                         | HTTP 调度在；SC7 MCP 写出未做                    |
-| T7  | `track_decision.py` 置信度阈值；`test_track_decision_t7.py`                                | compile 把主模型当 `classify_model`；无独立 Qwen                | **基本闭合**（小模型可选）                       |
-| T8  | `feedback.py` + PG store；`web/src/feedback.ts` helper                                     | `POST .../runs/{run_id}/feedback` 路由；`TurnRow.feedback`；web 控件 | **闭合**（`eb2d24a`）                            |
-| T9  | `observability.py`；`rewrite_retry.py`；`test_observability_retry_contracts.py`            | `GET /api/observability`；retrieve tool loop 已接 rewrite retry | **闭合**（`9baaf02`；model-backed rewriter 仍开放） |
+| 波  | 模块/测试                                                                                  | 产品路径                                                             | 相对 Acceptance                                     |
+| --- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------- | --------------------------------------------------- |
+| T1  | `db_pool.py`；`test_postgres_pool_t1.py`                                                   | 池只给 memory ON；saver 长连接、thread_store 短连接（ADR 0036）      | **决策闭合**；不要再接线 saver                      |
+| T2  | `redis_client.py`；`test_redis_skeleton.py`                                                | 未进 `http`/`health`；无限流实现                                     | **骨架闭合**；排队 wont-do                          |
+| T3  | `memory_port.py` `OffMemoryAdapter`；`test_memory_off_port.py`；HTTP `get_memory_port`     | 默认 OFF；图上无记忆 tools                                           | **闭合**                                            |
+| T4  | 条数窗库仍在；接线形状以 ADR 0044 为准                                                     | 本树不接 graph                                                       | **划出本队列**；见 `plans/session-compaction.md`    |
+| T5  | `memory_buffer.py` / `memory_store.py` + tests                                             | 无 host 记忆 tool；ON 时模型调不到 extract/recall                    | 库+单测在；图未接                                   |
+| T6  | `memory_dream.py`；SSE 结束后 `run_dream_after_turn`；`FIN_MEMORY_DREAM_BACKEND` 仅 `null` | 无 fixture/真 MCP transport（注释 T6d）                              | HTTP 调度在；SC7 MCP 写出未做                       |
+| T7  | `track_decision.py` 置信度阈值；`test_track_decision_t7.py`                                | compile 把主模型当 `classify_model`；无独立 Qwen                     | **基本闭合**（小模型可选）                          |
+| T8  | `feedback.py` + PG store；`web/src/feedback.ts` helper                                     | `POST .../runs/{run_id}/feedback` 路由；`TurnRow.feedback`；web 控件 | **闭合**（`eb2d24a`）                               |
+| T9  | `observability.py`；`rewrite_retry.py`；`test_observability_retry_contracts.py`            | `GET /api/observability`；retrieve tool loop 已接 rewrite retry      | **闭合**（`9baaf02`；model-backed rewriter 仍开放） |
 
 **下一刀（本 worktree，仍非 iknow、不含压缩）：** ~~T8 HTTP+UI、T9 接线~~ 已完成（2026-09-04：T8 `eb2d24a`，T9 `9baaf02`）。T5 图上记忆工具与 T6 dream 不当公司知识入库（ADR 0045）；需要时仅显式 extract。T4 压缩不在本树做。**本树剩余：T5/T6 的产品接线仍按 ADR 0045 不作为必做波，见各 task Status。**
 
@@ -87,12 +87,11 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
    - [parallel]
 
 4. **Session sliding window + incremental summary** — tag: `[implementation]`
-   - **Inherits:** spec Focus 2 / SC5：超阈值压缩；company/period 等 snapshot 槽位保留。
-   - **Surface:** host graph/checkpointer + tests（soft_track as needed）
-   - **Acceptance:** 长 scripted thread 压缩后 classify/inherit 仍见槽位；模型可见历史相对基线缩短可测；不写 MCP；`uv run pytest -q` exits 0。
-   - **Completion:** 阈值与摘要模型调用方式开放。
-   - Status: [ ] **out of this worktree** — 执行 SSOT 是 `plans/session-compaction.md`（`fin-wt-session-compaction` / `feat/session-compaction`）；本树禁止改压缩
-   - [unblocked: T1 closed without saver pooling]
+   - **Inherits:** superseded by ADR 0044 and `plans/session-compaction.md`（token occupancy, not message count）— session-compaction 已合入 main（PR #236）。
+   - **Surface:** see session-compaction plan
+   - **Acceptance:** do not implement this bullet; implement `plans/session-compaction.md` T1–T3.
+   - Status: [x] superseded 2026-09-04
+   - [unblocked: T1 pooling closed on main by ADR 0036]
 
 5. **Local memory buffer: extract / recall / GC** — tag: `[implementation]`
    - **Inherits:** spec Focus 3 / SC6–SC8；ADR 0035：PG 缓冲；recall advisory；不能单靠记忆 cite。
