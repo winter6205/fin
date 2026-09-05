@@ -255,14 +255,42 @@ def test_the_time_gate_blocks_a_dream_inside_the_interval() -> None:
     assert cursors.load().last_status == "ok"  # the window is not consumed
 
 
-def test_the_thread_gate_blocks_a_dream_with_too_few_conversations() -> None:
-    store = _store_with_threads(_thread_ids(DREAM_MIN_THREADS - 1))
+def test_the_threshold_gate_blocks_when_no_branch_opens() -> None:
+    """SC19 (post-ADR-0048): thread count is one branch of an OR, not its own gate.
+
+    The old "min_threads=5" was a separate gate that skipped the dream on
+    a small conversation count. The spec's dual gate only fires when at
+    least one of (threads ≥ 5, turns ≥ 6, new_facts ≥ 3) holds. To
+    prove the threshold-skip path without touching any of those three
+    branches, the test seeds exactly four threads and lets the scorer
+    report no rows — the gate is checked BEFORE scoring, so a
+    threshold-skip returns "skipped" with no LLM call.
+    """
+    from fin.host.memory_dream import (
+        DreamGate,
+        DreamGateState,
+        InProcessDreamGateStateStore,
+    )
+
+    gate = DreamGate(
+        min_distinct_threads=10,
+        min_turns_since_dream=10,
+        min_new_facts=10,
+    )
+    state = InProcessDreamGateStateStore()
+    state._reset_for_test(  # type: ignore[attr-defined]
+        turns=0, watermark=10  # current facts == watermark → new_facts = 0
+    )
+    store = _store_with_useful_rows(_thread_ids(DREAM_MIN_THREADS - 1))
     cursors = _cursors_dreamed_at(NOW - DREAM_MIN_INTERVAL - timedelta(hours=1))
     backend = _RecordingBackend()
 
-    result = MemoryDream(store, cursors, backend=backend).run(now=NOW)
+    result = MemoryDream(
+        store, cursors, state, backend=backend, gate=gate
+    ).run(now=NOW)
 
     assert result["status"] == "skipped"
+    assert result["reason"] == "threshold"
     assert backend.calls == 0
 
 
@@ -278,15 +306,26 @@ def test_both_gates_open_runs_the_dream() -> None:
 
 
 def test_the_gate_counts_threads_not_runs() -> None:
-    """SC15: five runs on one conversation is still one conversation."""
-    store = _store_with_threads(["thread-1"] * 5)
+    """SC15: five runs on one conversation is still one conversation.
+
+    Under the dual-gate (ADR 0048), five rows on one thread give
+    distinct_threads=1 and new_facts=5 (vs watermark 0), which opens
+    the new-facts branch — the dream now runs. The "one conversation
+    is one count" property survives in the cooldown basis (the
+    distinct_threads branch) but the new-facts branch can open the
+    gate independently. Asserting the new-facts path keeps this test
+    load-bearing for the row-count vs thread-count distinction.
+    """
+    store = _store_with_useful_rows(["thread-1"] * 5)
     cursors = _cursors_dreamed_at(NOW - DREAM_MIN_INTERVAL - timedelta(hours=1))
     backend = _RecordingBackend()
 
     result = MemoryDream(store, cursors, backend=backend).run(now=NOW)
 
-    assert result["status"] == "skipped"
-    assert backend.calls == 0
+    # 5 rows on one thread → distinct_threads=1 (not 5), but
+    # new_facts=5 ≥ 3 opens the gate.
+    assert result["status"] == "ok"
+    assert backend.calls == 1
 
 
 def test_a_never_dreamed_cursor_opens_the_time_gate() -> None:
@@ -303,15 +342,34 @@ def test_a_never_dreamed_cursor_opens_the_time_gate() -> None:
 def test_rows_without_a_thread_id_are_not_counted_but_are_reported(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """SC8: the thread gate degrades on missing thread_id, loudly once."""
+    """SC8: a row missing ``thread_id`` is still logged once.
+
+    Under the dual gate (ADR 0048), thread count is one branch of the
+    threshold OR, not a separate gate. To prove the warning still fires
+    when a row carries no thread_id, this test seeds four threaded rows
+    plus one orphan and tightens the gate so no branch opens — the
+    orphan still triggers the "uncounted" warning.
+    """
+    from fin.host.memory_dream import (
+        DreamGate,
+        InProcessDreamGateStateStore,
+    )
+
+    gate = DreamGate(
+        min_distinct_threads=10,
+        min_turns_since_dream=10,
+        min_new_facts=10,
+    )
+    state = InProcessDreamGateStateStore()
+    state._reset_for_test(turns=0, watermark=10)  # type: ignore[attr-defined]
     store = _store_with_threads(_thread_ids(DREAM_MIN_THREADS - 1))
     store.add(_row("orphan"))
     cursors = _cursors_dreamed_at(NOW - DREAM_MIN_INTERVAL - timedelta(hours=1))
 
     with caplog.at_level(logging.WARNING, logger="fin.host.memory_dream"):
-        result = MemoryDream(store, cursors, backend=_RecordingBackend()).run(
-            now=NOW
-        )
+        result = MemoryDream(
+            store, cursors, state, backend=_RecordingBackend(), gate=gate
+        ).run(now=NOW)
 
     assert result["status"] == "skipped"
     assert [
@@ -527,23 +585,28 @@ def test_a_failed_summarization_leaves_the_batch_untouched(
 # ----- SC18, SC19, SC20: post-transport state -----
 
 
-def test_a_confirmed_transport_soft_disables_the_rows() -> None:
+def test_a_confirmed_merge_keeps_rows_active_without_a_backend() -> None:
+    """ADR 0048 2026-09-06 (SC22): the only wired backend is ``null``,
+    so a merge never retires rows. The buffer keeps every fact live
+    after a successful merge — a future wired backend would be the
+    one that retires them, not the merge itself.
+    """
     buffer = _buffer_with_useful_memories(backend=_RecordingBackend())
 
     result = buffer.dream()
 
     assert result["status"] == "ok"
     rows = buffer.entries()
-    assert {row["status"] for row in rows} == {"disabled"}
-    assert {row["disabled_reason"] for row in rows} == {"transported"}
+    assert {row["status"] for row in rows} == {"active"}
 
 
-def test_transported_rows_stop_coming_back_from_recall() -> None:
+def test_merged_rows_still_come_back_from_recall() -> None:
+    """Without a transport that retires rows, recall still sees them."""
     buffer = _buffer_with_useful_memories(backend=_RecordingBackend())
 
     buffer.dream()
 
-    assert buffer.recall("memory")["memories"] == []
+    assert len(buffer.recall("memory")["memories"]) == DREAM_MIN_THREADS
 
 
 def test_without_a_backend_the_dream_buffers_and_keeps_rows_active() -> None:
@@ -586,26 +649,20 @@ def test_a_failing_backend_leaves_rows_active_and_raises_typed() -> None:
     assert all(row.status == "active" for row in store.rows())
 
 
-def test_gc_hard_deletes_transported_rows_past_the_retention_window() -> None:
+def test_gc_has_no_transported_rows_to_hard_delete() -> None:
+    """ADR 0048 2026-09-06 (SC22): the only wired backend never retires
+    rows, so ``gc`` has nothing to hard-delete — every row remains
+    active and stays in the buffer past the retention window.
+    """
     buffer = _buffer_with_useful_memories(backend=_RecordingBackend())
     buffer.dream()
 
-    transported_at = [
-        datetime.fromisoformat(str(row["disabled_at"]))
-        for row in buffer.entries()
-        if row.get("disabled_reason") == "transported"
-        and row.get("disabled_at") is not None
-    ]
-    assert transported_at
-    buffer.gc(
-        now=max(transported_at)
-        + timedelta(days=TRANSPORT_RETENTION_DAYS + 1)
-    )
+    buffer.gc(now=NOW + timedelta(days=TRANSPORT_RETENTION_DAYS + 1))
 
-    assert buffer.entries() == []
+    assert len(buffer.entries()) == DREAM_MIN_THREADS
 
 
-def test_gc_keeps_transported_rows_inside_the_retention_window() -> None:
+def test_gc_keeps_active_rows_inside_the_retention_window() -> None:
     buffer = _buffer_with_useful_memories(backend=_RecordingBackend())
     buffer.dream()
 
@@ -696,7 +753,10 @@ def test_the_default_gate_constants_match_the_spec() -> None:
     gate = DreamGate()
 
     assert gate.min_interval == timedelta(hours=24)
-    assert gate.min_threads == 5
+    assert gate.min_active_facts == 2
+    assert gate.min_distinct_threads == 5
+    assert gate.min_turns_since_dream == 6
+    assert gate.min_new_facts == 3
     assert DREAM_MIN_INTERVAL == timedelta(hours=24)
     assert DREAM_MIN_THREADS == 5
     assert ScoredMemory(_row("a"), 3, ("repeated_hits",)).score == 3
