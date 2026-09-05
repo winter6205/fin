@@ -31,15 +31,34 @@ from fin.corpus.facts import Fact, write_facts
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
-    """Deselect soft_track-marked items unless ``-m soft_track``."""
+    """Deselect opt-in suites unless the matching ``-m`` is on the CLI.
+
+    Two marks live here:
+
+    * ``soft_track``: Soft-Track ship suites (spec Soft-Track ship gate).
+    * ``memory_on``: cases that exercise the ON memory path under
+      pytest (T3 / SC3). Default ``uv run pytest -q`` must stay OFF
+      even when the operator ``.env`` has ``FIN_MEMORY_ENABLED=true``
+      (ADR 0035); the marker is the opt-in switch the gold set uses.
+
+    Both are register-style deselection: a CLI ``-m memory_on`` or
+    ``-m soft_track`` re-runs them. The check is per-mark so a CLI
+    ``-m memory_on`` keeps the ``soft_track`` items deselected and vice
+    versa — they are independent opt-in switches.
+    """
     markexpr = config.getoption("markexpr") or ""
-    if "soft_track" in markexpr:
-        return
 
     kept: list[pytest.Item] = []
     deselected: list[pytest.Item] = []
     for item in items:
-        if item.get_closest_marker("soft_track") is not None:
+        markers = (
+            "soft_track" if item.get_closest_marker("soft_track") is not None else None,
+            "memory_on" if item.get_closest_marker("memory_on") is not None else None,
+        )
+        # Drop only the opt-in marks that the CLI did NOT request. An
+        # unmarked test stays kept.
+        opt_in_only = tuple(name for name in markers if name is not None)
+        if opt_in_only and all(name not in markexpr for name in opt_in_only):
             deselected.append(item)
         else:
             kept.append(item)
@@ -47,6 +66,27 @@ def pytest_collection_modifyitems(
     if deselected:
         config.hook.pytest_deselected(items=deselected)
         items[:] = kept
+
+
+@pytest.fixture(autouse=True)
+def _memory_on_env_for_marked_tests(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    """Re-install ``FIN_MEMORY_ENABLED=true`` for ``memory_on``-marked tests.
+
+    The session-level clear in ``tests/conftest.py`` removes the var at
+    import time, and the autouse strip in
+    ``tests/host/test_memory_pytest_off.py._strip_operator_memory_env``
+    drops it again before each unmarked test. A test marked
+    ``@pytest.mark.memory_on`` opts out of THAT autouse strip; this
+    autouse fixture is the paired side, restoring the value the
+    operator's ``.env`` would have set so the test sees the real ON
+    path. monkeypatch teardown cleans up after the test, so subsequent
+    unmarked tests still see a clean env.
+    """
+    if request.node.get_closest_marker("memory_on") is None:
+        return
+    monkeypatch.setenv("FIN_MEMORY_ENABLED", "true")
 
 
 # ----- T3 comparison fact seed (spec Focus 1) -----
