@@ -4,11 +4,7 @@
 
 **总计划（阶段表，不再当实施队列）：** [`retrieval-upgrade.md`](retrieval-upgrade.md)
 
-<<<<<<< HEAD
-**下一刀实施：** [`corpus-serve-ingest.md`](corpus-serve-ingest.md)。记忆其余波见 [`memory-dialogue-platform.md`](memory-dialogue-platform.md)（T4 压缩不在该文件执行，见 compaction worktree 的 `plans/session-compaction.md`）。
-=======
-**下一刀实施：** [`session-compaction.md`](session-compaction.md)（worktree `feat/session-compaction`；MDP T4 执行权在本文件）。MDP 其余波在 `/home/winner/projects/fin-wt-memory-dialogue-platform` 的 [`memory-dialogue-platform.md`](memory-dialogue-platform.md)，该树不改压缩。
->>>>>>> origin/main
+**下一刀实施：** [`corpus-serve-ingest.md`](corpus-serve-ingest.md)（本树）。MDP 其余波见 [`memory-dialogue-platform.md`](memory-dialogue-platform.md)——T8/T9 已闭合（PR #237）；压缩已闭合（PR #236，ADR 0044）。
 
 **仍开着的 retrieve 内部债（非跨仓主线）：** [`retrieve-maintainability-followup.md`](retrieve-maintainability-followup.md)、[`2026-09-01-pr225-followup-plan-a.md`](2026-09-01-pr225-followup-plan-a.md)
 

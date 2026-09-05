@@ -4,6 +4,8 @@
 
 import { create } from "zustand";
 import * as api from "./api";
+// T8: the thumbs-feedback boundary (POST .../runs/{run_id}/feedback).
+import { submitFeedback, type FeedbackValue } from "./feedback";
 // T5 (#35): the last opened thread id, persisted so a returning
 // visit lands back on that thread.
 import { forgetLastThreadIf, rememberLastThread } from "./lastThread";
@@ -104,6 +106,16 @@ interface WorkspaceState {
   // door. Mints a turn-scoped attachment id; NEVER touches the
   // ingest endpoint — the doors must not cross.
   attachFile: (threadId: string, file: File) => Promise<ThreadAttachment>;
+  // T8: record (or flip) the operator's thumb for one run. Response-
+  // driven (matching ``dismissNotice``'s convention): the turn row is
+  // patched only after the host confirms the persisted value, so the
+  // UI never shows a thumb the store rejected. Rejects so the caller
+  // can surface a failure; the optimistic row is not touched.
+  setTurnFeedback: (
+    threadId: string,
+    runId: string,
+    value: FeedbackValue,
+  ) => Promise<void>;
 }
 
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
@@ -269,98 +281,93 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       request.attachment_ids = attachmentIds;
     }
     try {
-      const result = await api.sendMessage(
-        threadId,
-        request,
-        (event) => {
-          switch (event.type) {
-            case "thinking":
-              patchTurn((t) => ({
-                ...t,
-                thinking_text: t.thinking_text + event.text,
-              }));
-              break;
-            case "tool_call": {
-              // Append a placeholder row so the operator sees a
-              // running indicator while the tool executes. The
-              // matching ``tool_result`` replaces it with the
-              // server-formatted one-liner.
-              const placeholder: ToolSummary = {
-                name: event.name,
-                summary: "运行中…",
-                tool_call_id: event.tool_call_id,
-              };
-              patchTurn((t) => ({
-                ...t,
-                tool_summaries: [...(t.tool_summaries ?? []), placeholder],
-              }));
-              break;
-            }
-            case "tool_result": {
-              // The server already formatted the summary (spec line
-              // 32); replace the "running…" placeholder with it.
-              patchTurn((t) => ({
-                ...t,
-                tool_summaries: (t.tool_summaries ?? []).map((s) =>
-                  s.tool_call_id === event.tool_call_id
-                    ? { ...s, summary: event.summary }
-                    : s,
-                ),
-              }));
-              break;
-            }
-            case "status": {
-              statusSeen = true;
-              // Patch by the CLIENT placeholder id first — updating
-              // ``optimisticRunId`` before the patch would orphan the
-              // optimistic row and freeze the live view until GET.
-              const priorRunId = optimisticRunId;
-              patchTurnByRunId(priorRunId, (t) => ({
-                ...t,
-                run_id: event.run_id,
-                status: event.status,
-                status_reason: event.reason ?? "",
-                assistant_message: event.assistant_message,
-                // Soft-Track: optional until host SSE includes track.
-                track: event.track ?? t.track,
-                track_decision: event.track_decision ?? t.track_decision,
-                // Mid-flight stream taxonomy: only set on refuse
-                // rows whose refusal came from the stream engine;
-                // an empty value from the wire keeps the prior
-                // row's value (a fresh turn starts as ``""``).
-                status_classified:
-                  event.status_classified !== undefined
-                    ? event.status_classified
-                    : t.status_classified,
-                // T4 (#37): the run ended — thinking collapses to the
-                // duration label, tool rows collapse.
-                in_flight: false,
-                thinking_duration_ms:
-                  event.thinking_ms ?? t.thinking_duration_ms,
-              }));
-              optimisticRunId = event.run_id;
-              break;
-            }
-            case "answer":
-              answerFold = foldLiveAnswer(answerFold, {
-                text: event.text,
-                reset: event.reset,
-                statusSeen,
-              });
-              patchTurn((t) => ({ ...t, answer: answerFold.visible }));
-              break;
-            case "citations":
-              patchTurn((t) => ({ ...t, citations: event.citations }));
-              break;
-            case "comparison":
-              patchTurn((t) => ({
-                ...t,
-                comparisons: [...(t.comparisons ?? []), event.comparison],
-              }));
-              break;
+      const result = await api.sendMessage(threadId, request, (event) => {
+        switch (event.type) {
+          case "thinking":
+            patchTurn((t) => ({
+              ...t,
+              thinking_text: t.thinking_text + event.text,
+            }));
+            break;
+          case "tool_call": {
+            // Append a placeholder row so the operator sees a
+            // running indicator while the tool executes. The
+            // matching ``tool_result`` replaces it with the
+            // server-formatted one-liner.
+            const placeholder: ToolSummary = {
+              name: event.name,
+              summary: "运行中…",
+              tool_call_id: event.tool_call_id,
+            };
+            patchTurn((t) => ({
+              ...t,
+              tool_summaries: [...(t.tool_summaries ?? []), placeholder],
+            }));
+            break;
           }
-        },
-      );
+          case "tool_result": {
+            // The server already formatted the summary (spec line
+            // 32); replace the "running…" placeholder with it.
+            patchTurn((t) => ({
+              ...t,
+              tool_summaries: (t.tool_summaries ?? []).map((s) =>
+                s.tool_call_id === event.tool_call_id
+                  ? { ...s, summary: event.summary }
+                  : s,
+              ),
+            }));
+            break;
+          }
+          case "status": {
+            statusSeen = true;
+            // Patch by the CLIENT placeholder id first — updating
+            // ``optimisticRunId`` before the patch would orphan the
+            // optimistic row and freeze the live view until GET.
+            const priorRunId = optimisticRunId;
+            patchTurnByRunId(priorRunId, (t) => ({
+              ...t,
+              run_id: event.run_id,
+              status: event.status,
+              status_reason: event.reason ?? "",
+              assistant_message: event.assistant_message,
+              // Soft-Track: optional until host SSE includes track.
+              track: event.track ?? t.track,
+              track_decision: event.track_decision ?? t.track_decision,
+              // Mid-flight stream taxonomy: only set on refuse
+              // rows whose refusal came from the stream engine;
+              // an empty value from the wire keeps the prior
+              // row's value (a fresh turn starts as ``""``).
+              status_classified:
+                event.status_classified !== undefined
+                  ? event.status_classified
+                  : t.status_classified,
+              // T4 (#37): the run ended — thinking collapses to the
+              // duration label, tool rows collapse.
+              in_flight: false,
+              thinking_duration_ms: event.thinking_ms ?? t.thinking_duration_ms,
+            }));
+            optimisticRunId = event.run_id;
+            break;
+          }
+          case "answer":
+            answerFold = foldLiveAnswer(answerFold, {
+              text: event.text,
+              reset: event.reset,
+              statusSeen,
+            });
+            patchTurn((t) => ({ ...t, answer: answerFold.visible }));
+            break;
+          case "citations":
+            patchTurn((t) => ({ ...t, citations: event.citations }));
+            break;
+          case "comparison":
+            patchTurn((t) => ({
+              ...t,
+              comparisons: [...(t.comparisons ?? []), event.comparison],
+            }));
+            break;
+        }
+      });
       // The SSE stream already delivered terminal status, answer, and
       // citations. Re-GET'ing here used to replace the live turn row
       // and caused a visible retract/repop even when merge logic ran
@@ -622,6 +629,23 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // attachment the NEXT send references once. Deliberately does
     // NOT touch /api/corpus/ingest — the two doors must not cross.
     return api.attachToThread(threadId, file);
+  },
+
+  async setTurnFeedback(threadId, runId, value) {
+    // The host is authoritative for the persisted value (last write
+    // wins on a flip), so the confirmed record patches the row — not
+    // the optimistic request value.
+    const record = await submitFeedback(threadId, runId, value);
+    const current = get().activeThread;
+    if (!current || current.id !== threadId) return;
+    set({
+      activeThread: {
+        ...current,
+        turns: current.turns.map((t) =>
+          t.run_id === runId ? { ...t, feedback: record.value } : t,
+        ),
+      },
+    });
   },
 }));
 

@@ -134,3 +134,21 @@ The count command prints exactly two lines on stdout (`done=6`, `refuse=3`) and 
 `state` is `reachable` / `unconfigured` (URL unset) / `unreachable` (URL set, Postgres did not answer). Product `fin-serve` does not start when the URL is unset (`MissingCheckpointURLError`); `unconfigured` remains for tests and for a process that imported the app without going through `serve()`. Both degraded states are a 200 with operator copy: a monitoring probe can tell "fin is down" from "fin is up without a database", which a blank 500 cannot. The body never echoes the URL — that string carries the operator's password.
 
 This is a separate route from `GET /api/status`, which stays boot-scoped per ADR 0033 (retrieve reachability, adapter kind, model slug, corpus filing count) and grows no per-request database probe.
+
+### Run counters (`GET /api/observability`)
+
+`GET /api/observability` exposes the host process's observability counters (same process as `GET /health`):
+
+```json
+{
+  "counts": {"done": 12, "refuse": 2},
+  "latency_ms": {"count": 14, "total": 91234.5, "average": 6516.75},
+  "rewrite_retry": {"count": 3, "exhausted": 1}
+}
+```
+
+- `counts` — terminal statuses of completed turns (`done` / `refuse` / `step_cap`), recorded when the turn's SSE stream ends.
+- `latency_ms` — aggregate count / total / average of those turns' wall-clock duration.
+- `rewrite_retry` — empty-hit rewrite retries the `retrieve` tool performed (`count`) and how many of those still ended on an empty hit after the one bounded rewrite (`exhausted`). The retry fires only on the exact miss shape `{"chunks": []}` — never on hits, typed errors, or invalid input — so a rising `count` means retrieval genuinely missed before the rewrite.
+
+This is a counters-only surface by construction: no per-run data, no question / answer / URL text, no exception strings, no credentials. It is a third route, deliberately separate from `GET /api/status` (boot-scoped, ADR 0033) and `GET /health` (process-scoped); neither grows run-scoped counters.
