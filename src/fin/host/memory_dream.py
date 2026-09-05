@@ -521,6 +521,11 @@ class MemoryDream:
             self._cursors.advance(
                 at=at, seen_thread_ids=seen, last_status="empty"
             )
+            # Empty-selection still closed the window; the per-turn
+            # counters reset for the same reason the buffered / ok
+            # branches do (SC22 — window still closes).
+            if self._gate_state is not None:
+                self._gate_state.reset(active_facts=active_facts)
             return {"status": "empty", "transported": 0, "selected": 0}
 
         batch = self._summarize(selected)
