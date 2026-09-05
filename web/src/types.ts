@@ -186,6 +186,11 @@ export interface Turn {
   // the numbers the filing actually reported, which is the
   // evidence for the refusal.
   comparisons?: Comparison[];
+  // T8: the operator's latest thumb for this run ("up" / "down").
+  // Null / absent when no thumb was ever set. A side record keyed by
+  // run_id (mirrors ``fin.host.workspace_http.TurnRow.feedback``) —
+  // setting or flipping it never changes the run's citations.
+  feedback?: "up" | "down" | null;
   created_at: string;
 }
 
