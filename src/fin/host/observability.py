@@ -87,6 +87,8 @@ class ObservabilityCollector:
         self._counts: dict[str, int] = {}
         self._latency_count = 0
         self._latency_total = 0.0
+        self._retry_count = 0
+        self._retry_exhausted_count = 0
         self._lock = threading.Lock()
 
     @property
@@ -110,6 +112,33 @@ class ObservabilityCollector:
         """Return a context manager that records successful block latency."""
         _validate_status(status)
         return _ObservationContext(self, status)
+
+    def record_rewrite_retry(self, *, exhausted: bool) -> None:
+        """Count one performed empty-hit rewrite retry (T9).
+
+        ``exhausted`` marks a retry whose follow-up retrieve was STILL
+        an empty hit. These counters are deliberately separate from
+        :meth:`snapshot`: the terminal-status vocabulary (``done`` /
+        ``refuse`` / ``step_cap``) and the retry counters answer
+        different questions, and the pinned ``snapshot()`` shape must
+        not drift. Read them back with :meth:`retry_snapshot`.
+        """
+        if not isinstance(exhausted, bool):
+            raise ObservabilityConfigurationError(
+                "exhausted must be a boolean"
+            )
+        with self._lock:
+            self._retry_count += 1
+            if exhausted:
+                self._retry_exhausted_count += 1
+
+    def retry_snapshot(self) -> dict[str, int]:
+        """Return the retry counters as a JSON-safe dict."""
+        with self._lock:
+            return {
+                "count": self._retry_count,
+                "exhausted": self._retry_exhausted_count,
+            }
 
     def snapshot(self) -> dict[str, object]:
         """Return a JSON-safe payload suitable for a health/status surface."""
@@ -171,6 +200,31 @@ class _ObservationContext:
         return False
 
 
+# ----- process default (T9) -----
+
+
+_default_collector: ObservabilityCollector | None = None
+_default_collector_lock = threading.Lock()
+
+
+def default_collector() -> ObservabilityCollector:
+    """Return the per-process default collector, built once under a lock.
+
+    Both the HTTP surface (``fin.host.http.get_observability_collector``)
+    and the graph's retrieve tool (empty-hit rewrite retry counters)
+    record on / read from this ONE instance. The singleton lives here —
+    below ``graph`` and ``http`` — so the retrieve tool can reach it
+    without a circular import (``http`` imports ``graph``). Callers that
+    need isolation (tests) build their own :class:`ObservabilityCollector`
+    instead.
+    """
+    global _default_collector
+    with _default_collector_lock:
+        if _default_collector is None:
+            _default_collector = ObservabilityCollector()
+        return _default_collector
+
+
 def _validate_status(status: str) -> None:
     if not isinstance(status, str) or status not in OBSERVATION_STATUSES:
         raise InvalidObservationStatusError(
@@ -200,4 +254,5 @@ __all__ = [
     "ObservabilityConfigurationError",
     "ObservabilityCollector",
     "ObservabilityError",
+    "default_collector",
 ]
