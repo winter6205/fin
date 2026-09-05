@@ -101,11 +101,17 @@ from fin.host.evidence_admission import (
     admit_retrieved_chunks,
     evidence_from_chunks,
 )
+from fin.host.memory_port import MemoryPort
 from fin.host.session_compaction import (
     OccupancyCompactor,
     SessionSummaryError,
     count_tokens_approximately,
     session_budget_tokens,
+)
+from fin.host.user_profile import (
+    UserProfileError,
+    UserProfileStore,
+    UserProfileUnknownLayerError,
 )
 from fin.host.state import (
     AgentState,
@@ -778,6 +784,119 @@ def _make_get_xbrl_fact_tool(facts_root: Path):
 # by name; ``_ANALYSIS_PAYLOAD_KEYS`` in ``stream_map`` maps them to
 # payload keys). Renaming any of them would silently drop a tool from
 # the prompt.
+
+
+# ----- memory-tool factories (T6 / spec SC12-SC13) -----
+#
+# Three explicit memory tools surface only when the injected memory port
+# is enabled. The OFF branch (port is ``None`` or ``enabled is False``)
+# binds NONE of them — the compiled graph's tool set is the existing
+# eight ToolNode tools, identical to the pre-memory surface (T3 / SC3).
+#
+# The ``dream`` tool is NEVER created in any branch (map G4). No code
+# path here references a dream tool name, so the wiring test that
+# asserts ``"dream" not in compile_graph signature params`` stays green
+# regardless of which branch compiled the graph.
+#
+# ``user_profile_store`` is injectable so tests can use ``tmp_path``
+# roots; the production entry point builds one from ``workspace_root``
+# via ``UserProfileStore.from_env``.
+
+
+def _make_save_memory_tool(
+    memory_port: MemoryPort,
+    *,
+    workspace: str,
+) -> Any:
+    """Build the explicit ``save_memory`` tool (spec SC12).
+
+    Title + body text are forwarded to ``memory_port.extract`` so the
+    operator's hand-curated row lives in the same store the auto-extract
+    path writes to. ``workspace`` is the resolved workspace key the
+    factory received; SC6 isolates rows by workspace.
+
+    The tool returns a dict the ToolNode serializes as ToolMessage JSON
+    so the model can confirm the row landed (and the operator can see
+    the advisory marker).
+    """
+
+    @tool("save_memory")
+    def save_memory_tool(title: str, body: str) -> dict:
+        """Persist one cross-session memory row (title + body).
+
+        ``title`` is a short label; ``body`` is the full prose (the
+        first non-empty line becomes the memory hook — ≤80 chars). The
+        row is workspace-scoped and is advisory context, never citation
+        evidence.
+        """
+        result = memory_port.extract(
+            body,
+            metadata={"title": title},
+            workspace=workspace,
+        )
+        return result
+
+    return save_memory_tool
+
+
+def _make_recall_memory_tool(
+    memory_port: MemoryPort,
+    *,
+    workspace: str,
+) -> Any:
+    """Build the explicit ``recall_memory`` tool (spec SC12).
+
+    The returned payload carries the same ``advisory: True`` and
+    ``citation_eligible: False`` markers the host prefetch uses so the
+    citation verifier refuses memory rows as evidence (ADR 0035 /
+    0046).
+    """
+
+    @tool("recall_memory")
+    def recall_memory_tool(query: str, limit: int = 8) -> dict:
+        """Return advisory memory rows that lexically hit ``query``.
+
+        ``query`` is the operator's recall cue; ``limit`` is the cap
+        (default 8). The payload is advisory context — it cannot
+        satisfy the citation verifier. Rows are workspace-scoped.
+        """
+        return memory_port.recall(query, limit=limit, workspace=workspace)
+
+    return recall_memory_tool
+
+
+def _make_edit_user_profile_tool(
+    user_profile_store: UserProfileStore,
+) -> Any:
+    """Build the layered ``edit_user_profile`` tool (spec SC13).
+
+    ``layer`` selects which file the tool writes:
+
+    * ``"workspace"`` — ``<workspace>/.fin/user.md`` (overlay)
+    * ``"global"`` — ``$HOME/.fin/user.md``
+
+    Writing one layer NEVER rewrites the other; the contract is
+    file-isolated on disk. ``UserProfileStore.write_layer`` raises
+    :class:`UserProfileUnknownLayerError` for any other name, and the
+    error rides on the ToolMessage so the model sees a readable refusal
+    instead of a crashed run.
+    """
+
+    @tool("edit_user_profile")
+    def edit_user_profile_tool(layer: str, text: str) -> dict:
+        """Write ``text`` to one user-profile layer.
+
+        ``layer`` is ``"workspace"`` or ``"global"``; an unknown name
+        returns the typed ``user_profile_unknown_layer`` dict without
+        raising. Writing workspace does NOT rewrite global (SC13).
+        """
+        try:
+            user_profile_store.write_layer(layer, text)  # type: ignore[arg-type]
+        except UserProfileUnknownLayerError as exc:
+            return {"error": "user_profile_unknown_layer", "layer": exc.layer}
+        return {"status": "ok", "layer": layer}
+
+    return edit_user_profile_tool
 
 
 @dataclass(frozen=True)
@@ -1706,6 +1825,9 @@ def compile_graph(
     mapping_failure_ledger: MappingFailureLedger | None = None,
     degradation_ledger: DegradationLedger | None = None,
     summarizer: Any | None = None,
+    memory_port: MemoryPort | None = None,
+    workspace_root: Path | str | None = None,
+    user_profile_store: UserProfileStore | None = None,
 ) -> "_LockedGraph":
     """Build the v1 host graph (T6).
 
@@ -1850,6 +1972,32 @@ def compile_graph(
         catches ``SessionSummaryError`` so a model outage cannot
         refuse the operator turn (ADR 0044: "summary failure is
         typed and must not refuse the operator turn").
+    memory_port
+        T6 / spec SC12: the explicit memory-port seam. ``None`` (the
+        default, the boot shape per T3 / SC2 / SC3) keeps the graph
+        OFF — the compiled graph exposes no memory tool, and the
+        ToolNode's tool list is exactly the existing eight tools.
+        When supplied AND ``memory_port.enabled is True``, three
+        tools surface: ``save_memory`` (title + body → extract),
+        ``recall_memory`` (query → advisory payload), and
+        ``edit_user_profile`` (layer + text → layered file write).
+        There is NO dream tool in any branch (map G4). When
+        ``memory_port`` is supplied but ``enabled`` is ``False``,
+        the same OFF branch as ``None`` applies: the three memory
+        tools are NOT bound.
+    workspace_root
+        T6: the workspace key the save/recall memory tools pass into
+        ``MemoryBuffer``. Defaults to ``str(Path.cwd())`` when ON and
+        ``memory_port`` is supplied. ``OffMemoryAdapter`` ignores it.
+        Tests pass an explicit ``tmp_path``-rooted string so save/recall
+        isolation (SC6) is observable end to end.
+    user_profile_store
+        T6 / spec SC13: the two-layer profile file store the
+        ``edit_user_profile`` tool writes through. ``None`` (the
+        default) builds one from ``UserProfileStore.from_env(
+        workspace_root)`` when ``memory_port`` is ON; the OFF branch
+        does not need it. Tests inject an explicit store rooted at a
+        ``tmp_path`` so the suite never touches the real ``$HOME``.
 
     Returns
     -------
@@ -1942,19 +2090,67 @@ def compile_graph(
     table_extract_tool = _make_table_extract_tool(mpath, rpath)
     statement_tool = _make_statement_tool(fpath)
 
-    bound_model = model.bind_tools(
-        [
-            list_files_tool,
-            read_file_tool,
-            retrieve_tool,
-            get_xbrl_fact_tool,
-            compare_facts_tool,
-            research_issuers_tool,
-            redline_tool,
-            table_extract_tool,
-            statement_tool,
-        ]
+    # T6 (spec SC12 / SC13 / map G4): when memory is ON, expose exactly
+    # three tools — save / recall / edit_user_profile. OFF keeps the
+    # tool list at the existing eight ToolNode tools. No dream tool is
+    # EVER created in any branch.
+    memory_enabled = bool(memory_port is not None and memory_port.enabled)
+    resolved_workspace_root = (
+        workspace_root if workspace_root is not None else Path.cwd()
     )
+    workspace_key = str(resolved_workspace_root)
+    save_memory_tool: Any | None = None
+    recall_memory_tool: Any | None = None
+    edit_user_profile_tool: Any | None = None
+    if memory_enabled:
+        save_memory_tool = _make_save_memory_tool(
+            memory_port,  # type: ignore[arg-type]
+            workspace=workspace_key,
+        )
+        recall_memory_tool = _make_recall_memory_tool(
+            memory_port,  # type: ignore[arg-type]
+            workspace=workspace_key,
+        )
+        if user_profile_store is None:
+            user_profile_store = UserProfileStore.from_env(
+                resolved_workspace_root
+            )
+        edit_user_profile_tool = _make_edit_user_profile_tool(user_profile_store)
+
+    model_bound_tools: list[Any] = [
+        list_files_tool,
+        read_file_tool,
+        retrieve_tool,
+        get_xbrl_fact_tool,
+        compare_facts_tool,
+        research_issuers_tool,
+        redline_tool,
+        table_extract_tool,
+        statement_tool,
+    ]
+    tool_node_tools: list[Any] = [
+        list_files_tool,
+        read_file_tool,
+        retrieve_tool,
+        get_xbrl_fact_tool,
+        compare_facts_tool,
+        redline_tool,
+        table_extract_tool,
+        statement_tool,
+    ]
+    if memory_enabled:
+        # The three memory tools bind to BOTH the model and the ToolNode
+        # so a call the model emits reaches the dispatcher and the
+        # payload lands as a ToolMessage. Order matches the spec's
+        # "save / recall / edit-user-profile" listing.
+        model_bound_tools.extend(
+            [save_memory_tool, recall_memory_tool, edit_user_profile_tool]
+        )
+        tool_node_tools.extend(
+            [save_memory_tool, recall_memory_tool, edit_user_profile_tool]
+        )
+
+    bound_model = model.bind_tools(model_bound_tools)
     # T3 (#34): the off-preference binding layers the MiniMax
     # ``extra_body`` (``thinking.type=disabled``) on top of the same
     # bound tools. ``reasoning_split`` STAYS ``True`` so
@@ -1972,16 +2168,7 @@ def compile_graph(
     unbound_model_no_thinking = model.bind(extra_body=_thinking_off_body)
 
     tool_dispatcher = ToolNode(
-        [
-            list_files_tool,
-            read_file_tool,
-            retrieve_tool,
-            get_xbrl_fact_tool,
-            compare_facts_tool,
-            redline_tool,
-            table_extract_tool,
-            statement_tool,
-        ],
+        tool_node_tools,
         name="tool_node",
         handle_tool_errors=True,
     )
@@ -2766,6 +2953,27 @@ def compile_graph(
         # uses, so ``/compact`` and the >=90% auto path share one
         # eviction unit walker, one summarizer seam, one floor.
         compactor=_compactor,
+        # T6: surface the bound tool list (save / recall / profile on
+        # the ON branch) so the test introspection path can assert
+        # the spec-mandated tool surface without reaching through the
+        # compiled-graph internals.
+        bound_tools=model_bound_tools,
+        # T6: surface the ToolNode so the test introspection path
+        # can drive save / recall / edit_user_profile without going
+        # through ``tool_node_with_summaries`` (a wrapper whose name
+        # shadows the actual executor in the compiled graph).
+        tool_node=tool_dispatcher,
+        # T6: memory_port + workspace_root change the bound tool set
+        # (ON adds three tools; a different workspace re-routes the
+        # tool bodies but the BOUND tool list shape is identical), so
+        # the idempotence cache must distinguish graphs by memory
+        # surface. ``id(memory_port)`` is stable across two calls with
+        # the same injected port object — keying on the bound tool
+        # LIST directly would create a fresh list per call and break
+        # the OFF/idempotence contract that the existing wiring tests
+        # pin.
+        memory_port_id=id(memory_port) if memory_port is not None else 0,
+        workspace_root_key=str(resolved_workspace_root),
     )
 
 
@@ -2799,6 +3007,10 @@ def _make_locked_graph(
     issuer_cap: int = MAX_ISSUERS,
     summarizer: Any | None = None,
     compactor: OccupancyCompactor | None = None,
+    bound_tools: list[Any] | None = None,
+    tool_node: Any | None = None,
+    memory_port_id: int = 0,
+    workspace_root_key: str = "",
 ) -> "_LockedGraph":
     key = (
         id(checkpointer),
@@ -2814,6 +3026,11 @@ def _make_locked_graph(
         # graph's ``compaction_gate`` node, so two graphs that differ
         # only in ``summarizer`` are two different graphs.
         id(summarizer) if summarizer is not None else 0,
+        # T6: ON vs OFF adds three memory tools to the bound set;
+        # without this key the first OFF compile would hand a later
+        # ON compile a cached OFF proxy.
+        int(memory_port_id),
+        str(workspace_root_key),
     )
     cached = _IDEMPOTENCE_CACHE.get(key)
     if cached is not None:
@@ -2822,6 +3039,8 @@ def _make_locked_graph(
         compiled_graph=compiled_graph,
         recursion_limit=recursion_limit,
         compactor=compactor,
+        bound_tools=bound_tools or [],
+        tool_node=tool_node,
     )
     _IDEMPOTENCE_CACHE[key] = proxy
     return proxy
@@ -2849,6 +3068,8 @@ class _LockedGraph:
         compiled_graph: Any,
         recursion_limit: int,
         compactor: OccupancyCompactor | None = None,
+        bound_tools: list[Any] | None = None,
+        tool_node: Any | None = None,
     ) -> None:
         self._graph = compiled_graph
         # ``recursion_limit`` is exposed via the public attribute
@@ -2857,6 +3078,17 @@ class _LockedGraph:
         # T2 (ADR 0044): the compactor shared with the graph's
         # ``compaction_gate`` node; ``/compact`` runs the same gate.
         self._compactor = compactor
+        # T6: the bound tool list captured at factory time so the
+        # test surface can assert the spec-mandated save / recall /
+        # edit_user_profile presence without reaching through the
+        # compiled-graph internals.
+        self._bound_tools: list[Any] = list(bound_tools or [])
+        # T6: the executor-side ToolNode — exposed so tests can drive
+        # the spec tools (save / recall / edit_user_profile) directly
+        # without going through the ``tool_node_with_summaries``
+        # wrapper that shadows the registered executor name in the
+        # compiled graph.
+        self._tool_node = tool_node
         self._thread_locks: dict[str, threading.Lock] = {}
         self._meta_lock = threading.Lock()
 
