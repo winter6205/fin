@@ -37,6 +37,7 @@ markers = [
     "eval: opt-in eval cases (default `pytest -q` does NOT run these)",
     "soft_track: Soft-Track opt-in contracts (deselected by default)",
     "mcp: opt-in MCP 2.0 protocol smoke against a fixture server (deselected by default)",
+    "memory_on: opt-in memory ON cases (default `pytest -q` deselects these; run with `-m memory_on`)",
 ]
 
 [dependency-groups]

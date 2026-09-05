@@ -13,10 +13,18 @@ hand-rolled manifest.
 
 It yields ``{"catalog_path": ...}`` so callers can splat it straight
 into ``list_files`` / ``list_filings``.
+
+T3 / SC3 / ADR 0035 also live here: after ``apply_dotenv`` populates the
+process env, we DEL ``FIN_MEMORY_ENABLED`` so the default pytest run
+builds an OFF memory port even when the operator ``.env`` has
+``FIN_MEMORY_ENABLED=true``. Memory cases opt back in via the
+``@pytest.mark.memory_on`` marker + ``memory_on_env`` fixture in
+``tests/host/conftest.py``.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -31,6 +39,20 @@ from fin.host.operator_env import apply_dotenv
 # ``setdefault`` fill: an explicitly exported var still wins, and a
 # missing ``.env`` is a no-op (CI stays hermetic).
 apply_dotenv(start=Path(__file__).resolve().parent.parent)
+
+# SC3 / ADR 0035: default ``uv run pytest -q`` MUST stay OFF even when
+# the operator ``.env`` has ``FIN_MEMORY_ENABLED=true``. We strip the
+# var here so any ``build_memory_port()`` call in unmarked tests sees
+# an unset ``FIN_MEMORY_ENABLED`` and resolves to ``OffMemoryAdapter``.
+#
+# This is the session-level half of the strip. The per-test half lives
+# in ``tests/host/test_memory_pytest_off.py._strip_operator_memory_env``
+# and is needed because a sibling test in the same process can re-add
+# the var after this import-time clear.
+#
+# Opt-in: tests marked ``@pytest.mark.memory_on`` re-set the var via the
+# ``memory_on_env`` fixture in ``tests/host/conftest.py``.
+os.environ.pop("FIN_MEMORY_ENABLED", None)
 
 
 # One row per form the operator should be able to see in the library.
