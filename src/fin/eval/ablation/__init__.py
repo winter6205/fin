@@ -55,6 +55,15 @@ from fin.eval.ablation.runner import (
     MetricSeries,
     run_ablation,
 )
+from fin.eval.ablation.live_set import (
+    LIVE_BACKEND_KIND,
+    LIVE_DATASET_ID,
+    LiveEvalSeamWrapper,
+    LiveEvalSetError,
+    LiveSeamUnavailableError,
+    live_document_ids,
+    live_eval_set,
+)
 
 __all__ = [
     "ABLATION_REPORT_VERSION",
@@ -65,11 +74,16 @@ __all__ = [
     "B1_MIN_REPEATS",
     "B1_QUERY_SUBSET_MAX",
     "B1_QUERY_SUBSET_MIN",
+    "LIVE_BACKEND_KIND",
+    "LIVE_DATASET_ID",
     "METRIC_FIELDS",
     "AblationConfiguration",
     "AblationMatrixError",
     "ConcurrencySpecDriftError",
     "ConcurrencySpecRowMissingError",
+    "LiveEvalSeamWrapper",
+    "LiveEvalSetError",
+    "LiveSeamUnavailableError",
     "PublishedConcurrencyContract",
     "PublishedIdempotencyConcurrency",
     "PublishedL1Concurrency",
@@ -89,6 +103,8 @@ __all__ = [
     "build_ablation_matrix",
     "build_report",
     "evaluate_outcomes",
+    "live_document_ids",
+    "live_eval_set",
     "merge_with_retrieval_report",
     "published_concurrency_contract",
     "run_ablation",

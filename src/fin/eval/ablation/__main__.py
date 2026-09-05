@@ -9,6 +9,17 @@ Commands
     a missing configuration, a missing metric, a missing contribution or
     a bare percentage is a failed run, not a written file with a
     footnote.
+
+    ``--eval-set`` selects the eval set:
+      * ``dataset`` (default): the committed T10 subset, backend =
+        ``contract_fake`` (SC2).
+      * ``scripted``: the in-code smoke set, backend = ``contract_fake``.
+      * ``live`` (T3, opt-in): drives a real ``MCPRetrieveAdapter``
+        through the ablation seam; backend = ``"mcp"``. iknow down is
+        a named ``retrieve_unavailable`` failure and exits non-zero;
+        a ``degraded: true`` envelope with no chunks is the same named
+        failure. A successful live run writes a
+        ``backend.kind == "mcp"`` report.
 ``matrix``
     Print the 10 configurations without running anything.
 
@@ -31,9 +42,22 @@ from fin.eval.ablation.matrix import (
     build_ablation_matrix,
 )
 from fin.eval.ablation.metrics import METRIC_FIELDS, MetricEnumerationError
-from fin.eval.ablation.report import REPORT_FILENAME, build_report, validate_report
+from fin.eval.ablation.report import (
+    REPORT_FILENAME,
+    build_report,
+    validate_report,
+    write_report_atomically,
+)
 from fin.eval.ablation.runner import AblationRunError, run_ablation
 
+
+# Re-exported at module level so tests can monkeypatch the factory
+# without rerunning the live seam (which would spawn an MCP subprocess
+# in the default lane). The default implementation is the live path;
+# the CLI never instantiates a real ``MCPRetrieveAdapter`` itself —
+# :func:`fin.eval.ablation.live_set.live_eval_set` does, only when
+# ``--eval-set live`` is selected.
+from fin.eval.ablation.live_set import live_eval_set  # noqa: E402
 
 DEFAULT_OUTPUT_DIR = Path("data/eval/ablation")
 
@@ -82,6 +106,8 @@ def _run(args: argparse.Namespace) -> int:
 
         queries, port, known_document_ids = scripted_eval_set()
         metadata = dict(SCRIPTED_METADATA)
+    elif args.eval_set == "live":
+        queries, port, known_document_ids, metadata = live_eval_set()
     else:
         from fin.eval.ablation.dataset_set import dataset_eval_set
 
@@ -102,6 +128,27 @@ def _run(args: argparse.Namespace) -> int:
         print(f"ablation run refused: {getattr(exc, 'code', 'error')}: {exc}")
         return 2
 
+    # Live path: every query errored with the same typed code is the
+    # SC4「live unreachable」 signal — refuse to write a 「done with
+    # empty chunks」 report (SC4 says: never ``{chunks: []}`` as
+    # success). The named error code is the operator-facing signal.
+    if args.eval_set == "live":
+        codes = {
+            code
+            for config in run.configurations
+            for code in config.error_codes
+        }
+        live_codes = {"retrieve_unavailable", "retrieve_degraded_failure"}
+        transport_failure = codes & live_codes
+        if transport_failure and all(
+            config.error_codes and set(config.error_codes) <= transport_failure
+            for config in run.configurations
+            if config.error_codes
+        ):
+            named = ", ".join(sorted(transport_failure))
+            print(f"ablation run refused (live): {named}: iknow unreachable")
+            return 4
+
     report = build_report(run)
     problems = validate_report(report)
     _print_summary(report)
@@ -112,12 +159,8 @@ def _run(args: argparse.Namespace) -> int:
         return 1
 
     out_dir = Path(args.output)
-    out_dir.mkdir(parents=True, exist_ok=True)
     report_path = out_dir / REPORT_FILENAME
-    report_path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_report_atomically(report_path, report)
     print(f"report written to {report_path}")
     print("ablation: OK (缺失配置数 = 0，任一指标缺失的配置数 = 0)")
     return 0
@@ -129,9 +172,14 @@ def main(argv: list[str] | None = None) -> int:
     run_parser = sub.add_parser("run", help="run the full ablation matrix and write the report")
     run_parser.add_argument(
         "--eval-set",
-        choices=("dataset", "scripted"),
+        choices=("dataset", "scripted", "live"),
         default="dataset",
-        help="dataset: the committed T10 subset; scripted: the in-code smoke set",
+        help=(
+            "dataset: the committed T10 subset (default; backend = contract_fake); "
+            "scripted: the in-code smoke set (backend = contract_fake); "
+            "live: opt-in MCP retrieve (backend = mcp; iknow unreachable = "
+            "retrieve_unavailable, exit 4)"
+        ),
     )
     run_parser.add_argument(
         "--repeats",
