@@ -13,8 +13,7 @@ from fin.corpus.catalog import list_filings
 
 
 _DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "corpus"
-_MANIFEST = _DATA_DIR / "manifest.json"
-_EXTRACTED = _DATA_DIR / "extracted"
+_CATALOG = _DATA_DIR / "catalog.json"
 
 
 def test_catalog_exposes_extra_issuer_with_truthful_form_and_period() -> None:
@@ -22,8 +21,7 @@ def test_catalog_exposes_extra_issuer_with_truthful_form_and_period() -> None:
     result = list_filings(
         ticker="GOOG",
         form="10-K",
-        manifest_path=_MANIFEST,
-        extracted_root=_EXTRACTED,
+        catalog_path=_CATALOG,
     )
 
     assert result["filings"] == [
@@ -40,12 +38,8 @@ def test_catalog_exposes_extra_issuer_with_truthful_form_and_period() -> None:
 
 def test_catalog_expansion_keeps_existing_10q_rows() -> None:
     """SC6 is additive: the existing 10-Q rows plus one 10-K."""
-    ten_q = list_filings(
-        form="10-Q", manifest_path=_MANIFEST, extracted_root=_EXTRACTED
-    )
-    all_filings = list_filings(
-        manifest_path=_MANIFEST, extracted_root=_EXTRACTED
-    )
+    ten_q = list_filings(form="10-Q", catalog_path=_CATALOG)
+    all_filings = list_filings(catalog_path=_CATALOG)
 
     assert len(ten_q["filings"]) == 20
     assert len(all_filings["filings"]) == 21

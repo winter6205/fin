@@ -46,11 +46,11 @@ stable reason code (T17 / SC22 — see
 when the operator configures a path. The chunks answer is still
 ``{"chunks": []}``, so an adapter built with an empty map looks like
 a miss on the wire; the counter is what tells the operator it is not
-one. Wiring the map remains the caller's job, and
-``fin.host.compile_graph`` refuses to build a product adapter
-without one: it derives canonical ``source_ref`` keys with
-``fin.corpus.push.serialize_source_ref`` from the extracted tree
-unless the operator supplies an explicit compatibility map.
+one. Canonical ``source_ref`` hits need no map, so
+``fin.host.compile_graph`` auto-builds the product adapter with an
+empty map and never reads the extracted tree (ADR 0046 / 0047); an
+operator integrating via ``retrieval_id`` supplies the explicit
+compatibility map.
 
 Error contract
 --------------
@@ -117,6 +117,7 @@ from fin.retrieve.mcp_session import (
     MCPStdioProtocolError,
     MCPStdioSession,
 )
+from fin.retrieve.read_port import READ_UNAVAILABLE
 
 
 _DEFAULT_LIMIT = 8
@@ -476,11 +477,10 @@ class MCPRetrieveAdapter:
     locator_map
         Explicit transitional map from ``retrieval_id`` to a fin
         ``Locator``. Canonical ``source_ref`` values do not need this
-        map. Non-canonical hits using an old ``source_ref`` key remain
-        supported only through this explicit compatibility seam. An
-        empty map therefore drops only non-canonical hits;
-        ``compile_graph`` still requires a non-empty map for compatibility
-        with integrations that use retrieval ids.
+        map (ADR 0047's wire contract), so an empty map — including
+        the ``compile_graph`` auto-build default — drops only
+        non-canonical hits, and those drops are counted on
+        ``mapping_ledger``: visible, never silent.
     timeout_seconds
         Per-call timeout on the JSON-RPC exchange. Default 5s
         (operator override via constructor).
@@ -609,6 +609,28 @@ class MCPRetrieveAdapter:
             # coerced result: neither「未降级」nor an empty hit list
             # would be a true reading of that response.
             return {"error": exc.code}
+
+    def read(
+        self,
+        document_id: str,
+        version: str,
+        page: int = 1,
+        page_limit: int = 1,
+    ) -> dict[str, Any]:
+        """Named EXIT: the retrieve backend exposes no read tool.
+
+        ADR 0047: ``read_file`` is an ordinary read of a known locator
+        — MCP when that is where the bytes live. iknow-memory ships
+        retrieve / push / invalidation but **no read endpoint**
+        (handoff 2026-09-04), so the product read is the named
+        ``{"error": "read_unavailable"}`` failure. It is deliberately
+        NOT ``unknown_locator`` (the locator may well exist on the
+        backend) and it NEVER falls back to the local extracted tree —
+        that would reintroduce the second serve-time SSOT ADR 0046 /
+        0047 remove. When iknow-memory grows a read tool, this method
+        becomes the MCP round trip.
+        """
+        return {"error": READ_UNAVAILABLE}
 
     async def aretrieve(
         self,

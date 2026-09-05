@@ -50,6 +50,32 @@ class ManifestShaMismatchError(IngestMissingError):
     pass
 
 
+class CatalogCorruptError(IngestMissingError):
+    """The catalog metadata table exists but cannot be read as the
+    catalog schema (not valid JSON, not ``{"filings": [...]}``, or a
+    stored row violating the row contract).
+
+    A *missing* table file is NOT this error — the empty catalog is a
+    valid state (ADR 0047: ``list_files`` over a never-ingested corpus
+    is ``{"filings": []}``). This is the "the table is there but
+    broken" shape. It inherits from ``IngestMissingError`` so the
+    host's 503 ``ingest_missing`` mapping and the status strip's
+    zero-count fallback treat it as the same known-bad corpus-state
+    family (ADR 0020 / ADR 0033).
+    """
+
+
+class CatalogRowError(ValueError):
+    """A row handed to ``fin.corpus.catalog.record_filings`` violates
+    the catalog row contract (``{document_id, company, period,
+    version, page_count}``, optional ``source_sha256``).
+
+    This is the named failure for bad rows — never a silent
+    skip-as-success: the rejected write does not happen and the
+    existing table is left untouched.
+    """
+
+
 class ParseError(RuntimeError):
     """Base class for the multi-format parse path's named failures (T6).
 
@@ -155,6 +181,8 @@ class ParseMetadataIncompleteError(ParseError):
 
 __all__ = [
     "IngestMissingError",
+    "CatalogCorruptError",
+    "CatalogRowError",
     "MalformedExtractedIndexError",
     "ManifestShaMismatchError",
     "ParseError",

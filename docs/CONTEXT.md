@@ -30,20 +30,20 @@ One append-only per-turn record of research working context (e.g. company, perio
 _Avoid_: overwriting away prior snapshots, dual-writing into thread_store as SSOT, replacing full message history with snapshots
 
 **iknow-memory**:
-A separate TypeScript MCP memory server (own repo and release train). It may supply institutional or cross-session durable memory behind fin's **memory backend**, and may also back filing **retrieve** when configured — those are separate adapters/channels. fin's filing cite tree does not wait on it.
-_Avoid_: treating fin as the long-term vector backend, lockstep releases with fin, collapsing retrieve MCP and memory MCP into one config key, mirroring fin consumer ADRs into that repo
+A separate TypeScript MCP server (own repo). After ingest/push, product **company corpus** is queried through fin's **retrieve port** against this backend (ADR 0045); a distinct **memory port** channel may hold explicit pins and must not share one config key.
+_Avoid_: treating fin as the long-term vector backend, lockstep releases with fin, collapsing retrieve MCP and memory MCP into one config key, mirroring fin consumer ADRs into that repo, using dream to ingest filings
 
 **memory port**:
-The only dependency fin is allowed for switchable session/buffer memory operations (extract, recall, GC, dream transport): port in, typed results out — MCP-shaped for the durable backend, transport-agnostic. Default product boot leaves memory **OFF** (no tools, no dream).
-_Avoid_: stuffing memory into the retrieve port, dual-writing memory bodies into the checkpointer as SSOT, treating memory recall as citation evidence
+The only dependency fin is allowed for switchable session/buffer memory (extract, recall, GC, dream transport): port in, typed results out — MCP-shaped for the durable backend, transport-agnostic; default boot is **OFF**. Extract is an explicit operator or tool write, not every-turn auto-extract from dialogue; recall is advisory and never citation evidence.
+_Avoid_: stuffing memory into the retrieve port, dual-writing memory bodies into the checkpointer as SSOT, treating memory recall as citation evidence, every-turn auto-extract of chat into the buffer
 
 **memory backend**:
 The implementation behind the memory port. Local Postgres buffer is the in-fin working store; an optional MCP server (often iknow-memory) receives **dream** transports for durable persistence. Swapping MCP changes the adapter only.
 _Avoid_: requiring MCP for memory ON, storing cite-tree pages as memory entries, using Redis as memory SSOT
 
 **dream** (fin):
-A rule-gated consolidate step that selects useful local buffer memory and transports it to the configured **memory backend** MCP for durable persistence. With memory OFF or MCP absent it skips or stops at the Postgres buffer; it must not fail the foreground turn.
-_Avoid_: running dream inside model_node, auto-writing every turn to MCP, using dream to move filing locator units out of fin
+A rule-gated consolidate of the local **memory port** buffer onto the **memory backend**. It is not company-corpus ingest (ADR 0045). With memory OFF or MCP absent it skips or stops at the Postgres buffer; it must not fail the foreground turn.
+_Avoid_: running dream inside model_node, auto-writing every turn to MCP, using dream to move filing locator units out of fin, treating dream as the path that fills the retrieve backend
 
 ### Seams
 
@@ -52,8 +52,8 @@ The only retrieve dependency fin is allowed to have: `query` (+ optional filters
 _Avoid_: search API, vector store, conflating with the memory port
 
 **retrieve adapter**:
-The implementation behind the retrieve port. Default pytest uses a Fake port. When configured, product retrieve is an MCP 2.0 client (protocol-testable against a compliant public or fixture server); hits map to fin locators as `source_ref`. In-process BM25 is archived (ADR 0007; ADR 0030 superseded by 0032). Ranking stays outside fin; **切分** is fin's (ADR 0037) and the retrieval service stores and returns pushed chunk text byte-for-byte without re-splitting. The extracted cite tree stays in fin.
-_Avoid_: shipping BM25 as the product path, hybrid/RRF implemented in this repo, re-splitting / truncating / rewriting pushed chunk text on the retrieval side, moving the cite tree into a memory server, compile-time coupling to one memory repo, reusing the memory-backend URL as the retrieve adapter by implication
+The implementation behind the retrieve port. Default pytest uses a Fake port. When configured, product retrieve is an MCP 2.0 client (protocol-testable against a compliant public or fixture server); hits map to fin locators as `source_ref` and their returned text is serve-time citation evidence (ADR 0046). In-process BM25 is archived (ADR 0007; ADR 0030 superseded by 0032). Ranking stays outside fin; **切分** is fin's at ingest (ADR 0037) and the retrieval service stores and returns pushed chunk text byte-for-byte without re-splitting.
+_Avoid_: shipping BM25 as the product path, hybrid/RRF implemented in this repo, re-splitting / truncating / rewriting pushed chunk text on the retrieval side, compile-time coupling to one memory repo, reusing the memory-backend URL as the retrieve adapter by implication
 
 **降级标记** (`degraded`):
 检索响应信封上的布尔字段 `degraded`（连同同处的 `degraded_reasons` 有限枚举列表）：置位表示存在失败或无法尝试的能力臂，缺省即未降级。已尝试而未命中、以及调用方显式关闭的能力都不置位；fin 必须读取该标记，为真时按部分失败语义处置，不得把降级当合法空结果。
@@ -80,7 +80,7 @@ On the **research track**, the model repeatedly picks `list_files`, `retrieve`, 
 _Avoid_: pipeline, chain, fixed graph of retrieve-then-generate, requiring the citation verifier on dialogue/clarify/off_topic
 
 **list_files**:
-Catalog tool over **filings** in the extracted tree, keyed like EDGAR submissions: CIK, form, accession, filing_date always exist on a live row; ticker and fiscal period are optional. v1 callers still pass `company` / `period`; additive optional `cik` / `form` / `ticker` / `filing_date`; hits stay `{document_id, company, period, version, page_count}` until output keys are extended; unknown or conflicting filters yield `filings: []`.
+Catalog tool over ingested/pushed **filings** (not a serve-time extracted-tree SSOT), keyed like EDGAR submissions: CIK, form, accession, filing_date always exist on a live row; ticker and fiscal period are optional. v1 callers still pass `company` / `period`; additive optional `cik` / `form` / `ticker` / `filing_date`; hits stay `{document_id, company, period, version, page_count}` until output keys are extended; unknown or conflicting filters yield `filings: []`.
 _Avoid_: list_filings, list_documents, glob, requiring ticker, treating company as forever equal to ticker, a generic CMS file browser
 
 **get_xbrl_fact**:
@@ -100,16 +100,28 @@ The tagged-numbers format inside official 10-Q/10-K iXBRL. Not a website; SEC.go
 _Avoid_: using XBRL as a product or hostname, conflating it with iknow-memory retrieve
 
 **read_file**:
-v1 read of a frozen filing by `document_id` and `version`, with 1-based `page` (default 1) and `page_limit` (default 1, cap 3). Misses return `{ error: "unknown_locator" }`; the citation verifier still checks one page per cite.
-_Avoid_: read_locator, read_page, cat
+Ordinary read of a known locator: fetch that body's text (from the retrieve backend when that is where the object lives). Misses return `{ error: "unknown_locator" }`. Returned text may be this-run citation evidence (ADR 0046). It is not a 切分 step and not a citation module.
+_Avoid_: read_locator, read_page, treating read as retrieve, reading embeddings
+
+**ingest endpoint**:
+The product job that parses, applies **切分** from the format parameter table, and **入库推送** or invalidates via MCP. Version close/replace is an MCP call. Not a research-track tool.
+_Avoid_: chunk-any-string tool, model-chosen split points, EDGAR form name as the root document type
+
+**thread attach**:
+The operator places a file on the open **research thread** so the model can read it this turn. Default is no **入库推送**.
+_Avoid_: treating drag-into-chat as corpus ingest
+
+**corpus ingest**:
+The separate workspace control that sends a file through the **ingest endpoint** into the retrieve backend.
+_Avoid_: one control that both attaches and stores without an explicit ingest choice
 
 **locator**:
-Cite identity `{document_id, version, unit}`: for the frozen 12, `version` is the PDF sha256 and `unit` is the 1-based pdfplumber `page`; for live EDGAR, `version` hashes the official primary iXBRL `.htm` bytes and `unit` is a deterministic frozen partition of that HTML's stripped text, not an SEC or unofficial-PDF page. The claimed span is a quote string, not a locator field; the citation verifier checks it is a contiguous substring of that unit's frozen text; chunks carry the locator as `source_ref` and are not the identity.
+Cite identity `{document_id, version, unit}`. The claimed span is a quote string, not a locator field. The **citation verifier** checks it is a contiguous substring of evidenced text this run retrieved or read (ADR 0046). Chunks carry the locator as `source_ref` and are not the identity.
 _Avoid_: chunk_id, char offset, bbox, page-less citation, unofficial PDF page as live EDGAR identity, verifying an HTML quote against a PDF page
 
 **citation verifier**:
-A code gate on the **research track** path to END: a supporting span is a contiguous substring of the answer (v1 minimum 32 characters) that appears in a frozen locator unit this run retrieved or read. Passed spans become the user-visible citations; unknown locators refuse immediately; missing or unmatched spans bounce with a hidden template until the citation-repair cap, then refuse. Non-research tracks skip this gate.
-_Avoid_: faithfulness prompt, LLM-as-judge as the only gate, model-authored citation block, `verify` as a tool, running the gate on greetings or soft off-topic replies, web-search text as gate evidence
+A code gate on the **research track** path to END: a supporting span is a contiguous substring of the answer (v1 minimum 32 characters) that appears in text this run received from **retrieve** / **read_file** (ADR 0046). Passed spans become the user-visible citations; unknown locators refuse immediately; missing or unmatched spans bounce with a hidden template until the citation-repair cap, then refuse. Non-research tracks skip this gate.
+_Avoid_: faithfulness prompt, LLM-as-judge as the only gate, model-authored citation block, `verify` as a tool, running the gate on greetings or soft off-topic replies, web-search text as gate evidence, a second serve-time extracted tree as citation SSOT
 
 **citation span**:
 One user-visible citation row from the verifier: a ≥32-character contiguous substring of the answer that matched on a retrieved or read page. The workspace sources list may show many spans per page (sliding-window overlap); that granularity is expected, not a send failure.
@@ -130,8 +142,17 @@ LangGraph compiled around the agent loop plus code gates (verifier, caps, interr
 _Avoid_: retrieval graph
 
 **session compaction**:
+<<<<<<< HEAD
+A host gate on the **research thread**: occupancy is estimated tokens of the model-facing payload (track prompt, messages, research tool schemas, and when memory is ON any **recall injection**) against a 256_000 session budget; at ≥90% occupancy, or when the operator sends `/compact`, old checkpoint `messages` are summarized and removed, aiming at ~40% occupancy. The summarizer is injectable (v1 the **v1 model**); occupancy may render on the thread, not on `GET /api/status`.
+_Avoid_: message-count windows, treating `/compact` as a research tool, putting occupancy on the boot status strip, using the vendor 1M window as the compact threshold, treating a memory row-count cap as the occupancy gate
+
+**recall injection**:
+When memory is ON, advisory recall text placed in the model-facing payload. It counts toward the same occupancy ledger as **session compaction**; a row-count limit is only a fuse, not the budget.
+_Avoid_: last-N memory window as the token budget, using recall as retrieve/`read_file` evidence
+=======
 A host gate on the **research thread**: occupancy is estimated tokens of the model-facing payload (track prompt, messages, research tool schemas) against a 256_000 session budget; at ≥90% occupancy, or when the operator sends `/compact`, old checkpoint `messages` are summarized and removed, aiming at ~40% occupancy. The summarizer is injectable (v1 the **v1 model**); occupancy may render on the thread, not on `GET /api/status`.
 _Avoid_: message-count windows, treating `/compact` as a research tool, putting occupancy on the boot status strip, using the vendor 1M window as the compact threshold
+>>>>>>> origin/main
 
 **checkpointer**:
 v1 durable runs use LangGraph `PostgresSaver` via `FIN_CHECKPOINT_URL`; product HTTP/CLI raise if that URL is unset. Pytest uses `InMemorySaver` only (plus explicit `FIN_SCRIPTED_MODEL` e2e); it does not survive process exit.
@@ -188,7 +209,7 @@ _Avoid_: gpt-researcher, open_deep_research, blank-file StateGraph as the requir
 ### Corpus and eval
 
 **product corpus**:
-The operator-selected local extracted tree of official 10-Q and 10-K primary HTML. `fin-serve` retrieve, `read_file`, and the citation verifier read this tree under the live locator contract.
+The operator-selected filings after ingest: freeze and **切分** in fin, then push to the retrieve backend. Serve-time `retrieve` / `read_file` / the citation verifier use this-run tool payloads (ADR 0046), not a second on-disk tree as company-corpus SSOT.
 _Avoid_: private fixture source 12 as product SSOT, unofficial PDF as live identity, S&P 500 backfill as the ingest default, a second PDF-page product path
 
 **eval fixture**:
@@ -200,11 +221,11 @@ Historical private fixture source 12-PDF freeze (ADR 0004, superseded by 0029). 
 _Avoid_: current catalog, gold SSOT, demo FAQ
 
 **ingest**:
-A CLI that writes frozen locator-unit text from official filings (or the existing extracted tree) into an extracted tree. 滑动窗口式**切分**是 fin 的职责而非排序栈（ADR 0037），排序仍留在 fin 之外；the ask path does not fetch EDGAR or open source filings.
-_Avoid_: extract-on-query, host-graph ingest node, putting filing bytes in the checkpointer database
+The CLI/job (and the product **ingest endpoint**) that parses filings, **切分**s, and **入库推送** to the retrieve backend. The ask path does not fetch EDGAR or open source filings.
+_Avoid_: extract-on-query, host-graph ingest node, putting filing bytes in the checkpointer database, 切分 as a research-track tool
 
 **object store**:
-MinIO/S3-compatible storage for raw filing (and later multi-format) bytes. Postgres holds metadata and pointers; the extracted cite tree stays in fin. Git is not the byte warehouse once configured.
+MinIO/S3-compatible storage for raw filing (and later multi-format) bytes. Postgres holds metadata and pointers. Git is not the byte warehouse once configured. Raw object keys are not citation locators; citable text after ingest lives on the retrieve backend (ADR 0046 / 0047).
 _Avoid_: Postgres bytea as the primary raw store, putting raw PDFs in the checkpointer, treating object keys as citation locators
 
 **contract eval**:
@@ -220,7 +241,7 @@ Historical nine hand-authored cases against the private fixture source 12 (ADR 0
 _Avoid_: 40-question matrix as a v1 commitment, treating nine cases as the current ceiling
 
 **冻结单元**:
-fin 解析产出的最小可引用文本单位；文本一经产出即冻结，是 **citation verifier** 逐字符比对的基准。解析规则版本或参数表版本变更即产生新版本单元。
+fin 解析产出的最小可引用文本单位；一经产出即冻结。切出的块是其连续子串并 push；**citation verifier** 在运行时对的是本轮 retrieve/`read_file` 正文（ADR 0046）。
 _Avoid_: chunk, 原始文件, 任意段落, 未冻结的中间解析产物
 
 **切分**:

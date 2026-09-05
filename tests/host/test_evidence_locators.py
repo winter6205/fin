@@ -73,6 +73,7 @@ def wired(http_app: FastAPI):
     """In-memory store + a scripted graph whose script tests mutate."""
     from fin.host.http import get_graph, get_thread_store
     from fin.host.thread_store import InMemoryThreadStore
+    from fin.retrieve import ExtractedTreeReadPort
 
     store = InMemoryThreadStore()
     http_app.dependency_overrides[get_thread_store] = lambda: store
@@ -82,6 +83,14 @@ def wired(http_app: FastAPI):
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        # These tests script real ``read_file`` calls against the
+        # committed corpus, so they inject the legacy tree-backed read
+        # port explicitly (the default graph no longer reads the tree:
+        # ADR 0046 / 0047).
+        read_port=ExtractedTreeReadPort(
+            Path("data/corpus/manifest.json"),
+            Path("data/corpus/extracted"),
+        ),
     )
     http_app.dependency_overrides[get_graph] = lambda: graph
     return store, model

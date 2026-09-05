@@ -72,6 +72,16 @@ AAPL_2022Q3_VERSION = (
 
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
+# Legacy tree-backed read adapter over the committed corpus. Only the
+# scripted ``read_file`` transcripts need it; the default graph no
+# longer reads the tree on its own (ADR 0046 / 0047).
+from fin.retrieve import ExtractedTreeReadPort
+
+_TREE_READ_PORT = ExtractedTreeReadPort(
+    Path("data/corpus/manifest.json"),
+    Path("data/corpus/extracted"),
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -185,6 +195,7 @@ def test_done_run_prints_status_answer_citations_in_order(aapl_page1_text, capsy
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     rc = main(
         ["What was AAPL net sales in 2023 Q3?", "--thread-id", "t-cli-done"],
@@ -228,6 +239,7 @@ def test_step_cap_run_prints_status_and_answer_without_citations(capsys):
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     rc = main(["What was AAPL net sales in 2023 Q3?"], graph_factory=lambda: g)
     assert rc == 0
@@ -264,6 +276,7 @@ def test_refuse_unknown_locator_prints_reason_on_stderr(capsys):
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     rc = main(["What was AAPL net sales in 2023 Q3?"], graph_factory=lambda: g)
     assert rc == 0
@@ -290,6 +303,7 @@ def test_two_runs_on_same_thread_real_spans(aapl_page1_text, capsys):
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
     span = aapl_page1_text[:80]
 
@@ -364,6 +378,7 @@ def test_concurrent_runs_on_same_thread_report_error_via_main(capsys):
         checkpointer=InMemorySaver(),
         model=blocking,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
 
     results: dict[str, int] = {}
@@ -411,36 +426,20 @@ def test_empty_question_fails_fast_without_building_graph(capsys):
 
 
 def test_bootstrap_ingest_missing_reports_typed_error(monkeypatch, capsys):
-    """When ``load_extracted_tree`` fails during graph construction the
-    CLI reports ``error: ingest artifacts missing`` on stderr, exits 1,
+    """When a graph factory raises ``IngestMissingError`` the CLI
+    reports ``error: ingest artifacts missing`` on stderr, exits 1,
     and never silently re-extracts (ADR 0020).
 
-    T3 (#76): the product auto-build path
-    (``retrieve_adapter="mcp"``) resolves the tree to derive
-    ``known_document_ids`` and the iknow-id → locator map; the
-    default kind (``"fake"``) auto-builds a ``FakeRetrievePort``
-    and skips the loader. To exercise the product path the test
-    asks for the MCP kind explicitly — the same way
-    ``fin.host.compile`` does — so the loader runs and the patched
-    ``IngestMissingError`` propagates.
+    ADR 0046 / 0047 update: the boot itself no longer reads the
+    extracted tree (the MCP auto-build needs no locator map and the
+    fake auto-build needs no allow-list), so the typed handler is now
+    exercised through an injected factory that raises — the handler
+    contract is what this test pins.
     """
-    import fin.host.graph as graph_module
-    from langgraph.checkpoint.memory import InMemorySaver
-
-    def _missing(manifest_path, extracted_root):
-        raise IngestMissingError("extracted tree absent")
-
-    monkeypatch.setattr(graph_module, "load_extracted_tree", _missing)
+    from fin.corpus.errors import IngestMissingError as _IME
 
     def factory():
-        # Real production shape: compile_graph resolves the tree
-        # itself when no adapter is supplied and the product MCP
-        # kind is selected — the patched loader raises.
-        return compile_graph(
-            checkpointer=InMemorySaver(),
-            model=ScriptedChatModel(script=[]),
-            retrieve_adapter="mcp",
-        )
+        raise _IME("extracted tree absent")
 
     rc = main(["q"], graph_factory=factory)
     assert rc == 1
@@ -573,6 +572,7 @@ def test_cli_follow_up_resets_evidence(aapl_page1_text, capsys):
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
     )
 
     # Run 1: read_file + grounded answer -> done.

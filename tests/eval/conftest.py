@@ -48,6 +48,7 @@ from langchain_core.messages import BaseMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.host import ScriptedChatModel, compile_graph
+from fin.retrieve import ExtractedTreeReadPort
 
 
 def _eval_counts_module() -> ModuleType:
@@ -121,15 +122,21 @@ def scripted_graph_factory():
         # tuple / generator; we accept any iterable to match the
         # ticket's loose phrasing ("a script").
         model = ScriptedChatModel(script=list(script))
-        # No ``adapter`` / paths: ``compile_graph`` defaults resolve
-        # to the worktree's canonical corpus (graph.py
-        # ``_DEFAULT_DATA_DIR``). ``known_document_ids`` is then
-        # derived from the loaded tree — all 12 frozen manifest
-        # ids. FOO-2023Q1-style unknowns trip the gate's
-        # ``unknown_locator`` path; the 12 frozen docs do not.
+        # No ``adapter``: ``compile_graph`` auto-builds the hermetic
+        # FakeRetrievePort. The gold transcripts quote the frozen
+        # corpus, so the tree-backed read port is injected explicitly
+        # for their scripted ``read_file`` calls (ADR 0046 / 0047: the
+        # default graph no longer reads the tree on its own).
+        # Locator claims: FOO-2023Q1-style unknowns trip the gate's
+        # ``unknown_locator`` path (not in this run's evidence); the
+        # frozen docs the transcripts actually read do not.
         graph = compile_graph(
             checkpointer=InMemorySaver(),
             model=model,
+            read_port=ExtractedTreeReadPort(
+                Path("data/corpus/manifest.json"),
+                Path("data/corpus/extracted"),
+            ),
         )
         return _StatusRecordingGraph(graph, _OBSERVED_STATUSES)
 
