@@ -19,13 +19,19 @@ from __future__ import annotations
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from fin.host.agent_instructions import (
+    AGENT_IDENTITY,
+    AGENT_SOUL,
     DIALOGUE_INSTRUCTIONS_MARKER,
     DIALOGUE_SYSTEM_PROMPT,
     FIN_MEMORY_PREFETCH_MARKER,
     HOST_INSTRUCTIONS_MARKER,
     HOST_SYSTEM_PROMPT,
+    MEMORY_POINTER_BLOCK,
     MEMORY_POINTER_MARKER,
     MEMORY_POINTER_TEXT,
+    USAGE_RESEARCH,
+    USER_PROFILE_HEADER,
+    USER_PROFILE_MARKER,
     messages_for_model,
     memory_prefetch_message,
 )
@@ -200,6 +206,167 @@ def test_pointer_does_not_branch_on_prefetch_payload() -> None:
         memory_on=True,
     )
     assert base[0].content == same_with_prefetch[0].content
+
+
+# ---------- SC12: adjacent-turn prefix stability (profile path) ----------
+#
+# The earlier ``test_two_calls_with_different_prefetch_hits_keep_identical_prefix``
+# pins the SC12 invariant on the prefetch-overlay path: with ``user_profile=None``
+# the head SystemMessage is byte-equal across two scripted calls. SC12 also
+# requires the same stability on the **profile** path: when $HOME/.fin/user.md
+# is unchanged between two adjacent turns on one thread, the identity +
+# soul + usage + pointer substring of the prefix must stay deep-equal.
+#
+# Branch 1 (weak): the same ``user_profile`` string twice → head bytes are
+# deep-equal (the profile block is rebuilt with identical bytes, so the
+# whole prefix matches).
+# Branch 2 (strong, spec wording): different profile strings → the SHARED
+# identity + soul + usage + pointer substring (i.e. the prefix minus the
+# profile block) is STILL deep-equal. The profile block is the only
+# call-scoped attachment; everything else in the head must be stable.
+
+
+def _stable_prefix(head_content: str) -> str:
+    """Return the identity+soul+usage+pointer substring of a head message.
+
+    Strips out the user-profile block (which is the only call-scoped
+    block the profile path can shift) and returns the rest. The head
+    shape is ``<track prompt>\\n\\n<profile block>\\n\\n<pointer block>``;
+    the profile block is bounded by :data:`USER_PROFILE_MARKER` and the
+    start of the next block (``\\n\\n[FIN_``) or end of string.
+    """
+    marker_idx = head_content.index(USER_PROFILE_MARKER)
+    # Find the end of the profile block: the next "\n\n[FIN_" or EOS.
+    after_marker = marker_idx + len(USER_PROFILE_MARKER)
+    tail = head_content[after_marker:]
+    # Drop the header line + the verbatim profile text. The block ends
+    # at the next blank-line-separated ``[FIN_`` marker, or end of
+    # string. Since the only other block we inject is the memory
+    # pointer (``[FIN_MEMORY_POINTER]``), look for it specifically.
+    block_end_in_tail = tail.find(MEMORY_POINTER_MARKER)
+    if block_end_in_tail == -1:
+        # Profile-only call (memory_on=False): profile block runs to
+        # end of string. Stable prefix = everything before
+        # USER_PROFILE_MARKER, including any leading "\n\n" that
+        # separates the profile block from the track prompt.
+        return head_content[:marker_idx]
+    # Stable prefix = head up to and including the pointer block. The
+    # profile block lives between marker_idx and the pointer, so we
+    # keep both ends.
+    return head_content[:marker_idx] + tail[block_end_in_tail:]
+
+
+def test_profile_path_two_calls_same_profile_keep_identical_head() -> None:
+    """SC12 (profile path, branch 1): with the same ``user_profile``
+    string on two adjacent calls, the head SystemMessage is deep-equal.
+    The profile block is rebuilt from the merged file content at model-
+    call time; an unchanged file produces identical bytes.
+    """
+    profile = "Operator prefers quarterly revenue comparisons."
+    out_a = messages_for_model(
+        [HumanMessage(content="first turn")],
+        track="research",
+        memory_on=True,
+        user_profile=profile,
+    )
+    out_b = messages_for_model(
+        [HumanMessage(content="second turn")],
+        track="research",
+        memory_on=True,
+        user_profile=profile,
+    )
+    head_a = out_a[0]
+    head_b = out_b[0]
+    assert isinstance(head_a, SystemMessage) and isinstance(head_b, SystemMessage)
+    # Whole-head deep equality: same profile + same track + same
+    # memory_on → identical bytes including the profile block.
+    assert head_a.content == head_b.content
+    # And the head carries every contract the model expects:
+    # identity (HOST marker), profile block, pointer block.
+    content = str(head_a.content)
+    assert HOST_INSTRUCTIONS_MARKER in content
+    assert USER_PROFILE_MARKER in content
+    assert MEMORY_POINTER_MARKER in content
+    # Ordering: identity → profile → pointer.
+    assert content.index(HOST_INSTRUCTIONS_MARKER) < content.index(
+        USER_PROFILE_MARKER
+    ) < content.index(MEMORY_POINTER_MARKER)
+
+
+def test_profile_path_two_calls_different_profile_keep_stable_substring() -> (
+    None
+):
+    """SC12 (profile path, branch 2 — spec wording "profile block may
+    change if the file changed"): when the operator edits the profile
+    between calls, the identity+soul+usage+pointer substring of the
+    prefix is STILL deep-equal. The profile block is the only
+    call-scoped attachment; everything else in the head is byte-stable.
+    """
+    profile_a = "Operator prefers quarterly revenue comparisons."
+    profile_b = (
+        "Operator prefers quarterly revenue comparisons "
+        "(revised after 2024 earnings cycle)."
+    )
+    out_a = messages_for_model(
+        [HumanMessage(content="first turn")],
+        track="research",
+        memory_on=True,
+        user_profile=profile_a,
+    )
+    out_b = messages_for_model(
+        [HumanMessage(content="second turn")],
+        track="research",
+        memory_on=True,
+        user_profile=profile_b,
+    )
+    stable_a = _stable_prefix(str(out_a[0].content))
+    stable_b = _stable_prefix(str(out_b[0].content))
+    # Identity+soul+usage+pointer substring is deep-equal: editing
+    # the profile file did not shift any bytes outside the profile
+    # block.
+    assert stable_a == stable_b
+    # Sanity: the stable prefix carries the identity, the per-track
+    # usage, and the pointer — i.e. it's the full non-profile
+    # portion of the host prefix. The profile text itself does NOT
+    # appear here.
+    assert AGENT_IDENTITY in stable_a
+    assert AGENT_SOUL in stable_a
+    assert USAGE_RESEARCH in stable_a
+    assert MEMORY_POINTER_BLOCK in stable_a
+    assert USER_PROFILE_MARKER not in stable_a
+    assert USER_PROFILE_HEADER not in stable_a
+    # And the two whole heads DIFFER (the profile block changed).
+    assert out_a[0].content != out_b[0].content
+
+
+def test_profile_path_stable_substring_is_byte_equal_to_no_profile_prefix() -> (
+    None
+):
+    """The stable prefix with a profile block equals the byte-stable
+    prefix without one. The profile block is the ONLY thing the
+    profile path adds; removing it (or never adding it) yields the
+    same identity+soul+usage+pointer bytes either way. This is the
+    cross-check on the stronger branch above: the
+    identity+soul+usage+pointer substring does not depend on whether
+    a profile block is present.
+    """
+    profile = "Operator prefers quarterly revenue comparisons."
+    with_profile = messages_for_model(
+        [HumanMessage(content="x")],
+        track="research",
+        memory_on=True,
+        user_profile=profile,
+    )
+    no_profile = messages_for_model(
+        [HumanMessage(content="x")],
+        track="research",
+        memory_on=True,
+        user_profile=None,
+    )
+    stable_with = _stable_prefix(str(with_profile[0].content))
+    # The "no profile" head has no profile block to strip — its
+    # stable prefix IS its whole head.
+    assert stable_with == no_profile[0].content
 
 
 # ---------- memory_prefetch_message: user-side builder ----------
