@@ -344,13 +344,11 @@ def _compiled_graph(
     tmp_path: Path,
     port: MemoryPort | None,
     profile_store: UserProfileStore | None,
-    workspace_root: str | None = None,
     model: _RecordingScriptedModel | None = None,
 ) -> Any:
     kwargs: dict[str, Any] = {
         "checkpointer": InMemorySaver(),
         "model": model or _model(),
-        "workspace_root": workspace_root or str(tmp_path / "ws"),
         "known_document_ids": set(),
     }
     if port is not None:
@@ -418,7 +416,6 @@ def _compiled_graph_with_recording(
     tmp_path: Path,
     port: MemoryPort | None,
     profile_store: UserProfileStore | None,
-    workspace_root: str | None = None,
 ) -> tuple[Any, _RecordingScriptedModel]:
     """Build a graph whose recording model is returned for inspection."""
     rec = _model()
@@ -426,7 +423,6 @@ def _compiled_graph_with_recording(
         tmp_path=tmp_path,
         port=port,
         profile_store=profile_store,
-        workspace_root=workspace_root,
         model=rec,
     )
     # Stash the model on the proxy so tests can pull it back without

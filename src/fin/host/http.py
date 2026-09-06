@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -291,7 +292,16 @@ def get_workspace_registry() -> Any:
 # Mount the workspace routes (T1, #28) on the same FastAPI app.
 # Done at module load so ``uvicorn fin.host.http:app`` exposes the
 # workspace surface out of the box (spec / ADR 0013 / ADR 0024).
-from fin.host.workspace_http import mount as _mount_workspace_routes  # noqa: E402
+# Wave A (spec SC8 / ADR 0049): ``get_workspace_root`` is re-exported
+# under its own name so tests can override the seam in one place
+# (``app.dependency_overrides[get_workspace_root]``) for both the
+# ``/ask`` route and the workspace send / resume routes.
+from fin.host.workspace_http import (  # noqa: E402
+    get_workspace_root,
+    mount as _mount_workspace_routes,
+)
+
+_get_workspace_root = get_workspace_root
 
 _mount_workspace_routes(
     app,
@@ -303,6 +313,7 @@ _mount_workspace_routes(
     get_feedback_store=get_feedback_store,
     get_observability_collector=get_observability_collector,
     get_workspace_registry=get_workspace_registry,
+    get_workspace_root=_get_workspace_root,
 )
 
 # ``GET /health`` (the tracked change, SC9): checkpoint reachability, separate from
@@ -356,7 +367,11 @@ async def ingest_missing_handler(request: Request, exc: IngestMissingError) -> J
 
 
 @app.post("/ask", response_model=AskResponse)
-def ask(body: AskRequest, graph: Any = Depends(get_graph)) -> AskResponse:
+def ask(
+    body: AskRequest,
+    graph: Any = Depends(get_graph),
+    workspace_root: Path = Depends(_get_workspace_root),
+) -> AskResponse:
     """Run one v1 host-graph ``invoke`` on a ``POST /ask`` request.
 
     The handler is a sync ``def`` and calls ``graph.invoke`` — never
@@ -376,6 +391,10 @@ def ask(body: AskRequest, graph: Any = Depends(get_graph)) -> AskResponse:
 
     The hidden bounce marker is stripped from ``answer`` and
     ``reason`` defensively before serialization (ADR 0021).
+
+    Wave A (spec SC8 / ADR 0049): the resolved default 工作区 rides
+    the run config as ``configurable.workspace_root`` — the graph
+    reads it per call and never bakes its own root.
     """
     thread_id = body.thread_id or str(uuid.uuid4())
 
@@ -386,7 +405,12 @@ def ask(body: AskRequest, graph: Any = Depends(get_graph)) -> AskResponse:
     # run-scoped fields per ADR 0016 / spec line 34.
     raw = graph.invoke(
         reset_input_state(body.question),
-        config={"configurable": {"thread_id": thread_id}},
+        config={
+            "configurable": {
+                "thread_id": thread_id,
+                "workspace_root": str(workspace_root),
+            }
+        },
     )
 
     # Shared mapping (also used by the workspace send route) so the
