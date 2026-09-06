@@ -204,7 +204,6 @@ def _compiled_graph(
     *,
     tmp_path: Path,
     port: _FakeMemoryPort | MemoryPort,
-    workspace_root: str | None = None,
     known_ids: set[str] | None = None,
     model: ScriptedChatModel | None = None,
 ) -> Any:
@@ -214,7 +213,6 @@ def _compiled_graph(
         model=model or ScriptedChatModel(script=[]),
         memory_port=port,
         user_profile_store=_profile_store(tmp_path),
-        workspace_root=workspace_root or str(tmp_path / "ws"),
         known_document_ids=known_ids if known_ids is not None else _KNOWN_IDS,
     )
 
@@ -379,7 +377,6 @@ def test_research_turn_with_number_records_retrieve_tool_call(
     g = _compiled_graph(
         tmp_path=tmp_path,
         port=port,
-        workspace_root=workspace,
         model=model,
     )
 
@@ -397,7 +394,7 @@ def test_research_turn_with_number_records_retrieve_tool_call(
             "thinking_text": "",
             "tool_summaries": [],
         },
-        config={"configurable": {"thread_id": "t-gold-sc26"}},
+        config={"configurable": {"thread_id": "t-gold-sc26", "workspace_root": workspace}},
     )
 
     # The critical property: at least one retrieve or read_file tool
@@ -481,7 +478,6 @@ def test_company_named_fact_still_uses_retrieve_for_filing_claim(
     g = _compiled_graph(
         tmp_path=tmp_path,
         port=port,
-        workspace_root=workspace,
         model=model,
     )
 
@@ -501,7 +497,7 @@ def test_company_named_fact_still_uses_retrieve_for_filing_claim(
             "thinking_text": "",
             "tool_summaries": [],
         },
-        config={"configurable": {"thread_id": "t-gold-sc27"}},
+        config={"configurable": {"thread_id": "t-gold-sc27", "workspace_root": workspace}},
     )
 
     # (a) The model still hit retrieve / read_file even though the
@@ -566,7 +562,6 @@ def test_explicit_save_on_thread_a_recallable_on_thread_b(
     graph_a = _compiled_graph(
         tmp_path=tmp_path,
         port=port,
-        workspace_root=workspace,
     )
 
     # --- Thread A: explicit save via the bound tool ---
@@ -575,7 +570,8 @@ def test_explicit_save_on_thread_a_recallable_on_thread_b(
         {
             "title": "Coffee preference",
             "body": "Latte in the morning. Double shot on Mondays.",
-        }
+        },
+        config={"configurable": {"thread_id": "t-gold-a", "workspace_root": workspace}},
     )
 
     # The save persisted at the workspace level (port-backed).
@@ -588,12 +584,14 @@ def test_explicit_save_on_thread_a_recallable_on_thread_b(
     graph_b = _compiled_graph(
         tmp_path=tmp_path,
         port=port,
-        workspace_root=workspace,
     )
 
     # (a) recall_memory on thread B sees the row from thread A.
     recall_tool = graph_b._tool_node.tools_by_name["recall_memory"]
-    raw = recall_tool.invoke({"query": "latte morning coffee double shot"})
+    raw = recall_tool.invoke(
+        {"query": "latte morning coffee double shot"},
+        config={"configurable": {"thread_id": "t-gold-b", "workspace_root": workspace}},
+    )
     payload = json.loads(raw) if isinstance(raw, str) else raw
     assert payload["status"] == "ok"
     assert len(payload["memories"]) == 1
@@ -886,7 +884,6 @@ def test_default_pytest_builds_off_graph_with_zero_memory_tools(
         model=ScriptedChatModel(script=[]),
         memory_port=OffMemoryAdapter(),  # explicit OFF
         user_profile_store=_profile_store(tmp_path),
-        workspace_root=str(tmp_path / "ws"),
         known_document_ids=_KNOWN_IDS,
     )
 

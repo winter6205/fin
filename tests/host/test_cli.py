@@ -603,3 +603,64 @@ def test_cli_follow_up_resets_evidence(aapl_page1_text, capsys):
         out2.index("citations:") + len("citations:") :
     ]
     assert "  - " not in tail_after_header
+
+
+# ----- workspace seam (spec SC8 / ADR 0049) -----
+
+
+def test_cli_run_injects_default_workspace_root(tmp_path):
+    """SC8: the CLI seam resolves ``$HOME/.fin/default`` (mkdir'd) and
+    injects it into ``configurable.workspace_root`` on every invoke.
+    Tests inject ``tmp_path`` as the home so the suite never touches
+    the real ``$HOME``."""
+    from fin.host.workspace_registry import default_workspace_root
+
+    state = {
+        "status": "done",
+        "answer": "ok",
+        "citations": (),
+    }
+    fake = _FakeGraph(state)
+    run("q", graph=fake, thread_id="t-seam", home=tmp_path)
+
+    expected_root = default_workspace_root(tmp_path)
+    assert fake.calls, "fake graph must have captured one invoke call"
+    (_input, config) = fake.calls[0]
+    configurable = config.get("configurable") or {}
+    assert configurable.get("workspace_root") == str(expected_root)
+
+
+def test_cli_main_maps_workspace_root_missing_to_exit_one(capsys, tmp_path):
+    """A graph raising ``WorkspaceRootMissingError`` (a seam contract
+    violation) maps to exit 1 with the typed error on stderr."""
+    from fin.host.graph import WorkspaceRootMissingError
+
+    class _RaisingGraph:
+        def invoke(self, input: dict, config: dict | None = None, **kwargs):
+            raise WorkspaceRootMissingError()
+
+    rc = main(
+        ["q", "--thread-id", "t-seam-missing"],
+        graph_factory=lambda: _RaisingGraph(),
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "WorkspaceRootMissingError" in err
+
+
+def test_cli_default_home_resolves_from_env(
+    tmp_path, monkeypatch, capsys
+):
+    """When ``home`` is omitted the runner reads ``$HOME`` at call
+    time (never ``Path.cwd()``). The resolved default is the env's
+    home + ``.fin/default``."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    state = {"status": "done", "answer": "ok", "citations": ()}
+    fake = _FakeGraph(state)
+    run("q", graph=fake, thread_id="t-env-home")
+
+    expected = tmp_path / ".fin" / "default"
+    (_input, config) = fake.calls[0]
+    assert config["configurable"]["workspace_root"] == str(expected)
+    assert expected.exists(), "default_workspace_root mkdir's the path"

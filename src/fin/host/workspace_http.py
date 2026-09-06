@@ -304,6 +304,41 @@ def get_workspace_registry() -> WorkspaceRegistry:
     return default_workspace_registry()
 
 
+# The one default 工作区 root, resolved per request. spec Focus 3 /
+# SC8 / ADR 0049: HTTP is the workspace-inject seam — every send /
+# resume / ask invoke carries ``configurable.workspace_root`` =
+# ``$HOME/.fin/default``. ``default_workspace_root`` mkdir's the
+# directory on first resolve (spec Focus 2). Tests override this
+# dependency to point at a ``tmp_path`` home so the suite never
+# touches the real ``$HOME``.
+_workspace_root_singleton_lock = threading.Lock()
+_workspace_root_override: Path | None = None
+
+
+def default_workspace_root_for_process() -> Path:
+    """Resolve the process-default 工作区 from ``$HOME``.
+
+    Reads ``$HOME`` at call time (NEVER ``Path.cwd()`` — spec SC3)
+    and delegates to
+    :func:`fin.host.workspace_registry.default_workspace_root` so
+    the SSOT for the ``<home>/.fin/default`` shape stays in the
+    registry module.
+    """
+    home = os.environ.get("HOME") or str(Path.home())
+    return default_workspace_root(home)
+
+
+def get_workspace_root() -> Path:
+    """FastAPI dependency returning the resolved default 工作区 root.
+
+    Production resolves from ``$HOME`` per request (cheap; the mkdir
+    is idempotent). Tests override via
+    ``app.dependency_overrides[get_workspace_root]`` to inject a
+    ``tmp_path``-rooted directory.
+    """
+    return default_workspace_root_for_process()
+
+
 # ----- mid-flight stream exception classification + sanitization -----
 #
 # Why classify here: every model call ultimately routes through
@@ -1949,6 +1984,7 @@ def build_router(
     get_feedback_store=None,
     get_observability_collector=None,
     get_workspace_registry=None,
+    get_workspace_root=None,
 ) -> APIRouter:
     """Build the workspace APIRouter.
 
@@ -1963,6 +1999,9 @@ def build_router(
     HERE — one per mounted router, mirroring the ``RunControl`` registry
     so two apps in one test session cannot record into each other's
     counters. The prod app injects the per-process singleton.
+    ``get_workspace_root`` (Wave A, spec SC8 / ADR 0049) defaults to
+    the ``$HOME``-resolved default 工作区 and is the seam that
+    injects ``configurable.workspace_root`` on every send / resume.
 
     The stop registry (:class:`RunControl`) is created HERE rather than
     at module level: one registry per mounted router means two apps in
@@ -1994,6 +2033,8 @@ def build_router(
         get_observability_collector = lambda: router_collector  # noqa: E731
     if get_workspace_registry is None:
         get_workspace_registry = default_workspace_registry
+    if get_workspace_root is None:
+        get_workspace_root = default_workspace_root_for_process
 
     @router.get("/threads")
     def list_threads(store: ThreadStore = Depends(get_thread_store)) -> list[dict]:
@@ -2143,6 +2184,7 @@ def build_router(
         collector: ObservabilityCollector = Depends(
             get_observability_collector
         ),
+        workspace_root: Path = Depends(get_workspace_root),
     ) -> Response:
         """Run one v1 host-graph run on the thread over SSE (T1 #33).
 
@@ -2292,6 +2334,11 @@ def build_router(
                 # metadata. Keeping the HTTP run id there makes a later
                 # crash resume address the same canonical run.
                 "run_id": run_id,
+                # Wave A (spec SC8 / ADR 0049): the seam injects the
+                # one default 工作区 on every send — the graph reads
+                # it PER CALL and raises WorkspaceRootMissingError if
+                # a seam forgets.
+                "workspace_root": str(workspace_root),
             }
         }
         thinking_type = "adaptive" if body.thinking else "disabled"
@@ -2621,6 +2668,7 @@ def build_router(
         graph: Any = Depends(get_graph),
         store: ThreadStore = Depends(get_thread_store),
         memory_port: Any = Depends(get_memory_port),
+        workspace_root: Path = Depends(get_workspace_root),
     ) -> Response:
         """T4 crash resume (spec line 39 / ADR 0026 / ADR 0018).
 
@@ -2687,6 +2735,10 @@ def build_router(
             "configurable": {
                 "thread_id": thread_id,
                 "run_id": run_id,
+                # Wave A (spec SC8 / ADR 0049): resume re-injects the
+                # one default 工作区 so the remainder of the run
+                # resolves memory/profile seams from the same root.
+                "workspace_root": str(workspace_root),
             }
         }
 
@@ -3338,6 +3390,7 @@ def mount(
     get_feedback_store=None,
     get_observability_collector=None,
     get_workspace_registry=None,
+    get_workspace_root=None,
 ) -> None:
     """Mount the workspace routes onto an existing FastAPI app."""
     app.include_router(
@@ -3350,6 +3403,7 @@ def mount(
             get_feedback_store=get_feedback_store,
             get_observability_collector=get_observability_collector,
             get_workspace_registry=get_workspace_registry,
+            get_workspace_root=get_workspace_root,
         )
     )
 
@@ -3357,7 +3411,9 @@ def mount(
 __all__ = [
     "build_router",
     "default_workspace_registry",
+    "default_workspace_root_for_process",
     "get_ingest_service",
     "get_workspace_registry",
+    "get_workspace_root",
     "mount",
 ]

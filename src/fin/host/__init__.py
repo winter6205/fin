@@ -20,7 +20,7 @@ from fin.host.citation_gate import (
     RefuseResult,
     verify_citations,
 )
-from fin.host.graph import ConcurrentRunError, compile_graph
+from fin.host.graph import ConcurrentRunError, WorkspaceRootMissingError, compile_graph
 from fin.host.scripted_model import ScriptedChatModel
 from fin.host.session_compaction import (
     SESSION_TOKEN_BUDGET,
@@ -63,6 +63,7 @@ __all__ = [
     "SessionSummaryError",
     "Status",
     "TERMINAL_STATUSES",
+    "WorkspaceRootMissingError",
     "compile_graph",
     "count_tokens_approximately",
     "session_budget_tokens",

@@ -139,15 +139,25 @@ def _tool_node_tools(graph: Any) -> dict[str, BaseTool]:
     return dict(graph._tool_node.tools_by_name)
 
 
-def _invoke_tool(graph: Any, name: str, args: dict[str, Any]) -> Any:
+def _invoke_tool(
+    graph: Any,
+    name: str,
+    args: dict[str, Any],
+    *,
+    config: dict[str, Any] | None = None,
+) -> Any:
     """Call one of the ToolNode's tools by name with ``args``.
 
     The LangChain tool surface accepts a dict and returns the tool's
     declared payload (a JSON-serialized dict for ``@tool`` functions).
+    ``config`` is the per-call run config — memory tools read
+    ``configurable.workspace_root`` from it (spec SC8 / ADR 0049).
     """
     tool_node = graph._tool_node
     tool = tool_node.tools_by_name[name]
-    return tool.invoke(args)
+    if config is None:
+        return tool.invoke(args)
+    return tool.invoke(args, config=config)
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +173,6 @@ def test_on_graph_exposes_three_memory_tools(tmp_path: Path) -> None:
         model=_scripted_model(),
         memory_port=port,
         user_profile_store=_profile_store(tmp_path),
-        workspace_root=str(tmp_path / "ws"),
     )
 
     # Both surfaces see the same tool set; assert across both to catch a
@@ -185,7 +194,6 @@ def test_on_graph_does_not_expose_a_dream_tool(tmp_path: Path) -> None:
         model=_scripted_model(),
         memory_port=port,
         user_profile_store=_profile_store(tmp_path),
-        workspace_root=str(tmp_path / "ws"),
     )
 
     tool_node_names = set(_tool_node_tools(graph))
@@ -208,7 +216,6 @@ def test_off_graph_does_not_expose_any_memory_tool(tmp_path: Path) -> None:
         model=_scripted_model(),
         memory_port=OffMemoryAdapter(),
         user_profile_store=_profile_store(tmp_path),
-        workspace_root=str(tmp_path / "ws"),
     )
 
     tool_node_names = set(_tool_node_tools(graph))
@@ -224,7 +231,6 @@ def test_off_graph_with_none_port_still_has_eight_tools(tmp_path: Path) -> None:
     graph = compile_graph(
         checkpointer=InMemorySaver(),
         model=_scripted_model(),
-        workspace_root=str(tmp_path / "ws"),
         user_profile_store=_profile_store(tmp_path),
     )
 
@@ -263,13 +269,14 @@ def test_save_memory_persists_a_row_in_the_workspace(tmp_path: Path) -> None:
         model=_scripted_model(),
         memory_port=port,
         user_profile_store=_profile_store(tmp_path),
-        workspace_root=workspace_key,
     )
+    cfg = {"configurable": {"thread_id": "t-save", "workspace_root": workspace_key}}
 
     _invoke_tool(
         graph,
         "save_memory",
         {"title": "Coffee preference", "body": "Latte in the morning."},
+        config=cfg,
     )
 
     entries = port.buffer.entries(include_disabled=True, workspace=workspace_key)
@@ -286,15 +293,22 @@ def test_recall_memory_returns_advisory_rows(tmp_path: Path) -> None:
         model=_scripted_model(),
         memory_port=port,
         user_profile_store=_profile_store(tmp_path),
-        workspace_root=str(tmp_path / "ws"),
     )
+    workspace_key = str(tmp_path / "ws")
+    cfg = {"configurable": {"thread_id": "t-recall", "workspace_root": workspace_key}}
     _invoke_tool(
         graph,
         "save_memory",
         {"title": "Coffee preference", "body": "Latte in the morning."},
+        config=cfg,
     )
 
-    raw = _invoke_tool(graph, "recall_memory", {"query": "latte morning coffee"})
+    raw = _invoke_tool(
+        graph,
+        "recall_memory",
+        {"query": "latte morning coffee"},
+        config=cfg,
+    )
     payload = json.loads(raw) if isinstance(raw, str) else raw
 
     assert payload["status"] == "ok"
@@ -316,16 +330,19 @@ def test_recall_on_workspace_b_cannot_see_workspace_a(tmp_path: Path) -> None:
         model=_scripted_model(),
         memory_port=port_a,
         user_profile_store=_profile_store(tmp_path, ws="ws-a"),
-        workspace_root=str(tmp_path / "ws-a"),
     )
+    cfg_a = {"configurable": {"thread_id": "t-a", "workspace_root": str(tmp_path / "ws-a")}}
     _invoke_tool(
         graph_a,
         "save_memory",
         {"title": "Coffee preference", "body": "Latte in the morning."},
+        config=cfg_a,
     )
 
     # Same workspace → recall sees the row.
-    raw = _invoke_tool(graph_a, "recall_memory", {"query": "latte coffee"})
+    raw = _invoke_tool(
+        graph_a, "recall_memory", {"query": "latte coffee"}, config=cfg_a
+    )
     payload = json.loads(raw) if isinstance(raw, str) else raw
     assert len(payload["memories"]) == 1
 
@@ -336,10 +353,10 @@ def test_recall_on_workspace_b_cannot_see_workspace_a(tmp_path: Path) -> None:
         model=_scripted_model(),
         memory_port=port_b,
         user_profile_store=_profile_store(tmp_path, ws="ws-b"),
-        workspace_root=str(tmp_path / "ws-b"),
     )
+    cfg_b = {"configurable": {"thread_id": "t-b", "workspace_root": str(tmp_path / "ws-b")}}
     raw_other = _invoke_tool(
-        graph_b, "recall_memory", {"query": "latte coffee"}
+        graph_b, "recall_memory", {"query": "latte coffee"}, config=cfg_b
     )
     payload_other = json.loads(raw_other) if isinstance(raw_other, str) else raw_other
 
@@ -364,7 +381,6 @@ def test_edit_user_profile_workspace_does_not_rewrite_global(tmp_path: Path) -> 
         model=_scripted_model(),
         memory_port=port,
         user_profile_store=profile_store,
-        workspace_root=str(tmp_path / "ws"),
     )
 
     _invoke_tool(
@@ -392,7 +408,6 @@ def test_edit_user_profile_global_does_not_rewrite_workspace(
         model=_scripted_model(),
         memory_port=port,
         user_profile_store=profile_store,
-        workspace_root=str(tmp_path / "ws"),
     )
 
     _invoke_tool(
@@ -420,7 +435,6 @@ def test_edit_user_profile_unknown_layer_returns_typed_dict(tmp_path: Path) -> N
         model=_scripted_model(),
         memory_port=port,
         user_profile_store=_profile_store(tmp_path),
-        workspace_root=str(tmp_path / "ws"),
     )
 
     raw = _invoke_tool(
@@ -442,7 +456,6 @@ def test_edit_user_profile_merged_read_is_workspace_over_global(
         model=_scripted_model(),
         memory_port=port,
         user_profile_store=profile_store,
-        workspace_root=str(tmp_path / "ws"),
     )
 
     _invoke_tool(
