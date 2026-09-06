@@ -6,10 +6,16 @@ merged read shows workspace-over-global: a non-empty workspace file replaces
 the global read, so the operator sees the most specific intent on the active
 workspace. Writing one layer never touches the other.
 
+Wave A amendment (``specs/workbench-operator-workspace.md`` SC6 / ADR 0049):
+the PRODUCT path reads ``$HOME/.fin/user.md`` only — ``compile_graph``
+constructs the default store with BOTH layers pointed at the same global
+file, so no per-workspace overlay is required in production. The two-layer
+API stays intact for tests and callers that want the overlay.
+
 The store is pure file IO. No graph import, no memory port, no thread-locking
 beyond the single write call. Paths are injected at construction so tests
 never touch the real ``$HOME``; :meth:`from_env` resolves the same paths from
-the environment for the production entry point.
+the environment for test / tooling entry points.
 """
 
 from __future__ import annotations
@@ -131,10 +137,12 @@ class UserProfileStore:
     ) -> "UserProfileStore":
         """Build a store from environment-derived paths.
 
-        ``workspace_root`` defaults to :func:`pathlib.Path.cwd` (a stable
-        key for the current workspace). ``home`` defaults to ``$HOME``;
-        tests pass an explicit ``tmp_path`` to keep the real home directory
-        out of the suite.
+        ``workspace_root`` defaults to :func:`pathlib.Path.cwd` (kept for
+        test convenience — the PRODUCT path no longer routes through this
+        helper: Wave A / ADR 0049 builds the store directly in
+        ``compile_graph`` with both layers at ``$HOME/.fin/user.md``).
+        ``home`` defaults to ``$HOME``; tests pass an explicit
+        ``tmp_path`` to keep the real home directory out of the suite.
         """
         resolved_home = Path(home) if home is not None else Path(
             os.environ.get("HOME") or str(Path.home())

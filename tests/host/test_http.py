@@ -566,3 +566,43 @@ def test_ask_follow_up_resets_evidence(client: TestClient, aapl_page1_text: str)
     )
     assert body["reason"] == "citation_repair_cap"
     assert body["citations"] == []
+
+
+# ----- workspace_root inject seam (spec SC8 / ADR 0049) -----
+
+
+class _ConfigCapturingGraph:
+    """Duck-typed graph that records the config of every invoke."""
+
+    def __init__(self) -> None:
+        self.configs: list[dict] = []
+
+    def invoke(self, input: dict, config: dict | None = None, **kwargs):
+        self.configs.append(config or {})
+        return {
+            "status": "done",
+            "answer": "ok",
+            "citations": (),
+        }
+
+
+def test_ask_injects_workspace_root(
+    http_app: FastAPI, client: TestClient, tmp_path
+) -> None:
+    """SC8: ``/ask`` resolves the default 工作区 via
+    ``get_workspace_root`` and stamps it into
+    ``configurable.workspace_root`` for the graph invoke."""
+    from fin.host.http import get_graph, get_workspace_root
+
+    g = _ConfigCapturingGraph()
+    http_app.dependency_overrides[get_graph] = lambda: g
+    ws_root = tmp_path / "ws-ask"
+    http_app.dependency_overrides[get_workspace_root] = lambda: ws_root
+
+    r = client.post("/ask", json={"question": "q", "thread_id": "t-ask-seam"})
+    assert r.status_code == 200
+
+    assert g.configs, "graph must have been invoked once"
+    configurable = g.configs[0].get("configurable") or {}
+    assert configurable.get("workspace_root") == str(ws_root)
+    assert configurable.get("thread_id") == "t-ask-seam"

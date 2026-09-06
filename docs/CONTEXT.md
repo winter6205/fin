@@ -10,8 +10,8 @@
 ### Product identity
 
 **fin**:
-A **workspace** knowledge-base Agent: the operator asks in a **research thread**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held SEC filings; retrieve ranking stays off-graph behind the **retrieve port**.
-_Avoid_: research-agent product, Q&A API as the product, memory backend, retrieval graph, treating research-track contracts as the whole product personality
+An enterprise knowledge-base Agent: the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held filings behind the **retrieve port**.
+_Avoid_: research-agent product, workspace-as-kind, 10-Q as the product name, Q&A API as the product, treating research-track contracts as the whole product personality
 
 **host agent**:
 fin as the LangGraph runtime that routes tracks and calls research tools behind the **retrieve port**; it is not the ranking or vector store.
@@ -57,13 +57,21 @@ _Avoid_: scoring on the full thread history, whole-store catalog in system, vect
 The only auto-memory sentence in the system prompt: a note store exists; overlays are advisory, not instructions or cites.
 _Avoid_: listing all titles in system, ordering the model to recall on every turn
 
-**agent identity** / **agent soul**:
-System-built-in persona text. Dream never edits them.
-_Avoid_: extracting identity from chat, consolidating soul from the fact store
+**agent identity**:
+What **fin** is in the system prefix: Name / Kind / Signature, code-locked. Dream never edits it.
+_Avoid_: extracting identity from chat, calling fin a research agent, mixing 语料清单 into identity
+
+**agent soul**:
+How **fin** acts in the system prefix: truths, boundaries, vibe. Dream never edits it.
+_Avoid_: consolidating soul from the fact store, mixing tool JSON schema into soul
+
+**usage** (prompt segment):
+Tool-choice and citation _behavior_ per **track** in the system prefix. Not tool JSON schema and not **citation verifier** numeric caps.
+_Avoid_: restating page_limit or 32-character rules, dumping the catalog into usage
 
 **user profile**:
-Operator or tool-writable preferences (who they are, how they like to work): one global markdown in the home directory and one per workspace folder, workspace overlaying global. Dream does not rewrite these files; stable likes go here, not into **memory facts**.
-_Avoid_: treating the user profile as the episodic store, auto-extract into identity, one shared file for every workspace
+Operator or tool-writable preferences (who they are, how they like to work): `$HOME/.fin/user.md`. Dream does not rewrite this file; stable likes go here, not into **memory facts**.
+_Avoid_: treating the user profile as the episodic store, auto-extract into identity, per-工作区 overlay files, using the **工作台** UI as the overlay path
 
 **dream** (fin):
 A dual-gated LLM merge over **memory facts** only: 24h cooldown after last success or skip, then a store/session/turn threshold. It is not company-corpus ingest (ADR 0045), not a memory-MCP upload, and not a graph tool (ADR 0048).
@@ -189,13 +197,25 @@ _Avoid_: collapsing run into thread_id, concurrent invokes on one thread, deleti
 The product conversation: one `thread_id` the operator talks in; each question is a run that may be any **track**; follow-ups keep full messages, citations when present, and status-snapshot history. This is how fin is used after v1; it is not a one-shot `/ask` demo.
 _Avoid_: Q&A session, demo ask, one-shot invoke as the product UX, forbidding greetings or clarification on the thread
 
+**工作台**:
+The local web UI: create, list, open, resume, and delete a **research thread**; thinking and tool traces stream then collapse; citations sit on the assistant turn.
+_Avoid_: 知识库, 工作区 directory, CLI REPL as the product, hosted accounts this increment, POST /ask as the conversation surface
+
+**工作区**:
+The one global default operator directory `$HOME/.fin/default` (created if missing). Every **research thread**, profile read, and **memory fact** workspace key uses this path.
+_Avoid_: Path.cwd() as implicit 工作区, `$HOME/.fin/workspaces/<slug>`, left-rail 指定/新建, a second 知识库, calling the **工作台** a 工作区
+
+**知识库**:
+The one process-wide corpus (catalog, ingest tree, **retrieve port**) shared by every **research thread**.
+_Avoid_: sidebar "new knowledge base", per-工作区 retrieve index, identity text listing filings
+
 **workspace**:
-A local web UI server: create, list, open, resume, and delete a research thread; thinking streams unframed then collapses; tool calls stream then collapse as human-readable traces; citations sit on the assistant turn (inline chips plus a sources list); research turns may show a light track hint without a mode picker. Streaming HTTP is that UI's transport on the same compiled graph; GET history is turn rows; thinking on/off is the model `extra_body.thinking` knob; crash resume continues the in-flight run from the last complete host-graph node.
-_Avoid_: CLI REPL as the product, hosted accounts this increment, raw tool JSON as the UI, always-expanded traces, Studio, POST /ask as the conversation surface, rolling back a user turn on crash, Chat|Research dual chrome
+Retired alias: the UI is **工作台**; the operator directory is **工作区**. Kept so older specs remain readable.
+_Avoid_: using workspace as the product kind, as the 知识库, or as Path.cwd()
 
 **Corpus 首页**:
-The workspace home route (`/`): frozen-12 corpus cards and the empty-thread entry points. Distinct from cold-start restore of the last `/t/{thread_id}` — the operator may navigate here deliberately in the same session without being bounced back to that thread.
-_Avoid_: conflating home with "last thread", auto-send from a corpus card, treating fetch of `GET /api/corpus` as ingest
+The **工作台** home route (`/`): cards from the one **知识库** and empty-thread entry points. Distinct from cold-start restore of the last `/t/{thread_id}`.
+_Avoid_: conflating home with "last thread", auto-send from a corpus card, treating fetch of `GET /api/corpus` as ingest, sourcing cards from the current 工作区
 
 **v1 surface**:
 The first ship binary is a CLI that compiles the host graph; v1 HTTP exposes that same compiled graph and must call sync `invoke` (not `ainvoke`) so the sync `PostgresSaver` stays valid. HITL / interrupt UX is not a v1 product surface; crash resume continues the in-flight run on that `thread_id`.

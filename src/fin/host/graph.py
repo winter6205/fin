@@ -67,6 +67,7 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import os
 import threading
 import uuid
 from dataclasses import dataclass
@@ -82,7 +83,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-from langchain_core.tools import InjectedToolCallId, tool
+from langchain_core.tools import InjectedToolArg, InjectedToolCallId, tool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.prebuilt import ToolNode
@@ -109,6 +110,7 @@ from fin.host.session_compaction import (
     session_budget_tokens,
 )
 from fin.host.user_profile import (
+    GLOBAL_FILENAME,
     UserProfileError,
     UserProfileStore,
     UserProfileUnknownLayerError,
@@ -208,7 +210,56 @@ class RetrieveAdapterConfigError(HostGraphError):
     """
 
 
+class WorkspaceRootMissingError(HostGraphError):
+    """A call (model-call or memory-tool) had no usable ``workspace_root``.
+
+    spec SC8 / ADR 0049: ``configurable.workspace_root`` is the SOLE
+    carrier of the per-call 工作区. Missing or empty at tool-call time
+    → this typed error. The graph NEVER falls back to ``Path.cwd()``
+    or ``$HOME/.fin/default`` from inside the runtime — that fallback
+    lives in the HTTP / CLI seam only, where it resolves ``$HOME``
+    explicitly via :func:`fin.host.workspace_registry.default_workspace_root`.
+
+    Callers should surface this exit to the operator rather than
+    silently retrying with a default; an unset workspace is an
+    operator / seam bug, not a runtime recovery point.
+    """
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(
+            message
+            or "configurable.workspace_root is missing or empty; "
+            "the HTTP / CLI seam must inject the resolved default "
+            "$HOME/.fin/default path before invoking the graph."
+        )
+
+
 # ----- helpers -----
+
+
+def _resolve_workspace_root(config: Mapping[str, Any] | None) -> Path:
+    """Return the per-call workspace_root path from a LangGraph config.
+
+    spec SC8 / ADR 0049: the runtime reads ``configurable.workspace_root``
+    only — it does NOT consult ``$HOME``, ``Path.cwd()``, or any baked
+    default. Missing / empty values raise :class:`WorkspaceRootMissingError`
+    so a misconfigured seam surfaces as a typed exit rather than silently
+    selecting the operator's working directory.
+
+    Non-string values (None / Path / int) are rejected as missing; the
+    string ``""`` is rejected as empty. Both shapes share the same error
+    because the seam contract is "non-empty string path", not "any
+    truthy value".
+    """
+    if not config:
+        raise WorkspaceRootMissingError()
+    configurable = config.get("configurable") or {}
+    raw = configurable.get("workspace_root")
+    if raw is None:
+        raise WorkspaceRootMissingError()
+    if isinstance(raw, str) and raw == "":
+        raise WorkspaceRootMissingError()
+    return Path(raw)
 
 
 _DEFAULT_DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "corpus"
@@ -223,6 +274,14 @@ _DEFAULT_CATALOG_PATH = DEFAULT_CATALOG_PATH
 RETRIEVE_ADAPTER_FAKE = "fake"
 RETRIEVE_ADAPTER_MCP = "mcp"
 RETRIEVE_ADAPTER_KINDS = (RETRIEVE_ADAPTER_FAKE, RETRIEVE_ADAPTER_MCP)
+
+# spec SC6 / ADR 0049 (Wave A): the user-profile file lives one
+# directory below ``$HOME`` at ``$HOME/.fin/user.md``. The graph's
+# default ``user_profile_store`` constructs both layers pointing at
+# this single path so the merged read returns the global text. The
+# literal lives here (not imported from ``user_profile``) so the
+# ``user_profile`` module stays free of any host-graph reference.
+_USER_PROFILE_LAYER_DIR = ".fin"
 
 # Marker the gate uses on the next pass to recognize a bounce
 # template in the message history. The marker is data; CLI / HTTP
@@ -799,21 +858,22 @@ def _make_get_xbrl_fact_tool(facts_root: Path):
 # regardless of which branch compiled the graph.
 #
 # ``user_profile_store`` is injectable so tests can use ``tmp_path``
-# roots; the production entry point builds one from ``workspace_root``
-# via ``UserProfileStore.from_env``.
+# roots; the production entry point builds one with both layers at
+# ``$HOME/.fin/user.md`` (spec SC6 / ADR 0049 — no workspace overlay).
 
 
 def _make_save_memory_tool(
     memory_port: MemoryPort,
-    *,
-    workspace: str,
 ) -> Any:
     """Build the explicit ``save_memory`` tool (spec SC12).
 
     Title + body text are forwarded to ``memory_port.extract`` so the
     operator's hand-curated row lives in the same store the auto-extract
-    path writes to. ``workspace`` is the resolved workspace key the
-    factory received; SC6 isolates rows by workspace.
+    path writes to. The workspace key is resolved PER CALL from
+    ``configurable.workspace_root`` (spec SC8 / ADR 0049) — the tool
+    does NOT close over a compile-time path. A missing or empty
+    ``workspace_root`` raises :class:`WorkspaceRootMissingError`; the
+    graph never silently defaults to ``Path.cwd()`` or ``$HOME``.
 
     The tool returns a dict the ToolNode serializes as ToolMessage JSON
     so the model can confirm the row landed (and the operator can see
@@ -821,14 +881,20 @@ def _make_save_memory_tool(
     """
 
     @tool("save_memory")
-    def save_memory_tool(title: str, body: str) -> dict:
+    def save_memory_tool(
+        title: str,
+        body: str,
+        config: Annotated[RunnableConfig, InjectedToolArg()],
+    ) -> dict:
         """Persist one cross-session memory row (title + body).
 
         ``title`` is a short label; ``body`` is the full prose (the
         first non-empty line becomes the memory hook — ≤80 chars). The
-        row is workspace-scoped and is advisory context, never citation
-        evidence.
+        row is workspace-scoped (resolved from
+        ``configurable.workspace_root`` at call time) and is advisory
+        context, never citation evidence.
         """
+        workspace = str(_resolve_workspace_root(config))
         result = memory_port.extract(
             body,
             metadata={"title": title},
@@ -841,25 +907,31 @@ def _make_save_memory_tool(
 
 def _make_recall_memory_tool(
     memory_port: MemoryPort,
-    *,
-    workspace: str,
 ) -> Any:
     """Build the explicit ``recall_memory`` tool (spec SC12).
 
     The returned payload carries the same ``advisory: True`` and
     ``citation_eligible: False`` markers the host prefetch uses so the
     citation verifier refuses memory rows as evidence (ADR 0035 /
-    0046).
+    0046). The workspace key is resolved PER CALL from
+    ``configurable.workspace_root`` (spec SC8 / ADR 0049) — the tool
+    does NOT close over a compile-time path.
     """
 
     @tool("recall_memory")
-    def recall_memory_tool(query: str, limit: int = 8) -> dict:
+    def recall_memory_tool(
+        query: str,
+        limit: int = 8,
+        config: Annotated[RunnableConfig, InjectedToolArg()] = None,
+    ) -> dict:
         """Return advisory memory rows that lexically hit ``query``.
 
         ``query`` is the operator's recall cue; ``limit`` is the cap
         (default 8). The payload is advisory context — it cannot
-        satisfy the citation verifier. Rows are workspace-scoped.
+        satisfy the citation verifier. Rows are workspace-scoped
+        (resolved from ``configurable.workspace_root`` at call time).
         """
+        workspace = str(_resolve_workspace_root(config))
         return memory_port.recall(query, limit=limit, workspace=workspace)
 
     return recall_memory_tool
@@ -1826,7 +1898,6 @@ def compile_graph(
     degradation_ledger: DegradationLedger | None = None,
     summarizer: Any | None = None,
     memory_port: MemoryPort | None = None,
-    workspace_root: Path | str | None = None,
     user_profile_store: UserProfileStore | None = None,
 ) -> "_LockedGraph":
     """Build the v1 host graph (T6).
@@ -1986,23 +2057,29 @@ def compile_graph(
         the same OFF branch as ``None`` applies: the three memory
         tools are NOT bound.
     workspace_root
-        T6: the workspace key the save/recall memory tools pass into
-        ``MemoryBuffer``. Defaults to ``str(Path.cwd())`` when ON and
-        ``memory_port`` is supplied. ``OffMemoryAdapter`` ignores it.
-        Tests pass an explicit ``tmp_path``-rooted string so save/recall
-        isolation (SC6) is observable end to end.
+        **REMOVED in Wave A (ADR 0049).** The per-call 工作区 is now
+        carried in ``configurable.workspace_root`` (injected by HTTP
+        / CLI from :func:`fin.host.workspace_registry.default_workspace_root`).
+        ``compile_graph`` no longer bakes any path — neither
+        ``Path.cwd()`` nor ``$HOME/.fin/default`` — so the graph
+        reads the seam-injected value at every tool call and raises
+        :class:`WorkspaceRootMissingError` when the seam forgot it.
+        Keep this parameter out of the signature: SC8 forbids silent
+        defaults inside the runtime.
     user_profile_store
         T6 / spec SC13 + PR #240 operator decision: the two-layer
-        profile file store. ``None`` (the default) builds one from
-        ``UserProfileStore.from_env(workspace_root)``. PR #240 made
-        this unconditional — the store is built regardless of
-        ``memory_port`` because the user profile is operator-profile
-        machinery, NOT memory-fact machinery, and the merged
-        profile text surfaces into the system prefix on every
-        leaf (research AND non-research) regardless of memory_on.
-        The WRITE path (``edit_user_profile`` tool) stays ON-gated
-        per spec SC12. Tests inject an explicit store rooted at a
-        ``tmp_path`` so the suite never touches the real ``$HOME``.
+        profile file store. ``None`` (the default) builds one rooted
+        at ``$HOME/.fin/user.md`` (both layers point at the same file
+        — spec SC6: product reads ``$HOME/.fin/user.md`` only, no
+        workspace overlay). PR #240 made this unconditional — the
+        store is built regardless of ``memory_port`` because the user
+        profile is operator-profile machinery, NOT memory-fact
+        machinery, and the merged profile text surfaces into the
+        system prefix on every leaf (research AND non-research)
+        regardless of memory_on. The WRITE path (``edit_user_profile``
+        tool) stays ON-gated per spec SC12. Tests inject an explicit
+        store rooted at a ``tmp_path`` so the suite never touches the
+        real ``$HOME``.
 
     Returns
     -------
@@ -2100,10 +2177,6 @@ def compile_graph(
     # tool list at the existing eight ToolNode tools. No dream tool is
     # EVER created in any branch.
     memory_enabled = bool(memory_port is not None and memory_port.enabled)
-    resolved_workspace_root = (
-        workspace_root if workspace_root is not None else Path.cwd()
-    )
-    workspace_key = str(resolved_workspace_root)
     save_memory_tool: Any | None = None
     recall_memory_tool: Any | None = None
     edit_user_profile_tool: Any | None = None
@@ -2112,11 +2185,21 @@ def compile_graph(
     # profile text into the system prefix) is unconditional — both
     # ON and OFF graphs need a store to call ``read_merged()`` at
     # model-call time. The write path (edit_user_profile tool)
-    # remains ON-gated per spec SC12. Resolve the store here, before
-    # either branch needs it.
+    # remains ON-gated per spec SC12.
+    #
+    # spec SC6 (ADR 0049, Wave A): the product path reads
+    # ``$HOME/.fin/user.md`` ONLY — there is no workspace overlay
+    # in production. We construct a store with BOTH layers pointed at
+    # the same global path so ``read_merged()`` returns the global
+    # text (workspace layer is empty, so the overlay falls through).
+    # Tests inject an explicit ``user_profile_store`` rooted at a
+    # ``tmp_path``-built home so the suite never touches real ``$HOME``.
     if user_profile_store is None:
-        user_profile_store = UserProfileStore.from_env(
-            resolved_workspace_root
+        home = os.environ.get("HOME") or str(Path.home())
+        global_md = Path(home) / _USER_PROFILE_LAYER_DIR / GLOBAL_FILENAME
+        user_profile_store = UserProfileStore(
+            global_path=global_md,
+            workspace_path=global_md,
         )
     # Closure: read the merged profile text at model-call time so a
     # file edit between calls is visible on the next turn (no caching
@@ -2128,11 +2211,9 @@ def compile_graph(
     if memory_enabled:
         save_memory_tool = _make_save_memory_tool(
             memory_port,  # type: ignore[arg-type]
-            workspace=workspace_key,
         )
         recall_memory_tool = _make_recall_memory_tool(
             memory_port,  # type: ignore[arg-type]
-            workspace=workspace_key,
         )
         edit_user_profile_tool = _make_edit_user_profile_tool(user_profile_store)
 
@@ -3000,17 +3081,21 @@ def compile_graph(
         # through ``tool_node_with_summaries`` (a wrapper whose name
         # shadows the actual executor in the compiled graph).
         tool_node=tool_dispatcher,
-        # T6: memory_port + workspace_root change the bound tool set
-        # (ON adds three tools; a different workspace re-routes the
-        # tool bodies but the BOUND tool list shape is identical), so
-        # the idempotence cache must distinguish graphs by memory
+        # T6: memory_port changes the bound tool set (ON adds three
+        # tools; OFF keeps the eight ToolNode tools), so the
+        # idempotence cache must distinguish graphs by memory
         # surface. ``id(memory_port)`` is stable across two calls with
         # the same injected port object — keying on the bound tool
         # LIST directly would create a fresh list per call and break
         # the OFF/idempotence contract that the existing wiring tests
         # pin.
+        #
+        # spec SC8 / ADR 0049 (Wave A): the per-call workspace
+        # cache slot is GONE. The per-call 工作区 rides the run's
+        # ``configurable.workspace_root``, not the compile-time graph
+        # identity — two compiles with identical config but different
+        # run-time workspaces must share the same cached proxy.
         memory_port_id=id(memory_port) if memory_port is not None else 0,
-        workspace_root_key=str(resolved_workspace_root),
     )
 
 
@@ -3030,6 +3115,14 @@ def compile_graph(
 # directly would create a fresh cache entry per call. Keying on
 # ``id`` is the documented escape hatch for "same object reused"
 # idempotence.
+#
+# spec SC8 / ADR 0049 (Wave A): the key DROPS the per-call
+# workspace cache slot. The per-call 工作区 rides the run's
+# ``configurable.workspace_root``
+# (injected by HTTP / CLI), not the compile-time graph identity. Two
+# compiles that differ ONLY in the workspace they will be invoked
+# against must share one cache entry — there is exactly one graph
+# object per (checkpointer, model) pair.
 _IDEMPOTENCE_CACHE: dict[tuple, "_LockedGraph"] = {}
 
 
@@ -3047,7 +3140,6 @@ def _make_locked_graph(
     bound_tools: list[Any] | None = None,
     tool_node: Any | None = None,
     memory_port_id: int = 0,
-    workspace_root_key: str = "",
 ) -> "_LockedGraph":
     key = (
         id(checkpointer),
@@ -3067,7 +3159,6 @@ def _make_locked_graph(
         # without this key the first OFF compile would hand a later
         # ON compile a cached OFF proxy.
         int(memory_port_id),
-        str(workspace_root_key),
     )
     cached = _IDEMPOTENCE_CACHE.get(key)
     if cached is not None:

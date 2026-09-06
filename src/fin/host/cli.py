@@ -45,18 +45,21 @@ CLI test suite.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import uuid
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from langchain_core.messages import AIMessage, HumanMessage
 
 from fin.corpus.errors import IngestMissingError
-from fin.host import ConcurrentRunError
+from fin.host import ConcurrentRunError, WorkspaceRootMissingError
 from fin.host.citation_gate import strip_hidden_bounce_marker
 from fin.host.operator_env import apply_dotenv
 from fin.host.run_payload import ordinary_person_copy
 from fin.host.state import EVIDENCE_RESET, reset_input_state
+from fin.host.workspace_registry import default_workspace_root
 
 
 # ----- typed errors -----
@@ -153,7 +156,13 @@ def render_result(state: dict[str, Any]) -> str:
 # ----- the runner -----
 
 
-def run(question: str, *, graph: Any, thread_id: str | None = None) -> None:
+def run(
+    question: str,
+    *,
+    graph: Any,
+    thread_id: str | None = None,
+    home: str | Path | None = None,
+) -> None:
     """Drive one host-graph invoke and print the result to stdout.
 
     Parameters
@@ -171,6 +180,12 @@ def run(question: str, *, graph: Any, thread_id: str | None = None) -> None:
     thread_id
         Session id; auto-created as a UUID4 when ``None``. The chosen
         value is echoed on stderr.
+    home
+        Injected home directory for resolving the default 工作区
+        (``$HOME/.fin/default``). ``None`` (the default) reads
+        ``$HOME`` at call time. Tests pass an explicit ``tmp_path``
+        so the suite never touches the real home. spec Focus 3 / SC8:
+        the CLI is the workspace-inject seam for the ask path.
 
     Stdout sections (in order): ``status:``, ``answer:``, ``citations:``.
     Stderr: ``thread_id: <value>`` always; for ``refuse`` also
@@ -187,7 +202,16 @@ def run(question: str, *, graph: Any, thread_id: str | None = None) -> None:
         thread_id = str(uuid.uuid4())
     print(f"thread_id: {thread_id}", file=sys.stderr)
 
-    config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+    resolved_home = home if home is not None else (
+        os.environ.get("HOME") or str(Path.home())
+    )
+    workspace_root = default_workspace_root(resolved_home)
+    config: dict[str, Any] = {
+        "configurable": {
+            "thread_id": thread_id,
+            "workspace_root": str(workspace_root),
+        }
+    }
     # T2: explicit reset via the ``reset_input_state`` helper. The
     # previous ``evidence: []`` literal was a no-op under the old
     # ``operator.add`` reducer (``[1,2,3] + [] == [1,2,3]``), so a
@@ -320,6 +344,9 @@ def main(
     try:
         run(question, graph=graph, thread_id=args.thread_id)
     except ConcurrentRunError as exc:
+        print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    except WorkspaceRootMissingError as exc:
         print(f"error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
