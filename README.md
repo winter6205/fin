@@ -1,6 +1,6 @@
 # fin
 
-**Workspace knowledge-base Agent** (企业知识库 Agent): the operator asks in a **research thread**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. The first corpus on disk is operator-held SEC filings — a **source**, not the product. Citation checks run in code; LangGraph is the durable runtime (checkpoint / resume), not a retrieve-then-generate flowchart.
+**Enterprise knowledge-base Agent** (企业知识库 Agent): the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. The first corpus is operator-held filings behind the **retrieve port** — a **source**, not the product. Citation checks run in code; LangGraph is the durable runtime (checkpoint / resume), not a retrieve-then-generate flowchart.
 
 Product identity is SSOT'd in [`docs/CONTEXT.md`](docs/CONTEXT.md); the program contract is [`specs/enterprise-kb-agent.md`](specs/enterprise-kb-agent.md), mapped by [wayfinder #130](https://github.com/winter6205/fin/issues/130).
 
@@ -33,7 +33,7 @@ v1 host-agent ships: ingest artifacts are in git; CLI (`python -m fin`) and HTTP
 4. **Multi-issuer synthesize** — fan out in the host graph, then synthesize; every surviving claim still passes the verifier; over-cap is a typed overflow.
 5. **Trust in the workspace** — `evidence_locators` persisted on the run row, `GET /health`, and the eval count command.
 
-The workspace web UI is the only product entry; SEC filings are the first corpus, not the product name. [#91](https://github.com/winter6205/fin/issues/91) and [#125](https://github.com/winter6205/fin/issues/125) stay useful as **workstream** notes (vertical slice, quality loop) and are superseded as the product destination. Naming rule from #130: the internal `research` track enum may stay (rename cost), but product copy and `docs/CONTEXT.md` must not call fin a research agent. Opt-in eval: `uv run pytest -q -m eval` (9 gold cases).
+The **工作台** web UI is the only product entry; SEC filings are the first corpus, not the product name. [#91](https://github.com/winter6205/fin/issues/91) and [#125](https://github.com/winter6205/fin/issues/125) stay useful as **workstream** notes (vertical slice, quality loop) and are superseded as the product destination. Naming rule from #130: the internal `research` track enum may stay (rename cost), but product copy and `docs/CONTEXT.md` must not call fin a research agent. Opt-in eval: `uv run pytest -q -m eval` (9 gold cases).
 
 ## Running the workspace server (T1)
 
