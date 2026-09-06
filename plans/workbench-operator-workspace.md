@@ -38,7 +38,7 @@ minimal-change-verifier: yes — discard uncommitted T3 project_root WIP; remain
    - **Inherits:** operator freeze 2026-09-06; spec assumption 4.
    - **Surface:** worktree dirty files only (`graph.py`, `thread_store.py`, `workspace_http.py`, tests, …). Not a commit.
    - **Acceptance:** `git status` on the Wave A worktree has no per-thread `project_root` diffs; HEAD is still `424e76a` plus later allowed tracers. Then T3.
-   - Status: [ ] pending
+   - Status: [x] done (`958e83a` carried the amended contract docs; per-thread WIP reverted via `git checkout -- src/ tests/`).
 
 1. **Align remaining product copy with CONTEXT** — tag: `[implementation]`
    - Status: [x] done (`475ab62`). Re-check README vs amended **工作区** one-liner if copy still says left-rail bind.
@@ -50,12 +50,14 @@ minimal-change-verifier: yes — discard uncommitted T3 project_root WIP; remain
    - **Inherits:** spec SC3, SC6, SC8, Focus 3 EXIT, ADR 0049; `workspace_http` / CLI copy `default_workspace_root` into `configurable.workspace_root`; missing configurable → typed error, not cwd, not silent default inside the graph; idempotence cache drops `workspace_root_key`; `graph.py` still has zero `thread_store` imports; no `fin_thread.project_root`.
    - **Surface:** `workspace_http`, `compile_graph` / host graph, CLI if it invokes, `user_profile` / memory key; tests in `tests/host/`
    - **Acceptance:** a scripted invoke without `workspace_root` raises the typed missing-root error; HTTP stream configurable includes `workspace_root` equal to the resolved default (tests inject home); `compile_graph` does not close over `Path.cwd()`; `uv run pytest -q` exits 0.
-   - Status: [ ] pending
+   - Status: [x] done (`b6d01b5`: typed `WorkspaceRootMissingError` at `graph.py`, per-call resolution in profile/memory tools, HTTP send/resume + `/ask` + CLI inject, cache key drops `workspace_root_key`; review cleanup `9e1390c`).
    - [blocks: T0]
 
 4. **Unship T2 multi-root 工作区 API; no left rail** — tag: `[implementation]`
    - **Inherits:** spec SC4, SC5, SC7, Focus 2 remaining; delete `/api/workspaces` bind/create (and the multi-root registry / `workspaces/<slug>` create path); SPA must not add 指定/新建; keep `default_workspace_root`.
    - **Surface:** `src/fin/host/workspace_registry.py`, `workspace_http.py`, tests that targeted bind/create 4xx; `web/` only to confirm no picker
    - **Acceptance:** bind/create routes absent or 404; no slug create; `GET /api/threads` is not directory-scoped; `GET /api/corpus` unchanged; `uv run pytest -q` exits 0; if `web/` touched, `tsc --noEmit` exits 0.
-   - Status: [ ] pending
+   - Status: [x] done (`e823a93`: bind/create routes + registry + slug path deleted, unshipped-contract guard suite added; `web/` untouched — no picker existed; review cleanup `9e1390c`).
    - [blocks: T3]
+
+**End-of-round record (2026-09-06):** one code-review (Standards + Spec) on ee2e4ba..9e1390c — Standards 0 High / 0 Medium / 4 Low, Spec 0 High / 1 Medium / 0 Low → GATE PASS. Medium (stale overlay copy) + 2 cheap Lows (dead module state, cli `home` type) fixed in `9e1390c`; 2 Lows (`.fin` literal SSOT, configurable data-clumps helper) deferred as PR advisory on #244.
