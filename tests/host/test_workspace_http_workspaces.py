@@ -1,41 +1,39 @@
-"""HTTP routes for the 工作区 list/bind/create surface (spec Focus 2 / SC4).
+"""The ``/api/workspaces`` surface is UNSHIPPED (spec SC4 / SC7, Round 3).
 
-The ``/api/workspaces`` family sits next to ``/api/threads`` on the
-same FastAPI app. The tests follow the existing
-``tests/host/test_workspace_http.py`` pattern: a fresh app per test,
-in-memory thread store, and a dependency override for the
-``WorkspaceRegistry`` so each test gets a hermetic fake home.
+The 2026-09-06 single-default amendment (ADR 0049 amendment) retracted
+the T2 multi-root API: no ``GET /api/workspaces`` list, no
+``POST /api/workspaces/bind``, no ``POST /api/workspaces/create``.
+There is one global default 工作区 (``$HOME/.fin/default``) and
+multiplicity is research threads, not filesystem folders. The SPA
+must not grow a picker either.
 
-Coverage follows the five boundary classes:
+What this suite pins:
 
-* empty — fresh home, ``GET /api/workspaces`` returns the default entry;
-* negative — bind missing path, bind a file, illegal slug, missing body;
-* overflow — slug over the cap, no directory created;
-* concurrent — second create same slug, registry stays valid;
-* exception — corrupted registry -> typed 500 with named code, never
-  cwd fallback (spec SC4).
+* absence — the three routes answer 404 with a JSON error body (not
+  the SPA catch-all's 200-with-index.html), and bind/create do NOT
+  create ``$HOME/.fin/workspaces/<slug>`` or ``known_roots.json`` for
+  ANY request shape;
+* presence — ``default_workspace_root`` still resolves + mkdirs
+  ``$HOME/.fin/default`` (kept helper, spec Focus 2 / SC4);
+* inject seam end-to-end (spec SC8) — one scripted send injects the
+  resolved default 工作区 into ``configurable.workspace_root``.
 
-The routes also mkdir the default directory on list (spec Focus 2:
-"Default ``$HOME/.fin/default`` is created/used when listing 工作区").
+Boundary classes: empty (fresh home -> default created), negative
+(routes absent / 404), exception (no slug path ever created).
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from langchain_core.messages import AIMessage
+from langgraph.checkpoint.memory import InMemorySaver
 
-from fin.host.workspace_registry import (
-    DEFAULT_ROOT_NAME,
-    MAX_SLUG_LENGTH,
-    REGISTRY_FILENAME,
-    WorkspaceRegistry,
-    default_workspace_root,
-)
+from fin.host import ScriptedChatModel, compile_graph
+from fin.host.workspace_registry import DEFAULT_ROOT_NAME, default_workspace_root
 
 
 # ---------------------------------------------------------------------------
@@ -45,31 +43,26 @@ from fin.host.workspace_registry import (
 
 @pytest.fixture
 def fake_home(tmp_path: Path) -> Path:
-    """An isolated ``$HOME`` under ``tmp_path``."""
+    """An isolated ``$HOME`` under ``tmp_path``.
+
+    The suite never touches the operator's real home: the
+    ``$HOME``-reading dependencies resolve via
+    ``default_workspace_root_for_process``, which reads ``HOME`` at
+    call time — monkeypatched here.
+    """
     home = tmp_path / "home"
     home.mkdir(parents=True, exist_ok=True)
     return home
 
 
 @pytest.fixture
-def http_app(fake_home: Path) -> FastAPI:
-    """A fresh FastAPI app + a registry dependency bound to ``fake_home``.
+def http_app(fake_home: Path, monkeypatch: pytest.MonkeyPatch) -> FastAPI:
+    """The prod app with ``HOME`` pointed at ``fake_home``."""
+    from fin.host.http import app
 
-    The dependency override targets ``fin.host.http.get_workspace_registry``
-    because that is the callable ``http.py`` passes into
-    ``mount_workspace_routes`` — overriding the workspace_http copy
-    would silently miss the route's actual dependency.
-    """
-    from fin.host.http import app, get_workspace_registry
-
-    # Build a registry keyed off the fake home so the routes never
-    # touch the real ``$HOME``.
-    registry = WorkspaceRegistry(home=fake_home)
-    app.dependency_overrides[get_workspace_registry] = lambda: registry
-    try:
-        yield app
-    finally:
-        app.dependency_overrides.clear()
+    monkeypatch.setenv("HOME", str(fake_home))
+    yield app
+    app.dependency_overrides.clear()
 
 
 @pytest.fixture
@@ -77,352 +70,159 @@ def client(http_app: FastAPI) -> TestClient:
     return TestClient(http_app)
 
 
-def _registry_path(fake_home: Path) -> Path:
-    return fake_home / ".fin" / REGISTRY_FILENAME
-
-
 # ---------------------------------------------------------------------------
-# GET /api/workspaces — empty / list.
+# Negative — the bind/create/list surface is gone (404, not SPA 200).
 # ---------------------------------------------------------------------------
 
 
-def test_get_workspaces_empty_home_returns_default_entry(
-    client: TestClient, fake_home: Path
-) -> None:
-    """Fresh fake home -> the route mkdirs + returns exactly one entry."""
+def test_get_workspaces_is_absent(client: TestClient) -> None:
+    """``GET /api/workspaces`` no longer exists. The SPA catch-all is
+    mounted only when ``web/dist`` exists, so in this suite the
+    unmounted path must answer 404 with FastAPI's JSON error body —
+    never a 200 and never the old JSON list contract."""
     r = client.get("/api/workspaces")
-    assert r.status_code == 200
+    assert r.status_code == 404
     body = r.json()
-    assert isinstance(body, list)
-    assert len(body) == 1
-    entry = body[0]
-    assert entry["path"] == str(fake_home / ".fin" / DEFAULT_ROOT_NAME)
-    assert entry["slug"] == DEFAULT_ROOT_NAME
-    assert entry["is_default"] is True
+    assert not isinstance(body, list)
+    assert body != {"error": "workspace_list"}
 
 
-def test_get_workspaces_creates_default_dir_on_list(
-    client: TestClient, fake_home: Path
-) -> None:
-    target = fake_home / ".fin" / DEFAULT_ROOT_NAME
-    assert not target.exists()
-
-    r = client.get("/api/workspaces")
-    assert r.status_code == 200
-
-    assert target.is_dir()
-
-
-def test_get_workspaces_creates_registry_file(
-    client: TestClient, fake_home: Path
-) -> None:
-    reg_path = _registry_path(fake_home)
-    assert not reg_path.exists()
-
-    r = client.get("/api/workspaces")
-    assert r.status_code == 200
-
-    payload = json.loads(reg_path.read_text(encoding="utf-8"))
-    assert payload == {
-        "roots": [
-            {
-                "path": str(fake_home / ".fin" / DEFAULT_ROOT_NAME),
-                "slug": DEFAULT_ROOT_NAME,
-                "is_default": True,
-            }
-        ]
-    }
-
-
-# ---------------------------------------------------------------------------
-# POST /api/workspaces/bind — negative.
-# ---------------------------------------------------------------------------
-
-
-def test_bind_missing_path_returns_400_with_typed_code(
-    client: TestClient, fake_home: Path
-) -> None:
-    missing = fake_home / "nope"
-
-    r = client.post("/api/workspaces/bind", json={"path": str(missing)})
-
-    assert r.status_code == 400
-    body = r.json()
-    assert body["error"] == "workspace_not_found"
-
-
-def test_bind_a_file_returns_400_with_typed_code(
-    client: TestClient, fake_home: Path
-) -> None:
-    a_file = fake_home / "not-a-dir.txt"
-    a_file.write_text("hi", encoding="utf-8")
-
-    r = client.post("/api/workspaces/bind", json={"path": str(a_file)})
-
-    assert r.status_code == 400
-    assert r.json()["error"] == "workspace_not_a_directory"
-
-
-def test_bind_relative_path_returns_400(
-    client: TestClient, fake_home: Path
-) -> None:
-    r = client.post("/api/workspaces/bind", json={"path": "relative/path"})
-
-    assert r.status_code == 400
-    assert r.json()["error"] == "workspace_bind_failed"
-
-
-def test_bind_missing_body_returns_400(
-    client: TestClient, fake_home: Path
-) -> None:
-    r = client.post("/api/workspaces/bind", json={})
-
-    assert r.status_code == 400
-    assert r.json()["error"] == "workspace_bind_failed"
-
-
-def test_bind_existing_directory_returns_200(
-    client: TestClient, fake_home: Path
-) -> None:
+def test_bind_route_is_absent(client: TestClient, fake_home: Path) -> None:
     target = fake_home / "external"
     target.mkdir()
 
     r = client.post("/api/workspaces/bind", json={"path": str(target)})
 
-    assert r.status_code == 200
-    body = r.json()
-    assert body["path"] == str(target.resolve())
-    assert body["is_default"] is False
+    assert r.status_code == 404
+    # The old named-4xx contract must not survive under any answer.
+    assert r.json() != {"error": "workspace_not_found"}
 
 
-def test_bind_then_list_includes_the_new_root(
-    client: TestClient, fake_home: Path
-) -> None:
-    target = fake_home / "external"
-    target.mkdir()
-
-    bind = client.post("/api/workspaces/bind", json={"path": str(target)})
-    assert bind.status_code == 200
-
-    listed = client.get("/api/workspaces").json()
-    paths = {entry["path"] for entry in listed}
-    assert str(target.resolve()) in paths
-
-
-# ---------------------------------------------------------------------------
-# POST /api/workspaces/create — negative.
-# ---------------------------------------------------------------------------
-
-
-def test_create_empty_slug_returns_400_with_typed_code(
-    client: TestClient, fake_home: Path
-) -> None:
-    r = client.post("/api/workspaces/create", json={"slug": ""})
-
-    assert r.status_code == 400
-    assert r.json()["error"] == "workspace_slug_empty"
-
-
-def test_create_illegal_slug_returns_400(
-    client: TestClient, fake_home: Path
-) -> None:
-    r = client.post("/api/workspaces/create", json={"slug": "a/b"})
-
-    assert r.status_code == 400
-    assert r.json()["error"] == "workspace_slug_illegal"
-
-
-def test_create_traversal_slug_returns_400(
-    client: TestClient, fake_home: Path
-) -> None:
-    r = client.post("/api/workspaces/create", json={"slug": ".."})
-
-    assert r.status_code == 400
-    assert r.json()["error"] == "workspace_slug_illegal"
-
-
-def test_create_overflow_slug_returns_400(
-    client: TestClient, fake_home: Path
-) -> None:
-    r = client.post(
-        "/api/workspaces/create",
-        json={"slug": "x" * (MAX_SLUG_LENGTH + 1)},
-    )
-
-    assert r.status_code == 400
-    assert r.json()["error"] == "workspace_slug_overflow"
-
-
-def test_create_overflow_slug_does_not_create_partial_directory(
-    client: TestClient, fake_home: Path
-) -> None:
-    client.post(
-        "/api/workspaces/create",
-        json={"slug": "x" * (MAX_SLUG_LENGTH + 1)},
-    )
-
-    target = fake_home / ".fin" / "workspaces" / ("x" * MAX_SLUG_LENGTH)
-    assert not target.exists()
-
-
-def test_create_illegal_slug_does_not_create_directory(
-    client: TestClient, fake_home: Path
-) -> None:
-    client.post("/api/workspaces/create", json={"slug": "a/b"})
-
-    workspaces = fake_home / ".fin" / "workspaces"
-    if workspaces.exists():
-        assert list(workspaces.iterdir()) == []
-
-
-def test_create_missing_body_returns_400(
-    client: TestClient, fake_home: Path
-) -> None:
-    r = client.post("/api/workspaces/create", json={})
-
-    assert r.status_code == 400
-    assert r.json()["error"] == "workspace_slug_empty"
-
-
-def test_create_with_valid_slug_returns_200_and_creates_dir(
-    client: TestClient, fake_home: Path
-) -> None:
+def test_create_route_is_absent(client: TestClient, fake_home: Path) -> None:
     r = client.post("/api/workspaces/create", json={"slug": "team-b"})
 
-    assert r.status_code == 200
-    body = r.json()
-    assert body["path"] == str(fake_home / ".fin" / "workspaces" / "team-b")
-    assert body["slug"] == "team-b"
-    assert body["is_default"] is False
-
-    created = fake_home / ".fin" / "workspaces" / "team-b"
-    assert created.is_dir()
+    assert r.status_code == 404
+    assert r.json() != {"error": "workspace_slug_empty"}
 
 
-def test_create_does_not_create_a_second_corpus(
+def test_bind_with_traversal_slug_creates_nothing(
     client: TestClient, fake_home: Path
 ) -> None:
-    r = client.post("/api/workspaces/create", json={"slug": "no-catalog"})
-    assert r.status_code == 200
+    """No slug path may be created under ``$HOME/.fin/workspaces`` for
+    any request — including traversal attempts."""
+    r = client.post("/api/workspaces/bind", json={"path": "../escape"})
+    assert r.status_code == 404
 
-    target = fake_home / ".fin" / "workspaces" / "no-catalog"
-    children = sorted(p.name for p in target.iterdir())
-    assert children == []
+    assert not (fake_home / ".fin" / "workspaces").exists()
 
 
-def test_create_then_list_includes_the_new_root(
+def test_create_with_traversal_slug_creates_nothing(
     client: TestClient, fake_home: Path
 ) -> None:
-    create = client.post("/api/workspaces/create", json={"slug": "alpha"})
-    assert create.status_code == 200
+    r = client.post("/api/workspaces/create", json={"slug": "../escape"})
+    assert r.status_code == 404
 
-    listed = client.get("/api/workspaces").json()
-    slugs = {entry["slug"] for entry in listed}
-    assert "alpha" in slugs
-    assert DEFAULT_ROOT_NAME in slugs
+    assert not (fake_home / ".fin" / "workspaces").exists()
 
 
-# ---------------------------------------------------------------------------
-# Concurrent.
-# ---------------------------------------------------------------------------
-
-
-def test_two_creates_same_slug_leave_registry_valid(
+def test_create_with_valid_slug_creates_nothing(
     client: TestClient, fake_home: Path
 ) -> None:
-    first = client.post("/api/workspaces/create", json={"slug": "dup"})
-    assert first.status_code == 200
+    """Even a perfectly legal slug must not materialize a directory:
+    the route itself is gone, not merely restricted."""
+    r = client.post("/api/workspaces/create", json={"slug": "team-b"})
+    assert r.status_code == 404
 
-    second = client.post("/api/workspaces/create", json={"slug": "dup"})
-    # Idempotent OR typed 4xx — both acceptable per the ticket.
-    assert second.status_code in (200, 400)
-
-    # Registry stays valid JSON with one entry for the slug.
-    reg_path = _registry_path(fake_home)
-    payload = json.loads(reg_path.read_text(encoding="utf-8"))
-    slugs = [entry["slug"] for entry in payload["roots"]]
-    assert slugs.count("dup") == 1
-    assert DEFAULT_ROOT_NAME in slugs
+    assert not (fake_home / ".fin" / "workspaces").exists()
 
 
-# ---------------------------------------------------------------------------
-# Exception — corrupted registry.
-# ---------------------------------------------------------------------------
-
-
-def test_corrupt_registry_returns_typed_4xx_not_500(
+def test_no_registry_file_is_created_by_any_workspaces_request(
     client: TestClient, fake_home: Path
 ) -> None:
-    """A corrupted registry is a typed EXIT (4xx or 500 with a named
-    code). It must NEVER be a cwd fallback."""
-    # Materialize the registry, then corrupt it on disk.
+    """``known_roots.json`` is unshipped: no workspaces request may
+    create it."""
     client.get("/api/workspaces")
-    reg_path = _registry_path(fake_home)
-    reg_path.write_text("{not valid json", encoding="utf-8")
+    client.post("/api/workspaces/bind", json={"path": str(fake_home)})
+    client.post("/api/workspaces/create", json={"slug": "alpha"})
 
-    r = client.get("/api/workspaces")
+    assert not (fake_home / ".fin" / "known_roots.json").exists()
 
-    # Spec SC4: the route maps the typed ``WorkspaceRegistryError``
-    # to a named 4xx / 500 code — either answer is acceptable as long
-    # as the body is typed (no cwd fallback). The forbidden shape is
-    # a 200 listing cwd as a workspace root.
-    assert r.status_code in (400, 500)
-    body = r.json()
-    assert body["error"] in (
-        "workspace_registry_unreadable",
-        "workspace_registry_error",
+
+def test_no_slug_route_on_the_app(client: TestClient) -> None:
+    """No route accepts a slug path parameter (SC4: absent, not
+    restricted)."""
+    from fin.host.http import app
+
+    paths = [getattr(r, "path", "") for r in app.routes]
+    assert not any("slug" in p for p in paths), (
+        f"route with a slug parameter found: {[p for p in paths if 'slug' in p]}"
     )
 
 
-def test_corrupt_registry_does_not_list_cwd(
-    client: TestClient, fake_home: Path
-) -> None:
-    """The route must NEVER silently return cwd as a workspace root."""
-    client.get("/api/workspaces")
-    reg_path = _registry_path(fake_home)
-    reg_path.write_text("garbage", encoding="utf-8")
-
-    r = client.get("/api/workspaces")
-    body = r.json()
-
-    # Forbidden: a 200 with cwd as a workspace entry.
-    if r.status_code == 200:
-        for entry in body:
-            assert entry["slug"] != "cwd"
-
-
 # ---------------------------------------------------------------------------
-# Fresh home on first list creates the default directory.
+# Empty — the default 工作区 still resolves + mkdirs (kept helper).
 # ---------------------------------------------------------------------------
 
 
-def test_list_endpoint_uses_fake_home_not_real(
-    client: TestClient, fake_home: Path, tmp_path: Path
+def test_default_workspace_root_resolves_and_mkdirs(fake_home: Path) -> None:
+    target = fake_home / ".fin" / DEFAULT_ROOT_NAME
+    assert not target.exists()
+
+    root = default_workspace_root(fake_home)
+
+    assert root == target
+    assert target.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# Inject seam end-to-end (SC8) — one scripted send injects the
+# resolved default 工作区 from the process seam.
+# ---------------------------------------------------------------------------
+
+
+class _ConfigCapturingGraph:
+    def __init__(self) -> None:
+        self.configs: list[dict] = []
+
+    def invoke(self, input: dict, config: dict | None = None, **kwargs):
+        self.configs.append(config or {})
+        return {"status": "done", "answer": "", "citations": ()}
+
+    def stream(self, input, config: dict | None = None, **kwargs):
+        self.configs.append(config or {})
+        return iter(())
+
+
+def test_send_injects_default_workspace_root_from_process_home(
+    client: TestClient,
+    http_app: FastAPI,
+    fake_home: Path,
 ) -> None:
-    """A fresh fake home under tmp_path -> default dir under fake_home,
-    NEVER under the operator's real home (or cwd)."""
-    real_default = tmp_path.parent / ".fin" / DEFAULT_ROOT_NAME
-    fake_default = fake_home / ".fin" / DEFAULT_ROOT_NAME
+    """No dependency override for the root: the send route resolves
+    ``$HOME/.fin/default`` through the real process seam
+    (``default_workspace_root_for_process`` -> ``default_workspace_root``)
+    and stamps it into ``configurable.workspace_root``."""
+    from fin.host.http import get_graph, get_thread_store
+    from fin.host.thread_store import InMemoryThreadStore
 
-    r = client.get("/api/workspaces")
-    assert r.status_code == 200
+    g = _ConfigCapturingGraph()
+    http_app.dependency_overrides[get_graph] = lambda: g
+    store = InMemoryThreadStore()
+    http_app.dependency_overrides[get_thread_store] = lambda: store
 
-    assert fake_default.is_dir()
-    # The "real" home path used as a sentinel — we cannot know the
-    # actual real $HOME, so this just asserts the response is rooted
-    # under our injected home.
-    body = r.json()
-    assert body[0]["path"].startswith(str(fake_home))
-    assert body[0]["path"] != str(real_default)
+    record = store.create_thread(title="inject-default")
+    thread_id = record.id
 
+    with client.stream(
+        "POST",
+        f"/api/threads/{thread_id}/messages",
+        json={"question": "hello"},
+    ) as response:
+        for _ in response.iter_text():
+            pass
 
-def test_default_workspace_root_call_resolves_home_at_call_time(
-    client: TestClient, fake_home: Path
-) -> None:
-    """``default_workspace_root(home)`` reads home from its argument,
-    not from $HOME / Path.home() — the route uses the injected fake
-    home."""
-    r = client.get("/api/workspaces")
-    body = r.json()
+    assert g.configs, "graph must have been invoked at least once"
     expected = default_workspace_root(fake_home)
-    assert body[0]["path"] == str(expected)
+    for config in g.configs:
+        configurable = config.get("configurable") or {}
+        assert configurable.get("workspace_root") == str(expected)
