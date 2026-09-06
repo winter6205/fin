@@ -23,6 +23,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from fin.host.agent_instructions import (
+    AGENT_IDENTITY,
+    AGENT_SOUL,
     CLARIFY_SYSTEM_PROMPT,
     DIALOGUE_SYSTEM_PROMPT,
     HOST_SYSTEM_PROMPT,
@@ -133,11 +135,25 @@ def test_track_prompts_share_identity_soul_bytes() -> None:
     prompts were authored independently and share ~nothing, so the block
     is a couple of dozen characters; after the split it is the identity
     and soul paragraphs verbatim.
+
+    Length is the floor; the invariant is also pinned by content — the
+    shared block must contain the identity and soul paragraphs verbatim
+    so a length-only pass cannot ship a long incidental overlap that
+    missed the actual persona bytes.
     """
     shared = _longest_common_block(list(TRACK_PROMPTS.values()))
     assert len(shared) >= MIN_SHARED_IDENTITY_SOUL_CHARS, (
         f"longest block shared by all four tracks is {len(shared)} chars: "
         f"{shared!r}"
+    )
+    # Content check: the shared block must contain both the agent
+    # identity and the agent soul paragraphs (not just be long enough
+    # by accident).
+    assert AGENT_IDENTITY in shared, (
+        f"shared block does not contain AGENT_IDENTITY: {shared!r}"
+    )
+    assert AGENT_SOUL in shared, (
+        f"shared block does not contain AGENT_SOUL: {shared!r}"
     )
 
 

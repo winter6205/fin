@@ -234,26 +234,35 @@ def _stable_prefix(head_content: str) -> str:
     shape is ``<track prompt>\\n\\n<profile block>\\n\\n<pointer block>``;
     the profile block is bounded by :data:`USER_PROFILE_MARKER` and the
     start of the next block (``\\n\\n[FIN_``) or end of string.
+
+    The block boundary is the literal ``"\\n\\n["`` after the profile
+    marker (start of the next ``[FIN_...`` block) — not a hardcoded
+    marker constant — so a future block injected between profile and
+    pointer would still be sliced correctly: the search scans for the
+    next blank-line + open-bracket separator, regardless of which block
+    follows. If no such separator exists, the profile block runs to
+    end of string (profile-only call) and the stable prefix is the head
+    up to the profile marker.
     """
     marker_idx = head_content.index(USER_PROFILE_MARKER)
-    # Find the end of the profile block: the next "\n\n[FIN_" or EOS.
     after_marker = marker_idx + len(USER_PROFILE_MARKER)
     tail = head_content[after_marker:]
-    # Drop the header line + the verbatim profile text. The block ends
-    # at the next blank-line-separated ``[FIN_`` marker, or end of
-    # string. Since the only other block we inject is the memory
-    # pointer (``[FIN_MEMORY_POINTER]``), look for it specifically.
-    block_end_in_tail = tail.find(MEMORY_POINTER_MARKER)
-    if block_end_in_tail == -1:
-        # Profile-only call (memory_on=False): profile block runs to
-        # end of string. Stable prefix = everything before
-        # USER_PROFILE_MARKER, including any leading "\n\n" that
-        # separates the profile block from the track prompt.
+    # Block boundary: the literal ``"\n\n["`` separator that opens the
+    # next ``[FIN_...`` block. Block-agnostic end of the profile block,
+    # matching the docstring contract. We slice past the separator and
+    # keep the leading ``[`` of the next block so the joined output
+    # preserves the exact bytes that follow the profile block (same as
+    # the previous marker-specific search).
+    sep_idx = tail.find("\n\n[")
+    if sep_idx == -1:
+        # Profile-only call (memory_on=False) or any shape where the
+        # profile block runs to end of string: stable prefix = head up
+        # to USER_PROFILE_MARKER.
         return head_content[:marker_idx]
-    # Stable prefix = head up to and including the pointer block. The
-    # profile block lives between marker_idx and the pointer, so we
-    # keep both ends.
-    return head_content[:marker_idx] + tail[block_end_in_tail:]
+    # Skip the "\n\n" separator bytes; keep the "[" so the joined
+    # output is byte-identical to the prior marker-specific search.
+    next_block_start = sep_idx + 2  # len("\n\n")
+    return head_content[:marker_idx] + tail[next_block_start:]
 
 
 def test_profile_path_two_calls_same_profile_keep_identical_head() -> None:
