@@ -20,6 +20,24 @@ DIALOGUE_INSTRUCTIONS_MARKER: str = "[FIN_DIALOGUE_INSTRUCTIONS]"
 OFF_TOPIC_INSTRUCTIONS_MARKER: str = "[FIN_OFF_TOPIC_INSTRUCTIONS]"
 CLARIFY_INSTRUCTIONS_MARKER: str = "[FIN_CLARIFY_INSTRUCTIONS]"
 
+# ----- user profile (spec SC13, cross-session-operator-memory) -----
+# The user profile is operator-profile machinery, NOT memory-fact
+# machinery (operator decision on PR #240): its READ path (merged
+# profile text into the system prefix) must work regardless of
+# ``FIN_MEMORY_ENABLED``. The block sits BETWEEN the track prompt
+# (identity / persona) and the memory existence pointer when both
+# are present, so the order is identity → who the operator is →
+# advisory memory note. The block is advisory framing only — never a
+# command to recall / save / cite. The header names the operator and
+# the workspace-overlay semantics so the model knows the workspace
+# layer overrides the global.
+USER_PROFILE_MARKER: str = "[FIN_USER_PROFILE]"
+USER_PROFILE_HEADER: str = (
+    "Operator preferences (user profile, workspace layer overrides "
+    "global):"
+)
+
+
 # ----- memory existence pointer (spec SC10 / SC11 / ADR 0048) -----
 # The only auto-memory sentence in the system prompt: a note store
 # exists for this workspace; injected note reminders are advisory
@@ -205,6 +223,7 @@ def messages_for_model(
     *,
     missing_slots: Sequence[str] | None = None,
     memory_on: bool | None = False,
+    user_profile: str | None = None,
 ) -> list[BaseMessage]:
     """Return the model-facing list with the track prompt first.
 
@@ -230,6 +249,20 @@ def messages_for_model(
     stay green). The pointer is independent of any per-turn
     prefetch payload: prefetch rows live on the USER side via
     :func:`memory_prefetch_message`, never in the system prefix.
+
+    ``user_profile`` (spec SC13, PR #240 operator decision): the
+    raw merged text from :meth:`UserProfileStore.read_merged`. The
+    user profile is operator-profile machinery, NOT memory-fact
+    machinery — its READ path is INDEPENDENT of ``memory_on`` and
+    surfaces into the system prefix regardless of whether memory
+    is enabled. The block sits between the track prompt and the
+    memory existence pointer when both are present (ordering:
+    identity → who the operator is → advisory memory note). The
+    block is advisory framing only — never a command. ``None``,
+    empty, or whitespace-only text yields no profile block; the
+    SystemMessage bytes are then byte-identical to the no-profile
+    call so callers that have no profile files on disk keep their
+    prefix stable.
     """
     marker, prompt = _TRACK_PROMPTS.get(
         track, (DIALOGUE_INSTRUCTIONS_MARKER, DIALOGUE_SYSTEM_PROMPT)
@@ -244,6 +277,14 @@ def messages_for_model(
         existing = list(messages)
     else:
         existing = [SystemMessage(content=prompt), *messages]
+
+    # Profile block: independent of memory_on. Inserted BETWEEN the
+    # track prompt and the memory existence pointer when both are
+    # present. ``None`` / empty / whitespace-only → no block
+    # (byte-identical output for callers with no profile files).
+    profile_text = user_profile.strip() if isinstance(user_profile, str) else ""
+    if profile_text:
+        existing = _inject_profile_block(existing, profile_text)
 
     if not memory_on:
         # OFF path: byte-identical to today's output for callers that
@@ -271,6 +312,55 @@ def messages_for_model(
     rebuilt = list(existing)
     rebuilt[0] = SystemMessage(content=new_content)
     return rebuilt
+
+
+def _inject_profile_block(
+    messages: list[BaseMessage], profile_text: str
+) -> list[BaseMessage]:
+    """Insert the user-profile block into the head SystemMessage.
+
+    Idempotent: if the head already carries the profile marker
+    (re-entrant call, caller pre-injected), the block is left
+    untouched. The block is built fresh from ``profile_text`` so a
+    file edit between calls is visible on the next ``messages_for_model``
+    call (no caching at this seam). Whitespace-only input is the
+    caller's responsibility — this helper assumes a non-empty
+    ``profile_text`` because the caller filters ``None`` / ``""`` /
+    whitespace-only strings before invoking.
+    """
+    if not messages:
+        return [SystemMessage(content=_build_profile_block(profile_text))]
+    head = messages[0]
+    if not isinstance(head, SystemMessage):
+        # Defensive: non-SystemMessage head (unexpected shape). Drop
+        # a fresh SystemMessage in front so the model still sees the
+        # block; never crash a model call over an advisory block.
+        return [
+            SystemMessage(content=_build_profile_block(profile_text)),
+            *messages,
+        ]
+    head_content = str(head.content)
+    if USER_PROFILE_MARKER in head_content:
+        # Block already present (re-entry): leave the message unchanged
+        # so a second call with the same text doesn't shift bytes.
+        return messages
+    new_content = (
+        f"{head_content}\n\n{_build_profile_block(profile_text)}"
+    )
+    rebuilt = list(messages)
+    rebuilt[0] = SystemMessage(content=new_content)
+    return rebuilt
+
+
+def _build_profile_block(profile_text: str) -> str:
+    """Render the profile block as a marker-prefixed string.
+
+    One advisory header line naming the workspace-overlay semantics,
+    then the verbatim file content. Header wording follows
+    ``docs/guides/prompt-development.md``: framing only, never a
+    command to the model.
+    """
+    return f"{USER_PROFILE_MARKER}\n{USER_PROFILE_HEADER}\n{profile_text}"
 
 
 def memory_prefetch_message(
@@ -357,6 +447,8 @@ __all__ = [
     "OFF_TOPIC_INSTRUCTIONS_MARKER",
     "OFF_TOPIC_SYSTEM_PROMPT",
     "THREAD_ATTACHMENTS_MARKER",
+    "USER_PROFILE_HEADER",
+    "USER_PROFILE_MARKER",
     "attachment_context_message",
     "clarify_prompt",
     "memory_prefetch_message",
