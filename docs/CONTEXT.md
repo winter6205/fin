@@ -70,8 +70,8 @@ Tool-choice and citation _behavior_ per **track** in the system prefix. Not tool
 _Avoid_: restating page_limit or 32-character rules, dumping the catalog into usage
 
 **user profile**:
-Operator or tool-writable preferences (who they are, how they like to work): `$HOME/.fin/user.md` globally and `<工作区>/.fin/user.md` as overlay. Dream does not rewrite these files; stable likes go here, not into **memory facts**.
-_Avoid_: treating the user profile as the episodic store, auto-extract into identity, one shared file for every 工作区, using the **工作台** UI as the overlay path
+Operator or tool-writable preferences (who they are, how they like to work): `$HOME/.fin/user.md`. Dream does not rewrite this file; stable likes go here, not into **memory facts**.
+_Avoid_: treating the user profile as the episodic store, auto-extract into identity, per-工作区 overlay files, using the **工作台** UI as the overlay path
 
 **dream** (fin):
 A dual-gated LLM merge over **memory facts** only: 24h cooldown after last success or skip, then a store/session/turn threshold. It is not company-corpus ingest (ADR 0045), not a memory-MCP upload, and not a graph tool (ADR 0048).
@@ -174,7 +174,7 @@ LangGraph compiled around the agent loop plus code gates (verifier, caps, interr
 _Avoid_: retrieval graph
 
 **session compaction**:
-A host gate on the **research thread**: occupancy is estimated tokens of the model-facing payload (track prompt, messages, research tool schemas, and when memory is ON any **memory prefetch** or **recall injection**) against a 256_000 session budget; at ≥90% occupancy, or when the operator sends `/compact`, old checkpoint messages are summarized and removed, aiming at ~40% occupancy. The summarizer is injectable (v1 the **v1 model**); occupancy may render on the thread, not on `GET /api/status`.
+A host gate on the **research thread**: occupancy is estimated tokens of the model-facing payload (track prompt, messages, research tool schemas, and when memory is ON any **memory prefetch** or **recall injection**) against a 256_000 session budget; at ≥90% occupancy, or when the operator sends `/compact`, old checkpoint `messages` are summarized and removed, aiming at ~40% occupancy. The summarizer is injectable (v1 the **v1 model**); occupancy may render on the thread, not on `GET /api/status`.
 _Avoid_: message-count windows, treating `/compact` as a research tool, putting occupancy on the boot status strip, using the vendor 1M window as the compact threshold, treating a memory row-count cap as the occupancy gate
 
 **recall injection**:
@@ -202,11 +202,11 @@ The local web UI: create, list, open, resume, and delete a **research thread**; 
 _Avoid_: 知识库, 工作区 directory, CLI REPL as the product, hosted accounts this increment, POST /ask as the conversation surface
 
 **工作区**:
-A filesystem directory the operator binds **research thread**s to; default `$HOME/.fin/default`. Overlay **user profile** is `<dir>/.fin/user.md`.
-_Avoid_: Path.cwd() as implicit 工作区, a second 知识库, calling the **工作台** a 工作区
+The one global default operator directory `$HOME/.fin/default` (created if missing). Every **research thread**, profile read, and **memory fact** workspace key uses this path.
+_Avoid_: Path.cwd() as implicit 工作区, `$HOME/.fin/workspaces/<slug>`, left-rail 指定/新建, a second 知识库, calling the **工作台** a 工作区
 
 **知识库**:
-The one process-wide corpus (catalog, ingest tree, **retrieve port**) shared by every **research thread** regardless of 工作区.
+The one process-wide corpus (catalog, ingest tree, **retrieve port**) shared by every **research thread**.
 _Avoid_: sidebar "new knowledge base", per-工作区 retrieve index, identity text listing filings
 
 **workspace**:
