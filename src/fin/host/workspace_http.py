@@ -143,11 +143,13 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import re
 import threading
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Final, Iterator, Literal
 
 from fastapi import (
@@ -242,12 +244,64 @@ from fin.host.watchlist import (
     default_watchlist_store,
     refresh_notices,
 )
+from fin.host.workspace_registry import (
+    WorkspaceBindError,
+    WorkspaceNotADirectoryError,
+    WorkspaceNotFoundError,
+    WorkspaceRegistry,
+    WorkspaceRegistryError,
+    WorkspaceRegistryUnreadableError,
+    WorkspaceRoot,
+    WorkspaceSlugEmptyError,
+    WorkspaceSlugError,
+    WorkspaceSlugIllegalError,
+    WorkspaceSlugOverflowError,
+    default_workspace_root,
+)
 from fin.retrieve.fake_push_port import FakePushPort
 from fin.retrieve.invalidation_port.errors import InvalidationError
 from fin.retrieve.push_port import PushError
 
 
 logger = logging.getLogger(__name__)
+
+
+# ----- default 工作区 registry dependency (Focus 2 / SC4) -----
+
+
+# The registry is a process-level singleton too: it owns the on-disk
+# JSON file under ``$HOME/.fin/known_roots.json`` and writes to it
+# on bind / create. Lock-guarded construction mirrors the other
+# singletons in this module.
+_workspace_registry_singleton: WorkspaceRegistry | None = None
+_workspace_registry_lock = threading.Lock()
+
+
+def default_workspace_registry() -> WorkspaceRegistry:
+    """Build / return the process-default ``WorkspaceRegistry``.
+
+    Reads ``$HOME`` at call time (NEVER ``Path.cwd()`` — spec Focus 2
+    + SC3) so tests that monkeypatch ``HOME`` get a hermetic
+    registry; production boots see the operator's real home.
+    """
+    global _workspace_registry_singleton
+    with _workspace_registry_lock:
+        if _workspace_registry_singleton is None:
+            home = os.environ.get("HOME") or str(Path.home())
+            _workspace_registry_singleton = WorkspaceRegistry(home=home)
+        return _workspace_registry_singleton
+
+
+def get_workspace_registry() -> WorkspaceRegistry:
+    """FastAPI dependency returning the workspace registry.
+
+    Tests override this via
+    ``app.dependency_overrides[get_workspace_registry]`` to inject a
+    registry built against ``tmp_path`` — production wires
+    :func:`default_workspace_registry` (one process singleton, same
+    pattern as ``get_thread_store``).
+    """
+    return default_workspace_registry()
 
 
 # ----- mid-flight stream exception classification + sanitization -----
@@ -771,6 +825,60 @@ class ThreadDetailResponse(BaseModel):
     turns: list[TurnRow]
 
 
+class BindWorkspaceRequest(BaseModel):
+    """Body for ``POST /api/workspaces/bind``.
+
+    ``path`` is the absolute path to an existing directory the
+    operator wants to add to the registry. Relative paths and
+    non-existent paths are typed 4xx (the route never calls
+    ``Path.cwd()``).
+
+    Defaults to ``""`` rather than required so a missing body yields
+    the SAME typed 4xx the SPA renders for an empty / relative path
+    (FastAPI's default 422 Pydantic envelope is the generic
+    ``ValidationError`` shape — not the named ``workspace_bind_failed``
+    code the SPA's error path expects).
+    """
+
+    path: str = ""
+
+
+class CreateWorkspaceRequest(BaseModel):
+    """Body for ``POST /api/workspaces/create``.
+
+    ``slug`` is sanitized by the registry: empty / separators /
+    traversal / over-cap all surface as typed 4xx with a stable
+    ``error`` code.
+
+    Defaults to ``""`` rather than required so a missing body yields
+    the SAME typed 4xx the SPA renders for an empty slug.
+    """
+
+    slug: str = ""
+
+
+# ----- 工作区 list / bind / create (Focus 2 / SC4) -----
+#
+# Three endpoints answer the left rail's "select / bind / create"
+# affordances. Each typed failure maps to a stable ``error`` code so
+# the SPA can render actionable copy without parsing free text:
+#
+# * ``workspace_not_found`` (400) — bind target missing on disk.
+# * ``workspace_not_a_directory`` (400) — bind target is a file.
+# * ``workspace_bind_failed`` (400) — bind input invalid (relative,
+#   missing body).
+# * ``workspace_slug_empty`` (400) — create slug is empty / whitespace.
+# * ``workspace_slug_illegal`` (400) — create slug has separators,
+#   ``..``, or characters outside ``[A-Za-z0-9._-]``.
+# * ``workspace_slug_overflow`` (400) — create slug > MAX_SLUG_LENGTH.
+# * ``workspace_registry_unreadable`` (500) — registry file is
+#   corrupt / not readable (SC4: typed EXIT, never cwd fallback).
+#
+# All three routes mkdir the default ``$HOME/.fin/default`` on list
+# (spec Focus 2: "Default ``$HOME/.fin/default`` is created/used when
+# listing 工作区 or creating a thread with omit-root").
+
+
 # ----- helpers -----
 
 
@@ -857,6 +965,22 @@ def _serialize_watch(entry: WatchEntry) -> dict[str, Any]:
         "issuer": entry.issuer,
         "forms": list(entry.forms),
         "created_at": entry.created_at.isoformat(),
+    }
+
+
+def _serialize_workspace(root: WorkspaceRoot) -> dict[str, Any]:
+    """Translate a :class:`WorkspaceRoot` into the list-row shape.
+
+    The ``path`` is always the resolved absolute string; ``slug`` is
+    informational; ``is_default`` is the discriminator the SPA keys
+    off to render the default entry differently. Wire keys match the
+    existing route shape (``POST /api/workspaces/bind`` returns the
+    same dict so the SPA can update its list state from one row).
+    """
+    return {
+        "path": str(root.path),
+        "slug": root.slug,
+        "is_default": root.is_default,
     }
 
 
@@ -1824,6 +1948,7 @@ def build_router(
     get_filing_monitor=None,
     get_feedback_store=None,
     get_observability_collector=None,
+    get_workspace_registry=None,
 ) -> APIRouter:
     """Build the workspace APIRouter.
 
@@ -1867,6 +1992,8 @@ def build_router(
     if get_observability_collector is None:
         router_collector = ObservabilityCollector()
         get_observability_collector = lambda: router_collector  # noqa: E731
+    if get_workspace_registry is None:
+        get_workspace_registry = default_workspace_registry
 
     @router.get("/threads")
     def list_threads(store: ThreadStore = Depends(get_thread_store)) -> list[dict]:
@@ -3081,6 +3208,119 @@ def build_router(
         payload["rewrite_retry"] = collector.retry_snapshot()
         return payload
 
+    # ----- 工作区 list / bind / create (Focus 2 / SC4) -----
+
+    @router.get("/workspaces")
+    def list_workspaces(
+        registry: WorkspaceRegistry = Depends(get_workspace_registry),
+    ) -> Response:
+        """List every bound 工作区 (default entry is always present).
+
+        Side-effect: ``list_roots`` mkdirs ``$HOME/.fin/default`` on a
+        fresh home, so a brand-new boot answers 200 with one entry
+        AND a real on-disk default directory the operator can use
+        (spec Focus 2: "Default ``$HOME/.fin/default`` is created /
+        used when listing 工作区 or creating a thread with omit-root").
+        """
+        try:
+            roots = registry.list_roots()
+        except WorkspaceRegistryUnreadableError:
+            logger.exception(
+                "list_workspaces: registry unreadable; refusing cwd fallback"
+            )
+            return JSONResponse(
+                status_code=500,
+                content={"error": "workspace_registry_unreadable"},
+            )
+        return JSONResponse(content=[_serialize_workspace(r) for r in roots])
+
+    @router.post("/workspaces/bind")
+    def bind_workspace(
+        body: BindWorkspaceRequest,
+        registry: WorkspaceRegistry = Depends(get_workspace_registry),
+    ) -> Response:
+        """Bind an existing absolute directory as a 工作区.
+
+        400 typed variants: missing path (``workspace_not_found``),
+        file-not-dir (``workspace_not_a_directory``), relative path
+        (``workspace_bind_failed``). The route does NOT create the
+        directory — bind is a "register what already exists" surface.
+        """
+        try:
+            bound = registry.bind_root(body.path)
+        except WorkspaceNotFoundError:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "workspace_not_found"},
+            )
+        except WorkspaceNotADirectoryError:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "workspace_not_a_directory"},
+            )
+        except WorkspaceBindError:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "workspace_bind_failed"},
+            )
+        return JSONResponse(
+            status_code=200,
+            content=_serialize_workspace(
+                WorkspaceRoot(
+                    path=bound,
+                    slug=bound.name,
+                    is_default=False,
+                )
+            ),
+        )
+
+    @router.post("/workspaces/create")
+    def create_workspace(
+        body: CreateWorkspaceRequest,
+        registry: WorkspaceRegistry = Depends(get_workspace_registry),
+    ) -> Response:
+        """Create ``$HOME/.fin/workspaces/<slug>`` and register it.
+
+        400 typed variants: empty / whitespace slug
+        (``workspace_slug_empty``), separator / traversal / illegal
+        characters (``workspace_slug_illegal``), over-cap
+        (``workspace_slug_overflow``). Create does NOT add a catalog
+        file under the new directory — spec Focus 2 forbids splitting
+        the 知识库.
+        """
+        try:
+            created = registry.create_root(body.slug)
+        except WorkspaceSlugEmptyError:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "workspace_slug_empty"},
+            )
+        except WorkspaceSlugIllegalError:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "workspace_slug_illegal"},
+            )
+        except WorkspaceSlugOverflowError:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "workspace_slug_overflow"},
+            )
+        except WorkspaceSlugError:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "workspace_slug_error"},
+            )
+        return JSONResponse(
+            status_code=200,
+            content=_serialize_workspace(
+                WorkspaceRoot(
+                    path=created,
+                    slug=created.name,
+                    is_default=False,
+                )
+            ),
+        )
+
     return router
 
 
@@ -3097,6 +3337,7 @@ def mount(
     get_filing_monitor=None,
     get_feedback_store=None,
     get_observability_collector=None,
+    get_workspace_registry=None,
 ) -> None:
     """Mount the workspace routes onto an existing FastAPI app."""
     app.include_router(
@@ -3108,12 +3349,15 @@ def mount(
             get_filing_monitor=get_filing_monitor,
             get_feedback_store=get_feedback_store,
             get_observability_collector=get_observability_collector,
+            get_workspace_registry=get_workspace_registry,
         )
     )
 
 
 __all__ = [
     "build_router",
+    "default_workspace_registry",
     "get_ingest_service",
+    "get_workspace_registry",
     "mount",
 ]

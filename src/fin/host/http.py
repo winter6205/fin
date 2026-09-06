@@ -273,6 +273,21 @@ def get_observability_collector() -> ObservabilityCollector:
     return default_collector()
 
 
+def get_workspace_registry() -> Any:
+    """FastAPI dependency that returns the workspace registry.
+
+    Backed by the process singleton built once per process by
+    ``fin.host.workspace_http.default_workspace_registry``. Tests
+    override this via
+    ``app.dependency_overrides[get_workspace_registry]`` to inject a
+    registry rooted at ``tmp_path`` so the suite never touches the
+    real ``$HOME``.
+    """
+    from fin.host.workspace_http import default_workspace_registry
+
+    return default_workspace_registry()
+
+
 # Mount the workspace routes (T1, #28) on the same FastAPI app.
 # Done at module load so ``uvicorn fin.host.http:app`` exposes the
 # workspace surface out of the box (spec / ADR 0013 / ADR 0024).
@@ -287,6 +302,7 @@ _mount_workspace_routes(
     get_filing_monitor=get_filing_monitor,
     get_feedback_store=get_feedback_store,
     get_observability_collector=get_observability_collector,
+    get_workspace_registry=get_workspace_registry,
 )
 
 # ``GET /health`` (#135, SC9): checkpoint reachability, separate from
