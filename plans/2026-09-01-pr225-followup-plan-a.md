@@ -1,6 +1,6 @@
 # Plan: PR #225 follow-up — Plan A（fin 侧可独立推进项收口，2026-09-01）
 
-**Status（2026-09-04）：** 文中「跨仓缺口 1–6 / 对侧无基线」已过期（见 `docs/handoff/2026-09-04-cross-repo-status.md`）。本文件只还覆盖 **retrieve 内部 maintainability**（ledger 抽取等），不是跨仓主线。跨仓提案 stub：`docs/cross-repo/alignment-proposal.md`。
+**Status（2026-09-04）：** 文中「跨仓缺口 1–6 / 对侧无基线」已过期（见 `docs/handoff/2026-09-05-status.md`）。本文件只还覆盖 **retrieve 内部 maintainability**（ledger 抽取等），不是跨仓主线。跨仓提案 stub：`docs/cross-repo/alignment-proposal.md`。
 
 **Goal:** 把 PR #225 合 main 之后 fin 侧**不依赖跨仓 wire** 即可推进的事项收口为单一 plan，避免继续追加到 `plans/retrieve-maintainability-followup.md` 造成单点膨胀。本 plan 是「fin 侧 follow-up」轮次的第一刀。
 

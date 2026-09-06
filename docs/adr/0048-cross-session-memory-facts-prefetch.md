@@ -1,0 +1,10 @@
+# 0048. Cross-session memory is fact+hook prefetch; not catalog, promote, or MCP upload
+
+Date: 2026-09-05
+Status: accepted
+
+Company knowledge stays on the **retrieve port** (ADR 0045). Cross-session private memory is a store of atomic **memory facts** (one extract = one fact). When auto-extract is on, the system prompt gets only a **memory existence pointer**; each turn may **memory prefetch** at most three lexical hits as **memory hooks** on the user side; zero hits inject nothing. Dream merges facts only, on a dual time∧session gate, and never edits identity, soul, or the user profile. Short-term thread state and the local fact store are not a license to write a memory MCP. Frequently recalled facts do not enter the system prompt (no promote-as-reward).
+
+Amended 2026-09-06: code boot default is **OFF** (`FIN_MEMORY_ENABLED` unset). This checkout’s project env turns it **ON** so local evals see auto-extract and prefetch. Default pytest / citation contract eval stays **OFF** even if that env is set (ADR 0035). The over-attention golden set is the acceptance bar, not an enable-gate. The existing port stays; the working buffer becomes the fact table; graph tools are explicit save / recall / edit **user profile**; prefetch is host assembly, not a model tool; there is no dream tool; unconditional post-SSE dream and memory-MCP writes are removed.
+
+Considered Options: whole-store title catalog in system (rejected — the model treats it as a todo); promote-on-recall-count into system (rejected — today's task is not durable importance); tool-recall-only with no prefetch (rejected — the model often will not look, so cross-session memory fails); dream upload to memory MCP because a buffer exists (rejected — only explicit operator upload may leave the box); vector search on the fact store as v1 (rejected — lexical hit on a small store is enough until miss evidence); product boot always ON with no env switch (rejected — default stays OFF; this checkout opts in); always-on memory inside default pytest (rejected — citation fixtures must stay retrieve-only).

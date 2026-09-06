@@ -139,6 +139,8 @@ class MemoryBuffer:
         text: str,
         *,
         metadata: Mapping[str, object] | None = None,
+        title: str = "",
+        workspace: str = "",
     ) -> dict[str, object]:
         """Store one non-empty dialogue memory as advisory context."""
         if not isinstance(text, str):
@@ -148,6 +150,10 @@ class MemoryBuffer:
             return {"status": "empty", "memories": []}
         if metadata is not None and not isinstance(metadata, Mapping):
             raise MemoryBufferInputError("metadata must be a mapping")
+        if not isinstance(title, str):
+            raise MemoryBufferInputError("title must be a string")
+        if not isinstance(workspace, str):
+            raise MemoryBufferInputError("workspace must be a string")
 
         copied_metadata = copy.deepcopy(dict(metadata or {}))
         expires_at = self._expiry_from_metadata(copied_metadata)
@@ -163,6 +169,9 @@ class MemoryBuffer:
             metadata=_json_safe_metadata(copied_metadata),
             created_at=_utc_now(),
             expires_at=expires_at,
+            title=title,
+            body=cleaned,
+            workspace=workspace,
         )
         self._store.add(row)
         return {"status": "ok", "memories": [self._as_memory(row)]}
@@ -172,6 +181,7 @@ class MemoryBuffer:
         query: str,
         *,
         limit: int = DEFAULT_MEMORY_LIMIT,
+        workspace: str = "",
     ) -> dict[str, object]:
         """Return active memories ranked by lexical token overlap.
 
@@ -179,15 +189,21 @@ class MemoryBuffer:
         intentionally cannot be passed to the citation gate as filing
         locators. Every returned row records one hit, which is the
         recurrence signal the dream score reads (SC7).
+
+        ``workspace`` scopes the read to one workspace (spec SC6). The
+        default empty string keeps legacy callers working; production
+        callers pass the operator's workspace.
         """
         if not isinstance(query, str):
             raise MemoryBufferInputError("query must be a string")
+        if not isinstance(workspace, str):
+            raise MemoryBufferInputError("workspace must be a string")
         resolved_limit = _resolve_limit(limit)
         query_tokens = _tokens(query.strip())
         if not query_tokens:
             return {"status": "empty", "memories": []}
 
-        rows = self._store.rows(include_disabled=False)
+        rows = self._store.rows(include_disabled=False, workspace=workspace)
         ranked = [
             (len(query_tokens & _tokens(row.text)), row)
             for row in rows
@@ -257,11 +273,24 @@ class MemoryBuffer:
         )
         return {"status": "ok", "removed": removed}
 
-    def entries(self, *, include_disabled: bool = True) -> list[dict[str, object]]:
-        """Return copies of authority rows for inspection and persistence."""
+    def entries(
+        self,
+        *,
+        include_disabled: bool = True,
+        workspace: str = "",
+    ) -> list[dict[str, object]]:
+        """Return copies of authority rows for inspection and persistence.
+
+        ``workspace`` scopes the read to one workspace (spec SC6).
+        """
+        if not isinstance(workspace, str):
+            raise MemoryBufferInputError("workspace must be a string")
         return [
             self._as_memory(row)
-            for row in self._store.rows(include_disabled=include_disabled)
+            for row in self._store.rows(
+                include_disabled=include_disabled,
+                workspace=workspace,
+            )
         ]
 
     def dream(self, *, limit: int = DEFAULT_MEMORY_LIMIT) -> dict[str, object]:
@@ -304,6 +333,10 @@ class MemoryBuffer:
         result: dict[str, object] = {
             "id": row.id,
             "text": row.text,
+            "title": row.title,
+            "body": row.body,
+            "workspace": row.workspace,
+            "hook": row.hook,
             "metadata": copy.deepcopy(row.metadata),
             "created_at": row.created_at.isoformat(),
             "expires_at": (
