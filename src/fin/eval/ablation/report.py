@@ -25,13 +25,43 @@ The report is built to be merged with the retrieval side's report
 to overwrite a metric either side already produced — fin never
 recomputes the retrieval side's dimensions, and 长文档召回 /
 跨文档多跳召回 are not fin's to compute at all (SC38).
+
+Citation-gate finite discipline (T4 / SC5)
+-----------------------------------------
+
+The citation-gate pass rate (``citation_gate_pass_rate``) is fin's
+own production (ADR 0042 / 0046). On the merged live report it must
+be a **finite** number — a ``NaN`` or ``inf`` would read like a
+measured zero and silently corrupt the §B1 pass-rate column.
+:func:`validate_report` enforces finiteness on every metric in
+:data:`METRIC_FIELDS`; :func:`merge_with_retrieval_report` extends
+the same discipline to values the retrieval side hands in, refusing
+to copy through a non-finite ``citation_gate_pass_rate`` (or any
+other fin-owned metric) under the typed code
+``ablation_merge_citation_gate_non_finite``.
+
+Atomic write (T3 / ADR 0042)
+----------------------------
+
+The baseline ``report.json`` is the canonical §B1 artifact, so a half-
+written document on a crash — or two simultaneous ``run`` invocations
+tearing each other's writes — would silently lower the numbers the
+operator reads. :func:`write_report_atomically` serializes through a
+sibling lock file (``fcntl.flock``) and then writes to a temp file
+before renaming onto the target, so the document on disk is always a
+whole one or the previous whole one.
 """
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
-from typing import Any, Mapping, Sequence
+import math
+import os
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
 
 from fin.eval.ablation.matrix import (
     B1_CONFIGURATION_TOTAL,
@@ -66,6 +96,13 @@ DIMENSIONS_NOT_COMPUTED_BY_FIN: tuple[str, ...] = (
     "跨文档多跳召回",
 )
 
+#: Metric names fin owns end to end. The merge refuses to accept any of
+#: them on the retrieval-side report (SC38, mirrored for the inverse
+#: direction): the citation-gate pass rate is fin's gate over the run's
+#: own retrieved chunks, not a number the retrieval service hands in
+#: (T4 / SC5).
+MERGE_FIN_OWNED_METRICS: tuple[str, ...] = FIN_OWNED_METRICS
+
 PERCENT_COMPUTED = "computed"
 PERCENT_UNDEFINED_ZERO_BASELINE = "undefined_zero_baseline"
 
@@ -86,6 +123,16 @@ class AblationMergeMetricConflictError(AblationReportError):
     """The other side recomputed a metric this side already produced."""
 
     code = "ablation_merge_metric_conflict"
+
+
+class AblationMergeCitationGateNonFiniteError(AblationReportError):
+    """A retrieval-side value the merge would have copied through is
+    not a finite number (NaN / inf). The merge refuses so a silent
+    false zero cannot land on the merged report's citation-gate column
+    (T4 / SC5).
+    """
+
+    code = "ablation_merge_citation_gate_non_finite"
 
 
 def query_subset_hash(query_ids: Sequence[str]) -> str:
@@ -323,8 +370,15 @@ def validate_report(report: Mapping[str, Any]) -> list[str]:
                     f"{cid}: metric {metric} has {len(raw) if isinstance(raw, list) else 0} "
                     f"raw values, §B1 requires >= {B1_MIN_REPEATS}"
                 )
-            if not isinstance(series.get("median"), (int, float)):
-                problems.append(f"{cid}: metric {metric} has no median")
+            elif not all(_is_finite_number(v) for v in raw):
+                problems.append(
+                    f"{cid}: metric {metric} raw list contains a non-finite value"
+                )
+            median = series.get("median")
+            if not _is_finite_number(median):
+                problems.append(
+                    f"{cid}: metric {metric} median is not a finite number"
+                )
 
     claims = report.get("improvement_claims")
     if not isinstance(claims, list) or not claims:
@@ -371,6 +425,19 @@ def validate_report(report: Mapping[str, Any]) -> list[str]:
     return problems
 
 
+def _is_finite_number(value: Any) -> bool:
+    """A scalar is "finite" when it is a real ``int`` / ``float`` that
+    is not ``NaN`` and not ``+inf`` / ``-inf``.
+
+    Booleans, ``None``, strings, and non-numeric types all return
+    ``False``; the caller is expected to translate that into a typed
+    rejection with a stable ``code``.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(float(value))
+
+
 def merge_with_retrieval_report(
     fin_report: Mapping[str, Any],
     retrieval_report: Mapping[str, Any],
@@ -380,6 +447,14 @@ def merge_with_retrieval_report(
     Neither side's metrics are recomputed: a metric present on both
     sides is a named conflict, because two numbers for one 口径 is
     exactly the ambiguity the merge is supposed to prevent.
+
+    The retrieval side is also forbidden from carrying any of the
+    fin-owned metrics (currently ``citation_gate_pass_rate``) and
+    forbidden from handing in a non-finite value for any metric it
+    contributes. The cite-gate pass rate is fin's gate over the run's
+    own retrieved chunks (ADR 0042 / 0046); a non-finite value would
+    read as a measured zero and silently corrupt the §B1 pass-rate
+    column on the merged report (T4 / SC5).
     """
     fin_merge = fin_report.get("merge", {})
     for key in ("dataset_id", "query_subset_hash"):
@@ -407,6 +482,19 @@ def merge_with_retrieval_report(
                     f"{configuration_id}: retrieval side recomputed {metric!r}, "
                     "which fin already produced on this run"
                 )
+            if metric in MERGE_FIN_OWNED_METRICS:
+                raise AblationMergeMetricConflictError(
+                    f"{configuration_id}: retrieval side supplies "
+                    f"{metric!r}, which is fin-owned (T4 / SC5); fin never "
+                    "reads this column from the retrieval service"
+                )
+            if not _is_finite_number(value):
+                raise AblationMergeCitationGateNonFiniteError(
+                    f"{configuration_id}: retrieval side supplies a non-finite "
+                    f"value for {metric!r} ({value!r}); the merge refuses "
+                    "so the merged report's citation-gate column cannot "
+                    "land on a silent false zero (T4 / SC5)"
+                )
             merged_metrics[metric] = value
         merged = dict(config)
         merged["metrics"] = merged_metrics
@@ -422,13 +510,91 @@ def merge_with_retrieval_report(
     return merged_report
 
 
+# ---------------------------------------------------------------------------
+# Atomic write
+# ---------------------------------------------------------------------------
+
+
+def _default_report_serializer(payload: Mapping[str, Any]) -> str:
+    """Canonical JSON shape the operator's tooling reads back."""
+    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def _lock_path_for(target: Path) -> Path:
+    """Sibling lock file path used to serialize write access."""
+    return target.with_name(target.name + ".lock")
+
+
+@contextlib.contextmanager
+def _report_lock(target: Path):
+    """Hold an exclusive ``fcntl.flock`` on the sibling lock file.
+
+    Shared with ``fin.corpus.catalog._table_lock`` so the same
+    ``flock`` discipline is used wherever two processes may write to
+    the same JSON artifact.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _lock_path_for(target)
+    with open(lock_path, "a+", encoding="utf-8") as lock_fd:
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+
+
+def write_report_atomically(
+    target: Path,
+    payload: Mapping[str, Any] | Callable[[], str],
+) -> Path:
+    """Write ``payload`` to ``target`` under a flock, atomically.
+
+    The contract is: a reader of ``target`` always sees either the
+    previous whole document or a freshly-written whole document —
+    never a half-written one. Two writers serialize through the
+    sibling lock file (T3 / ADR 0042). The temp file is renamed over
+    ``target`` so a crash mid-write leaves the previous document
+    intact.
+
+    ``payload`` may be a mapping (serialized via the canonical
+    formatter) or a zero-argument callable that returns the encoded
+    string. The callable form lets callers defer expensive work until
+    the lock is held, and lets tests inject serializers that raise
+    mid-write.
+    """
+    encoded: str | None = None
+    if isinstance(payload, Mapping):
+        encoded = _default_report_serializer(payload)
+    elif callable(payload):
+        # ``callable`` covers lambdas / functions; the Mapping branch
+        # above already handled dicts.
+        encoded = payload()
+    else:
+        raise TypeError(
+            "write_report_atomically payload must be a mapping or a "
+            f"callable, got {type(payload).__name__}"
+        )
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_name(target.name + ".tmp")
+    with _report_lock(target):
+        with open(tmp_path, "w", encoding="utf-8") as tmp_file:
+            tmp_file.write(encoded)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.replace(tmp_path, target)
+    return target
+
+
 __all__ = [
     "ABLATION_REPORT_VERSION",
     "DIMENSIONS_NOT_COMPUTED_BY_FIN",
+    "MERGE_FIN_OWNED_METRICS",
     "MERGE_KEYS",
     "PERCENT_COMPUTED",
     "PERCENT_UNDEFINED_ZERO_BASELINE",
     "REPORT_FILENAME",
+    "AblationMergeCitationGateNonFiniteError",
     "AblationMergeKeyMismatchError",
     "AblationMergeMetricConflictError",
     "AblationReportError",
@@ -436,4 +602,5 @@ __all__ = [
     "merge_with_retrieval_report",
     "query_subset_hash",
     "validate_report",
+    "write_report_atomically",
 ]
