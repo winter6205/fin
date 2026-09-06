@@ -1992,11 +1992,16 @@ def compile_graph(
         Tests pass an explicit ``tmp_path``-rooted string so save/recall
         isolation (SC6) is observable end to end.
     user_profile_store
-        T6 / spec SC13: the two-layer profile file store the
-        ``edit_user_profile`` tool writes through. ``None`` (the
-        default) builds one from ``UserProfileStore.from_env(
-        workspace_root)`` when ``memory_port`` is ON; the OFF branch
-        does not need it. Tests inject an explicit store rooted at a
+        T6 / spec SC13 + that pull request operator decision: the two-layer
+        profile file store. ``None`` (the default) builds one from
+        ``UserProfileStore.from_env(workspace_root)``. that pull request made
+        this unconditional — the store is built regardless of
+        ``memory_port`` because the user profile is operator-profile
+        machinery, NOT memory-fact machinery, and the merged
+        profile text surfaces into the system prefix on every
+        leaf (research AND non-research) regardless of memory_on.
+        The WRITE path (``edit_user_profile`` tool) stays ON-gated
+        per spec SC12. Tests inject an explicit store rooted at a
         ``tmp_path`` so the suite never touches the real ``$HOME``.
 
     Returns
@@ -2102,6 +2107,24 @@ def compile_graph(
     save_memory_tool: Any | None = None
     recall_memory_tool: Any | None = None
     edit_user_profile_tool: Any | None = None
+    # that pull request operator decision: the user profile is operator-profile
+    # machinery, NOT memory-fact machinery. Its READ path (merged
+    # profile text into the system prefix) is unconditional — both
+    # ON and OFF graphs need a store to call ``read_merged()`` at
+    # model-call time. The write path (edit_user_profile tool)
+    # remains ON-gated per spec SC12. Resolve the store here, before
+    # either branch needs it.
+    if user_profile_store is None:
+        user_profile_store = UserProfileStore.from_env(
+            resolved_workspace_root
+        )
+    # Closure: read the merged profile text at model-call time so a
+    # file edit between calls is visible on the next turn (no caching
+    # at compile time). Used by ``_non_research_leaf`` and
+    # ``model_node`` to pass ``user_profile=`` into ``messages_for_model``.
+    def _read_profile_text() -> str:
+        return user_profile_store.read_merged()
+
     if memory_enabled:
         save_memory_tool = _make_save_memory_tool(
             memory_port,  # type: ignore[arg-type]
@@ -2111,10 +2134,6 @@ def compile_graph(
             memory_port,  # type: ignore[arg-type]
             workspace=workspace_key,
         )
-        if user_profile_store is None:
-            user_profile_store = UserProfileStore.from_env(
-                resolved_workspace_root
-            )
         edit_user_profile_tool = _make_edit_user_profile_tool(user_profile_store)
 
     model_bound_tools: list[Any] = [
@@ -2265,11 +2284,19 @@ def compile_graph(
         missing_slots = (
             _clarify_missing_slots(state) if track == "clarify" else None
         )
+        # that pull request: the user profile is operator-profile machinery,
+        # NOT memory-fact machinery. Surface the merged profile text
+        # into the system prefix regardless of memory_on. Read at
+        # call time (not compile-time) so file edits between calls
+        # take effect on the next turn.
         stream = selected.stream(
             _with_turn_attachments(
                 state,
                 messages_for_model(
-                    state["messages"], track=track, missing_slots=missing_slots
+                    state["messages"],
+                    track=track,
+                    missing_slots=missing_slots,
+                    user_profile=_read_profile_text(),
                 ),
             )
         )
@@ -2362,8 +2389,18 @@ def compile_graph(
         # attachment context, injected CALL-SCOPED like the track
         # prompt — see ``_with_turn_attachments`` for the full
         # contract (this-turn-only, checkpoint-clean, never evidence).
+        # that pull request: read the merged profile text at call time (NOT at
+        # compile time) so a file edit between calls is visible on
+        # the next turn. The user profile is operator-profile
+        # machinery and surfaces regardless of memory_on.
         model_messages = _with_turn_attachments(
-            state, messages_for_model(state["messages"], track="research")
+            state,
+            messages_for_model(
+                state["messages"],
+                track="research",
+                memory_on=memory_enabled,
+                user_profile=_read_profile_text(),
+            ),
         )
         stream = selected_model.stream(model_messages)
         answer_message = assemble_final_ai_message(stream)
