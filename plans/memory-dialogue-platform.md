@@ -2,13 +2,17 @@
 
 **Goal:** 在 workspace 上交付可开关的完整记忆与对话平台：会话压缩、DST 升级、dream→MCP 持久化、👍/👎、Postgres 池与可选 Redis——不依赖语料扩库/redline。
 **Approach:** 粗颗粒度九波：数据面（池+Redis）与记忆空壳并行；会话压缩；本地缓冲；dream→MCP；DST；反馈与可观测/重试收尾。默认 `uv run pytest -q` 记忆 OFF。
+
+> **Supersede notice (2026-09-06, ADR 0048):** T5 (Local memory buffer) and T6 (dream → memory MCP) are **superseded for the remaining memory product wiring** by [`plans/cross-session-operator-memory.md`](cross-session-operator-memory.md) / [`specs/cross-session-operator-memory.md`](../specs/cross-session-operator-memory.md). Default boot is **OFF** with this checkout’s project env **ON**; dream is a local fact merge with 24h + threshold gates, never a memory-MCP upload, never an unconditional post-SSE step. Surviving waves (T1 pool, T2 Redis skeleton, T3 OFF shell, T4 carve-out to session-compaction, T7 DST, T8 feedback, T9 observability + retry) stay as historical record. This plan is not silently rewritten.
+
 **Spec link:** `specs/memory-dialogue-platform.md`
-**Map:** local program B (`memory-dialogue-platform`); tracker issues live on GitHub separately — not embedded here.
-**Tracker:** local `plans/memory-dialogue-platform.md` only — do not embed GitHub issue numbers in this file.
-**Out of this worktree:** Task 4（session compaction）执行权在 `plans/session-compaction.md`（worktree `/home/winner/projects/fin-wt-session-compaction`，分支 `feat/session-compaction`；ADR 0044 occupancy，取代本文件 T4 的条数窗）。本树不要改压缩模块、不要把 T4 当下一刀。
-**Per-ticket loop (all bullets, header 声明一次):** test-driven-development → typecheck+tests（`uv run pytest -q`；触及 Soft-Track 时加 `-m soft_track`；eval 弹加 `-m eval`；web：`npx tsc --noEmit`）→ verification-before-completion → one commit on the ticket branch
-**End-of-round:** 九波都落地后对整轮 diff 做一次 code-review（Standards + Spec）；单弹 loop 不重复整轮 review。
-**待写入:** empty — CONTEXT + ADR 0035/0036 already flushed with the spec persist.
+
+> **Map:** local program B (`memory-dialogue-platform`); tracker issues live on GitHub separately — not embedded here.
+> **Tracker:** local `plans/memory-dialogue-platform.md` only — do not embed GitHub issue numbers in this file.
+> **Out of this worktree:** Task 4（session compaction）执行权在 `plans/session-compaction.md`（worktree `/home/winner/projects/fin-wt-session-compaction`，分支 `feat/session-compaction`；ADR 0044 occupancy，取代本文件 T4 的条数窗）。本树不要改压缩模块、不要把 T4 当下一刀。
+> **Per-ticket loop (all bullets, header 声明一次):** test-driven-development → typecheck+tests（`uv run pytest -q`；触及 Soft-Track 时加 `-m soft_track`；eval 弹加 `-m eval`；web：`npx tsc --noEmit`）→ verification-before-completion → one commit on the ticket branch
+> **End-of-round:** 九波都落地后对整轮 diff 做一次 code-review（Standards + Spec）；单弹 loop 不重复整轮 review。
+> **待写入:** empty — CONTEXT + ADR 0035/0036 already flushed with the spec persist.
 
 ## ACR（自 `specs/memory-dialogue-platform.md` 原样粘贴）
 
@@ -42,21 +46,21 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
 - 可观测暴露在 `/health` 扩展 vs 独立路由 vs 脚本。
 - Qwen 是否单独加载（当前 classify 复用主模型）。
 
-**代码对照（2026-09-04 harvest；GitHub T1–T9 勾选仍可能过期）：**
+**代码对照（2026-09-05 harvest；the wayfinder program–#157 / #160–#162 已关，#158/#159 仍开）：**
 
 对照物是各波 Acceptance，不是「文件在不在」。相关单测 `160 passed, 35 skipped`（skip 因本机未设 `FIN_CHECKPOINT_URL`）；未跑全仓 pytest、未跑 web `tsc`、未打 live MCP。
 
-| 波  | 模块/测试                                                                                  | 产品路径                                                             | 相对 Acceptance                                     |
-| --- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------- | --------------------------------------------------- |
-| T1  | `db_pool.py`；`test_postgres_pool_t1.py`                                                   | 池只给 memory ON；saver 长连接、thread_store 短连接（ADR 0036）      | **决策闭合**；不要再接线 saver                      |
-| T2  | `redis_client.py`；`test_redis_skeleton.py`                                                | 未进 `http`/`health`；无限流实现                                     | **骨架闭合**；排队 wont-do                          |
-| T3  | `memory_port.py` `OffMemoryAdapter`；`test_memory_off_port.py`；HTTP `get_memory_port`     | 默认 OFF；图上无记忆 tools                                           | **闭合**                                            |
-| T4  | 条数窗库仍在；接线形状以 ADR 0044 为准                                                     | 本树不接 graph                                                       | **划出本队列**；见 `plans/session-compaction.md`    |
-| T5  | `memory_buffer.py` / `memory_store.py` + tests                                             | 无 host 记忆 tool；ON 时模型调不到 extract/recall                    | 库+单测在；图未接                                   |
-| T6  | `memory_dream.py`；SSE 结束后 `run_dream_after_turn`；`FIN_MEMORY_DREAM_BACKEND` 仅 `null` | 无 fixture/真 MCP transport（注释 T6d）                              | HTTP 调度在；SC7 MCP 写出未做                       |
-| T7  | `track_decision.py` 置信度阈值；`test_track_decision_t7.py`                                | compile 把主模型当 `classify_model`；无独立 Qwen                     | **基本闭合**（小模型可选）                          |
-| T8  | `feedback.py` + PG store；`web/src/feedback.ts` helper                                     | `POST .../runs/{run_id}/feedback` 路由；`TurnRow.feedback`；web 控件 | **闭合**（`eb2d24a`）                               |
-| T9  | `observability.py`；`rewrite_retry.py`；`test_observability_retry_contracts.py`            | `GET /api/observability`；retrieve tool loop 已接 rewrite retry      | **闭合**（`9baaf02`；model-backed rewriter 仍开放） |
+| 波  | 模块/测试                                                                                  | 产品路径                                                             | 相对 Acceptance                                         |
+| --- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------- | ------------------------------------------------------- |
+| T1  | `db_pool.py`；`test_postgres_pool_t1.py`                                                   | 池只给 memory ON；saver 长连接、thread_store 短连接（ADR 0036）      | **决策闭合**；不要再接线 saver                          |
+| T2  | `redis_client.py`；`test_redis_skeleton.py`                                                | 未进 `http`/`health`；无限流实现                                     | **骨架闭合**；排队 wont-do                              |
+| T3  | `memory_port.py` `OffMemoryAdapter`；`test_memory_off_port.py`；HTTP `get_memory_port`     | 默认 OFF；图上无记忆 tools                                           | **闭合**                                                |
+| T4  | 条数窗库仍在；接线形状以 ADR 0044 为准                                                     | occupancy 压缩已合 main                                              | **划出并闭合**；`plans/session-compaction.md` · that pull request |
+| T5  | `memory_buffer.py` / `memory_store.py` + tests                                             | 无 host 记忆 tool；ON 时模型调不到 extract/recall                    | 库+单测在；图未接                                       |
+| T6  | `memory_dream.py`；SSE 结束后 `run_dream_after_turn`；`FIN_MEMORY_DREAM_BACKEND` 仅 `null` | 无 fixture/真 MCP transport（注释 T6d）                              | HTTP 调度在；SC7 MCP 写出未做                           |
+| T7  | `track_decision.py` 置信度阈值；`test_track_decision_t7.py`                                | compile 把主模型当 `classify_model`；无独立 Qwen                     | **基本闭合**（小模型可选）                              |
+| T8  | `feedback.py` + PG store；`web/src/feedback.ts` helper                                     | `POST .../runs/{run_id}/feedback` 路由；`TurnRow.feedback`；web 控件 | **闭合**（`eb2d24a`）                                   |
+| T9  | `observability.py`；`rewrite_retry.py`；`test_observability_retry_contracts.py`            | `GET /api/observability`；retrieve tool loop 已接 rewrite retry      | **闭合**（`9baaf02`；model-backed rewriter 仍开放）     |
 
 **下一刀（本 worktree，仍非 iknow、不含压缩）：** ~~T8 HTTP+UI、T9 接线~~ 已完成（2026-09-04：T8 `eb2d24a`，T9 `9baaf02`）。T5 图上记忆工具与 T6 dream 不当公司知识入库（ADR 0045）；需要时仅显式 extract。T4 压缩不在本树做。**本树剩余：T5/T6 的产品接线仍按 ADR 0045 不作为必做波，见各 task Status。**
 
@@ -98,7 +102,7 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
    - **Surface:** memory port local backend + host tools + tests
    - **Acceptance:** ON 时 extract≥1 条；recall 返回；GC 软禁 fixture；仅记忆文本不能 `done` 出记忆 citations；`uv run pytest -q` exits 0。
    - **Completion:** 条目 schema 开放。
-   - Status: [ ] remaining — buffer/store exist; **no graph memory tools**
+   - Status: [x] **superseded 2026-09-06** by [`plans/cross-session-operator-memory.md`](cross-session-operator-memory.md) (ADR 0048): remaining wiring = atomic **memory fact** + ≤3 lexical **memory hook** prefetch + explicit save/recall/edit-user-profile tools (no dream tool, no buffer-as-extract graph tool); auto-extract N=3 cap 1 with deny categories.
    - [blocks: T3]
 
 6. **dream → memory MCP persistence** — tag: `[implementation]`
@@ -106,7 +110,7 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
    - **Surface:** host dream + memory MCP adapter + tests（fixture MCP）
    - **Acceptance:** fixture MCP 上 dream 写出可观察；无 MCP 时 skip/仅缓冲且前台正常；`uv run pytest -q` exits 0。
    - **Completion:** 规则阈值与 MCP tool 名开放。
-   - Status: [ ] remaining — `null` backend + post-SSE dream; **no MCP transport** (parallel with iknow)
+   - Status: [x] **superseded 2026-09-06** by [`plans/cross-session-operator-memory.md`](cross-session-operator-memory.md) (ADR 0048): dream is a **local fact merge** with 24h + threshold gates; **no memory-MCP write**; **no unconditional post-SSE `run_dream_after_turn`**; dream is not a graph tool; foreground-turn failure isolation is preserved.
    - [blocks: T5]
 
 7. **DST confidence + optional small classify model** — tag: `[implementation]`

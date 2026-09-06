@@ -47,7 +47,7 @@ minimal-change-verifier: yes — one logical program, not one commit; writing-pl
    - **Inherits:** spec Focus 1；CONTEXT **list_files**。
    - **Surface:** host catalog + tests
    - **Acceptance:** catalog empty/miss is `filings: []` without requiring a serve-time HTML tree SSOT; `uv run pytest -q` exits 0。
-   - **Completion:** whether catalog is MCP list vs host metadata table open — resolved: host metadata table `data/corpus/catalog.json`（iknow-memory 无 list 类 MCP 端点，见 docs/handoff/2026-09-04-cross-repo-status.md）；写侧 seam `fin.corpus.catalog.record_filings`（document_id+version upsert）留给 T3 接线。
+   - **Completion:** whether catalog is MCP list vs host metadata table open — resolved: host metadata table `data/corpus/catalog.json`（iknow-memory 无 list 类 MCP 端点，见 docs/handoff/2026-09-05-status.md）；写侧 seam `fin.corpus.catalog.record_filings`（document_id+version upsert）留给 T3 接线。
    - Status: [x]
    - [blocks: T1]
 
@@ -55,9 +55,9 @@ minimal-change-verifier: yes — one logical program, not one commit; writing-pl
    - **Inherits:** spec Focus 2 / SC5 / SC7 / SC8；ADR 0047；`specs/corpus-retrieval.md` 场景适配颗粒度。
    - **Surface:** corpus ingest + host HTTP + tests
    - **Acceptance:** supported fixture ingest is observable as push (or Fake record); unsupported type named failure; MCP down typed; no research-graph 切分 tool; `uv run pytest -q` exits 0。
-    - **Completion:** HTTP path vs CLI-only first slice open if HTTP lands in T5.
-    - 接线记录：产品装配（`_build_default_ingest_service` 两分支）默认传 `on_ingested` → `record_filings`（默认 catalog 路径）；push 成功后 catalog 写失败 = 200 + 具名 `catalog_warning`（`catalog_record_failed`），不回滚 push、不静默。
-    - Status: [x]
+   - **Completion:** HTTP path vs CLI-only first slice open if HTTP lands in T5.
+   - 接线记录：产品装配（`_build_default_ingest_service` 两分支）默认传 `on_ingested` → `record_filings`（默认 catalog 路径）；push 成功后 catalog 写失败 = 200 + 具名 `catalog_warning`（`catalog_record_failed`），不回滚 push、不静默。
+   - Status: [x]
    - [blocks: T1]
 
 4. **Thread attach does not push** — tag: `[implementation]`

@@ -406,6 +406,55 @@ def _sanitize_reason_text(text: str, max_len: int = 200) -> str:
     return out
 
 
+def _dream_hook_kwargs(port: Any) -> dict[str, Any]:
+    """Probe ``port`` for the dual-gate wiring the per-turn hook needs.
+
+    ADR 0048 2026-09-06 (SC21): the SSE routes must not unconditionally
+    enqueue ``port.dream()``; they call :func:`run_dream_after_turn`
+    with the gate wiring the runtime port exposes. A port that does
+    not expose any of the three required callables (gate-state store,
+    active-facts counter, dream factory) yields an empty kwargs dict,
+    and the hook falls back to a safe no-op — the dream is not fired.
+    Tests' recording port exposes all three so the wiring pins the
+    gated behaviour end-to-end.
+    """
+    gate_state = getattr(port, "gate_state_store", None)
+    if gate_state is None:
+        return {}
+    facts_count = getattr(port, "_facts_count", None)
+    if not callable(facts_count):
+        return {}
+    dream_factory = getattr(port, "_build_dream", None)
+    if not callable(dream_factory):
+        return {}
+    return {
+        "gate_state_store": gate_state,
+        "active_facts_provider": facts_count,
+        "dream_factory": dream_factory,
+    }
+
+
+def _register_dream_background(
+    background: BackgroundTasks,
+    memory_port: Any,
+    thread_id: str,
+) -> None:
+    """Schedule the per-turn dream hook on ``background`` (SC21).
+
+    Dream runs AFTER the SSE stream is exhausted, never inside a graph
+    node (CONTEXT.md:46). Registering before the response is returned
+    means every exit path from the generator still gets its chance;
+    the dual gate inside the hook decides whether it actually runs
+    (ADR 0048 2026-09-06 / SC21).
+    """
+    background.add_task(
+        run_dream_after_turn,
+        memory_port,
+        thread_id=thread_id,
+        **_dream_hook_kwargs(memory_port),
+    )
+
+
 @dataclass(frozen=True)
 class RunStreamOutcome:
     """What ``_stream_run_frames`` hands back when the run's wire ends.
@@ -2326,12 +2375,8 @@ def build_router(
             )
 
         # Dream runs AFTER the stream is exhausted, never inside a graph
-        # node (CONTEXT.md:46). Registering before the response is
-        # returned means every exit path from the generator still gets
-        # its chance; the gate inside dream decides whether it runs.
-        background.add_task(
-            run_dream_after_turn, memory_port, thread_id=thread_id
-        )
+        # node (CONTEXT.md:46); see ``_register_dream_background``.
+        _register_dream_background(background, memory_port, thread_id)
         return StreamingResponse(
             event_stream(),
             media_type="text/event-stream",
@@ -2622,9 +2667,7 @@ def build_router(
                 answer_reset=outcome.answer_reset,
             )
 
-        background.add_task(
-            run_dream_after_turn, memory_port, thread_id=thread_id
-        )
+        _register_dream_background(background, memory_port, thread_id)
         return StreamingResponse(
             event_stream(),
             media_type="text/event-stream",

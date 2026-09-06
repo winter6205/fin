@@ -30,10 +30,18 @@ _SSE_ROUTES = {"send_message", "resume_thread"}
 
 
 class _RecordingMemoryPort:
-    """Minimal ``MemoryPort`` that records when dream ran.
+    """Minimal ``MemoryPort`` that records when the gated hook fired.
 
-    ``on_dream`` runs inside ``dream()`` so a test can snapshot state at
-    the moment dream fires — that is how the ordering claim is proven.
+    ADR 0048 2026-09-06 (SC21): the per-turn hook is gated, not
+    unconditional. The real wiring (workspace_http) passes the gate
+    state store, an active-facts provider, and a dream factory; this
+    fake mirrors the same shape so the tests assert the gated call,
+    not ``port.dream()``.
+
+    ``on_dream`` runs inside the gated ``MemoryDream.run()`` so a
+    test can snapshot state at the moment dream fires — that is how
+    the "ran after the turn was persisted" claim is proven under the
+    new wiring.
     """
 
     def __init__(
@@ -42,19 +50,65 @@ class _RecordingMemoryPort:
         enabled: bool = True,
         explode: bool = False,
         on_dream=None,
+        active_facts: int = 5,
     ) -> None:
+        from fin.host.memory_dream import (
+            InProcessDreamGateStateStore,
+        )
+        from fin.host.memory_store import (
+            InProcessDreamCursorStore,
+            InProcessMemoryStore,
+        )
+
         self.enabled = enabled
         self.dream_calls = 0
+        self.turn_count = 0
         self._explode = explode
         self._on_dream = on_dream
+        # Wire the dual-gate inputs ``run_dream_after_turn`` reads.
+        self._gate_state = InProcessDreamGateStateStore()
+        self._cursors = InProcessDreamCursorStore()
+        self._store = InProcessMemoryStore()
+        self._active_facts = active_facts
 
-    def dream(self, *, limit: int = 8) -> dict[str, object]:
-        self.dream_calls += 1
+    def _facts_count(self) -> int:
+        return self._active_facts
+
+    @property
+    def gate_state_store(self):
+        return self._gate_state
+
+    def _build_dream(self):
+        from fin.host.memory_dream import MemoryDream, NullDreamBackend
+
         if self._on_dream is not None:
             self._on_dream()
+        self.dream_calls += 1
+        return MemoryDream(
+            self._store,
+            self._cursors,
+            self._gate_state,
+            backend=_ExplodingBackend() if self._explode else NullDreamBackend(),
+        )
+
+    def dream(self, *, limit: int = 8) -> dict[str, object]:
+        """Kept for the ``OFF must not even start dream`` assertion.
+
+        SC21 says the per-turn hook must not call ``port.dream()``
+        unconditionally; when the hook is gated, ``dream()`` is
+        unreachable from the SSE wiring. A test that still asks for
+        ``port.dream()`` directly gets a recorded call so the legacy
+        contract is pinned even after the rework.
+        """
+        self.dream_calls += 1
         if self._explode:
             raise RuntimeError("simulated dream backend outage")
         return {"status": "buffered", "transported": 0}
+
+
+class _ExplodingBackend:
+    def persist(self, memories):
+        raise RuntimeError("simulated dream backend outage")
 
 
 @pytest.fixture

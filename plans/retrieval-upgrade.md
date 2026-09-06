@@ -1,6 +1,6 @@
 # Plan: retrieval-upgrade（跨仓总计划）
 
-**Status（2026-09-04）：** 阶段 0–3 的 fin 串行队列已合入。本文件只保留阶段表与指针，不再当实施入口。进度：`docs/handoff/2026-09-04-cross-repo-status.md`。闭合队列：`plans/archive/2026-09-retrieve-queue/`。
+**Status（2026-09-04）：** 阶段 0–3 的 fin 串行队列已合入。本文件只保留阶段表与指针，不再当实施入口。进度：`docs/handoff/2026-09-05-status.md`。闭合队列：`plans/archive/2026-09-retrieve-queue/`。
 
 **Goal:** 把 fin 建成语料的唯一解析与切分权威，并把切好的块幂等推送给检索服务 **iknow-memory**，使引用门的连续子串约束在推送链路上成立、检索能力默认全启用、两侧报告可合并成一份量化结论。
 
@@ -8,7 +8,7 @@
 
 **Spec 指针：** fin 侧 `specs/corpus-retrieval.md`；检索服务侧 `iknow-memory` `specs/retrieval-stack.md`（同名「跨仓对齐基线」章节）。2026-09-01 命名对齐提案只作 audit：`docs/cross-repo/alignment-proposal.md`。
 
-**跨仓对齐基线指针：** 两份 spec 各自的「跨仓对齐基线」章节（自 `## 跨仓对齐基线` 标题行之后起，到下一个 `## ` 标题行之前止，去掉首尾空行）逐字相同，是该章节全部内容的**唯一权威**。本计划**不复制**基线任何条目——数字口径（B1）、部分失败语义（B2）、降级信号形态与消费（B3）、跨仓契约字段（B4）、统一术语（B5）、本章验收（B6）一律回源。任何一侧要改该章节，必须同一次改动同步改另一侧；改动期间全部分阶段并行线冻结。**B6 状态（2026-09-04）：** iknow-memory `specs/retrieval-stack.md` 已含同名章节；`python -m fin.corpus.baseline` 对两侧路径 `status: match`、exit 0。2026-09-01 提案里「对侧无章节 / B6 单边」已过期，只作 audit：`docs/cross-repo/alignment-proposal.md`。进度索引：`docs/handoff/2026-09-04-cross-repo-status.md`。
+**跨仓对齐基线指针：** 两份 spec 各自的「跨仓对齐基线」章节（自 `## 跨仓对齐基线` 标题行之后起，到下一个 `## ` 标题行之前止，去掉首尾空行）逐字相同，是该章节全部内容的**唯一权威**。本计划**不复制**基线任何条目——数字口径（B1）、部分失败语义（B2）、降级信号形态与消费（B3）、跨仓契约字段（B4）、统一术语（B5）、本章验收（B6）一律回源。任何一侧要改该章节，必须同一次改动同步改另一侧；改动期间全部分阶段并行线冻结。**B6 状态（2026-09-04）：** iknow-memory `specs/retrieval-stack.md` 已含同名章节；`python -m fin.corpus.baseline` 对两侧路径 `status: match`、exit 0。2026-09-01 提案里「对侧无章节 / B6 单边」已过期，只作 audit：`docs/cross-repo/alignment-proposal.md`。进度索引：`docs/handoff/2026-09-05-status.md`。
 
 **Tracker:** FALLBACK — 本地 plan 文件。本轮只产出两个计划文件，不建 GitHub issue（开 issue 属外部可见副作用，需操作者单独授权）。授权后按 `writing-plans/references/tracker.md` 主路径补建：每颗 bullet 一个 issue + 原生阻塞边。
 
@@ -72,11 +72,11 @@ minimal-change-verifier: yes — 本 spec 不改引用门、意图识别、编�
 
 ## 分计划入口
 
-| 分计划         | 文件                                                                                                                                                                                                                                | 覆盖阶段                                                                         | 入口              | 出口                                                                       |
-| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- | ----------------- | -------------------------------------------------------------------------- |
-| 已闭合串行队列 | [`plans/archive/2026-09-retrieve-queue/`](archive/2026-09-retrieve-queue/)（P1 → P2 → P3；入口 stub [`2026-09-02-product-queue.md`](2026-09-02-product-queue.md)）                                                                  | 阶段 2 真实进程 + corpus-ops-depth + 阶段 3 live                                 | 已完成（that pull request） | 三份计划全部子弹 `[x]`，合入 `main`；下一步不从本队列开工                  |
-| fin 侧         | [`plans/corpus-retrieval.md`](corpus-retrieval.md)                                                                                                                                                                                  | 阶段 0（fin 承担部分）、阶段 1 线 A、阶段 1 线 C、阶段 2（D）、阶段 3（E1 / E2） | 阶段 0 出口达成   | 该分计划全部 bullet 的 Acceptance 成立，且默认 `uv run pytest -q` 未被放宽 |
-| 检索服务侧     | **iknow-memory** `plans/`（D0 / retrieval-stack / retrieve-graph-quality）。本地 markdown Status 可能滞后，以 GitHub tracer COMPLETED 为准。剩余 OPEN 见 `docs/handoff/2026-09-04-cross-repo-status.md`（the tracked change 已关；#170 flake 等） | 阶段 1 线 B，及其在阶段 2 / 3 的联调配合                                         | 阶段 0 出口达成   | 契约字段可被 fin 侧逐字校验；真实进程联调已由 fin P1 覆盖                  |
+| 分计划         | 文件                                                                                                                                                                                                                             | 覆盖阶段                                                                         | 入口              | 出口                                                                       |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- | ----------------- | -------------------------------------------------------------------------- |
+| 已闭合串行队列 | [`plans/archive/2026-09-retrieve-queue/`](archive/2026-09-retrieve-queue/)（P1 → P2 → P3；入口 stub [`2026-09-02-product-queue.md`](2026-09-02-product-queue.md)）                                                               | 阶段 2 真实进程 + corpus-ops-depth + 阶段 3 live                                 | 已完成（that pull request） | 三份计划全部子弹 `[x]`，合入 `main`；下一步不从本队列开工                  |
+| fin 侧         | [`plans/corpus-retrieval.md`](corpus-retrieval.md)                                                                                                                                                                               | 阶段 0（fin 承担部分）、阶段 1 线 A、阶段 1 线 C、阶段 2（D）、阶段 3（E1 / E2） | 阶段 0 出口达成   | 该分计划全部 bullet 的 Acceptance 成立，且默认 `uv run pytest -q` 未被放宽 |
+| 检索服务侧     | **iknow-memory** `plans/`（D0 / retrieval-stack / retrieve-graph-quality）。进度：`docs/handoff/2026-09-05-status.md`。T14 ES 已合（iknow that pull request）；质量栈 T2–T11 已合。剩余见该 handoff（#170 flake；retrieval-stack T17–T24） | 阶段 1 线 B，及其在阶段 2 / 3 的联调配合                                         | 阶段 0 出口达成   | 契约字段可被 fin 侧逐字校验；真实进程联调已由 fin P1 覆盖                  |
 
 ---
 
