@@ -1,8 +1,10 @@
-# 0049. Operator 工作区 bind: default directory, never cwd; one shared 知识库
+# 0049. Operator 工作区: one global default, never cwd; one shared 知识库
 
 Date: 2026-09-06
 Status: accepted
 
-The operator **工作区** is an explicit filesystem directory (`thread.project_root`). Product create/list uses `$HOME/.fin/default` when unset; `Path.cwd()` is never the implicit root. Each `invoke` / `stream` carries `configurable.workspace_root` per-call injected by HTTP/CLI from that thread row; `graph.py` does not import `thread_store`. The **知识库** (catalog / ingest / **retrieve port**) stays one process-wide corpus; creating a 工作区 does not create a second library. Spec: `specs/workbench-operator-workspace.md`.
+The operator **工作区** is the single directory `$HOME/.fin/default` (mkdir if missing). `Path.cwd()` is never the implicit root. Each `invoke` / `stream` carries `configurable.workspace_root` injected by HTTP/CLI from that default (tests inject home); `graph.py` does not import `thread_store` and does not bake the root at compile time. The **知识库** (catalog / ingest / **retrieve port**) stays one process-wide corpus. There is no left-rail 指定/新建, no `$HOME/.fin/workspaces/<slug>`, and no per-thread `project_root` switch. Spec: `specs/workbench-operator-workspace.md`.
 
-Considered Options: bake `workspace_root` at `compile_graph` from cwd (rejected — silent product root, LRU keyed per directory); graph looks up `fin_thread` itself (rejected — reverse dep onto `thread_store`); per-工作区 catalog (rejected — 知识库 is shared); sessions as `~/.fin/sessions/` files (rejected — Postgres checkpointer remains ADR 0015).
+Amendment 2026-09-06: retracted multi-root bind (`thread.project_root`, `known_roots.json`, `/api/workspaces` bind/create, `workspaces/<slug>`). Multiplicity is **research thread**s. Future many-libraries / tenants / collections is not this ADR.
+
+Considered Options: bake `workspace_root` at `compile_graph` from cwd (rejected — silent product root); graph looks up `fin_thread` itself (rejected — reverse dep onto `thread_store`); per-工作区 catalog (rejected — 知识库 is shared); sessions as `~/.fin/sessions/` files (rejected — Postgres checkpointer remains ADR 0015); coding-agent left-rail many directories (rejected 2026-09-06 — fin is an enterprise knowledge-base Agent, not a repo picker); per-thread `project_root` (rejected 2026-09-06 — YAGNI until a tenant/library split exists).
