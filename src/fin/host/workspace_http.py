@@ -263,8 +263,6 @@ logger = logging.getLogger(__name__)
 # directory on first resolve (spec Focus 2). Tests override this
 # dependency to point at a ``tmp_path`` home so the suite never
 # touches the real ``$HOME``.
-_workspace_root_singleton_lock = threading.Lock()
-_workspace_root_override: Path | None = None
 
 
 def default_workspace_root_for_process() -> Path:

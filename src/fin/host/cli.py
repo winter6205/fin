@@ -161,7 +161,7 @@ def run(
     *,
     graph: Any,
     thread_id: str | None = None,
-    home: Any = None,
+    home: str | Path | None = None,
 ) -> None:
     """Drive one host-graph invoke and print the result to stdout.
 
