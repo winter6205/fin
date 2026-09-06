@@ -114,8 +114,17 @@ def test_clarify_prompt_is_call_scoped_not_research():
     assert isinstance(first[0], SystemMessage)
     assert CLARIFY_INSTRUCTIONS_MARKER in str(first[0].content)
     assert HOST_INSTRUCTIONS_MARKER not in str(first[0].content)
-    assert "AAPL" in str(first[0].content)
-    assert "2022 Q3" in str(first[0].content) or "2023" in str(first[0].content)
+    # T2 split: identity/soul/usage must NOT hardcode the frozen
+    # ticker/quarter snapshot — asks ground options in the 知识库 via
+    # list_files. The clarify leaf must still surface the missing-slot
+    # structure (company and period fields) so the model knows which
+    # catalog fields to ask for.
+    content = str(first[0].content)
+    for forbidden in ("AAPL", "MSFT", "AMZN", "2022 Q3", "2023 Q1",
+                      "2023 Q2", "2023 Q3"):
+        assert forbidden not in content, forbidden
+    assert "company" in content
+    assert "period" in content
 
 
 def test_company_without_period_metric_ask_is_clarify():

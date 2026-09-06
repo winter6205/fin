@@ -1,25 +1,18 @@
-"""Focus 5 T1 fixtures: prompt-assembly invariants, written before copy.
+"""Focus 5 T1 fixtures: prompt-assembly invariants.
 
 ``docs/guides/prompt-development.md`` 流程 1 (先写夹具，再动文案): a prompt
 change starts with the fixture, not with the prose. Every test in this
 module asserts the POST-split invariant from spec
 ``specs/workbench-operator-workspace.md`` SC10–SC12 — research prefix
 free of ``12 SEC`` / ``page_limit is capped at 3`` /
-``32 or more characters``, no hardcoded AAPL/MSFT/AMZN quarter list, and
-four **track** prompts that share **agent identity** + **agent soul**
-bytes.
+``32 or more characters``, no hardcoded AAPL/MSFT/AMZN quarter list,
+identity never calls fin a research agent, and four **track** prompts
+that share **agent identity** + **agent soul** bytes.
 
-The current prompts still violate all of it, so each test carries
-``@pytest.mark.xfail(strict=True)``. That is the protocol, not a
-concession:
-
-* today the assertion really fails, which is the red proof T1 owes —
-  a passing test here would mean the fixture does not bite;
-* ``strict=True`` turns an unexpected pass into a FAILURE
-  (``XPASS(strict)``), so once T2 rewrites the prompts this module goes
-  red until the marks are deleted. T2 removes every ``xfail`` mark in
-  this file; it must not weaken an assertion instead;
-* default ``uv run pytest -q`` stays at exit 0 meanwhile (SC1).
+These fixtures were authored as ``xfail(strict=True)`` in T1 against the
+pre-split prompts. T2 removed the xfail marks — the assertions now pass
+on the post-split shared-identity / shared-soul assembly in
+``src/fin/host/agent_instructions.py``.
 
 Style follows ``tests/host/test_agent_instructions.py``: plain functions,
 prompt constants imported directly.
@@ -29,19 +22,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-import pytest
-
 from fin.host.agent_instructions import (
     CLARIFY_SYSTEM_PROMPT,
     DIALOGUE_SYSTEM_PROMPT,
     HOST_SYSTEM_PROMPT,
     OFF_TOPIC_SYSTEM_PROMPT,
     clarify_prompt,
-)
-
-_T1_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason="T1 fixture: pre-split prompt still violates SC10/SC11 — removed in T2",
 )
 
 # The four **track** prompts of the Soft-Track host. Identity and soul
@@ -84,7 +70,6 @@ def _longest_common_block(texts: Sequence[str]) -> str:
     return best
 
 
-@_T1_XFAIL
 def test_research_prefix_has_no_frozen_corpus_count() -> None:
     """SC10: the corpus size is catalog state, not persona prose.
 
@@ -97,7 +82,6 @@ def test_research_prefix_has_no_frozen_corpus_count() -> None:
         assert "12-filing" not in prompt, track
 
 
-@_T1_XFAIL
 def test_research_prefix_does_not_restate_page_limit_cap() -> None:
     """SC10: ``page_limit`` is a tool field cap, owned by the schema.
 
@@ -107,7 +91,6 @@ def test_research_prefix_does_not_restate_page_limit_cap() -> None:
     assert "page_limit is capped at 3" not in HOST_SYSTEM_PROMPT
 
 
-@_T1_XFAIL
 def test_research_prefix_does_not_restate_citation_span_number() -> None:
     """SC10: the 32-character span threshold belongs to the gate.
 
@@ -117,7 +100,6 @@ def test_research_prefix_does_not_restate_citation_span_number() -> None:
     assert "32 or more characters" not in HOST_SYSTEM_PROMPT
 
 
-@_T1_XFAIL
 def test_track_prompts_do_not_hardcode_ticker_list() -> None:
     """SC10/SC11: no track prompt carries the AAPL/MSFT/AMZN seed list.
 
@@ -129,7 +111,6 @@ def test_track_prompts_do_not_hardcode_ticker_list() -> None:
             assert ticker not in prompt, f"{track} names {ticker}"
 
 
-@_T1_XFAIL
 def test_clarify_prompt_does_not_hardcode_quarter_list() -> None:
     """SC10: the rendered clarify ask grounds options without a snapshot.
 
@@ -145,7 +126,6 @@ def test_clarify_prompt_does_not_hardcode_quarter_list() -> None:
         assert ticker not in rendered, ticker
 
 
-@_T1_XFAIL
 def test_track_prompts_share_identity_soul_bytes() -> None:
     """SC11: four tracks reuse identity + soul and differ in usage only.
 
@@ -161,7 +141,6 @@ def test_track_prompts_share_identity_soul_bytes() -> None:
     )
 
 
-@_T1_XFAIL
 def test_identity_is_not_a_research_agent() -> None:
     """SC10 / CONTEXT **agent identity** _Avoid_: fin is not a research agent.
 
