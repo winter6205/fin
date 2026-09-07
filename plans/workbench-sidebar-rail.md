@@ -29,18 +29,19 @@ Flushed 2026-09-07 with the spec (CONTEXT **工作台** / **Corpus 首页**; ADR
    - **Inherits:** spec: chrome labels exactly 知识库 / 监控; 16px stroke SVG `currentColor`; no emoji; no new icon npm package; subtitle 企业知识库助手; 1px black rule under chrome; Soft Brutalism tokens; `navChrome` tests pin labels
    - **Surface:** **host** SPA (`web/` sidebar + nav helpers)
    - **Acceptance:** Sidebar shows those two labels with non-emoji icons; subtitle is 企业知识库助手; a 1px black separator sits below that chrome; no 对话 chrome label; `web/` `tsc --noEmit` exits 0
-   - Status: [ ] pending
+   - Status: [x] done (commit a9ca7ce)
 
 2. **会话 disclosure; `/` is not a 对话总览** — tag: `[implementation]`
    - **Inherits:** spec: 会话 is a collapsible list (button + `aria-expanded`); 新建 lives in that group; `/` has no thread-card wall; last-thread restore on `/` unless kb/monitor gate; collapsed 会话 still shows a count
    - **Surface:** **host** SPA (sidebar list + HomePage)
    - **Acceptance:** 会话 folds and unfolds from the keyboard; `/` does not render the thread-card overview; a restorable last thread still restores when no gate; empty 会话 list is a visible empty state under the disclosure, not a blank rail
-   - Status: [ ] pending
+   - Status: [x] done (commit 581312e; review fixes 70a22fa)
+   - Note: `web/src/App.tsx` NotFoundThread copy (「返回对话列表」→「返回首页」) is a necessary consequential edit — `/` no longer hosts the thread list the old copy pointed at.
    - [blocks: T1]
 
 3. **监控警告 without a right-side pebble** — tag: `[implementation]`
    - **Inherits:** spec: unreachable retrieve must not use `h-2 w-2 rounded-full` (or equivalent pebble) on the right; icon plus label text carry 「搜索断开」; `aria-label` names the failure; color is not the sole cue; `/monitor` 重连 unchanged
    - **Surface:** **host** SPA (nav mark helper + sidebar + existing status panel)
    - **Acceptance:** unreachable paints 监控 · 搜索断开 (or equivalent) with a changed icon, no right-side dot; `uv run pytest -q` exits 0 and `web/` `tsc --noEmit` exits 0
-   - Status: [ ] pending
+   - Status: [x] done (commit 5caeda8)
    - [blocks: T1]
