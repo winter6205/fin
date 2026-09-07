@@ -1,37 +1,43 @@
-// T10 (ADR 0033): the Sidebar status strip. The strip is the
-// operator's only readable signal that retrieve is unreachable, so
-// the invariant under test is "never blank": every view state — even
-// a malformed payload or a status route that never answered —
-// produces non-empty copy for every line.
+// T3 (specs/workbench-chrome.md): the 监控 page owns the status copy
+// once the Sidebar footer StatusStrip is gone. The invariant under
+// test is "never blank" (SC7) — loading / unavailable / unreachable /
+// reachable-fake / reachable-mcp each produce non-empty copy for every
+// line, and the operator copy NEVER carries the model identity (model
+// stays on research-thread surfaces; not a chrome line).
 
 import { describe, expect, it } from "vitest";
 import {
-  describeStatusStrip,
+  describeMonitorStatus,
   parseWorkspaceStatus,
   workspaceStatusView,
 } from "./statusStrip";
 import type { WorkspaceStatus } from "./types";
 
-const REACHABLE: WorkspaceStatus = {
+const REACHABLE_MCP: WorkspaceStatus = {
   retrieve_reachability: "reachable",
   retrieve_adapter_kind: "mcp",
   model_identity: "fin/MiniMax-M3",
   corpus_filing_count: 12,
 };
 
+const REACHABLE_FAKE: WorkspaceStatus = {
+  ...REACHABLE_MCP,
+  retrieve_adapter_kind: "fake",
+};
+
 const UNREACHABLE: WorkspaceStatus = {
-  ...REACHABLE,
+  ...REACHABLE_MCP,
   retrieve_reachability: "unreachable",
 };
 
 describe("parseWorkspaceStatus", () => {
   it("accepts the four ADR 0033 fields", () => {
-    expect(parseWorkspaceStatus({ ...REACHABLE })).toEqual(REACHABLE);
+    expect(parseWorkspaceStatus({ ...REACHABLE_MCP })).toEqual(REACHABLE_MCP);
   });
 
   it("ignores extra keys rather than failing the whole payload", () => {
-    const parsed = parseWorkspaceStatus({ ...REACHABLE, future_field: 1 });
-    expect(parsed).toEqual(REACHABLE);
+    const parsed = parseWorkspaceStatus({ ...REACHABLE_MCP, future_field: 1 });
+    expect(parsed).toEqual(REACHABLE_MCP);
   });
 
   it("rejects a non-object payload", () => {
@@ -41,18 +47,21 @@ describe("parseWorkspaceStatus", () => {
   });
 
   it("rejects a payload missing a field", () => {
-    const { corpus_filing_count: _dropped, ...partial } = REACHABLE;
+    const { corpus_filing_count: _dropped, ...partial } = REACHABLE_MCP;
     expect(parseWorkspaceStatus(partial)).toBeNull();
   });
 
   it("rejects an unknown reachability or adapter value", () => {
-    // Never coerced to "reachable": a strip that claims a healthy
+    // Never coerced to "reachable": a panel that claims a healthy
     // port it cannot vouch for is worse than one that says unknown.
     expect(
-      parseWorkspaceStatus({ ...REACHABLE, retrieve_reachability: "maybe" }),
+      parseWorkspaceStatus({
+        ...REACHABLE_MCP,
+        retrieve_reachability: "maybe",
+      }),
     ).toBeNull();
     expect(
-      parseWorkspaceStatus({ ...REACHABLE, retrieve_adapter_kind: "bm25" }),
+      parseWorkspaceStatus({ ...REACHABLE_MCP, retrieve_adapter_kind: "bm25" }),
     ).toBeNull();
   });
 });
@@ -67,84 +76,109 @@ describe("workspaceStatusView", () => {
   });
 
   it("is ready once a parsed payload is in the store", () => {
-    expect(workspaceStatusView(REACHABLE, true)).toEqual({
+    expect(workspaceStatusView(REACHABLE_MCP, true)).toEqual({
       state: "ready",
-      status: REACHABLE,
+      status: REACHABLE_MCP,
     });
   });
 });
 
-describe("describeStatusStrip", () => {
+describe("describeMonitorStatus", () => {
   const views = [
     { state: "loading" } as const,
     { state: "unavailable" } as const,
-    { state: "ready", status: REACHABLE } as const,
+    { state: "ready", status: REACHABLE_MCP } as const,
+    { state: "ready", status: REACHABLE_FAKE } as const,
     { state: "ready", status: UNREACHABLE } as const,
-    {
-      state: "ready",
-      status: { ...REACHABLE, retrieve_adapter_kind: "fake" },
-    } as const,
   ];
 
   it("never renders a blank line in any view state", () => {
     for (const view of views) {
-      const copy = describeStatusStrip(view);
+      const copy = describeMonitorStatus(view);
       for (const [key, value] of Object.entries(copy)) {
         expect(value, `${view.state}.${key}`).not.toBe("");
       }
     }
   });
 
-  it("reads as healthy on a reachable product boot", () => {
-    const copy = describeStatusStrip({ state: "ready", status: REACHABLE });
-    expect(copy.retrieveTone).toBe("ok");
-    expect(copy.retrieveLabel).toContain("可用");
-    expect(copy.adapterLabel).toContain("iknow-memory");
-    expect(copy.modelLabel).toContain("fin/MiniMax-M3");
-    expect(copy.corpusLabel).toContain("12");
+  it("produces a degraded tone on the three observable failure paths", () => {
+    // SC7: unreachable + route unavailable + a healthy probe that
+    // returns zero filings still must not read as broken chrome.
+    const unreachable = describeMonitorStatus({
+      state: "ready",
+      status: UNREACHABLE,
+    });
+    expect(unreachable.tone).toBe("degraded");
+    const unavailable = describeMonitorStatus({ state: "unavailable" });
+    expect(unavailable.tone).toBe("degraded");
+    // Loading and reachable boot both stay ok / quiet.
+    expect(
+      describeMonitorStatus({ state: "loading" }).tone,
+    ).toBe("ok");
+    expect(
+      describeMonitorStatus({ state: "ready", status: REACHABLE_MCP }).tone,
+    ).toBe("ok");
+  });
+
+  it("reads as healthy on a reachable MCP boot", () => {
+    const copy = describeMonitorStatus({
+      state: "ready",
+      status: REACHABLE_MCP,
+    });
+    expect(copy.tone).toBe("ok");
+    expect(copy.headline).toContain("可用");
+    expect(copy.detail).toContain("iknow-memory");
   });
 
   it("degrades readably — and actionably — when retrieve is unreachable", () => {
-    const copy = describeStatusStrip({ state: "ready", status: UNREACHABLE });
-    expect(copy.retrieveTone).toBe("degraded");
-    expect(copy.retrieveLabel).toContain("不可用");
+    const copy = describeMonitorStatus({ state: "ready", status: UNREACHABLE });
+    expect(copy.tone).toBe("degraded");
+    expect(copy.headline).toContain("不可用");
     // An ordinary operator has to learn two things: what they lose
     // (evidence-backed answers) and what to do next.
-    expect(copy.retrieveDetail).toContain("引用");
-    expect(copy.retrieveDetail).toContain("iknow-memory");
-    expect(copy.retrieveDetail).toContain("FIN_RETRIEVE_ADAPTER=fake");
-    // The other three fields still carry their real values.
-    expect(copy.modelLabel).toContain("fin/MiniMax-M3");
-    expect(copy.corpusLabel).toContain("12");
+    expect(copy.detail).toContain("引用");
+    expect(copy.detail).toContain("iknow-memory");
+    expect(copy.detail).toContain("FIN_RETRIEVE_ADAPTER=fake");
   });
 
-  it("marks a fake-adapter boot as reachable but corpus-less", () => {
-    const copy = describeStatusStrip({
+  it("marks a fake-adapter boot as reachable but local-placeholder", () => {
+    const copy = describeMonitorStatus({
       state: "ready",
-      status: { ...REACHABLE, retrieve_adapter_kind: "fake" },
+      status: REACHABLE_FAKE,
     });
-    expect(copy.retrieveTone).toBe("ok");
-    expect(copy.adapterLabel).toContain("fake");
-    expect(copy.adapterLabel).not.toContain("iknow-memory");
+    expect(copy.tone).toBe("ok");
+    expect(copy.detail).toContain("fake");
+    expect(copy.detail).not.toContain("iknow-memory");
   });
 
   it("says zero filings instead of hiding the count", () => {
-    const copy = describeStatusStrip({
+    const copy = describeMonitorStatus({
       state: "ready",
-      status: { ...REACHABLE, corpus_filing_count: 0 },
+      status: { ...REACHABLE_MCP, corpus_filing_count: 0 },
     });
-    expect(copy.corpusLabel).toContain("0");
+    expect(copy.detail).toContain("0");
   });
 
   it("degrades when the status route itself is unavailable", () => {
-    const copy = describeStatusStrip({ state: "unavailable" });
-    expect(copy.retrieveTone).toBe("degraded");
-    expect(copy.retrieveLabel).toContain("未知");
+    const copy = describeMonitorStatus({ state: "unavailable" });
+    expect(copy.tone).toBe("degraded");
+    expect(copy.headline).toContain("未知");
   });
 
   it("does not accuse the port while the first fetch is in flight", () => {
-    const copy = describeStatusStrip({ state: "loading" });
-    expect(copy.retrieveTone).toBe("ok");
-    expect(copy.retrieveLabel).not.toContain("不可用");
+    const copy = describeMonitorStatus({ state: "loading" });
+    expect(copy.tone).toBe("ok");
+    expect(copy.headline).not.toContain("不可用");
+  });
+
+  it("never surfaces model_identity on the 监控 copy (model is not a chrome line)", () => {
+    // Model stays on research-thread surfaces (composer / turn row).
+    // The 监控 page must not regress into a model card, even on a
+    // healthy boot where the slug is non-empty.
+    for (const view of views) {
+      const copy = describeMonitorStatus(view);
+      expect(copy.headline).not.toContain(REACHABLE_MCP.model_identity);
+      expect(copy.detail).not.toContain(REACHABLE_MCP.model_identity);
+    }
   });
 });

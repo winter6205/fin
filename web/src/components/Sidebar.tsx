@@ -5,14 +5,20 @@
 // 首页" label is gone and the active chrome is keyed off the
 // pathname via ``navChrome.ts``. T2 (specs/workbench-chrome.md): the
 // watchlist + notice form moved off the sidebar onto /monitor; this
-// surface is chrome + thread list only. The StatusStrip footer stays
-// — T3 takes it off.
+// surface is chrome + thread list only. T3: the StatusStrip footer
+// leaves the sidebar — boot-scoped status copy now lives on
+// /monitor, and an unreachable retrieve paints a non-text-only
+// mark on the 监控 entry instead of a footer strip.
 
 import * as Dialog from "@radix-ui/react-dialog";
 import { useState } from "react";
 import { NavLink, useLocation, useNavigate } from "react-router-dom";
-import { activeNavKey, NAV_ENTRIES } from "../navChrome";
-import { describeStatusStrip, workspaceStatusView } from "../statusStrip";
+import {
+  activeNavKey,
+  monitorNavMark,
+  NAV_ENTRIES,
+} from "../navChrome";
+import { workspaceStatusView } from "../statusStrip";
 import { useWorkspaceStore } from "../store";
 
 export function truncateTitle(title: string, max = 50): string {
@@ -79,6 +85,13 @@ export default function Sidebar() {
   const createThread = useWorkspaceStore((s) => s.createThread);
   const location = useLocation();
   const activeKey = activeNavKey(location.pathname);
+  // T3: a healthy /api/status that answers ``unreachable`` paints a
+  // non-text-only glyph next to the 监控 label. Route-level failures
+  // (``unavailable``) intentionally do NOT mark — those get their
+  // degraded copy on /monitor itself, never a sidebar alarm.
+  const status = useWorkspaceStore((s) => s.status);
+  const statusLoaded = useWorkspaceStore((s) => s.statusLoaded);
+  const monitorMark = monitorNavMark(workspaceStatusView(status, statusLoaded));
 
   return (
     <aside className="w-[280px] shrink-0 border-r border-black bg-page flex flex-col h-full">
@@ -109,7 +122,21 @@ export default function Sidebar() {
                 }`;
               }}
             >
-              {entry.label}
+              {entry.key === "monitor" && monitorMark ? (
+                <span className="inline-flex items-center gap-2">
+                  <span>{entry.label}</span>
+                  <span
+                    aria-label={monitorMark.aria}
+                    title={monitorMark.aria}
+                    data-testid="monitor-degraded-mark"
+                    className="inline-block h-2 w-2 rounded-full bg-accent text-accent"
+                  >
+                    {monitorMark.glyph}
+                  </span>
+                </span>
+              ) : (
+                entry.label
+              )}
             </NavLink>
           ))}
         </div>
@@ -136,48 +163,7 @@ export default function Sidebar() {
           ))}
         </ul>
       </nav>
-      <StatusStrip />
     </aside>
-  );
-}
-
-// T10 (ADR 0033): boot-scoped workspace status, pinned under the
-// thread list. Every state renders four lines — an unreachable
-// retrieve is degraded copy here, never an empty panel and never an
-// error page. T3 removes this footer; T2 leaves it alone.
-function StatusStrip() {
-  const status = useWorkspaceStore((s) => s.status);
-  const statusLoaded = useWorkspaceStore((s) => s.statusLoaded);
-  const copy = describeStatusStrip(workspaceStatusView(status, statusLoaded));
-  const degraded = copy.retrieveTone === "degraded";
-
-  return (
-    <section
-      aria-label="工作区状态"
-      className={`shrink-0 border-t border-black px-3 py-2 text-xs ${
-        degraded ? "bg-tool" : "bg-card"
-      }`}
-    >
-      <p data-testid="status-retrieve">
-        <span
-          className={`inline-block font-semibold ${
-            degraded
-              ? "border border-black bg-black px-1.5 py-0.5 text-white"
-              : "text-gray-700"
-          }`}
-        >
-          {copy.retrieveLabel}
-        </span>
-      </p>
-      <p className="mt-0.5 leading-snug text-gray-700">{copy.retrieveDetail}</p>
-      <ul className="mt-1.5 space-y-0.5 text-gray-600">
-        <li>{copy.adapterLabel}</li>
-        <li className="truncate" title={copy.modelLabel}>
-          {copy.modelLabel}
-        </li>
-        <li>{copy.corpusLabel}</li>
-      </ul>
-    </section>
   );
 }
 

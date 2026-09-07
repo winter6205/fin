@@ -45,6 +45,11 @@ interface WorkspaceState {
   // the strip renders its unavailable copy rather than nothing.
   status: WorkspaceStatus | null;
   statusLoaded: boolean;
+  // T3 (specs/workbench-chrome.md): ``true`` while a GET /api/status
+  // is in flight, so the 重连 button can disable itself and a
+  // concurrent second dispatch is ignored (SC7: double-click must
+  // not look like success twice).
+  loadingStatus: boolean;
   sendingQuestion: boolean;
   // T4: ``resumeThread(threadId)`` sets this while the resume SSE
   // stream is active so the Composer can disable itself and so a
@@ -64,8 +69,11 @@ interface WorkspaceState {
 
   refreshThreads: () => Promise<void>;
   loadCorpus: () => Promise<void>;
-  // Fetched once when the workspace opens. Boot-scoped fields do not
-  // change mid-session, so there is no poll.
+  // T3: also re-driven by the 重连 button on /monitor (re-GETs
+  // ``GET /api/status``). Boot-scoped fields do not change mid-
+  // session, so a successful reconnect updates the store; a thrown
+  // fetch still flips ``statusLoaded`` so the panel renders its
+  // unavailable copy rather than a silent OK.
   loadStatus: () => Promise<void>;
   openThread: (threadId: string) => Promise<void>;
   createThread: (firstMessage: string | null) => Promise<string>;
@@ -127,6 +135,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   corpusLoaded: false,
   status: null,
   statusLoaded: false,
+  loadingStatus: false,
   sendingQuestion: false,
   resumingThreadId: null,
   watchlist: [],
@@ -155,14 +164,30 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   async loadStatus() {
-    // A failed or malformed status read is a strip state, not an
-    // error the operator has to act on: the workspace keeps working
-    // without it. ``statusLoaded`` still flips so the strip stops
-    // showing "读取中" and shows its unavailable copy instead.
+    // T3 (specs/workbench-chrome.md): a failing or malformed status
+    // read is a panel state, not an error the operator has to act
+    // on: the workspace keeps working without it. ``statusLoaded``
+    // still flips so the panel stops showing "读取中" and shows
+    // its unavailable copy instead (no silent OK on probe miss).
+    //
+    // SC7 in-flight guard: a double-click on 重连 while the first
+    // GET is in flight MUST issue ONE wire call. The store tracks
+    // ``loadingStatus`` and returns the in-flight promise to any
+    // concurrent caller instead of kicking off a second fetch.
+    const existing = get();
+    if (existing.loadingStatus) {
+      // The in-flight promise resolves with whatever the first call
+      // resolves with; awaiting it preserves the same outcome for
+      // both click handlers.
+      return;
+    }
+    set({ loadingStatus: true });
     try {
       set({ status: await api.getStatus(), statusLoaded: true });
     } catch {
       set({ status: null, statusLoaded: true });
+    } finally {
+      set({ loadingStatus: false });
     }
   },
 

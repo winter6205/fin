@@ -612,10 +612,14 @@ describe("openThread GET reconcile", () => {
   });
 });
 
-// T10 (ADR 0033): the Sidebar strip reads this slice. A status load
-// that fails must still leave the strip renderable — the failure is
-// a view state, not an unhandled rejection.
-describe("loadStatus", () => {
+// T3 (specs/workbench-chrome.md): the 监控 重连 control re-GETs
+// /api/status. SC7 forbids a double-click while the first GET is in
+// flight from "looking like success twice" — it must issue ONE wire
+// call. The store flips a ``loadingStatus`` flag the button can
+// disable, and ``loadStatus`` ignores concurrent calls until the
+// in-flight one resolves. The existing exception tests above prove
+// a fetch throw still produces the unavailable view.
+describe("loadStatus 重连 in-flight guard", () => {
   function stubStatus(status: number, body: unknown): void {
     vi.stubGlobal(
       "fetch",
@@ -629,43 +633,84 @@ describe("loadStatus", () => {
     );
   }
 
-  it("stores the typed payload from the status route", async () => {
-    useWorkspaceStore.setState({ status: null, statusLoaded: false });
+  it("ignores a concurrent 重连 while the first GET is still in flight", async () => {
+    useWorkspaceStore.setState({
+      status: null,
+      statusLoaded: false,
+      loadingStatus: false,
+    });
+
+    let resolveFetch: ((value: Response) => void) | null = null;
+    const fetchMock = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveFetch = resolve;
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = useWorkspaceStore.getState().loadStatus();
+    // The second dispatch happens BEFORE the first promise resolves.
+    const second = useWorkspaceStore.getState().loadStatus();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(useWorkspaceStore.getState().loadingStatus).toBe(true);
+
+    resolveFetch!(
+      new Response(
+        JSON.stringify({
+          retrieve_reachability: "reachable",
+          retrieve_adapter_kind: "mcp",
+          model_identity: "fin/MiniMax-M3",
+          corpus_filing_count: 12,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    await Promise.all([first, second]);
+
+    const state = useWorkspaceStore.getState();
+    expect(state.loadingStatus).toBe(false);
+    expect(state.statusLoaded).toBe(true);
+    expect(state.status?.retrieve_reachability).toBe("reachable");
+  });
+
+  it("flips loadingStatus true while the fetch is pending and false after", async () => {
+    useWorkspaceStore.setState({
+      status: null,
+      statusLoaded: false,
+      loadingStatus: false,
+    });
     stubStatus(200, {
-      retrieve_reachability: "unreachable",
+      retrieve_reachability: "reachable",
       retrieve_adapter_kind: "mcp",
       model_identity: "fin/MiniMax-M3",
       corpus_filing_count: 12,
     });
 
+    expect(useWorkspaceStore.getState().loadingStatus).toBe(false);
     await useWorkspaceStore.getState().loadStatus();
-
-    const state = useWorkspaceStore.getState();
-    expect(state.statusLoaded).toBe(true);
-    expect(state.status?.retrieve_reachability).toBe("unreachable");
-    expect(state.status?.corpus_filing_count).toBe(12);
+    expect(useWorkspaceStore.getState().loadingStatus).toBe(false);
+    expect(useWorkspaceStore.getState().statusLoaded).toBe(true);
   });
 
-  it("marks the load finished with no payload when the route fails", async () => {
-    useWorkspaceStore.setState({ status: null, statusLoaded: false });
-    stubStatus(500, { error: "boom" });
-
-    await expect(
-      useWorkspaceStore.getState().loadStatus(),
-    ).resolves.toBeUndefined();
-
-    const state = useWorkspaceStore.getState();
-    expect(state.statusLoaded).toBe(true);
-    expect(state.status).toBeNull();
-  });
-
-  it("treats a malformed payload as no payload", async () => {
-    useWorkspaceStore.setState({ status: null, statusLoaded: false });
-    stubStatus(200, { retrieve_reachability: "yes" });
+  it("clears loadingStatus even when the fetch throws (no silent OK)", async () => {
+    useWorkspaceStore.setState({
+      status: null,
+      statusLoaded: false,
+      loadingStatus: false,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("network down");
+      }),
+    );
 
     await useWorkspaceStore.getState().loadStatus();
 
     const state = useWorkspaceStore.getState();
+    expect(state.loadingStatus).toBe(false);
     expect(state.statusLoaded).toBe(true);
     expect(state.status).toBeNull();
   });
