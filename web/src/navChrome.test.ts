@@ -1,19 +1,23 @@
-// Workbench chrome — three-entry sidebar nav. Pin the labels and
-// active-route mapping so the chrome never silently drifts back to
-// "Corpus 首页" / English labels. The mark helper decides whether the
-// 监控 entry carries a non-text-only degraded glyph, derived from a
-// view that only the store can produce.
+// Workbench chrome — two-entry sidebar nav (specs/workbench-sidebar-rail.md).
+// T1 retires the 对话 chrome entry: 知识库 and 监控 are the only chrome
+// rows now; research threads live in a 会话 disclosure below. The
+// helper pins labels so the chrome never silently drifts back to
+// "Corpus 首页" / English / a 对话 row, and pins active-route mapping
+// so / and /t/{id} light no chrome row (a thread page is a list item,
+// not a chrome entry). The mark helper decides whether the 监控 entry
+// carries a non-text-only degraded glyph, derived from a view that
+// only the store can produce.
 
 import { describe, expect, it } from "vitest";
 import { NAV_ENTRIES, activeNavKey, monitorNavMark } from "./navChrome";
 
 describe("NAV_ENTRIES", () => {
-  it("renders exactly three entries, in spec order", () => {
-    expect(NAV_ENTRIES.map((e) => e.label)).toEqual(["对话", "知识库", "监控"]);
+  it("renders exactly two entries, in spec order", () => {
+    expect(NAV_ENTRIES.map((e) => e.label)).toEqual(["知识库", "监控"]);
   });
 
   it("points each entry at its spec route", () => {
-    expect(NAV_ENTRIES.map((e) => e.route)).toEqual(["/", "/kb", "/monitor"]);
+    expect(NAV_ENTRIES.map((e) => e.route)).toEqual(["/kb", "/monitor"]);
   });
 
   it("never carries an English word in any label", () => {
@@ -29,16 +33,27 @@ describe("NAV_ENTRIES", () => {
       expect(entry.label).not.toContain("关注");
     }
   });
+
+  it("does not expose a 对话 chrome entry (retired in T1)", () => {
+    // The 对话 row was the overview the operator rejected; sessions
+    // live in the 会话 disclosure under the chrome, not in the chrome.
+    expect(NAV_ENTRIES.map((e) => e.label)).not.toContain("对话");
+    expect(NAV_ENTRIES.map((e) => e.route)).not.toContain("/");
+  });
 });
 
 describe("activeNavKey", () => {
-  it("lights 对话 on the home route", () => {
-    expect(activeNavKey("/")).toBe("chat");
+  it("does not light any entry on the home route", () => {
+    // / is no chrome — it is either a placeholder composer or a
+    // last-thread restore, not a 对话总览.
+    expect(activeNavKey("/")).toBeNull();
   });
 
-  it("lights 对话 on a thread route", () => {
-    expect(activeNavKey("/t/abc-123")).toBe("chat");
-    expect(activeNavKey("/t/some-thread-id-with-many-segments")).toBe("chat");
+  it("does not light any entry on a thread route", () => {
+    // A /t/{id} page is a research thread, not a chrome entry — the
+    // 会话 list item lights up, not the chrome.
+    expect(activeNavKey("/t/abc-123")).toBeNull();
+    expect(activeNavKey("/t/some-thread-id-with-many-segments")).toBeNull();
   });
 
   it("lights 知识库 on /kb", () => {
@@ -55,7 +70,7 @@ describe("activeNavKey", () => {
     expect(activeNavKey("/monitor/anything")).toBeNull();
   });
 
-  it("does not mis-light /t as 对话 without a slash", () => {
+  it("does not mis-light /t without a slash as any entry", () => {
     // ``/t`` alone (no thread id) is not a valid thread route.
     expect(activeNavKey("/t")).toBeNull();
   });

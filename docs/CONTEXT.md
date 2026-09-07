@@ -198,8 +198,8 @@ The product conversation: one `thread_id` the operator talks in; each question i
 _Avoid_: Q&A session, demo ask, one-shot invoke as the product UX, forbidding greetings or clarification on the thread
 
 **工作台**:
-The local web UI: chrome is 对话 / **知识库** / **监控**; create, list, open, resume, and delete a **research thread**; thinking and tool traces stream then collapse; citations sit on the assistant turn.
-_Avoid_: 知识库, 工作区 directory, CLI REPL as the product, hosted accounts this increment, POST /ask as the conversation surface, Corpus / MCP / Status as nav labels
+The local web UI: chrome is **知识库** / **监控**; **research thread**s live in a 会话 list, not a 对话 nav; create, list, open, resume, and delete a **research thread**; thinking and tool traces stream then collapse; citations sit on the assistant turn.
+_Avoid_: 知识库 as the UI name, 工作区 directory, CLI REPL as the product, hosted accounts this increment, POST /ask as the conversation surface, Corpus / MCP / Status as nav labels, 对话 as a chrome overview
 
 **工作区**:
 The one global default operator directory `$HOME/.fin/default` (created if missing). Every **research thread**, profile read, and **memory fact** workspace key uses this path.
@@ -218,8 +218,8 @@ The **工作台** route `/monitor`: issuer watchlist, in-app notices, and retrie
 _Avoid_: MCP as a nav label, StatusStrip in the sidebar footer, treating 监控 as a 工作区 picker
 
 **Corpus 首页**:
-Retired chrome name. The **知识库** catalog and ingest live on **工作台** route `/kb`. Distinct from `/` (对话 empty / last-thread restore) and from `/t/{thread_id}`.
-_Avoid_: `/` as corpus cards, Corpus as a nav label, conflating home with "last thread", auto-send from a corpus card, treating fetch of `GET /api/corpus` as ingest, sourcing cards from the current 工作区
+Retired chrome name. The **知识库** catalog and ingest live on **工作台** route `/kb`. Distinct from `/` (last-thread restore or empty composer — not a 对话总览) and from `/t/{thread_id}`.
+_Avoid_: `/` as corpus cards, `/` as a thread-card overview, Corpus as a nav label, 对话 as a chrome entry, auto-send from a corpus card, treating fetch of `GET /api/corpus` as ingest
 
 **v1 surface**:
 The first ship binary is a CLI that compiles the host graph; v1 HTTP exposes that same compiled graph and must call sync `invoke` (not `ainvoke`) so the sync `PostgresSaver` stays valid. HITL / interrupt UX is not a v1 product surface; crash resume continues the in-flight run on that `thread_id`.
