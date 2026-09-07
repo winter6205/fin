@@ -29,7 +29,11 @@ import {
   showThumbs,
   type FeedbackValue,
 } from "../turnFeedback";
-import { thinkingTailPreview, traceItemsFromTurn } from "../turnTrace";
+import {
+  foldOpenState,
+  thinkingTailPreview,
+  traceItemsFromTurn,
+} from "../turnTrace";
 import { useWorkspaceStore } from "../store";
 import { occupancyPercent, parseThreadOccupancy } from "../threadOccupancy";
 
@@ -616,11 +620,12 @@ function ThinkingFold({
   const [manualOpen, setManualOpen] = useState<boolean | null>(null);
   // Reset the manual override when the burst transitions live <-> ended.
   const [wasLive, setWasLive] = useState(live);
-  if (wasLive !== live) {
+  const liveChanged = wasLive !== live;
+  if (liveChanged) {
     setWasLive(live);
     setManualOpen(null);
   }
-  const open = manualOpen ?? live;
+  const open = foldOpenState(manualOpen, live, liveChanged);
   const showDurationLabel =
     !live && typeof durationMs === "number" && durationMs > 0;
   const label =
@@ -672,11 +677,12 @@ function ThinkingFold({
 function ToolsFold({ calls, live }: { calls: ToolSummary[]; live: boolean }) {
   const [manualOpen, setManualOpen] = useState<boolean | null>(null);
   const [wasLive, setWasLive] = useState(live);
-  if (wasLive !== live) {
+  const liveChanged = wasLive !== live;
+  if (liveChanged) {
     setWasLive(live);
     setManualOpen(null);
   }
-  const open = manualOpen ?? live;
+  const open = foldOpenState(manualOpen, live, liveChanged);
   return (
     <div className="mb-1">
       <button

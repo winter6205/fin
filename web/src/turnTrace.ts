@@ -14,6 +14,85 @@ export type TraceFrame =
   | { type: "tool_call"; name: string; tool_call_id: string }
   | { type: "tool_result"; summary: string; tool_call_id: string };
 
+/** The live-tool-row placeholder. Single source: the store, the
+ * folder, and the UI all show the same running copy. */
+export const RUNNING_SUMMARY = "运行中…";
+
+function runningRow(name: string, toolCallId: string): ToolSummary {
+  return { name, summary: RUNNING_SUMMARY, tool_call_id: toolCallId };
+}
+
+/** Close every still-live burst, returning the list unchanged when
+ * nothing is live (keeps the common all-closed path allocation-free). */
+function closeLive(items: TraceItem[]): TraceItem[] {
+  if (!items.some((item) => item.live)) return items;
+  return items.map((item) => (item.live ? { ...item, live: false } : item));
+}
+
+/** The tool burst holding ``toolCallId``, else null. */
+function findToolBurst(
+  items: TraceItem[],
+  toolCallId: string,
+): { item: Extract<TraceItem, { kind: "tools" }>; index: number } | null {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (
+      item.kind === "tools" &&
+      item.calls.some((call) => call.tool_call_id === toolCallId)
+    ) {
+      return { item, index };
+    }
+  }
+  return null;
+}
+
+function appendToolCall(
+  items: TraceItem[],
+  frame: TraceFrame & { type: "tool_call" },
+): TraceItem[] {
+  const last = items.length > 0 ? items[items.length - 1] : null;
+  if (last !== null && last.kind === "tools" && last.live) {
+    return [
+      ...items.slice(0, -1),
+      {
+        ...last,
+        calls: [...last.calls, runningRow(frame.name, frame.tool_call_id)],
+      },
+    ];
+  }
+  // A new tool burst closes an open thinking burst by arrival.
+  return [
+    ...closeLive(items),
+    {
+      kind: "tools",
+      calls: [runningRow(frame.name, frame.tool_call_id)],
+      live: true,
+    },
+  ];
+}
+
+function applyToolResult(
+  items: TraceItem[],
+  frame: TraceFrame & { type: "tool_result" },
+): TraceItem[] {
+  const found = findToolBurst(items, frame.tool_call_id);
+  if (found === null) {
+    // A result for an id no ``tool_call`` frame announced is
+    // dropped — there is no burst to render it in, and a phantom
+    // row would confuse the timeline (the store still reconciles
+    // the call via tool_summaries on GET).
+    return items;
+  }
+  const { item, index } = found;
+  const calls = item.calls.map((call) =>
+    call.tool_call_id === frame.tool_call_id
+      ? { ...call, summary: frame.summary }
+      : call,
+  );
+  const updated: TraceItem = { ...item, calls };
+  return [...items.slice(0, index), updated, ...items.slice(index + 1)];
+}
+
 /** Fold one frame into the trace-item list for the current turn.
  *
  * Burst rules (spec Boundaries lines 33-35):
@@ -32,85 +111,28 @@ export function foldTraceFrame(
   items: TraceItem[],
   frame: TraceFrame,
 ): TraceItem[] {
-  const last = items.length > 0 ? items[items.length - 1] : null;
   if (frame.type === "thinking") {
+    const last = items.length > 0 ? items[items.length - 1] : null;
     if (last !== null && last.kind === "thinking" && last.live) {
       const merged: TraceItem = { ...last, text: last.text + frame.text };
       return [...items.slice(0, -1), merged];
     }
     // A new thinking burst closes an open tool burst by arrival.
-    const closed = items.map((item) =>
-      item.live ? { ...item, live: false } : item,
-    );
-    return [...closed, { kind: "thinking", text: frame.text, live: true }];
-  }
-  if (frame.type === "tool_call") {
-    if (last !== null && last.kind === "tools" && last.live) {
-      const calls: ToolSummary[] = [
-        ...last.calls,
-        {
-          name: frame.name,
-          summary: "运行中…",
-          tool_call_id: frame.tool_call_id,
-        },
-      ];
-      return [...items.slice(0, -1), { ...last, calls }];
-    }
-    // A new tool burst closes an open thinking burst by arrival.
-    const closed = items.map((item) =>
-      item.live ? { ...item, live: false } : item,
-    );
     return [
-      ...closed,
-      {
-        kind: "tools",
-        calls: [
-          {
-            name: frame.name,
-            summary: "运行中…",
-            tool_call_id: frame.tool_call_id,
-          },
-        ],
-        live: true,
-      },
+      ...closeLive(items),
+      { kind: "thinking", text: frame.text, live: true },
     ];
   }
-  // tool_result: replace the matching placeholder inside a tool
-  // burst. A result for an id no ``tool_call`` frame announced is
-  // dropped — there is no burst to render it in, and a phantom row
-  // would confuse the timeline (the store still reconciles the call
-  // via tool_summaries on GET). The burst a result lands in stays
-  // live: more calls may join it.
-  const changed = items.some(
-    (item) =>
-      item.kind === "tools" &&
-      item.calls.some((call) => call.tool_call_id === frame.tool_call_id),
-  );
-  if (!changed) {
-    return items;
+  if (frame.type === "tool_call") {
+    return appendToolCall(items, frame);
   }
-  return items.map((item, index) => {
-    if (item.kind !== "tools") return item;
-    const hasCall = item.calls.some(
-      (call) => call.tool_call_id === frame.tool_call_id,
-    );
-    if (!hasCall) return item;
-    const calls = item.calls.map((call) =>
-      call.tool_call_id === frame.tool_call_id
-        ? { ...call, summary: frame.summary }
-        : call,
-    );
-    return item === items[index]
-      ? { ...item, calls, live: index === items.length - 1 && item.live }
-      : item;
-  });
+  return applyToolResult(items, frame);
 }
 
 /** Close any still-live burst (run ended / terminal frame arrived).
  * Auto-collapse runs here — burst end, per spec line 34. */
 export function closeOpenBursts(items: TraceItem[]): TraceItem[] {
-  if (!items.some((item) => item.live)) return items;
-  return items.map((item) => (item.live ? { ...item, live: false } : item));
+  return closeLive(items);
 }
 
 /** The last three lines of a burst's text, for the collapsed preview
@@ -124,6 +146,25 @@ export function thinkingTailPreview(text: string, lines = 3): string[] {
   }
   if (kept.length === 0) return [""];
   return kept.slice(-lines);
+}
+
+/** Open state for one burst fold (spec line 34): a manual toggle
+ * wins over the auto state (live) UNTIL the burst's liveness flips —
+ * auto-collapse at burst end always runs, but it cannot fight an
+ * operator's mid-burst open, and a user-opened completed burst stays
+ * open across re-renders. Extracted pure so the transition matrix is
+ * unit-testable without a DOM.
+ *
+ * (manualOpen, live) -> open; ``liveChanged`` says the burst just
+ * transitioned between live and ended (the caller then clears the
+ * override).
+ */
+export function foldOpenState(
+  manualOpen: boolean | null,
+  live: boolean,
+  liveChanged: boolean,
+): boolean {
+  return liveChanged ? live : (manualOpen ?? live);
 }
 
 /** Build the GET-restored trace for one persisted turn. The server

@@ -641,12 +641,11 @@ def test_format_tool_summary_save_memory_with_args_is_not_bare_name() -> None:
 
 def test_format_tool_summary_unknown_tool_error_result_shows_fail() -> None:
     """A result dict carrying ``error`` flips the one-liner to the
-    fail state."""
+    fail state with the error token appended."""
     out = format_tool_summary(
         "future_tool", result={"error": "boom"}, args={"query": "x"}
     )
-    assert out != "future_tool"
-    assert "boom" in out or "fail" in out or "失败" in out
+    assert out.endswith("fail (boom)")
 
 
 def test_format_tool_summary_unknown_tool_truncates_long_arg_values() -> None:

@@ -928,6 +928,57 @@ def _format_sse(event: str, data: Any) -> str:
 # ----- SSE frame builders (T1 #33 / T3) -----
 
 
+def _tool_result_frames(
+    message: ToolMessage,
+    pending_args: dict[str, dict[str, Any]] | None = None,
+) -> Iterator[tuple[str, Any]]:
+    """Yield the ``tool_result`` (plus ``comparison``/``analysis``)
+    frames for one ``ToolMessage``.
+
+    Split from :func:`_node_frame_payloads` to keep each function
+    under the complexity budget (code-review T2 finding): the
+    args-consuming summary belongs to the T1 contract, the
+    structured envelopes to the T3 comparison wire.
+    """
+    tool_name = getattr(message, "name", "") or ""
+    tool_call_id = getattr(message, "tool_call_id", "") or ""
+    raw_content = message.content
+    parsed: Any = raw_content
+    if isinstance(raw_content, str):
+        try:
+            parsed = json.loads(raw_content)
+        except (TypeError, ValueError):
+            parsed = raw_content
+    # Strip the marker from the human-readable summary so a
+    # bounce template embedded in tool output never escapes
+    # to the SPA (ADR 0021).
+    call_args = (
+        pending_args.get(tool_call_id) if pending_args is not None else None
+    )
+    if pending_args is not None and tool_call_id:
+        pending_args.pop(tool_call_id, None)
+    yield (
+        "tool_result",
+        {
+            "name": tool_name,
+            "summary": strip_hidden_bounce_marker(
+                format_tool_summary(tool_name, result=parsed, args=call_args)
+            ),
+            "tool_call_id": tool_call_id,
+        },
+    )
+    # T3: the comparison table rides its own frame so the SPA
+    # does not have to re-parse ``tool_result``. Reuses the
+    # graph's extractor so the wire entry and the persisted
+    # ``RunRecord.comparisons`` entry are byte-identical.
+    comparison = comparison_from_tool_message(message)
+    if comparison is not None:
+        yield ("comparison", comparison)
+    analysis = analysis_from_tool_message(message)
+    if analysis is not None:
+        yield ("analysis", analysis)
+
+
 def _node_frame_payloads(
     message: BaseMessage,
     pending_args: dict[str, dict[str, Any]] | None = None,
@@ -982,43 +1033,7 @@ def _node_frame_payloads(
             )
         return
     if isinstance(message, ToolMessage):
-        tool_name = getattr(message, "name", "") or ""
-        tool_call_id = getattr(message, "tool_call_id", "") or ""
-        raw_content = message.content
-        parsed: Any = raw_content
-        if isinstance(raw_content, str):
-            try:
-                parsed = json.loads(raw_content)
-            except (TypeError, ValueError):
-                parsed = raw_content
-        # Strip the marker from the human-readable summary so a
-        # bounce template embedded in tool output never escapes
-        # to the SPA (ADR 0021).
-        call_args = (
-            pending_args.get(tool_call_id) if pending_args is not None else None
-        )
-        if pending_args is not None and tool_call_id:
-            pending_args.pop(tool_call_id, None)
-        yield (
-            "tool_result",
-            {
-                "name": tool_name,
-                "summary": strip_hidden_bounce_marker(
-                    format_tool_summary(tool_name, result=parsed, args=call_args)
-                ),
-                "tool_call_id": tool_call_id,
-            },
-        )
-        # T3: the comparison table rides its own frame so the SPA
-        # does not have to re-parse ``tool_result``. Reuses the
-        # graph's extractor so the wire entry and the persisted
-        # ``RunRecord.comparisons`` entry are byte-identical.
-        comparison = comparison_from_tool_message(message)
-        if comparison is not None:
-            yield ("comparison", comparison)
-        analysis = analysis_from_tool_message(message)
-        if analysis is not None:
-            yield ("analysis", analysis)
+        yield from _tool_result_frames(message, pending_args)
 
 
 def _stream_run_frames(
