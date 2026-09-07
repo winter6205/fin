@@ -1,11 +1,11 @@
-// Copy for the Corpus 首页 cards.
+// Copy for the 知识库 (/kb) cards.
 //
-// Spec Focus 2: the home page lists form / period so the operator can
+// Spec Focus 2: the kb page lists form / period so the operator can
 // see what is in the library. The catalog stopped being a 10-Q-only
 // slice, so no string here may assume one — a 10-K row that reads
 // "10-Q" on the card is worse than no label at all. Rendering lives in
-// components/CorpusCard.tsx and pages/HomePage.tsx; the wording lives
-// here so it is unit-testable without a DOM.
+// components/CorpusCard.tsx and pages/KnowledgeBasePage.tsx; the
+// wording lives here so it is unit-testable without a DOM.
 
 import type { Filing } from "./types";
 
