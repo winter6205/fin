@@ -1,6 +1,6 @@
 # Spec: workbench sidebar rail (知识库 / 监控 + 会话)
 
-> Increment on merged that pull request (`specs/workbench-chrome.md`). **对话 as a chrome entry is retired** — that row was the overview the operator does not want. Soft-Track `dialogue` is unchanged.
+> Increment on a merged pull request (`specs/workbench-chrome.md`). **对话 as a chrome entry is retired** — that row was the overview the operator does not want. Soft-Track `dialogue` is unchanged.
 
 ## Assumption gate (confirmed 2026-09-07 in-thread)
 
@@ -21,7 +21,7 @@ The operator can tell **places** (知识库, 监控) apart from **chats** (会�
 
 Quoted from `docs/CONTEXT.md` after persist of this increment:
 
-- **工作台**: The local web UI: chrome is **知识库** / **监控**; **research thread**s live in a 会话 list, not a 对话 nav; create, list, open, resume, and delete a **research thread**; thinking and tool traces stream then collapse; citations sit on the assistant turn.
+- **工作台**: The local web UI: chrome is **知识库** / **监控**; **research thread**s live in a 会话 list, not a 对话 nav; create, list, open, resume, and delete a **research thread**; **thinking fold**s and **tool fold**s stream then collapse; citations sit on the assistant turn.
 - **知识库** / **监控** / **research thread**: unchanged meaning; **监控** is still `/monitor`.
 
 ## Boundaries
@@ -53,7 +53,7 @@ Quoted from `docs/CONTEXT.md` after persist of this increment:
 
 ## Inherits / Changes
 
-**Inherits:** SPA `web/` Soft Brutalism; routes `/kb` `/monitor` `/t/{id}` from `specs/workbench-chrome.md` / that pull request; last-thread restore + kb/monitor session gates; ADR 0033 status route; watchlist on `/monitor`.
+**Inherits:** SPA `web/` Soft Brutalism; routes `/kb` `/monitor` `/t/{id}` from `specs/workbench-chrome.md`; last-thread restore + kb/monitor session gates; ADR 0033 status route; watchlist on `/monitor`.
 
 **Changes:** 对话 chrome retired; 会话 disclosure; SVG icons; 企业知识库助手; retrieve-down without a right-side dot. ADR 0050 amended (not superseded).
 

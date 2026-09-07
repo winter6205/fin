@@ -26,7 +26,7 @@ The operator uses the **工作台**: new dialogue and the thread list are one pr
 Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 
 - **fin**: An enterprise knowledge-base Agent: the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held filings behind the **retrieve port**.
-- **工作台**: The local web UI: create, list, open, resume, and delete a **research thread**; thinking and tool traces stream then collapse; citations sit on the assistant turn.
+- **工作台**: The local web UI: create, list, open, resume, and delete a **research thread**; **thinking fold**s and **tool fold**s stream then collapse; citations sit on the assistant turn.
 - **工作区**: The one global default operator directory `$HOME/.fin/default` (created if missing). Every **research thread**, profile read, and **memory fact** workspace key uses this path.
 - **知识库**: The one process-wide corpus (catalog, ingest tree, **retrieve port**) shared by every **research thread**.
 - **workspace**: Retired alias: the UI is **工作台**; the operator directory is **工作区**. Kept so older specs remain readable.
