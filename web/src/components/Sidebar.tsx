@@ -1,12 +1,13 @@
-// Sidebar: 280px, two-entry chrome (知识库 / 监控) + 会话 list.
-// T1 (specs/workbench-sidebar-rail.md) retires the 对话 chrome row;
-// research threads live in the 会话 list under a 1px black rule.
-// T2 will wrap the thread list in a foldable 会话 disclosure; for T1
-// the rule separates chrome (brand + two nav entries) from the
-// thread list area, and a placeholder paragraph marks where the
-// disclosure header will land so the rule's job is visible. Icons
-// are 16px stroke SVG using currentColor so they follow the
-// active/inactive text color — no emoji, no new icon package.
+// Sidebar: 280px, two-entry chrome (知识库 / 监控) + 会话 disclosure.
+// T2 (specs/workbench-sidebar-rail.md) wraps 新建 + the thread list in
+// a foldable 会话 group under the chrome's 1px black rule. The
+// disclosure is a real <button aria-expanded> so Enter/Space toggle
+// it natively; folding is remembered for the session via
+// readSessionsFolded/writeSessionsFolded (storage-unavailable safe,
+// default unfolded). The folded rail still shows the thread count so
+// threads never feel lost, and an empty list shows the visible
+// 「尚无对话」 empty state rather than a blank rail. Icons are 16px
+// stroke SVG using currentColor — no emoji, no new icon package.
 // Active thread highlighted with the single blue accent. T3: the
 // StatusStrip footer left the sidebar; an unreachable retrieve
 // paints a non-text-only mark on the 监控 entry instead.
@@ -21,12 +22,17 @@ import {
   type NavKey,
 } from "../navChrome";
 import { workspaceStatusView } from "../statusStrip";
+import { readSessionsFolded, writeSessionsFolded } from "../sessionKeys";
 import { useWorkspaceStore } from "../store";
 
 export function truncateTitle(title: string, max = 50): string {
   if (title.length <= max) return title;
   return title.slice(0, max) + "…";
 }
+
+/** id of the thread-list container so the disclosure button's
+ * aria-controls points at what it expands. */
+const SESSIONS_LIST_ID = "sidebar-sessions-list";
 
 /** 16px stroke SVG glyph for a chrome entry. currentColor so the
  * icon follows the active/inactive text color (no per-state color
@@ -134,18 +140,30 @@ export default function Sidebar() {
   // T3: a healthy /api/status that answers ``unreachable`` paints a
   // non-text-only glyph next to the 监控 label. Route-level failures
   // (``unavailable``) intentionally do NOT mark — those get their
-  // degraded copy on /monitor itself, never a sidebar alarm. T1
-  // leaves the presentation alone — T3 swaps the pebble for label
-  // copy + icon.
+  // degraded copy on /monitor itself, never a sidebar alarm.
   const status = useWorkspaceStore((s) => s.status);
   const statusLoaded = useWorkspaceStore((s) => s.statusLoaded);
   const monitorMark = monitorNavMark(workspaceStatusView(status, statusLoaded));
+  // Fold state starts from sessionStorage and persists on every
+  // toggle, so the rail stays as the operator left it this session.
+  const [sessionsOpen, setSessionsOpen] = useState(() => {
+    try {
+      return !readSessionsFolded(window.sessionStorage);
+    } catch {
+      return true; /* no storage at all - default unfolded. */
+    }
+  });
+  const toggleSessions = () => {
+    setSessionsOpen((open) => {
+      writeSessionsFolded(!open, window.sessionStorage);
+      return !open;
+    });
+  };
 
   return (
     <aside className="w-[280px] shrink-0 border-r border-black bg-page flex flex-col h-full">
       {/* T1: chrome = brand + two nav entries. The 1px rule on this
-          block separates chrome from the 会话 list area below; T2
-          will lift the thread list into a foldable 会话 disclosure. */}
+          block separates chrome from the 会话 disclosure below. */}
       <div className="border-b border-black">
         <div className="p-4">
           <h1 className="text-lg font-bold tracking-tight">fin</h1>
@@ -188,37 +206,70 @@ export default function Sidebar() {
           </ul>
         </nav>
       </div>
-      {/* T2 placeholder: the 会话 disclosure header lands here, so
-          the rule above is the visual split between chrome and the
-          会话 surface (sessions + 新建 + thread list). For T1 the
-          thread list + 新建 stay directly below the rule. */}
-      <div className="p-3">
-        <NewThreadButton onCreate={() => createThread(null)} />
+      {/* T2: the 会话 disclosure — 新建 + thread links live inside the
+          group, indented under the header. The rule above is the
+          visual split between chrome and this group. The count stays
+          visible when folded so threads are not lost; an empty list
+          shows the dashed empty state instead of a blank rail. */}
+      <div className="flex-1 overflow-y-auto p-3">
+        <button
+          type="button"
+          aria-expanded={sessionsOpen}
+          aria-controls={SESSIONS_LIST_ID}
+          onClick={toggleSessions}
+          className="mb-2 flex w-full items-center gap-1 border border-black px-2 py-1.5 text-left text-sm font-semibold bg-card hover:bg-tool"
+        >
+          <span aria-hidden="true" className="w-3 text-xs">
+            {sessionsOpen ? "▾" : "▸"}
+          </span>
+          <span className="flex-1">会话</span>
+          <span className="text-xs font-normal text-gray-600">
+            ({threads.length})
+          </span>
+        </button>
+        {sessionsOpen ? (
+          <div className="pl-3">
+            <div className="mb-2">
+              <NewThreadButton onCreate={() => createThread(null)} />
+            </div>
+            <nav aria-label="会话">
+              <ul id={SESSIONS_LIST_ID}>
+                {threads.length === 0 ? (
+                  <li>
+                    <p className="border border-dashed border-black p-3 text-sm text-gray-500 bg-card">
+                      尚无对话 — 在下方提问，或选择一份语料（侧栏 知识库）。
+                    </p>
+                  </li>
+                ) : (
+                  threads.map((t) => (
+                    <li key={t.id} className="group flex items-center py-1">
+                      <NavLink
+                        to={`/t/${t.id}`}
+                        className={({ isActive }) =>
+                          `flex-1 truncate border px-2 py-1.5 text-sm ${
+                            isActive
+                              ? "border-accent bg-accent text-white"
+                              : "border-transparent hover:border-black"
+                          }`
+                        }
+                        title={t.title}
+                      >
+                        {truncateTitle(t.title)}
+                      </NavLink>
+                      <span className="ml-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100">
+                        <DeleteThreadDialog
+                          threadId={t.id}
+                          threadTitle={t.title}
+                        />
+                      </span>
+                    </li>
+                  ))
+                )}
+              </ul>
+            </nav>
+          </div>
+        ) : null}
       </div>
-      <nav aria-label="会话" className="flex-1 overflow-y-auto">
-        <ul>
-          {threads.map((t) => (
-            <li key={t.id} className="group flex items-center px-3 py-1">
-              <NavLink
-                to={`/t/${t.id}`}
-                className={({ isActive }) =>
-                  `flex-1 truncate border px-2 py-1.5 text-sm ${
-                    isActive
-                      ? "border-accent bg-accent text-white"
-                      : "border-transparent hover:border-black"
-                  }`
-                }
-                title={t.title}
-              >
-                {truncateTitle(t.title)}
-              </NavLink>
-              <span className="ml-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100">
-                <DeleteThreadDialog threadId={t.id} threadTitle={t.title} />
-              </span>
-            </li>
-          ))}
-        </ul>
-      </nav>
     </aside>
   );
 }
