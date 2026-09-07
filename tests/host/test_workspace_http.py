@@ -778,7 +778,8 @@ def test_get_history_keeps_row_for_empty_tool_call_id(
     assert summaries[0]["name"] == "read_file"
 
 
-def test_send_message_turn_row_exposes_tool_summaries_as_dicts(    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+def test_send_message_turn_row_exposes_tool_summaries_as_dicts(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
 ) -> None:
     """T3 (spec line 32): the persisted turn row carries
     ``tool_summaries`` as a list of ``{name, summary, tool_call_id}``

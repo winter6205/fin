@@ -1153,9 +1153,11 @@ def format_tool_summary(
     Exhaustive over the host graph's six model-facing tools (ADR 0009 +
     ``get_xbrl_fact`` from ADR 0031 + ``compare_facts`` from the
     enterprise-kb Focus 1 + ``research_issuers`` from Focus 4 /
-    ADR 0034). An unknown name falls back to the bare tool name so a
-    future tool still surfaces a readable row in the tools region
-    instead of an empty cell - never raw JSON.
+    ADR 0034). An unknown name (including the memory tools) renders
+    name + up to two arg values + done/fail via
+    :func:`_format_unknown_tool_summary` when args or a result dict
+    exist; only a call with NEITHER falls back to the bare tool name
+    so a future tool still surfaces a readable row - never raw JSON.
     """
     result_dict = result if isinstance(result, dict) else None
     if name == "list_files":

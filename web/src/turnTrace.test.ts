@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   closeOpenBursts,
+  foldOpenState,
   foldTraceFrame,
   thinkingTailPreview,
   traceItemsFromTurn,
@@ -152,6 +153,29 @@ describe("thinkingTailPreview", () => {
 
   it("handles empty text", () => {
     expect(thinkingTailPreview("")).toEqual([""]);
+  });
+});
+
+describe("foldOpenState", () => {
+  it("follows the live state with no manual override", () => {
+    expect(foldOpenState(null, true, false)).toBe(true);
+    expect(foldOpenState(null, false, false)).toBe(false);
+  });
+
+  it("keeps a manual open during the same live burst (no fighting)", () => {
+    // Operator expanded a live burst: stays open even though the
+    // auto state would collapse (manual wins until liveness flips).
+    expect(foldOpenState(true, true, false)).toBe(true);
+    // Operator collapsed a live burst: stays collapsed mid-burst.
+    expect(foldOpenState(false, true, false)).toBe(false);
+  });
+
+  it("resets the override when the burst's liveness flips (auto-collapse at end)", () => {
+    // A burst the operator manually opened collapses at burst end.
+    expect(foldOpenState(true, false, true)).toBe(false);
+    // A completed burst the operator opened stays open (override set
+    // AFTER the transition — liveChanged false again).
+    expect(foldOpenState(true, false, false)).toBe(true);
   });
 });
 
