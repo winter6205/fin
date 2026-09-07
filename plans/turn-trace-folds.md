@@ -5,7 +5,7 @@
 **Spec link:** `specs/turn-trace-folds.md`
 **ACR:** all-yes (block below)
 **Per-ticket loop (all bullets):** tdd → typecheck+tests → code-review → verification-before-completion → one commit on the ticket branch
-**Tracker:** GitHub `ready-for-agent` issues (created with this plan). Fallback not used (`gh` authenticated).
+**Tracker:** GitHub. Spec: spec: turn trace folds. Tickets: T1 SSE and persist tool one-liners share args, T2 Thinking fold and tool fold on the live timeline (blocked by T1), T3 Last-turn SVG thumbs (parallel).
 
 ## ACR
 
