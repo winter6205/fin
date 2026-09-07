@@ -26,6 +26,7 @@ import {
   canSubmitFeedback,
   feedbackErrorVisible,
   isFeedbackActive,
+  showThumbs,
   type FeedbackValue,
 } from "../turnFeedback";
 import { useWorkspaceStore } from "../store";
@@ -151,7 +152,14 @@ export default function ThreadPage() {
         {activeThread.turns.map((turn, index) => (
           // Turn rows are append-only; a stable index key avoids
           // remounting when the server-minted ``run_id`` reconciles.
-          <TurnView key={index} turn={turn} threadId={thread_id} />
+          <TurnView
+            key={index}
+            turn={turn}
+            turnIndex={index}
+            turns={activeThread.turns}
+            threadId={thread_id}
+            threadInFlight={activeThread.in_flight === true}
+          />
         ))}
 
         {/* Spec #2: a freshly-created (zero-turn) thread must still
@@ -248,7 +256,19 @@ function EmptyThreadCorpusGrid() {
   );
 }
 
-function TurnView({ turn, threadId }: { turn: Turn; threadId: string }) {
+function TurnView({
+  turn,
+  turnIndex,
+  turns,
+  threadId,
+  threadInFlight,
+}: {
+  turn: Turn;
+  turnIndex: number;
+  turns: Turn[];
+  threadId: string;
+  threadInFlight: boolean;
+}) {
   // T4 (#37): while THIS turn is live (optimistic send or a
   // lock-held latest row) the tool rows stay open and the thinking
   // region line-clamps; after the run both collapse.
@@ -361,10 +381,11 @@ function TurnView({ turn, threadId }: { turn: Turn; threadId: string }) {
       )}
       {/* T8: the thumbs tail card — the operator's verdict on this
           turn, rendered after the answer card so it reads as a
-          per-turn action, not part of the answer. Gated to terminal
-          rows (canSubmitFeedback) so a live optimistic turn — whose
-          run_id is still a client placeholder — shows nothing. */}
-      {canSubmitFeedback(turn) ? (
+          per-turn action. T3 (the tracked change): gated to the LAST terminal
+          turn of a thread that is not in_flight (showThumbs) —
+          older turns show nothing; canSubmitFeedback stays the
+          persist gate inside FeedbackControls. */}
+      {showThumbs(turnIndex, turns, threadInFlight) ? (
         <FeedbackControls threadId={threadId} turn={turn} />
       ) : null}
     </article>
@@ -379,6 +400,11 @@ function TurnView({ turn, threadId }: { turn: Turn; threadId: string }) {
 // surfaces as an inline "提交失败，请重试" hint next to the thumbs;
 // the hint clears on the next submit (transition pinned in
 // ``turnFeedback.feedbackErrorVisible``).
+// T3 (the tracked change): the word buttons (有帮助 / 没帮助) become stroke SVG
+// thumbs (no emoji, no words) — same stroke idiom as Sidebar's
+// 16x16 nav icons. testids / aria-pressed / inline retry copy keep
+// their existing contract; canSubmitFeedback stays the persist
+// gate so a turn that lost its run_id can never POST.
 function FeedbackControls({
   threadId,
   turn,
@@ -389,6 +415,7 @@ function FeedbackControls({
   const setTurnFeedback = useWorkspaceStore((s) => s.setTurnFeedback);
   const [submitFailed, setSubmitFailed] = useState(false);
   const submit = (value: FeedbackValue) => {
+    if (!canSubmitFeedback(turn)) return;
     setSubmitFailed((current) => feedbackErrorVisible(current, "submit"));
     setTurnFeedback(threadId, turn.run_id, value).catch(() => {
       setSubmitFailed((current) => feedbackErrorVisible(current, "failure"));
@@ -396,8 +423,8 @@ function FeedbackControls({
   };
   const buttonClass = (active: boolean) =>
     active
-      ? "border border-black bg-accent px-2 py-1 text-xs text-white"
-      : "border border-black bg-card px-2 py-1 text-xs hover:bg-accent hover:text-white";
+      ? "border border-black bg-accent px-1.5 py-1 text-white"
+      : "border border-black bg-card px-1.5 py-1 hover:bg-accent hover:text-white";
   return (
     <div className="flex max-w-3xl mx-auto justify-end gap-2 items-center" data-testid="turn-feedback">
       {submitFailed ? (
@@ -409,21 +436,46 @@ function FeedbackControls({
         type="button"
         data-testid="feedback-up"
         aria-pressed={isFeedbackActive(turn, "up")}
+        aria-label="有帮助"
         onClick={() => submit("up")}
         className={buttonClass(isFeedbackActive(turn, "up"))}
       >
-        有帮助
+        <ThumbIcon direction="up" />
       </button>
       <button
         type="button"
         data-testid="feedback-down"
         aria-pressed={isFeedbackActive(turn, "down")}
+        aria-label="没帮助"
         onClick={() => submit("down")}
         className={buttonClass(isFeedbackActive(turn, "down"))}
       >
-        没帮助
+        <ThumbIcon direction="down" />
       </button>
     </div>
+  );
+}
+
+// T3 (the tracked change): stroke thumbs-up / thumbs-down icon, one path set
+// mirrored vertically for "down" — matches the Sidebar nav-icon
+// idiom (16x16 viewBox, stroke currentColor, no fill).
+function ThumbIcon({ direction }: { direction: "up" | "down" }) {
+  return (
+    <svg
+      aria-hidden="true"
+      width="16"
+      height="16"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="square"
+      strokeLinejoin="miter"
+      style={direction === "down" ? { transform: "rotate(180deg)" } : undefined}
+    >
+      <path d="M2 7h2.5v7H2z" />
+      <path d="M4.5 8l3-5.5c.8 0 1.5.7 1.5 1.5V6.5h3.2c.9 0 1.5.8 1.3 1.6l-1 4.4c-.1.6-.7 1-1.3 1H4.5" />
+    </svg>
   );
 }
 
