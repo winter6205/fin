@@ -9,8 +9,9 @@
 // 「尚无对话」 empty state rather than a blank rail. Icons are 16px
 // stroke SVG using currentColor — no emoji, no new icon package.
 // Active thread highlighted with the single blue accent. T3: the
-// StatusStrip footer left the sidebar; an unreachable retrieve
-// paints a non-text-only mark on the 监控 entry instead.
+// StatusStrip footer left the sidebar; an unreachable retrieve paints
+// the warning as 「监控 · 搜索断开」 + a warning icon variant — no
+// right-side pebble, so color is never the sole cue.
 
 import * as Dialog from "@radix-ui/react-dialog";
 import { useState, type ReactNode } from "react";
@@ -36,8 +37,16 @@ const SESSIONS_LIST_ID = "sidebar-sessions-list";
 
 /** 16px stroke SVG glyph for a chrome entry. currentColor so the
  * icon follows the active/inactive text color (no per-state color
- * drift). Inline + hand-drawn: no icon-package dependency added. */
-function NavIcon({ name }: { name: NavKey }): ReactNode {
+ * drift). Inline + hand-drawn: no icon-package dependency added.
+ * ``warning`` swaps the monitor pulse for an attention triangle —
+ * T3: the degraded 监控 state is named in icon + label text. */
+function NavIcon({
+  name,
+  warning = false,
+}: {
+  name: NavKey;
+  warning?: boolean;
+}): ReactNode {
   if (name === "kb") {
     // Open book — two pages, spine on the left.
     return (
@@ -54,6 +63,27 @@ function NavIcon({ name }: { name: NavKey }): ReactNode {
       >
         <path d="M2 3h5v10H2zM9 3h5v10H9z" />
         <path d="M8 3v10" />
+      </svg>
+    );
+  }
+  if (name === "monitor" && warning) {
+    // Warning variant: attention triangle with an exclamation mark —
+    // a distinct silhouette from the pulse circle, not just a color.
+    return (
+      <svg
+        aria-hidden="true"
+        width="16"
+        height="16"
+        viewBox="0 0 16 16"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="square"
+        strokeLinejoin="miter"
+      >
+        <path d="M8 2 L14.5 13.5 H1.5 Z" />
+        <path d="M8 6.5v3" />
+        <path d="M8 11.5h0.01" />
       </svg>
     );
   }
@@ -137,8 +167,9 @@ export default function Sidebar() {
   const createThread = useWorkspaceStore((s) => s.createThread);
   const location = useLocation();
   const activeKey = activeNavKey(location.pathname);
-  // T3: a healthy /api/status that answers ``unreachable`` paints a
-  // non-text-only glyph next to the 监控 label. Route-level failures
+  // T3: a healthy /api/status that answers ``unreachable`` paints the
+  // warning in icon + label text on the 监控 entry (「监控 · 搜索断
+  // 开」 + warning icon) — no right-side pebble. Route-level failures
   // (``unavailable``) intentionally do NOT mark — those get their
   // degraded copy on /monitor itself, never a sidebar alarm.
   const status = useWorkspaceStore((s) => s.status);
@@ -188,18 +219,27 @@ export default function Sidebar() {
                     }`;
                   }}
                 >
-                  <NavIcon name={entry.key} />
-                  <span className="flex-1">{entry.label}</span>
-                  {entry.key === "monitor" && monitorMark ? (
-                    <span
-                      aria-label={monitorMark.aria}
-                      title={monitorMark.aria}
-                      data-testid="monitor-degraded-mark"
-                      className="inline-block h-2 w-2 rounded-full bg-accent text-accent"
-                    >
-                      {monitorMark.glyph}
-                    </span>
-                  ) : null}
+                  <NavIcon
+                    name={entry.key}
+                    warning={entry.key === "monitor" && monitorMark !== null}
+                  />
+                  <span
+                    className="flex-1"
+                    aria-label={
+                      entry.key === "monitor" && monitorMark
+                        ? monitorMark.aria
+                        : undefined
+                    }
+                    title={
+                      entry.key === "monitor" && monitorMark
+                        ? monitorMark.aria
+                        : undefined
+                    }
+                  >
+                    {entry.key === "monitor" && monitorMark
+                      ? monitorMark.label
+                      : entry.label}
+                  </span>
                 </NavLink>
               </li>
             ))}

@@ -127,10 +127,14 @@ describe("monitorNavMark", () => {
       },
     });
     expect(mark).not.toBeNull();
-    // Non-text-only: a glyph + non-empty aria text. The operator
-    // has to learn this without reading the entry label.
-    expect(mark?.glyph.length).toBeGreaterThan(0);
+    // The warning is painted in icon + label text, never a right-side
+    // pebble: the label names the failure (搜索断开), the aria text
+    // names it too, and the icon state flips to the warning variant.
+    expect(mark?.label).toBe("监控 · 搜索断开");
+    expect(mark?.label).toContain("搜索断开");
     expect(mark?.aria.length).toBeGreaterThan(0);
+    expect(mark?.aria).toContain("搜索断开");
+    expect(mark?.icon).toBe("warning");
   });
 
   it("returns a degraded mark when the port is unreachable regardless of adapter kind", () => {
@@ -146,5 +150,7 @@ describe("monitorNavMark", () => {
       },
     });
     expect(mark).not.toBeNull();
+    expect(mark?.icon).toBe("warning");
+    expect(mark?.label).toContain("搜索断开");
   });
 });
