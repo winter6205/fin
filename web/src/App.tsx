@@ -58,7 +58,7 @@ function ThreadRoute() {
 // top-left and left ~90% of the viewport blank - functionally a blank
 // chat surface. Center the card vertically with a min-height so the
 // "404 + back" presentation has visual weight, then point the user
-// at the thread list.
+// home; other threads stay reachable in the sidebar 会话 group.
 function NotFoundThread() {
   const navigate = useNavigate();
   return (
@@ -67,13 +67,13 @@ function NotFoundThread() {
         <h2 className="text-lg font-semibold mb-2">对话不存在</h2>
         <p className="text-sm text-gray-600 mb-4">
           此研究 thread 不存在（可能已删除，或服务重启后未保留持久化
-          checkpoint）。
+          checkpoint）。其他 thread 可在侧栏「会话」列表打开。
         </p>
         <button
           onClick={() => navigate("/")}
           className="border border-black px-3 py-1.5 text-sm hover:bg-accent hover:text-white"
         >
-          返回对话列表
+          返回首页
         </button>
       </div>
     </main>
