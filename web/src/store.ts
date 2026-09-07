@@ -27,6 +27,12 @@ import {
   mergeReconciledTurn,
   type LiveAnswerState,
 } from "./turnStream";
+import {
+  closeOpenBursts,
+  foldTraceFrame,
+  RUNNING_SUMMARY,
+  type TraceFrame,
+} from "./turnTrace";
 
 interface WorkspaceState {
   threads: ThreadListItem[];
@@ -124,6 +130,21 @@ interface WorkspaceState {
     runId: string,
     value: FeedbackValue,
   ) => Promise<void>;
+}
+
+// turn-trace-folds (the tracked change): fold one wire frame into the turn's burst
+// timeline. Shared by send and resume so the two paths cannot drift
+// on burst semantics (arrival-order folds, auto-collapse at burst
+// end). Plain helpers — no state access.
+function foldTraceFrameOntoTurn(t: Turn, frame: TraceFrame): Turn {
+  return {
+    ...t,
+    trace_items: foldTraceFrame(t.trace_items ?? [], frame),
+  };
+}
+
+function closeOpenBurstsOnTurn(t: Turn): Turn {
+  return { ...t, trace_items: closeOpenBursts(t.trace_items ?? []) };
 }
 
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
@@ -309,7 +330,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         switch (event.type) {
           case "thinking":
             patchTurn((t) => ({
-              ...t,
+              ...foldTraceFrameOntoTurn(t, event),
               thinking_text: t.thinking_text + event.text,
             }));
             break;
@@ -320,11 +341,11 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
             // server-formatted one-liner.
             const placeholder: ToolSummary = {
               name: event.name,
-              summary: "运行中…",
+              summary: RUNNING_SUMMARY,
               tool_call_id: event.tool_call_id,
             };
             patchTurn((t) => ({
-              ...t,
+              ...foldTraceFrameOntoTurn(t, event),
               tool_summaries: [...(t.tool_summaries ?? []), placeholder],
             }));
             break;
@@ -333,7 +354,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
             // The server already formatted the summary (spec line
             // 32); replace the "running…" placeholder with it.
             patchTurn((t) => ({
-              ...t,
+              ...foldTraceFrameOntoTurn(t, event),
               tool_summaries: (t.tool_summaries ?? []).map((s) =>
                 s.tool_call_id === event.tool_call_id
                   ? { ...s, summary: event.summary }
@@ -344,12 +365,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           }
           case "status": {
             statusSeen = true;
+            // turn-trace-folds: the run ended — close any still-live
+            // burst so the folds auto-collapse (spec line 34).
             // Patch by the CLIENT placeholder id first — updating
             // ``optimisticRunId`` before the patch would orphan the
             // optimistic row and freeze the live view until GET.
             const priorRunId = optimisticRunId;
             patchTurnByRunId(priorRunId, (t) => ({
-              ...t,
+              ...closeOpenBurstsOnTurn(t),
               run_id: event.run_id,
               status: event.status,
               status_reason: event.reason ?? "",
@@ -400,7 +423,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       const cur = get().activeThread;
       if (cur?.id === threadId) {
         patchTurn((t) => ({
-          ...t,
+          ...closeOpenBurstsOnTurn(t),
           in_flight: false,
           citations:
             result.citations.length > 0 ? result.citations : t.citations,
@@ -474,25 +497,25 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         switch (event.type) {
           case "thinking":
             patchLatestTurn(threadId, (t) => ({
-              ...t,
+              ...foldTraceFrameOntoTurn(t, event),
               thinking_text: t.thinking_text + event.text,
             }));
             break;
           case "tool_call": {
             const placeholder: ToolSummary = {
               name: event.name,
-              summary: "运行中…",
+              summary: RUNNING_SUMMARY,
               tool_call_id: event.tool_call_id,
             };
             patchLatestTurn(threadId, (t) => ({
-              ...t,
+              ...foldTraceFrameOntoTurn(t, event),
               tool_summaries: [...(t.tool_summaries ?? []), placeholder],
             }));
             break;
           }
           case "tool_result": {
             patchLatestTurn(threadId, (t) => ({
-              ...t,
+              ...foldTraceFrameOntoTurn(t, event),
               tool_summaries: (t.tool_summaries ?? []).map((s) =>
                 s.tool_call_id === event.tool_call_id
                   ? { ...s, summary: event.summary }
@@ -504,7 +527,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           case "status":
             statusSeen = true;
             patchLatestTurn(threadId, (t) => ({
-              ...t,
+              ...closeOpenBurstsOnTurn(t),
               status: event.status,
               status_reason: event.reason ?? "",
               assistant_message: event.assistant_message,
@@ -550,7 +573,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       const cur = get().activeThread;
       if (cur?.id === threadId) {
         patchLatestTurn(threadId, (t) => ({
-          ...t,
+          ...closeOpenBurstsOnTurn(t),
           in_flight: false,
           citations:
             result.citations.length > 0 ? result.citations : t.citations,

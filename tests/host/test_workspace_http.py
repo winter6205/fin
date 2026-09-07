@@ -657,6 +657,127 @@ def test_send_message_streaming_emits_thinking_and_tool_call_frames(
     assert isinstance(citations_event, list) and len(citations_event) >= 1
 
 
+def test_send_message_tool_result_summary_matches_get_history(
+    client: TestClient, fresh_store, http_app: FastAPI
+) -> None:
+    """turn-trace-folds T1 (the tracked change): the SSE ``tool_result`` summary
+    passes the same args the graph persist path passes, so a
+    ``retrieve`` one-liner shows its query live AND the GET
+    ``tool_summaries`` entry for the same ``tool_call_id`` matches."""
+    from fin.corpus.extracted import Locator
+    from fin.host.http import get_graph
+    from fin.retrieve.fake_port import FakeRetrievePort
+    from fin.retrieve.port import Chunk
+
+    query = "iphone revenue"
+    adapter = FakeRetrievePort(
+        hits_by_query={
+            query: [
+                Chunk(
+                    text="revenue rose",
+                    source_ref=Locator(
+                        document_id="AAPL-2022Q3",
+                        version="v-" + "a" * 60,
+                        page=1,
+                    ),
+                    score=1.0,
+                )
+            ]
+        }
+    )
+    model = ScriptedChatModel(
+        script=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "retrieve",
+                        "args": {"query": query, "limit": 8},
+                        "id": "c-retr",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="The answer."),
+        ]
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        adapter=adapter,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    events = _post_message(
+        client, created["id"], "What was AAPL net sales in 2023 Q3?"
+    )
+
+    tool_result_event = next(d for n, d in events if n == "tool_result")
+    assert tool_result_event["tool_call_id"] == "c-retr"
+    assert query in tool_result_event["summary"]
+
+    detail = client.get(f"/api/threads/{created['id']}").json()
+    summaries = detail["turns"][0]["tool_summaries"]
+    assert len(summaries) == 1
+    entry = summaries[0]
+    assert entry["tool_call_id"] == "c-retr"
+    assert entry["summary"] == tool_result_event["summary"]
+
+
+def test_get_history_keeps_row_for_empty_tool_call_id(
+    client: TestClient, fresh_store, http_app: FastAPI
+) -> None:
+    """turn-trace-folds spec line 36: an empty ``tool_call_id`` still
+    renders a row — GET history must not drop the call."""
+    from fin.host.http import get_graph
+
+    model = ScriptedChatModel(
+        script=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {
+                            "document_id": AAPL_2022Q3,
+                            "version": AAPL_2022Q3_VERSION,
+                            "page": 1,
+                            "page_limit": 1,
+                        },
+                        "id": "",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Noted."),
+        ]
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    events = _post_message(
+        client, created["id"], "What was AAPL net sales in 2023 Q3?"
+    )
+
+    # The SSE tool_call frame still emits with the empty id.
+    tool_call_event = next(d for n, d in events if n == "tool_call")
+    assert tool_call_event["tool_call_id"] == ""
+
+    detail = client.get(f"/api/threads/{created['id']}").json()
+    summaries = detail["turns"][0]["tool_summaries"]
+    assert len(summaries) == 1
+    assert summaries[0]["tool_call_id"] == ""
+    assert summaries[0]["name"] == "read_file"
+
+
 def test_send_message_turn_row_exposes_tool_summaries_as_dicts(
     client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
 ) -> None:

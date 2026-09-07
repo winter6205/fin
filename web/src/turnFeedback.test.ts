@@ -9,6 +9,8 @@ import {
   canSubmitFeedback,
   feedbackErrorVisible,
   isFeedbackActive,
+  lastTerminalTurnIndex,
+  showThumbs,
 } from "./turnFeedback";
 
 function makeTurn(overrides: Partial<Turn> = {}): Turn {
@@ -71,5 +73,67 @@ describe("feedbackErrorVisible", () => {
   it("clears the hint when a new submit starts", () => {
     expect(feedbackErrorVisible(true, "submit")).toBe(false);
     expect(feedbackErrorVisible(false, "submit")).toBe(false);
+  });
+});
+
+// T3 (the tracked change): thumbs chrome only on the LAST terminal turn of a
+// thread that is not in_flight. Older turns show nothing, so the
+// control can't sit on every historical row. Pure helpers again —
+// no DOM — with ``lastTerminalTurnIndex`` split out so the "which
+// row is last-terminal" rule is testable on its own.
+
+function makeTurns(...overrides: Partial<Turn>[]): Turn[] {
+  return overrides.map((o, i) =>
+    makeTurn({
+      run_id: `${33333333 + i}-3333-4333-8333-333333333333`,
+      ...o,
+    }),
+  );
+}
+
+describe("lastTerminalTurnIndex", () => {
+  it("points at the final row when it is terminal", () => {
+    const turns = makeTurns({ in_flight: false }, { in_flight: false });
+    expect(lastTerminalTurnIndex(turns)).toBe(1);
+  });
+
+  it("skips the live last row and finds the prior terminal one", () => {
+    const turns = makeTurns({ in_flight: false }, { in_flight: true });
+    expect(lastTerminalTurnIndex(turns)).toBe(0);
+  });
+
+  it("is -1 when no row is terminal", () => {
+    expect(lastTerminalTurnIndex(makeTurns({ in_flight: true }))).toBe(-1);
+    expect(lastTerminalTurnIndex([])).toBe(-1);
+  });
+});
+
+describe("showThumbs", () => {
+  it("shows thumbs on the last terminal turn", () => {
+    const turns = makeTurns({ in_flight: false }, { in_flight: false });
+    expect(showThumbs(1, turns, false)).toBe(true);
+  });
+
+  it("does NOT show thumbs on an older terminal turn (two-turn thread)", () => {
+    const turns = makeTurns({ in_flight: false }, { in_flight: false });
+    expect(showThumbs(0, turns, false)).toBe(false);
+  });
+
+  it("does NOT show thumbs when the thread is in_flight (thread-level)", () => {
+    // Thread-level in_flight covers the gap the per-turn flag
+    // misses: a thread mid-run where the last row may not yet
+    // carry ``in_flight`` — no thumbs until the run ends.
+    const turns = makeTurns({ in_flight: false });
+    expect(showThumbs(0, turns, true)).toBe(false);
+  });
+
+  it("does NOT show thumbs on a turn missing run_id (persist gate)", () => {
+    const turns = makeTurns({ run_id: "   " });
+    expect(showThumbs(0, turns, false)).toBe(false);
+  });
+
+  it("does NOT show thumbs on the live optimistic row", () => {
+    const turns = makeTurns({ in_flight: false }, { in_flight: true });
+    expect(showThumbs(1, turns, false)).toBe(false);
   });
 });
