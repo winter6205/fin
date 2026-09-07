@@ -1,14 +1,18 @@
-// Workbench chrome — the three-entry sidebar nav (specs/workbench-chrome.md).
+// Workbench chrome — the two-entry sidebar nav (specs/workbench-sidebar-rail.md, T1).
 //
-// The sidebar renders exactly these three entries, with these exact
+// The sidebar renders exactly these two entries, with these exact
 // labels, and the route each one points at. The decision of which
 // entry is "active" for the current pathname lives here as a pure
 // function so the boundary is testable without a DOM and so the
-// chrome never silently re-renders an English label or a "Corpus"
-// word that the spec has retired from this surface.
+// chrome never silently re-renders an English label, a "Corpus"
+// word, or a retired 对话 row that the spec has removed from this
+// surface.
 //
-// `/t/{id}` counts as 对话: opening a thread should still light the
-// 对话 entry, not show three inactive labels.
+// T1: the 对话 chrome entry is retired. The home route (`/`) and a
+// thread route (`/t/{id}`) are NOT chrome — they are either a
+// placeholder composer / last-thread restore (/) or a research-thread
+// page whose highlight lives in the 会话 list below the chrome. So
+// ``activeNavKey`` returns ``null`` for both: no chrome row lights.
 //
 // T3: ``monitorNavMark`` decides whether the 监控 entry carries a
 // non-text-only degraded glyph. Loading + unavailable stay clean —
@@ -18,7 +22,7 @@
 
 import type { WorkspaceStatusView } from "./statusStrip";
 
-export type NavKey = "chat" | "kb" | "monitor";
+export type NavKey = "kb" | "monitor";
 
 export interface NavEntry {
   key: NavKey;
@@ -30,7 +34,6 @@ export interface NavEntry {
 
 /** The chrome entries in render order. */
 export const NAV_ENTRIES: readonly NavEntry[] = [
-  { key: "chat", label: "对话", route: "/" },
   { key: "kb", label: "知识库", route: "/kb" },
   { key: "monitor", label: "监控", route: "/monitor" },
 ] as const;
@@ -38,15 +41,13 @@ export const NAV_ENTRIES: readonly NavEntry[] = [
 /**
  * Which nav entry is active for the given pathname.
  *
- *  - `/`            → 对话
- *  - `/t/{id}`      → 对话  (a thread page is still a 对话)
+ *  - `/`            → null  (no chrome row lights)
+ *  - `/t/{id}`      → null  (a thread page is a list item, not chrome)
  *  - `/kb`          → 知识库
  *  - `/monitor`     → 监控
  *  - anything else  → null (no chrome lit; a 404 inside the app)
  */
 export function activeNavKey(pathname: string): NavKey | null {
-  if (pathname === "/") return "chat";
-  if (pathname.startsWith("/t/")) return "chat";
   if (pathname === "/kb") return "kb";
   if (pathname === "/monitor") return "monitor";
   return null;
