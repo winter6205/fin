@@ -198,8 +198,16 @@ The product conversation: one `thread_id` the operator talks in; each question i
 _Avoid_: Q&A session, demo ask, one-shot invoke as the product UX, forbidding greetings or clarification on the thread
 
 **工作台**:
-The local web UI: chrome is **知识库** / **监控**; **research thread**s live in a 会话 list, not a 对话 nav; create, list, open, resume, and delete a **research thread**; thinking and tool traces stream then collapse; citations sit on the assistant turn.
+The local web UI: chrome is **知识库** / **监控**; **research thread**s live in a 会话 list, not a 对话 nav; create, list, open, resume, and delete a **research thread**; **thinking fold**s and **tool fold**s stream then collapse; citations sit on the assistant turn.
 _Avoid_: 知识库 as the UI name, 工作区 directory, CLI REPL as the product, hosted accounts this increment, POST /ask as the conversation surface, Corpus / MCP / Status as nav labels, 对话 as a chrome overview
+
+**thinking fold**:
+A per-burst collapsible thinking region on a **research thread** turn: streams expanded while that burst is live; auto-collapses when the burst ends; collapsed shows a header plus a three-line tail preview of the latest lines. UI label: 深度思考.
+_Avoid_: mixing thinking prose into the answer card, clamping the first lines as the live view, concatenating a whole run's thinking above all tools
+
+**tool fold**:
+A per-burst collapsible tool-call list on the same turn, sibling to the **thinking fold**. Live while those calls run so the operator can debug (including retrieve via the **retrieve port**); auto-collapses when that burst ends. UI label: 工具. MCP is not a transcript tool name.
+_Avoid_: default-hidden tools with no fold, dumping ToolMessage JSON, nesting tools inside thinking prose, labeling the row MCP
 
 **工作区**:
 The one global default operator directory `$HOME/.fin/default` (created if missing). Every **research thread**, profile read, and **memory fact** workspace key uses this path.

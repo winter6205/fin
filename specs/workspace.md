@@ -89,6 +89,10 @@ This amendment is the outcome of `plans/workspace-stream-fidelity.md` T5 (`[deci
 
 **Still out (unchanged from the original exclusion):** Playwright (or any browser harness) as a dependency or collection target of default `uv run pytest -q`; browser tests replacing the scripted-model pytest contract above; any browser lane beyond the two named here. Runner filenames, harness library choice, and per-check assertion lists are not fixed by this amendment — the implementation bullets (`plans/workspace-stream-fidelity.md` T6–T8) own those.
 
+## Amendment 2026-09-07: thinking fold / tool fold (`specs/turn-trace-folds.md`)
+
+Supersedes the Does bullets that described one unframed thinking region with start-of-text line-clamp for the whole run, and a stack of live-open tool `<details>` under it. Burst-scoped **thinking fold** / **tool fold**, three-line tail preview, SSE summaries with args, and last-turn SVG thumbs are owned by `specs/turn-trace-folds.md`. SSE event _types_, citation verifier, and crash-resume grain are unchanged.
+
 ## Planned files (ACR input, not a filename freeze)
 
 Host surface: `src/fin/host/http.py`, `src/fin/host/graph.py`, `src/fin/host/state.py`, `src/fin/host/compile.py`, `src/fin/host/scripted_model.py`, plus new host-owned modules for thread metadata / turn rows / SSE mapping / thinking converter as the implementer splits them. Tests under `tests/host/`. SPA under `web/`. No copy of `docs/design-references/prototype-workspace/` into product paths.
