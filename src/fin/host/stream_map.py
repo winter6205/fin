@@ -1183,7 +1183,39 @@ def format_tool_summary(
         return summarize_statement(result=result_dict, args=args)
     if name == ISSUER_FANOUT_TOOL:
         return summarize_research_issuers(result=result_dict, args=args)
+    # Unknown / memory tools (save_memory, recall_memory,
+    # edit_user_profile, any future name): when args or a result dict
+    # exist, render name + up to two arg values + done/fail — never
+    # the bare name alone, never raw JSON (turn-trace-folds spec).
+    if args or result_dict is not None:
+        return _format_unknown_tool_summary(name, args=args, result=result_dict)
     return name or "tool"
+
+
+def _format_unknown_tool_summary(
+    name: str,
+    *,
+    args: dict[str, Any] | None,
+    result: dict[str, Any] | None,
+) -> str:
+    """One-liner for tools outside the dispatch table.
+
+    Up to two arg values (truncated) so the operator sees the query /
+    locator the tool ran with; the state suffix flips to the error
+    token when the result dict carries ``error``. Values are coerced
+    to short human strings — no JSON braces ever reach the row.
+    """
+    parts = [name or "tool"]
+    for key, value in list((args or {}).items())[:2]:
+        text = str(value).replace("\n", " ")
+        if len(text) > 40:
+            text = text[:37] + "..."
+        parts.append(f"{key}={text}" if text else key)
+    if result is not None and result.get("error"):
+        parts.append(f"fail ({result['error']})")
+    else:
+        parts.append("done")
+    return " · ".join(parts)
 
 
 __all__ = [

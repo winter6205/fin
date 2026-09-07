@@ -608,11 +608,54 @@ def test_format_tool_summary_dispatches_read_file() -> None:
     assert out == "X p.3"
 
 
-def test_format_tool_summary_unknown_tool_returns_bare_name() -> None:
-    """A future tool name not in the dispatch table falls back to
-    the bare name so the tools region still shows a row."""
+def test_format_tool_summary_unknown_tool_without_args_or_result_keeps_bare_name() -> None:
+    """A future tool name not in the dispatch table with NO args and
+    NO result dict still falls back to the bare name so the tools
+    region shows a row (nothing else is renderable)."""
     out = format_tool_summary("future_tool", result=None, args=None)
     assert out == "future_tool"
+
+
+def test_format_tool_summary_unknown_tool_with_args_is_not_bare_name() -> None:
+    """turn-trace-folds spec line 37: an unknown/memory tool with
+    args must render ``name`` plus its arg keys plus done/fail —
+    never the bare name alone, never raw JSON."""
+    out = format_tool_summary("future_tool", result=None, args={"query": "growth"})
+    assert out != "future_tool"
+    assert "future_tool" in out
+    assert "growth" in out
+    assert "{" not in out
+
+
+def test_format_tool_summary_save_memory_with_args_is_not_bare_name() -> None:
+    """A memory tool (not in the dispatch table) with args renders a
+    one-liner, not the bare name."""
+    out = format_tool_summary(
+        "save_memory", result={"advisory": True}, args={"content": "risk appetite low"}
+    )
+    assert out != "save_memory"
+    assert "save_memory" in out
+    assert "risk appetite low" in out or "content" in out
+    assert "{" not in out
+
+
+def test_format_tool_summary_unknown_tool_error_result_shows_fail() -> None:
+    """A result dict carrying ``error`` flips the one-liner to the
+    fail state."""
+    out = format_tool_summary(
+        "future_tool", result={"error": "boom"}, args={"query": "x"}
+    )
+    assert out != "future_tool"
+    assert "boom" in out or "fail" in out or "失败" in out
+
+
+def test_format_tool_summary_unknown_tool_truncates_long_arg_values() -> None:
+    """An overly long arg value is truncated in the one-liner."""
+    out = format_tool_summary(
+        "future_tool", result=None, args={"query": "x" * 500}
+    )
+    assert len(out) < 200
+    assert "x" * 500 not in out
 
 
 def test_format_tool_summary_handles_non_dict_result() -> None:
