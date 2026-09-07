@@ -1487,8 +1487,9 @@ def _build_tool_summaries(
     """
     rendered: list[dict[str, str]] = []
     for name, args, call_id in pending:
-        if not call_id:
-            continue
+        # Empty tool_call_id still renders a row (turn-trace-folds
+        # spec: GET must not drop those calls; the SPA keys rows with
+        # an index fallback so empty ids stay stable).
         result = _tool_result_for_call(call_id, tool_messages)
         rendered.append(
             {
@@ -2585,7 +2586,9 @@ def compile_graph(
         return update
 
     def _fanout_tool_update(
-        payload: dict[str, Any], tool_call_id: str
+        payload: dict[str, Any],
+        tool_call_id: str,
+        args: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """The ``ToolMessage`` + tool-trace half of a fan-out result.
 
@@ -2607,7 +2610,7 @@ def compile_graph(
                 {
                     "name": ISSUER_FANOUT_TOOL,
                     "summary": format_tool_summary(
-                        ISSUER_FANOUT_TOOL, result=payload
+                        ISSUER_FANOUT_TOOL, result=payload, args=args
                     ),
                     "tool_call_id": tool_call_id,
                 }
@@ -2659,7 +2662,7 @@ def compile_graph(
             # once the branches have reported. Answering it here too
             # would put two ``ToolMessage``s on one ``tool_call_id``.
             return update
-        update.update(_fanout_tool_update(plan, tool_call_id))
+        update.update(_fanout_tool_update(plan, tool_call_id, args=args))
         if plan["error"] == "issuer_overflow":
             update["status"] = "refuse"
             update["status_reason"] = "issuer_overflow"
@@ -2753,8 +2756,12 @@ def compile_graph(
             plan=plan, findings=list(state.get("issuer_findings") or [])
         )
         tool_call_id = str(plan.get("tool_call_id") or "")
+        # The planner stored the call's args into ``issuer_plan``'s
+        # query, so the join's one-liner keeps the same query prefix
+        # the live wire shows (turn-trace-folds T1).
+        join_args = {"query": plan.get("query")} if plan.get("query") else None
         return {
-            **_fanout_tool_update(result, tool_call_id),
+            **_fanout_tool_update(result, tool_call_id, args=join_args),
             "issuer_fanout": result["fanout"],
         }
 

@@ -21,7 +21,7 @@ The operator can tell **places** (知识库, 监控) apart from **chats** (会�
 
 Quoted from `docs/CONTEXT.md` after persist of this increment:
 
-- **工作台**: The local web UI: chrome is **知识库** / **监控**; **research thread**s live in a 会话 list, not a 对话 nav; create, list, open, resume, and delete a **research thread**; thinking and tool traces stream then collapse; citations sit on the assistant turn.
+- **工作台**: The local web UI: chrome is **知识库** / **监控**; **research thread**s live in a 会话 list, not a 对话 nav; create, list, open, resume, and delete a **research thread**; **thinking fold**s and **tool fold**s stream then collapse; citations sit on the assistant turn.
 - **知识库** / **监控** / **research thread**: unchanged meaning; **监控** is still `/monitor`.
 
 ## Boundaries

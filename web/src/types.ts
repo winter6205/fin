@@ -52,6 +52,15 @@ export interface ToolSummary {
   tool_call_id: string;
 }
 
+// turn-trace-folds (#250): one sibling burst on the per-turn trace
+// timeline — a thinking burst or a tool burst, in arrival order.
+// ``live`` is true while that burst is still accepting frames; at
+// burst end it flips false and the fold auto-collapses (the UI keeps
+// a manual override so an operator-opened fold stays open).
+export type TraceItem =
+  | { kind: "thinking"; text: string; live: boolean }
+  | { kind: "tools"; calls: ToolSummary[]; live: boolean };
+
 // ----- T3 comparison (enterprise-kb Focus 1) -----
 //
 // The ``fin.comparison.v1`` envelope produced by the
@@ -157,6 +166,12 @@ export interface Turn {
   // T3: one entry per tool call observed this run (dicts, not
   // strings - T1's placeholder shape).
   tool_summaries?: ToolSummary[];
+  // turn-trace-folds (#250): the burst timeline this session folded
+  // from the live stream. Optional — GET-restored rows build it in
+  // the view layer (traceItemsFromTurn) since the server keeps no
+  // burst history. Maintained in parallel with thinking_text /
+  // tool_summaries, which stay the persisted SSOT.
+  trace_items?: TraceItem[];
   // T2: ordinary-person copy on refuse / step_cap (empty on done).
   // Mirrored on the SSE status frame and the persisted turn row so
   // reload keeps the copy.

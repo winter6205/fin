@@ -6,7 +6,7 @@ import { useLocation, useParams } from "react-router-dom";
 import AnswerWithCitations from "../components/CitationChips";
 import Composer from "../components/Composer";
 import CorpusCard from "../components/CorpusCard";
-import type { Comparison, Turn } from "../types";
+import type { Comparison, ToolSummary, Turn } from "../types";
 import {
   cellTitle,
   comparisonCaption,
@@ -26,8 +26,14 @@ import {
   canSubmitFeedback,
   feedbackErrorVisible,
   isFeedbackActive,
+  showThumbs,
   type FeedbackValue,
 } from "../turnFeedback";
+import {
+  foldOpenState,
+  thinkingTailPreview,
+  traceItemsFromTurn,
+} from "../turnTrace";
 import { useWorkspaceStore } from "../store";
 import { occupancyPercent, parseThreadOccupancy } from "../threadOccupancy";
 
@@ -151,7 +157,14 @@ export default function ThreadPage() {
         {activeThread.turns.map((turn, index) => (
           // Turn rows are append-only; a stable index key avoids
           // remounting when the server-minted ``run_id`` reconciles.
-          <TurnView key={index} turn={turn} threadId={thread_id} />
+          <TurnView
+            key={index}
+            turn={turn}
+            turnIndex={index}
+            turns={activeThread.turns}
+            threadId={thread_id}
+            threadInFlight={activeThread.in_flight === true}
+          />
         ))}
 
         {/* Spec #2: a freshly-created (zero-turn) thread must still
@@ -248,14 +261,32 @@ function EmptyThreadCorpusGrid() {
   );
 }
 
-function TurnView({ turn, threadId }: { turn: Turn; threadId: string }) {
+function TurnView({
+  turn,
+  turnIndex,
+  turns,
+  threadId,
+  threadInFlight,
+}: {
+  turn: Turn;
+  turnIndex: number;
+  turns: Turn[];
+  threadId: string;
+  threadInFlight: boolean;
+}) {
   // T4 (#37): while THIS turn is live (optimistic send or a
   // lock-held latest row) the tool rows stay open and the thinking
   // region line-clamps; after the run both collapse.
   const live = turn.in_flight === true;
-  const hasTrace =
-    Boolean(turn.thinking_text) ||
-    (turn.tool_summaries != null && turn.tool_summaries.length > 0);
+  // turn-trace-folds (#250): the burst timeline. A live run carries
+  // the folded bursts from the store; a GET-restored row (or legacy
+  // state without trace_items) builds one thinking fold + one tool
+  // fold from the persisted blob — spec line 41 allows this.
+  const traceItems =
+    turn.trace_items && turn.trace_items.length > 0
+      ? turn.trace_items
+      : traceItemsFromTurn(turn);
+  const hasTrace = traceItems.length > 0;
   // T3 (spec Focus 1): structured comparison tables from the
   // ``compare_facts`` tool. Rendered between the trace and the
   // answer card — the order they arrived in, and the one place
@@ -269,40 +300,33 @@ function TurnView({ turn, threadId }: { turn: Turn; threadId: string }) {
           {turn.question}
         </div>
       </div>
-      {/* Trace (spec lines 31–32, SC66): thinking + tools grouped
-          unframed on page bg between user bubble and answer card —
-          assistant-ui chain-of-thought style; not inside bg-card. */}
+      {/* Trace (turn-trace-folds #250): sibling thinking/tool bursts
+          in arrival order, unframed on page bg between user bubble
+          and answer card. Each burst streams expanded while live and
+          auto-collapses at burst end; a manual toggle wins over the
+          auto state until the burst's liveness changes again. */}
       {hasTrace ? (
         <div data-testid="turn-trace" className="space-y-1">
-          {/* T4 (spec line 31): thinking is unframed; while the run is
-              live it line-clamps to a few lines; after the run it
-              collapses to a one-line duration label that expands the
-              full text. Region exists only when thinking streamed. */}
-          {turn.thinking_text ? (
-            <ThinkingAccordion
-              text={turn.thinking_text}
-              durationMs={turn.thinking_duration_ms}
-              live={live}
-            />
-          ) : null}
-          {/* T4 (spec line 32): tool rows are separate light-gray
-              (#F5F5F4) details — visible while that call runs, then
-              collapse after the run. Correlated by tool_call_id. */}
-          {turn.tool_summaries && turn.tool_summaries.length > 0 ? (
-            <div className="space-y-1">
-              {turn.tool_summaries.map((s, i) => (
-                <details
-                  key={`${s.tool_call_id}-${i}`}
-                  className="bg-tool px-2 py-1 text-xs"
-                  open={live}
-                >
-                  <summary className="cursor-pointer select-none font-mono">
-                    {s.name}: {s.summary}
-                  </summary>
-                </details>
-              ))}
-            </div>
-          ) : null}
+          {traceItems.map((item, i) =>
+            item.kind === "thinking" ? (
+              <ThinkingFold
+                key={`thinking-${i}`}
+                text={item.text}
+                durationMs={
+                  i === traceItems.length - 1
+                    ? turn.thinking_duration_ms
+                    : undefined
+                }
+                live={item.live}
+              />
+            ) : (
+              <ToolsFold
+                key={`tools-${i}`}
+                calls={item.calls}
+                live={item.live}
+              />
+            ),
+          )}
         </div>
       ) : null}
       {comparisons.map((comparison, i) => (
@@ -361,10 +385,11 @@ function TurnView({ turn, threadId }: { turn: Turn; threadId: string }) {
       )}
       {/* T8: the thumbs tail card — the operator's verdict on this
           turn, rendered after the answer card so it reads as a
-          per-turn action, not part of the answer. Gated to terminal
-          rows (canSubmitFeedback) so a live optimistic turn — whose
-          run_id is still a client placeholder — shows nothing. */}
-      {canSubmitFeedback(turn) ? (
+          per-turn action. T3 (#251): gated to the LAST terminal
+          turn of a thread that is not in_flight (showThumbs) —
+          older turns show nothing; canSubmitFeedback stays the
+          persist gate inside FeedbackControls. */}
+      {showThumbs(turnIndex, turns, threadInFlight) ? (
         <FeedbackControls threadId={threadId} turn={turn} />
       ) : null}
     </article>
@@ -379,6 +404,11 @@ function TurnView({ turn, threadId }: { turn: Turn; threadId: string }) {
 // surfaces as an inline "提交失败，请重试" hint next to the thumbs;
 // the hint clears on the next submit (transition pinned in
 // ``turnFeedback.feedbackErrorVisible``).
+// T3 (#251): the word buttons (有帮助 / 没帮助) become stroke SVG
+// thumbs (no emoji, no words) — same stroke idiom as Sidebar's
+// 16x16 nav icons. testids / aria-pressed / inline retry copy keep
+// their existing contract; canSubmitFeedback stays the persist
+// gate so a turn that lost its run_id can never POST.
 function FeedbackControls({
   threadId,
   turn,
@@ -389,6 +419,7 @@ function FeedbackControls({
   const setTurnFeedback = useWorkspaceStore((s) => s.setTurnFeedback);
   const [submitFailed, setSubmitFailed] = useState(false);
   const submit = (value: FeedbackValue) => {
+    if (!canSubmitFeedback(turn)) return;
     setSubmitFailed((current) => feedbackErrorVisible(current, "submit"));
     setTurnFeedback(threadId, turn.run_id, value).catch(() => {
       setSubmitFailed((current) => feedbackErrorVisible(current, "failure"));
@@ -396,10 +427,13 @@ function FeedbackControls({
   };
   const buttonClass = (active: boolean) =>
     active
-      ? "border border-black bg-accent px-2 py-1 text-xs text-white"
-      : "border border-black bg-card px-2 py-1 text-xs hover:bg-accent hover:text-white";
+      ? "border border-black bg-accent px-1.5 py-1 text-white"
+      : "border border-black bg-card px-1.5 py-1 hover:bg-accent hover:text-white";
   return (
-    <div className="flex max-w-3xl mx-auto justify-end gap-2 items-center" data-testid="turn-feedback">
+    <div
+      className="flex max-w-3xl mx-auto justify-end gap-2 items-center"
+      data-testid="turn-feedback"
+    >
       {submitFailed ? (
         <span data-testid="feedback-error" className="text-xs text-red-700">
           提交失败，请重试
@@ -409,21 +443,46 @@ function FeedbackControls({
         type="button"
         data-testid="feedback-up"
         aria-pressed={isFeedbackActive(turn, "up")}
+        aria-label="有帮助"
         onClick={() => submit("up")}
         className={buttonClass(isFeedbackActive(turn, "up"))}
       >
-        有帮助
+        <ThumbIcon direction="up" />
       </button>
       <button
         type="button"
         data-testid="feedback-down"
         aria-pressed={isFeedbackActive(turn, "down")}
+        aria-label="没帮助"
         onClick={() => submit("down")}
         className={buttonClass(isFeedbackActive(turn, "down"))}
       >
-        没帮助
+        <ThumbIcon direction="down" />
       </button>
     </div>
+  );
+}
+
+// T3 (#251): stroke thumbs-up / thumbs-down icon, one path set
+// mirrored vertically for "down" — matches the Sidebar nav-icon
+// idiom (16x16 viewBox, stroke currentColor, no fill).
+function ThumbIcon({ direction }: { direction: "up" | "down" }) {
+  return (
+    <svg
+      aria-hidden="true"
+      width="16"
+      height="16"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="square"
+      strokeLinejoin="miter"
+      style={direction === "down" ? { transform: "rotate(180deg)" } : undefined}
+    >
+      <path d="M2 7h2.5v7H2z" />
+      <path d="M4.5 8l3-5.5c.8 0 1.5.7 1.5 1.5V6.5h3.2c.9 0 1.5.8 1.3 1.6l-1 4.4c-.1.6-.7 1-1.3 1H4.5" />
+    </svg>
   );
 }
 
@@ -541,7 +600,15 @@ function formatThinkingDuration(ms: number): string {
   return `${Math.floor(totalSeconds / 60)}m ${totalSeconds % 60}s`;
 }
 
-function ThinkingAccordion({
+// turn-trace-folds (#250): one thinking burst fold. Live = expanded
+// with the FULL burst text (viewport pinned to the tail — no
+// start-of-text clamp as the live view). Collapsed = 「深度思考」
+// header (+ duration when the run measured one) + a three-line TAIL
+// preview (latest lines, not the first). A manual toggle wins over
+// the auto state until the burst's liveness changes: the override
+// resets when ``live`` flips, so auto-collapse at burst end always
+// runs (spec line 34) but cannot fight an operator's mid-burst open.
+function ThinkingFold({
   text,
   durationMs,
   live,
@@ -550,31 +617,93 @@ function ThinkingAccordion({
   durationMs?: number;
   live: boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const [manualOpen, setManualOpen] = useState<boolean | null>(null);
+  // Reset the manual override when the burst transitions live <-> ended.
+  const [wasLive, setWasLive] = useState(live);
+  const liveChanged = wasLive !== live;
+  if (liveChanged) {
+    setWasLive(live);
+    setManualOpen(null);
+  }
+  const open = foldOpenState(manualOpen, live, liveChanged);
   const showDurationLabel =
     !live && typeof durationMs === "number" && durationMs > 0;
-  const label = showDurationLabel
-    ? `Thinking · ${formatThinkingDuration(durationMs as number)}`
-    : "Thinking";
+  const label =
+    "深度思考" +
+    (showDurationLabel
+      ? ` · ${formatThinkingDuration(durationMs as number)}`
+      : "");
+  const tailLines = thinkingTailPreview(text);
   return (
-    <div className="mb-2">
+    <div className="mb-1">
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        data-testid="trace-thinking-toggle"
+        onClick={() => setManualOpen(!open)}
         className="text-xs font-semibold uppercase tracking-wide text-gray-400 hover:text-gray-600"
       >
         {label} {open ? "−" : "+"}
       </button>
-      {open || live ? (
-        <p
-          className={
-            open
-              ? "mt-1 text-xs text-gray-600 whitespace-pre-wrap break-words"
-              : "mt-1 text-xs text-gray-600 whitespace-pre-wrap break-words line-clamp-3"
-          }
+      {open ? (
+        <div
+          className="mt-1 text-xs text-gray-600 whitespace-pre-wrap break-words"
+          data-testid="trace-thinking-full"
         >
           {text}
+        </div>
+      ) : text.length > 0 ? (
+        <p
+          className="mt-1 text-xs text-gray-400 whitespace-pre-wrap break-words line-clamp-3"
+          data-testid="trace-thinking-preview"
+        >
+          {tailLines.join("\n")}
         </p>
+      ) : null}
+    </div>
+  );
+}
+
+// Live-thinking tail pinning: keep the full text reachable — the
+// expanded body is plain flow content; the page's own scroll area
+// already follows the streaming tail because each frame appends at
+// the bottom of the transcript. (The old line-clamp hid the tail
+// behind the head — the regression this fold fixes.)
+
+// turn-trace-folds (#250): one tool burst fold. Live = expanded,
+// each call a compact row (name + human one-liner; running rows show
+// the 运行中… placeholder). Collapsed = 「工具」 header + call count.
+// Same manual-override semantics as ThinkingFold; the default never
+// dumps raw JSON — a row's summary is the whole payload.
+function ToolsFold({ calls, live }: { calls: ToolSummary[]; live: boolean }) {
+  const [manualOpen, setManualOpen] = useState<boolean | null>(null);
+  const [wasLive, setWasLive] = useState(live);
+  const liveChanged = wasLive !== live;
+  if (liveChanged) {
+    setWasLive(live);
+    setManualOpen(null);
+  }
+  const open = foldOpenState(manualOpen, live, liveChanged);
+  return (
+    <div className="mb-1">
+      <button
+        type="button"
+        data-testid="trace-tools-toggle"
+        onClick={() => setManualOpen(!open)}
+        className="text-xs font-semibold uppercase tracking-wide text-gray-400 hover:text-gray-600"
+      >
+        工具{calls.length > 0 ? ` · ${calls.length}` : ""}
+      </button>
+      {open ? (
+        <ul className="mt-1 space-y-1" data-testid="trace-tools-list">
+          {calls.map((s, i) => (
+            <li
+              key={`${s.tool_call_id}-${i}`}
+              className="bg-tool px-2 py-1 text-xs font-mono"
+            >
+              {s.name}: {s.summary}
+            </li>
+          ))}
+        </ul>
       ) : null}
     </div>
   );
