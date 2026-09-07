@@ -6,7 +6,7 @@ import { useLocation, useParams } from "react-router-dom";
 import AnswerWithCitations from "../components/CitationChips";
 import Composer from "../components/Composer";
 import CorpusCard from "../components/CorpusCard";
-import type { Comparison, Turn } from "../types";
+import type { Comparison, ToolSummary, Turn } from "../types";
 import {
   cellTitle,
   comparisonCaption,
@@ -29,6 +29,7 @@ import {
   showThumbs,
   type FeedbackValue,
 } from "../turnFeedback";
+import { thinkingTailPreview, traceItemsFromTurn } from "../turnTrace";
 import { useWorkspaceStore } from "../store";
 import { occupancyPercent, parseThreadOccupancy } from "../threadOccupancy";
 
@@ -273,9 +274,15 @@ function TurnView({
   // lock-held latest row) the tool rows stay open and the thinking
   // region line-clamps; after the run both collapse.
   const live = turn.in_flight === true;
-  const hasTrace =
-    Boolean(turn.thinking_text) ||
-    (turn.tool_summaries != null && turn.tool_summaries.length > 0);
+  // turn-trace-folds (#250): the burst timeline. A live run carries
+  // the folded bursts from the store; a GET-restored row (or legacy
+  // state without trace_items) builds one thinking fold + one tool
+  // fold from the persisted blob — spec line 41 allows this.
+  const traceItems =
+    turn.trace_items && turn.trace_items.length > 0
+      ? turn.trace_items
+      : traceItemsFromTurn(turn);
+  const hasTrace = traceItems.length > 0;
   // T3 (spec Focus 1): structured comparison tables from the
   // ``compare_facts`` tool. Rendered between the trace and the
   // answer card — the order they arrived in, and the one place
@@ -289,40 +296,33 @@ function TurnView({
           {turn.question}
         </div>
       </div>
-      {/* Trace (spec lines 31–32, SC66): thinking + tools grouped
-          unframed on page bg between user bubble and answer card —
-          assistant-ui chain-of-thought style; not inside bg-card. */}
+      {/* Trace (turn-trace-folds #250): sibling thinking/tool bursts
+          in arrival order, unframed on page bg between user bubble
+          and answer card. Each burst streams expanded while live and
+          auto-collapses at burst end; a manual toggle wins over the
+          auto state until the burst's liveness changes again. */}
       {hasTrace ? (
         <div data-testid="turn-trace" className="space-y-1">
-          {/* T4 (spec line 31): thinking is unframed; while the run is
-              live it line-clamps to a few lines; after the run it
-              collapses to a one-line duration label that expands the
-              full text. Region exists only when thinking streamed. */}
-          {turn.thinking_text ? (
-            <ThinkingAccordion
-              text={turn.thinking_text}
-              durationMs={turn.thinking_duration_ms}
-              live={live}
-            />
-          ) : null}
-          {/* T4 (spec line 32): tool rows are separate light-gray
-              (#F5F5F4) details — visible while that call runs, then
-              collapse after the run. Correlated by tool_call_id. */}
-          {turn.tool_summaries && turn.tool_summaries.length > 0 ? (
-            <div className="space-y-1">
-              {turn.tool_summaries.map((s, i) => (
-                <details
-                  key={`${s.tool_call_id}-${i}`}
-                  className="bg-tool px-2 py-1 text-xs"
-                  open={live}
-                >
-                  <summary className="cursor-pointer select-none font-mono">
-                    {s.name}: {s.summary}
-                  </summary>
-                </details>
-              ))}
-            </div>
-          ) : null}
+          {traceItems.map((item, i) =>
+            item.kind === "thinking" ? (
+              <ThinkingFold
+                key={`thinking-${i}`}
+                text={item.text}
+                durationMs={
+                  i === traceItems.length - 1
+                    ? turn.thinking_duration_ms
+                    : undefined
+                }
+                live={item.live}
+              />
+            ) : (
+              <ToolsFold
+                key={`tools-${i}`}
+                calls={item.calls}
+                live={item.live}
+              />
+            ),
+          )}
         </div>
       ) : null}
       {comparisons.map((comparison, i) => (
@@ -426,7 +426,10 @@ function FeedbackControls({
       ? "border border-black bg-accent px-1.5 py-1 text-white"
       : "border border-black bg-card px-1.5 py-1 hover:bg-accent hover:text-white";
   return (
-    <div className="flex max-w-3xl mx-auto justify-end gap-2 items-center" data-testid="turn-feedback">
+    <div
+      className="flex max-w-3xl mx-auto justify-end gap-2 items-center"
+      data-testid="turn-feedback"
+    >
       {submitFailed ? (
         <span data-testid="feedback-error" className="text-xs text-red-700">
           提交失败，请重试
@@ -593,7 +596,15 @@ function formatThinkingDuration(ms: number): string {
   return `${Math.floor(totalSeconds / 60)}m ${totalSeconds % 60}s`;
 }
 
-function ThinkingAccordion({
+// turn-trace-folds (#250): one thinking burst fold. Live = expanded
+// with the FULL burst text (viewport pinned to the tail — no
+// start-of-text clamp as the live view). Collapsed = 「深度思考」
+// header (+ duration when the run measured one) + a three-line TAIL
+// preview (latest lines, not the first). A manual toggle wins over
+// the auto state until the burst's liveness changes: the override
+// resets when ``live`` flips, so auto-collapse at burst end always
+// runs (spec line 34) but cannot fight an operator's mid-burst open.
+function ThinkingFold({
   text,
   durationMs,
   live,
@@ -602,31 +613,91 @@ function ThinkingAccordion({
   durationMs?: number;
   live: boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const [manualOpen, setManualOpen] = useState<boolean | null>(null);
+  // Reset the manual override when the burst transitions live <-> ended.
+  const [wasLive, setWasLive] = useState(live);
+  if (wasLive !== live) {
+    setWasLive(live);
+    setManualOpen(null);
+  }
+  const open = manualOpen ?? live;
   const showDurationLabel =
     !live && typeof durationMs === "number" && durationMs > 0;
-  const label = showDurationLabel
-    ? `Thinking · ${formatThinkingDuration(durationMs as number)}`
-    : "Thinking";
+  const label =
+    "深度思考" +
+    (showDurationLabel
+      ? ` · ${formatThinkingDuration(durationMs as number)}`
+      : "");
+  const tailLines = thinkingTailPreview(text);
   return (
-    <div className="mb-2">
+    <div className="mb-1">
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        data-testid="trace-thinking-toggle"
+        onClick={() => setManualOpen(!open)}
         className="text-xs font-semibold uppercase tracking-wide text-gray-400 hover:text-gray-600"
       >
         {label} {open ? "−" : "+"}
       </button>
-      {open || live ? (
-        <p
-          className={
-            open
-              ? "mt-1 text-xs text-gray-600 whitespace-pre-wrap break-words"
-              : "mt-1 text-xs text-gray-600 whitespace-pre-wrap break-words line-clamp-3"
-          }
+      {open ? (
+        <div
+          className="mt-1 text-xs text-gray-600 whitespace-pre-wrap break-words"
+          data-testid="trace-thinking-full"
         >
           {text}
+        </div>
+      ) : text.length > 0 ? (
+        <p
+          className="mt-1 text-xs text-gray-400 whitespace-pre-wrap break-words line-clamp-3"
+          data-testid="trace-thinking-preview"
+        >
+          {tailLines.join("\n")}
         </p>
+      ) : null}
+    </div>
+  );
+}
+
+// Live-thinking tail pinning: keep the full text reachable — the
+// expanded body is plain flow content; the page's own scroll area
+// already follows the streaming tail because each frame appends at
+// the bottom of the transcript. (The old line-clamp hid the tail
+// behind the head — the regression this fold fixes.)
+
+// turn-trace-folds (#250): one tool burst fold. Live = expanded,
+// each call a compact row (name + human one-liner; running rows show
+// the 运行中… placeholder). Collapsed = 「工具」 header + call count.
+// Same manual-override semantics as ThinkingFold; the default never
+// dumps raw JSON — a row's summary is the whole payload.
+function ToolsFold({ calls, live }: { calls: ToolSummary[]; live: boolean }) {
+  const [manualOpen, setManualOpen] = useState<boolean | null>(null);
+  const [wasLive, setWasLive] = useState(live);
+  if (wasLive !== live) {
+    setWasLive(live);
+    setManualOpen(null);
+  }
+  const open = manualOpen ?? live;
+  return (
+    <div className="mb-1">
+      <button
+        type="button"
+        data-testid="trace-tools-toggle"
+        onClick={() => setManualOpen(!open)}
+        className="text-xs font-semibold uppercase tracking-wide text-gray-400 hover:text-gray-600"
+      >
+        工具{calls.length > 0 ? ` · ${calls.length}` : ""}
+      </button>
+      {open ? (
+        <ul className="mt-1 space-y-1" data-testid="trace-tools-list">
+          {calls.map((s, i) => (
+            <li
+              key={`${s.tool_call_id}-${i}`}
+              className="bg-tool px-2 py-1 text-xs font-mono"
+            >
+              {s.name}: {s.summary}
+            </li>
+          ))}
+        </ul>
       ) : null}
     </div>
   );

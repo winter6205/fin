@@ -243,6 +243,81 @@ describe("sendQuestion failure surfacing", () => {
   });
 });
 
+// turn-trace-folds (#250): the store folds the SSE stream into the
+// turn's burst timeline — arrival-order sibling thinking/tool folds,
+// auto-collapse at burst end.
+describe("trace burst folding on send", () => {
+  it("renders thinking-fold -> tool-fold -> thinking-fold in arrival order", async () => {
+    seedThread();
+    stubSseRun([
+      ["thinking", { text: "first burst" }],
+      [
+        "tool_call",
+        { name: "retrieve", args: { query: "q" }, tool_call_id: "c1" },
+      ],
+      [
+        "tool_result",
+        { name: "retrieve", summary: "'q': 1 hit", tool_call_id: "c1" },
+      ],
+      ["thinking", { text: "second burst" }],
+      ["status", { run_id: RUN_ID, status: "done", assistant_message: "" }],
+      ["answer", { text: "a" }],
+      ["citations", []],
+    ]);
+
+    await useWorkspaceStore.getState().sendQuestion(THREAD_ID, "营收多少？");
+
+    const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+    expect(turns).toHaveLength(1);
+    const items = turns[0].trace_items ?? [];
+    expect(items.map((i) => i.kind)).toEqual(["thinking", "tools", "thinking"]);
+    // All bursts collapsed once the run ended.
+    expect(items.every((i) => i.live === false)).toBe(true);
+    // Tool one-liner replaced the placeholder inside the tool burst.
+    const tools = items[1];
+    if (tools.kind === "tools") {
+      expect(tools.calls[0].summary).toBe("'q': 1 hit");
+    } else {
+      expect.unreachable("expected a tools burst");
+    }
+    // tool_summaries (persist SSOT) still maintained in parallel.
+    expect(turns[0].tool_summaries?.[0]?.summary).toBe("'q': 1 hit");
+  });
+
+  it("closes the live thinking burst when a tool_call arrives mid-run", async () => {
+    seedThread();
+    stubSseRun([
+      ["thinking", { text: "burst one" }],
+      [
+        "tool_call",
+        { name: "retrieve", args: { query: "q" }, tool_call_id: "c1" },
+      ],
+    ]);
+    // Drive the stream manually: stubSseRun closes after all frames,
+    // so capture state after the tool_call frame via subscribe.
+    const seen: string[] = [];
+    const stop = useWorkspaceStore.subscribe((state) => {
+      const turns = state.activeThread?.turns ?? [];
+      if (turns.length > 0) {
+        const items = turns[0].trace_items ?? [];
+        seen.push(
+          items.map((i) => `${i.kind}:${i.live ? "live" : "closed"}`).join(","),
+        );
+      }
+    });
+
+    await useWorkspaceStore.getState().sendQuestion(THREAD_ID, "营收多少？");
+    stop();
+
+    // Before the status frame the thinking burst must already be
+    // closed while the tool burst is live.
+    expect(seen.some((s) => s === "thinking:closed,tools:live")).toBe(true);
+    const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+    const items = turns[0].trace_items ?? [];
+    expect(items.every((i) => i.live === false)).toBe(true);
+  });
+});
+
 // T3 (plans/workspace-stream-fidelity.md): the host arms a pending
 // reset on the hidden bounce marker and carries ``reset: true`` on the
 // next non-empty delta. The live bubble must ride that boundary
