@@ -9,6 +9,7 @@
 
 import { useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
+import { EMPTY_SESSIONS_COPY } from "../components/Sidebar";
 import {
   decideLastThreadRestore,
   forgetLastThread,
@@ -70,7 +71,7 @@ export default function HomePage() {
           visit is never a blank pane. */}
       {threads.length === 0 && !loadingThreads ? (
         <p className="text-sm text-gray-500 border border-dashed border-black p-4 bg-card">
-          尚无对话 — 在下方提问，或选择一份语料（侧栏 知识库）。
+          {EMPTY_SESSIONS_COPY}
         </p>
       ) : null}
       {loadingThreads && <p className="text-xs text-gray-400 mt-2">加载中…</p>}

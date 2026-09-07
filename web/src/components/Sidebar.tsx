@@ -23,7 +23,7 @@ import {
   type NavKey,
 } from "../navChrome";
 import { workspaceStatusView } from "../statusStrip";
-import { readSessionsFolded, writeSessionsFolded } from "../sessionKeys";
+import { readSessionsOpen, writeSessionsFolded } from "../sessionKeys";
 import { useWorkspaceStore } from "../store";
 
 export function truncateTitle(title: string, max = 50): string {
@@ -34,6 +34,12 @@ export function truncateTitle(title: string, max = 50): string {
 /** id of the thread-list container so the disclosure button's
  * aria-controls points at what it expands. */
 const SESSIONS_LIST_ID = "sidebar-sessions-list";
+
+/** Shared empty-state copy — the sidebar rail and `/` say the same
+ * thing about the same empty 会话 list, so the strings must not
+ * drift apart. (HomePage imports this.) */
+export const EMPTY_SESSIONS_COPY =
+  "尚无对话 — 在下方提问，或选择一份语料（侧栏 知识库）。";
 
 /** 16px stroke SVG glyph for a chrome entry. currentColor so the
  * icon follows the active/inactive text color (no per-state color
@@ -177,18 +183,13 @@ export default function Sidebar() {
   const monitorMark = monitorNavMark(workspaceStatusView(status, statusLoaded));
   // Fold state starts from sessionStorage and persists on every
   // toggle, so the rail stays as the operator left it this session.
-  const [sessionsOpen, setSessionsOpen] = useState(() => {
-    try {
-      return !readSessionsFolded(window.sessionStorage);
-    } catch {
-      return true; /* no storage at all - default unfolded. */
-    }
-  });
+  // (Explicit over Implicit: the write happens on the event path,
+  // not inside the setState updater, which StrictMode may run twice.)
+  const [sessionsOpen, setSessionsOpen] = useState(() => readSessionsOpen());
   const toggleSessions = () => {
-    setSessionsOpen((open) => {
-      writeSessionsFolded(!open, window.sessionStorage);
-      return !open;
-    });
+    const next = !sessionsOpen;
+    writeSessionsFolded(!next, window.sessionStorage);
+    setSessionsOpen(next);
   };
 
   return (
@@ -223,23 +224,23 @@ export default function Sidebar() {
                     name={entry.key}
                     warning={entry.key === "monitor" && monitorMark !== null}
                   />
-                  <span
-                    className="flex-1"
-                    aria-label={
+                  {/* Degraded 监控 swaps label + aria in one place so
+                      the triple conditional is not repeated per prop. */}
+                  {(() => {
+                    const degraded =
                       entry.key === "monitor" && monitorMark
-                        ? monitorMark.aria
-                        : undefined
-                    }
-                    title={
-                      entry.key === "monitor" && monitorMark
-                        ? monitorMark.aria
-                        : undefined
-                    }
-                  >
-                    {entry.key === "monitor" && monitorMark
-                      ? monitorMark.label
-                      : entry.label}
-                  </span>
+                        ? monitorMark
+                        : null;
+                    return (
+                      <span
+                        className="flex-1"
+                        aria-label={degraded ? degraded.aria : undefined}
+                        title={degraded ? degraded.aria : undefined}
+                      >
+                        {degraded ? degraded.label : entry.label}
+                      </span>
+                    );
+                  })()}
                 </NavLink>
               </li>
             ))}
@@ -252,21 +253,40 @@ export default function Sidebar() {
           visible when folded so threads are not lost; an empty list
           shows the dashed empty state instead of a blank rail. */}
       <div className="flex-1 overflow-y-auto p-3">
-        <button
-          type="button"
-          aria-expanded={sessionsOpen}
-          aria-controls={SESSIONS_LIST_ID}
-          onClick={toggleSessions}
-          className="mb-2 flex w-full items-center gap-1 border border-black px-2 py-1.5 text-left text-sm font-semibold bg-card hover:bg-tool"
-        >
-          <span aria-hidden="true" className="w-3 text-xs">
-            {sessionsOpen ? "▾" : "▸"}
-          </span>
-          <span className="flex-1">会话</span>
-          <span className="text-xs font-normal text-gray-600">
-            ({threads.length})
-          </span>
-        </button>
+        {/* Spec Boundaries: 「h2 会话 as <button aria-expanded>」 —
+            the h2 keeps 会话 in the document outline while the inner
+            button stays the disclosure control. */}
+        <h2 className="mb-2">
+          <button
+            type="button"
+            aria-expanded={sessionsOpen}
+            aria-controls={SESSIONS_LIST_ID}
+            onClick={toggleSessions}
+            className="flex w-full items-center gap-1 border border-black px-2 py-1.5 text-left text-sm font-semibold bg-card hover:bg-tool"
+          >
+            {/* Inline SVG chevron, same stroke language as NavIcon —
+                not a text glyph, so it scales and inherits color. */}
+            <svg
+              aria-hidden="true"
+              width="16"
+              height="16"
+              viewBox="0 0 16 16"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="square"
+              className={`shrink-0 transition-transform ${
+                sessionsOpen ? "" : "-rotate-90"
+              }`}
+            >
+              <path d="M4 6l4 4 4-4" />
+            </svg>
+            <span className="flex-1">会话</span>
+            <span className="text-xs font-normal text-gray-600">
+              ({threads.length})
+            </span>
+          </button>
+        </h2>
         {sessionsOpen ? (
           <div className="pl-3">
             <div className="mb-2">
@@ -277,7 +297,7 @@ export default function Sidebar() {
                 {threads.length === 0 ? (
                   <li>
                     <p className="border border-dashed border-black p-3 text-sm text-gray-500 bg-card">
-                      尚无对话 — 在下方提问，或选择一份语料（侧栏 知识库）。
+                      {EMPTY_SESSIONS_COPY}
                     </p>
                   </li>
                 ) : (

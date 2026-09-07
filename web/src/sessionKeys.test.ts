@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import {
   SESSIONS_FOLDED_KEY,
   readSessionsFolded,
+  readSessionsOpen,
   writeSessionsFolded,
 } from "./sessionKeys";
 
@@ -82,5 +83,37 @@ describe("writeSessionsFolded", () => {
       throw new Error("denied");
     };
     expect(() => writeSessionsFolded(true, storage)).not.toThrow();
+  });
+});
+
+describe("readSessionsOpen", () => {
+  it("starts open by default (nothing stored)", () => {
+    expect(readSessionsOpen()).toBe(true);
+  });
+
+  it("starts folded when the fold flag is set in window.sessionStorage", () => {
+    const storage = fakeStorage();
+    storage.setItem(SESSIONS_FOLDED_KEY, "1");
+    // Node env has no window; stub the global the helper reads so the
+    // windowed path is pinned without jsdom.
+    const originalWindow = globalThis.window;
+    (globalThis as { window?: unknown }).window = {
+      sessionStorage: storage,
+    };
+    try {
+      expect(readSessionsOpen()).toBe(false);
+    } finally {
+      (globalThis as { window?: unknown }).window = originalWindow;
+    }
+  });
+
+  it("still starts open when window itself is inaccessible", () => {
+    const originalWindow = globalThis.window;
+    delete (globalThis as { window?: unknown }).window;
+    try {
+      expect(readSessionsOpen()).toBe(true);
+    } finally {
+      (globalThis as { window?: unknown }).window = originalWindow;
+    }
   });
 });
