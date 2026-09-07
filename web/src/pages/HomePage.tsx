@@ -1,12 +1,15 @@
-// /: 对话. The workbench chrome's chat surface: an empty placeholder
-// for operators with no threads, and the last-thread restore for
-// returning visits. T1 (specs/workbench-chrome.md) split the corpus
-// catalog onto its own ``/kb`` page; the card grid no longer lives
-// here. T2 (specs/workbench-chrome.md) split the watchlist / notices
-// onto ``/monitor``. The sidebar list remains the thread path.
+// /: minimal home. The workbench chrome has no 对话总览 — research
+// threads live in the sidebar 会话 disclosure
+// (specs/workbench-sidebar-rail.md T2), so this page renders only an
+// empty placeholder pointing at the composer / 知识库. What stays is
+// the last-thread restore for returning visits (decideLastThreadRestore
+// + the /kb, /monitor session gates): a restorable thread still
+// bounces straight to /t/{id}; the gates keep the operator on the
+// chrome surface they picked.
 
 import { useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
+import { EMPTY_SESSIONS_COPY } from "../components/Sidebar";
 import {
   decideLastThreadRestore,
   forgetLastThread,
@@ -62,33 +65,16 @@ export default function HomePage() {
       <p className="text-sm text-gray-600 mb-4">
         就本地语料库里的 SEC filing 提问。
       </p>
-
-      <section aria-label="对话列表" className="mb-8">
-        {threads.length === 0 ? (
-          <p className="text-sm text-gray-500 border border-dashed border-black p-4 bg-card">
-            尚无对话 — 在下方提问，或选择一份语料（侧栏 知识库）。
-          </p>
-        ) : (
-          <ul className="grid gap-2 md:grid-cols-2">
-            {threads.slice(0, 6).map((t) => (
-              <li key={t.id} className="border border-black bg-card p-3">
-                <a
-                  href={`/t/${t.id}`}
-                  className="block text-sm font-medium hover:text-accent"
-                >
-                  {t.title}
-                </a>
-                <span className="text-xs text-gray-500">
-                  {new Date(t.created_at).toLocaleString()}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-        {loadingThreads && (
-          <p className="text-xs text-gray-400 mt-2">加载中…</p>
-        )}
-      </section>
+      {/* No thread-card wall here (the 对话总览 the spec retired):
+          threads are listed and opened in the sidebar 会话 group.
+          The empty state keeps the dashed-border copy so a fresh
+          visit is never a blank pane. */}
+      {threads.length === 0 && !loadingThreads ? (
+        <p className="text-sm text-gray-500 border border-dashed border-black p-4 bg-card">
+          {EMPTY_SESSIONS_COPY}
+        </p>
+      ) : null}
+      {loadingThreads && <p className="text-xs text-gray-400 mt-2">加载中…</p>}
     </main>
   );
 }
