@@ -8,6 +8,8 @@ import {
 } from "react-router-dom";
 import Sidebar from "./components/Sidebar";
 import HomePage from "./pages/HomePage";
+import KnowledgeBasePage from "./pages/KnowledgeBasePage";
+import MonitorPage from "./pages/MonitorPage";
 import ThreadPage from "./pages/ThreadPage";
 import { useWorkspaceStore } from "./store";
 
@@ -97,6 +99,8 @@ export default function App() {
       <div className="flex-1 overflow-y-auto">
         <Routes>
           <Route path="/" element={<HomePage />} />
+          <Route path="/kb" element={<KnowledgeBasePage />} />
+          <Route path="/monitor" element={<MonitorPage />} />
           <Route path="/t/:thread_id" element={<ThreadRoute />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

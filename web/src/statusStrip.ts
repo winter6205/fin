@@ -1,11 +1,14 @@
-// T10 (ADR 0033): copy for the Sidebar status strip.
+// T3 (specs/workbench-chrome.md): the StatusStrip footer left the
+// Sidebar; the boot-scoped status copy is now the 监控 page's job.
+// The invariant under test is "never blank" (SC7): every view state
+// — including a status route that never answered — yields non-empty
+// ``headline`` + ``detail`` copy. The model identity never rides
+// here (model is not a chrome line; it stays on research-thread
+// surfaces like the composer / turn row).
 //
-// The strip is the only place an ordinary operator learns that
-// retrieve is unreachable, so the rule it enforces is "never blank":
-// every view state — including a status route that never answered —
-// yields non-empty copy for every line. Rendering lives in
-// components/Sidebar.tsx; the wording and the two-state decision
-// live here so they are unit-testable without a DOM.
+// Rendering lives in components/MonitorStatusPanel.tsx; the wording
+// and the two-state decision live here so they are unit-testable
+// without a DOM.
 
 import type { WorkspaceStatus } from "./types";
 
@@ -21,7 +24,7 @@ const ADAPTER_KINDS: ReadonlySet<string> = new Set(["mcp", "fake"]);
  *
  * Returns ``null`` for anything that is not the full ADR 0033 field
  * set. An unknown reachability value is NOT coerced to
- * ``reachable``: a strip that vouches for a port it cannot read is
+ * ``reachable``: a panel that vouches for a port it cannot read is
  * worse than one that says it does not know.
  */
 export function parseWorkspaceStatus(raw: unknown): WorkspaceStatus | null {
@@ -47,7 +50,7 @@ export function parseWorkspaceStatus(raw: unknown): WorkspaceStatus | null {
   };
 }
 
-/** What the strip knows right now. ``unavailable`` is the route
+/** What the panel knows right now. ``unavailable`` is the route
  * itself failing — distinct from a route that answered
  * ``unreachable``, which is a healthy route reporting a sick port. */
 export type WorkspaceStatusView =
@@ -64,61 +67,63 @@ export function workspaceStatusView(
   return { state: "ready", status };
 }
 
-export interface StatusStripCopy {
-  retrieveLabel: string;
-  // ``degraded`` is what the Sidebar paints in the warning treatment.
-  retrieveTone: "ok" | "degraded";
-  retrieveDetail: string;
-  adapterLabel: string;
-  modelLabel: string;
-  corpusLabel: string;
+export interface MonitorStatusCopy {
+  /** One-line top label: 检索：可用 / 检索：不可用 / 检索：未知 / 检索：读取中. */
+  headline: string;
+  /** Ordinary-person explanation under the headline. Never empty. */
+  detail: string;
+  /** Drives the panel's treatment (red background for degraded). */
+  tone: "ok" | "degraded";
 }
 
 const UNREACHABLE_DETAIL =
   "找不到 iknow-memory 检索服务，回答不会带引用来源。" +
   "启动该服务，或设置 FIN_RETRIEVE_ADAPTER=fake 以占位检索启动。";
 
-export function describeStatusStrip(view: WorkspaceStatusView): StatusStripCopy {
+/** Copy for the 监控 page's status panel. The five view states each
+ * produce non-empty copy; ``degraded`` is what the panel paints in
+ * the warning treatment. The Sidebar used to carry the same surface
+ * as a four-line footer strip — T3 retires that and pulls model
+ * identity off the chrome entirely. */
+export function describeMonitorStatus(
+  view: WorkspaceStatusView,
+): MonitorStatusCopy {
   if (view.state === "loading") {
     return {
-      retrieveLabel: "检索：读取中",
+      headline: "检索：读取中",
       // Not an accusation: the first fetch has not answered yet.
-      retrieveTone: "ok",
-      retrieveDetail: "正在读取工作区状态…",
-      adapterLabel: "检索来源：读取中",
-      modelLabel: "模型：读取中",
-      corpusLabel: "语料：读取中",
+      tone: "ok",
+      detail: "正在读取工作区状态…",
     };
   }
   if (view.state === "unavailable") {
     return {
-      retrieveLabel: "检索：未知",
-      retrieveTone: "degraded",
-      retrieveDetail: "暂时读不到工作区状态，刷新页面可重试。",
-      adapterLabel: "检索来源：未知",
-      modelLabel: "模型：未知",
-      corpusLabel: "语料：未知",
+      headline: "检索：未知",
+      tone: "degraded",
+      detail: "暂时读不到工作区状态，点 重连 再试。",
     };
   }
 
   const { status } = view;
   const unreachable = status.retrieve_reachability === "unreachable";
   const fake = status.retrieve_adapter_kind === "fake";
+  if (unreachable) {
+    return {
+      headline: "检索：不可用",
+      tone: "degraded",
+      detail: UNREACHABLE_DETAIL,
+    };
+  }
+  if (fake) {
+    return {
+      headline: "检索：可用",
+      tone: "ok",
+      detail: `本地占位检索（fake）：能回答，但没有真实语料；语料 ${status.corpus_filing_count} 份。`,
+    };
+  }
   return {
-    retrieveLabel: unreachable ? "检索：不可用" : "检索：可用",
-    retrieveTone: unreachable ? "degraded" : "ok",
-    retrieveDetail: unreachable
-      ? UNREACHABLE_DETAIL
-      : fake
-        ? "本地占位检索：能回答，但没有真实语料。"
-        : "已连接 iknow-memory 检索服务。",
-    adapterLabel: fake
-      ? "检索来源：本地占位（fake）"
-      : "检索来源：iknow-memory（mcp）",
-    modelLabel: `模型：${status.model_identity || "未配置"}`,
-    corpusLabel:
-      status.corpus_filing_count === 0
-        ? "语料：0 份（未导入）"
-        : `语料：${status.corpus_filing_count} 份`,
+    headline: "检索：可用",
+    tone: "ok",
+    detail: `已连接 iknow-memory 检索服务；语料 ${status.corpus_filing_count} 份。`,
   };
 }

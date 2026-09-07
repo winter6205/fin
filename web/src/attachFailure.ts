@@ -30,11 +30,11 @@ export function describeAttachFailure(error: unknown): AttachFailureNotice {
       break;
     case "attachment_too_large":
       message =
-        "这份文件超过附件大小上限，没有上传。要长期入库请改用 Corpus 首页的入库入口。";
+        "这份文件超过附件大小上限，没有上传。要长期入库请改用知识库的入库入口。";
       break;
     case "attachment_not_text":
       message =
-        "附件只支持文本文件；PDF / Word / Excel 等格式请改用 Corpus 首页的入库入口。";
+        "附件只支持文本文件；PDF / Word / Excel 等格式请改用知识库的入库入口。";
       break;
     case "attachment_store_failed":
       message = "附件保存失败，请重试。";
