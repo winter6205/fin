@@ -213,16 +213,33 @@ function fakeThreadPage() {
       ];
     }
     if (state.route === "/monitor") {
-      // T2: the watchlist surface lives on /monitor. The mirror
-      // renders just enough of it (the watchlist form) to keep the
-      // tree realistic for any future monitor-side check; the
-      // composer is NOT on this route so the submit count is 1.
+      // T2: the watchlist surface lives on /monitor. T3: the boot-
+      // scoped status panel + 重连 control live here too. The mirror
+      // renders just enough of both to keep the tree realistic for
+      // the lane; the composer is NOT on this route so the submit
+      // count is 1 (composer-arming check stays scoped).
       return [
         ...sidebarEl(),
         el("main", {}, [
+          el("section", {
+            attrs: { "data-testid": "monitor-status-panel" },
+          }, [
+            el("p", {
+              attrs: { "data-testid": "monitor-status-headline" },
+              text: "检索：可用",
+            }),
+            el("p", {
+              attrs: { "data-testid": "monitor-status-detail" },
+              text: "已连接 iknow-memory 检索服务；语料 12 份。",
+            }),
+            el("button", {
+              attrs: { type: "button", "data-testid": "monitor-reconnect" },
+              text: "重连",
+            }),
+          ]),
           el("section", { attrs: { "aria-label": "关注列表" } }, [
             el("form", {}, [
-              el("input", { attrs: { "aria-label": "要关注的 issuer" } }),
+              el("input", { attrs: { "aria-label": "要关注 issuer" } }),
               el("button", { attrs: { type: "submit" }, text: "+ 关注" }),
             ]),
           ]),

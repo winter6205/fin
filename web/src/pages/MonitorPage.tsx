@@ -2,14 +2,17 @@
 //
 // T1 placed the route + chrome label; T2 fills in the surface —
 // watchlist CRUD + unread notices move here from the sidebar. T3
-// (separate ticket) adds retrieve-down copy + a **重连** control
-// once the StatusStrip footer leaves the sidebar.
+// adds the boot-scoped status panel above the watchlist: ordinary-
+// person copy for loading / unavailable / unreachable / reachable-
+// fake / reachable-mcp, plus a **重连** control that re-GETs
+// ``GET /api/status`` without a full document reload.
 //
 // Visiting this page sets the ``fin.monitor`` session gate so a
 // returning visit lands back on /monitor instead of bouncing the
 // operator to their last /t/{id} — same role as ``markKbVisit``.
 
 import { useEffect } from "react";
+import MonitorStatusPanel from "../components/MonitorStatusPanel";
 import WatchlistPanel from "../components/WatchlistPanel";
 import { markMonitorVisit } from "../sessionKeys";
 
@@ -30,6 +33,7 @@ export default function MonitorPage() {
         关注本地 filing 动态；未读通知在此 dismiss。
       </p>
       <div className="max-w-md border border-black bg-card p-4">
+        <MonitorStatusPanel />
         <WatchlistPanel />
       </div>
     </main>

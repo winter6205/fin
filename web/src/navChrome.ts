@@ -9,6 +9,14 @@
 //
 // `/t/{id}` counts as 对话: opening a thread should still light the
 // 对话 entry, not show three inactive labels.
+//
+// T3: ``monitorNavMark`` decides whether the 监控 entry carries a
+// non-text-only degraded glyph. Loading + unavailable stay clean —
+// only a healthy route that reports ``retrieve_reachability:
+// unreachable`` paints the mark. Route-level failures show their
+// degraded copy on /monitor itself, never a sidebar alarm.
+
+import type { WorkspaceStatusView } from "./statusStrip";
 
 export type NavKey = "chat" | "kb" | "monitor";
 
@@ -42,4 +50,30 @@ export function activeNavKey(pathname: string): NavKey | null {
   if (pathname === "/kb") return "kb";
   if (pathname === "/monitor") return "monitor";
   return null;
+}
+
+export interface MonitorNavMark {
+  /** A non-text glyph the Sidebar paints next to the 监控 label. */
+  glyph: string;
+  /** Plain-text alternative the aria-label reads aloud. */
+  aria: string;
+}
+
+/**
+ * Decide whether the 监控 sidebar entry gets a non-text-only
+ * degraded mark. The mark is reserved for a HEALTHY route reporting
+ * an unreachable retrieve port — the route-level failure state
+ * (``unavailable``) paints its degraded copy on the /monitor page
+ * itself, never as a sidebar alarm (SC: sidebar is chrome, not
+ * diagnostics). Returns ``null`` when no mark should render.
+ */
+export function monitorNavMark(
+  view: WorkspaceStatusView,
+): MonitorNavMark | null {
+  if (view.state !== "ready") return null;
+  if (view.status.retrieve_reachability !== "unreachable") return null;
+  return {
+    glyph: "●",
+    aria: "检索不可用",
+  };
 }

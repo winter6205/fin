@@ -398,54 +398,97 @@ export default async function runStreamChecks(page, options = {}) {
     };
   });
 
-  // T10 (ADR 0033): the Sidebar strip is the only place an ordinary
-  // operator learns retrieve is unreachable, so it must never be
-  // blank and must agree with the route it reads. Whichever of the
-  // two states this workspace is in, the strip has to render it.
+  // T3 (specs/workbench-chrome.md): the Sidebar footer strip is
+  // gone. The status copy now lives on /monitor, and an
+  // unreachable retrieve paints a non-text-only mark on the 监控
+  // entry. This check asserts the new IA on three surfaces:
+  //   1. on /monitor, the panel + 重连 button are present;
+  //   2. on a thread route, the strip selector is gone;
+  //   3. on the home route, the strip selector is gone.
+  // The probe answer is checked against the rendered headline so
+  // a healthy vs unreachable boot reads distinctly.
   await check("6-status-strip", async () => {
     const route = await page.evaluate(async (base) => {
       const response = await fetch(base + "/api/status");
       return { ok: response.ok, body: await response.json() };
     }, cfg.baseUrl);
 
-    const strip = page.locator('[aria-label="工作区状态"]');
-    if ((await strip.count()) === 0) {
-      return { pass: false, detail: { route, stripRendered: false } };
-    }
-    const rendered = await strip.first().evaluate((node) => {
-      const clean = (el) => (el?.textContent ?? "").replace(/\s+/g, " ").trim();
-      const paragraphs = Array.from(node.querySelectorAll("p")).map(clean);
-      return {
-        retrieveLine: clean(node.querySelector('[data-testid="status-retrieve"]')),
-        detailLine: paragraphs[1] ?? "",
-        facts: Array.from(node.querySelectorAll("li")).map(clean),
-      };
-    });
-
     const unreachable = route.body?.retrieve_reachability === "unreachable";
-    // "可用" is a substring of "不可用", so the reachable case has to
-    // exclude the negation explicitly.
-    const labelMatchesRoute = unreachable
-      ? rendered.retrieveLine.includes("不可用")
-      : rendered.retrieveLine.includes("可用") &&
-        !rendered.retrieveLine.includes("不可用");
+
+    // /monitor — the status panel must render with a headline +
+    // 重连 control. Headline agrees with the route: unreachable
+    // → 不可用, reachable (mcp or fake) → 可用 (excluding the
+    // negation, since 不可用 contains 可用).
+    await page.goto(cfg.baseUrl + "/monitor", { timeout: cfg.navTimeoutMs });
+    const panel = page.locator('[data-testid="monitor-status-panel"]');
+    const panelCount = await panel.count();
+    let headlineText = "";
+    let detailText = "";
+    let reconnectCount = 0;
+    if (panelCount > 0) {
+      headlineText = (
+        (await panel
+          .locator('[data-testid="monitor-status-headline"]')
+          .first()
+          .textContent()) ?? ""
+      ).replace(/\s+/g, " ").trim();
+      detailText = (
+        (await panel
+          .locator('[data-testid="monitor-status-detail"]')
+          .first()
+          .textContent()) ?? ""
+      ).replace(/\s+/g, " ").trim();
+      reconnectCount = await panel
+        .locator('[data-testid="monitor-reconnect"]')
+        .count();
+    }
+
+    const headlineMatchesRoute = unreachable
+      ? headlineText.includes("不可用")
+      : headlineText.includes("可用") &&
+        !headlineText.includes("不可用");
+
+    // Sidebar — the legacy footer strip selector must be gone on
+    // every chrome surface. /monitor is already loaded; we hop
+    // through / and /t/{id} to assert each.
+    async function legacyStripAbsent(label) {
+      await page.goto(cfg.baseUrl + label, { timeout: cfg.navTimeoutMs });
+      const legacy = await page
+        .locator('[data-testid="status-retrieve"]')
+        .count();
+      return legacy;
+    }
+    const onHomeLegacy = await legacyStripAbsent("/");
+    // New thread so we have a /t/{id} to verify against.
+    await page.goto(cfg.baseUrl + "/monitor", { timeout: cfg.navTimeoutMs });
+    await page
+      .getByRole("button", { name: "+ 新建 thread" })
+      .click({ timeout: cfg.navTimeoutMs });
+    await page.waitForURL(/\/t\//, { timeout: cfg.navTimeoutMs });
+    const onThreadLegacy = await page
+      .locator('[data-testid="status-retrieve"]')
+      .count();
+    await page.goto(cfg.baseUrl + "/monitor", { timeout: cfg.navTimeoutMs });
 
     return {
       pass:
         route.ok === true &&
-        labelMatchesRoute &&
-        rendered.retrieveLine.length > 0 &&
-        rendered.detailLine.length > 0 &&
-        rendered.facts.length === 3 &&
-        rendered.facts.every((line) => line.length > 0),
+        panelCount === 1 &&
+        headlineMatchesRoute &&
+        headlineText.length > 0 &&
+        detailText.length > 0 &&
+        reconnectCount === 1 &&
+        onHomeLegacy === 0 &&
+        onThreadLegacy === 0,
       detail: {
         reachability: route.body?.retrieve_reachability ?? null,
         adapter: route.body?.retrieve_adapter_kind ?? null,
-        corpusFilingCount: route.body?.corpus_filing_count ?? null,
-        retrieveLine: rendered.retrieveLine,
-        detailLineChars: rendered.detailLine.length,
-        facts: rendered.facts,
-        labelMatchesRoute,
+        headlineText,
+        detailLen: detailText.length,
+        reconnectCount,
+        onHomeLegacy,
+        onThreadLegacy,
+        headlineMatchesRoute,
       },
     };
   });
