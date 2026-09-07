@@ -296,59 +296,80 @@ export default async function runStreamChecks(page, options = {}) {
     };
   });
 
-  // Spec line 31-32: once the run ends the trace collapses — thinking
-  // to a one-line label, tool rows to closed `details`. Collapsed is
-  // not lost: expanding the label brings the reasoning back.
+  // turn-trace-folds (the tracked change) replaces the old accordion/details trace:
+  // sibling thinking/tool bursts, each collapsed by default once the
+  // run ends. Collapsed thinking shows the 深度思考 header + a tail
+  // preview (no full text); collapsed tools shows the 工具 header
+  // (no rows). Collapsed is not lost: expanding brings the content
+  // back, and a manual toggle round-trips both folds. A turn may
+  // hold several thinking bursts (pre-tool and post-tool reasoning);
+  // every one of them obeys the same contract.
   await check("5-trace-collapse", async () => {
-    const thinkingToggle = page
-      .locator("article")
-      .last()
-      .locator('[data-testid="turn-trace"] button')
-      .filter({ hasText: /thinking/i })
+    const article = page.locator("article").last();
+
+    const thinkingToggle = article
+      .locator('[data-testid="trace-thinking-toggle"]')
+      .first();
+    const toolsToggle = article
+      .locator('[data-testid="trace-tools-toggle"]')
       .first();
 
     const readTrace = () =>
       page
         .locator("article")
         .last()
-        .evaluate((article) => {
-          const trace = article.querySelector('[data-testid="turn-trace"]');
-          if (!trace) return { hasTrace: false, label: "", proseLen: 0, openToolRows: 0, toolRows: 0 };
-          const button = Array.from(trace.querySelectorAll("button")).find((btn) =>
-            /thinking/i.test(btn.textContent ?? ""),
-          );
-          const prose = button?.closest("div")?.querySelector("p");
-          const details = Array.from(trace.querySelectorAll("details"));
+        .evaluate((el) => {
+          const trace = el.querySelector('[data-testid="turn-trace"]');
+          const all = (id) =>
+            trace
+              ? Array.from(trace.querySelectorAll(`[data-testid="${id}"]`))
+              : [];
           return {
-            hasTrace: true,
-            hasThinkingToggle: !!button,
-            label: (button?.textContent ?? "").replace(/\s+/g, " ").trim(),
-            proseLen: (prose?.textContent ?? "").replace(/\s+/g, " ").trim().length,
-            toolRows: details.length,
-            openToolRows: details.filter((node) => node.open).length,
+            hasTrace: !!trace,
+            thinkingToggles: all("trace-thinking-toggle").length,
+            previews: all("trace-thinking-preview").length,
+            fulls: all("trace-thinking-full").length,
+            toolsToggle: all("trace-tools-toggle").length,
+            toolsListsOpen: all("trace-tools-list").length,
           };
         });
 
     const collapsed = await readTrace();
-    if (!collapsed.hasTrace || !collapsed.hasThinkingToggle) {
+    if (
+      !collapsed.hasTrace ||
+      collapsed.thinkingToggles === 0 ||
+      collapsed.toolsToggle === 0
+    ) {
       return { pass: false, detail: collapsed };
     }
 
+    // Expand the first thinking fold: its full burst text must come
+    // back, and toggling again must re-collapse it (manual override
+    // works). Unrelated bursts stay collapsed throughout.
     await thinkingToggle.click();
     const expanded = await readTrace();
+    await thinkingToggle.click();
+    const recollapsed = await readTrace();
+
+    // Expand the tools fold: the call rows come back as name: summary.
+    await toolsToggle.click();
+    const toolsOpen = await readTrace();
 
     return {
       pass:
-        collapsed.proseLen === 0 &&
-        collapsed.openToolRows === 0 &&
-        collapsed.toolRows > 0 &&
-        expanded.proseLen > 0,
+        collapsed.previews === collapsed.thinkingToggles &&
+        collapsed.fulls === 0 &&
+        collapsed.toolsListsOpen === 0 &&
+        expanded.fulls === 1 &&
+        recollapsed.fulls === 0 &&
+        toolsOpen.toolsListsOpen === 1,
       detail: {
-        label: collapsed.label,
-        toolRows: collapsed.toolRows,
-        openToolRowsAfterRun: collapsed.openToolRows,
-        collapsedProseLen: collapsed.proseLen,
-        expandedProseLen: expanded.proseLen,
+        thinkingToggles: collapsed.thinkingToggles,
+        collapsedPreviews: collapsed.previews,
+        collapsedFulls: collapsed.fulls,
+        expandedFulls: expanded.fulls,
+        recollapsedFulls: recollapsed.fulls,
+        toolsListsOpen: toolsOpen.toolsListsOpen,
       },
     };
   });
@@ -418,7 +439,11 @@ export default async function runStreamChecks(page, options = {}) {
     // /monitor — the status panel must render with a headline +
     // 重连 control. Headline agrees with the route: unreachable
     // → 不可用, reachable (mcp or fake) → 可用 (excluding the
-    // negation, since 不可用 contains 可用).
+    // negation, since 不可用 contains 可用). The panel starts in
+    // the 读取中 loading state until the status fetch lands, so the
+    // headline is polled until it settles (loading never counts as
+    // a verdict — a panel stuck loading is what a poll timeout
+    // reports).
     await page.goto(cfg.baseUrl + "/monitor", { timeout: cfg.navTimeoutMs });
     const panel = page.locator('[data-testid="monitor-status-panel"]');
     const panelCount = await panel.count();
@@ -426,12 +451,19 @@ export default async function runStreamChecks(page, options = {}) {
     let detailText = "";
     let reconnectCount = 0;
     if (panelCount > 0) {
-      headlineText = (
-        (await panel
-          .locator('[data-testid="monitor-status-headline"]')
-          .first()
-          .textContent()) ?? ""
-      ).replace(/\s+/g, " ").trim();
+      const readHeadline = async () =>
+        (
+          (await panel
+            .locator('[data-testid="monitor-status-headline"]')
+            .first()
+            .textContent()) ?? ""
+        ).replace(/\s+/g, " ").trim();
+      const deadline = Date.now() + cfg.navTimeoutMs;
+      while (Date.now() < deadline) {
+        headlineText = await readHeadline();
+        if (headlineText.length > 0 && !headlineText.includes("读取中")) break;
+        await page.waitForTimeout(100);
+      }
       detailText = (
         (await panel
           .locator('[data-testid="monitor-status-detail"]')
