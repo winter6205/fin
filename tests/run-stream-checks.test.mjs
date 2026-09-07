@@ -27,7 +27,7 @@ if (has("open")) {
 if (has("run-code")) {
   const failedId = process.env.FAKE_FAILED_CHECK_ID;
   const ids = [
-    "1-home-corpus",
+    "1-kb-corpus",
     "2-stream-no-retract",
     "4-dom-separation",
     "5-trace-collapse",
@@ -183,18 +183,33 @@ function fakeThreadPage() {
   };
 
   // Rebuilt per query so the answer bubble tracks the stream clock.
+  // T1 chrome (specs/workbench-chrome.md): the sidebar is mounted
+  // outside <Routes> in App.tsx, so its "+ 新建 thread" button is on
+  // every route. The corpus cards moved off "/" onto "/kb", so the
+  // "/" main is just the empty/restore placeholder — there is no
+  // longer a 12-card grid inline on the home route.
+  const sidebarEl = () => [
+    el("aside", {}, [
+      el("button", { text: "+ 新建 thread", action: "new-thread" }),
+    ]),
+  ];
   const tree = () => {
     if (state.route === "/") {
+      return [...sidebarEl(), el("main", {}, [])];
+    }
+    if (state.route === "/kb") {
       return [
+        ...sidebarEl(),
         el("main", {}, [
+          el("div", { attrs: { "data-testid": "ingest-control" } }),
           ...Array.from({ length: 12 }, (_, i) =>
             el("button", { text: `Apple 10-Q ${i} · 24 pages` }),
           ),
-          el("button", { text: "+ 新建 thread", action: "new-thread" }),
         ]),
       ];
     }
     return [
+      ...sidebarEl(),
       el("main", {}, [
         // Sidebar watchlist: a SECOND `type="submit"` on the thread
         // page. Rendered first, so the composer is not the first form

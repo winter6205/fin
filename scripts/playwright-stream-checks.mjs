@@ -12,7 +12,7 @@
 
 // Checks that run on every invocation, in report order.
 const BASE_CHECK_IDS = [
-  "1-home-corpus",
+  "1-kb-corpus",
   "2-stream-no-retract",
   "4-dom-separation",
   "5-trace-collapse",
@@ -143,8 +143,13 @@ export default async function runStreamChecks(page, options = {}) {
     return ((await node.first().textContent()) ?? "").replace(/\s+/g, " ").trim();
   };
 
-  await check("1-home-corpus", async () => {
-    await page.goto(cfg.baseUrl + "/", { timeout: cfg.navTimeoutMs });
+  // T1 workbench chrome: corpus cards + IngestCorpusControl moved off
+  // ``/`` onto ``/kb`` (specs/workbench-chrome.md). The check drives
+  // ``/kb`` and asserts the catalog surface is intact; ``/`` is the
+  // 对话 empty / last-thread restore surface and does not carry the
+  // card grid.
+  await check("1-kb-corpus", async () => {
+    await page.goto(cfg.baseUrl + "/kb", { timeout: cfg.navTimeoutMs });
     await page
       .locator("button")
       .filter({ hasText: "pages" })
@@ -157,9 +162,12 @@ export default async function runStreamChecks(page, options = {}) {
     const newThreadVisible = await page
       .getByRole("button", { name: "+ 新建 thread" })
       .isVisible();
+    const ingestVisible = await page
+      .locator('[data-testid="ingest-control"]')
+      .count();
     return {
-      pass: corpusCards >= 12 && newThreadVisible,
-      detail: { corpusCards, newThreadVisible },
+      pass: corpusCards >= 12 && newThreadVisible && ingestVisible > 0,
+      detail: { corpusCards, newThreadVisible, ingestVisible },
     };
   });
 

@@ -3,9 +3,9 @@
 //
 // The decision is a pure function so its boundaries — list not
 // fetched yet, marker pointing at a deleted thread, operator who
-// deliberately chose the corpus home — are testable without a DOM.
-// The localStorage wrappers around it degrade to "no restore" when
-// storage is unavailable.
+// deliberately chose the corpus home OR the knowledge base this
+// session — are testable without a DOM. The localStorage wrappers
+// around it degrade to "no restore" when storage is unavailable.
 
 export const LAST_THREAD_KEY = "fin.lastThread";
 
@@ -14,8 +14,21 @@ export interface LastThreadRestoreInput {
   threadsLoaded: boolean;
   lastThreadId: string | null;
   threadIds: readonly string[];
-  /** Operator chose the corpus home this session (session gate). */
+  /**
+   * Operator chose the corpus home this session (session gate).
+   * @deprecated kept for the legacy ``Corpus 首页`` marker; T1 workbench
+   * chrome lights the same gate via ``kbGateActive`` when the operator
+   * visits ``/kb``. Both are honored — either set is enough to stay.
+   */
   homeGateActive: boolean;
+  /**
+   * T1 (specs/workbench-chrome.md): operator visited ``/kb`` this
+   * session. Same role as the corpus-home gate: a returning visit
+   * must not bounce the operator off the surface they picked. Set
+   * independently of ``homeGateActive`` so the chrome's nav click is
+   * the single thing the gate keys off.
+   */
+  kbGateActive: boolean;
 }
 
 export type LastThreadRestoreDecision =
@@ -30,7 +43,7 @@ export function decideLastThreadRestore(
   // "Loaded and genuinely empty" must not look like "not fetched
   // yet", or the one-shot restore burns itself on a valid marker.
   if (!input.threadsLoaded) return { action: "wait" };
-  if (input.homeGateActive) return { action: "stay" };
+  if (input.homeGateActive || input.kbGateActive) return { action: "stay" };
   if (!input.lastThreadId) return { action: "stay" };
   if (input.threadIds.includes(input.lastThreadId)) {
     return { action: "restore", threadId: input.lastThreadId };
