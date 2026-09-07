@@ -188,6 +188,10 @@ function fakeThreadPage() {
   // every route. The corpus cards moved off "/" onto "/kb", so the
   // "/" main is just the empty/restore placeholder — there is no
   // longer a 12-card grid inline on the home route.
+  // T2 chrome (specs/workbench-chrome.md): the watchlist CRUD + notice
+  // dismissal moved off the sidebar onto /monitor — the thread page
+  // (and its sidebar) no longer render the watchlist form, so the
+  // composer is the only `type="submit"` left on this route.
   const sidebarEl = () => [
     el("aside", {}, [
       el("button", { text: "+ 新建 thread", action: "new-thread" }),
@@ -208,18 +212,26 @@ function fakeThreadPage() {
         ]),
       ];
     }
+    if (state.route === "/monitor") {
+      // T2: the watchlist surface lives on /monitor. The mirror
+      // renders just enough of it (the watchlist form) to keep the
+      // tree realistic for any future monitor-side check; the
+      // composer is NOT on this route so the submit count is 1.
+      return [
+        ...sidebarEl(),
+        el("main", {}, [
+          el("section", { attrs: { "aria-label": "关注列表" } }, [
+            el("form", {}, [
+              el("input", { attrs: { "aria-label": "要关注的 issuer" } }),
+              el("button", { attrs: { type: "submit" }, text: "+ 关注" }),
+            ]),
+          ]),
+        ]),
+      ];
+    }
     return [
       ...sidebarEl(),
       el("main", {}, [
-        // Sidebar watchlist: a SECOND `type="submit"` on the thread
-        // page. Rendered first, so the composer is not the first form
-        // in document order either.
-        el("section", { attrs: { "aria-label": "关注列表" } }, [
-          el("form", {}, [
-            el("input", { attrs: { "aria-label": "要关注的 issuer" } }),
-            el("button", { attrs: { type: "submit" }, text: "+ 关注" }),
-          ]),
-        ]),
         el("article", {}, [
           el("div", { classes: ["bg-card"] }, [
             el("p", {
@@ -375,12 +387,15 @@ function fakeThreadPage() {
   };
 }
 
-// The thread page renders the composer's 发送 AND the watchlist's
-// + 关注, both `type="submit"`. Addressing submit buttons page-wide
-// therefore resolves to two elements and every call on the locator
-// dies in strict mode — which is how the lane lost checks 2/4/5
-// while the product itself was fine.
-test("arms the composer on a thread page that also renders the watchlist submit", async () => {
+// T2 chrome (specs/workbench-chrome.md): the watchlist + its
+// `+ 关注` submit moved off the thread page onto /monitor, so the
+// thread page now renders only the composer. The original lane
+// regressed because a page-wide submit locator resolved to two
+// elements (composer + watchlist) and died in strict mode. Today
+// the watchlist submit lives at /monitor and the thread page has
+// exactly one submit; the composer-only assertion still guards
+// that the harness scopes the locator it means to scope.
+test("arms the composer on a thread page whose only submit is the composer", async () => {
   const page = fakeThreadPage();
   const report = await runStreamChecks(page, {
     baseUrl: "http://127.0.0.1:1",
@@ -394,7 +409,7 @@ test("arms the composer on a thread page that also renders the watchlist submit"
   assert.equal(
     stream.pass,
     true,
-    `2-stream-no-retract must pass on a page with two submit buttons; got ` +
+    `2-stream-no-retract must pass on a thread page with a single submit; got ` +
       `${stream.error ?? JSON.stringify(stream.detail)}`,
   );
 });

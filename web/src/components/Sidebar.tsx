@@ -3,7 +3,10 @@
 // single blue accent. T1 (specs/workbench-chrome.md): the chrome row
 // is the three-entry nav (对话 / 知识库 / 监控); the legacy "Corpus
 // 首页" label is gone and the active chrome is keyed off the
-// pathname via ``navChrome.ts``.
+// pathname via ``navChrome.ts``. T2 (specs/workbench-chrome.md): the
+// watchlist + notice form moved off the sidebar onto /monitor; this
+// surface is chrome + thread list only. The StatusStrip footer stays
+// — T3 takes it off.
 
 import * as Dialog from "@radix-ui/react-dialog";
 import { useState } from "react";
@@ -11,7 +14,6 @@ import { NavLink, useLocation, useNavigate } from "react-router-dom";
 import { activeNavKey, NAV_ENTRIES } from "../navChrome";
 import { describeStatusStrip, workspaceStatusView } from "../statusStrip";
 import { useWorkspaceStore } from "../store";
-import WatchlistPanel from "./WatchlistPanel";
 
 export function truncateTitle(title: string, max = 50): string {
   if (title.length <= max) return title;
@@ -134,7 +136,6 @@ export default function Sidebar() {
           ))}
         </ul>
       </nav>
-      <WatchlistPanel />
       <StatusStrip />
     </aside>
   );
@@ -143,7 +144,7 @@ export default function Sidebar() {
 // T10 (ADR 0033): boot-scoped workspace status, pinned under the
 // thread list. Every state renders four lines — an unreachable
 // retrieve is degraded copy here, never an empty panel and never an
-// error page.
+// error page. T3 removes this footer; T2 leaves it alone.
 function StatusStrip() {
   const status = useWorkspaceStore((s) => s.status);
   const statusLoaded = useWorkspaceStore((s) => s.statusLoaded);

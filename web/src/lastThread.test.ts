@@ -17,6 +17,7 @@ describe("decideLastThreadRestore", () => {
         threadIds: [OTHER, LAST],
         homeGateActive: false,
         kbGateActive: false,
+        monitorGateActive: false,
       }),
     ).toEqual({ action: "restore", threadId: LAST });
   });
@@ -31,6 +32,7 @@ describe("decideLastThreadRestore", () => {
         threadIds: [],
         homeGateActive: false,
         kbGateActive: false,
+        monitorGateActive: false,
       }),
     ).toEqual({ action: "wait" });
   });
@@ -43,6 +45,7 @@ describe("decideLastThreadRestore", () => {
         threadIds: [OTHER],
         homeGateActive: false,
         kbGateActive: false,
+        monitorGateActive: false,
       }),
     ).toEqual({ action: "forget" });
   });
@@ -55,6 +58,7 @@ describe("decideLastThreadRestore", () => {
         threadIds: [],
         homeGateActive: false,
         kbGateActive: false,
+        monitorGateActive: false,
       }),
     ).toEqual({ action: "forget" });
   });
@@ -67,6 +71,7 @@ describe("decideLastThreadRestore", () => {
         threadIds: [OTHER],
         homeGateActive: false,
         kbGateActive: false,
+        monitorGateActive: false,
       }),
     ).toEqual({ action: "stay" });
   });
@@ -79,6 +84,7 @@ describe("decideLastThreadRestore", () => {
         threadIds: [LAST],
         homeGateActive: true,
         kbGateActive: false,
+        monitorGateActive: false,
       }),
     ).toEqual({ action: "stay" });
   });
@@ -91,6 +97,7 @@ describe("decideLastThreadRestore", () => {
         threadIds: [LAST],
         homeGateActive: false,
         kbGateActive: false,
+        monitorGateActive: false,
       }),
     ).toEqual({ action: "stay" });
   });
@@ -107,6 +114,7 @@ describe("decideLastThreadRestore", () => {
         threadIds: [LAST],
         homeGateActive: false,
         kbGateActive: true,
+        monitorGateActive: false,
       }),
     ).toEqual({ action: "stay" });
   });
@@ -120,6 +128,7 @@ describe("decideLastThreadRestore", () => {
         threadIds: [LAST],
         homeGateActive: false,
         kbGateActive: true,
+        monitorGateActive: false,
       }),
     ).toEqual({ action: "stay" });
     // Both set → still stays (either is enough).
@@ -130,6 +139,7 @@ describe("decideLastThreadRestore", () => {
         threadIds: [LAST],
         homeGateActive: true,
         kbGateActive: true,
+        monitorGateActive: false,
       }),
     ).toEqual({ action: "stay" });
     // Both clear → restores the marker.
@@ -140,6 +150,72 @@ describe("decideLastThreadRestore", () => {
         threadIds: [LAST],
         homeGateActive: false,
         kbGateActive: false,
+        monitorGateActive: false,
+      }),
+    ).toEqual({ action: "restore", threadId: LAST });
+  });
+
+  // T2 chrome + /monitor (specs/workbench-chrome.md): visiting
+  // /monitor this session sets a gate that makes the restore bounce
+  // — same role as the kb gate. The decision is keyed off any of
+  // the three gates (home / kb / monitor), and a monitor visit
+  // alone is enough to keep the operator on /monitor.
+  it("stays home when the operator chose the monitor surface this session", () => {
+    expect(
+      decideLastThreadRestore({
+        threadsLoaded: true,
+        lastThreadId: LAST,
+        threadIds: [LAST],
+        homeGateActive: false,
+        kbGateActive: false,
+        monitorGateActive: true,
+      }),
+    ).toEqual({ action: "stay" });
+  });
+
+  it("treats the monitor gate independently of the kb gate", () => {
+    // kb set, monitor clear → stays (kb alone is enough).
+    expect(
+      decideLastThreadRestore({
+        threadsLoaded: true,
+        lastThreadId: LAST,
+        threadIds: [LAST],
+        homeGateActive: false,
+        kbGateActive: true,
+        monitorGateActive: false,
+      }),
+    ).toEqual({ action: "stay" });
+    // kb clear, monitor set → stays (monitor alone is enough).
+    expect(
+      decideLastThreadRestore({
+        threadsLoaded: true,
+        lastThreadId: LAST,
+        threadIds: [LAST],
+        homeGateActive: false,
+        kbGateActive: false,
+        monitorGateActive: true,
+      }),
+    ).toEqual({ action: "stay" });
+    // All three set → stays (any is enough).
+    expect(
+      decideLastThreadRestore({
+        threadsLoaded: true,
+        lastThreadId: LAST,
+        threadIds: [LAST],
+        homeGateActive: true,
+        kbGateActive: true,
+        monitorGateActive: true,
+      }),
+    ).toEqual({ action: "stay" });
+    // All three clear → restores the marker.
+    expect(
+      decideLastThreadRestore({
+        threadsLoaded: true,
+        lastThreadId: LAST,
+        threadIds: [LAST],
+        homeGateActive: false,
+        kbGateActive: false,
+        monitorGateActive: false,
       }),
     ).toEqual({ action: "restore", threadId: LAST });
   });
