@@ -49,6 +49,18 @@ export function readSessionsFolded(storage: Storage): boolean {
   }
 }
 
+/** Sidebar-facing wrapper: returns true when the disclosure should
+ * start open. ``window.sessionStorage`` itself may be inaccessible
+ * (privacy mode throws on property access), so the default-unfolded
+ * fallback lives here — in exactly one place. */
+export function readSessionsOpen(): boolean {
+  try {
+    return !readSessionsFolded(window.sessionStorage);
+  } catch {
+    return true; /* no storage at all - default unfolded. */
+  }
+}
+
 export function writeSessionsFolded(folded: boolean, storage: Storage): void {
   try {
     if (folded) {
