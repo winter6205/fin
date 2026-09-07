@@ -172,13 +172,12 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     //
     // SC7 in-flight guard: a double-click on 重连 while the first
     // GET is in flight MUST issue ONE wire call. The store tracks
-    // ``loadingStatus`` and returns the in-flight promise to any
-    // concurrent caller instead of kicking off a second fetch.
+    // ``loadingStatus`` and treats a concurrent caller as a no-op
+    // while it is set — the first call drives the outcome and the
+    // 重连 button is disabled while ``loadingStatus`` is true, so a
+    // second click cannot reach this branch.
     const existing = get();
     if (existing.loadingStatus) {
-      // The in-flight promise resolves with whatever the first call
-      // resolves with; awaiting it preserves the same outcome for
-      // both click handlers.
       return;
     }
     set({ loadingStatus: true });
