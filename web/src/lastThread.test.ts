@@ -16,6 +16,7 @@ describe("decideLastThreadRestore", () => {
         lastThreadId: LAST,
         threadIds: [OTHER, LAST],
         homeGateActive: false,
+        kbGateActive: false,
       }),
     ).toEqual({ action: "restore", threadId: LAST });
   });
@@ -29,6 +30,7 @@ describe("decideLastThreadRestore", () => {
         lastThreadId: LAST,
         threadIds: [],
         homeGateActive: false,
+        kbGateActive: false,
       }),
     ).toEqual({ action: "wait" });
   });
@@ -40,6 +42,7 @@ describe("decideLastThreadRestore", () => {
         lastThreadId: LAST,
         threadIds: [OTHER],
         homeGateActive: false,
+        kbGateActive: false,
       }),
     ).toEqual({ action: "forget" });
   });
@@ -51,6 +54,7 @@ describe("decideLastThreadRestore", () => {
         lastThreadId: LAST,
         threadIds: [],
         homeGateActive: false,
+        kbGateActive: false,
       }),
     ).toEqual({ action: "forget" });
   });
@@ -62,6 +66,7 @@ describe("decideLastThreadRestore", () => {
         lastThreadId: null,
         threadIds: [OTHER],
         homeGateActive: false,
+        kbGateActive: false,
       }),
     ).toEqual({ action: "stay" });
   });
@@ -73,6 +78,7 @@ describe("decideLastThreadRestore", () => {
         lastThreadId: LAST,
         threadIds: [LAST],
         homeGateActive: true,
+        kbGateActive: false,
       }),
     ).toEqual({ action: "stay" });
   });
@@ -84,7 +90,57 @@ describe("decideLastThreadRestore", () => {
         lastThreadId: "",
         threadIds: [LAST],
         homeGateActive: false,
+        kbGateActive: false,
       }),
     ).toEqual({ action: "stay" });
+  });
+
+  // T1 chrome + /kb (specs/workbench-chrome.md): visiting /kb this
+  // session sets a gate that makes the restore bounce — same role
+  // as the corpus-home gate. The decision is keyed off either gate,
+  // and a kb visit alone is enough to keep the operator on /kb.
+  it("stays home when the operator chose the knowledge base this session", () => {
+    expect(
+      decideLastThreadRestore({
+        threadsLoaded: true,
+        lastThreadId: LAST,
+        threadIds: [LAST],
+        homeGateActive: false,
+        kbGateActive: true,
+      }),
+    ).toEqual({ action: "stay" });
+  });
+
+  it("treats the two session gates independently", () => {
+    // kb set, home clear → stays.
+    expect(
+      decideLastThreadRestore({
+        threadsLoaded: true,
+        lastThreadId: LAST,
+        threadIds: [LAST],
+        homeGateActive: false,
+        kbGateActive: true,
+      }),
+    ).toEqual({ action: "stay" });
+    // Both set → still stays (either is enough).
+    expect(
+      decideLastThreadRestore({
+        threadsLoaded: true,
+        lastThreadId: LAST,
+        threadIds: [LAST],
+        homeGateActive: true,
+        kbGateActive: true,
+      }),
+    ).toEqual({ action: "stay" });
+    // Both clear → restores the marker.
+    expect(
+      decideLastThreadRestore({
+        threadsLoaded: true,
+        lastThreadId: LAST,
+        threadIds: [LAST],
+        homeGateActive: false,
+        kbGateActive: false,
+      }),
+    ).toEqual({ action: "restore", threadId: LAST });
   });
 });

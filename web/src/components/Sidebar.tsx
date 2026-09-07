@@ -1,11 +1,14 @@
 // Sidebar: 280px, thread list, New thread button, delete with a
 // Radix confirmation dialog. Active thread highlighted with the
-// single blue accent.
+// single blue accent. T1 (specs/workbench-chrome.md): the chrome row
+// is the three-entry nav (对话 / 知识库 / 监控); the legacy "Corpus
+// 首页" label is gone and the active chrome is keyed off the
+// pathname via ``navChrome.ts``.
 
 import * as Dialog from "@radix-ui/react-dialog";
 import { useState } from "react";
-import { NavLink, useNavigate } from "react-router-dom";
-import { markCorpusHomeVisit } from "../sessionKeys";
+import { NavLink, useLocation, useNavigate } from "react-router-dom";
+import { activeNavKey, NAV_ENTRIES } from "../navChrome";
 import { describeStatusStrip, workspaceStatusView } from "../statusStrip";
 import { useWorkspaceStore } from "../store";
 import WatchlistPanel from "./WatchlistPanel";
@@ -72,6 +75,8 @@ function DeleteThreadDialog({
 export default function Sidebar() {
   const threads = useWorkspaceStore((s) => s.threads);
   const createThread = useWorkspaceStore((s) => s.createThread);
+  const location = useLocation();
+  const activeKey = activeNavKey(location.pathname);
 
   return (
     <aside className="w-[280px] shrink-0 border-r border-black bg-page flex flex-col h-full">
@@ -82,22 +87,29 @@ export default function Sidebar() {
       <div className="p-3">
         <NewThreadButton onCreate={() => createThread(null)} />
       </div>
-      <nav aria-label="研究 thread" className="flex-1 overflow-y-auto">
-        <div className="px-3 py-1 mb-1">
-          <NavLink
-            to="/"
-            end
-            onClick={markCorpusHomeVisit}
-            className={({ isActive }) =>
-              `block border px-2 py-1.5 text-sm font-medium ${
-                isActive
-                  ? "border-accent bg-accent text-white"
-                  : "border-transparent hover:border-black"
-              }`
-            }
-          >
-            Corpus 首页
-          </NavLink>
+      <nav aria-label="工作台" className="flex-1 overflow-y-auto">
+        <div className="px-3 py-1 mb-1 space-y-1">
+          {NAV_ENTRIES.map((entry) => (
+            <NavLink
+              key={entry.key}
+              to={entry.route}
+              end={entry.route === "/"}
+              className={() => {
+                // Drive active off the pure helper so /t/{id} lights
+                // 对话 (react-router's isActive wouldn't, since the
+                // route is /t/{id}, not /). For /kb and /monitor the
+                // helper agrees with NavLink's own isActive.
+                const lit = activeKey === entry.key;
+                return `block border px-2 py-1.5 text-sm font-medium ${
+                  lit
+                    ? "border-accent bg-accent text-white"
+                    : "border-transparent hover:border-black"
+                }`;
+              }}
+            >
+              {entry.label}
+            </NavLink>
+          ))}
         </div>
         <ul>
           {threads.map((t) => (
