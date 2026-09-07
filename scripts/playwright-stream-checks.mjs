@@ -97,12 +97,12 @@ export default async function runStreamChecks(page, options = {}) {
 
   const readAssistantLen = async () => (await readAssistantText()).length;
 
-  // The thread page renders TWO `type="submit"` buttons: this one and
-  // the watchlist's "+ 关注" (WatchlistPanel, in the sidebar). A
-  // page-wide `form button[type="submit"]` resolves to both and every
-  // call on it dies in strict mode, so the composer's send button is
-  // addressed by test id — the harness binds to the one control it
-  // means, and to no other form on the page.
+  // T2 chrome (specs/workbench-chrome.md): the watchlist + its
+  // `+ 关注` submit moved off the sidebar onto /monitor, so the
+  // thread page renders one `type="submit"` (this one). The harness
+  // still scopes by test id rather than a page-wide submit locator
+  // so a future surface that adds another form cannot silently
+  // break the lane again.
   const sendButton = () => page.locator('[data-testid="composer-send"]');
 
   // `waitForURL` returns the moment the address bar changes, but the

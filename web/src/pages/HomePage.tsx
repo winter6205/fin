@@ -2,7 +2,8 @@
 // for operators with no threads, and the last-thread restore for
 // returning visits. T1 (specs/workbench-chrome.md) split the corpus
 // catalog onto its own ``/kb`` page; the card grid no longer lives
-// here. The sidebar list remains the thread path.
+// here. T2 (specs/workbench-chrome.md) split the watchlist / notices
+// onto ``/monitor``. The sidebar list remains the thread path.
 
 import { useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
@@ -14,6 +15,7 @@ import {
 import {
   CORPUS_HOME_GATE_KEY,
   KB_GATE_KEY,
+  MONITOR_GATE_KEY,
 } from "../sessionKeys";
 import { useWorkspaceStore } from "../store";
 
@@ -33,8 +35,11 @@ export default function HomePage() {
   // T5 (#35, spec line 42): a RETURNING visit restores the last
   // opened `/t/{id}` when that id still exists. First visit (no
   // stored id, or the thread was deleted / is unknown) stays on
-  // home — never a blank chat. One-shot per mount so a deliberate
-  // later navigation home does not bounce the operator away again.
+  // home — never a blank chat. T1 /kb and T2 /monitor add their own
+  // session gates so a returning visit lands back on the surface
+  // the operator picked rather than bouncing onto the last thread.
+  // One-shot per mount so a deliberate later navigation home does
+  // not bounce the operator away again.
   const threadsLoaded = useWorkspaceStore((s) => s.threadsLoaded);
   const restoreAttempted = useRef(false);
   useEffect(() => {
@@ -45,6 +50,7 @@ export default function HomePage() {
       threadIds: threads.map((t) => t.id),
       homeGateActive: readSessionGate(CORPUS_HOME_GATE_KEY),
       kbGateActive: readSessionGate(KB_GATE_KEY),
+      monitorGateActive: readSessionGate(MONITOR_GATE_KEY),
     });
     if (decision.action === "wait") return;
     restoreAttempted.current = true;
