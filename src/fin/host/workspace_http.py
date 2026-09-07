@@ -928,7 +928,10 @@ def _format_sse(event: str, data: Any) -> str:
 # ----- SSE frame builders (T1 #33 / T3) -----
 
 
-def _node_frame_payloads(message: BaseMessage) -> Iterator[tuple[str, Any]]:
+def _node_frame_payloads(
+    message: BaseMessage,
+    pending_args: dict[str, dict[str, Any]] | None = None,
+) -> Iterator[tuple[str, Any]]:
     """Yield the node-complete ``(event, data)`` frames for a message.
 
     Node-complete frames are synthesized from ``values``-mode
@@ -963,12 +966,18 @@ def _node_frame_payloads(message: BaseMessage) -> Iterator[tuple[str, Any]]:
                     args = json.loads(args)
                 except (TypeError, ValueError):
                     args = {}
+            call_id = call.get("id", "")
+            # Register id -> args so the matching ToolMessage frame
+            # can summarize with the same args the persist path uses
+            # (turn-trace-folds: live one-liners match GET history).
+            if pending_args is not None and call_id:
+                pending_args[str(call_id)] = dict(args)
             yield (
                 "tool_call",
                 {
                     "name": call.get("name", ""),
                     "args": args,
-                    "tool_call_id": call.get("id", ""),
+                    "tool_call_id": call_id,
                 },
             )
         return
@@ -985,12 +994,17 @@ def _node_frame_payloads(message: BaseMessage) -> Iterator[tuple[str, Any]]:
         # Strip the marker from the human-readable summary so a
         # bounce template embedded in tool output never escapes
         # to the SPA (ADR 0021).
+        call_args = (
+            pending_args.get(tool_call_id) if pending_args is not None else None
+        )
+        if pending_args is not None and tool_call_id:
+            pending_args.pop(tool_call_id, None)
         yield (
             "tool_result",
             {
                 "name": tool_name,
                 "summary": strip_hidden_bounce_marker(
-                    format_tool_summary(tool_name, result=parsed)
+                    format_tool_summary(tool_name, result=parsed, args=call_args)
                 ),
                 "tool_call_id": tool_call_id,
             },
@@ -1083,6 +1097,12 @@ def _stream_run_frames(
     # not clear pending. If the run ends with pending still armed,
     # the terminal empty answer flushes it (refuse / no retry prose).
     pending_answer_reset = False
+    # tool_call_id -> args, registered when the AIMessage's
+    # ``tool_call`` frames are emitted and consumed by the matching
+    # ``tool_result`` frame so its summary carries the same args the
+    # graph persist path passes (turn-trace-folds T1: live one-liners
+    # match GET history, e.g. retrieve shows its query).
+    pending_args: dict[str, dict[str, Any]] = {}
 
     def _answer_payload(text: str) -> dict[str, Any]:
         nonlocal pending_answer_reset
@@ -1145,7 +1165,9 @@ def _stream_run_frames(
                         ):
                             pending_answer_reset = True
                         continue
-                    for event, data in _node_frame_payloads(message):
+                    for event, data in _node_frame_payloads(
+                        message, pending_args
+                    ):
                         yield _frame(event, data)
 
         # Stream end: release any held-back inline-filter fragment so
