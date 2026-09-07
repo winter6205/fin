@@ -4,11 +4,9 @@
 
 **总计划（阶段表，不再当实施队列）：** [`retrieval-upgrade.md`](retrieval-upgrade.md)
 
-**已闭合（本树近期）：** [`workbench-chrome.md`](workbench-chrome.md)（PR #246）；[`corpus-serve-ingest.md`](corpus-serve-ingest.md)（PR #238）；[`session-compaction.md`](session-compaction.md)（PR #236）。MDP 见 [`memory-dialogue-platform.md`](memory-dialogue-platform.md)——T1–T4 / T7–T9 已闭合；T5/T6 按 ADR 0045 非入库必做波。
+**已闭合（本树近期）：** [`workbench-sidebar-rail.md`](workbench-sidebar-rail.md)（PR #247）；[`workbench-chrome.md`](workbench-chrome.md)（PR #246）；[`corpus-serve-ingest.md`](corpus-serve-ingest.md)（PR #238）；[`session-compaction.md`](session-compaction.md)（PR #236）。MDP 见 [`memory-dialogue-platform.md`](memory-dialogue-platform.md)——T1–T4 / T7–T9 已闭合；T5/T6 按 ADR 0045 非入库必做波。
 
-**仍开着的工作台侧栏（worktree `feat/workbench-sidebar-rail`）：** [`workbench-sidebar-rail.md`](workbench-sidebar-rail.md)（spec `specs/workbench-sidebar-rail.md`；本地计划，不开 GitHub issue）。
-
-**仍开着的工作台根 + prompt（本程序）：** [`workbench-operator-workspace.md`](workbench-operator-workspace.md)（Wave A，先做）；[`host-prompt-assembly.md`](host-prompt-assembly.md)（Wave B / #242，A 合入后再做）。
+**仍开着的工作台 prompt（本程序）：** Wave A 已合入（[#244](https://github.com/winter6205/fin/pull/244) / [#243](https://github.com/winter6205/fin/issues/243) closed）。**下一刀：** [`host-prompt-assembly.md`](host-prompt-assembly.md)（Wave B / #242）。
 
 **仍开着的 retrieve 内部债（非跨仓主线）：** [`retrieve-maintainability-followup.md`](retrieve-maintainability-followup.md)、[`2026-09-01-pr225-followup-plan-a.md`](2026-09-01-pr225-followup-plan-a.md)
 
