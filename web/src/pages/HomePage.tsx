@@ -12,11 +12,7 @@ import {
   forgetLastThread,
   readLastThread,
 } from "../lastThread";
-import {
-  CORPUS_HOME_GATE_KEY,
-  KB_GATE_KEY,
-  MONITOR_GATE_KEY,
-} from "../sessionKeys";
+import { KB_GATE_KEY, MONITOR_GATE_KEY } from "../sessionKeys";
 import { useWorkspaceStore } from "../store";
 
 function readSessionGate(key: string): boolean {
@@ -48,7 +44,6 @@ export default function HomePage() {
       threadsLoaded,
       lastThreadId: readLastThread(),
       threadIds: threads.map((t) => t.id),
-      homeGateActive: readSessionGate(CORPUS_HOME_GATE_KEY),
       kbGateActive: readSessionGate(KB_GATE_KEY),
       monitorGateActive: readSessionGate(MONITOR_GATE_KEY),
     });
@@ -71,7 +66,7 @@ export default function HomePage() {
       <section aria-label="对话列表" className="mb-8">
         {threads.length === 0 ? (
           <p className="text-sm text-gray-500 border border-dashed border-black p-4 bg-card">
-            尚无对话 — 在下方提问，或选择一份语料（点 1）。
+            尚无对话 — 在下方提问，或选择一份语料（侧栏 知识库）。
           </p>
         ) : (
           <ul className="grid gap-2 md:grid-cols-2">
