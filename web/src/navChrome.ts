@@ -15,10 +15,12 @@
 // ``activeNavKey`` returns ``null`` for both: no chrome row lights.
 //
 // T3: ``monitorNavMark`` decides whether the 监控 entry carries a
-// non-text-only degraded glyph. Loading + unavailable stay clean —
-// only a healthy route that reports ``retrieve_reachability:
-// unreachable`` paints the mark. Route-level failures show their
-// degraded copy on /monitor itself, never a sidebar alarm.
+// degraded warning. Loading + unavailable stay clean — only a healthy
+// route that reports ``retrieve_reachability: unreachable`` paints
+// the warning, and it is painted in icon + label text (「监控 · 搜索
+// 断开」), never a right-side pebble/dot: color is not the sole cue.
+// Route-level failures show their degraded copy on /monitor itself,
+// never a sidebar alarm.
 
 import type { WorkspaceStatusView } from "./statusStrip";
 
@@ -54,19 +56,21 @@ export function activeNavKey(pathname: string): NavKey | null {
 }
 
 export interface MonitorNavMark {
-  /** A non-text glyph the Sidebar paints next to the 监控 label. */
-  glyph: string;
+  /** The full label the Sidebar renders for the degraded 监控 entry. */
+  label: string;
+  /** Which icon state NavIcon renders for the entry. */
+  icon: "warning";
   /** Plain-text alternative the aria-label reads aloud. */
   aria: string;
 }
 
 /**
- * Decide whether the 监控 sidebar entry gets a non-text-only
- * degraded mark. The mark is reserved for a HEALTHY route reporting
- * an unreachable retrieve port — the route-level failure state
- * (``unavailable``) paints its degraded copy on the /monitor page
- * itself, never as a sidebar alarm (SC: sidebar is chrome, not
- * diagnostics). Returns ``null`` when no mark should render.
+ * Decide whether the 监控 sidebar entry gets a degraded warning.
+ * Reserved for a HEALTHY route reporting an unreachable retrieve
+ * port — the route-level failure state (``unavailable``) paints its
+ * degraded copy on the /monitor page itself, never as a sidebar
+ * alarm (SC: sidebar is chrome, not diagnostics). Returns ``null``
+ * when no mark should render.
  */
 export function monitorNavMark(
   view: WorkspaceStatusView,
@@ -74,7 +78,8 @@ export function monitorNavMark(
   if (view.state !== "ready") return null;
   if (view.status.retrieve_reachability !== "unreachable") return null;
   return {
-    glyph: "●",
-    aria: "检索不可用",
+    label: "监控 · 搜索断开",
+    icon: "warning",
+    aria: "搜索断开 — 检索不可用",
   };
 }
