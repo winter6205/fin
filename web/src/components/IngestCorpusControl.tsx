@@ -63,11 +63,11 @@ export default function IngestCorpusControl() {
         onClick={() => inputRef.current?.click()}
         className="border border-black bg-card px-3 py-1.5 text-sm font-medium hover:bg-accent hover:text-white disabled:opacity-50"
       >
-        {busy ? "入库中…" : "Ingest 语料文件…"}
+        {busy ? "添加中…" : "添加文件…"}
       </button>
       {ingested ? (
         <p data-testid="ingest-success" className="mt-1 text-xs text-gray-600">
-          已入库 {ingested.document_id}：{ingested.block_count} 块（新增{" "}
+          已添加 {ingested.document_id}：{ingested.block_count} 块（新增{" "}
           {ingested.written}）
         </p>
       ) : null}

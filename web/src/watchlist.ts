@@ -25,14 +25,14 @@ export function parseFormsInput(text: string): string[] {
 
 /** One line describing what a watch covers. */
 export function watchSummary(entry: WatchEntry): string {
-  return entry.forms.length > 0 ? entry.forms.join("、") : "全部 form";
+  return entry.forms.length > 0 ? entry.forms.join("、") : "全部类型";
 }
 
 /** One line describing a filing detected by the monitor. */
 export function noticeSummary(notice: Notice): string {
   const form = notice.form ? ` ${notice.form}` : "";
   const period = notice.period ? `（${notice.period}）` : "";
-  return `${notice.issuer}${form} ${notice.document_id}${period} 已进入本地 catalog`;
+  return `${notice.issuer}${form} ${notice.document_id}${period} 已加入知识库`;
 }
 
 export function unreadCount(notices: Notice[]): number {

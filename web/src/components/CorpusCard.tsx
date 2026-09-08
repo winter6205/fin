@@ -28,7 +28,7 @@ export default function CorpusCard({ filing }: { filing: Filing }) {
     >
       <p className="font-mono text-sm font-semibold">{filing.document_id}</p>
       <p className="text-xs text-gray-600 mt-1">{cardMetaLine(filing)}</p>
-      <p className="text-xs text-gray-500">{filing.page_count} pages</p>
+      <p className="text-xs text-gray-500">{filing.page_count} 页</p>
     </button>
   );
 }

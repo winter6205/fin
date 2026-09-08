@@ -257,9 +257,9 @@ function EmptyThreadCorpusGrid() {
   const corpus = useWorkspaceStore((s) => s.corpus);
   if (corpus.length === 0) return null;
   return (
-    <section aria-label="从 filing 开始" className="max-w-3xl mx-auto pt-4">
+    <section aria-label="从一份文件开始" className="max-w-3xl mx-auto pt-4">
       <h3 className="text-sm font-semibold text-gray-500 mb-2">
-        或从一份 filing 开始
+        或从一份文件开始
       </h3>
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         {corpus.map((f) => (

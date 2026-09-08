@@ -30,7 +30,7 @@ export default function MonitorPage() {
     <main className="p-6">
       <h2 className="text-xl font-bold mb-1">监控</h2>
       <p className="text-sm text-gray-600 mb-4">
-        关注本地 filing 动态；未读通知在此 dismiss。
+        看知识库能不能搜到；需要的话订阅某家公司有新文件时的提醒。
       </p>
       <div className="max-w-md border border-black bg-card p-4">
         <MonitorStatusPanel />

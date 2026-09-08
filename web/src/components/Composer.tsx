@@ -219,7 +219,10 @@ export default function Composer({
         </ul>
       ) : null}
       {dragOver ? (
-        <p data-testid="attach-drop-hint" className="mb-2 text-xs text-gray-500">
+        <p
+          data-testid="attach-drop-hint"
+          className="mb-2 text-xs text-gray-500"
+        >
           松开以上传为本轮附件（仅本轮可读，不入库）
         </p>
       ) : null}
@@ -233,7 +236,7 @@ export default function Composer({
             void submit();
           }
         }}
-        placeholder="输入关于 10-Q 的问题…"
+        placeholder="输入问题…"
         disabled={busy}
         rows={3}
         className="w-full resize-none border border-black bg-card p-2 text-sm disabled:opacity-50"
