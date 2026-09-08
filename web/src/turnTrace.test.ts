@@ -110,6 +110,33 @@ describe("foldTraceFrame", () => {
     expect(items).toEqual([]);
   });
 
+  // Spec line 33: the first answer frame closes a still-live burst —
+  // the fold must collapse when prose starts streaming, not only at
+  // terminal status.
+  it("closes a live thinking burst when the first answer frame arrives", () => {
+    let items = foldTraceFrame([], { type: "thinking", text: "a" });
+    items = foldTraceFrame(items, { type: "answer" });
+    expect(items).toEqual([{ kind: "thinking", text: "a", live: false }]);
+  });
+
+  it("closes a live tool burst when the first answer frame arrives", () => {
+    let items = foldTraceFrame([], {
+      type: "tool_call",
+      name: "retrieve",
+      tool_call_id: "t1",
+    });
+    items = foldTraceFrame(items, { type: "answer" });
+    expect(items[0]).toMatchObject({ kind: "tools", live: false });
+  });
+
+  it("answer frames leave already-closed bursts untouched", () => {
+    const items = foldTraceFrame(
+      [{ kind: "thinking", text: "a", live: false }],
+      { type: "answer" },
+    );
+    expect(items).toEqual([{ kind: "thinking", text: "a", live: false }]);
+  });
+
   it("does not mutate the input list", () => {
     const before: ReturnType<typeof foldTraceFrame> = [
       { kind: "thinking", text: "a", live: true },
