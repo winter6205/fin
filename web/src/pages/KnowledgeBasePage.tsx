@@ -39,13 +39,13 @@ export default function KnowledgeBasePage() {
     <main className="p-6">
       <h2 className="text-xl font-bold mb-1">知识库</h2>
       <p className="text-sm text-gray-600 mb-4">
-        本地语料 catalog：选 1 份 filing 开始提问，或入库新文件。
+        这里是已经放进来的文件。点一份开始提问，或添加新文件。
       </p>
 
       {!corpusLoaded ? (
         <>
           <h3 className="text-base font-semibold mb-1">正在加载知识库…</h3>
-          <p className="text-sm text-gray-600 mb-3">从服务读取语料索引</p>
+          <p className="text-sm text-gray-600 mb-3">正在读取文件列表</p>
           <div
             className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
             aria-busy="true"
@@ -60,15 +60,15 @@ export default function KnowledgeBasePage() {
           <IngestCorpusControl />
           {corpus.length === 0 ? (
             <div className="border border-black bg-card p-4 max-w-md">
-              <h3 className="text-base font-semibold mb-1">知识库尚未 ingest</h3>
+              <h3 className="text-base font-semibold mb-1">还没有文件</h3>
               <p className="text-sm text-gray-600 mb-3">
-                语料 catalog 为空。请运行 ingest 入库后再提问。
+                请先添加文件，再提问。
               </p>
               <button
                 onClick={() => void startThread(null)}
                 className="border border-black px-3 py-1.5 text-sm hover:bg-accent hover:text-white"
               >
-                新建对话（语料为空也可试）
+                先开一个空对话
               </button>
             </div>
           ) : (

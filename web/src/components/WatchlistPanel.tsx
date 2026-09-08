@@ -42,7 +42,7 @@ export default function WatchlistPanel() {
   const submit = async () => {
     const trimmed = issuer.trim();
     if (!trimmed) {
-      setError("填写 issuer（如 AAPL）");
+      setError("填写公司代码（如 AAPL）");
       return;
     }
     setBusy(true);
@@ -60,11 +60,11 @@ export default function WatchlistPanel() {
 
   return (
     <section
-      aria-label="关注列表"
+      aria-label="新文件提醒"
       className="shrink-0 border-t border-black px-3 py-2 text-xs"
     >
       <h2 className="font-semibold text-gray-700">
-        关注
+        新文件提醒
         {unread.length > 0 ? (
           <span
             data-testid="notice-count"
@@ -76,8 +76,12 @@ export default function WatchlistPanel() {
       </h2>
 
       {filingMonitorStatus === "degraded" ? (
-        <p data-testid="filing-monitor-degraded" role="alert" className="mt-1 text-gray-700">
-          filing 监控源暂不可用；已保存的通知仍然保留。
+        <p
+          data-testid="filing-monitor-degraded"
+          role="alert"
+          className="mt-1 text-gray-700"
+        >
+          文件来源暂不可用；已保存的提醒还在。
         </p>
       ) : null}
 
@@ -106,14 +110,17 @@ export default function WatchlistPanel() {
 
       <ul className="mt-1.5 space-y-1">
         {watchlist.map((entry) => (
-          <li key={entry.id} className="flex items-center justify-between gap-2">
+          <li
+            key={entry.id}
+            className="flex items-center justify-between gap-2"
+          >
             <span className="truncate">
               <span className="font-mono">{entry.issuer}</span>
               <span className="ml-1 text-gray-500">{watchSummary(entry)}</span>
             </span>
             <button
               type="button"
-              aria-label={`取消关注 ${entry.issuer}`}
+              aria-label={`取消订阅 ${entry.issuer}`}
               onClick={() => {
                 void removeWatch(entry.id);
               }}
@@ -135,15 +142,15 @@ export default function WatchlistPanel() {
         <input
           value={issuer}
           onChange={(e) => setIssuer(e.target.value)}
-          placeholder="issuer（如 AAPL）"
-          aria-label="要关注的 issuer"
+          placeholder="公司代码（如 AAPL）"
+          aria-label="要订阅的公司代码"
           className="w-full border border-black bg-card px-1.5 py-1"
         />
         <input
           value={forms}
           onChange={(e) => setForms(e.target.value)}
-          placeholder="form（留空=全部，如 10-K 8-K）"
-          aria-label="要关注的 form 类型"
+          placeholder="文件类型（可留空，如 10-K 8-K）"
+          aria-label="要订阅的文件类型"
           className="w-full border border-black bg-card px-1.5 py-1"
         />
         {error ? (
@@ -156,7 +163,7 @@ export default function WatchlistPanel() {
           disabled={busy}
           className="w-full border border-black bg-card px-2 py-1 font-medium hover:bg-accent hover:text-white disabled:opacity-50"
         >
-          + 关注
+          + 订阅这家公司
         </button>
       </form>
     </section>

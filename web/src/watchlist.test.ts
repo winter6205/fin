@@ -30,7 +30,7 @@ describe("watchSummary", () => {
   });
 
   it("says every form when the watch named none", () => {
-    expect(watchSummary({ ...base, forms: [] })).toBe("全部 form");
+    expect(watchSummary({ ...base, forms: [] })).toBe("全部类型");
   });
 });
 
@@ -48,6 +48,8 @@ describe("noticeSummary", () => {
     });
     expect(text).toContain("AAPL-2023FY");
     expect(text).toContain("10-K");
+    expect(text).toContain("知识库");
+    expect(text).not.toContain("catalog");
   });
 });
 
@@ -101,8 +103,6 @@ describe("unreadCount", () => {
       created_at: "2026-08-27T00:00:00Z",
       read: false,
     };
-    expect(
-      unreadCount([notice, { ...notice, id: "n2", read: true }]),
-    ).toBe(1);
+    expect(unreadCount([notice, { ...notice, id: "n2", read: true }])).toBe(1);
   });
 });

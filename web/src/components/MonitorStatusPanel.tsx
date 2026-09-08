@@ -8,10 +8,7 @@
 // no Python changes — just the existing ``/api/status`` route).
 
 import { useWorkspaceStore } from "../store";
-import {
-  describeMonitorStatus,
-  workspaceStatusView,
-} from "../statusStrip";
+import { describeMonitorStatus, workspaceStatusView } from "../statusStrip";
 
 export default function MonitorStatusPanel() {
   const status = useWorkspaceStore((s) => s.status);
@@ -24,7 +21,7 @@ export default function MonitorStatusPanel() {
 
   return (
     <section
-      aria-label="工作区状态"
+      aria-label="知识库搜索"
       data-testid="monitor-status-panel"
       className={`mb-4 border border-black p-4 text-sm ${
         degraded ? "bg-tool" : "bg-card"

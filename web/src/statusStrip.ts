@@ -43,8 +43,10 @@ export function parseWorkspaceStatus(raw: unknown): WorkspaceStatus | null {
   if (typeof model !== "string") return null;
   if (typeof count !== "number" || !Number.isFinite(count)) return null;
   return {
-    retrieve_reachability: reachability as WorkspaceStatus["retrieve_reachability"],
-    retrieve_adapter_kind: adapterKind as WorkspaceStatus["retrieve_adapter_kind"],
+    retrieve_reachability:
+      reachability as WorkspaceStatus["retrieve_reachability"],
+    retrieve_adapter_kind:
+      adapterKind as WorkspaceStatus["retrieve_adapter_kind"],
     model_identity: model,
     corpus_filing_count: count,
   };
@@ -68,7 +70,7 @@ export function workspaceStatusView(
 }
 
 export interface MonitorStatusCopy {
-  /** One-line top label: 检索：可用 / 检索：不可用 / 检索：未知 / 检索：读取中. */
+  /** One-line top label: 知识库搜索：检查中 / 查不到 / 连不上 / 可用. */
   headline: string;
   /** Ordinary-person explanation under the headline. Never empty. */
   detail: string;
@@ -77,30 +79,27 @@ export interface MonitorStatusCopy {
 }
 
 const UNREACHABLE_DETAIL =
-  "找不到 iknow-memory 检索服务，回答不会带引用来源。" +
-  "启动该服务，或设置 FIN_RETRIEVE_ADAPTER=fake 以占位检索启动。";
+  "现在搜不到知识库里的内容，回答不会带来源。把搜索服务准备好后，点「重连」。";
 
 /** Copy for the 监控 page's status panel. The five view states each
  * produce non-empty copy; ``degraded`` is what the panel paints in
- * the warning treatment. The Sidebar used to carry the same surface
- * as a four-line footer strip — T3 retires that and pulls model
- * identity off the chrome entirely. */
+ * the warning treatment. Operator copy names 知识库搜索, not MCP /
+ * env vars / 工作区. */
 export function describeMonitorStatus(
   view: WorkspaceStatusView,
 ): MonitorStatusCopy {
   if (view.state === "loading") {
     return {
-      headline: "检索：读取中",
-      // Not an accusation: the first fetch has not answered yet.
+      headline: "知识库搜索：检查中",
       tone: "ok",
-      detail: "正在读取工作区状态…",
+      detail: "正在检查能不能搜到知识库…",
     };
   }
   if (view.state === "unavailable") {
     return {
-      headline: "检索：未知",
+      headline: "知识库搜索：查不到",
       tone: "degraded",
-      detail: "暂时读不到工作区状态，点 重连 再试。",
+      detail: "暂时查不到搜索是否可用，点「重连」再试。",
     };
   }
 
@@ -109,21 +108,21 @@ export function describeMonitorStatus(
   const fake = status.retrieve_adapter_kind === "fake";
   if (unreachable) {
     return {
-      headline: "检索：不可用",
+      headline: "知识库搜索：连不上",
       tone: "degraded",
       detail: UNREACHABLE_DETAIL,
     };
   }
   if (fake) {
     return {
-      headline: "检索：可用",
+      headline: "知识库搜索：可用",
       tone: "ok",
-      detail: `本地占位检索（fake）：能回答，但没有真实语料；语料 ${status.corpus_filing_count} 份。`,
+      detail: `现在是演示搜索，没有真实文件；已添加 ${status.corpus_filing_count} 份。`,
     };
   }
   return {
-    headline: "检索：可用",
+    headline: "知识库搜索：可用",
     tone: "ok",
-    detail: `已连接 iknow-memory 检索服务；语料 ${status.corpus_filing_count} 份。`,
+    detail: `可以搜索知识库；已添加 ${status.corpus_filing_count} 份。`,
   };
 }

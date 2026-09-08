@@ -112,9 +112,7 @@ describe("describeMonitorStatus", () => {
     const unavailable = describeMonitorStatus({ state: "unavailable" });
     expect(unavailable.tone).toBe("degraded");
     // Loading and reachable boot both stay ok / quiet.
-    expect(
-      describeMonitorStatus({ state: "loading" }).tone,
-    ).toBe("ok");
+    expect(describeMonitorStatus({ state: "loading" }).tone).toBe("ok");
     expect(
       describeMonitorStatus({ state: "ready", status: REACHABLE_MCP }).tone,
     ).toBe("ok");
@@ -127,18 +125,16 @@ describe("describeMonitorStatus", () => {
     });
     expect(copy.tone).toBe("ok");
     expect(copy.headline).toContain("可用");
-    expect(copy.detail).toContain("iknow-memory");
+    expect(copy.headline).toContain("知识库搜索");
+    expect(copy.detail).toContain("12");
   });
 
   it("degrades readably — and actionably — when retrieve is unreachable", () => {
     const copy = describeMonitorStatus({ state: "ready", status: UNREACHABLE });
     expect(copy.tone).toBe("degraded");
-    expect(copy.headline).toContain("不可用");
-    // An ordinary operator has to learn two things: what they lose
-    // (evidence-backed answers) and what to do next.
-    expect(copy.detail).toContain("引用");
-    expect(copy.detail).toContain("iknow-memory");
-    expect(copy.detail).toContain("FIN_RETRIEVE_ADAPTER=fake");
+    expect(copy.headline).toContain("连不上");
+    expect(copy.detail).toContain("来源");
+    expect(copy.detail).toContain("重连");
   });
 
   it("marks a fake-adapter boot as reachable but local-placeholder", () => {
@@ -147,8 +143,16 @@ describe("describeMonitorStatus", () => {
       status: REACHABLE_FAKE,
     });
     expect(copy.tone).toBe("ok");
-    expect(copy.detail).toContain("fake");
-    expect(copy.detail).not.toContain("iknow-memory");
+    expect(copy.detail).toContain("演示");
+  });
+
+  it("never uses engineer jargon the operator asked to stop seeing", () => {
+    for (const view of views) {
+      const blob = `${describeMonitorStatus(view).headline} ${describeMonitorStatus(view).detail}`;
+      expect(blob).not.toMatch(
+        /Corpus|catalog|iknow-memory|FIN_|工作区状态|fake|MCP/i,
+      );
+    }
   });
 
   it("says zero filings instead of hiding the count", () => {
@@ -162,7 +166,7 @@ describe("describeMonitorStatus", () => {
   it("degrades when the status route itself is unavailable", () => {
     const copy = describeMonitorStatus({ state: "unavailable" });
     expect(copy.tone).toBe("degraded");
-    expect(copy.headline).toContain("未知");
+    expect(copy.headline).toContain("查不到");
   });
 
   it("does not accuse the port while the first fetch is in flight", () => {
