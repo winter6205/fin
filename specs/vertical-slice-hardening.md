@@ -4,7 +4,7 @@
 
 Harden the already-merged vertical slice — ask filings → evidence → cited answer → reliable **workspace** UX — on execution map the tracked change, standing on merged that pull request (Soft-Track) and that pull request (S1 corpus-retrieve). This is a harden/close-leftover increment, not a new epic: the **host graph** does not change; new reliability lands as tool/adapter contracts, typed error surfacing, and workspace copy/UX fixes. The user is the operator running the local workspace against the frozen corpus with the Fake retrieve port by default, and optionally a real MCP adapter. Success is: every known contract gap in the retrieve seam has a green test, every known error state renders as ordinary-person copy (never a blank crash card or a silent "0 hits"), and an opt-in MCP 2.0 protocol smoke exists against a fixture server — with default `uv run pytest -q` staying green with no live SEC and no live memory server.
 
-The Does foci mirror the NOW four-focus table in `docs/research/009-optimized-agent-first-path.md`: Soft-Track × research tools; Host tools + retrieve port; Citation UX; optional MCP protocol smoke.
+The Does foci mirror the NOW four-focus table in `docs/research/archive/2026-08-sec-research-workbench/009-optimized-agent-first-path.md` (archived 2026-09-06; identity SSOT is `docs/CONTEXT.md`, not that file): Soft-Track × research tools; Host tools + retrieve port; Citation UX; optional MCP protocol smoke.
 
 Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 

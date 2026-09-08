@@ -1,5 +1,7 @@
 # Spec: v1 host agent
 
+> **Identity banner (2026-09-06):** this spec is the frozen **v1 host-agent contract**, not current product identity. Quoted **fin** = 「bounded 10-Q research agent」is the v1 slice. Current **fin** SSOT: [`docs/CONTEXT.md`](../docs/CONTEXT.md) (enterprise knowledge-base Agent). Do not copy that quoted line into new product copy.
+
 ## Objective
 
 Ship **fin** v1: a bounded 10-Q research agent. The operator asks a question on the CLI (and the same compiled graph over HTTP). The model selects `list_files`, `retrieve`, or `read_file` in a loop. Code verifies that the answer is grounded in pages this run actually fetched, then fills the citation list from those passed checks. LangGraph is the durable **host graph** (checkpoint / resume / caps), not a retrieve-then-generate flowchart.
