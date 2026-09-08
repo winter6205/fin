@@ -13,8 +13,9 @@ This repository is the SSOT. Do not keep parallel copies under `projects/test`.
 | `docs/CONTEXT.md`                                        | Domain terms **and product identity** (SSOT)                                         |
 | `docs/adr/`                                              | Accepted decisions (0001–0027)                                                       |
 | `specs/enterprise-kb-agent.md`                           | Program contract: the five foci of the knowledge-base Agent                          |
+| `docs/research/README.md`                                | Research folder gate — identity is CONTEXT, not 003–009                              |
 | `docs/research/002-demo-corpus-and-evidence-contract.md` | Inherited corpus/evidence contract (snapshot from iknow wayfinder)                   |
-| `docs/research/003-enterprise-product-research-index.md` | Enterprise-product research index (004–009; not CONTEXT/ADR SSOT)                    |
+| `docs/research/archive/2026-08-sec-research-workbench/`  | Archived 2026-08 「SEC 财报研究工作台」research — **not** current identity           |
 | `data/corpus/pdf/`                                       | Frozen 12 SEC 10-Q PDFs (AAPL, MSFT, AMZN)                                           |
 | `data/corpus/manifest.json`                              | document_id, periods, sha256, upstream commit                                        |
 | `data/upstream/`                                         | private fixture source LICENSE, sec-10-q README, `qna_data.csv` (upstream QA; not the v1 gold set) |

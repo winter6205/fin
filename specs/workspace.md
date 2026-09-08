@@ -1,5 +1,7 @@
 # Spec: workspace
 
+> **Identity banner (2026-09-06):** this spec is the frozen **workspace UI contract**, not current product identity. Quoted **fin** = 「bounded 10-Q research agent」and **workspace** as the UI name are v1 wording. Current SSOT: [`docs/CONTEXT.md`](../docs/CONTEXT.md) — **fin** is an enterprise knowledge-base Agent; the UI is **工作台**. Do not copy those quoted lines into new product copy.
+
 ## Objective
 
 Ship **fin** as a product the operator can talk in: one local **workspace** web UI over **research threads** on the frozen 12 AAPL/MSFT/AMZN 10-Qs. Each send is one **run** on that `thread_id`. Thinking (when the model emits it) and tool calls stream on the turn then collapse. Citations sit on the assistant turn. Follow-ups reuse the thread. Reload restores history. Crash resume continues the in-flight **run** from the last complete host-graph node — not a new question, not a rolled-back user turn.

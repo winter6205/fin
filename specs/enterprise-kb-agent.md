@@ -1,5 +1,7 @@
 # Spec: enterprise-kb-agent
 
+> **Identity banner (2026-09-06):** this file is still the program contract (enterprise knowledge-base Agent). Do not replace it with archived `docs/research/006-enterprise-feature-spec.md` (SEC 财报研究工作台). Frozen-12 SEC is the first corpus seed, not the product name. Current glossary: [`docs/CONTEXT.md`](../docs/CONTEXT.md).
+
 ## Assumption gate (confirmed 2026-08-27)
 
 Operator waived per-item grilling (`/spec-driven-development` + prior thread). These are in force:
