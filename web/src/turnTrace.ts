@@ -7,12 +7,16 @@
 import type { ToolSummary, TraceItem, Turn } from "./types";
 
 /** One streaming wire frame as the burst folder sees it. Only the
- * frame types that shape the trace are modeled; answer/citations/
- * comparison/status are handled by the store as before. */
+ * frame types that shape the trace are modeled; citations/
+ * comparison/status are handled by the store as before. The
+ * ``answer`` frame is the burst-end signal for the trace: spec
+ * Boundaries line 33 — "the next ``thinking`` or first ``answer``
+ * closes that tool burst (auto-collapse)". */
 export type TraceFrame =
   | { type: "thinking"; text: string }
   | { type: "tool_call"; name: string; tool_call_id: string }
-  | { type: "tool_result"; summary: string; tool_call_id: string };
+  | { type: "tool_result"; summary: string; tool_call_id: string }
+  | { type: "answer" };
 
 /** The live-tool-row placeholder. Single source: the store, the
  * folder, and the UI all show the same running copy. */
@@ -99,10 +103,10 @@ function applyToolResult(
  * - consecutive ``thinking`` frames append to the current thinking
  *   burst; a ``tool_call`` closes that thinking burst (live=false);
  * - consecutive ``tool_call``/``tool_result`` frames belong to the
- *   current tool burst; the next ``thinking`` frame closes it.
- * The first ``answer``/terminal frame is NOT folded here — the store
- * closes any still-live burst when it handles ``status``/run end via
- * ``closeOpenBursts``.
+ *   current tool burst; the next ``thinking`` or first ``answer``
+ *   frame closes it.
+ * The terminal ``status`` frame is NOT folded here — the store closes
+ * any still-live burst at run end via ``closeOpenBursts``.
  *
  * The list is treated immutably (a new array + copied items) so it
  * can live in Zustand state without mutation aliasing.
@@ -125,6 +129,11 @@ export function foldTraceFrame(
   }
   if (frame.type === "tool_call") {
     return appendToolCall(items, frame);
+  }
+  if (frame.type === "answer") {
+    // First answer closes any still-live burst (spec line 33): the
+    // operator is now reading prose, not watching a burst stream.
+    return closeLive(items);
   }
   return applyToolResult(items, frame);
 }
