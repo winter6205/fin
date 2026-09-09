@@ -11,6 +11,7 @@ import {
   isFeedbackActive,
   lastTerminalTurnIndex,
   showThumbs,
+  showThumbsForTurn,
 } from "./turnFeedback";
 
 function makeTurn(overrides: Partial<Turn> = {}): Turn {
@@ -76,7 +77,7 @@ describe("feedbackErrorVisible", () => {
   });
 });
 
-// T3 (the tracked change): thumbs chrome only on the LAST terminal turn of a
+// T3: thumbs chrome only on the LAST terminal turn of a
 // thread that is not in_flight. Older turns show nothing, so the
 // control can't sit on every historical row. Pure helpers again —
 // no DOM — with ``lastTerminalTurnIndex`` split out so the "which
@@ -135,5 +136,35 @@ describe("showThumbs", () => {
   it("does NOT show thumbs on the live optimistic row", () => {
     const turns = makeTurns({ in_flight: false }, { in_flight: true });
     expect(showThumbs(1, turns, false)).toBe(false);
+  });
+});
+
+// The narrow-arg form the memoized TurnView renders through. The
+// adapter above delegates to THIS function, so these pins are the
+// single implementation's contract.
+describe("showThumbsForTurn", () => {
+  it("shows thumbs on the last terminal turn of an idle thread", () => {
+    const turn = makeTurn();
+    expect(showThumbsForTurn(true, turn, false)).toBe(true);
+  });
+
+  it("does NOT show thumbs when the thread is in_flight", () => {
+    const turn = makeTurn();
+    expect(showThumbsForTurn(true, turn, true)).toBe(false);
+  });
+
+  it("does NOT show thumbs on a non-last-terminal row", () => {
+    const turn = makeTurn();
+    expect(showThumbsForTurn(false, turn, false)).toBe(false);
+  });
+
+  it("does NOT show thumbs on the live optimistic row", () => {
+    const turn = makeTurn({ in_flight: true });
+    expect(showThumbsForTurn(true, turn, false)).toBe(false);
+  });
+
+  it("does NOT show thumbs on a turn missing run_id (persist gate)", () => {
+    const turn = makeTurn({ run_id: "   " });
+    expect(showThumbsForTurn(true, turn, false)).toBe(false);
   });
 });

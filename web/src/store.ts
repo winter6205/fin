@@ -147,6 +147,60 @@ function closeOpenBurstsOnTurn(t: Turn): Turn {
   return { ...t, trace_items: closeOpenBursts(t.trace_items ?? []) };
 }
 
+// Streaming render saturation (#252 follow-up): at provider chunk
+// granularity every SSE frame triggers one store patch → one full
+// transcript re-render. A long thread (round 3+) re-renders EVERY
+// historical turn row per frame; with a fast provider the frames
+// arrive faster than React can commit and the live fold's updates
+// coalesce visually into a freeze — the operator sees thinking
+// "disappear" mid-run and the answer dump at the end.
+//
+// Fix: coalesce the per-frame delta patchers (thinking / answer) into
+// one animation-frame flush. The callbacks run against the LATEST
+// turn snapshot in order, so the folded trace is identical to
+// unbatched folding — only the number of intermediate renders
+// shrinks. UI-only: the send promise's result/fold state still
+// tracks every wire frame exactly.
+//
+// Ordering invariant: a non-delta frame (tool_call / tool_result /
+// status / citations / the finalize patch) must NEVER overtake
+// deltas queued in the same animation frame — otherwise a tool_call
+// landing between a queued thinking delta and its flush would fold
+// the tools burst BEFORE the thinking burst, inverting the arrival
+// order the folder guarantees. ``flushThen`` drains the queue first
+// and only then applies the immediate patcher; the scheduled rAF
+// later fires on an empty queue and is a no-op.
+function makeTurnPatcherQueue(patch: (patcher: (t: Turn) => Turn) => void) {
+  const queue: Array<(t: Turn) => Turn> = [];
+  let scheduled = false;
+  const flush = () => {
+    scheduled = false;
+    if (queue.length === 0) return;
+    const batch = queue.splice(0, queue.length);
+    // Sequential fold onto the freshest snapshot: the same contract
+    // as unbatched onEvent processing.
+    patch((t) => batch.reduce((acc, fn) => fn(acc), t));
+  };
+  return {
+    coalesce: (patcher: (t: Turn) => Turn) => {
+      queue.push(patcher);
+      if (scheduled) return;
+      scheduled = true;
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(flush);
+      } else {
+        // Non-browser fallback (tests): synchronous flush keeps the
+        // batch boundary deterministic.
+        flush();
+      }
+    },
+    flushThen: (patcher: (t: Turn) => Turn) => {
+      flush();
+      patch(patcher);
+    },
+  };
+}
+
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   threads: [],
   corpus: [],
@@ -302,6 +356,12 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     };
     const patchTurn = (patcher: (t: Turn) => Turn) =>
       patchTurnByRunId(optimisticRunId, patcher);
+    // Coalesced patcher for high-frequency SSE deltas (thinking /
+    // answer): one store patch per animation frame instead of one
+    // per wire frame. Non-delta frames go through ``flushThen`` so a
+    // queued delta can never be overtaken — or applied after — the
+    // terminal patch.
+    const turnPatches = makeTurnPatcherQueue(patchTurn);
 
     const initial = get().activeThread;
     if (initial && initial.id === threadId) {
@@ -329,7 +389,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       const result = await api.sendMessage(threadId, request, (event) => {
         switch (event.type) {
           case "thinking":
-            patchTurn((t) => ({
+            turnPatches.coalesce((t) => ({
               ...foldTraceFrameOntoTurn(t, event),
               thinking_text: t.thinking_text + event.text,
             }));
@@ -344,7 +404,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
               summary: RUNNING_SUMMARY,
               tool_call_id: event.tool_call_id,
             };
-            patchTurn((t) => ({
+            turnPatches.flushThen((t) => ({
               ...foldTraceFrameOntoTurn(t, event),
               tool_summaries: [...(t.tool_summaries ?? []), placeholder],
             }));
@@ -353,7 +413,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           case "tool_result": {
             // The server already formatted the summary (spec line
             // 32); replace the "running…" placeholder with it.
-            patchTurn((t) => ({
+            turnPatches.flushThen((t) => ({
               ...foldTraceFrameOntoTurn(t, event),
               tool_summaries: (t.tool_summaries ?? []).map((s) =>
                 s.tool_call_id === event.tool_call_id
@@ -367,11 +427,13 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
             statusSeen = true;
             // turn-trace-folds: the run ended — close any still-live
             // burst so the folds auto-collapse (spec line 34).
-            // Patch by the CLIENT placeholder id first — updating
-            // ``optimisticRunId`` before the patch would orphan the
-            // optimistic row and freeze the live view until GET.
-            const priorRunId = optimisticRunId;
-            patchTurnByRunId(priorRunId, (t) => ({
+            // Drain queued deltas first so a pending thinking/answer
+            // patch can never land after this terminal patch and
+            // re-open a live burst on an ended run. Patch by the
+            // CLIENT placeholder id (``optimisticRunId`` is not
+            // reassigned until after this patch) so the optimistic
+            // row is never orphaned until GET.
+            turnPatches.flushThen((t) => ({
               ...closeOpenBurstsOnTurn(t),
               run_id: event.run_id,
               status: event.status,
@@ -402,13 +464,22 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
               reset: event.reset,
               statusSeen,
             });
-            patchTurn((t) => ({ ...t, answer: answerFold.visible }));
+            turnPatches.coalesce((t) => ({
+              // turn-trace-folds spec line 33: the first answer frame
+              // closes the still-live burst — the fold must collapse
+              // when prose starts, not only at terminal status.
+              ...foldTraceFrameOntoTurn(t, { type: "answer" }),
+              answer: answerFold.visible,
+            }));
             break;
           case "citations":
-            patchTurn((t) => ({ ...t, citations: event.citations }));
+            turnPatches.flushThen((t) => ({
+              ...t,
+              citations: event.citations,
+            }));
             break;
           case "comparison":
-            patchTurn((t) => ({
+            turnPatches.flushThen((t) => ({
               ...t,
               comparisons: [...(t.comparisons ?? []), event.comparison],
             }));
@@ -422,7 +493,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       // list only. Reload still uses GET via ThreadPage's effect.
       const cur = get().activeThread;
       if (cur?.id === threadId) {
-        patchTurn((t) => ({
+        // Drain the queue first: a queued delta patch must not land
+        // after the finalize patch (same ghost-burst risk as the
+        // status branch).
+        turnPatches.flushThen((t) => ({
           ...closeOpenBurstsOnTurn(t),
           in_flight: false,
           citations:
@@ -443,7 +517,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       // row the stream had already started painting, then rethrow so
       // the composer can show the failure.
       if (statusSeen) {
-        patchTurn((t) => ({ ...t, in_flight: false }));
+        // Drain any queued deltas before un-living the row so a late
+        // flush cannot patch a row the stream already abandoned; the
+        // closeOpenBursts also guarantees a queued delta folded after
+        // the terminal status cannot leave a live burst on the row.
+        turnPatches.flushThen((t) => ({
+          ...closeOpenBurstsOnTurn(t),
+          in_flight: false,
+        }));
       } else {
         dropTurnByRunId(threadId, optimisticRunId);
       }
@@ -486,6 +567,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         ...EMPTY_LIVE_ANSWER,
         visible: latestTurnAnswer(threadId),
       };
+      // Coalesced patcher (see sendQuestion): SSE deltas land in one
+      // animation-frame flush instead of one patch per wire frame.
+      // Non-delta frames go through ``flushThen`` so a queued delta
+      // can never be overtaken — or applied after — the terminal
+      // patch.
+      const latestTurnPatches = makeTurnPatcherQueue((fn) =>
+        patchLatestTurn(threadId, fn),
+      );
       const result = await api.resumeThread(threadId, (event) => {
         // Switch-thread guard: if the operator navigated away
         // mid-resume, drop the patches rather than painting them
@@ -496,7 +585,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 
         switch (event.type) {
           case "thinking":
-            patchLatestTurn(threadId, (t) => ({
+            latestTurnPatches.coalesce((t) => ({
               ...foldTraceFrameOntoTurn(t, event),
               thinking_text: t.thinking_text + event.text,
             }));
@@ -507,14 +596,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
               summary: RUNNING_SUMMARY,
               tool_call_id: event.tool_call_id,
             };
-            patchLatestTurn(threadId, (t) => ({
+            latestTurnPatches.flushThen((t) => ({
               ...foldTraceFrameOntoTurn(t, event),
               tool_summaries: [...(t.tool_summaries ?? []), placeholder],
             }));
             break;
           }
           case "tool_result": {
-            patchLatestTurn(threadId, (t) => ({
+            latestTurnPatches.flushThen((t) => ({
               ...foldTraceFrameOntoTurn(t, event),
               tool_summaries: (t.tool_summaries ?? []).map((s) =>
                 s.tool_call_id === event.tool_call_id
@@ -526,7 +615,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           }
           case "status":
             statusSeen = true;
-            patchLatestTurn(threadId, (t) => ({
+            latestTurnPatches.flushThen((t) => ({
               ...closeOpenBurstsOnTurn(t),
               status: event.status,
               status_reason: event.reason ?? "",
@@ -549,19 +638,20 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
               reset: event.reset,
               statusSeen,
             });
-            patchLatestTurn(threadId, (t) => ({
-              ...t,
+            latestTurnPatches.coalesce((t) => ({
+              // Same answer-closes-burst contract as sendQuestion.
+              ...foldTraceFrameOntoTurn(t, { type: "answer" }),
               answer: answerFold.visible,
             }));
             break;
           case "citations":
-            patchLatestTurn(threadId, (t) => ({
+            latestTurnPatches.flushThen((t) => ({
               ...t,
               citations: event.citations,
             }));
             break;
           case "comparison":
-            patchLatestTurn(threadId, (t) => ({
+            latestTurnPatches.flushThen((t) => ({
               ...t,
               comparisons: [...(t.comparisons ?? []), event.comparison],
             }));
@@ -572,7 +662,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       // Same as sendQuestion: do not re-GET over the streamed row.
       const cur = get().activeThread;
       if (cur?.id === threadId) {
-        patchLatestTurn(threadId, (t) => ({
+        // Drain queued deltas before the finalize patch (same
+        // ghost-burst risk as the status branch).
+        latestTurnPatches.flushThen((t) => ({
           ...closeOpenBurstsOnTurn(t),
           in_flight: false,
           citations:

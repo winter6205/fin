@@ -284,6 +284,60 @@ describe("trace burst folding on send", () => {
     expect(turns[0].tool_summaries?.[0]?.summary).toBe("'q': 1 hit");
   });
 
+  // Spec line 33 + #252 follow-up: the SECOND thinking burst must
+  // collapse when the first answer frame streams, NOT stay open until
+  // terminal status — the operator watches prose while the fold is
+  // already folded (with its tail preview).
+  it("collapses the live thinking burst at the first answer frame, BEFORE status arrives", async () => {
+    seedThread();
+    // Wire order matters: the burst must already be closed when the
+    // answer streams, NOT only at the terminal status frame.
+    stubSseRun([
+      ["thinking", { text: "burst one" }],
+      ["answer", { text: "part" }],
+      ["citations", []],
+      ["status", { run_id: RUN_ID, status: "done", assistant_message: "" }],
+    ]);
+
+    // Capture the store state after every update. The contract
+    // under test: after the answer frame (and before status) there
+    // is a state where the thinking burst is closed.
+    const midStates: string[][] = [];
+    const unsub = useWorkspaceStore.subscribe((s) => {
+      const turns = s.activeThread?.turns ?? [];
+      if (turns.length === 0) return;
+      midStates.push(
+        (turns[0].trace_items ?? []).map(
+          (i) => `${i.kind}:${i.live ? "live" : "closed"}`,
+        ),
+      );
+    });
+
+    let statusSeenAt = -1;
+    try {
+      await useWorkspaceStore.getState().sendQuestion(THREAD_ID, "营收多少？");
+      // Re-run the fold against a bare wire to find where status
+      // landed: in THIS stub status is the 4th frame, i.e. the LAST
+      // state captured. Everything up to the citations state came
+      // from thinking/answer handling alone.
+      statusSeenAt = midStates.length - 1;
+    } finally {
+      unsub();
+    }
+    // While the burst streamed it was live...
+    expect(midStates).toContainEqual(["thinking:live"]);
+    // ...and by the time the answer frame landed (before status's
+    // closeOpenBursts could act) it was closed.
+    expect(
+      midStates
+        .slice(0, Math.max(statusSeenAt, 1))
+        .some((kinds) => kinds.includes("thinking:closed")),
+    ).toBe(true);
+    const items =
+      useWorkspaceStore.getState().activeThread?.turns[0].trace_items ?? [];
+    expect(items.every((i) => i.live === false)).toBe(true);
+  });
+
   it("closes the live thinking burst when a tool_call arrives mid-run", async () => {
     seedThread();
     stubSseRun([
@@ -315,6 +369,107 @@ describe("trace burst folding on send", () => {
     const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
     const items = turns[0].trace_items ?? [];
     expect(items.every((i) => i.live === false)).toBe(true);
+  });
+
+  // #252 follow-up (render saturation): at provider chunk granularity
+  // every SSE frame used to trigger one store patch → one full
+  // transcript re-render; on a long thread the live fold froze and
+  // the answer dumped at run end. The store now coalesces delta
+  // patches into one animation-frame flush. With rAF stubbed, a
+  // burst of thinking frames must land as ONE patch whose folded
+  // trace is identical to unbatched folding.
+  it("coalesces a burst of thinking deltas into one rAF flush", async () => {
+    seedThread();
+    stubSseRun([
+      ["thinking", { text: "a" }],
+      ["thinking", { text: "b" }],
+      ["thinking", { text: "c" }],
+      ["status", { run_id: RUN_ID, status: "done", assistant_message: "" }],
+      ["answer", { text: "x" }],
+      ["citations", []],
+    ]);
+
+    // Stub rAF BEFORE the send: capture the callback and run it
+    // manually so the flush boundary is deterministic.
+    let rafCallback: FrameRequestCallback | null = null;
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      rafCallback = cb;
+      return 1;
+    });
+    // One entry per store update carrying a thinking burst — the
+    // batched fold must produce ONE mid-stream update ("a" through
+    // "c" in a single flush), not one per wire frame.
+    const patchTexts: string[] = [];
+    const stop = useWorkspaceStore.subscribe((state) => {
+      const turns = state.activeThread?.turns ?? [];
+      if (turns.length === 0) return;
+      const first = turns[0].trace_items?.[0];
+      if (first && first.kind === "thinking") patchTexts.push(first.text);
+    });
+
+    try {
+      await useWorkspaceStore.getState().sendQuestion(THREAD_ID, "营收多少？");
+      // Deltas queued while rAF was stubbed never flushed mid-run:
+      // no intermediate state ever showed a partial fold ("a",
+      // "ab", "bc"). Later updates re-push the same burst text (the
+      // status/citations patches ride the same turn), so dedupe
+      // consecutive entries before comparing.
+      const distinct = patchTexts.filter(
+        (text, i) => i === 0 || text !== patchTexts[i - 1],
+      );
+      expect(distinct).toEqual(["abc"]);
+      // The scheduled rAF then fires on an empty queue (no-op).
+      if (rafCallback) (rafCallback as FrameRequestCallback)(0);
+      rafCallback = null;
+      expect(
+        patchTexts.filter((text, i) => i === 0 || text !== patchTexts[i - 1]),
+      ).toEqual(["abc"]);
+    } finally {
+      stop();
+      vi.unstubAllGlobals();
+    }
+
+    // The flushed fold is identical to unbatched folding.
+    const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+    const items = turns[0].trace_items ?? [];
+    expect(items).toEqual([{ kind: "thinking", text: "abc", live: false }]);
+    expect(turns[0].thinking_text).toBe("abc");
+  });
+
+  // Ordering invariant of the patch queue: a non-delta frame must
+  // never overtake — or land after — deltas queued in the same
+  // animation frame. Here the thinking delta is queued (rAF stubbed),
+  // then tool_call arrives; flushThen must drain the queued delta
+  // BEFORE folding the tool_call, preserving wire arrival order.
+  it("flushes queued deltas before folding an immediately-arriving tool_call", async () => {
+    seedThread();
+    stubSseRun([
+      ["thinking", { text: "burst one" }],
+      [
+        "tool_call",
+        { name: "retrieve", args: { query: "q" }, tool_call_id: "c1" },
+      ],
+      ["status", { run_id: RUN_ID, status: "done", assistant_message: "" }],
+      ["answer", { text: "x" }],
+      ["citations", []],
+    ]);
+
+    let rafCallback: FrameRequestCallback | null = null;
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      rafCallback = cb;
+      return 1;
+    });
+    try {
+      await useWorkspaceStore.getState().sendQuestion(THREAD_ID, "营收多少？");
+      if (rafCallback) (rafCallback as FrameRequestCallback)(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    const items =
+      useWorkspaceStore.getState().activeThread?.turns[0].trace_items ?? [];
+    // Wire order preserved: thinking burst FIRST, tools after it.
+    expect(items.map((i) => i.kind)).toEqual(["thinking", "tools"]);
   });
 });
 
