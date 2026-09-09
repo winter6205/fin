@@ -23,10 +23,7 @@ export function canSubmitFeedback(turn: Turn): boolean {
  * Drives the pressed state of each button; a turn with no feedback
  * (null / undefined) has neither pressed.
  */
-export function isFeedbackActive(
-  turn: Turn,
-  value: FeedbackValue,
-): boolean {
+export function isFeedbackActive(turn: Turn, value: FeedbackValue): boolean {
   return turn.feedback === value;
 }
 
@@ -68,20 +65,41 @@ export function lastTerminalTurnIndex(turns: readonly Turn[]): number {
   return -1;
 }
 
-/** Whether the thumbs control should render on turn ``index``.
+/** The single source of the T3 chrome rule: thumbs render on the
+ * LAST TERMINAL turn of a thread that is not in_flight (spec
+ * turn-trace-folds line 40), gated by ``canSubmitFeedback`` (not
+ * in-flight + a persisted run_id). The row renders from its own
+ * turn + a precomputed "this row is the last terminal turn" scalar.
  *
- * Composes the persist gate (``canSubmitFeedback``: not in-flight
- * + a persisted run_id) with the T3 chrome rule: this turn is the
- * last terminal one AND the thread as a whole is not in_flight
- * (the thread-level flag covers a mid-run window where the last
- * row does not yet carry its own ``in_flight``).
+ * The scalar (``lastTerminalTurnIndex(turns) === index``, computed
+ * by the caller) keeps the memoized ``TurnView`` comparison
+ * allocation-free — a fresh turns array per streaming patch would
+ * otherwise defeat the memo. While a new optimistic row streams the
+ * scalar still points at the prior terminal row, matching the spec
+ * wording read at row grain.
+ */
+export function showThumbsForTurn(
+  isLastTerminalTurn: boolean,
+  turn: Turn,
+  threadInFlight: boolean,
+): boolean {
+  if (threadInFlight) return false;
+  if (!isLastTerminalTurn) return false;
+  return canSubmitFeedback(turn);
+}
+
+/** ``showThumbsForTurn`` at index/turns grain — a thin adapter for
+ * callers that hold the full turn list (and its test block).
+ * Delegation keeps the T3 rule in ONE implementation.
  */
 export function showThumbs(
   index: number,
   turns: readonly Turn[],
   threadInFlight: boolean,
 ): boolean {
-  if (threadInFlight) return false;
-  if (!canSubmitFeedback(turns[index])) return false;
-  return lastTerminalTurnIndex(turns) === index;
+  return showThumbsForTurn(
+    lastTerminalTurnIndex(turns) === index,
+    turns[index],
+    threadInFlight,
+  );
 }

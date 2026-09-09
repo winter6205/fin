@@ -1,7 +1,7 @@
 // Chat page for one research thread: turn table + composer. Reload
 // restores turns from GET (no re-invoke).
 
-import { useEffect, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { useLocation, useParams } from "react-router-dom";
 import AnswerWithCitations from "../components/CitationChips";
 import Composer from "../components/Composer";
@@ -26,7 +26,8 @@ import {
   canSubmitFeedback,
   feedbackErrorVisible,
   isFeedbackActive,
-  showThumbs,
+  lastTerminalTurnIndex,
+  showThumbsForTurn,
   type FeedbackValue,
 } from "../turnFeedback";
 import {
@@ -157,11 +158,19 @@ export default function ThreadPage() {
         {activeThread.turns.map((turn, index) => (
           // Turn rows are append-only; a stable index key avoids
           // remounting when the server-minted ``run_id`` reconciles.
+          // ``TurnView`` is memoized: streaming patches touch one
+          // row, the other rows' props are unchanged (turn identity
+          // + scalars), so a live round on a long thread no longer
+          // re-renders every historical row per SSE frame (the
+          // render-saturation freeze). The thumbs scalar keeps the
+          // T3 "last TERMINAL turn" rule — computed once per render,
+          // not per row.
           <TurnView
             key={index}
             turn={turn}
-            turnIndex={index}
-            turns={activeThread.turns}
+            isLastTerminalTurn={
+              index === lastTerminalTurnIndex(activeThread.turns)
+            }
             threadId={thread_id}
             threadInFlight={activeThread.in_flight === true}
           />
@@ -261,16 +270,17 @@ function EmptyThreadCorpusGrid() {
   );
 }
 
-function TurnView({
+// Memoized row: a streaming round patches one turn; historical rows
+// re-render only when THEIR turn object changes (see the TurnView
+// call site for the prop-narrowing rationale).
+const TurnView = memo(function TurnView({
   turn,
-  turnIndex,
-  turns,
+  isLastTerminalTurn,
   threadId,
   threadInFlight,
 }: {
   turn: Turn;
-  turnIndex: number;
-  turns: Turn[];
+  isLastTerminalTurn: boolean;
   threadId: string;
   threadInFlight: boolean;
 }) {
@@ -389,12 +399,12 @@ function TurnView({
           turn of a thread that is not in_flight (showThumbs) —
           older turns show nothing; canSubmitFeedback stays the
           persist gate inside FeedbackControls. */}
-      {showThumbs(turnIndex, turns, threadInFlight) ? (
+      {showThumbsForTurn(isLastTerminalTurn, turn, threadInFlight) ? (
         <FeedbackControls threadId={threadId} turn={turn} />
       ) : null}
     </article>
   );
-}
+});
 
 // T8: thumbs up/down for one terminal run. Clicking submits through
 // the store's ``setTurnFeedback`` (response-driven: the row's
@@ -633,7 +643,11 @@ function ThinkingFold({
     (showDurationLabel
       ? ` · ${formatThinkingDuration(durationMs as number)}`
       : "");
-  const tailLines = thinkingTailPreview(text);
+  // The collapsed preview splits the WHOLE burst text per render;
+  // a long thinking blob streaming at chunk granularity makes this
+  // a hot path — memoize on the text so re-renders triggered by
+  // sibling rows don't re-split.
+  const tailLines = useMemo(() => thinkingTailPreview(text), [text]);
   return (
     <div className="mb-1">
       <button
