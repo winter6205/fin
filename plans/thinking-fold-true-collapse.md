@@ -8,7 +8,7 @@
 **Tracker:** GitHub. Spec: spec: thinking fold true collapse + thinking pending. Tickets: T1 SSOT, T2 header-only collapse (blocked by T1), T3 thinking pending (blocked by T2).
 **Worktree:** `.worktrees/thinking-fold-true-collapse` on `feat/thinking-fold-true-collapse`
 
-> Contradicts ADR-0025 — the accepted paragraph still says “tail preview on collapsed thinking”. Reopen that sentence only: grain stays burst-scoped folds; collapsed thinking is header-only; **thinking pending** is named. Worth reopening because CONTEXT and this plan’s T1 replace the preview contract.
+> T1 reopened ADR-0025’s burst-grain sentence (was “tail preview on collapsed thinking”). Grain stays burst-scoped folds; collapsed thinking is header-only; **thinking pending** is named. CONTEXT and the amended spec are the SSOT.
 
 Two behaviours only — three bullets because the SSOT reversal is a docs ticket before UI. Not padded: T1 has no code; T2/T3 are the two ACR commits.
 

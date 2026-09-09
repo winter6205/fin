@@ -296,14 +296,13 @@ export default async function runStreamChecks(page, options = {}) {
     };
   });
 
-  // turn-trace-folds (the tracked change) replaces the old accordion/details trace:
-  // sibling thinking/tool bursts, each collapsed by default once the
-  // run ends. Collapsed thinking shows the 深度思考 header + a tail
-  // preview (no full text); collapsed tools shows the 工具 header
-  // (no rows). Collapsed is not lost: expanding brings the content
-  // back, and a manual toggle round-trips both folds. A turn may
-  // hold several thinking bursts (pre-tool and post-tool reasoning);
-  // every one of them obeys the same contract.
+  // turn-trace-folds (the tracked change / the tracked change): sibling thinking/tool bursts,
+  // each collapsed by default once the run ends. Collapsed thinking
+  // is header-only (深度思考; no tail preview, no full text);
+  // collapsed tools shows the 工具 header (no rows). Expanding
+  // brings the content back; a manual toggle round-trips both folds.
+  // A turn may hold several thinking bursts; every one of them
+  // obeys the same contract.
   await check("5-trace-collapse", async () => {
     const article = page.locator("article").last();
 
@@ -357,7 +356,6 @@ export default async function runStreamChecks(page, options = {}) {
 
     return {
       pass:
-        collapsed.previews === collapsed.thinkingToggles &&
         collapsed.fulls === 0 &&
         collapsed.toolsListsOpen === 0 &&
         expanded.fulls === 1 &&
