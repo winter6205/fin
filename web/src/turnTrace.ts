@@ -144,17 +144,14 @@ export function closeOpenBursts(items: TraceItem[]): TraceItem[] {
   return closeLive(items);
 }
 
-/** The last three lines of a burst's text, for the collapsed preview
- * (spec: latest lines, not the first). Fewer lines → all lines. */
-export function thinkingTailPreview(text: string, lines = 3): string[] {
-  const split = text.split("\n");
-  const kept: string[] = [];
-  for (const line of split) {
-    if (line.trim().length === 0 && kept.length === 0) continue;
-    kept.push(line);
-  }
-  if (kept.length === 0) return [""];
-  return kept.slice(-lines);
+/** Visible burst prose for a thinking fold. Open (live or expanded)
+ * → full burst text (latest lines included). Collapsed → header-only,
+ * no three-line tail preview. */
+export function thinkingFoldVisibleText(
+  open: boolean,
+  text: string,
+): string | null {
+  return open ? text : null;
 }
 
 /** Open state for one burst fold (spec line 34): a manual toggle
