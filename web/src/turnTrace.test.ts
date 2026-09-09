@@ -113,6 +113,23 @@ describe("foldTraceFrame", () => {
   // Spec line 33: the first answer frame closes a still-live burst —
   // the fold must collapse when prose starts streaming, not only at
   // terminal status.
+  it("drops empty pending thinking when the first frame is tool_call", () => {
+    const items = foldTraceFrame([{ kind: "thinking", text: "", live: true }], {
+      type: "tool_call",
+      name: "retrieve",
+      tool_call_id: "c1",
+    });
+    expect(items.filter((i) => i.kind === "thinking")).toEqual([]);
+    expect(items[0]).toMatchObject({ kind: "tools", live: true });
+  });
+
+  it("drops empty pending thinking when the first frame is answer", () => {
+    const items = foldTraceFrame([{ kind: "thinking", text: "", live: true }], {
+      type: "answer",
+    });
+    expect(items).toEqual([]);
+  });
+
   it("closes a live thinking burst when the first answer frame arrives", () => {
     let items = foldTraceFrame([], { type: "thinking", text: "a" });
     items = foldTraceFrame(items, { type: "answer" });

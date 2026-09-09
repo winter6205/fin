@@ -41,7 +41,7 @@ affects: `docs/CONTEXT.md`; `docs/adr/0025-ordinary-person-workspace.md`; `specs
    - **Inherits:** amended spec: optimistic send immediately shows **thinking pending** (same 深度思考 chrome, no body); first `thinking` frame becomes that fold; first `tool_call` or `answer` removes pending and attaches the real fold or answer card; stream error / no-frame drop still removes the optimistic turn
    - **Surface:** `web/` send/resume store + thread transcript
    - **Acceptance:** after send and before any SSE event, the assistant side shows 深度思考 chrome with no thinking prose; a first `thinking` delta appears in that same region (not a second card); a thinking-off stream whose first event is `tool_call` or `answer` does not leave a leftover pending fold; existing drop-if-no-frame behaviour still holds
-   - Status: [ ] pending
+   - Status: [x] done
    - [blocks: T2]
 
 ## 待写入

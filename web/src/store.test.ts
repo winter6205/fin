@@ -151,6 +151,39 @@ function recordVisibleAnswers(): { seen: string[]; stop: () => void } {
   return { seen, stop };
 }
 
+/** Hold `/messages` or `/resume` until `release` so the optimistic
+ * turn can be inspected before any SSE frame is parsed. */
+function stubHeldSse(release: Promise<void>, frames: Frame[] = []): void {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : String(input);
+      if (!url.endsWith("/messages") && !url.endsWith("/resume")) {
+        return new Response("[]", {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      await release;
+      let next = 0;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (next >= frames.length) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(new TextEncoder().encode(sseFrame(frames[next])));
+          next += 1;
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }),
+  );
+}
+
 function expectNeverShrinks(seen: string[]): void {
   const first = seen.findIndex((v) => v.length > 0);
   expect(first).toBeGreaterThanOrEqual(0);
@@ -240,6 +273,155 @@ describe("sendQuestion failure surfacing", () => {
     const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
     expect(turns).toHaveLength(1);
     expect(turns[0].in_flight).toBe(false);
+  });
+});
+
+// thinking pending (turn-trace-folds): optimistic send shows the same
+// 深度思考 chrome with no burst body until the first real frame.
+describe("thinking pending on send", () => {
+  function pendingThinking(items: unknown): boolean {
+    return (
+      Array.isArray(items) &&
+      items.length === 1 &&
+      items[0] !== null &&
+      typeof items[0] === "object" &&
+      (items[0] as { kind?: string; text?: string; live?: boolean }).kind ===
+        "thinking" &&
+      (items[0] as { text?: string }).text === "" &&
+      (items[0] as { live?: boolean }).live === true
+    );
+  }
+
+  it("seeds empty live thinking chrome on the optimistic turn before any SSE frame", async () => {
+    seedThread();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stubHeldSse(gate);
+
+    const sendP = useWorkspaceStore
+      .getState()
+      .sendQuestion(THREAD_ID, "营收多少？");
+    const items =
+      useWorkspaceStore.getState().activeThread?.turns[0]?.trace_items;
+    expect(pendingThinking(items)).toBe(true);
+
+    release();
+    await sendP.catch(() => undefined);
+  });
+
+  it("seeds thinking pending even when the thinking toggle is off", async () => {
+    seedThread();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stubHeldSse(gate);
+
+    const sendP = useWorkspaceStore
+      .getState()
+      .sendQuestion(THREAD_ID, "营收多少？", false);
+    const items =
+      useWorkspaceStore.getState().activeThread?.turns[0]?.trace_items;
+    expect(pendingThinking(items)).toBe(true);
+
+    release();
+    await sendP.catch(() => undefined);
+  });
+
+  it("merges the first thinking frame into the pending fold, not a second card", async () => {
+    seedThread();
+    const seen: unknown[][] = [];
+    const stop = useWorkspaceStore.subscribe((state) => {
+      const turns = state.activeThread?.turns ?? [];
+      if (turns.length > 0) seen.push(turns[0].trace_items ?? []);
+    });
+    stubSseRun([
+      ["thinking", { text: "first burst" }],
+      ["status", { run_id: RUN_ID, status: "done", assistant_message: "" }],
+      ["answer", { text: "a" }],
+      ["citations", []],
+    ]);
+
+    await useWorkspaceStore.getState().sendQuestion(THREAD_ID, "营收多少？");
+    stop();
+
+    expect(seen.some(pendingThinking)).toBe(true);
+    const items =
+      useWorkspaceStore.getState().activeThread?.turns[0].trace_items ?? [];
+    expect(items.filter((i) => i.kind === "thinking")).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      kind: "thinking",
+      text: "first burst",
+      live: false,
+    });
+  });
+
+  it("drops empty pending when the first frame is tool_call", async () => {
+    seedThread();
+    const seen: unknown[][] = [];
+    const stop = useWorkspaceStore.subscribe((state) => {
+      const turns = state.activeThread?.turns ?? [];
+      if (turns.length > 0) seen.push(turns[0].trace_items ?? []);
+    });
+    stubSseRun([
+      [
+        "tool_call",
+        { name: "retrieve", args: { query: "q" }, tool_call_id: "c1" },
+      ],
+      ["status", { run_id: RUN_ID, status: "done", assistant_message: "" }],
+      ["answer", { text: "a" }],
+      ["citations", []],
+    ]);
+
+    await useWorkspaceStore.getState().sendQuestion(THREAD_ID, "营收多少？");
+    stop();
+
+    expect(seen.some(pendingThinking)).toBe(true);
+    const items =
+      useWorkspaceStore.getState().activeThread?.turns[0].trace_items ?? [];
+    expect(items.filter((i) => i.kind === "thinking")).toEqual([]);
+    expect(items.some((i) => i.kind === "tools")).toBe(true);
+  });
+
+  it("drops empty pending when the first frame is answer", async () => {
+    seedThread();
+    const seen: unknown[][] = [];
+    const stop = useWorkspaceStore.subscribe((state) => {
+      const turns = state.activeThread?.turns ?? [];
+      if (turns.length > 0) seen.push(turns[0].trace_items ?? []);
+    });
+    stubSseRun([
+      ["answer", { text: "a" }],
+      ["status", { run_id: RUN_ID, status: "done", assistant_message: "" }],
+      ["citations", []],
+    ]);
+
+    await useWorkspaceStore.getState().sendQuestion(THREAD_ID, "营收多少？");
+    stop();
+
+    expect(seen.some(pendingThinking)).toBe(true);
+    const items =
+      useWorkspaceStore.getState().activeThread?.turns[0].trace_items ?? [];
+    expect(items.filter((i) => i.kind === "thinking")).toEqual([]);
+  });
+
+  it("does not seed thinking pending on resumeThread", async () => {
+    seedResumableThread();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    stubHeldSse(gate);
+
+    const resumeP = useWorkspaceStore.getState().resumeThread(THREAD_ID);
+    const items =
+      useWorkspaceStore.getState().activeThread?.turns[0]?.trace_items;
+    expect(pendingThinking(items)).toBe(false);
+
+    release();
+    await resumeP.catch(() => undefined);
   });
 });
 
@@ -414,15 +596,16 @@ describe("trace burst folding on send", () => {
       // "ab", "bc"). Later updates re-push the same burst text (the
       // status/citations patches ride the same turn), so dedupe
       // consecutive entries before comparing.
-      const distinct = patchTexts.filter(
-        (text, i) => i === 0 || text !== patchTexts[i - 1],
+      const streamed = patchTexts.filter((text) => text.length > 0);
+      const distinct = streamed.filter(
+        (text, i) => i === 0 || text !== streamed[i - 1],
       );
       expect(distinct).toEqual(["abc"]);
       // The scheduled rAF then fires on an empty queue (no-op).
       if (rafCallback) (rafCallback as FrameRequestCallback)(0);
       rafCallback = null;
       expect(
-        patchTexts.filter((text, i) => i === 0 || text !== patchTexts[i - 1]),
+        streamed.filter((text, i) => i === 0 || text !== streamed[i - 1]),
       ).toEqual(["abc"]);
     } finally {
       stop();
