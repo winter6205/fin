@@ -34,7 +34,7 @@ affects: `docs/CONTEXT.md`; `docs/adr/0025-ordinary-person-workspace.md`; `specs
    - **Inherits:** amended spec: live thinking remains expanded full text with tail-follow; manual collapse and auto-collapse at burst end hide the burst body; header is 深度思考 plus duration when measured; answer / citations / **tool fold** unchanged
    - **Surface:** `web/` thread transcript thinking chrome
    - **Acceptance:** a collapsed thinking burst shows the header and does not show burst prose (no three-line preview node); expanding shows the full burst; a live un-collapsed burst still shows the latest lines; `web/` `tsc --noEmit` exits 0
-   - Status: [ ] pending
+   - Status: [x] done
    - [blocks: T1]
 
 3. **thinking pending until the first real frame** — tag: `[implementation]`
