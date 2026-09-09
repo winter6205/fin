@@ -202,8 +202,12 @@ The local web UI: chrome is **知识库** / **监控**; **research thread**s liv
 _Avoid_: 知识库 as the UI name, 工作区 directory, CLI REPL as the product, hosted accounts this increment, POST /ask as the conversation surface, Corpus / MCP / Status as nav labels, 对话 as a chrome overview
 
 **thinking fold**:
-A per-burst collapsible thinking region on a **research thread** turn: streams expanded while that burst is live; auto-collapses when the burst ends; collapsed shows a header plus a three-line tail preview of the latest lines. UI label: 深度思考.
-_Avoid_: mixing thinking prose into the answer card, clamping the first lines as the live view, concatenating a whole run's thinking above all tools
+A per-burst collapsible thinking region on a **research thread** turn: streams expanded while that burst is live; auto-collapses when the burst ends; collapsed is header-only (UI label 深度思考, plus duration when measured) with the burst text hidden until expand.
+_Avoid_: mixing thinking prose into the answer card, clamping the first lines as the live view, concatenating a whole run's thinking above all tools, a three-line tail preview as the collapsed state
+
+**thinking pending**:
+The same **thinking fold** chrome on an optimistic **research thread** turn after send, before the first `thinking` SSE frame, with no burst body. The first `thinking` frame becomes that fold; a first `tool_call` or `answer` removes it.
+_Avoid_: a second thinking card, a new SSE event type, treating HTTP wait as model tokens, 处理中 as the default label
 
 **tool fold**:
 A per-burst collapsible tool-call list on the same turn, sibling to the **thinking fold**. Live while those calls run so the operator can debug (including retrieve via the **retrieve port**); auto-collapses when that burst ends. UI label: 工具. MCP is not a transcript tool name.

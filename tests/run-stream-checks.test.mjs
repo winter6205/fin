@@ -441,3 +441,17 @@ test("never addresses submit buttons page-wide", () => {
     "the send button must be scoped to the composer, not to every form on the page",
   );
 });
+
+// T2 header-only collapse: collapsed thinking has toggles + no full
+// burst; expand shows one full. A tail-preview node is not part of
+// the pass contract (specs/turn-trace-folds.md).
+test("5-trace-collapse does not require thinking tail preview nodes", () => {
+  const body = runStreamChecks.toString().replace(/^\s*\/\/.*$/gm, "");
+  assert.doesNotMatch(
+    body,
+    /collapsed\.previews\s*===\s*collapsed\.thinkingToggles/,
+    "header-only collapse must not require one preview node per thinking toggle",
+  );
+  assert.match(body, /collapsed\.fulls\s*===\s*0/);
+  assert.match(body, /expanded\.fulls\s*===\s*1/);
+});

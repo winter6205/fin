@@ -30,6 +30,7 @@ import {
 import {
   closeOpenBursts,
   foldTraceFrame,
+  thinkingPendingItems,
   RUNNING_SUMMARY,
   type TraceFrame,
 } from "./turnTrace";
@@ -337,6 +338,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       // status frame — the thinking region line-clamps and the tool
       // rows stay open while the run streams, then collapse.
       in_flight: true,
+      // thinking pending: same 深度思考 chrome until the first
+      // thinking frame (or drop on first tool_call / answer).
+      trace_items: thinkingPendingItems(),
       created_at: new Date().toISOString(),
     };
 
