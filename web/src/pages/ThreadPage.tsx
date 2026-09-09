@@ -1,7 +1,7 @@
 // Chat page for one research thread: turn table + composer. Reload
 // restores turns from GET (no re-invoke).
 
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { useLocation, useParams } from "react-router-dom";
 import AnswerWithCitations from "../components/CitationChips";
 import Composer from "../components/Composer";
@@ -32,7 +32,7 @@ import {
 } from "../turnFeedback";
 import {
   foldOpenState,
-  thinkingTailPreview,
+  thinkingFoldVisibleText,
   traceItemsFromTurn,
 } from "../turnTrace";
 import { useWorkspaceStore } from "../store";
@@ -285,8 +285,8 @@ const TurnView = memo(function TurnView({
   threadInFlight: boolean;
 }) {
   // T4 (#37): while THIS turn is live (optimistic send or a
-  // lock-held latest row) the tool rows stay open and the thinking
-  // region line-clamps; after the run both collapse.
+  // lock-held latest row) the tool rows stay open and the live
+  // thinking burst stays expanded; after the run both collapse.
   const live = turn.in_flight === true;
   // turn-trace-folds (the tracked change): the burst timeline. A live run carries
   // the folded bursts from the store; a GET-restored row (or legacy
@@ -598,12 +598,10 @@ function ComparisonTable({ comparison }: { comparison: Comparison }) {
   );
 }
 
-// T4 (#37): the thinking region — unframed (no border/background,
-// per spec line 31). While the run is LIVE the prose line-clamps to
-// a few lines (click expands); AFTER the run it collapses to a
-// one-line duration label ("Thought for 4.2s") that expands the
-// full text on click. When no duration was measured (0ms / legacy
-// rows) a completed run falls back to the plain collapsed label.
+// thinking fold: live burst is expanded full text; collapsed is
+// header-only (深度思考 + duration when measured). No line-clamp
+// preview. When no duration was measured (0ms / legacy rows) a
+// completed burst falls back to the plain collapsed label.
 function formatThinkingDuration(ms: number): string {
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
   const totalSeconds = Math.round(ms / 1000);
@@ -613,11 +611,11 @@ function formatThinkingDuration(ms: number): string {
 // turn-trace-folds (the tracked change): one thinking burst fold. Live = expanded
 // with the FULL burst text (viewport pinned to the tail — no
 // start-of-text clamp as the live view). Collapsed = 「深度思考」
-// header (+ duration when the run measured one) + a three-line TAIL
-// preview (latest lines, not the first). A manual toggle wins over
-// the auto state until the burst's liveness changes: the override
-// resets when ``live`` flips, so auto-collapse at burst end always
-// runs (spec line 34) but cannot fight an operator's mid-burst open.
+// header (+ duration when the run measured one), burst body hidden.
+// A manual toggle wins over the auto state until the burst's
+// liveness changes: the override resets when ``live`` flips, so
+// auto-collapse at burst end always runs (spec) but cannot fight
+// an operator's mid-burst open.
 function ThinkingFold({
   text,
   durationMs,
@@ -643,11 +641,7 @@ function ThinkingFold({
     (showDurationLabel
       ? ` · ${formatThinkingDuration(durationMs as number)}`
       : "");
-  // The collapsed preview splits the WHOLE burst text per render;
-  // a long thinking blob streaming at chunk granularity makes this
-  // a hot path — memoize on the text so re-renders triggered by
-  // sibling rows don't re-split.
-  const tailLines = useMemo(() => thinkingTailPreview(text), [text]);
+  const visibleText = thinkingFoldVisibleText(open, text);
   return (
     <div className="mb-1">
       <button
@@ -658,20 +652,13 @@ function ThinkingFold({
       >
         {label} {open ? "−" : "+"}
       </button>
-      {open ? (
+      {visibleText !== null ? (
         <div
           className="mt-1 text-xs text-gray-600 whitespace-pre-wrap break-words"
           data-testid="trace-thinking-full"
         >
-          {text}
+          {visibleText}
         </div>
-      ) : text.length > 0 ? (
-        <p
-          className="mt-1 text-xs text-gray-400 whitespace-pre-wrap break-words line-clamp-3"
-          data-testid="trace-thinking-preview"
-        >
-          {tailLines.join("\n")}
-        </p>
       ) : null}
     </div>
   );
@@ -680,8 +667,7 @@ function ThinkingFold({
 // Live-thinking tail pinning: keep the full text reachable — the
 // expanded body is plain flow content; the page's own scroll area
 // already follows the streaming tail because each frame appends at
-// the bottom of the transcript. (The old line-clamp hid the tail
-// behind the head — the regression this fold fixes.)
+// the bottom of the transcript.
 
 // turn-trace-folds (the tracked change): one tool burst fold. Live = expanded,
 // each call a compact row (name + human one-liner; running rows show

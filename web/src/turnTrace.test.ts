@@ -3,7 +3,7 @@ import {
   closeOpenBursts,
   foldOpenState,
   foldTraceFrame,
-  thinkingTailPreview,
+  thinkingFoldVisibleText,
   traceItemsFromTurn,
 } from "./turnTrace";
 import type { Turn } from "./types";
@@ -113,6 +113,23 @@ describe("foldTraceFrame", () => {
   // Spec line 33: the first answer frame closes a still-live burst —
   // the fold must collapse when prose starts streaming, not only at
   // terminal status.
+  it("drops empty pending thinking when the first frame is tool_call", () => {
+    const items = foldTraceFrame([{ kind: "thinking", text: "", live: true }], {
+      type: "tool_call",
+      name: "retrieve",
+      tool_call_id: "c1",
+    });
+    expect(items.filter((i) => i.kind === "thinking")).toEqual([]);
+    expect(items[0]).toMatchObject({ kind: "tools", live: true });
+  });
+
+  it("drops empty pending thinking when the first frame is answer", () => {
+    const items = foldTraceFrame([{ kind: "thinking", text: "", live: true }], {
+      type: "answer",
+    });
+    expect(items).toEqual([]);
+  });
+
   it("closes a live thinking burst when the first answer frame arrives", () => {
     let items = foldTraceFrame([], { type: "thinking", text: "a" });
     items = foldTraceFrame(items, { type: "answer" });
@@ -164,22 +181,24 @@ describe("closeOpenBursts", () => {
   });
 });
 
-describe("thinkingTailPreview", () => {
-  it("returns the LAST three lines for long text", () => {
+describe("thinkingFoldVisibleText", () => {
+  it("hides burst prose when collapsed (no three-line tail preview)", () => {
     const text = ["l1", "l2", "l3", "l4", "l5"].join("\n");
-    expect(thinkingTailPreview(text)).toEqual(["l3", "l4", "l5"]);
+    expect(thinkingFoldVisibleText(false, text)).toBeNull();
   });
 
-  it("returns all lines when the burst is shorter than three", () => {
-    expect(thinkingTailPreview("only line")).toEqual(["only line"]);
+  it("returns the full burst including latest lines when open", () => {
+    const text = ["l1", "l2", "l3", "l4", "l5"].join("\n");
+    expect(thinkingFoldVisibleText(true, text)).toBe(text);
   });
 
-  it("skips leading blank lines", () => {
-    expect(thinkingTailPreview("\n\na\nb")).toEqual(["a", "b"]);
+  it("hides collapsed body even when the burst is a single line", () => {
+    expect(thinkingFoldVisibleText(false, "only line")).toBeNull();
   });
 
-  it("handles empty text", () => {
-    expect(thinkingTailPreview("")).toEqual([""]);
+  it("returns empty string when open with empty burst (no preview node)", () => {
+    expect(thinkingFoldVisibleText(true, "")).toBe("");
+    expect(thinkingFoldVisibleText(false, "")).toBeNull();
   });
 });
 

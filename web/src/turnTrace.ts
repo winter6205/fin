@@ -1,4 +1,4 @@
-// turn-trace-folds (the tracked change): pure helpers that fold the SSE stream into
+// turn-trace-folds: pure helpers that fold the SSE stream into
 // the per-turn burst timeline. Extracted from the store so the burst
 // contract (arrival-order sibling thinking/tool folds, auto-collapse
 // at burst end) can be unit-tested without Zustand, and so send and
@@ -26,11 +26,30 @@ function runningRow(name: string, toolCallId: string): ToolSummary {
   return { name, summary: RUNNING_SUMMARY, tool_call_id: toolCallId };
 }
 
+/** Optimistic send chrome: same thinking-fold slot, no burst body. */
+export function thinkingPendingItems(): TraceItem[] {
+  return [{ kind: "thinking", text: "", live: true }];
+}
+
+/** First tool_call / answer / burst-end must not leave an empty header. */
+function dropEmptyThinking(items: TraceItem[]): TraceItem[] {
+  if (
+    !items.some((item) => item.kind === "thinking" && item.text.length === 0)
+  ) {
+    return items;
+  }
+  return items.filter(
+    (item) => item.kind !== "thinking" || item.text.length > 0,
+  );
+}
+
 /** Close every still-live burst, returning the list unchanged when
  * nothing is live (keeps the common all-closed path allocation-free). */
 function closeLive(items: TraceItem[]): TraceItem[] {
-  if (!items.some((item) => item.live)) return items;
-  return items.map((item) => (item.live ? { ...item, live: false } : item));
+  const closed = items.some((item) => item.live)
+    ? items.map((item) => (item.live ? { ...item, live: false } : item))
+    : items;
+  return dropEmptyThinking(closed);
 }
 
 /** The tool burst holding ``toolCallId``, else null. */
@@ -144,17 +163,14 @@ export function closeOpenBursts(items: TraceItem[]): TraceItem[] {
   return closeLive(items);
 }
 
-/** The last three lines of a burst's text, for the collapsed preview
- * (spec: latest lines, not the first). Fewer lines → all lines. */
-export function thinkingTailPreview(text: string, lines = 3): string[] {
-  const split = text.split("\n");
-  const kept: string[] = [];
-  for (const line of split) {
-    if (line.trim().length === 0 && kept.length === 0) continue;
-    kept.push(line);
-  }
-  if (kept.length === 0) return [""];
-  return kept.slice(-lines);
+/** Visible burst prose for a thinking fold. Open (live or expanded)
+ * → full burst text (latest lines included). Collapsed → header-only,
+ * no three-line tail preview. */
+export function thinkingFoldVisibleText(
+  open: boolean,
+  text: string,
+): string | null {
+  return open ? text : null;
 }
 
 /** Open state for one burst fold (spec line 34): a manual toggle

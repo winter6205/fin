@@ -156,8 +156,8 @@ export interface Turn {
   status_reason?: string;
   answer: string;
   citations: Citation[];
-  // T3: the run's streamed thinking prose (collapsed / line-clamped
-  // in the UI). Empty when the model surfaced no reasoning.
+  // T3: the run's streamed thinking prose (header-only when the
+  // thinking fold is collapsed). Empty when the model surfaced no reasoning.
   thinking_text?: string;
   // T4 (#37): total thinking duration in ms. After the run the
   // thinking region collapses to a one-line duration label
