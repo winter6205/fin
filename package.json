@@ -1,0 +1,16 @@
+{
+  "name": "fin-hooks",
+  "private": true,
+  "description": "Repo hooks only. App code is Python (pyproject) and web/.",
+  "scripts": {
+    "prepare": "husky",
+    "lint:s5": "node $HOME/.claude/plugins/marketplaces/arthurpower-local/plugins/arthurpower/scripts/s5-complexity/check.mjs --changed",
+    "lint:s5:staged": "node $HOME/.claude/plugins/marketplaces/arthurpower-local/plugins/arthurpower/scripts/s5-complexity/check.mjs --changed --staged",
+    "lint:s5:all": "node $HOME/.claude/plugins/marketplaces/arthurpower-local/plugins/arthurpower/scripts/s5-complexity/check.mjs web/src"
+  },
+  "devDependencies": {
+    "eslint": "^10.10.0",
+    "husky": "^9.1.7",
+    "typescript-eslint": "^8.70.0"
+  }
+}
