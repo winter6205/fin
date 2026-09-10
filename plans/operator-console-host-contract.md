@@ -57,7 +57,7 @@ minimal-change-verifier: yes — this repo only the host contract; dashboard/sch
    - **Inherits:** spec: system is a tool map; 查已入库 → MCP **retrieve**; 读入库整篇 → `read_source`; 本地路径 → local read; research claims about ingested filings require MCP **retrieve** or `read_source` on the trace (`docs/guides/prompt-development.md`).
    - **Surface:** existing prompt / citation-verifier assembly
    - **Acceptance:** research-track fixture that asserts a numeric/filing claim without MCP **retrieve** or `read_source` fails the hard gate (or the existing verifier extension). `uv run pytest -q` exits 0.
-   - Status: [ ] pending
+   - Status: [x] done — commit eaa9142 (USAGE_RESEARCH tool map wording; fixture proves ungrounded numeric/filing claim refuses at citation_repair_cap; no gate-code change needed)
    - [parallel]
    - [blocks: T2]
 
