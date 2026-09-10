@@ -35,6 +35,18 @@ parse rule version, params table version) rides along in
 :attr:`PushRecord.metadata`; :data:`REQUIRED_PUSH_METADATA_FIELDS` is
 its single authority, consumed by the push adapter and by the contract
 fake so the required-field list cannot fork into two copies.
+
+One envelope per 资料 (plan `operator-console-host-contract` T1)
+-----------------------------------------------------------------
+
+After **切分**, the ingest endpoint pushes **one envelope per unit**
+(spec `operator-console-host-contract`): `source_ref` + the unit's
+extracted body + `chunks[]` of ``{content, index}``. The
+:class:`PushEnvelope` dataclass is the wire shape and the carrier of
+the unit-level content identity used as the idempotency key on the
+wire. Per-child :class:`PushRecord` rows remain — they are what the
+invalidation path keys on (see :mod:`fin.corpus.invalidation`) — but
+they no longer ride the wire one-per-block.
 """
 
 from __future__ import annotations
@@ -47,6 +59,7 @@ from typing import Any, Final, Mapping, Sequence
 
 from fin.corpus.chunking import ChunkPayload, DocumentChunking, UnitChunking
 from fin.corpus.determinism import canonical_json_bytes
+from fin.corpus.normalization import NORMALIZATION_RULE_VERSION
 from fin.corpus.parsers._common import UnitLocator
 
 # SC20: the structured metadata the retrieval side consumes as filter
@@ -246,12 +259,212 @@ def document_push_records(document: DocumentChunking) -> tuple[PushRecord, ...]:
     return tuple(record_of_payload(payload) for payload in document.payloads())
 
 
+# ---------------------------------------------------------------------------
+# One envelope per 资料 — operator-console-host-contract T1
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PushChunk:
+    """One slice inside a :class:`PushEnvelope`.
+
+    ``index`` is the 0-based monotonic position of the slice inside the
+    envelope (``0, 1, ..., N-1``); ``content`` is the slice text, a
+    contiguous substring of the envelope body (SC11 / SC16「连续子串」).
+    ``id`` and ``content_id`` are propagated from the per-child
+    :class:`ChunkPayload` when the envelope is built by
+    :func:`envelope_of_unit`, so the catalog side keeps pinning the
+    same block id / content identity it had pre-T1 and the
+    invalidation path's per-child keys resolve on the receiving side.
+    """
+
+    index: int
+    content: str
+    id: str | None = None
+    content_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PushEnvelope:
+    """The wire shape of one 资料 push (spec `operator-console-host-contract`).
+
+    One envelope per frozen unit: ``source_ref`` (the unit locator
+    triple), the unit's full extracted text as the ``body``, and the
+    child slices as ``chunks`` with monotonic ``index`` starting at 0.
+    The metadata carries the SC20 filter surface; ``valid_from`` /
+    ``valid_until`` ride along for the retrieval side's interval
+    tracking.
+
+    The idempotency key on the wire is
+    ``(source_ref, body_content_id)`` — ``body_content_id`` is the
+    deterministic sha256 of (body text + normalization rule version +
+    parse rule version + params table version), the same hash
+    construction :func:`content_identity` uses, just over the body
+    instead of a single child block.
+    """
+
+    source_ref: str
+    body: str
+    chunks: tuple[PushChunk, ...]
+    metadata: Mapping[str, Any]
+    valid_from: str
+    valid_until: str
+    body_content_id: str
+
+    @property
+    def idempotency_key(self) -> tuple[str, str]:
+        """The wire-level idempotency key: ``(source_ref, body_content_id)``."""
+        return (self.source_ref, self.body_content_id)
+
+    def to_wire(self) -> dict[str, Any]:
+        """The wire shape (verbatim field names the receiving schema
+        accepts). Metadata is copied so the caller's mutation cannot
+        reach back into the envelope.
+
+        ``chunks[i]`` carries the per-child ``id`` and ``content_id``
+        when the envelope was built from a :class:`UnitChunking` —
+        the receiving service uses these as the canonical
+        per-slice identifiers (the citation gate keys on them,
+        the invalidation path keys on ``content_id``).
+        """
+        return {
+            "source_ref": self.source_ref,
+            "body": self.body,
+            "chunks": [
+                {
+                    "index": chunk.index,
+                    "content": chunk.content,
+                    **(
+                        {"id": chunk.id}
+                        if chunk.id is not None
+                        else {}
+                    ),
+                    **(
+                        {"content_id": chunk.content_id}
+                        if chunk.content_id is not None
+                        else {}
+                    ),
+                }
+                for chunk in self.chunks
+            ],
+            "metadata": dict(self.metadata),
+            "valid_from": self.valid_from,
+            "valid_until": self.valid_until,
+        }
+
+
+def envelope_of_unit(
+    unit: UnitChunking,
+    *,
+    valid_from: str,
+    valid_until: str,
+) -> PushEnvelope:
+    """Build the wire envelope of one frozen unit.
+
+    The body is the unit's full extracted text (the same text
+    ``UnitChunking.unit_text`` holds — the SC11/SC16 invariant is that
+    every child block text is a contiguous substring of its parent's
+    text, every parent text is a contiguous substring of the unit
+    text, so the body contains every slice). The chunks are the
+    children in order, indexed from 0.
+
+    Each chunk's ``id`` / ``content_id`` is propagated from the
+    per-child :class:`ChunkPayload` so the catalog side keeps pinning
+    the same block id and per-child content identity it already had
+    pre-T1: the invalidation path keys on these via
+    :func:`fin.corpus.invalidation.plan_invalidations`, and the
+    contract fake's per-chunk index needs the matching keys to resolve.
+
+    The body content identity is :func:`content_identity` over the
+    body text and the three rule versions — the same hashing
+    construction per-child records use, so the envelope and a
+    would-be per-child record share the content-identity contract.
+    """
+    chunks = tuple(
+        PushChunk(
+            index=index,
+            content=payload.text,
+            id=payload.block_id,
+            content_id=content_identity(
+                payload.text,
+                normalization_rule_version=payload.normalization_rule_version,
+                parse_rule_version=payload.parse_rule_version,
+                params_table_version=payload.params_table_version,
+            ),
+        )
+        for index, payload in enumerate(unit.payloads())
+    )
+    return PushEnvelope(
+        source_ref=serialize_source_ref(unit.locator),
+        body=unit.unit_text,
+        chunks=chunks,
+        metadata=MappingProxyType(
+            {
+                # SC20 filter surface — single authority is
+                # ``REQUIRED_PUSH_METADATA_FIELDS``, asserted by both
+                # the push adapter and the contract fake.
+                "fmt": unit.fmt,
+                "doc_type": unit.doc_type,
+                "section": unit.section,
+                "source_sha256": unit.source_sha256,
+                "parse_rule_version": unit.parse_rule_version,
+                "params_table_version": unit.params_table_version,
+                # beyond SC20 — locator round-trip + density filter.
+                "density": unit.density,
+                "normalization_rule_version": NORMALIZATION_RULE_VERSION,
+                "locator": dict(unit.locator.to_dict()),
+            }
+        ),
+        valid_from=valid_from,
+        valid_until=valid_until,
+        body_content_id=content_identity(
+            unit.unit_text,
+            normalization_rule_version=NORMALIZATION_RULE_VERSION,
+            parse_rule_version=unit.parse_rule_version,
+            params_table_version=unit.params_table_version,
+        ),
+    )
+
+
+def envelopes_of_document(
+    document: DocumentChunking,
+    *,
+    valid_from: str,
+    valid_until: str,
+) -> tuple[PushEnvelope, ...]:
+    """The push envelopes of a whole document, in unit order."""
+    return tuple(
+        envelope_of_unit(unit, valid_from=valid_from, valid_until=valid_until)
+        for unit in document.units
+    )
+
+
+def envelopes_of_unit(
+    unit: UnitChunking,
+    *,
+    valid_from: str,
+    valid_until: str,
+) -> tuple[PushEnvelope, ...]:
+    """The push envelopes of one frozen unit (a one-element tuple).
+
+    Provided so callers that have a single :class:`UnitChunking` can
+    iterate like they would over :func:`envelopes_of_document`
+    without branching on the document/unit shape.
+    """
+    return (envelope_of_unit(unit, valid_from=valid_from, valid_until=valid_until),)
+
+
 __all__ = [
     "REQUIRED_PUSH_METADATA_FIELDS",
+    "PushChunk",
+    "PushEnvelope",
     "PushRecord",
     "content_identity",
     "deserialize_source_ref",
     "document_push_records",
+    "envelope_of_unit",
+    "envelopes_of_document",
+    "envelopes_of_unit",
     "idempotency_keys_digest",
     "record_of_payload",
     "serialize_source_ref",

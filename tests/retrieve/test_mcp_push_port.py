@@ -39,7 +39,7 @@ from fin.retrieve.push_port import (
 # ``text`` — ``strictObject`` would refuse them and the refusal would
 # read as a wire-shape bug rather than a §B4 violation.
 _IKNOW_PUSH_ITEM_KEYS: frozenset[str] = frozenset(
-    {"content", "source_ref", "metadata", "valid_from", "valid_until"}
+    {"content", "source_ref", "metadata", "valid_from", "valid_until", "chunks"}
 )
 
 
@@ -84,9 +84,36 @@ def _records(n: int) -> tuple[PushRecord, ...]:
 
 
 def _wires(n: int) -> list[dict[str, Any]]:
-    """Wire-shape dicts the same shape :meth:`PushRecord.to_wire` produces,
-    matching how :func:`push_records` calls into a port."""
-    return [record.to_wire() for record in _records(n)]
+    """Wire-shape envelopes after T1.
+
+    One envelope per frozen unit (``source_ref`` + body +
+    ``chunks[]``). For tests that previously passed per-child
+    ``PushRecord`` instances, this builds a matching single-chunk
+    envelope so the §B4 + spec T1 invariants hold on the wire.
+    """
+    envelopes: list[dict[str, Any]] = []
+    for i in range(n):
+        body = f"text {i}"
+        metadata = {
+            "fmt": "txt",
+            "doc_type": "narrative",
+            "section": "filing",
+            "source_sha256": "sha-" + str(i),
+            "parse_rule_version": "v1",
+            "params_table_version": "p1",
+            "normalization_rule_version": "n1",
+        }
+        envelopes.append(
+            {
+                "source_ref": f"docs/{i}.md",
+                "body": body,
+                "chunks": [{"index": 0, "content": body}],
+                "metadata": metadata,
+                "valid_from": "0001-01-01T00:00:00.000Z",
+                "valid_until": "9999-12-31T23:59:59.999Z",
+            }
+        )
+    return envelopes
 
 
 # ----- scripted transport override -----

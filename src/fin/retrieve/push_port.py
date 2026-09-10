@@ -8,26 +8,42 @@ retrieval service (which stores and recalls the pushed text verbatim,
 (:mod:`fin.retrieve.fake_push_port`); the real transport to the
 iknow-memory service lands with a later ticket.
 
+Envelope contract (spec `operator-console-host-contract`, T1)
+-------------------------------------------------------------
+
+Each ``push`` call carries a batch of **envelopes** (one per 资料 —
+one per frozen unit). The envelope shape is verbatim:
+
+* ``source_ref`` — the unit locator triple serialization;
+* ``content`` — the unit's full extracted text (the 资料 body);
+* ``chunks`` — ``[{content, index}, ...]`` with ``index`` starting at 0
+  and increasing monotonically; every ``chunks[i].content`` is a
+  contiguous substring of ``content`` (SC11 / SC16);
+* ``metadata`` — the SC20 filter surface (see
+  :data:`fin.corpus.push.REQUIRED_PUSH_METADATA_FIELDS`);
+* ``valid_from`` / ``valid_until`` — the validity interval the service
+  attaches to the block.
+
 Idempotency contract (§B4 / SC18)
 ---------------------------------
 
-The write identity is the record's idempotency key — the
-``(source_ref, content identity)`` pair. Pushing the same batch again
-(the §B1「幂等基准」row: :data:`IDEMPOTENCY_BASELINE_PUSHES` = 3
-consecutive pushes) must leave the block total increment at 0 and the
-block id set unchanged, and must return the same block ids.
+The wire-level write identity is the envelope's idempotency key —
+the ``(source_ref, body content identity)`` pair. Pushing the same
+batch again (the §B1「幂等基准」row: :data:`IDEMPOTENCY_BASELINE_PUSHES`
+= 3 consecutive pushes) must leave the block total increment at 0
+and the block id set unchanged, and must return the same block ids.
 
 Failure contract
 ----------------
 
-A batch whose record misses a SC20 metadata field is refused **as a
+A batch whose envelope misses a SC20 metadata field is refused **as a
 whole** with :class:`PushMetadataIncompleteError`: the receiving side
-validates every record before it writes any, so a refused batch writes
-nothing and cannot half-land. Failures are typed and carry a stable
-``code`` — never
-``None``, never an empty success, never a silent drop. A refused batch
-is not a write and therefore does not count towards the idempotency
-assertion (the store's rejection counter keeps the trace).
+validates every envelope before it writes any, so a refused batch
+writes nothing and cannot half-land. Failures are typed and carry a
+stable ``code`` — never ``None``, never an empty success, never a
+silent drop. A refused batch is not a write and therefore does not
+count towards the idempotency assertion (the store's rejection
+counter keeps the trace).
 
 SC21 splits the transport's two failure shapes into distinguishable
 codes: :class:`PushServiceUnavailableError` (the service was never
@@ -38,17 +54,17 @@ as a write and cannot be settled by a local artifact — the replay path
 is :mod:`fin.retrieve.push_batching`, whose journal keeps the failure
 enumerable.
 
-An empty block batch is a third thing: **invalid input** per §B2 第 5
-条, refused with :class:`PushEmptyBatchError` rather than answered with
-a zero-write success, and — unlike the two capability failures above —
-it does not set ``degraded`` (see :class:`PushError`).
+An empty envelope batch is a third thing: **invalid input** per §B2
+第 5 条, refused with :class:`PushEmptyBatchError` rather than answered
+with a zero-write success, and — unlike the two capability failures
+above — it does not set ``degraded`` (see :class:`PushError`).
 
 T21 folds that third thing into the shared dichotomy: the two
 invalid-input failures on this seam (:class:`PushEmptyBatchError` and
-:class:`PushEmptyDocumentError`, a record offered with no text) also
-inherit :class:`~fin.retrieve.input_validation.InputValidationError`, so
-one classification and one「输入校验失败」count cover the push side and
-the retrieve side alike.
+:class:`PushEmptyDocumentError`, an envelope with no body) also
+inherit :class:`~fin.retrieve.input_validation.InputValidationError`,
+so one classification and one「输入校验失败」count cover the push side
+and the retrieve side alike.
 """
 
 from __future__ import annotations
@@ -56,7 +72,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Final, Mapping, Protocol, Sequence, runtime_checkable
 
-from fin.corpus.push import REQUIRED_PUSH_METADATA_FIELDS, PushRecord
+from fin.corpus.push import (
+    REQUIRED_PUSH_METADATA_FIELDS,
+    PushEnvelope,
+)
 from fin.retrieve.input_validation import (
     INPUT_CLASS_EMPTY_BATCH,
     INPUT_CLASS_EMPTY_DOCUMENT,
@@ -214,9 +233,9 @@ class PushEmptyBatchError(PushError, InputValidationError):
 
 
 class PushEmptyDocumentError(PushError, InputValidationError):
-    """A pushed record carries no text (§B2 第 5 条's 空文档 / 空内容).
+    """A pushed envelope carries no body (§B2 第 5 条's 空文档 / 空内容).
 
-    A block with nothing in it cannot be recalled verbatim and cannot be
+    A 资料 with nothing in it cannot be recalled verbatim and cannot be
     a citation's evidence, so storing it would create a row that looks
     like content. Refused by name, with the batch unwritten — the same
     class the parse path names as ``empty_source`` / ``no_units``.
@@ -230,11 +249,11 @@ class PushEmptyDocumentError(PushError, InputValidationError):
 class PushOutcome:
     """The result of one push batch.
 
-    ``block_ids`` is parallel to the pushed records: a record whose
-    idempotency key was already stored yields the **stored** block id,
+    ``block_ids`` is parallel to the pushed envelopes: an envelope whose
+    idempotency key was already stored yields the **stored** block ids,
     so a replay returns the same ids as the original write. ``written``
-    counts first-time writes, ``duplicates`` counts records recognized
-    as an existing write.
+    counts first-time writes, ``duplicates`` counts envelopes
+    recognized as an existing write.
     """
 
     block_ids: tuple[str, ...]
@@ -246,20 +265,20 @@ class PushOutcome:
 class PushPort(Protocol):
     """Structural protocol for push adapters.
 
-    ``push`` takes wire records (``PushRecord.to_wire()`` shape) and
+    ``push`` takes wire envelopes (``PushEnvelope.to_wire()`` shape) and
     returns ``{"block_ids": [...], "written": int, "duplicates": int}``.
     Implementations raise a :class:`PushError` subclass on failure and
     never report a refused batch as an empty success.
     """
 
     def push(
-        self, records: Sequence[Mapping[str, Any]]
+        self, envelopes: Sequence[Mapping[str, Any]]
     ) -> Mapping[str, Any]:  # pragma: no cover - protocol
         ...
 
 
 def missing_metadata_fields(wire: Mapping[str, Any]) -> tuple[str, ...]:
-    """The SC20 metadata fields absent or empty on one wire record.
+    """The SC20 metadata fields absent or empty on one wire envelope.
 
     A present-but-empty value counts as missing: an empty format or an
     empty parse rule version is not a filterable value.
@@ -275,12 +294,12 @@ def missing_metadata_fields(wire: Mapping[str, Any]) -> tuple[str, ...]:
 
 
 def validate_wire_record(wire: Mapping[str, Any]) -> None:
-    """Raise :class:`PushMetadataIncompleteError` when the record's SC20
-    metadata is incomplete (SC20's rejection path)."""
+    """Raise :class:`PushMetadataIncompleteError` when the envelope's
+    SC20 metadata is incomplete (SC20's rejection path)."""
     missing = missing_metadata_fields(wire)
     if missing:
         raise PushMetadataIncompleteError(
-            f"push of block {wire.get('block_id')!r} misses metadata "
+            f"push of envelope {wire.get('source_ref')!r} misses metadata "
             f"fields: {', '.join(missing)}"
         )
 
@@ -290,7 +309,7 @@ def validate_batch_not_empty(
     *,
     ledger: InputValidationLedger | None = None,
 ) -> None:
-    """Raise :class:`PushEmptyBatchError` for a batch with no records.
+    """Raise :class:`PushEmptyBatchError` for a batch with no envelopes.
 
     Single authority for §B2 第 5 条's empty-batch rule, applied on both
     sides of the seam: the caller is refused before a pointless round
@@ -303,8 +322,8 @@ def validate_batch_not_empty(
     """
     if len(records) == 0:
         failure = PushEmptyBatchError(
-            "push batch is empty; an empty block batch is invalid input, "
-            "not an empty result"
+            "push batch is empty; an empty envelope batch is invalid "
+            "input, not an empty result"
         )
         if ledger is None:
             raise failure
@@ -316,33 +335,92 @@ def validate_wire_record_text(
     *,
     ledger: InputValidationLedger | None = None,
 ) -> None:
-    """Raise :class:`PushEmptyDocumentError` for a record with no text.
+    """Raise :class:`PushEmptyDocumentError` for an envelope with no
+    body.
 
-    Whitespace-only counts as none: the retrieval service stores the text
-    verbatim and the citation gate quotes it, so a blank block is not a
-    thinner block, it is an absent one.
+    Whitespace-only counts as none: the retrieval service stores the
+    body verbatim and the citation gate quotes it, so a blank body is
+    not a thinner one, it is an absent one.
     """
-    text = wire.get("text")
-    if not isinstance(text, str) or not text.strip():
+    body = wire.get("content") if "content" in wire else wire.get("body")
+    if not isinstance(body, str) or not body.strip():
         failure = PushEmptyDocumentError(
-            f"push of block {wire.get('block_id')!r} carries no text; an "
-            "empty document is invalid input, not an empty result"
+            f"push of envelope {wire.get('source_ref')!r} carries no body; "
+            "an empty document is invalid input, not an empty result"
         )
         if ledger is None:
             raise failure
         raise_input_failure(failure, ledger=ledger)
 
 
+def validate_envelope_chunks(
+    wire: Mapping[str, Any],
+) -> None:
+    """Raise :class:`PushProtocolError` when the envelope's ``chunks``
+    array violates the one-envelope invariants (T1 acceptance).
+
+    Pinned invariants:
+
+    * ``chunks`` is a non-empty sequence of mappings;
+    * each chunk has an integer ``index`` and a non-empty string
+      ``content``;
+    * indexes are monotonic starting at 0 — the wire shape declares
+      ``0, 1, ..., N-1`` in order;
+    * each chunk's ``content`` is a contiguous substring of the body —
+      SC11 / SC16 (「连续子串」).
+    """
+    chunks = wire.get("chunks")
+    body = wire.get("content") if "content" in wire else wire.get("body")
+    if not isinstance(chunks, list) or not chunks:
+        raise PushProtocolError(
+            f"push of envelope {wire.get('source_ref')!r} carries no chunks; "
+            "one envelope must carry at least one slice"
+        )
+    body_str = body if isinstance(body, str) else ""
+    expected = 0
+    for chunk in chunks:
+        if not isinstance(chunk, Mapping):
+            raise PushProtocolError(
+                f"push of envelope {wire.get('source_ref')!r} carries a "
+                "non-mapping chunk; the chunk shape is {content, index}"
+            )
+        index = chunk.get("index")
+        content = chunk.get("content")
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise PushProtocolError(
+                f"push of envelope {wire.get('source_ref')!r} carries a "
+                f"non-integer chunk index {index!r}"
+            )
+        if not isinstance(content, str) or not content:
+            raise PushProtocolError(
+                f"push of envelope {wire.get('source_ref')!r} carries a "
+                f"non-string chunk content at index {index!r}"
+            )
+        if index != expected:
+            raise PushProtocolError(
+                f"push of envelope {wire.get('source_ref')!r} chunks are "
+                f"not monotonic from 0; saw index {index} where "
+                f"{expected} was expected"
+            )
+        if body_str and content not in body_str:
+            raise PushProtocolError(
+                f"push of envelope {wire.get('source_ref')!r} chunk at "
+                f"index {index} is not a contiguous substring of the body"
+            )
+        expected += 1
+
+
 def outcome_of_response(
-    response: Any, *, record_count: int
+    response: Any, *, chunk_count: int
 ) -> PushOutcome:
     """Read one push response envelope, or fail by name (SC21).
 
-    Every field of the §B4 response shape is checked before it is
-    trusted: the envelope must be a mapping carrying ``block_ids`` plus
-    the two counters, one block id (a string) per pushed record, and
-    counters that are non-negative integers accounting for exactly the
-    records pushed. Anything else is a :class:`PushProtocolError` — a
+    After T1 the response carries one ``block_ids`` entry per chunk
+    (the slices are what the receiving service hands back ids for;
+    envelopes are not chunked again). Every field is checked before
+    it is trusted: ``block_ids`` is a sequence of strings of length
+    ``chunk_count``, and ``written`` / ``duplicates`` sum to that
+    same total. Anything else is a :class:`PushProtocolError` — a
     short envelope is never padded and a stray one is never truncated
     into a plausible outcome.
     """
@@ -368,10 +446,10 @@ def outcome_of_response(
             f"push response block_ids is {type(block_ids).__name__}, "
             "expected a sequence of block ids"
         )
-    if len(block_ids) != record_count:
+    if len(block_ids) != chunk_count:
         raise PushProtocolError(
             f"push response carries {len(block_ids)} block ids for "
-            f"{record_count} pushed records"
+            f"{chunk_count} pushed chunks"
         )
     if not all(isinstance(block_id, str) for block_id in block_ids):
         raise PushProtocolError(
@@ -388,10 +466,10 @@ def outcome_of_response(
             )
         counts[field] = value
     total = sum(counts.values())
-    if total != record_count:
+    if total != chunk_count:
         raise PushProtocolError(
-            f"push response accounts for {total} of {record_count} pushed "
-            "records"
+            f"push response accounts for {total} of {chunk_count} pushed "
+            "chunks"
         )
     return PushOutcome(
         block_ids=tuple(block_ids),
@@ -400,17 +478,17 @@ def outcome_of_response(
     )
 
 
-def push_records(
+def push_envelopes(
     port: PushPort,
-    records: Sequence[PushRecord],
+    envelopes: Sequence[PushEnvelope],
     *,
     input_validation_ledger: InputValidationLedger | None = None,
 ) -> PushOutcome:
-    """Push ``records`` through ``port`` idempotently.
+    """Push ``envelopes`` (one per 资料) through ``port`` idempotently.
 
     Metadata completeness is the receiving side's judgement (SC20:
     「缺字段的推送**被拒**」), so this function does not pre-screen the
-    batch for it: it hands the wire records over and lets the typed
+    batch for it: it hands the wire envelopes over and lets the typed
     :class:`PushMetadataIncompleteError` propagate. A refused batch
     therefore leaves its trace where the refusal happened, and one
     validation authority (:func:`validate_wire_record`) serves both
@@ -425,12 +503,13 @@ def push_records(
     a failed batch is never recorded as a write.
 
     ``input_validation_ledger`` is where a client-side refusal of an
-    empty batch is counted (T21). The record-level checks stay on the
-    receiving side, which carries its own ledger.
+    empty batch is counted (T21). The envelope-level checks stay on
+    the receiving side, which carries its own ledger.
     """
-    validate_batch_not_empty(records, ledger=input_validation_ledger)
+    validate_batch_not_empty(envelopes, ledger=input_validation_ledger)
+    chunk_count = sum(len(envelope.chunks) for envelope in envelopes)
     try:
-        response = port.push([record.to_wire() for record in records])
+        response = port.push([envelope.to_wire() for envelope in envelopes])
     except PushError:
         # already named by the receiving side (SC20 / SC44) — leave it
         raise
@@ -439,7 +518,77 @@ def push_records(
             f"push to the retrieval service failed to reach it: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
-    return outcome_of_response(response, record_count=len(records))
+    return outcome_of_response(response, chunk_count=chunk_count)
+
+
+def push_records(
+    port: PushPort,
+    records: Sequence[Any],
+    *,
+    input_validation_ledger: InputValidationLedger | None = None,
+) -> PushOutcome:
+    """Backward-compat shim: forward wire dicts OR :class:`PushRecord`
+    instances to the port as envelopes.
+
+    Most older tests call this with hand-rolled wire dicts or
+    :class:`PushRecord` rows (the per-child record shape that the
+    invalidation path still keys on, but that no longer rides the
+    wire). The production path uses :func:`push_envelopes` with
+    :class:`PushEnvelope` instances; this shim exists so a per-child
+    record can be flattened into an envelope wire dict on the way in,
+    without forcing every test to rewrite its fixtures for the new
+    shape.
+
+    Conversion rule: a :class:`PushRecord` becomes
+    ``{"source_ref": ..., "body": text, "chunks": [{"content": text,
+    "index": 0}], "metadata": ..., "valid_from": ..., "valid_until":
+    ...}`` — a single-chunk envelope whose chunk is the record's
+    block text. A mapping is forwarded as-is.
+    """
+    validate_batch_not_empty(records, ledger=input_validation_ledger)
+    wire_envelopes = [_record_or_wire_to_envelope(item) for item in records]
+    chunk_count = sum(len(item["chunks"]) for item in wire_envelopes)
+    try:
+        response = port.push(wire_envelopes)
+    except PushError:
+        raise
+    except _TRANSPORT_UNAVAILABLE as exc:
+        raise PushServiceUnavailableError(
+            f"push to the retrieval service failed to reach it: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    return outcome_of_response(response, chunk_count=chunk_count)
+
+
+def _record_or_wire_to_envelope(item: Any) -> Mapping[str, Any]:
+    """Forward a wire envelope dict OR project a :class:`PushRecord`
+    into the one-envelope-per-资料 wire shape."""
+    if isinstance(item, Mapping):
+        return item
+    # Per-child PushRecord → single-chunk envelope. The record's
+    # ``text`` is the body and the chunk, its ``metadata`` rides
+    # along, and ``valid_from`` / ``valid_until`` use the same
+    # sentinel the adapter does. The pre-T1 block id and per-child
+    # content_id are propagated as the chunk's ``id`` / ``content_id``
+    # so the receiving service (and its contract fake) keeps handing
+    # back the same block ids the catalog side already pinned on the
+    # record — the per-child invalidation path keys on these.
+    return {
+        "source_ref": item.source_ref,
+        "body": item.text,
+        "chunks": [
+            {
+                "index": 0,
+                "content": item.text,
+                "id": item.block_id,
+                "content_id": item.content_id,
+            }
+        ],
+        "metadata": dict(item.metadata),
+        "valid_from": "0001-01-01T00:00:00.000Z",
+        "valid_until": "9999-12-31T23:59:59.999Z",
+        "body_content_id": item.content_id,
+    }
 
 
 __all__ = [
@@ -461,8 +610,10 @@ __all__ = [
     "UnknownPushedBlockError",
     "missing_metadata_fields",
     "outcome_of_response",
+    "push_envelopes",
     "push_records",
     "validate_batch_not_empty",
+    "validate_envelope_chunks",
     "validate_wire_record",
     "validate_wire_record_text",
 ]

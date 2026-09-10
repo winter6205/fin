@@ -106,8 +106,17 @@ def test_ingest_route_pushes_and_answers_the_outcome(
     assert body["block_count"] == len(body["block_ids"]) > 0
     assert body["invalidation"] is None
     assert fake.block_total() == body["block_count"]
+    # After T1 the fake stores the one-envelope-per-资料 shape: the
+    # recalled row carries the unit body plus its chunk slices with
+    # monotonic indexes, and the body is a non-empty 资料 text.
     recalled = fake.recall(body["block_ids"][0])
-    assert recalled["text"]
+    assert recalled["body"]
+    assert recalled["chunks"], "envelope must carry at least one chunk"
+    assert [chunk["index"] for chunk in recalled["chunks"]] == list(
+        range(len(recalled["chunks"]))
+    )
+    for chunk in recalled["chunks"]:
+        assert chunk["content"] in recalled["body"]
     assert recalled["metadata"]["fmt"] == "md"
 
 

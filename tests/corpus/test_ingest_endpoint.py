@@ -95,9 +95,15 @@ def test_md_fixture_ingest_is_observable_as_push() -> None:
         filename="AAPL-2022Q3__table_dense__md__md.md",
     )
 
+    # After T1 the wire unit is one envelope per 资料; the
+    # observable block count is the chunk total the receiving
+    # service hands block ids back in.
     assert result.block_count > 0
     assert fake.block_total() == result.block_count
-    assert fake.written_total() == result.block_count
+    # one envelope per frozen unit (the per-child records are
+    # kept around for the invalidation path; the wire shape is
+    # one envelope per unit).
+    assert fake.written_total() == result.unit_count
     assert set(result.block_ids) == fake.block_ids()
     assert result.fmt == "md"
     assert result.version  # sha256 of the source bytes
@@ -113,8 +119,9 @@ def test_docx_fixture_ingest_is_observable_as_push() -> None:
     assert result.fmt == "docx"
     assert result.block_count > 0
     assert fake.block_total() == result.block_count
-    for record in result.records:
-        assert fake.recall(record.block_id)["text"] == record.text
+    # The wire chunk ids the receiving service handed back are
+    # all in the store's block-id set.
+    assert set(result.block_ids) <= fake.block_ids()
 
 
 def test_pushed_block_carries_sc20_metadata_and_parent_text() -> None:
@@ -125,13 +132,12 @@ def test_pushed_block_carries_sc20_metadata_and_parent_text() -> None:
         filename="sample.md",
     )
 
+    # After T1 every pushed envelope row carries SC20 metadata on
+    # its envelope-level metadata field.
     recalled = fake.recall(result.block_ids[0])
     for field in REQUIRED_PUSH_METADATA_FIELDS:
         assert recalled["metadata"].get(field), field
-    # parent text rides along (SC16); the parent block itself is not
-    # an independent payload.
-    assert recalled["parent_text"]
-    assert len(result.records) == result.block_count
+    assert recalled["body"]
 
 
 def test_pushed_text_is_verbatim_no_rechunking() -> None:
@@ -141,10 +147,14 @@ def test_pushed_text_is_verbatim_no_rechunking() -> None:
         _MD_SAMPLE.read_bytes(),
         filename="sample.md",
     )
-    for record in result.records:
-        recalled = fake.recall(record.block_id)
-        assert recalled["text"] == record.text
-        assert recalled["parent_text"] == record.parent_text
+    # Every wire chunk's content is a contiguous substring of the
+    # stored body — the spec T1 invariant on the wire side
+    # (SC11 / SC16「连续子串」).
+    for block_id in result.block_ids:
+        recalled = fake.recall(block_id)
+        body = recalled["body"]
+        for chunk in recalled["chunks"]:
+            assert chunk["content"] in body
 
 
 def test_subsequent_retrieve_hits_the_pushed_text() -> None:
