@@ -31,6 +31,13 @@ from fin.retrieve.mcp_session import MCPStdioSession
 
 IKNOW_ROOT = Path("/home/winner/projects/iknow-memory")
 IKNOW_ENTRY = IKNOW_ROOT / "dist" / "index.js"
+# A worktree checkout whose build carries a newer tool surface (e.g. the
+# operator-console worktree's ``read_source``). Pass ``root=`` to
+# :func:`live_iknow` to test against it; the default keeps the main
+# checkout so existing opt-in tests are unaffected.
+IKNOW_WORKTREE_ROOT = Path(
+    "/home/winner/projects/iknow-memory-wt-operator-console"
+)
 EMBED_DIMENSIONS = 8
 
 
@@ -128,12 +135,20 @@ def child_records() -> tuple[PushRecord, ...]:
 @contextmanager
 def live_iknow(
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    root: Path = IKNOW_ROOT,
 ) -> Iterator[LiveIknow]:
-    """Run the real compiled iknow stdio server over one shared process."""
+    """Run the real compiled iknow stdio server over one shared process.
 
-    if not IKNOW_ENTRY.is_file():
+    ``root`` selects the iknow-memory checkout whose ``dist/index.js``
+    is spawned; pass ``IKNOW_WORKTREE_ROOT`` for a worktree build that
+    carries tools the main checkout does not have yet.
+    """
+
+    entry = root / "dist" / "index.js"
+    if not entry.is_file():
         raise AssertionError(
-            f"{IKNOW_ENTRY} is missing; run `npm run build` in iknow-memory"
+            f"{entry} is missing; run `npm run build` in {root}"
         )
 
     embedding_server = ThreadingHTTPServer(("127.0.0.1", 0), _EmbeddingHandler)
@@ -164,8 +179,8 @@ def live_iknow(
         monkeypatch.setenv(key, value)
 
     session = MCPStdioSession(
-        [_node_executable(), str(IKNOW_ENTRY)],
-        cwd=IKNOW_ROOT,
+        [_node_executable(), str(entry)],
+        cwd=str(root),
         timeout_seconds=20.0,
     )
     live = LiveIknow(
