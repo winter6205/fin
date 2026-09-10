@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 import pytest
 
@@ -91,6 +91,45 @@ class LiveIknow:
     invalidation: MCPInvalidationPort
 
 
+@dataclass(frozen=True)
+class _LiveChildRecord(PushRecord):
+    """A per-child record shaped for the live MCP tests' assertions.
+
+    Inherits :class:`PushRecord` so the batching driver's
+    ``_coerce_envelope`` recognizes the per-child shape (the T3 batch
+    test asserts ``plans[0].records[0].block_id``, which only works if
+    the plan row carries the per-child ``block_id``). ``to_wire()``
+    is overridden to return the **one envelope per 资料** wire shape
+    declared by T1 — a single-chunk envelope carrying the per-child
+    ``id`` / ``content_id`` — so the receiving server indexes the
+    slice as one chunk per envelope.
+    """
+
+    def to_wire(self) -> dict[str, Any]:
+        """The one-envelope wire shape, projected per child.
+
+        ``metadata`` is a copy of the underlying mapping so a caller's
+        mutation of the returned wire cannot reach back into the
+        record.
+        """
+        return {
+            "source_ref": self.source_ref,
+            "body": self.text,
+            "chunks": [
+                {
+                    "index": 0,
+                    "content": self.text,
+                    "id": self.block_id,
+                    "content_id": self.content_id,
+                }
+            ],
+            "metadata": dict(self.metadata),
+            "valid_from": "0001-01-01T00:00:00.000Z",
+            "valid_until": "9999-12-31T23:59:59.999Z",
+            "body_content_id": self.content_id,
+        }
+
+
 def _node_executable() -> str:
     """Resolve the WSL-visible Node executable used by the live process."""
 
@@ -110,26 +149,90 @@ def _node_executable() -> str:
     )
 
 
-def child_records() -> tuple[PushRecord, ...]:
-    """Build existing fin child blocks, with enough text for multiple blocks."""
+def child_records() -> tuple[_LiveChildRecord, ...]:
+    """Build the live MCP tests' push records.
+
+    Returns one :class:`_LiveChildRecord` per distinct frozen unit
+    (4 units → 4 records), each as a one-chunk envelope on the wire
+    (the ``_LiveChildRecord.to_wire()`` projection).
+
+    Why one record per unit and not many children per unit
+    -------------------------------------------------------
+
+    The T1 wire contract is **one envelope per 资料** (one per unit;
+    spec ``operator-console-host-contract``). ``source_ref`` is
+    unit-granular — its locator triple has no block component, so
+    every block of one unit necessarily serializes to the same
+    ``source_ref``. The catalog side keys invalidation and
+    reconstruction off that unit-level string; pushing N children of
+    one unit as N one-chunk envelopes that share the unit's
+    ``source_ref`` is a legacy per-block model that no production
+    path emits.
+
+    The earlier fixture built one unit with 48 sentences and pushed
+    every child as a separate envelope against the same
+    ``source_ref``. The real process correctly treats that as the
+    ``rebuild-on-repush`` class: each envelope triggers
+    ``deleteChunksForSourceDoc`` for the unit, so a multi-envelope
+    push over the same unit collapses to the last envelope's chunks.
+    That is the contract-correct outcome — the bug was the fixture,
+    not the server.
+
+    Modeling the live tests after the contract: 4 distinct units
+    (unit numbers 1..4, all sharing the same document/version) →
+    4 distinct ``source_ref`` values. Each unit's text is one short
+    sentence (so ``split_unit`` produces one child per unit and the
+    one-envelope-per-unit shape yields exactly one ``PushRecord``);
+    the per-unit ``source_ref`` keeps the catalog-side
+    ``deleteChunksForSourceDoc`` from trampling sibling units on a
+    sequential per-batch push (T3's resume flow). Every sentence
+    carries the phrase ``operating revenue`` so BM25 matches all 4
+    regardless of unit.
+    """
 
     version = "f" * 64
-    text = "".join(
-        f"Live child sentence {index:03d} records operating revenue and "
-        "keeps punctuation - byte identity matters.\n"
-        for index in range(48)
-    )
-    unit = build_unit(
-        fmt="txt",
-        source_sha256=version,
-        document_id="LIVE-2026Q3",
-        version=version,
-        unit=1,
-        text=text,
-    )
-    records = unit_push_records(split_unit(unit, doc_type="narrative"))
-    assert len(records) >= 2
-    return records
+    documents_units: tuple[int, ...] = (1, 2, 3, 4)
+    out: list[_LiveChildRecord] = []
+    for unit_number in documents_units:
+        unit_text = (
+            f"Live child unit {unit_number:03d} reports operating revenue "
+            "and keeps punctuation - byte identity matters."
+        )
+        unit = build_unit(
+            fmt="txt",
+            source_sha256=version,
+            document_id="LIVE-2026Q3",
+            version=version,
+            unit=unit_number,
+            text=unit_text,
+        )
+        records = unit_push_records(split_unit(unit, doc_type="narrative"))
+        # Contract: one envelope per unit. With one short sentence
+        # of unit text ``split_unit`` produces exactly one child
+        # block, so the per-unit ``unit_push_records`` tuple is
+        # length 1. Assert it so a future chunker change cannot
+        # silently violate the fixture's one-record-per-unit
+        # invariant.
+        assert len(records) == 1, (
+            f"unit {unit_number} split into {len(records)} children; "
+            "the live MCP fixture requires one child per unit so the "
+            "T1 one-envelope-per-unit wire shape stays in sync with "
+            "the contract (no per-block envelopes against a shared "
+            "source_ref)."
+        )
+        record = records[0]
+        out.append(
+            _LiveChildRecord(
+                block_id=record.block_id,
+                source_ref=record.source_ref,
+                content_id=record.content_id,
+                text=record.text,
+                parent_block_id=record.parent_block_id,
+                parent_text=record.parent_text,
+                metadata=dict(record.metadata),
+            )
+        )
+    return tuple(out)
 
 
 @contextmanager
