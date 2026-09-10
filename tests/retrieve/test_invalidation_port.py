@@ -161,12 +161,20 @@ def test_invalidated_blocks_are_hit_at_no_query_time() -> None:
         for at in QUERY_TIMES:
             assert port.count_hits(record.block_id, at=at) == 0
     for at in QUERY_TIMES:
-        assert stale_ids.isdisjoint({row["block_id"] for row in port.hits(at=at)})
+        # After T1 every stored envelope row carries per-chunk
+        # block ids inside ``chunks[]`` (the row no longer exposes a
+        # top-level ``block_id``).
+        hittable_ids = {
+            chunk["id"]
+            for row in port.hits(at=at)
+            for chunk in row["chunks"]
+        }
+        assert stale_ids.isdisjoint(hittable_ids)
 
     # the surviving version keeps hitting
     for record in current:
         assert port.is_hittable_at_any_time(record.block_id) is True
-    assert {row["block_id"] for row in port.hits(at=0)} == {
+    assert {chunk["id"] for row in port.hits(at=0) for chunk in row["chunks"]} == {
         record.block_id for record in current
     }
 
@@ -187,7 +195,12 @@ def test_invalidation_does_not_physically_delete_the_old_block() -> None:
     for record in previous:
         assert port.physically_present(record.block_id) is True
         row = port.recall(record.block_id)
-        assert row["text"].encode("utf-8") == record.text.encode("utf-8")
+        # After T1 the row is the envelope shape: the body is the
+        # unit's extracted text, and the chunk content is the
+        # per-child text the record carried.
+        assert row["body"] == record.text or any(
+            chunk["content"] == record.text for chunk in row["chunks"]
+        )
 
 
 # ---------------------------------------------------------------------------

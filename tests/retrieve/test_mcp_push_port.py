@@ -39,7 +39,7 @@ from fin.retrieve.push_port import (
 # ``text`` — ``strictObject`` would refuse them and the refusal would
 # read as a wire-shape bug rather than a §B4 violation.
 _IKNOW_PUSH_ITEM_KEYS: frozenset[str] = frozenset(
-    {"content", "source_ref", "metadata", "valid_from", "valid_until"}
+    {"content", "source_ref", "metadata", "valid_from", "valid_until", "chunks"}
 )
 
 
@@ -84,9 +84,36 @@ def _records(n: int) -> tuple[PushRecord, ...]:
 
 
 def _wires(n: int) -> list[dict[str, Any]]:
-    """Wire-shape dicts the same shape :meth:`PushRecord.to_wire` produces,
-    matching how :func:`push_records` calls into a port."""
-    return [record.to_wire() for record in _records(n)]
+    """Wire-shape envelopes after T1.
+
+    One envelope per frozen unit (``source_ref`` + body +
+    ``chunks[]``). For tests that previously passed per-child
+    ``PushRecord`` instances, this builds a matching single-chunk
+    envelope so the §B4 + spec T1 invariants hold on the wire.
+    """
+    envelopes: list[dict[str, Any]] = []
+    for i in range(n):
+        body = f"text {i}"
+        metadata = {
+            "fmt": "txt",
+            "doc_type": "narrative",
+            "section": "filing",
+            "source_sha256": "sha-" + str(i),
+            "parse_rule_version": "v1",
+            "params_table_version": "p1",
+            "normalization_rule_version": "n1",
+        }
+        envelopes.append(
+            {
+                "source_ref": f"docs/{i}.md",
+                "body": body,
+                "chunks": [{"index": 0, "content": body}],
+                "metadata": metadata,
+                "valid_from": "0001-01-01T00:00:00.000Z",
+                "valid_until": "9999-12-31T23:59:59.999Z",
+            }
+        )
+    return envelopes
 
 
 # ----- scripted transport override -----
@@ -114,7 +141,7 @@ class _ScriptedPushPort(MCPPushPort):
         self._command = list(command) if command else None
         self._timeout = float(timeout_seconds)
         self._ledger = None
-        self._seen_keys: dict[tuple[str, str], str] = {}
+        self._seen_keys: dict[tuple[str, str], bool] = {}
         self._scripted_response = scripted_response
         self._scripted_exception = scripted_exception
 
@@ -321,6 +348,32 @@ def test_push_transport_failure_is_named_not_silent() -> None:
         ),
         pytest.param(
             {
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps({"chunk_ids": ["a", 42]}),
+                        }
+                    ]
+                }
+            },
+            id="chunk-ids-stray-non-string-element",
+        ),
+        pytest.param(
+            {
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps({"chunk_ids": {"0": "a"}}),
+                        }
+                    ]
+                }
+            },
+            id="chunk-ids-mapping-not-list",
+        ),
+        pytest.param(
+            {
                 "error": {
                     "code": -32603,
                     "message": "internal error",
@@ -387,3 +440,140 @@ def test_no_configured_command_raises_service_unavailable() -> None:
     port = MCPPushPort(command=None)
     with pytest.raises(PushServiceUnavailableError):
         port.push(_wires(1))
+
+
+# ----- F1: chunk-count parity with the receiving tool -----
+
+
+def _multi_chunk_wires(specs: list[tuple[str, list[str]]]) -> list[dict[str, Any]]:
+    """Build envelopes whose ``chunks`` lists match ``specs``.
+
+    Each spec is ``(source_ref, [chunk_content, ...])``; every chunk is
+    also a contiguous substring of the body so the standard envelope
+    validation passes. Used to pin the post-T1 wire shape the
+    ``push`` server actually answers with (one ``chunk_id`` per
+    slice, across all envelopes).
+    """
+    envelopes: list[dict[str, Any]] = []
+    for index, (source_ref, chunks) in enumerate(specs):
+        body = "".join(chunks)
+        metadata = {
+            "fmt": "txt",
+            "doc_type": "narrative",
+            "section": "filing",
+            "source_sha256": "sha-" + str(index),
+            "parse_rule_version": "v1",
+            "params_table_version": "p1",
+            "normalization_rule_version": "n1",
+        }
+        envelopes.append(
+            {
+                "source_ref": source_ref,
+                "body": body,
+                "chunks": [
+                    {"index": offset, "content": chunk}
+                    for offset, chunk in enumerate(chunks)
+                ],
+                "metadata": metadata,
+                "valid_from": "0001-01-01T00:00:00.000Z",
+                "valid_until": "9999-12-31T23:59:59.999Z",
+            }
+        )
+    return envelopes
+
+
+def test_push_multi_chunk_envelope_chunk_count_matches_server() -> None:
+    """F1: the ``chunk_ids`` count check pins the new wire shape.
+
+    The receiving ``push`` tool hands back one ``chunk_id`` per chunk
+    across all envelopes (see ``src/tools/push.ts`` ``allChunkIds``),
+    so a 3-envelope batch where the first envelope carries 2 chunks,
+    the second carries 1, and the third carries 3 yields **6** chunk
+    ids — not 3. The previous record-count check raised
+    :class:`PushProtocolError` for any multi-chunk envelope. This
+    test pins the post-T1 chunk-count parity so the regression cannot
+    return.
+
+    The scripted server returns one id per slice (``chunk-0``,
+    ``chunk-1``, ...), the adapter's chunk-count check accepts that
+    count, and the response's ``block_ids`` is parallel to chunks —
+    not envelopes.
+    """
+    specs = [
+        ("docs/a.md", ["alpha ", "beta"]),  # 2 chunks
+        ("docs/b.md", ["gamma"]),  # 1 chunk
+        ("docs/c.md", ["delta ", "epsilon ", "zeta"]),  # 3 chunks
+    ]
+    expected_chunk_count = sum(len(chunks) for _, chunks in specs)
+    expected_chunk_ids = [f"chunk-{i}" for i in range(expected_chunk_count)]
+
+    class _PerChunkScripted(MCPPushPort):
+        def __init__(self) -> None:
+            self._command: list[str] | None = ["iknow-memory"]
+            self._timeout: float = 5.0
+            self._ledger = None  # type: ignore[assignment]
+            self._seen_keys: dict[tuple[str, str], bool] = {}
+
+        async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
+            # Mirror the server: one chunk_id per slice, in order.
+            chunk_count = sum(
+                len(item.get("chunks") or []) for item in (
+                    payload["params"]["arguments"]["items"]
+                )
+            )
+            return _success_envelope(
+                [f"chunk-{i}" for i in range(chunk_count)]
+            )
+
+    port = _PerChunkScripted()
+    outcome = port.push(_multi_chunk_wires(specs))
+
+    assert outcome["block_ids"] == expected_chunk_ids
+    # ``written`` counts chunks now, not envelopes: 6 fresh chunks.
+    assert outcome["written"] == expected_chunk_count
+    assert outcome["duplicates"] == 0
+
+
+def test_push_multi_chunk_envelope_replay_counts_chunks_not_envelopes() -> None:
+    """F1: a multi-chunk envelope replay reports ``duplicates`` in
+    chunks, not in envelopes.
+
+    The (source_ref, body_content_id) ledger keys on the envelope —
+    pushing the same 2-chunk envelope twice contributes **2** to
+    ``duplicates`` the second time, not 1. Both envelopes here are
+    multi-chunk, so the replay total is 5 chunks.
+    """
+    specs = [
+        ("docs/a.md", ["alpha ", "beta"]),  # 2 chunks
+        ("docs/b.md", ["gamma ", "delta ", "epsilon"]),  # 3 chunks
+    ]
+
+    class _FixedScripted(MCPPushPort):
+        def __init__(self) -> None:
+            self._command: list[str] | None = ["iknow-memory"]
+            self._timeout: float = 5.0
+            self._ledger = None  # type: ignore[assignment]
+            self._seen_keys: dict[tuple[str, str], bool] = {}
+
+        async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
+            chunk_count = sum(
+                len(item.get("chunks") or []) for item in (
+                    payload["params"]["arguments"]["items"]
+                )
+            )
+            return _success_envelope(
+                [f"chunk-{i}" for i in range(chunk_count)]
+            )
+
+    port = _FixedScripted()
+    envelopes = _multi_chunk_wires(specs)
+
+    first = port.push(envelopes)
+    assert first["written"] == 5
+    assert first["duplicates"] == 0
+
+    again = port.push(envelopes)
+    # Both envelopes are on the (source_ref, body_content_id) ledger
+    # → every chunk is a duplicate.
+    assert again["written"] == 0
+    assert again["duplicates"] == 5

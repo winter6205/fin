@@ -13,7 +13,7 @@ from fin.host.state import reset_input_state
 from fin.retrieve.capabilities import capability_switch_hits
 from fin.retrieve.mcp_adapter import MCPRetrieveAdapter
 
-from live_iknow_support import child_records, live_iknow
+from live_iknow_support import IKNOW_WORKTREE_ROOT, child_records, live_iknow
 
 
 pytestmark = pytest.mark.mcp
@@ -55,7 +55,10 @@ def test_compiled_product_retrieve_sends_no_capability_off_keys(
 ) -> None:
     """The compiled host path sends only the retrieve contract fields."""
 
-    with live_iknow(monkeypatch) as live:
+    # The envelope-based wire matches the operator-console worktree
+    # schema; the main-checkout ``push`` schema predates T1 and rejects
+    # the ``chunks`` field. Run against the worktree build.
+    with live_iknow(monkeypatch, root=IKNOW_WORKTREE_ROOT) as live:
         records = child_records()
         pushed_text = records[0].text
         live.push.push([record.to_wire() for record in records])

@@ -164,7 +164,7 @@ def test_invalidate_envelope_matches_iknow_schema() -> None:
     assert len(port.payloads) == 2
     for payload, target in zip(port.payloads, targets):
         arguments = payload["params"]["arguments"]
-        assert payload["params"]["name"] == "invalidation"
+        assert payload["params"]["name"] == "invalidate"  # tool renamed per src/tools/invalidation.ts:3
         # No key outside the iknow-memory schema is sent.
         assert set(arguments) <= _IKNOW_INVALIDATION_INPUT_KEYS, arguments
         assert arguments["source_ref"] == target.source_ref

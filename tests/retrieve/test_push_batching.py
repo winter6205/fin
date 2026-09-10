@@ -27,6 +27,8 @@ import pytest
 
 from fin.corpus.chunking import split_unit
 from fin.corpus.parsers._common import build_unit
+from types import MappingProxyType
+
 from fin.corpus.push import PushRecord, unit_push_records
 from fin.retrieve.fake_push_port import FakePushPort
 from fin.retrieve.push_batching import (
@@ -101,8 +103,17 @@ class FlakyPushPort:
         if self.calls == self.fail_on_call:
             raise self.error
         for record in records:
+            # After T1 the wire envelope's body identity is
+            # ``body_content_id`` (the per-unit sha256 over the body +
+            # rule versions), not the per-child ``content_id``. Older
+            # per-child wire records may still carry ``content_id``;
+            # accept either so the flaky port is a faithful interceptor
+            # for both shapes.
+            content_id = record.get("body_content_id") or record.get(
+                "content_id"
+            )
             self.forwarded_keys.append(
-                (str(record["source_ref"]), str(record["content_id"]))
+                (str(record["source_ref"]), str(content_id))
             )
         return self.inner.push(records)
 
@@ -118,9 +129,12 @@ def test_plan_batches_splits_without_losing_the_tail() -> None:
 
     batches = plan_batches(records, batch_size=3)
 
+    # After T1 the plan holds one envelope per PushRecord (each
+    # record coerces into a single-chunk envelope); the count of
+    # pushed items is preserved across the split.
     assert sum(len(batch.records) for batch in batches) == len(records)
     flattened = [record for batch in batches for record in batch.records]
-    assert flattened == list(records)
+    assert len(flattened) == len(records)
     assert [batch.index for batch in batches] == list(range(len(batches)))
     assert len({batch.key for batch in batches}) == len(batches)
     # the last batch is the remainder, not a dropped tail
@@ -442,3 +456,133 @@ def test_failed_batch_is_not_counted_as_a_write(tmp_path) -> None:
     assert inner.written_total() == 0
     assert journal.completed_keys() == ()
     assert len(journal.failures()) == 1
+
+
+# ---------------------------------------------------------------------------
+# T1 wire-shape parity: a coerced envelope's chunks must carry the record's
+# per-child id / content_id, so the batching wire matches the direct-push
+# wire (envelope_of_unit). The catalog-side invalidation path keys on
+# ``chunks[0]["id"]``; without this propagation the T3 live test's blocking
+# recorder raises ``KeyError: 'id'``.
+# ---------------------------------------------------------------------------
+
+
+def test_coerced_envelope_chunks_carry_record_id_and_content_id() -> None:
+    """A :class:`PushRecord` coerced into a :class:`PushEnvelope` must
+    forward the per-child ``block_id`` and ``content_id`` onto the
+    synthesized chunk.
+
+    Without this propagation the batching wire drops the
+    per-child identity that the direct-push wire (``envelope_of_unit``
+    via ``live.push.push``) carries; the catalog-side invalidation
+    path resolves its per-child keys off ``chunks[0]["id"]`` and a
+    missing field raises ``KeyError: 'id'`` (live T3 regression).
+    """
+    records = _records(units=1, sentences=12)
+    assert records, "fixture must yield at least one record"
+
+    batches = plan_batches(records)
+
+    # One envelope per record; each carries one chunk.
+    assert len(batches) == 1
+    envelopes = batches[0].envelopes
+    assert len(envelopes) == len(records)
+
+    for envelope, record in zip(envelopes, records):
+        wire = envelope.to_wire()
+        assert len(wire["chunks"]) == 1
+        chunk = wire["chunks"][0]
+        assert chunk["id"] == record.block_id
+        assert chunk["content_id"] == record.content_id
+        # The envelope-level idempotency key is
+        # ``(source_ref, body_content_id)`` — on the coerced path
+        # ``body_content_id`` is the record's ``content_id`` (the
+        # record is the per-child leaf, so the unit-level and
+        # child-level content identities collapse).
+        assert envelope.body_content_id == record.content_id
+        assert envelope.source_ref == record.source_ref
+
+
+# ---------------------------------------------------------------------------
+# Back-compat coercion boundary: degenerate PushRecord inputs
+# ---------------------------------------------------------------------------
+
+
+def _degenerate_record(**overrides: object) -> PushRecord:
+    base: dict[str, Any] = {
+        "block_id": "b0",
+        "source_ref": "docs/x.md",
+        "content_id": "c0",
+        "text": "hello",
+        "parent_block_id": "p0",
+        "parent_text": "parent",
+        "metadata": MappingProxyType({}),
+    }
+    base.update(overrides)
+    return PushRecord(**base)
+
+
+def test_coerced_record_without_block_id_omits_the_chunk_id_field() -> None:
+    """A hand-rolled record whose ``block_id`` is ``None`` (or missing)
+    coerces into an envelope whose chunk simply omits the ``id`` field —
+    the projection is well-defined rather than raising or writing a
+    ``null`` id the receiving schema would refuse."""
+    envelopes = plan_batches([_degenerate_record(block_id=None)])
+
+    wire = envelopes[0].envelopes[0].to_wire()
+    assert wire["chunks"] == [{"index": 0, "content": "hello", "content_id": "c0"}]
+    # the body identity is the record's own pinned content_id
+    assert envelopes[0].envelopes[0].body_content_id == "c0"
+
+
+def test_coerced_record_with_empty_text_is_forwarded_verbatim() -> None:
+    """An empty-text record coerces to an empty-body envelope; the
+    empty-document judgement is the push entry point's named refusal
+    (``PushEmptyDocumentError``), never a silent zero-chunk write."""
+    from fin.retrieve.fake_push_port import FakePushPort
+    from fin.retrieve.push_batching import push_in_batches, PushJournal
+    from fin.retrieve.push_port import PushEmptyDocumentError
+
+    port = FakePushPort()
+    journal = PushJournal()
+    record = _degenerate_record(
+        text="",
+        metadata=MappingProxyType(
+            {
+                "fmt": "txt",
+                "doc_type": "narrative",
+                "section": "body",
+                "source_sha256": "a" * 64,
+                "parse_rule_version": "p1",
+                "params_table_version": "t1",
+            }
+        ),
+    )
+
+    with pytest.raises(PushEmptyDocumentError):
+        push_in_batches(port, [record], journal=journal)
+
+    assert port.block_total() == 0
+
+
+def test_coerce_rejects_items_that_are_neither_envelope_nor_record() -> None:
+    """``plan_batches`` names the item type it cannot coerce instead of
+    letting a ``AttributeError`` escape from the wrong layer."""
+    from fin.corpus.push import PushEnvelope
+
+    with pytest.raises(TypeError) as excinfo:
+        plan_batches(["not an envelope"])
+
+    assert "str" in str(excinfo.value)
+    # the two supported shapes still pass through untouched
+    record = _degenerate_record()
+    assert plan_batches([record])[0].envelopes[0].body_content_id == "c0"
+    assert plan_batches(
+        [PushEnvelope(
+            source_ref="s", body="b",
+            chunks=(), metadata=MappingProxyType({}),
+            valid_from="0001-01-01T00:00:00.000Z",
+            valid_until="9999-12-31T23:59:59.999Z",
+            body_content_id="c0",
+        )]
+    )[0].envelopes[0].body_content_id == "c0"

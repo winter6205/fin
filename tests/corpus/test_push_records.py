@@ -23,6 +23,7 @@ from fin.corpus.determinism import canonical_json_bytes
 from fin.corpus.normalization import NORMALIZATION_RULE_VERSION
 from fin.corpus.push import (
     REQUIRED_PUSH_METADATA_FIELDS,
+    body_content_id,
     content_identity,
     document_push_records,
     serialize_source_ref,
@@ -199,3 +200,89 @@ def test_document_push_records_cover_every_hittable_block() -> None:
     assert {record.block_id for record in records} == {
         block.block_id for block in document.hittable_blocks()
     }
+
+
+# ---------------------------------------------------------------------------
+# T1: body_content_id — the wire-level idempotency key component (SSOT)
+# ---------------------------------------------------------------------------
+
+
+_META = {
+    "normalization_rule_version": "norm-1",
+    "parse_rule_version": "parse-1",
+    "params_table_version": "params-1",
+}
+
+
+def test_body_content_id_is_derived_like_content_identity_from_the_body() -> None:
+    """A hand-rolled wire envelope without ``body_content_id`` hashes
+    through the SAME construction ``content_identity`` uses — the wire
+    key and the corpus-side content identity can never drift."""
+    wire = {"source_ref": "s", "body": "revenue grew", "metadata": _META}
+
+    assert body_content_id(wire) == content_identity(
+        "revenue grew",
+        normalization_rule_version="norm-1",
+        parse_rule_version="parse-1",
+        params_table_version="params-1",
+    )
+
+
+def test_body_content_id_accepts_content_spelling_of_the_body() -> None:
+    """Envelopes spelling the body ``content`` (the direct-push wire
+    name) hash identically to ones spelling it ``body`` — the two
+    spellings are one body for identity purposes."""
+    assert body_content_id({"content": "revenue grew", "metadata": _META}) == (
+        body_content_id({"body": "revenue grew", "metadata": _META})
+    )
+
+
+def test_body_content_id_moves_with_each_rule_version() -> None:
+    """The derived id is version-scoped: bumping any of the three rule
+    versions moves it, so a re-parse under new rules is a new write."""
+    baseline = body_content_id({"body": "t", "metadata": _META})
+
+    for field in _META:
+        bumped = dict(_META)
+        bumped[field] = _META[field] + "x"
+        assert (
+            body_content_id({"body": "t", "metadata": bumped}) != baseline
+        ), field
+
+
+def test_body_content_id_is_stable_for_the_same_body_and_versions() -> None:
+    """Same body + same versions → same id, independent of dict
+    insertion order or envelope construction path."""
+    first = body_content_id({"body": "t", "metadata": dict(_META)})
+    second = body_content_id(
+        {
+            "metadata": {"params_table_version": "params-1", "parse_rule_version": "parse-1", "normalization_rule_version": "norm-1"},
+            "body": "t",
+        }
+    )
+    assert first == second
+
+
+def test_explicit_body_content_id_is_trusted_verbatim() -> None:
+    """When the corpus side pre-computes ``body_content_id``, the SSOT
+    trusts it — a hand-edited body with a pinned id keys on the pinned
+    id, not a re-derived hash (record_to_envelope's contract)."""
+    wire = {"body": "t", "metadata": _META, "body_content_id": "pinned-id"}
+
+    assert body_content_id(wire) == "pinned-id"
+
+
+def test_body_content_id_of_an_empty_body_is_stable_and_named() -> None:
+    """An empty / absent body has a well-defined id (hash of ``""``) —
+    it does not raise, so the empty-document refusal stays on the push
+    path's named check, not on the hashing helper."""
+    empty = body_content_id({"body": "", "metadata": _META})
+    absent = body_content_id({"metadata": _META})
+
+    assert empty == absent
+    assert empty == content_identity(
+        "",
+        normalization_rule_version="norm-1",
+        parse_rule_version="parse-1",
+        params_table_version="params-1",
+    )

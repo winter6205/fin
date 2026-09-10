@@ -11,7 +11,7 @@ from fin.corpus.invalidation import (
     InvalidationTarget,
 )
 
-from live_iknow_support import child_records, live_iknow
+from live_iknow_support import IKNOW_WORKTREE_ROOT, child_records, live_iknow
 
 
 pytestmark = pytest.mark.mcp
@@ -36,10 +36,21 @@ def test_real_iknow_invalidation_is_idempotent_and_hides_old_text(
 ) -> None:
     """Repeating one old-unit invalidation neither errors nor reopens hits."""
 
-    with live_iknow(monkeypatch) as live:
+    # The envelope-based wire matches the operator-console worktree
+    # schema; the main-checkout ``push`` schema predates T1 and rejects
+    # the ``chunks`` field. Run against the worktree build.
+    with live_iknow(monkeypatch, root=IKNOW_WORKTREE_ROOT) as live:
         records = child_records()
         live.push.push([record.to_wire() for record in records])
-        target = _target_of(records[0])
+        # The live fixture now models the T1 contract: one record per
+        # distinct frozen unit (4 units → 4 records, each with its
+        # own ``source_ref``). Invalidation fans out per
+        # ``source_ref`` on the receiving side, so closing the whole
+        # document requires one target per record — invalidating only
+        # ``records[0]`` would close that one unit and leave the
+        # other three visible to retrieve, breaking the
+        # ``after.chunks == []`` assertion that ends the test.
+        targets = [_target_of(record) for record in records]
 
         before = live.retrieve.retrieve(
             "operating revenue",
@@ -47,8 +58,8 @@ def test_real_iknow_invalidation_is_idempotent_and_hides_old_text(
         )
         assert len(before["chunks"]) == len(records)
 
-        first = live.invalidation.invalidate([target])
-        second = live.invalidation.invalidate([target])
+        first = live.invalidation.invalidate(targets)
+        second = live.invalidation.invalidate(targets)
 
         assert first.closed == len(records)
         assert first.already_closed == 0

@@ -556,13 +556,22 @@ class MCPInvalidationPort:
 
     @staticmethod
     def _build_payload(arguments: dict[str, Any]) -> dict[str, Any]:
-        """The JSON-RPC ``tools/call`` payload for ``invalidation``."""
+        """The JSON-RPC ``tools/call`` payload for ``invalidation``.
+
+        The MCP tool name on the receiving side is ``invalidate`` — the
+        tool was renamed from ``invalidation`` per
+        ``specs/mcp-tool-surface.md Catalog`` (see also
+        ``src/tools/invalidation.ts`` line 3). Calling
+        ``tools/call`` with ``name: "invalidation"`` makes the server
+        reject the call with ``Tool invalidation not found``; this
+        adapter must use the renamed name.
+        """
         return {
             "jsonrpc": "2.0",
             "id": _TOOL_REQUEST_ID,
             "method": "tools/call",
             "params": {
-                "name": "invalidation",
+                "name": "invalidate",
                 "arguments": arguments,
             },
         }

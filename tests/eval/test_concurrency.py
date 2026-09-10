@@ -303,10 +303,23 @@ def test_idempotency_check_and_write_is_one_concurrent_critical_section() -> Non
     port._by_key = _CheckSnapshotStore(
         port, threading.Barrier(2)
     )
+    # T1 wire shape: one envelope per 资料. The envelope body
+    # contains the record text, so the push is a valid one-slice
+    # envelope and the (source_ref, body_content_id) idempotency key
+    # behaves exactly like the per-record key did for this scenario.
+    record = _record()
+    envelope_wire = {
+        "source_ref": record.source_ref,
+        "body": record.text,
+        "chunks": [{"content": record.text, "index": 0}],
+        "metadata": dict(record.metadata),
+        "valid_from": "0001-01-01T00:00:00.000Z",
+        "valid_until": "9999-12-31T23:59:59.999Z",
+    }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         results = tuple(
-            pool.map(lambda _: port.push([_record().to_wire()]), range(2))
+            pool.map(lambda _: port.push([dict(envelope_wire)]), range(2))
         )
 
     assert sum(result["written"] for result in results) == 1

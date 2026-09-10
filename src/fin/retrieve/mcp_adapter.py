@@ -98,6 +98,8 @@ import logging
 from typing import Any, Mapping
 
 from fin.corpus.extracted import Locator
+from fin.corpus.parsers._common import UnitLocator
+from fin.corpus.push import serialize_source_ref
 from fin.retrieve.degradation import (
     NOT_DEGRADED,
     DegradationError,
@@ -117,7 +119,6 @@ from fin.retrieve.mcp_session import (
     MCPStdioProtocolError,
     MCPStdioSession,
 )
-from fin.retrieve.read_port import READ_UNAVAILABLE
 
 
 _DEFAULT_LIMIT = 8
@@ -617,20 +618,117 @@ class MCPRetrieveAdapter:
         page: int = 1,
         page_limit: int = 1,
     ) -> dict[str, Any]:
-        """Named EXIT: the retrieve backend exposes no read tool.
+        """Read an ingested document through MCP ``read_source``.
 
-        ADR 0047: ``read_file`` is an ordinary read of a known locator
-        — MCP when that is where the bytes live. iknow-memory ships
-        retrieve / push / invalidation but **no read endpoint**
-        (handoff 2026-09-04), so the product read is the named
-        ``{"error": "read_unavailable"}`` failure. It is deliberately
-        NOT ``unknown_locator`` (the locator may well exist on the
-        backend) and it NEVER falls back to the local extracted tree —
-        that would reintroduce the second serve-time SSOT ADR 0046 /
-        0047 remove. When iknow-memory grows a read tool, this method
-        becomes the MCP round trip.
+        The adapter's known document set is the set ingested on MCP. For
+        an ingested document, the configured locator map is used only to
+        discover its unit locators. The map is ordered by unit number;
+        each unit is fetched independently and its body becomes one
+        page in the existing ``read_file`` contract. This preserves the
+        unit granularity of the pushed envelope while keeping the
+        model's read shape unchanged.
         """
-        return {"error": READ_UNAVAILABLE}
+        locators = self._read_locators(document_id, version, page, page_limit)
+        if locators is None:
+            return {"error": "unknown_locator"}
+        end = min(page + page_limit - 1, len(locators))
+        units: list[str] = []
+        for locator in locators[page - 1:end]:
+            body = self._fetch_unit_body(
+                document_id, version, locator.page
+            )
+            if body is None:
+                return {"error": "unknown_locator"}
+            units.append(body)
+
+        return {
+            "document_id": document_id,
+            "version": version,
+            "page": page,
+            "text": "\n\n".join(str(unit) for unit in units),
+            "page_count": len(locators),
+        }
+
+    def _read_locators(
+        self,
+        document_id: str,
+        version: str,
+        page: int,
+        page_limit: int,
+    ) -> list[Locator] | None:
+        """Resolve the ordered unit locators one ``read`` page covers.
+
+        Returns ``None`` for every shape that maps to the named
+        ``unknown_locator`` miss: a non-positive page / page_limit, a
+        document the adapter does not know, no locators matching
+        ``(document_id, version)``, or a page past the locator count.
+        """
+        if page < 1 or page_limit < 1:
+            return None
+        if page_limit > 3:
+            page_limit = 3
+        if (
+            self._known_doc_ids is not None
+            and document_id not in self._known_doc_ids
+        ):
+            return None
+        locators = sorted(
+            (
+                locator
+                for locator in self._locator_map.values()
+                if locator.document_id == document_id
+                and locator.version == version
+            ),
+            key=lambda locator: locator.page,
+        )
+        if not locators or page > len(locators):
+            return None
+        return locators
+
+    def _fetch_unit_body(
+        self,
+        document_id: str,
+        version: str,
+        unit: int,
+    ) -> str | None:
+        """Fetch one unit's body via MCP ``read_source``.
+
+        Returns the body string, or ``None`` for every miss shape the
+        ``read`` contract folds into ``unknown_locator``: a transport
+        answer that is not a success dict, a result without a
+        ``content`` block, and the decoder's named
+        ``read_source_*`` miss sentinel. Transport-level failures
+        (spawn / timeout) still raise :class:`RetrieveUnavailableError`
+        — the machine answering "I cannot read" is a different failure
+        from the locator not being there.
+        """
+        source_ref = serialize_source_ref(
+            UnitLocator(document_id, version, unit)
+        )
+        payload = {
+            "jsonrpc": "2.0",
+            "id": _TOOL_REQUEST_ID,
+            "method": "tools/call",
+            "params": {
+                "name": "read_source",
+                "arguments": {"source_ref": source_ref},
+            },
+        }
+        try:
+            response = asyncio.run(self._call_mcp(payload))
+        except (OSError, asyncio.TimeoutError, TimeoutError) as exc:
+            raise RetrieveUnavailableError(
+                f"MCP transport failed: {exc!r}"
+            ) from exc
+        if not isinstance(response, dict) or "error" in response:
+            return None
+        result = response.get("result")
+        if not isinstance(result, dict) or "content" not in result:
+            return None
+        body = _read_body_of_content(result)
+        if body is _READ_MISS_SENTINEL:
+            return None
+        return body
 
     async def aretrieve(
         self,
@@ -919,3 +1017,70 @@ __all__ = [
     "RetrieveDegradedFailureError",
     "RetrieveUnavailableError",
 ]
+
+
+# ----- read_source content-block decoding -----
+
+
+_READ_MISS_SENTINEL = object()
+
+
+def _read_body_of_content(result: Mapping[str, Any]) -> Any:
+    """Decode the ``read_source`` ``result.content`` envelope.
+
+    The real iknow-memory ``read_source`` tool writes the canonical MCP
+    tools/call shape — ``{isError?, content: [{type: "text", text: "..."}]}``
+    — and the inner ``text`` carries the business envelope
+    ``{id, source_ref, content}`` on success or
+    ``{error: "read_source_not_found" | "read_source_invalidated", ...}``
+    on the named miss.
+
+    This decoder returns the body string when the wire is a success,
+    or :data:`_READ_MISS_SENTINEL` when the wire carries the named
+    ``read_source_*`` miss code (the caller's contract is to translate
+    that to the existing ``{"error": "unknown_locator"}`` shape). A
+    text block that is not valid JSON is also the miss sentinel —
+    garbage on the wire is not a body. Non-recognized JSON envelopes
+    fall back to the raw text so a hand-rolled adapter that ships a
+    plain string body still produces a usable read result.
+
+    A flat string ``content`` is preserved as a forward-compat fallback
+    for hand-rolled adapters that still project the body directly.
+    """
+    if result.get("isError"):
+        return _READ_MISS_SENTINEL
+    content = result["content"]
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list) or not content:
+        return _READ_MISS_SENTINEL
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, Mapping):
+            return _READ_MISS_SENTINEL
+        if block.get("type") != "text":
+            continue
+        text = block.get("text")
+        if not isinstance(text, str):
+            return _READ_MISS_SENTINEL
+        try:
+            inner = json.loads(text)
+        except ValueError:
+            return _READ_MISS_SENTINEL
+        if isinstance(inner, Mapping):
+            error_code = inner.get("error")
+            if isinstance(error_code, str) and error_code.startswith(
+                "read_source_"
+            ):
+                return _READ_MISS_SENTINEL
+            body = inner.get("content")
+            if isinstance(body, str):
+                parts.append(body)
+                continue
+        # Fallback: keep the raw text when the block is not a JSON
+        # envelope we recognize, so a hand-rolled adapter that ships a
+        # plain string body still produces a usable read result.
+        parts.append(text)
+    if not parts:
+        return _READ_MISS_SENTINEL
+    return "\n\n".join(parts)
