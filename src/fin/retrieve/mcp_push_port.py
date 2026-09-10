@@ -1,21 +1,25 @@
-"""MCP stdio transport for the push seam (Plan D0 I-T4, SC18 / SC20, §B4).
+"""MCP stdio transport for the push seam (Plan D0 I-T4, SC18 / SC20, §B4;
+spec `operator-console-host-contract` T1).
 
-The push port sends each ``PushRecord``'s wire shape to the
-**iknow-memory** MCP ``push`` tool via JSON-RPC 2.0 over stdio. Wire
-field names are verbatim the **z.strictObject** schema in
-``src/tools/push.ts`` — ``content`` / ``source_ref`` / ``metadata`` /
-``valid_from`` / ``valid_until``. Extra keys would either be rejected
-by ``strictObject`` or silently dropped on a mock without ``.strict()``;
-both are the same kind of wire-shape failure this module refuses to
-ship.
+The push port sends each envelope's wire shape to the **iknow-memory**
+MCP ``push`` tool via JSON-RPC 2.0 over stdio. After T1 the wire shape
+is the **one envelope per 资料** declared by the spec — ``source_ref``
++ the unit's extracted body + ``chunks[]`` of ``{content, index}`` +
+``metadata`` + ``valid_from`` / ``valid_until``. Wire field names are
+verbatim the **z.strictObject** schema in ``src/tools/push.ts``. Extra
+keys would either be rejected by ``strictObject`` or silently dropped
+on a mock without ``.strict()``; both are the same kind of wire-shape
+failure this module refuses to ship.
 
 **no re-splitting** (§B4「不二次切分」): fin owns chunking; the bytes
-that leave here equal the bytes that were pushed.
+that leave here equal the bytes that were pushed. The chunks list is
+forwarded verbatim — the receiving tool stores it as-is, never
+re-normalizes the slice text and never re-runs the chunker.
 
-**not a second chunker** — the push port forwards ``PushRecord.to_wire()``
-fields unchanged and lets the receiving tool store the text verbatim.
-The adapter never inserts a sliding-window pass between fin and the
-service.
+**not a second chunker** — the push port forwards the envelope wire
+fields unchanged and lets the receiving tool store the body + slices
+verbatim. The adapter never inserts a sliding-window pass between fin
+and the service.
 
 Failure contract
 ----------------
@@ -28,14 +32,17 @@ Failure contract
   than collapsed into the generic ``push_protocol_error``.
 * Empty batch is invalid input (§B2 第 5 条) →
   :class:`PushEmptyBatchError`, refused before the round trip.
+* Envelope body missing → :class:`PushEmptyDocumentError`, refused
+  before the round trip (the same T21 invalid-input refusal the
+  receiving side names).
 
 Concurrency / state
 -------------------
 
 The public ``push`` is sync and bridges to ``asyncio.run``. The
-adapter tracks the ``(source_ref, content_id)`` keys it has already
-seen so a replay is reported as ``duplicates`` rather than a fresh
-``written`` batch — the §B1「幂等基准」assertion lives in fin's
+adapter tracks the ``(source_ref, body_content_id)`` keys it has
+already seen so a replay is reported as ``duplicates`` rather than a
+fresh ``written`` batch — the §B1「幂等基准」assertion lives in fin's
 adapter, not on the service side, because the service only echoes
 ``chunk_ids`` and does not split them into new vs. duplicate.
 """
@@ -56,10 +63,14 @@ from fin.retrieve.mcp_session import (
 )
 from fin.retrieve.push_port import (
     PushEmptyBatchError,
+    PushEmptyDocumentError,
     PushMetadataIncompleteError,
     PushProtocolError,
     PushServiceUnavailableError,
     validate_batch_not_empty,
+    validate_envelope_chunks,
+    validate_wire_record,
+    validate_wire_record_text,
 )
 
 # The iknow ``push`` schema requires ``valid_until`` to be a strict ISO
@@ -72,6 +83,44 @@ _VALID_UNTIL_SENTINEL: str = "9999-12-31T23:59:59.999Z"
 _MCP_PROTOCOL_VERSION: str = "2025-06-18"
 _INITIALIZE_REQUEST_ID: int = 1
 _TOOL_REQUEST_ID: int = 2
+
+# The same ``\x1f`` separator :func:`fin.corpus.push.content_identity`
+# uses to keep rule-version strings from impersonating field
+# boundaries. The wire envelope carries its own
+# ``body_content_id`` (the corpus side's hash over the body + the
+# three rule versions); the adapter accepts that key when present
+# and falls back to deriving the same hash from the wire body +
+# metadata.
+_BODY_ID_SEPARATOR: str = "\x1f"
+
+
+def _body_content_id(envelope: Mapping[str, Any]) -> str:
+    """The wire-level idempotency body identity.
+
+    Mirrors :func:`fin.corpus.push.content_identity` over the envelope
+    body + the three rule versions. The envelope may already carry
+    ``body_content_id`` (the corpus side pre-computes it); when it
+    does, we trust it. Otherwise we derive the same hash on the
+    adapter side so a hand-rolled wire envelope still keys idempotent.
+    """
+    explicit = envelope.get("body_content_id")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    body = envelope.get("content")
+    if body is None:
+        body = envelope.get("body")
+    metadata = envelope.get("metadata") or {}
+    import hashlib
+    parts = (
+        str(body or ""),
+        str(metadata.get("normalization_rule_version", "")),
+        str(metadata.get("parse_rule_version", "")),
+        str(metadata.get("params_table_version", "")),
+    )
+    return hashlib.sha256(
+        _BODY_ID_SEPARATOR.join(parts).encode("utf-8")
+    ).hexdigest()
+
 
 logger = logging.getLogger(__name__)
 
@@ -390,21 +439,24 @@ class MCPPushPort:
 
     # ----- PushPort surface -----
 
-    def push(self, records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-        """Send ``records`` to the MCP ``push`` tool and report the
+    def push(self, envelopes: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """Send ``envelopes`` to the MCP ``push`` tool and report the
         §B4 outcome.
 
-        Empty batches are refused by name before the round trip
-        (§B2 第 5 条); metadata completeness is the receiving side's
-        judgement, so the adapter does NOT pre-screen the batch but
-        DOES translate the receiving schema's ``metadata`` rejection
-        into :class:`PushMetadataIncompleteError`. A transport-level
+        Each envelope is the **one envelope per 资料** shape declared by
+        the spec: ``source_ref`` + the unit's extracted body + the
+        child ``chunks`` with monotonic ``index`` from 0. Empty batches
+        are refused by name before the round trip (§B2 第 5 条);
+        metadata completeness is the receiving side's judgement, so the
+        adapter does NOT pre-screen the batch but DOES translate the
+        receiving schema's ``metadata`` rejection into
+        :class:`PushMetadataIncompleteError`. A transport-level
         ``OSError`` becomes :class:`PushServiceUnavailableError`; a
         short or off-contract envelope becomes
         :class:`PushProtocolError`.
 
-        ``block_ids`` is parallel to ``records``: a record whose
-        ``(source_ref, content_id)`` was already seen yields the
+        ``block_ids`` is parallel to ``envelopes``: an envelope whose
+        ``(source_ref, body_content_id)`` was already seen yields the
         **stored** ``chunk_id``, so a replay returns the same ids as
         the original write. ``written`` / ``duplicates`` come from the
         adapter's own idempotency ledger (the service only echoes
@@ -412,9 +464,17 @@ class MCPPushPort:
         duplicate).
         """
         ledger = self.input_validation_failures
-        validate_batch_not_empty(records, ledger=ledger)
+        validate_batch_not_empty(envelopes, ledger=ledger)
+        # Pre-screen the envelope shape on the client side too — the
+        # receiving schema's strictObject will refuse it, but failing
+        # before the round trip is the typed refusal the suite asserts
+        # on (T21: invalid input is counted, not silently dropped).
+        for envelope in envelopes:
+            validate_wire_record(envelope)
+            validate_wire_record_text(envelope, ledger=ledger)
+            validate_envelope_chunks(envelope)
 
-        items = [self._to_push_item(record) for record in records]
+        items = [self._to_push_item(envelope) for envelope in envelopes]
         payload = self._build_payload(items)
 
         try:
@@ -430,11 +490,14 @@ class MCPPushPort:
             ) from exc
 
         envelope = _extract_push_business_envelope(response)
-        chunk_ids = _chunk_ids_of(envelope, record_count=len(records))
+        chunk_ids = _chunk_ids_of(envelope, record_count=len(envelopes))
 
         written, duplicates = 0, 0
-        for record, block_id in zip(records, chunk_ids):
-            key = (str(record["source_ref"]), str(record["content_id"]))
+        for wire, block_id in zip(envelopes, chunk_ids):
+            key = (
+                str(wire["source_ref"]),
+                str(_body_content_id(wire)),
+            )
             if key in self._seen_keys:
                 duplicates += 1
             else:
@@ -450,44 +513,49 @@ class MCPPushPort:
     # ----- helpers -----
 
     @staticmethod
-    def _to_push_item(record: Mapping[str, Any]) -> dict[str, Any]:
-        """Translate one fin wire record into the iknow ``PushItem`` shape.
+    def _to_push_item(envelope: Mapping[str, Any]) -> dict[str, Any]:
+        """Project one fin envelope into the iknow ``PushItem`` shape.
 
-        Field names are verbatim the **z.strictObject** schema in
-        ``src/tools/push.ts``. No fin-side keys (``block_id``,
-        ``content_id``, ``idempotency_key``, ``parent_block_id``,
-        ``parent_text``, ``text``) are forwarded — ``strictObject``
-        would refuse them on the wire.
+        The wire shape (verbatim the **z.strictObject** schema in
+        ``src/tools/push.ts``) is ``{content, source_ref, chunks,
+        metadata, valid_from, valid_until}``. Every envelope field is
+        forwarded verbatim — fin owns chunking (§B4「不二次切分」),
+        so the receiving tool stores the body and slices as-is.
         """
-        text = record.get("text")
-        source_ref = record.get("source_ref")
-        metadata = record.get("metadata")
-        if not isinstance(text, str) or not text.strip():
-            raise PushEmptyBatchError(
-                f"push of block {record.get('block_id')!r} carries no text; "
-                "an empty document is invalid input, not an empty result"
-            )
+        source_ref = envelope.get("source_ref")
         if not isinstance(source_ref, str) or not source_ref.strip():
             raise PushProtocolError(
-                f"push of block {record.get('block_id')!r} carries no "
+                f"push envelope {envelope.get('source_ref')!r} carries no "
                 "source_ref"
             )
-        if not isinstance(metadata, Mapping) or len(metadata) == 0:
-            raise PushMetadataIncompleteError(
-                f"push of block {record.get('block_id')!r} carries no "
-                "metadata (B4 requires at least one key)"
+        body = envelope.get("content")
+        if body is None:
+            body = envelope.get("body")
+        if not isinstance(body, str) or not body.strip():
+            raise PushEmptyDocumentError(
+                f"push envelope {source_ref!r} carries no body; "
+                "an empty document is invalid input, not an empty result"
             )
         return {
-            "content": text,
+            "content": body,
             "source_ref": source_ref,
-            "metadata": dict(metadata),
+            "chunks": [
+                {"index": int(chunk["index"]), "content": str(chunk["content"])}
+                for chunk in envelope.get("chunks", [])
+            ],
+            "metadata": dict(envelope.get("metadata") or {}),
             "valid_from": _now_iso(),
             "valid_until": _VALID_UNTIL_SENTINEL,
         }
 
     @staticmethod
     def _build_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
-        """The JSON-RPC ``tools/call`` payload for ``push``."""
+        """The JSON-RPC ``tools/call`` payload for ``push``.
+
+        One envelope per ``items[i]``; the receiving schema indexes by
+        position so ``chunk_ids`` from the response is parallel to
+        ``items``.
+        """
         return {
             "jsonrpc": "2.0",
             "id": _TOOL_REQUEST_ID,
@@ -553,6 +621,7 @@ class MCPPushPort:
 __all__ = [
     "MCPPushPort",
     "PushEmptyBatchError",
+    "PushEmptyDocumentError",
     "PushMetadataIncompleteError",
     "PushProtocolError",
     "PushServiceUnavailableError",

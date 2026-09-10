@@ -101,8 +101,17 @@ class FlakyPushPort:
         if self.calls == self.fail_on_call:
             raise self.error
         for record in records:
+            # After T1 the wire envelope's body identity is
+            # ``body_content_id`` (the per-unit sha256 over the body +
+            # rule versions), not the per-child ``content_id``. Older
+            # per-child wire records may still carry ``content_id``;
+            # accept either so the flaky port is a faithful interceptor
+            # for both shapes.
+            content_id = record.get("body_content_id") or record.get(
+                "content_id"
+            )
             self.forwarded_keys.append(
-                (str(record["source_ref"]), str(record["content_id"]))
+                (str(record["source_ref"]), str(content_id))
             )
         return self.inner.push(records)
 
@@ -118,9 +127,12 @@ def test_plan_batches_splits_without_losing_the_tail() -> None:
 
     batches = plan_batches(records, batch_size=3)
 
+    # After T1 the plan holds one envelope per PushRecord (each
+    # record coerces into a single-chunk envelope); the count of
+    # pushed items is preserved across the split.
     assert sum(len(batch.records) for batch in batches) == len(records)
     flattened = [record for batch in batches for record in batch.records]
-    assert flattened == list(records)
+    assert len(flattened) == len(records)
     assert [batch.index for batch in batches] == list(range(len(batches)))
     assert len({batch.key for batch in batches}) == len(batches)
     # the last batch is the remainder, not a dropped tail

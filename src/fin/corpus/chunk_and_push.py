@@ -3,7 +3,7 @@ from pathlib import Path
 from fin.corpus.chunking import split_document
 from fin.corpus.dataset.t1 import load_t1_manifest
 from fin.corpus.parsers import parse_document
-from fin.corpus.push import document_push_records
+from fin.corpus.push import envelopes_of_document
 from fin.retrieve.push_port import (
     MAX_PUSH_BATCH_RECORDS,
     PushError,
@@ -17,6 +17,12 @@ def push_t1_corpus(*, manifest_path: Path, text_dir: Path, port: PushPort) -> di
     The caller supplies the port, making the default test path entirely
     in-process. Each sample is one atomic push batch; failures are retained
     by sample id and re-raised only after all independent samples are tried.
+
+    After T1 the wire unit is the **one envelope per 资料** declared by the
+    spec: ``source_ref`` + body + ``chunks[]``. The push path here builds
+    the envelopes from the same chunking the document side produced,
+    stitches the manifest's ``scene`` / ``license`` / ``url`` into the
+    envelope metadata, and ships one batch per sample.
 
     The per-sample catch is narrowed to the **expected** exception family:
 
@@ -41,21 +47,29 @@ def push_t1_corpus(*, manifest_path: Path, text_dir: Path, port: PushPort) -> di
             text = source.read_bytes()
             parsed = parse_document(text, fmt="txt", document_id=str(sample["document_id"]), version=str(sample["sha256"]))
             chunked = split_document(parsed, doc_type="mixed")
-            records = list(document_push_records(chunked))
-            if not records:
+            envelopes = list(envelopes_of_document(
+                chunked,
+                valid_from=str(sample["sha256"]),
+                valid_until="9999-12-31T23:59:59.999Z",
+            ))
+            if not envelopes:
                 raise ValueError("t1_empty_chunks")
-            if len(records) > MAX_PUSH_BATCH_RECORDS:
-                raise ValueError(f"push_batch_overflow: {len(records)} > {MAX_PUSH_BATCH_RECORDS}")
+            if len(envelopes) > MAX_PUSH_BATCH_RECORDS:
+                raise ValueError(f"push_batch_overflow: {len(envelopes)} > {MAX_PUSH_BATCH_RECORDS}")
             enriched = []
-            for record in records:
-                metadata = dict(record.metadata)
+            from dataclasses import replace
+            from types import MappingProxyType
+            for envelope in envelopes:
+                metadata = dict(envelope.metadata)
                 metadata.update({"scene": sample["scene"], "license": sample["source"]["license"], "url": sample["source"]["url"]})
-                from dataclasses import replace
-                from types import MappingProxyType
-                enriched.append(replace(record, metadata=MappingProxyType(metadata)))
-            outcome = port.push([record.to_wire() for record in enriched])
+                enriched.append(replace(envelope, metadata=MappingProxyType(metadata)))
+            # The block count we expose is the total chunk count
+            # across the sample's envelopes — the unit the receiving
+            # service hands block ids back in (T1).
+            block_total = sum(len(envelope.chunks) for envelope in enriched)
+            outcome = port.push([envelope.to_wire() for envelope in enriched])
             report["samples"] += 1
-            report["blocks"] += len(enriched)
+            report["blocks"] += block_total
             report["written"] += int(outcome.get("written", 0))
             report["duplicates"] += int(outcome.get("duplicates", 0))
         except (PushError, ValueError, OSError) as exc:
