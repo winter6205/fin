@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from live_iknow_support import child_records, live_iknow
+from live_iknow_support import (
+    IKNOW_WORKTREE_ROOT,
+    child_records,
+    live_iknow,
+)
 
 
 pytestmark = pytest.mark.mcp
@@ -15,7 +19,10 @@ def test_real_iknow_round_trip_is_byte_identical_and_idempotent(
 ) -> None:
     """The real process stores fin child text verbatim and replays ids."""
 
-    with live_iknow(monkeypatch) as live:
+    # The envelope-based wire matches the operator-console worktree
+    # schema; the main-checkout ``push`` schema predates T1 and rejects
+    # the ``chunks`` field. Run against the worktree build.
+    with live_iknow(monkeypatch, root=IKNOW_WORKTREE_ROOT) as live:
         records = child_records()
         wire_records = [record.to_wire() for record in records]
 
