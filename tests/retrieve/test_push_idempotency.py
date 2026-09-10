@@ -29,21 +29,31 @@ from __future__ import annotations
 
 import pytest
 
-from fin.corpus.chunking import split_document, split_unit
+from fin.corpus.chunking import (
+    DocumentChunking,
+    lookup_chunk_params,
+    split_document,
+    split_unit,
+)
 from fin.corpus.parsers import parse_document
-from fin.corpus.parsers._common import build_unit
+from fin.corpus.parsers._common import UnitLocator, build_unit
 from fin.corpus.push import (
     REQUIRED_PUSH_METADATA_FIELDS,
+    envelope_of_unit,
     envelopes_of_document,
     envelopes_of_unit,
 )
 from fin.retrieve.fake_push_port import FakePushPort
 from fin.retrieve.push_port import (
     IDEMPOTENCY_BASELINE_PUSHES,
+    PushEmptyBatchError,
+    PushEmptyDocumentError,
     PushError,
     PushMetadataIncompleteError,
+    PushProtocolError,
     UnknownPushedBlockError,
     push_envelopes,
+    validate_envelope_chunks,
 )
 
 DOCUMENT_ID = "TEST-2023Q1"
@@ -330,3 +340,151 @@ def test_chunk_texts_on_the_wire_are_substrings_of_the_body() -> None:
         body = row["body"]
         for chunk in row["chunks"]:
             assert chunk["content"] in body
+
+
+# ---------------------------------------------------------------------------
+# T1 boundary: empty unit / empty document on the envelope path
+# ---------------------------------------------------------------------------
+
+
+def _empty_unit_chunking():
+    """A :class:`UnitChunking` whose frozen text is empty (no parents,
+    no children — the shape an empty frozen unit would carry)."""
+    from fin.corpus.chunking import UnitChunking
+
+    return UnitChunking(
+        locator=UnitLocator(DOCUMENT_ID, VERSION, 1),
+        unit_text="",
+        fmt="txt",
+        doc_type="narrative",
+        section="body",
+        density=0,
+        params=lookup_chunk_params("narrative", "body", 0),
+        parents=(),
+        children=(),
+        source_sha256=VERSION,
+        parse_rule_version="parse-1",
+        params_table_version="params-1",
+    )
+
+
+def test_envelope_of_empty_unit_is_well_defined_with_no_chunks() -> None:
+    """An empty unit produces a well-defined envelope — empty body, zero
+    chunks — rather than raising at construction time; the refusal is
+    the push side's named ``PushEmptyDocumentError`` (invalid input),
+    not a construction-time crash."""
+    envelope = envelope_of_unit(
+        _empty_unit_chunking(),
+        valid_from=VALID_FROM,
+        valid_until=VALID_UNTIL,
+    )
+
+    assert envelope.body == ""
+    assert envelope.chunks == ()
+    assert envelope.source_ref == _unit_envelope(unit=1)[0].source_ref
+
+
+def test_pushing_the_empty_unit_envelope_is_a_named_empty_document() -> None:
+    """Pushing the empty-unit envelope is invalid input per §B2 第 5 条
+    (「空文档 / 空内容」): refused by name with nothing written — never a
+    zero-chunk silent success and never a half-write."""
+    port = FakePushPort()
+    envelope = envelope_of_unit(
+        _empty_unit_chunking(),
+        valid_from=VALID_FROM,
+        valid_until=VALID_UNTIL,
+    )
+
+    with pytest.raises(PushEmptyDocumentError) as excinfo:
+        push_envelopes(port, [envelope])
+
+    assert excinfo.value.code == "push_empty_document"
+    assert excinfo.value.degraded is False
+    assert port.block_total() == 0
+
+
+def test_envelopes_of_document_with_no_units_is_empty_not_an_error() -> None:
+    """A document with zero frozen units yields a zero-length envelope
+    tuple — a well-defined empty input, not an exception. The empty
+    batch itself is refused later, at the push entry point."""
+    document = DocumentChunking(
+        document_id=DOCUMENT_ID,
+        version=VERSION,
+        doc_type="narrative",
+        units=(),
+    )
+
+    assert (
+        envelopes_of_document(
+            document, valid_from=VALID_FROM, valid_until=VALID_UNTIL
+        )
+        == ()
+    )
+
+
+# ---------------------------------------------------------------------------
+# T1 acceptance: chunk index density + substring invariants (validator)
+# ---------------------------------------------------------------------------
+
+
+def _wire_with_chunks(chunks: list[dict]) -> dict:
+    """A minimal on-contract wire envelope with ``chunks`` replaced."""
+    return {
+        "source_ref": '{"document_id":"D","unit":1,"version":"v"}',
+        "body": "alpha beta",
+        "chunks": chunks,
+        "metadata": {field: "x" for field in REQUIRED_PUSH_METADATA_FIELDS},
+        "valid_from": VALID_FROM,
+        "valid_until": VALID_UNTIL,
+    }
+
+
+def test_chunk_index_not_dense_from_zero_is_a_named_protocol_error() -> None:
+    """A ``chunks`` index sequence of ``0, 2`` (gap at 1) violates the
+    monotonic-from-0 invariant and is refused by name — the wire
+    declares ``0..N-1`` in order, not merely "increasing"."""
+    wire = _wire_with_chunks(
+        [{"index": 0, "content": "alpha"}, {"index": 2, "content": "beta"}]
+    )
+
+    with pytest.raises(PushProtocolError) as excinfo:
+        validate_envelope_chunks(wire)
+
+    assert excinfo.value.code == "push_protocol_error"
+    assert "not monotonic" in str(excinfo.value)
+
+
+def test_chunk_content_not_contiguous_substring_of_body_is_refused() -> None:
+    """A chunk whose content is not a contiguous substring of the body
+    (SC11 / SC16「连续子串」) is refused by name."""
+    wire = _wire_with_chunks([{"index": 0, "content": "gamma delta"}])
+
+    with pytest.raises(PushProtocolError) as excinfo:
+        validate_envelope_chunks(wire)
+
+    assert excinfo.value.code == "push_protocol_error"
+    assert "contiguous substring" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        pytest.param([], id="empty-chunks"),
+        pytest.param(
+            [{"index": 0, "content": "alpha"}, "stray string"],
+            id="non-mapping-chunk",
+        ),
+        pytest.param([{"index": "0", "content": "alpha"}], id="str-index"),
+        pytest.param([{"index": True, "content": "alpha"}], id="bool-index"),
+        pytest.param([{"index": 0, "content": ""}], id="empty-content"),
+        pytest.param([{"index": 0, "content": None}], id="null-content"),
+    ],
+)
+def test_off_contract_chunk_shapes_are_refused_by_name(chunks: list) -> None:
+    """The chunk validator refuses every off-contract ``chunks`` shape
+    with the same named protocol error — a malformed chunk is never
+    coerced into a plausible one."""
+    with pytest.raises(PushProtocolError) as excinfo:
+        validate_envelope_chunks(_wire_with_chunks(chunks))
+
+    assert excinfo.value.code == "push_protocol_error"

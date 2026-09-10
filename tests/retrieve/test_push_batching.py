@@ -27,6 +27,8 @@ import pytest
 
 from fin.corpus.chunking import split_unit
 from fin.corpus.parsers._common import build_unit
+from types import MappingProxyType
+
 from fin.corpus.push import PushRecord, unit_push_records
 from fin.retrieve.fake_push_port import FakePushPort
 from fin.retrieve.push_batching import (
@@ -499,3 +501,88 @@ def test_coerced_envelope_chunks_carry_record_id_and_content_id() -> None:
         # child-level content identities collapse).
         assert envelope.body_content_id == record.content_id
         assert envelope.source_ref == record.source_ref
+
+
+# ---------------------------------------------------------------------------
+# Back-compat coercion boundary: degenerate PushRecord inputs
+# ---------------------------------------------------------------------------
+
+
+def _degenerate_record(**overrides: object) -> PushRecord:
+    base: dict[str, Any] = {
+        "block_id": "b0",
+        "source_ref": "docs/x.md",
+        "content_id": "c0",
+        "text": "hello",
+        "parent_block_id": "p0",
+        "parent_text": "parent",
+        "metadata": MappingProxyType({}),
+    }
+    base.update(overrides)
+    return PushRecord(**base)
+
+
+def test_coerced_record_without_block_id_omits_the_chunk_id_field() -> None:
+    """A hand-rolled record whose ``block_id`` is ``None`` (or missing)
+    coerces into an envelope whose chunk simply omits the ``id`` field —
+    the projection is well-defined rather than raising or writing a
+    ``null`` id the receiving schema would refuse."""
+    envelopes = plan_batches([_degenerate_record(block_id=None)])
+
+    wire = envelopes[0].envelopes[0].to_wire()
+    assert wire["chunks"] == [{"index": 0, "content": "hello", "content_id": "c0"}]
+    # the body identity is the record's own pinned content_id
+    assert envelopes[0].envelopes[0].body_content_id == "c0"
+
+
+def test_coerced_record_with_empty_text_is_forwarded_verbatim() -> None:
+    """An empty-text record coerces to an empty-body envelope; the
+    empty-document judgement is the push entry point's named refusal
+    (``PushEmptyDocumentError``), never a silent zero-chunk write."""
+    from fin.retrieve.fake_push_port import FakePushPort
+    from fin.retrieve.push_batching import push_in_batches, PushJournal
+    from fin.retrieve.push_port import PushEmptyDocumentError
+
+    port = FakePushPort()
+    journal = PushJournal()
+    record = _degenerate_record(
+        text="",
+        metadata=MappingProxyType(
+            {
+                "fmt": "txt",
+                "doc_type": "narrative",
+                "section": "body",
+                "source_sha256": "a" * 64,
+                "parse_rule_version": "p1",
+                "params_table_version": "t1",
+            }
+        ),
+    )
+
+    with pytest.raises(PushEmptyDocumentError):
+        push_in_batches(port, [record], journal=journal)
+
+    assert port.block_total() == 0
+
+
+def test_coerce_rejects_items_that_are_neither_envelope_nor_record() -> None:
+    """``plan_batches`` names the item type it cannot coerce instead of
+    letting a ``AttributeError`` escape from the wrong layer."""
+    from fin.corpus.push import PushEnvelope
+
+    with pytest.raises(TypeError) as excinfo:
+        plan_batches(["not an envelope"])
+
+    assert "str" in str(excinfo.value)
+    # the two supported shapes still pass through untouched
+    record = _degenerate_record()
+    assert plan_batches([record])[0].envelopes[0].body_content_id == "c0"
+    assert plan_batches(
+        [PushEnvelope(
+            source_ref="s", body="b",
+            chunks=(), metadata=MappingProxyType({}),
+            valid_from="0001-01-01T00:00:00.000Z",
+            valid_until="9999-12-31T23:59:59.999Z",
+            body_content_id="c0",
+        )]
+    )[0].envelopes[0].body_content_id == "c0"
