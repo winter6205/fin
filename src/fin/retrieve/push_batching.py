@@ -76,6 +76,7 @@ from fin.corpus.push import (
     PushEnvelope,
     PushRecord,
     idempotency_keys_digest,
+    record_to_envelope,
 )
 from fin.retrieve._ledger.jsonl import append_jsonl_object, replay_jsonl_objects
 from fin.retrieve.input_validation import InputValidationLedger
@@ -500,45 +501,15 @@ def _coerce_envelope(item: object) -> PushEnvelope:
     hand :class:`PushRecord` rows to ``push_in_batches`` keep working
     after T1. Production callers should pass :class:`PushEnvelope`
     instances built by :func:`fin.corpus.push.envelopes_of_document`.
+    The record → envelope projection itself is the SSOT
+    :func:`fin.corpus.push.record_to_envelope` — shared with the
+    direct-push shim in :mod:`fin.retrieve.push_port` so the two wire
+    paths cannot drift.
     """
     if isinstance(item, PushEnvelope):
         return item
     if isinstance(item, PushRecord):
-        from fin.corpus.push import envelope_of_unit  # avoid cycle
-        # A PushRecord carries a single child block; reconstruct a
-        # unit-shaped chunking for envelope_of_unit's ``payloads``
-        # iterator. Easier: build the envelope directly.
-        from fin.corpus.push import (
-            PushChunk,
-            content_identity,
-            serialize_source_ref,
-        )
-        # Use the record's text as both body and single chunk, since
-        # the record is the per-child leaf. Carry the record's
-        # ``block_id`` / ``content_id`` onto the synthesized chunk so
-        # the batching wire shape matches the direct-push wire shape
-        # produced by :func:`envelope_of_unit` — otherwise the
-        # catalog-side invalidation path (which keys on
-        # ``chunks[0]["id"]``) cannot resolve per-child ids on a
-        # batched envelope and the test suite's blocking-port recorder
-        # raises ``KeyError: 'id'``.
-        metadata = dict(item.metadata)
-        return PushEnvelope(
-            source_ref=item.source_ref,
-            body=item.text,
-            chunks=(
-                PushChunk(
-                    index=0,
-                    content=item.text,
-                    id=item.block_id,
-                    content_id=item.content_id,
-                ),
-            ),
-            metadata=metadata,  # type: ignore[arg-type]
-            valid_from="0001-01-01T00:00:00.000Z",
-            valid_until="9999-12-31T23:59:59.999Z",
-            body_content_id=item.content_id,
-        )
+        return record_to_envelope(item)
     raise TypeError(
         f"cannot coerce {type(item).__name__} into a push envelope"
     )

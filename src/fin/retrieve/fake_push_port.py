@@ -68,6 +68,10 @@ import json
 import threading
 from typing import Any, Final, Mapping, Sequence
 
+from fin.corpus.push import (
+    body_content_id,
+    content_identity,
+)
 from fin.retrieve.invalidation_port import (
     InvalidationError,
     InvalidationUnknownTargetError,
@@ -89,28 +93,6 @@ from fin.retrieve.push_port import (
 # interval sets ``valid_to`` to this same value, making the half-open
 # interval empty — no query instant can fall inside it.
 VALID_FROM: Final[int] = 0
-
-_ID_SEPARATOR: Final[str] = "\x1f"
-
-
-def _envelope_body_content_id(envelope: Mapping[str, Any]) -> str:
-    """The wire-level idempotency body identity.
-
-    Deterministic sha256 over the body text + the SC20 rule versions,
-    joined by ``\\x1f`` so a field value cannot impersonate a field
-    boundary (mirrors :func:`fin.corpus.push.content_identity`).
-    """
-    body = envelope.get("content")
-    if body is None:
-        body = envelope.get("body")
-    metadata = envelope.get("metadata") or {}
-    parts = (
-        str(body),
-        str(metadata.get("normalization_rule_version", "")),
-        str(metadata.get("parse_rule_version", "")),
-        str(metadata.get("params_table_version", "")),
-    )
-    return hashlib.sha256(_ID_SEPARATOR.join(parts).encode("utf-8")).hexdigest()
 
 
 def _fake_chunk_id(source_ref: str, chunk: Mapping[str, Any]) -> str:
@@ -147,13 +129,14 @@ def _fake_chunk_content_id(
     (``(source_ref, content_id)``) still resolves, even when a test
     pushes a hand-rolled envelope that omits the per-chunk key.
     """
-    parts = (
+    return content_identity(
         str(chunk["content"]),
-        str(metadata.get("normalization_rule_version", "")),
-        str(metadata.get("parse_rule_version", "")),
-        str(metadata.get("params_table_version", "")),
+        normalization_rule_version=str(
+            metadata.get("normalization_rule_version", "")
+        ),
+        parse_rule_version=str(metadata.get("parse_rule_version", "")),
+        params_table_version=str(metadata.get("params_table_version", "")),
     )
-    return hashlib.sha256(_ID_SEPARATOR.join(parts).encode("utf-8")).hexdigest()
 
 
 class FakePushPort:
@@ -248,6 +231,41 @@ class FakePushPort:
           (SC11 / SC16 「连续子串」);
         * the SC20 metadata filter fields are present and well-typed.
         """
+        self._validate_batch(envelopes)
+        block_ids: list[str] = []
+        written = 0
+        duplicates = 0
+        for envelope in envelopes:
+            with self._idempotency_lock:
+                key = self._envelope_key(envelope)
+                if key in self._by_key:
+                    stored = self._by_key[key]
+                    duplicates += self._index_replayed_envelope(
+                        str(envelope["source_ref"]), stored, block_ids
+                    )
+                else:
+                    stored = self._store_envelope(envelope, key)
+                    written += self._index_fresh_envelope(
+                        str(envelope["source_ref"]), stored, block_ids
+                    )
+        return {
+            "block_ids": block_ids,
+            "written": written,
+            "duplicates": duplicates,
+        }
+
+    # ----- push helpers (each step of one push call) -----
+
+    def _validate_batch(
+        self, envelopes: Sequence[Mapping[str, Any]]
+    ) -> None:
+        """Refuse the whole batch before a single write (SC44 / T21).
+
+        An empty batch, an over-cap batch, an envelope with an
+        incomplete body / metadata / chunks shape — every rejection
+        counts on :attr:`rejected_batches` and raises by name, so a
+        refused push can never half-land.
+        """
         ledger = self.input_validation_failures
         try:
             validate_batch_not_empty(envelopes, ledger=ledger)
@@ -264,105 +282,112 @@ class FakePushPort:
             self._rejected_batches += 1
             raise
 
-        # Idempotency on the envelope: wire-level
-        # ``(source_ref, body content identity)``. The fake reconstructs
-        # the body content identity from the envelope metadata + body
-        # text (one canonical hash over the body + the three rule
-        # versions) so the contract fake matches what the adapter
-        # computes.
-        block_ids: list[str] = []
-        written = 0
-        duplicates = 0
-        for envelope in envelopes:
-            source_ref = str(envelope["source_ref"])
-            body_key = _envelope_body_content_id(envelope)
-            key = (source_ref, body_key)
-            with self._idempotency_lock:
-                stored = self._by_key.get(key)
-                if stored is None:
-                    # Deep-enough copy: the metadata mapping is copied
-                    # so a caller mutating its wire dict afterwards
-                    # cannot alter what the "service" holds. The chunks
-                    # list is rebuilt as a fresh list of fresh dicts so
-                    # the same isolation covers the slices.
-                    stored = dict(envelope)
-                    stored["metadata"] = dict(envelope["metadata"])
-                    stored["chunks"] = [
-                        {
-                            "index": chunk["index"],
-                            "content": chunk["content"],
-                            # Preserve the wire-side ``id`` /
-                            # ``content_id`` when the producer
-                            # provided them (the per-child
-                            # ``PushRecord`` shim pins both, so the
-                            # catalog side's pre-T1 block ids stay
-                            # round-trippable).
-                            **(
-                                {"id": chunk["id"]}
-                                if "id" in chunk
-                                else {}
-                            ),
-                            **(
-                                {"content_id": chunk["content_id"]}
-                                if "content_id" in chunk
-                                else {}
-                            ),
-                        }
-                        for chunk in envelope["chunks"]
-                    ]
-                    stored["valid_from"] = VALID_FROM
-                    stored["valid_to"] = None
-                    # Per-chunk validity: every slice starts open; an
-                    # invalidation closes one slice without affecting
-                    # siblings.
-                    for chunk in stored["chunks"]:
-                        chunk["valid_from"] = VALID_FROM
-                        chunk["valid_to"] = None
-                    self._by_key[key] = stored
-                    # Index every chunk by its deterministic block id
-                    # so callers (citation gate, retrieve side) can
-                    # still recall by block id, and also by its
-                    # per-chunk content identity so the invalidation
-                    # path (which is keyed per child) can resolve the
-                    # target back to the right slice.
-                    chunk_block_ids: list[str] = []
-                    for chunk in stored["chunks"]:
-                        chunk_block_id = chunk.get("id")
-                        if chunk_block_id is None:
-                            chunk_block_id = _fake_chunk_id(
-                                source_ref, chunk
-                            )
-                            chunk["id"] = chunk_block_id
-                        self._by_block_id[chunk_block_id] = {
-                            "envelope": stored,
-                            "chunk": chunk,
-                        }
-                        chunk_content_id = chunk.get("content_id")
-                        if chunk_content_id is None:
-                            chunk_content_id = _fake_chunk_content_id(
-                                source_ref, chunk, stored["metadata"]
-                            )
-                            chunk["content_id"] = chunk_content_id
-                        self._by_chunk_invalidation_key[
-                            (source_ref, chunk_content_id)
-                        ] = (stored, chunk)
-                        chunk_block_ids.append(chunk_block_id)
-                    # Counted per chunk (the response shape after T1
-                    # is one block id per chunk, with ``written`` /
-                    # ``duplicates`` summing to the chunk total).
-                    written += len(stored["chunks"])
-                    block_ids.extend(chunk_block_ids)
-                else:
-                    duplicates += len(stored["chunks"])
-                    block_ids.extend(
-                        chunk.get("id") or _fake_chunk_id(source_ref, chunk)
-                        for chunk in stored["chunks"]
-                    )
-        return {
-            "block_ids": block_ids,
-            "written": written,
-            "duplicates": duplicates,
-        }
+    @staticmethod
+    def _envelope_key(envelope: Mapping[str, Any]) -> tuple[str, str]:
+        """The wire-level idempotency key ``(source_ref, body identity)``.
+
+        The body content identity comes from the SSOT
+        :func:`fin.corpus.push.body_content_id` — one canonical hash
+        over the body + the three rule versions, shared with the
+        adapter so the contract fake matches what it computes.
+        """
+        return (str(envelope["source_ref"]), body_content_id(envelope))
+
+    def _store_envelope(
+        self,
+        envelope: Mapping[str, Any],
+        key: tuple[str, str],
+    ) -> dict[str, Any]:
+        """Deep-enough copy of one envelope into the per-key store.
+
+        The metadata mapping is copied so a caller mutating its wire
+        dict afterwards cannot alter what the "service" holds; the
+        chunks list is rebuilt as fresh dicts so the same isolation
+        covers the slices. Every slice starts with an open validity
+        interval (an invalidation closes one slice without affecting
+        siblings).
+        """
+        stored = dict(envelope)
+        stored["metadata"] = dict(envelope["metadata"])
+        stored["chunks"] = [
+            {
+                "index": chunk["index"],
+                "content": chunk["content"],
+                # Preserve the wire-side ``id`` / ``content_id`` when
+                # the producer provided them (the per-child
+                # ``PushRecord`` shim pins both, so the catalog side's
+                # pre-T1 block ids stay round-trippable).
+                **({"id": chunk["id"]} if "id" in chunk else {}),
+                **(
+                    {"content_id": chunk["content_id"]}
+                    if "content_id" in chunk
+                    else {}
+                ),
+            }
+            for chunk in envelope["chunks"]
+        ]
+        stored["valid_from"] = VALID_FROM
+        stored["valid_to"] = None
+        for chunk in stored["chunks"]:
+            chunk["valid_from"] = VALID_FROM
+            chunk["valid_to"] = None
+        self._by_key[key] = stored
+        return stored
+
+    def _index_fresh_envelope(
+        self,
+        source_ref: str,
+        stored: dict[str, Any],
+        block_ids: list[str],
+    ) -> int:
+        """Index a just-stored envelope's chunks; return its chunk count.
+
+        Every chunk is indexed by its deterministic block id (so
+        callers — citation gate, retrieve side — can still recall by
+        block id) and by its per-chunk content identity (so the
+        invalidation path, which is keyed per child, can resolve the
+        target back to the right slice).
+        """
+        for chunk in stored["chunks"]:
+            chunk_block_id = chunk.get("id")
+            if chunk_block_id is None:
+                chunk_block_id = _fake_chunk_id(source_ref, chunk)
+                chunk["id"] = chunk_block_id
+            self._by_block_id[chunk_block_id] = {
+                "envelope": stored,
+                "chunk": chunk,
+            }
+            chunk_content_id = chunk.get("content_id")
+            if chunk_content_id is None:
+                chunk_content_id = _fake_chunk_content_id(
+                    source_ref, chunk, stored["metadata"]
+                )
+                chunk["content_id"] = chunk_content_id
+            self._by_chunk_invalidation_key[
+                (source_ref, chunk_content_id)
+            ] = (stored, chunk)
+            block_ids.append(chunk_block_id)
+        # Counted per chunk (the response shape after T1 is one block
+        # id per chunk, with ``written`` / ``duplicates`` summing to
+        # the chunk total).
+        return len(stored["chunks"])
+
+    def _index_replayed_envelope(
+        self,
+        source_ref: str,
+        stored: dict[str, Any],
+        block_ids: list[str],
+    ) -> int:
+        """Echo a replayed envelope's stored chunk ids; return chunk count.
+
+        A replay writes nothing — the stored chunk ids are returned in
+        order so the response matches the original write.
+        """
+        block_ids.extend(
+            chunk.get("id") or _fake_chunk_id(source_ref, chunk)
+            for chunk in stored["chunks"]
+        )
+        return len(stored["chunks"])
 
     # ----- recall -----
 

@@ -55,6 +55,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
+from fin.corpus.push import body_content_id as _body_content_id
 from fin.host.compile import DEFAULT_MCP_COMMAND
 from fin.retrieve.input_validation import InputValidationLedger
 from fin.retrieve.mcp_session import (
@@ -83,44 +84,6 @@ _VALID_UNTIL_SENTINEL: str = "9999-12-31T23:59:59.999Z"
 _MCP_PROTOCOL_VERSION: str = "2025-06-18"
 _INITIALIZE_REQUEST_ID: int = 1
 _TOOL_REQUEST_ID: int = 2
-
-# The same ``\x1f`` separator :func:`fin.corpus.push.content_identity`
-# uses to keep rule-version strings from impersonating field
-# boundaries. The wire envelope carries its own
-# ``body_content_id`` (the corpus side's hash over the body + the
-# three rule versions); the adapter accepts that key when present
-# and falls back to deriving the same hash from the wire body +
-# metadata.
-_BODY_ID_SEPARATOR: str = "\x1f"
-
-
-def _body_content_id(envelope: Mapping[str, Any]) -> str:
-    """The wire-level idempotency body identity.
-
-    Mirrors :func:`fin.corpus.push.content_identity` over the envelope
-    body + the three rule versions. The envelope may already carry
-    ``body_content_id`` (the corpus side pre-computes it); when it
-    does, we trust it. Otherwise we derive the same hash on the
-    adapter side so a hand-rolled wire envelope still keys idempotent.
-    """
-    explicit = envelope.get("body_content_id")
-    if isinstance(explicit, str) and explicit:
-        return explicit
-    body = envelope.get("content")
-    if body is None:
-        body = envelope.get("body")
-    metadata = envelope.get("metadata") or {}
-    import hashlib
-    parts = (
-        str(body or ""),
-        str(metadata.get("normalization_rule_version", "")),
-        str(metadata.get("parse_rule_version", "")),
-        str(metadata.get("params_table_version", "")),
-    )
-    return hashlib.sha256(
-        _BODY_ID_SEPARATOR.join(parts).encode("utf-8")
-    ).hexdigest()
-
 
 logger = logging.getLogger(__name__)
 
@@ -369,8 +332,18 @@ def _extract_push_business_envelope(response: Any) -> dict[str, Any]:
     )
 
 
-def _chunk_ids_of(envelope: dict[str, Any], *, record_count: int) -> tuple[str, ...]:
-    """Pull ``chunk_ids`` out of the business envelope and validate it."""
+def _chunk_ids_of(envelope: dict[str, Any], *, chunk_count: int) -> tuple[str, ...]:
+    """Pull ``chunk_ids`` out of the business envelope and validate it.
+
+    ``chunk_count`` is the number of chunks across **all** envelopes the
+    adapter sent — the receiving ``push`` tool hands back one
+    ``chunk_id`` per slice, regardless of how many envelopes those
+    slices were packed into. A multi-chunk envelope therefore
+    contributes ``len(envelope.chunks)`` ids to the response. The
+    length check pins that 1:1 correspondence: a short envelope would
+    hide a lost chunk; a stray one would pretend a chunk we never
+    sent had landed.
+    """
     chunk_ids = envelope.get("chunk_ids")
     if isinstance(chunk_ids, (str, bytes)) or not isinstance(chunk_ids, list):
         raise PushProtocolError(
@@ -381,10 +354,10 @@ def _chunk_ids_of(envelope: dict[str, Any], *, record_count: int) -> tuple[str, 
         raise PushProtocolError(
             "push response chunk_ids contains a non-string chunk id"
         )
-    if len(chunk_ids) != record_count:
+    if len(chunk_ids) != chunk_count:
         raise PushProtocolError(
             f"push response carries {len(chunk_ids)} chunk ids for "
-            f"{record_count} pushed records"
+            f"{chunk_count} pushed chunks"
         )
     return tuple(chunk_ids)
 
@@ -425,10 +398,13 @@ class MCPPushPort:
         self._timeout: float = float(timeout_seconds)
         self._ledger: InputValidationLedger | None = ledger
         self._session = session
-        # ``(source_ref, content_id)`` → ``block_id`` for the keys the
-        # adapter has already seen, so a replay is reported as
-        # ``duplicates`` instead of a fresh ``written`` batch.
-        self._seen_keys: dict[tuple[str, str], str] = {}
+        # ``(source_ref, body_content_id)`` membership set for envelopes
+        # the adapter has already seen, so a replay is reported as
+        # ``duplicates`` instead of a fresh ``written`` batch. The value
+        # is a constant sentinel — the membership test is the only
+        # invariant the bookkeeping needs (the chunk ids come back from
+        # the receiver's own idempotency baseline).
+        self._seen_keys: dict[tuple[str, str], bool] = {}
 
     @property
     def input_validation_failures(self) -> InputValidationLedger:
@@ -455,13 +431,16 @@ class MCPPushPort:
         short or off-contract envelope becomes
         :class:`PushProtocolError`.
 
-        ``block_ids`` is parallel to ``envelopes``: an envelope whose
-        ``(source_ref, body_content_id)`` was already seen yields the
-        **stored** ``chunk_id``, so a replay returns the same ids as
-        the original write. ``written`` / ``duplicates`` come from the
-        adapter's own idempotency ledger (the service only echoes
-        ``chunk_ids`` — it does not split them into new vs.
-        duplicate).
+        ``block_ids`` is parallel to **chunks across all envelopes**
+        (the receiving ``push`` tool hands back one ``chunk_id`` per
+        slice — see ``src/tools/push.ts`` ``allChunkIds``). ``written``
+        and ``duplicates`` count chunks so the three fields agree; an
+        envelope that was already on this adapter's ``(source_ref,
+        body_content_id)`` ledger contributes its chunk count to
+        ``duplicates`` rather than to ``written``. The
+        ``_seen_keys`` ledger keys on the envelope-level idempotency
+        pair, not on chunk ids, so a multi-chunk envelope is one
+        idempotency row.
         """
         ledger = self.input_validation_failures
         validate_batch_not_empty(envelopes, ledger=ledger)
@@ -490,19 +469,29 @@ class MCPPushPort:
             ) from exc
 
         envelope = _extract_push_business_envelope(response)
-        chunk_ids = _chunk_ids_of(envelope, record_count=len(envelopes))
+        chunk_count = sum(
+            len(item.get("chunks") or []) for item in items
+        )
+        chunk_ids = _chunk_ids_of(envelope, chunk_count=chunk_count)
 
         written, duplicates = 0, 0
-        for wire, block_id in zip(envelopes, chunk_ids):
+        for wire in envelopes:
+            chunk_total = len(wire.get("chunks") or [])
             key = (
                 str(wire["source_ref"]),
                 str(_body_content_id(wire)),
             )
             if key in self._seen_keys:
-                duplicates += 1
+                # The adapter's ledger remembers the envelope as a
+                # duplicate before the round trip; the server is
+                # expected to echo the same chunk ids (its own
+                # idempotency baseline — §B1 / §B4), so the chunk ids
+                # returned this round are exactly the ones the original
+                # write produced.
+                duplicates += chunk_total
             else:
-                self._seen_keys[key] = block_id
-                written += 1
+                self._seen_keys[key] = True
+                written += chunk_total
 
         return {
             "block_ids": list(chunk_ids),
