@@ -195,31 +195,30 @@ def test_fake_port_pages_by_doc_is_copied_not_aliased() -> None:
     assert fake.read("INJECTED-2024Q1", VERSION) == {"error": "unknown_locator"}
 
 
-# ===== MCPRetrieveAdapter.read: named failure, no local fallback =====
+# ===== MCPRetrieveAdapter.read: MCP dispatch, no local fallback =====
 
 
-def test_mcp_adapter_read_is_named_unavailable() -> None:
-    """iknow-memory has no read endpoint (handoff 2026-09-04), so the
-    product read is the named ``read_unavailable`` EXIT — not
-    ``{"chunks": []}``-style silence and not a read of the local tree."""
+def test_mcp_adapter_read_unknown_without_locator_map() -> None:
+    """A document with no unit locator map is a typed miss and never
+    silently consults the local extracted tree."""
     adapter = MCPRetrieveAdapter(command=None)
-    assert adapter.read("TEST-2023Q1", VERSION) == {"error": "read_unavailable"}
+    assert adapter.read("TEST-2023Q1", VERSION) == {"error": "unknown_locator"}
 
 
-def test_mcp_adapter_read_touches_no_transport_and_no_tree(
+def test_mcp_adapter_read_touches_no_local_tree(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The unavailable read is decided before any subprocess spawn and
-    without consulting the extracted tree loader."""
+    """An MCP read with no known document cannot fall through to the
+    extracted tree loader."""
 
     def _boom(*args: object, **kwargs: object) -> None:
-        raise AssertionError("MCP read must not spawn a transport")
+        raise AssertionError("MCP read consulted the local tree")
 
     monkeypatch.setattr(
-        "fin.retrieve.mcp_adapter.MCPStdioSession", _boom, raising=False
+        "fin.retrieve.read_port.load_extracted_tree", _boom, raising=False
     )
     adapter = MCPRetrieveAdapter(command=["iknow-memory"])
-    assert adapter.read("TEST-2023Q1", VERSION) == {"error": "read_unavailable"}
+    assert adapter.read("TEST-2023Q1", VERSION) == {"error": "unknown_locator"}
 
 
 # ===== ExtractedTreeReadPort: legacy adapter, typed miss on broken tree =====

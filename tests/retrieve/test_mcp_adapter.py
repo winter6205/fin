@@ -116,6 +116,378 @@ class _ScriptedAdapter(MCPRetrieveAdapter):
         raise RuntimeError("no scripted response configured")
 
 
+class _ReadCapturingAdapter(_ScriptedAdapter):
+    """Scripted ``_call_mcp`` for ``read()``.
+
+    The fake returns the **real** MCP wire shape — a list of text content
+    blocks carrying a JSON envelope — so the scripted suite exercises the
+    same decode path the real iknow-memory server drives. Bodies map
+    ``source_ref`` → body text; ``errors`` inject JSON-RPC error envelopes
+    for the named-miss path.
+    """
+
+    def __init__(self, *, bodies: dict[str, str], errors: list[dict] | None = None, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.bodies = dict(bodies)
+        self.errors = list(errors or [])
+        self.payloads: list[dict] = []
+
+    async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
+        self.payloads.append(payload)
+        if self.errors:
+            return self.errors.pop(0)
+        source_ref = payload["params"]["arguments"]["source_ref"]
+        body = self.bodies.get(source_ref, "")
+        inner = {
+            "id": source_ref,
+            "source_ref": source_ref,
+            "content": body,
+        }
+        return {
+            "result": {
+                "content": [
+                    {"type": "text", "text": json.dumps(inner)}
+                ]
+            }
+        }
+
+
+def test_mcp_read_ingested_document_calls_read_source_per_unit() -> None:
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locators = (Locator(document_id, version, 2), Locator(document_id, version, 1))
+    source_refs = [serialize_source_ref(UnitLocator(document_id, version, locator.page)) for locator in locators]
+    adapter = _ReadCapturingAdapter(
+        bodies={source_refs[0]: "SECOND PARAGRAPH", source_refs[1]: "FIRST PARAGRAPH"},
+        locator_map={"hit-2": locators[0], "hit-1": locators[1]},
+        known_document_ids={document_id},
+    )
+    result = adapter.read(document_id, version, page=1, page_limit=2)
+    assert [payload["params"]["arguments"] for payload in adapter.payloads] == [
+        {"source_ref": source_refs[1]}, {"source_ref": source_refs[0]}
+    ]
+    assert result == {"document_id": document_id, "version": version, "page": 1, "text": "FIRST PARAGRAPH\n\nSECOND PARAGRAPH", "page_count": 2}
+
+
+def test_mcp_read_clamps_window_and_unit_order() -> None:
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locators = tuple(Locator(document_id, version, page) for page in range(1, 5))
+    refs = {locator.page: serialize_source_ref(UnitLocator(document_id, version, locator.page)) for locator in locators}
+    adapter = _ReadCapturingAdapter(
+        bodies={refs[2]: "PAGE TWO", refs[3]: "PAGE THREE", refs[4]: "PAGE FOUR"},
+        locator_map={f"hit-{page}": locator for page, locator in enumerate(locators, 1)},
+        known_document_ids={document_id},
+    )
+    result = adapter.read(document_id, version, page=2, page_limit=99)
+    assert [payload["params"]["arguments"] for payload in adapter.payloads] == [{"source_ref": refs[2]}, {"source_ref": refs[3]}, {"source_ref": refs[4]}]
+    assert result["text"] == "PAGE TWO\n\nPAGE THREE\n\nPAGE FOUR"
+    assert result["page"] == 2 and result["page_count"] == 4
+
+
+def test_mcp_read_miss_and_unknown_document_are_unknown_locator() -> None:
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locator = Locator(document_id, version, 1)
+    adapter = _ReadCapturingAdapter(
+        bodies={}, locator_map={"hit": locator}, known_document_ids={document_id},
+        errors=[{"error": {"code": -32001, "message": "read_source_not_found"}}],
+    )
+    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
+    unknown = _ReadCapturingAdapter(bodies={}, locator_map={"hit": locator}, known_document_ids={document_id})
+    assert unknown.read("UNKNOWN-2099Q9", version) == {"error": "unknown_locator"}
+    assert unknown.payloads == []
+
+
+def test_mcp_read_iserror_content_block_is_unknown_locator() -> None:
+    """The real ``read_source`` miss wire is an ``isError`` content
+    block whose text is a JSON envelope carrying the named code.
+
+    The adapter must surface that as ``unknown_locator`` — the same
+    miss shape the JSON-RPC error path uses — never as an empty
+    success and never as the raw block list.
+    """
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locator = Locator(document_id, version, 1)
+    source_ref = serialize_source_ref(
+        UnitLocator(document_id, version, unit=locator.page)
+    )
+    miss_envelope = {
+        "error": "read_source_not_found",
+        "source_ref": source_ref,
+    }
+    adapter = _ReadCapturingAdapter(
+        bodies={},
+        locator_map={"hit": locator},
+        known_document_ids={document_id},
+        errors=[
+            {
+                "result": {
+                    "isError": True,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(miss_envelope),
+                        }
+                    ],
+                }
+            }
+        ],
+    )
+    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
+
+
+def test_mcp_read_invalidated_content_block_is_unknown_locator() -> None:
+    """A ``read_source_invalidated`` content block — the T5
+    operator-console miss — is also surfaced as ``unknown_locator``.
+
+    The receiving service distinguishes "row exists but window is
+    closed" from "row missing", but fin's read contract collapses
+    both to the existing miss shape; this guard ensures the
+    invalidated code (which also starts with ``read_source_``) does
+    not slip through as a successful empty body.
+    """
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locator = Locator(document_id, version, 1)
+    source_ref = serialize_source_ref(
+        UnitLocator(document_id, version, unit=locator.page)
+    )
+    miss_envelope = {
+        "error": "read_source_invalidated",
+        "source_ref": source_ref,
+        "valid_until": "2026-01-01T00:00:00.000Z",
+    }
+    adapter = _ReadCapturingAdapter(
+        bodies={},
+        locator_map={"hit": locator},
+        known_document_ids={document_id},
+        errors=[
+            {
+                "result": {
+                    "isError": True,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(miss_envelope),
+                        }
+                    ],
+                }
+            }
+        ],
+    )
+    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
+
+
+def test_mcp_read_version_mismatch_rejects_before_transport() -> None:
+    locator = Locator("DOC-2023Q1", "v-" + "b" * 60, 1)
+    adapter = _ReadCapturingAdapter(bodies={}, locator_map={"hit": locator}, known_document_ids={"DOC-2023Q1"})
+    assert adapter.read("DOC-2023Q1", "v-" + "a" * 60) == {"error": "unknown_locator"}
+    assert adapter.payloads == []
+
+
+@pytest.mark.parametrize(("page", "page_limit"), [(0, 1), (1, 0), (4, 3)])
+def test_mcp_read_invalid_window_rejects_before_transport(page: int, page_limit: int) -> None:
+    locator = Locator("DOC-2023Q1", "v-" + "a" * 60, 3)
+    adapter = _ReadCapturingAdapter(bodies={}, locator_map={"hit": locator}, known_document_ids={"DOC-2023Q1"})
+    assert adapter.read("DOC-2023Q1", "v-" + "a" * 60, page, page_limit) == {"error": "unknown_locator"}
+    assert adapter.payloads == []
+
+
+# ----- read_source content-block decode: boundary shapes -----
+
+
+class _FixedResponseAdapter(_ScriptedAdapter):
+    """Scripted ``_call_mcp`` returning one fixed wire response for
+    ``read()`` — same decode path as ``_ReadCapturingAdapter`` but with
+    full control over the response envelope."""
+
+    def __init__(self, response: dict, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self._response = response
+
+    async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
+        return self._response
+
+
+def _success_content_block(*blocks: dict) -> dict:
+    return {"result": {"content": list(blocks)}}
+
+
+def test_read_mixed_content_blocks_concatenate_only_text_bodies() -> None:
+    """A content list mixing text blocks with non-text blocks (e.g.
+    resource / image blocks) still reads: every text block carrying a
+    body envelope contributes, the non-text ones are skipped — the
+    decode is per-block, not all-or-nothing."""
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locator = Locator(document_id, version, 1)
+    source_ref = serialize_source_ref(UnitLocator(document_id, version, unit=1))
+    adapter = _FixedResponseAdapter(
+        _success_content_block(
+            {"type": "text", "text": json.dumps({"id": source_ref, "content": "BODY TEXT"})},
+            {"type": "resource", "resource": {"uri": "x"}},
+            {"type": "text", "text": json.dumps({"id": source_ref, "content": "MORE"})},
+        ),
+        locator_map={"hit": locator},
+        known_document_ids={document_id},
+    )
+    result = adapter.read(document_id, version)
+    assert result["text"] == "BODY TEXT\n\nMORE"
+
+
+def test_read_content_block_with_unknown_error_code_is_not_a_body() -> None:
+    """An inner JSON envelope whose ``error`` code does NOT start with
+    ``read_source_`` carries no ``content`` body — the fallback keeps
+    the raw text, so the read surfaces the envelope as page text rather
+    than silently answering ``unknown_locator``. Pinned so a future
+    tightening of the decoder is a deliberate contract change."""
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locator = Locator(document_id, version, 1)
+    adapter = _FixedResponseAdapter(
+        _success_content_block(
+            {"type": "text", "text": json.dumps({"error": "internal_boom"})}
+        ),
+        locator_map={"hit": locator},
+        known_document_ids={document_id},
+    )
+    result = adapter.read(document_id, version)
+    assert result["text"] == json.dumps({"error": "internal_boom"})
+
+
+def test_read_content_block_with_read_source_error_without_iserror_misses() -> None:
+    """The invalidated miss can arrive WITHOUT an ``isError`` flag — a
+    success envelope whose inner JSON carries the ``read_source_*``
+    code. The decoder still treats it as the named miss (the code
+    prefix is the contract, not the ``isError`` flag)."""
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locator = Locator(document_id, version, 1)
+    source_ref = serialize_source_ref(UnitLocator(document_id, version, unit=1))
+    adapter = _FixedResponseAdapter(
+        _success_content_block(
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "error": "read_source_invalidated",
+                        "source_ref": source_ref,
+                        "valid_until": "2026-01-01T00:00:00.000Z",
+                    }
+                ),
+            }
+        ),
+        locator_map={"hit": locator},
+        known_document_ids={document_id},
+    )
+    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
+
+
+def test_read_empty_content_list_is_unknown_locator() -> None:
+    """A success envelope with an EMPTY content list has no body on the
+    wire — folded into the ``unknown_locator`` miss, never answered as
+    an empty page text."""
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locator = Locator(document_id, version, 1)
+    adapter = _FixedResponseAdapter(
+        _success_content_block(),
+        locator_map={"hit": locator},
+        known_document_ids={document_id},
+    )
+    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
+
+
+def test_read_non_json_inner_text_is_unknown_locator() -> None:
+    """A text block that is not valid JSON is garbage on the wire —
+    folded into the miss, never surfaced as page text."""
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locator = Locator(document_id, version, 1)
+    adapter = _FixedResponseAdapter(
+        _success_content_block({"type": "text", "text": "plain garbage, not json"}),
+        locator_map={"hit": locator},
+        known_document_ids={document_id},
+    )
+    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
+
+
+def test_read_flat_string_content_is_a_usable_body() -> None:
+    """A hand-rolled adapter that projects the body as a flat string
+    ``content`` still reads — the forward-compat fallback is pinned."""
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locator = Locator(document_id, version, 1)
+    adapter = _FixedResponseAdapter(
+        {"result": {"content": "FLAT BODY"}},
+        locator_map={"hit": locator},
+        known_document_ids={document_id},
+    )
+    result = adapter.read(document_id, version)
+    assert result["text"] == "FLAT BODY"
+
+
+def test_read_iserror_block_with_plain_text_misses() -> None:
+    """An ``isError`` content block whose text is not even the named
+    ``read_source_*`` JSON still misses — ``isError`` itself means the
+    tool refused, whatever the text says."""
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locator = Locator(document_id, version, 1)
+    adapter = _FixedResponseAdapter(
+        {"result": {"isError": True, "content": [{"type": "text", "text": "boom"}]}},
+        locator_map={"hit": locator},
+        known_document_ids={document_id},
+    )
+    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
+
+
+def test_read_transport_timeout_is_a_typed_error_not_a_miss() -> None:
+    """A transport-level failure (timeout) during ``read`` raises the
+    typed ``RetrieveUnavailableError`` — the machine saying "I cannot
+    ask" is a DIFFERENT failure from the locator not being there (the
+    miss shape). The host tool never sees it through ``read_file``'s
+    miss contract, so this stays a raised, typed EXIT."""
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locator = Locator(document_id, version, 1)
+
+    class _TimeoutAdapter(_ScriptedAdapter):
+        async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
+            raise asyncio.TimeoutError()
+
+    adapter = _TimeoutAdapter(
+        locator_map={"hit": locator},
+        known_document_ids={document_id},
+    )
+    with pytest.raises(RetrieveUnavailableError) as excinfo:
+        adapter.read(document_id, version)
+    assert "MCP transport failed" in str(excinfo.value)
+
+
+def test_read_ingested_locator_invalidated_on_memory_side_is_unknown_locator() -> None:
+    """Cross-repo semantic (T5): a locator fin ingested but the memory
+    side later invalidated answers the ``unknown_locator`` miss — the
+    invalidated row is not readable through ``read_file``, and the
+    distinction "exists but window closed" is deliberately collapsed
+    into the existing miss shape fin's read contract already has."""
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locator = Locator(document_id, version, 1)
+    source_ref = serialize_source_ref(UnitLocator(document_id, version, unit=1))
+    adapter = _ReadCapturingAdapter(
+        bodies={},
+        locator_map={"hit": locator},
+        known_document_ids={document_id},
+        errors=[
+            {
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {
+                                    "error": "read_source_invalidated",
+                                    "source_ref": source_ref,
+                                }
+                            ),
+                        }
+                    ]
+                }
+            }
+        ],
+    )
+    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
+
+
 # ----- boundary 1: empty -----
 
 

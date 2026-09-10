@@ -7,8 +7,8 @@ an injected :class:`~fin.retrieve.read_port.ReadPort` (ADR 0046 /
 0047) — the tool itself owns NO storage path:
 
 * the product MCP path injects the ``MCPRetrieveAdapter``'s own
-  ``read`` (currently the named ``read_unavailable`` EXIT — iknow
-  has no read tool yet);
+  ``read``, which dispatches an ingested locator to the MCP
+  ``read_source`` tool and misses otherwise;
 * the fake path injects ``FakeRetrievePort.read``, which serves
   bodies from the fake's ``pages_by_doc`` manifest;
 * offline / committed-corpus tests may inject

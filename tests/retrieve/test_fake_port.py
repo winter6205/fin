@@ -247,3 +247,90 @@ def _mk_chunk(document_id: str, page: int, text: str):
         ),
         score=1.0,
     )
+
+
+# ----- spec SC: retrieve envelope shape (no full 资料 body) -----
+
+
+def test_fake_retrieve_empty_hits_yield_chunks_only_no_body() -> None:
+    """Spec SC: Fake retrieve still maps empty hits to
+    ``{ chunks: [] }`` and the retrieve envelope carries no full 资料
+    body field.
+
+    The retrieve envelope is the contract shape ADR 0009 / ADR 0031
+    pin — ``{"chunks": [...]}`` plus the §B3 degradation fields — and
+    the spec adds that it MUST NOT carry a full 资料 body field
+    (``body`` / ``content``) on the envelope or on the chunks
+    themselves. The Fake mirrors the canonical MCP adapter's envelope
+    shape exactly: an empty hit answer is the same dict shape, just
+    with an empty ``chunks`` list.
+
+    This test pins three invariants on the empty-hit answer:
+
+    * the envelope has exactly the ``chunks`` key (plus, optionally,
+      ``source_ref`` — see :class:`FakeRetrievePort.retrieve`);
+    * the envelope has NO ``body`` or ``content`` key at the top
+      level;
+    * every chunk in the envelope has only the fields the §B3 / ADR
+      0009 chunk schema declares (``text`` / ``source_ref`` /
+      ``score``) and no ``body`` / ``content`` / full-text keys.
+
+    A future change that smuggles a full 资料 body into the retrieve
+    envelope would (a) leak the full unit text past the cite gate's
+    per-slice boundary and (b) break the canonical envelope parity
+    with the MCP adapter. Both are caught here.
+    """
+    port = FakeRetrievePort(
+        hits_by_query={"alpha": [_chunk("hit")]},
+        known_document_ids={"DOC-2023Q1"},
+    )
+
+    envelope = port.retrieve("nonexistent query")
+
+    # 1. Empty hits → ``{"chunks": []}`` (possibly plus source_ref
+    #    carried by the fake); no ``body`` / ``content`` keys.
+    assert envelope["chunks"] == []
+    forbidden_top_level = {"body", "content"}
+    present_top_level = set(envelope)
+    assert not (forbidden_top_level & present_top_level), (
+        f"retrieve envelope carries forbidden full-body fields: "
+        f"{forbidden_top_level & present_top_level}"
+    )
+
+
+def test_fake_retrieve_with_hits_has_no_full_body_field_per_chunk() -> None:
+    """The non-empty retrieve envelope is the same shape: ``chunks``
+    plus optional ``source_ref``, never a full 资料 body field.
+
+    The full unit body rides the **push** wire, not the retrieve
+    response. The retrieve response carries only per-slice fields
+    (``text`` / ``source_ref`` / ``score``) so the citation gate can
+    quote a slice without leaking the whole 资料.
+    """
+    chunks = [_chunk("slice-1"), _chunk("slice-2", page=2)]
+    port = FakeRetrievePort(
+        hits_by_query={"alpha": chunks},
+        known_document_ids={"DOC-2023Q1"},
+    )
+
+    envelope = port.retrieve("alpha")
+
+    assert "chunks" in envelope
+    assert envelope["chunks"], "fixture should yield hits"
+    forbidden_top_level = {"body", "content"}
+    assert not (forbidden_top_level & set(envelope)), (
+        f"non-empty retrieve envelope carries forbidden fields: "
+        f"{forbidden_top_level & set(envelope)}"
+    )
+    forbidden_chunk_keys = {"body", "content"}
+    for chunk in envelope["chunks"]:
+        # The chunk's ``text`` is the per-slice text — that's allowed.
+        # The forbidden keys are the full 资料 body carriers, which
+        # would let the cite gate bypass the per-slice boundary.
+        from dataclasses import asdict
+        chunk_keys = set(asdict(chunk))
+        leaked = forbidden_chunk_keys & chunk_keys
+        assert not leaked, (
+            f"chunk carries forbidden full-body fields: {leaked} "
+            f"(chunk keys: {sorted(chunk_keys)})"
+        )

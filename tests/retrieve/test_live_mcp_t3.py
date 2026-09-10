@@ -14,7 +14,7 @@ from fin.retrieve.push_batching import (
 )
 from fin.retrieve.push_port import PushError, PushServiceUnavailableError
 
-from live_iknow_support import child_records, live_iknow
+from live_iknow_support import IKNOW_WORKTREE_ROOT, child_records, live_iknow
 
 
 pytestmark = pytest.mark.mcp
@@ -35,7 +35,14 @@ class _InterruptingPushPort:
             raise PushServiceUnavailableError(
                 "simulated interruption before batch forwarding"
             )
-        self.forwarded.append(tuple(str(record["block_id"]) for record in records))
+        # The wire is the one-envelope-per-record shape
+        # (``PushRecord.to_wire()`` after T1 carries the ``chunks[0].id``
+        # as the per-child block id); the per-record id is therefore
+        # under ``chunks[0]["id"]`` rather than a top-level ``block_id``
+        # field.
+        self.forwarded.append(
+            tuple(str(record["chunks"][0]["id"]) for record in records)
+        )
         return self.inner.push(records)
 
 
@@ -44,7 +51,10 @@ def test_real_iknow_resume_skips_landed_batches_and_outage_is_named(
 ) -> None:
     """A real process resumes the unfinished child batches exactly once."""
 
-    with live_iknow(monkeypatch) as live:
+    # The envelope-based wire matches the operator-console worktree
+    # schema; the main-checkout ``push`` schema predates T1 and rejects
+    # the ``chunks`` field. Run against the worktree build.
+    with live_iknow(monkeypatch, root=IKNOW_WORKTREE_ROOT) as live:
         records = child_records()
         journal = PushJournal()
         expected = expected_block_total(records)
@@ -61,7 +71,7 @@ def test_real_iknow_resume_skips_landed_batches_and_outage_is_named(
 
         assert failure.value.code == "push_service_unavailable"
         assert interrupted.forwarded == [
-            (plans[0].records[0].block_id,),
+            (plans[0].records[0].chunks[0].id,),
         ]
         assert journal.completed_keys() == (plans[0].key,)
         assert len(journal.failures()) == 1
@@ -77,7 +87,7 @@ def test_real_iknow_resume_skips_landed_batches_and_outage_is_named(
         assert outcome.batches_skipped == 1
         assert outcome.batches_pushed == len(plans) - 1
         assert resumed.forwarded
-        assert plans[0].records[0].block_id not in {
+        assert plans[0].records[0].chunks[0].id not in {
             block_id for batch in resumed.forwarded for block_id in batch
         }
         assert journal.failures() == ()

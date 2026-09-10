@@ -22,12 +22,15 @@ deterministic — no model participates in any split decision:
    :func:`fin.corpus.doc_type.classify_page` — the dataset's
    deterministic integer classifier, shared (not copied) so the eval
    builder and this endpoint can never drift into two rules.
-4. **入库推送** — :func:`fin.corpus.push.document_push_records` turns
-   the children into push records; :func:`fin.retrieve.push_batching.
-   push_in_batches` pushes them batch by batch through the
-   ``PushPort`` (batch cap honored, resumable journal). Push failures
-   are the named ``PushError`` family and leave nothing recorded as a
-   write (SC8).
+4. **入库推送** — :func:`fin.corpus.push.envelopes_of_document`
+   turns the frozen units into wire envelopes (one per 资料:
+   ``source_ref`` + body + ``chunks[]``); per-child
+   :class:`PushRecord` rows are also built so the invalidation path
+   can still key on them (see :mod:`fin.corpus.invalidation`).
+   :func:`fin.retrieve.push_batching.push_in_batches` pushes the
+   envelopes batch by batch through the ``PushPort`` (batch cap
+   honored, resumable journal). Push failures are the named
+   ``PushError`` family and leave nothing recorded as a write (SC8).
 5. **版本失效** — when the caller supplies the previously pushed
    records for the same document (``previous_records``), the stale
    blocks are planned with :func:`fin.corpus.invalidation.
@@ -64,7 +67,12 @@ from fin.corpus.errors import UnsupportedFormatParseError
 from fin.corpus.invalidation import VersionChange, plan_invalidations
 from fin.corpus.params import DOC_TYPES
 from fin.corpus.parsers import SUPPORTED_FORMATS, ParseResult, parse_document
-from fin.corpus.push import PushRecord, document_push_records
+from fin.corpus.push import (
+    PushEnvelope,
+    PushRecord,
+    document_push_records,
+    envelopes_of_document,
+)
 from fin.retrieve.invalidation_port.errors import (
     InvalidationOutcome,
     InvalidationPort,
@@ -166,11 +174,14 @@ class IngestedDocument:
 class IngestEndpointResult:
     """The observable outcome of one ingest call.
 
-    ``block_ids`` is parallel to the children pushed; ``written`` /
-    ``duplicates`` come from the push outcome (SC18 idempotency
-    accounting). ``invalidation`` is ``None`` when nothing was stale;
-    ``records`` is the full push-record set so callers (tests, the
-    future catalog seam) can hand it back as ``previous_records``.
+    ``block_ids`` is the chunk block ids the receiving service
+    handed back for this batch (one per slice, in chunk order across
+    envelopes — the unit the citation gate keys on after T1).
+    ``written`` / ``duplicates`` come from the push outcome (SC18
+    idempotency accounting). ``invalidation`` is ``None`` when
+    nothing was stale; ``records`` is the full per-child record set
+    so callers (tests, the future catalog seam, the invalidation
+    path) can hand it back as ``previous_records``.
     """
 
     document_id: str
@@ -450,11 +461,19 @@ class IngestEndpoint:
             version=version,
         )
         chunking, resolved_doc_type = _split(parsed, doc_type=doc_type)
+        # Per-child records are kept for the invalidation path (it
+        # keys on (source_ref, per-child content_id)); envelopes are
+        # the wire shape (one per 资料, with body + chunks).
         records = document_push_records(chunking)
+        envelopes = envelopes_of_document(
+            chunking,
+            valid_from=version,
+            valid_until="9999-12-31T23:59:59.999Z",
+        )
 
         push_outcome = push_in_batches(
             self._push_port,
-            records,
+            envelopes,
             journal=(
                 self._journal if self._journal is not None else PushJournal()
             ),
@@ -488,8 +507,8 @@ class IngestEndpoint:
             fmt=fmt,
             doc_type=resolved_doc_type,
             unit_count=len(parsed.units),
-            block_count=len(records),
-            block_ids=tuple(record.block_id for record in records),
+            block_count=push_outcome.written + push_outcome.duplicates,
+            block_ids=tuple(push_outcome.block_ids),
             written=push_outcome.written,
             duplicates=push_outcome.duplicates,
             records=records,

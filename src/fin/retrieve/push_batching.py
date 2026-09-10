@@ -1,40 +1,49 @@
-"""Batched, resumable push (plan T15, SC23 / SC44, §B4 后台路径失败契约).
+"""Batched, resumable push (plan T15, SC23 / SC44, §B4 后台路径失败契约;
+spec `operator-console-host-contract` T1).
 
 This module is the driver on top of the T14 seam
-(:mod:`fin.retrieve.push_port`): it splits a document's push records
-into batches the receiving side accepts, records per-batch progress so
-an interrupted run can be resumed, and turns every batch failure into
-an enumerable, replayable named record.
+(:mod:`fin.retrieve.push_port`): it splits a document's push
+**envelopes** into batches the receiving side accepts, records per-batch
+progress so an interrupted run can be resumed, and turns every batch
+failure into an enumerable, replayable named record.
+
+After T1 the unit of work is the **envelope** — one per frozen unit
+(spec `operator-console-host-contract`): ``source_ref`` + 资料 body +
+``chunks[]``. Per-child :class:`fin.corpus.push.PushRecord` rows still
+exist on the corpus side (the invalidation path keys on them), but
+they no longer ride the wire.
 
 Splitting (SC44)
 ----------------
 
-:func:`plan_batches` cuts the record sequence into consecutive batches
-of at most ``batch_size`` records (default
+:func:`plan_batches` cuts the envelope sequence into consecutive
+batches of at most ``batch_size`` envelopes (default
 :data:`fin.retrieve.push_port.MAX_PUSH_BATCH_RECORDS`). The
 concatenation of the batches is the input sequence — a document whose
-block count exceeds the cap is split, never truncated. Asking for a
-size above the cap or a non-positive size is a named failure
+envelope count exceeds the cap is split, never truncated. Asking for
+a size above the cap or a non-positive size is a named failure
 (``push_batch_overflow`` / ``push_batch_size_invalid``) rather than a
 silently clamped run.
 
 Resume (SC23)
 -------------
 
-Each batch has a **batch key**: the sha256 of the canonical JSON of its
-records' T14 idempotency keys, in order. It is derived from the existing
-``(source_ref, content identity)`` pairs — no second hashing scheme and
-no second `source_ref` spelling. Because the key covers the batch's
-composition, a resumed run only skips a batch whose contents are
-byte-for-byte the batch that already succeeded.
+Each batch has a **batch key**: the sha256 of the canonical JSON of
+its envelopes' ``(source_ref, body_content_id)`` pairs, in order. It
+is derived from the existing :func:`fin.corpus.push.idempotency_keys_digest`
+helper — no second hashing scheme and no second `source_ref` spelling.
+Because the key covers the batch's composition, a resumed run only
+skips a batch whose contents are byte-for-byte the batch that already
+succeeded.
 
 :class:`PushJournal` holds those keys. A batch whose key is already
 completed is not pushed at all, so a resumed run writes nothing for it
 (block total increment = 0); the remaining batches are pushed and fill
 the document up to :func:`expected_block_total`. Should an
 acknowledgement be lost *after* the store accepted a batch, the replay
-is still safe: the T14 idempotency key makes it a duplicate, not a
-second write.
+is still safe: the wire-level idempotency key
+``(source_ref, body_content_id)`` makes it a duplicate, not a second
+write.
 
 Failure records (§B4 后台路径失败契约)
 ------------------------------------
@@ -63,7 +72,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Final, Sequence
 
-from fin.corpus.push import PushRecord, idempotency_keys_digest
+from fin.corpus.push import (
+    PushEnvelope,
+    PushRecord,
+    idempotency_keys_digest,
+    record_to_envelope,
+)
 from fin.retrieve._ledger.jsonl import append_jsonl_object, replay_jsonl_objects
 from fin.retrieve.input_validation import InputValidationLedger
 from fin.retrieve.push_port import (
@@ -73,7 +87,7 @@ from fin.retrieve.push_port import (
     PushBatchSizeInvalidError,
     PushError,
     PushPort,
-    push_records,
+    push_envelopes,
     validate_batch_not_empty,
 )
 
@@ -83,18 +97,30 @@ _EVENT_FAILED: Final[str] = "failed"
 
 @dataclass(frozen=True)
 class BatchPlan:
-    """One planned push batch: its position, its key and its records."""
+    """One planned push batch: its position, its key and its envelopes."""
 
     index: int
     key: str
-    records: tuple[PushRecord, ...]
+    envelopes: tuple[PushEnvelope, ...]
+
+    @property
+    def records(self) -> tuple[PushEnvelope, ...]:
+        """Backward-compat alias for :attr:`envelopes`.
+
+        Older callers used ``plan.records`` (the pre-T1 per-child
+        record tuple); after T1 the wire unit is the envelope. The
+        alias lets a test keep reading ``plan.records`` without
+        rewriting — the envelope tuple is what the driver actually
+        pushes.
+        """
+        return self.envelopes
 
     def source_refs(self) -> tuple[str, ...]:
         """The distinct `source_ref` values in the batch, in first-seen
         order — the frozen units this batch touches."""
         seen: dict[str, None] = {}
-        for record in self.records:
-            seen.setdefault(record.source_ref, None)
+        for envelope in self.envelopes:
+            seen.setdefault(envelope.source_ref, None)
         return tuple(seen)
 
 
@@ -121,9 +147,9 @@ class BatchFailure:
 class BatchedPushOutcome:
     """The result of one batched run.
 
-    ``block_ids`` covers the batches this run pushed, in record order;
-    skipped batches contribute none (their ids were returned by the run
-    that completed them).
+    ``block_ids`` covers the batches this run pushed, in envelope
+    order; skipped batches contribute none (their ids were returned by
+    the run that completed them).
     """
 
     batches_planned: int
@@ -166,29 +192,36 @@ class PushJournalCorruptError(PushError):
     code = "push_journal_corrupt"
 
 
-def expected_block_total(records: Sequence[PushRecord]) -> int:
-    """The block total a complete push of ``records`` must reach.
+def expected_block_total(envelopes: Sequence[PushEnvelope]) -> int:
+    """The block total a complete push of ``envelopes`` must reach.
 
-    Distinct T14 idempotency keys, not record count: two records with
-    the same key are one write by contract.
+    Distinct envelope idempotency keys, not envelope count: two
+    envelopes with the same ``(source_ref, body_content_id)`` pair are
+    one write by contract.
     """
-    return len({record.idempotency_key for record in records})
+    return len({envelope.idempotency_key for envelope in envelopes})
 
 
-def batch_key(records: Sequence[PushRecord]) -> str:
+def batch_key(envelopes: Sequence[PushEnvelope]) -> str:
     """The deterministic key of one batch composition (see module doc)."""
     return idempotency_keys_digest(
-        [record.idempotency_key for record in records]
+        [envelope.idempotency_key for envelope in envelopes]
     )
 
 
 def plan_batches(
-    records: Sequence[PushRecord],
+    items: Sequence[object],
     *,
     batch_size: int = MAX_PUSH_BATCH_RECORDS,
 ) -> tuple[BatchPlan, ...]:
-    """Split ``records`` into consecutive batches of at most
-    ``batch_size`` records (SC44: split, never truncate)."""
+    """Split ``items`` (envelopes or :class:`PushRecord` rows) into
+    consecutive batches of at most ``batch_size`` items (SC44: split,
+    never truncate).
+
+    ``PushRecord`` rows are coerced into single-chunk envelopes so the
+    wire-shape invariants (one envelope per 资料 + monotonic chunks)
+    hold on the batches the driver pushes.
+    """
     if batch_size <= 0:
         raise PushBatchSizeInvalidError(
             f"batch size must be positive, got {batch_size}"
@@ -198,11 +231,12 @@ def plan_batches(
             f"batch size {batch_size} exceeds the per-call cap of "
             f"{MAX_PUSH_BATCH_RECORDS}"
         )
+    envelopes = tuple(_coerce_envelope(item) for item in items)
     plans: list[BatchPlan] = []
-    for index, start in enumerate(range(0, len(records), batch_size)):
-        chunk = tuple(records[start : start + batch_size])
+    for index, start in enumerate(range(0, len(envelopes), batch_size)):
+        chunk = envelopes[start : start + batch_size]
         plans.append(
-            BatchPlan(index=index, key=batch_key(chunk), records=chunk)
+            BatchPlan(index=index, key=batch_key(chunk), envelopes=chunk)
         )
     return tuple(plans)
 
@@ -258,7 +292,7 @@ class PushJournal:
                 "event": _EVENT_COMPLETED,
                 "batch_key": plan.key,
                 "batch_index": plan.index,
-                "block_count": len(plan.records),
+                "block_count": len(plan.envelopes),
             }
         )
         self._completed.setdefault(plan.key, None)
@@ -276,7 +310,7 @@ class PushJournal:
             code=code,
             message=message,
             source_refs=plan.source_refs(),
-            block_count=len(plan.records),
+            block_count=len(plan.envelopes),
         )
         self._append(
             {
@@ -394,28 +428,34 @@ class PushJournal:
 
 def push_in_batches(
     port: PushPort,
-    records: Sequence[PushRecord],
+    items: Sequence[object],
     *,
     journal: PushJournal,
     batch_size: int = MAX_PUSH_BATCH_RECORDS,
     input_validation_ledger: InputValidationLedger | None = None,
 ) -> BatchedPushOutcome:
-    """Push ``records`` batch by batch, resuming from ``journal``.
+    """Push ``items`` (envelopes or :class:`PushRecord` rows) batch by
+    batch, resuming from ``journal``.
 
     Batches already marked completed are skipped without a push call.
     The first failing batch is journaled with its stable error code and
     the typed error is re-raised; running again with the same journal
     replays exactly the batches that did not complete.
 
-    A push of no records is invalid input (§B2 第 5 条) and is refused
-    by name here rather than returning a zero-batch outcome, which would
-    be exactly the empty success the contract forbids.
-    :func:`plan_batches` stays a pure splitter and answers ``()`` for an
-    empty sequence; the judgement lives on the push entry point.
+    A push of no items is invalid input (§B2 第 5 条) and is refused
+    by name here rather than returning a zero-batch outcome, which
+    would be exactly the empty success the contract forbids.
+    :func:`plan_batches` stays a pure splitter and answers ``()`` for
+    an empty sequence; the judgement lives on the push entry point.
     ``input_validation_ledger`` is where that refusal is counted (T21).
+
+    Items can be :class:`PushEnvelope` instances (the wire shape) or
+    :class:`PushRecord` rows (the per-child record the invalidation
+    path still keys on); the latter are coerced into envelopes here so
+    legacy callers don't break.
     """
-    validate_batch_not_empty(records, ledger=input_validation_ledger)
-    plans = plan_batches(records, batch_size=batch_size)
+    validate_batch_not_empty(items, ledger=input_validation_ledger)
+    plans = plan_batches(items, batch_size=batch_size)
     pushed = skipped = written = duplicates = 0
     block_ids: list[str] = []
     for plan in plans:
@@ -441,7 +481,7 @@ def push_in_batches(
 def _push_one_batch(port: PushPort, plan: BatchPlan, *, journal: PushJournal):
     """Push one batch, journaling a named failure before re-raising."""
     try:
-        return push_records(port, plan.records)
+        return push_envelopes(port, plan.envelopes)
     except PushError as exc:
         journal.record_failure(plan, code=exc.code, message=str(exc))
         raise
@@ -451,6 +491,28 @@ def _push_one_batch(port: PushPort, plan: BatchPlan, *, journal: PushJournal):
         )
         journal.record_failure(plan, code=wrapped.code, message=str(exc))
         raise wrapped from exc
+
+
+def _coerce_envelope(item: object) -> PushEnvelope:
+    """Convert a :class:`PushRecord` to a :class:`PushEnvelope` for the
+    wire path, or return a wire envelope as-is.
+
+    Used by the back-compat path so older tests / catalog callers that
+    hand :class:`PushRecord` rows to ``push_in_batches`` keep working
+    after T1. Production callers should pass :class:`PushEnvelope`
+    instances built by :func:`fin.corpus.push.envelopes_of_document`.
+    The record → envelope projection itself is the SSOT
+    :func:`fin.corpus.push.record_to_envelope` — shared with the
+    direct-push shim in :mod:`fin.retrieve.push_port` so the two wire
+    paths cannot drift.
+    """
+    if isinstance(item, PushEnvelope):
+        return item
+    if isinstance(item, PushRecord):
+        return record_to_envelope(item)
+    raise TypeError(
+        f"cannot coerce {type(item).__name__} into a push envelope"
+    )
 
 
 __all__ = [
