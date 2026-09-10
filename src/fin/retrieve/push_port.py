@@ -75,6 +75,7 @@ from typing import Any, Final, Mapping, Protocol, Sequence, runtime_checkable
 from fin.corpus.push import (
     REQUIRED_PUSH_METADATA_FIELDS,
     PushEnvelope,
+    record_to_envelope,
 )
 from fin.retrieve.input_validation import (
     INPUT_CLASS_EMPTY_BATCH,
@@ -562,33 +563,16 @@ def push_records(
 
 def _record_or_wire_to_envelope(item: Any) -> Mapping[str, Any]:
     """Forward a wire envelope dict OR project a :class:`PushRecord`
-    into the one-envelope-per-资料 wire shape."""
+    into the one-envelope-per-资料 wire shape.
+
+    The record projection is the SSOT
+    :func:`fin.corpus.push.record_to_envelope`, shared with the
+    batching path's ``_coerce_envelope`` — the direct-push wire and
+    the batched wire are the same shape by construction.
+    """
     if isinstance(item, Mapping):
         return item
-    # Per-child PushRecord → single-chunk envelope. The record's
-    # ``text`` is the body and the chunk, its ``metadata`` rides
-    # along, and ``valid_from`` / ``valid_until`` use the same
-    # sentinel the adapter does. The pre-T1 block id and per-child
-    # content_id are propagated as the chunk's ``id`` / ``content_id``
-    # so the receiving service (and its contract fake) keeps handing
-    # back the same block ids the catalog side already pinned on the
-    # record — the per-child invalidation path keys on these.
-    return {
-        "source_ref": item.source_ref,
-        "body": item.text,
-        "chunks": [
-            {
-                "index": 0,
-                "content": item.text,
-                "id": item.block_id,
-                "content_id": item.content_id,
-            }
-        ],
-        "metadata": dict(item.metadata),
-        "valid_from": "0001-01-01T00:00:00.000Z",
-        "valid_until": "9999-12-31T23:59:59.999Z",
-        "body_content_id": item.content_id,
-    }
+    return record_to_envelope(item).to_wire()
 
 
 __all__ = [

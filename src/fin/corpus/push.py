@@ -139,7 +139,13 @@ def content_identity(
 ) -> str:
     """The content identity of one block (§B4): sha256 over the block
     text and the three rule versions, joined by ``\\x1f`` so no field
-    value can impersonate a field boundary."""
+    value can impersonate a field boundary.
+
+    This is also the SSOT for the wire-level ``body_content_id`` hash
+    :func:`body_content_id` computes over an envelope's body — the
+    underlying hashing construction is one function with one
+    separator and one encoding, so the two can never drift.
+    """
     parts = (
         text,
         normalization_rule_version,
@@ -147,6 +153,45 @@ def content_identity(
         params_table_version,
     )
     return hashlib.sha256(_ID_SEPARATOR.join(parts).encode("utf-8")).hexdigest()
+
+
+def body_content_id(envelope: Mapping[str, Any]) -> str:
+    """The wire-level body content identity of one envelope (§B4 / T1).
+
+    Single authority for the ``body_content_id`` hash used as the
+    envelope-level idempotency key component on the wire. The
+    envelope may carry an explicit ``body_content_id`` (the corpus
+    side pre-computes it via :func:`content_identity`); when it does,
+    we trust the pre-computed value so a wire envelope that already
+    pinned the id keys identically on both sides. Otherwise we derive
+    the same hash from the envelope body + the three SC20 rule
+    versions so a hand-rolled wire envelope that omits
+    ``body_content_id`` still hashes identically.
+
+    The push adapter (:mod:`fin.retrieve.mcp_push_port`), the
+    contract fake (:mod:`fin.retrieve.fake_push_port`) and the
+    batching path (:mod:`fin.retrieve.push_batching`) all funnel
+    through this function — there is exactly one body-hashing
+    construction in fin, and adding a fourth copy would let the
+    envelope / adapter / fake diverge.
+    """
+    explicit = envelope.get("body_content_id")
+    if isinstance(explicit, str) and explicit:
+        return explicit
+    body = envelope.get("content")
+    if body is None:
+        body = envelope.get("body")
+    metadata = envelope.get("metadata") or {}
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    return content_identity(
+        "" if body is None else str(body),
+        normalization_rule_version=str(
+            metadata.get("normalization_rule_version", "")
+        ),
+        parse_rule_version=str(metadata.get("parse_rule_version", "")),
+        params_table_version=str(metadata.get("params_table_version", "")),
+    )
 
 
 def idempotency_keys_digest(keys: Sequence[tuple[str, str]]) -> str:
@@ -454,11 +499,58 @@ def envelopes_of_unit(
     return (envelope_of_unit(unit, valid_from=valid_from, valid_until=valid_until),)
 
 
+# Sentinels the per-child-record back-compat path uses: a record is a
+# leaf with no interval of its own, so it reads as "always valid" on
+# the wire. Shared by every caller so the coercion shapes cannot drift.
+_RECORD_VALID_FROM: Final[str] = "0001-01-01T00:00:00.000Z"
+_RECORD_VALID_UNTIL: Final[str] = "9999-12-31T23:59:59.999Z"
+
+
+def record_to_envelope(record: PushRecord) -> PushEnvelope:
+    """Project one per-child :class:`PushRecord` into the
+    one-envelope-per-资料 wire shape (single authority for the
+    back-compat coercion).
+
+    The record's ``text`` is the body and the single chunk (the record
+    is the per-child leaf, so the unit-level and child-level content
+    identities collapse); its ``block_id`` / ``content_id`` ride along
+    as the chunk's ``id`` / ``content_id`` so the receiving service and
+    the catalog-side invalidation path keep resolving the same
+    per-child identities they pinned pre-T1. The envelope's
+    ``body_content_id`` is the record's ``content_id`` for the same
+    reason — a hand-rolled record's pinned identity is preserved
+    verbatim rather than re-derived, so a wire envelope coerced here
+    keys idempotently the same on both sides of the seam.
+
+    :mod:`fin.retrieve.push_batching` (``_coerce_envelope``) and
+    :mod:`fin.retrieve.push_port` (``_record_or_wire_to_envelope``)
+    both go through this function — two projections of one record
+    would let the batching wire and the direct-push wire drift.
+    """
+    return PushEnvelope(
+        source_ref=record.source_ref,
+        body=record.text,
+        chunks=(
+            PushChunk(
+                index=0,
+                content=record.text,
+                id=record.block_id,
+                content_id=record.content_id,
+            ),
+        ),
+        metadata=dict(record.metadata),
+        valid_from=_RECORD_VALID_FROM,
+        valid_until=_RECORD_VALID_UNTIL,
+        body_content_id=record.content_id,
+    )
+
+
 __all__ = [
     "REQUIRED_PUSH_METADATA_FIELDS",
     "PushChunk",
     "PushEnvelope",
     "PushRecord",
+    "body_content_id",
     "content_identity",
     "deserialize_source_ref",
     "document_push_records",
@@ -467,6 +559,7 @@ __all__ = [
     "envelopes_of_unit",
     "idempotency_keys_digest",
     "record_of_payload",
+    "record_to_envelope",
     "serialize_source_ref",
     "unit_push_records",
 ]

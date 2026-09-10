@@ -160,7 +160,7 @@ class _ScriptedPushPort(MCPPushPort):
         self._command: list[str] | None = ["iknow-memory"]
         self._timeout: float = 5.0
         self._ledger = None  # type: ignore[assignment]
-        self._seen_keys: dict[tuple[str, str], str] = {}
+        self._seen_keys: dict[tuple[str, str], bool] = {}
         self.sent_items: list[dict[str, Any]] = []
 
     async def _call_mcp(self, payload: dict[str, Any]) -> dict[str, Any]:
