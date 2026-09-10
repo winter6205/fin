@@ -454,3 +454,48 @@ def test_failed_batch_is_not_counted_as_a_write(tmp_path) -> None:
     assert inner.written_total() == 0
     assert journal.completed_keys() == ()
     assert len(journal.failures()) == 1
+
+
+# ---------------------------------------------------------------------------
+# T1 wire-shape parity: a coerced envelope's chunks must carry the record's
+# per-child id / content_id, so the batching wire matches the direct-push
+# wire (envelope_of_unit). The catalog-side invalidation path keys on
+# ``chunks[0]["id"]``; without this propagation the T3 live test's blocking
+# recorder raises ``KeyError: 'id'``.
+# ---------------------------------------------------------------------------
+
+
+def test_coerced_envelope_chunks_carry_record_id_and_content_id() -> None:
+    """A :class:`PushRecord` coerced into a :class:`PushEnvelope` must
+    forward the per-child ``block_id`` and ``content_id`` onto the
+    synthesized chunk.
+
+    Without this propagation the batching wire drops the
+    per-child identity that the direct-push wire (``envelope_of_unit``
+    via ``live.push.push``) carries; the catalog-side invalidation
+    path resolves its per-child keys off ``chunks[0]["id"]`` and a
+    missing field raises ``KeyError: 'id'`` (live T3 regression).
+    """
+    records = _records(units=1, sentences=12)
+    assert records, "fixture must yield at least one record"
+
+    batches = plan_batches(records)
+
+    # One envelope per record; each carries one chunk.
+    assert len(batches) == 1
+    envelopes = batches[0].envelopes
+    assert len(envelopes) == len(records)
+
+    for envelope, record in zip(envelopes, records):
+        wire = envelope.to_wire()
+        assert len(wire["chunks"]) == 1
+        chunk = wire["chunks"][0]
+        assert chunk["id"] == record.block_id
+        assert chunk["content_id"] == record.content_id
+        # The envelope-level idempotency key is
+        # ``(source_ref, body_content_id)`` — on the coerced path
+        # ``body_content_id`` is the record's ``content_id`` (the
+        # record is the per-child leaf, so the unit-level and
+        # child-level content identities collapse).
+        assert envelope.body_content_id == record.content_id
+        assert envelope.source_ref == record.source_ref

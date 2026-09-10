@@ -514,12 +514,26 @@ def _coerce_envelope(item: object) -> PushEnvelope:
             serialize_source_ref,
         )
         # Use the record's text as both body and single chunk, since
-        # the record is the per-child leaf.
+        # the record is the per-child leaf. Carry the record's
+        # ``block_id`` / ``content_id`` onto the synthesized chunk so
+        # the batching wire shape matches the direct-push wire shape
+        # produced by :func:`envelope_of_unit` — otherwise the
+        # catalog-side invalidation path (which keys on
+        # ``chunks[0]["id"]``) cannot resolve per-child ids on a
+        # batched envelope and the test suite's blocking-port recorder
+        # raises ``KeyError: 'id'``.
         metadata = dict(item.metadata)
         return PushEnvelope(
             source_ref=item.source_ref,
             body=item.text,
-            chunks=(PushChunk(index=0, content=item.text),),
+            chunks=(
+                PushChunk(
+                    index=0,
+                    content=item.text,
+                    id=item.block_id,
+                    content_id=item.content_id,
+                ),
+            ),
             metadata=metadata,  # type: ignore[arg-type]
             valid_from="0001-01-01T00:00:00.000Z",
             valid_until="9999-12-31T23:59:59.999Z",
