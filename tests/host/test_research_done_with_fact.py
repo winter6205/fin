@@ -305,6 +305,65 @@ def test_research_done_no_fact_call_skips_numeric_gate() -> None:
     assert out["status_reason"] != "numeric_gate_fail"
 
 
+# ===== operator-console-host-contract T3: no retrieve / read_source on
+# the trace -> the hard gate fails the run =====
+
+
+def test_research_fact_only_trace_without_read_or_retrieve_refuses() -> None:
+    """operator-console-host-contract T3 acceptance: a research-track
+    answer that asserts a numeric/filing claim about an ingested
+    filing, on a trace with NEITHER ``retrieve`` NOR ``read_file``
+    calls, must FAIL the hard gate.
+
+    The script calls only ``get_xbrl_fact`` — the fact row matches
+    the claimed value, so the numeric gate would pass if it were
+    reached — and then answers with the seeded value and a locator
+    claim. ``get_xbrl_fact`` contributes no ``EvidenceItem``s (fact
+    rows are not page text), so the citation gate has no evidence to
+    match a ≥32-char span against: bounce until the repair cap, then
+    refuse ``citation_repair_cap``. A fact-table hit alone is not a
+    retrieve / read_source trace; grounding still requires page or
+    chunk text from this run's tools.
+    """
+    from fin.host.graph import REPAIR_CAP
+
+    answer = (
+        f"{load_private_fixture('883a8c998be20c78f02cff38bce092bc029dd17664e64d743fdd7c1bc37cfe7d')}{AAPL_2022Q3}."
+    )
+    model = ScriptedChatModel(
+        script=_invocation_script(answer=answer, include_read=False)
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+        read_port=_TREE_READ_PORT,
+        facts_root=_facts_root(),
+    )
+    out = g.invoke(
+        {
+            "messages": [HumanMessage(content="What was AAPL Q3 2023 revenue?")],
+            "evidence": [],
+            "repair_count": 0,
+            "step_count": 0,
+        },
+        config=_thread_config("t-research-no-read-no-retrieve"),
+    )
+    # The hard gate refuses: no retrieve / read_file text on the trace
+    # means no evidence, and the repair cap turns the bounce loop into
+    # a terminal refuse. The locator claim (AAPL-2022Q3) is in the
+    # caller's known-id set, so this is the repair-cap refuse, not
+    # unknown_locator — the point being that a locator the run never
+    # grounded is not saved by being in the catalog.
+    assert out["status"] == "refuse"
+    assert out["status_reason"] == "citation_repair_cap"
+    assert out["repair_count"] == REPAIR_CAP
+    assert out.get("citations", ()) == ()
+    # The repair counter — not the step cap — triggered the refuse
+    # (same pin as the existing bounce-loop test in test_graph.py).
+    assert out["step_count"] < 32
+
+
 # ===== direct tool surface sanity (without graph) =====
 
 

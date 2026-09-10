@@ -164,3 +164,42 @@ def test_identity_is_not_a_research_agent() -> None:
     **track**, never the product kind.
     """
     assert "research agent" not in HOST_SYSTEM_PROMPT
+
+
+# ----- operator-console-host-contract T3: the system prompt is a
+# tool MAP for ingested vs local text, never a body carrier -----
+
+
+def test_research_prompt_maps_read_file_to_read_source_for_ingested() -> None:
+    """Spec Focus 4: 读入库整篇 → `read_source`. The research prompt's
+    ``read_file`` line must say that an ingested-filing read dispatches
+    to the memory service's ``read_source`` — the map names the seam,
+    the dispatch itself lives in code (T2)."""
+    assert "read_source" in HOST_SYSTEM_PROMPT
+
+
+def test_research_prompt_maps_local_paths_and_thread_attachments() -> None:
+    """Spec Focus 4: 本地路径 → local read; a thread attachment is
+    neither the ingested corpus nor a local file and its text is not
+    citable (the structural guarantee stays: attachment text never
+    enters the evidence channel)."""
+    assert "local read" in HOST_SYSTEM_PROMPT
+    assert "not citable" in HOST_SYSTEM_PROMPT
+    assert "attachment" in HOST_SYSTEM_PROMPT
+
+
+def test_research_prompt_names_retrieve_as_the_ingested_corpus_lookup() -> None:
+    """Spec Focus 4: 查已入库 → MCP retrieve. The retrieve line must
+    say the search runs over the ingested corpus on the memory
+    service — not over a local tree."""
+    assert "ingested corpus" in HOST_SYSTEM_PROMPT
+
+
+def test_research_prompt_carries_no_corpus_body_text() -> None:
+    """System is a map, never a body carrier: no page text from the
+    committed corpus may appear in the research prefix (bodies stay
+    in tool_result)."""
+    assert (
+        "UNITED STATES SECURITIES AND EXCHANGE COMMISSION"
+        not in HOST_SYSTEM_PROMPT
+    )
