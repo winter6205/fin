@@ -117,6 +117,15 @@ class _ScriptedAdapter(MCPRetrieveAdapter):
 
 
 class _ReadCapturingAdapter(_ScriptedAdapter):
+    """Scripted ``_call_mcp`` for ``read()``.
+
+    The fake returns the **real** MCP wire shape — a list of text content
+    blocks carrying a JSON envelope — so the scripted suite exercises the
+    same decode path the real iknow-memory server drives. Bodies map
+    ``source_ref`` → body text; ``errors`` inject JSON-RPC error envelopes
+    for the named-miss path.
+    """
+
     def __init__(self, *, bodies: dict[str, str], errors: list[dict] | None = None, **kwargs: object) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
         self.bodies = dict(bodies)
@@ -128,7 +137,19 @@ class _ReadCapturingAdapter(_ScriptedAdapter):
         if self.errors:
             return self.errors.pop(0)
         source_ref = payload["params"]["arguments"]["source_ref"]
-        return {"result": {"id": source_ref, "source_ref": source_ref, "content": self.bodies.get(source_ref, "")}}
+        body = self.bodies.get(source_ref, "")
+        inner = {
+            "id": source_ref,
+            "source_ref": source_ref,
+            "content": body,
+        }
+        return {
+            "result": {
+                "content": [
+                    {"type": "text", "text": json.dumps(inner)}
+                ]
+            }
+        }
 
 
 def test_mcp_read_ingested_document_calls_read_source_per_unit() -> None:
@@ -173,6 +194,85 @@ def test_mcp_read_miss_and_unknown_document_are_unknown_locator() -> None:
     unknown = _ReadCapturingAdapter(bodies={}, locator_map={"hit": locator}, known_document_ids={document_id})
     assert unknown.read("UNKNOWN-2099Q9", version) == {"error": "unknown_locator"}
     assert unknown.payloads == []
+
+
+def test_mcp_read_iserror_content_block_is_unknown_locator() -> None:
+    """The real ``read_source`` miss wire is an ``isError`` content
+    block whose text is a JSON envelope carrying the named code.
+
+    The adapter must surface that as ``unknown_locator`` — the same
+    miss shape the JSON-RPC error path uses — never as an empty
+    success and never as the raw block list.
+    """
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locator = Locator(document_id, version, 1)
+    source_ref = serialize_source_ref(
+        UnitLocator(document_id, version, unit=locator.page)
+    )
+    miss_envelope = {
+        "error": "read_source_not_found",
+        "source_ref": source_ref,
+    }
+    adapter = _ReadCapturingAdapter(
+        bodies={},
+        locator_map={"hit": locator},
+        known_document_ids={document_id},
+        errors=[
+            {
+                "result": {
+                    "isError": True,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(miss_envelope),
+                        }
+                    ],
+                }
+            }
+        ],
+    )
+    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
+
+
+def test_mcp_read_invalidated_content_block_is_unknown_locator() -> None:
+    """A ``read_source_invalidated`` content block — the T5
+    operator-console miss — is also surfaced as ``unknown_locator``.
+
+    The receiving service distinguishes "row exists but window is
+    closed" from "row missing", but fin's read contract collapses
+    both to the existing miss shape; this guard ensures the
+    invalidated code (which also starts with ``read_source_``) does
+    not slip through as a successful empty body.
+    """
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locator = Locator(document_id, version, 1)
+    source_ref = serialize_source_ref(
+        UnitLocator(document_id, version, unit=locator.page)
+    )
+    miss_envelope = {
+        "error": "read_source_invalidated",
+        "source_ref": source_ref,
+        "valid_until": "2026-01-01T00:00:00.000Z",
+    }
+    adapter = _ReadCapturingAdapter(
+        bodies={},
+        locator_map={"hit": locator},
+        known_document_ids={document_id},
+        errors=[
+            {
+                "result": {
+                    "isError": True,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(miss_envelope),
+                        }
+                    ],
+                }
+            }
+        ],
+    )
+    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
 
 
 def test_mcp_read_version_mismatch_rejects_before_transport() -> None:

@@ -676,7 +676,10 @@ class MCPRetrieveAdapter:
             result = response.get("result")
             if not isinstance(result, dict) or "content" not in result:
                 return {"error": "unknown_locator"}
-            units.append(result["content"])
+            body = _read_body_of_content(result)
+            if body is _READ_MISS_SENTINEL:
+                return {"error": "unknown_locator"}
+            units.append(body)
 
         return {
             "document_id": document_id,
@@ -973,3 +976,66 @@ __all__ = [
     "RetrieveDegradedFailureError",
     "RetrieveUnavailableError",
 ]
+
+
+# ----- read_source content-block decoding -----
+
+
+_READ_MISS_SENTINEL = object()
+
+
+def _read_body_of_content(result: Mapping[str, Any]) -> Any:
+    """Decode the ``read_source`` ``result.content`` envelope.
+
+    The real iknow-memory ``read_source`` tool writes the canonical MCP
+    tools/call shape — ``{isError?, content: [{type: "text", text: "..."}]}``
+    — and the inner ``text`` carries the business envelope
+    ``{id, source_ref, content}`` on success or
+    ``{error: "read_source_not_found" | "read_source_invalidated", ...}``
+    on the named miss.
+
+    This decoder returns the body string when the wire is a success,
+    or :data:`_READ_MISS_SENTINEL` when the wire carries the named
+    ``read_source_*`` miss code (the caller's contract is to translate
+    that to the existing ``{"error": "unknown_locator"}` shape).
+
+    A flat string ``content`` is preserved as a forward-compat fallback
+    for hand-rolled adapters that still project the body directly.
+    """
+    if result.get("isError"):
+        return _READ_MISS_SENTINEL
+    content = result["content"]
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list) or not content:
+        return _READ_MISS_SENTINEL
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, Mapping):
+            return _READ_MISS_SENTINEL
+        if block.get("type") != "text":
+            continue
+        text = block.get("text")
+        if not isinstance(text, str):
+            return _READ_MISS_SENTINEL
+        try:
+            inner = json.loads(text)
+        except ValueError:
+            return _READ_MISS_SENTINEL
+        if isinstance(inner, Mapping):
+            error_code = inner.get("error")
+            if isinstance(error_code, str) and error_code.startswith(
+                "read_source_"
+            ):
+                return _READ_MISS_SENTINEL
+            body = inner.get("content")
+            if isinstance(body, str):
+                parts.append(body)
+                continue
+        # Fallback: keep the raw text when the block is not a JSON
+        # envelope we recognize, so a hand-rolled adapter that ships a
+        # plain string body still produces a usable read result.
+        parts.append(text)
+    if not parts:
+        return _READ_MISS_SENTINEL
+    return "\n\n".join(parts)
