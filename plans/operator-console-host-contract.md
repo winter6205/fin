@@ -3,7 +3,7 @@
 **Goal:** Fin ingest pushes one envelope to **iknow-memory**; **read_file** on ingested locators calls MCP `read_source`; local paths / **thread attach** stay local; prompt map and hard gates stay in code.
 **Approach:** Change the Fake-MCP push shape first (no live server). Then dispatch inside **read_file**. Then prompt map + citation gate. Opt-in live MCP last. Do not rebuild PDF/office ingest. Dashboard/schema stay in the memory repo.
 **Spec link:** `specs/operator-console-host-contract.md`
-**Pair plan:** iknow-memory worktree `plans/operator-console.md` (T3 envelope / T4 `read_source` must exist before a live MCP run; Fake tests do not wait)
+**Pair plan:** iknow-memory `plans/operator-console.md` (T3 envelope / T4 `read_source` must exist before a live MCP run; Fake tests do not wait)
 **Tracker:** **local markdown fallback** — operator: 本程序不开 GitHub issue tracker；票以本文件 Tasks 编号为准。
 **Map (memory repo):** [操作员完整控制台：同一权威源上的检视、喂数与图投影](https://github.com/winter6205/iknow-memory/issues/201)
 **ACR:** all-yes (copied from spec · 2026-09-10)
@@ -44,13 +44,13 @@ minimal-change-verifier: yes — this repo only the host contract; dashboard/sch
    - **Inherits:** spec: after **切分**, **入库推送** with `source_ref` (locator string) + 资料 body (extracted unit text) + `chunks[]` `{ content, index }`; **thread attach** still does not push.
    - **Surface:** existing ingest push mapper (corpus ingest → MCP)
    - **Acceptance:** Fake MCP ingest payload includes `source_ref`, a non-empty 资料 body, and `chunks` with monotonic `index` starting at 0; slice texts are contiguous substrings of the body. `uv run pytest -q` exits 0.
-   - Status: [ ] pending
+   - Status: [x] done — commit e390fdf (PushEnvelope wire per unit; substring/monotonic-index validation; FakePushPort envelope storage)
 
 2. **`read_file` dispatches ingested vs local** — tag: `[implementation]`
    - **Inherits:** spec: ingested locator → MCP `read_source`; local path / **thread attach** → existing local read; unknown locator still `{ error: "unknown_locator" }`; no silent local-tree fallback for ingested locators.
    - **Surface:** existing **read_file** tool wrapper
    - **Acceptance:** **read_file** on an ingested locator issues `read_source` (not a local tree read); **thread attach** / local path does not call `read_source`; unknown locator is `unknown_locator`. `uv run pytest -q` exits 0.
-   - Status: [ ] pending
+   - Status: [x] done — commit bd2e650 (MCPRetrieveAdapter.read -> per-unit read_source; unknown_locator misses; no local fallback; attach pin)
    - [blocks: T1]
 
 3. **[parallel] Prompt map + hard gate for ingested claims** — tag: `[implementation]`
