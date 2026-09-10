@@ -348,6 +348,32 @@ def test_push_transport_failure_is_named_not_silent() -> None:
         ),
         pytest.param(
             {
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps({"chunk_ids": ["a", 42]}),
+                        }
+                    ]
+                }
+            },
+            id="chunk-ids-stray-non-string-element",
+        ),
+        pytest.param(
+            {
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps({"chunk_ids": {"0": "a"}}),
+                        }
+                    ]
+                }
+            },
+            id="chunk-ids-mapping-not-list",
+        ),
+        pytest.param(
+            {
                 "error": {
                     "code": -32603,
                     "message": "internal error",
