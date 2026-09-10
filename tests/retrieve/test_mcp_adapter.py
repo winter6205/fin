@@ -116,6 +116,80 @@ class _ScriptedAdapter(MCPRetrieveAdapter):
         raise RuntimeError("no scripted response configured")
 
 
+class _ReadCapturingAdapter(_ScriptedAdapter):
+    def __init__(self, *, bodies: dict[str, str], errors: list[dict] | None = None, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.bodies = dict(bodies)
+        self.errors = list(errors or [])
+        self.payloads: list[dict] = []
+
+    async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
+        self.payloads.append(payload)
+        if self.errors:
+            return self.errors.pop(0)
+        source_ref = payload["params"]["arguments"]["source_ref"]
+        return {"result": {"id": source_ref, "source_ref": source_ref, "content": self.bodies.get(source_ref, "")}}
+
+
+def test_mcp_read_ingested_document_calls_read_source_per_unit() -> None:
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locators = (Locator(document_id, version, 2), Locator(document_id, version, 1))
+    source_refs = [serialize_source_ref(UnitLocator(document_id, version, locator.page)) for locator in locators]
+    adapter = _ReadCapturingAdapter(
+        bodies={source_refs[0]: "SECOND PARAGRAPH", source_refs[1]: "FIRST PARAGRAPH"},
+        locator_map={"hit-2": locators[0], "hit-1": locators[1]},
+        known_document_ids={document_id},
+    )
+    result = adapter.read(document_id, version, page=1, page_limit=2)
+    assert [payload["params"]["arguments"] for payload in adapter.payloads] == [
+        {"source_ref": source_refs[1]}, {"source_ref": source_refs[0]}
+    ]
+    assert result == {"document_id": document_id, "version": version, "page": 1, "text": "FIRST PARAGRAPH\n\nSECOND PARAGRAPH", "page_count": 2}
+
+
+def test_mcp_read_clamps_window_and_unit_order() -> None:
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locators = tuple(Locator(document_id, version, page) for page in range(1, 5))
+    refs = {locator.page: serialize_source_ref(UnitLocator(document_id, version, locator.page)) for locator in locators}
+    adapter = _ReadCapturingAdapter(
+        bodies={refs[2]: "PAGE TWO", refs[3]: "PAGE THREE", refs[4]: "PAGE FOUR"},
+        locator_map={f"hit-{page}": locator for page, locator in enumerate(locators, 1)},
+        known_document_ids={document_id},
+    )
+    result = adapter.read(document_id, version, page=2, page_limit=99)
+    assert [payload["params"]["arguments"] for payload in adapter.payloads] == [{"source_ref": refs[2]}, {"source_ref": refs[3]}, {"source_ref": refs[4]}]
+    assert result["text"] == "PAGE TWO\n\nPAGE THREE\n\nPAGE FOUR"
+    assert result["page"] == 2 and result["page_count"] == 4
+
+
+def test_mcp_read_miss_and_unknown_document_are_unknown_locator() -> None:
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    locator = Locator(document_id, version, 1)
+    adapter = _ReadCapturingAdapter(
+        bodies={}, locator_map={"hit": locator}, known_document_ids={document_id},
+        errors=[{"error": {"code": -32001, "message": "read_source_not_found"}}],
+    )
+    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
+    unknown = _ReadCapturingAdapter(bodies={}, locator_map={"hit": locator}, known_document_ids={document_id})
+    assert unknown.read("UNKNOWN-2099Q9", version) == {"error": "unknown_locator"}
+    assert unknown.payloads == []
+
+
+def test_mcp_read_version_mismatch_rejects_before_transport() -> None:
+    locator = Locator("DOC-2023Q1", "v-" + "b" * 60, 1)
+    adapter = _ReadCapturingAdapter(bodies={}, locator_map={"hit": locator}, known_document_ids={"DOC-2023Q1"})
+    assert adapter.read("DOC-2023Q1", "v-" + "a" * 60) == {"error": "unknown_locator"}
+    assert adapter.payloads == []
+
+
+@pytest.mark.parametrize(("page", "page_limit"), [(0, 1), (1, 0), (4, 3)])
+def test_mcp_read_invalid_window_rejects_before_transport(page: int, page_limit: int) -> None:
+    locator = Locator("DOC-2023Q1", "v-" + "a" * 60, 3)
+    adapter = _ReadCapturingAdapter(bodies={}, locator_map={"hit": locator}, known_document_ids={"DOC-2023Q1"})
+    assert adapter.read("DOC-2023Q1", "v-" + "a" * 60, page, page_limit) == {"error": "unknown_locator"}
+    assert adapter.payloads == []
+
+
 # ----- boundary 1: empty -----
 
 

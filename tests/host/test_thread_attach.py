@@ -543,6 +543,65 @@ def test_attach_and_send_never_ingest_or_push(
     assert calls == []
 
 
+def test_attach_does_not_trigger_mcp_read_source(
+    client: TestClient, fresh_store, http_app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T2: thread attach never resolves a body through MCP ``read_source``.
+
+    The attach door is "give the model that file for this turn only"
+    (ADR 0047). Re-routing attachment text through MCP would silently
+    expand the read_file tool's surface, so the seam must short-circuit
+    in the host graph before any MCP call. A spy on
+    ``MCPRetrieveAdapter.read`` is installed and the graph is rebuilt
+    with the MCP adapter as its ``read_port``; the assertion holds
+    whether or not the model itself asks for ``read_file``.
+    """
+    from fin.host.http import get_graph
+    from fin.retrieve import MCPRetrieveAdapter
+
+    calls: list[tuple[str, str]] = []
+
+    real_read = MCPRetrieveAdapter.read
+
+    def _spy(self, document_id, version, page=1, page_limit=1):
+        calls.append((document_id, version))
+        return real_read(self, document_id, version, page, page_limit)
+
+    monkeypatch.setattr(MCPRetrieveAdapter, "read", _spy)
+
+    # Build a graph whose read port IS the MCP adapter so the spy
+    # is on the actual seam, not a side branch.
+    mcp_adapter = MCPRetrieveAdapter(
+        command=None,
+        known_document_ids=KNOWN_IDS,
+    )
+    model = RecordingScriptedModel(script=[AIMessage(content="ok")])
+    graph = _compile_with_mcp_read_port(model, mcp_adapter)
+    http_app.dependency_overrides[get_graph] = lambda: graph
+
+    thread_id = _new_thread(client)
+    attached = _attach(client, thread_id, ATTACH_SENTINEL.encode()).json()
+    sent = _send(client, thread_id, attachment_ids=[attached["attachment_id"]])
+    assert sent.status_code == 200
+
+    # No MCP ``read`` happened on the attach turn.
+    assert calls == [], (
+        "thread attach triggered an MCP read; the attach door must "
+        "never resolve a body through read_source"
+    )
+
+
+def _compile_with_mcp_read_port(model: ScriptedChatModel, mcp_adapter: Any) -> Any:
+    from fin.host import compile_graph
+
+    return compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        known_document_ids=KNOWN_IDS,
+        read_port=mcp_adapter,
+    )
+
+
 def test_attachment_text_cannot_satisfy_citation_gate(
     client: TestClient, fresh_store, http_app: FastAPI
 ) -> None:

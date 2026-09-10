@@ -27,10 +27,12 @@ Adapters that also implement retrieve carry ``read`` on themselves:
 * ``FakeRetrievePort.read`` (``fin.retrieve.fake_port``) answers from
   its optional ``pages_by_doc`` manifest — the scripted-serve answer to
   "where does a fake read body come from without a local tree".
-* ``MCPRetrieveAdapter.read`` (``fin.retrieve.mcp_adapter``) returns
-  the named ``READ_UNAVAILABLE`` failure: iknow-memory exposes no read
-  tool today (handoff 2026-09-04), and reading the local tree instead
-  would reintroduce exactly the second SSOT ADR 0047 removes.
+* ``MCPRetrieveAdapter.read`` (``fin.retrieve.mcp_adapter``) dispatches
+  an ingested locator to the MCP ``read_source`` tool (one call per
+  frozen unit, canonical ``source_ref``) and answers the typed miss
+  dict for anything else — it NEVER falls back to the local extracted
+  tree, which would reintroduce exactly the second SSOT ADR 0047
+  removes.
 """
 
 from __future__ import annotations
