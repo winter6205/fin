@@ -65,6 +65,6 @@ minimal-change-verifier: yes — this repo only the host contract; dashboard/sch
    - **Inherits:** spec: live transport stays opt-in (`mcp` mark or existing equivalent); not collected by default pytest.
    - **Surface:** existing opt-in MCP test surface
    - **Acceptance:** marked test may cover initialize + `tools/call` `read_source`; default `uv run pytest -q` still exits 0 without a live server. Live run expects memory-repo T4 (`read_source`) available on that server.
-   - Status: [ ] pending
+   - Status: [x] done — commit f687f84 (mcp-marked live read_source: tools/list presence, by-ref/by-id wire shape byte-identical body, named not-found; live_iknow root= worktree spawn)
    - [parallel]
    - [blocks: T2]
