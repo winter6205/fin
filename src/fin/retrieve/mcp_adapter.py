@@ -98,6 +98,8 @@ import logging
 from typing import Any, Mapping
 
 from fin.corpus.extracted import Locator
+from fin.corpus.parsers._common import UnitLocator
+from fin.corpus.push import serialize_source_ref
 from fin.retrieve.degradation import (
     NOT_DEGRADED,
     DegradationError,
@@ -117,7 +119,6 @@ from fin.retrieve.mcp_session import (
     MCPStdioProtocolError,
     MCPStdioSession,
 )
-from fin.retrieve.read_port import READ_UNAVAILABLE
 
 
 _DEFAULT_LIMIT = 8
@@ -617,20 +618,73 @@ class MCPRetrieveAdapter:
         page: int = 1,
         page_limit: int = 1,
     ) -> dict[str, Any]:
-        """Named EXIT: the retrieve backend exposes no read tool.
+        """Read an ingested document through MCP ``read_source``.
 
-        ADR 0047: ``read_file`` is an ordinary read of a known locator
-        — MCP when that is where the bytes live. iknow-memory ships
-        retrieve / push / invalidation but **no read endpoint**
-        (handoff 2026-09-04), so the product read is the named
-        ``{"error": "read_unavailable"}`` failure. It is deliberately
-        NOT ``unknown_locator`` (the locator may well exist on the
-        backend) and it NEVER falls back to the local extracted tree —
-        that would reintroduce the second serve-time SSOT ADR 0046 /
-        0047 remove. When iknow-memory grows a read tool, this method
-        becomes the MCP round trip.
+        The adapter's known document set is the set ingested on MCP. For
+        an ingested document, the configured locator map is used only to
+        discover its unit locators. The map is ordered by unit number;
+        each unit is fetched independently and its body becomes one
+        page in the existing ``read_file`` contract. This preserves the
+        unit granularity of the pushed envelope while keeping the
+        model's read shape unchanged.
         """
-        return {"error": READ_UNAVAILABLE}
+        if page < 1 or page_limit < 1:
+            return {"error": "unknown_locator"}
+        if page_limit > 3:
+            page_limit = 3
+        if (
+            self._known_doc_ids is not None
+            and document_id not in self._known_doc_ids
+        ):
+            return {"error": "unknown_locator"}
+
+        locators = sorted(
+            (
+                locator
+                for locator in self._locator_map.values()
+                if locator.document_id == document_id
+                and locator.version == version
+            ),
+            key=lambda locator: locator.page,
+        )
+        if not locators or page > len(locators):
+            return {"error": "unknown_locator"}
+
+        end = min(page + page_limit - 1, len(locators))
+        units: list[str] = []
+        for locator in locators[page - 1:end]:
+            source_ref = serialize_source_ref(
+                UnitLocator(document_id, version, locator.page)
+            )
+            payload = {
+                "jsonrpc": "2.0",
+                "id": _TOOL_REQUEST_ID,
+                "method": "tools/call",
+                "params": {
+                    "name": "read_source",
+                    "arguments": {"source_ref": source_ref},
+                },
+            }
+            try:
+                response = asyncio.run(self._call_mcp(payload))
+            except (OSError, asyncio.TimeoutError, TimeoutError) as exc:
+                raise RetrieveUnavailableError(
+                    f"MCP transport failed: {exc!r}"
+                ) from exc
+            if not isinstance(response, dict) or "error" in response:
+                return {"error": "unknown_locator"}
+            result = response.get("result")
+            if not isinstance(result, dict) or "content" not in result:
+                return {"error": "unknown_locator"}
+            units.append(result["content"])
+
+        return {
+            "document_id": document_id,
+            "version": version,
+            "page": page,
+            "text": "\n\n".join(str(unit) for unit in units),
+            "page_count": len(locators),
+        }
 
     async def aretrieve(
         self,
