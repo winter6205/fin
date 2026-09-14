@@ -1,22 +1,23 @@
 # Testing Patterns — Full Code Examples
 
-Companion to SKILL.md "Writing Good Tests" section. Each example shows the principle applied to real code.
+Companion to `references/test-shape.md` (writing rules). Each example shows the principle applied to real code.
 
 ## Test State, Not Interactions
 
 ```typescript
 // Good: Tests what the function does (state-based)
-it('returns tasks sorted by creation date, newest first', async () => {
-  const tasks = await listTasks({ sortBy: 'createdAt', sortOrder: 'desc' });
-  expect(tasks[0].createdAt.getTime())
-    .toBeGreaterThan(tasks[1].createdAt.getTime());
+it("returns tasks sorted by creation date, newest first", async () => {
+  const tasks = await listTasks({ sortBy: "createdAt", sortOrder: "desc" });
+  expect(tasks[0].createdAt.getTime()).toBeGreaterThan(
+    tasks[1].createdAt.getTime(),
+  );
 });
 
 // Bad: Tests how the function works internally (interaction-based)
-it('calls db.query with ORDER BY created_at DESC', async () => {
-  await listTasks({ sortBy: 'createdAt', sortOrder: 'desc' });
+it("calls db.query with ORDER BY created_at DESC", async () => {
+  await listTasks({ sortBy: "createdAt", sortOrder: "desc" });
   expect(db.query).toHaveBeenCalledWith(
-    expect.stringContaining('ORDER BY created_at DESC')
+    expect.stringContaining("ORDER BY created_at DESC"),
   );
 });
 ```
@@ -25,15 +26,15 @@ it('calls db.query with ORDER BY created_at DESC', async () => {
 
 ```typescript
 // DAMP: Each test is self-contained and readable
-it('rejects tasks with empty titles', () => {
-  const input = { title: '', assignee: 'user-1' };
-  expect(() => createTask(input)).toThrow('Title is required');
+it("rejects tasks with empty titles", () => {
+  const input = { title: "", assignee: "user-1" };
+  expect(() => createTask(input)).toThrow("Title is required");
 });
 
-it('trims whitespace from titles', () => {
-  const input = { title: '  Buy groceries  ', assignee: 'user-1' };
+it("trims whitespace from titles", () => {
+  const input = { title: "  Buy groceries  ", assignee: "user-1" };
   const task = createTask(input);
-  expect(task.title).toBe('Buy groceries');
+  expect(task.title).toBe("Buy groceries");
 });
 
 // Over-DRY: Shared setup obscures what each test actually verifies
