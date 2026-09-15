@@ -1,9 +1,10 @@
 // Ordinary-person copy for a thread-attach failure (the attach door
 // in the Composer). The door's own failures describe what happened
-// to the ATTACHMENT — nothing about入库 — so an attach failure can
+// to the ATTACHMENT — nothing about 入库 — so an attach failure can
 // never read as ingest business (SC4). The two rejections that are
-// actually "wrong door" signals (oversize, non-text bytes) point the
-// operator at the corpus-ingest door by name.
+// actually "wrong door" signals (oversize, non-text bytes) name the
+// 入库 process, not a fin page: the corpus-ingest UI lives outside
+// the fin chrome, so the copy must not point at a retired entry.
 
 import { AttachFailedError } from "./api";
 
@@ -30,11 +31,11 @@ export function describeAttachFailure(error: unknown): AttachFailureNotice {
       break;
     case "attachment_too_large":
       message =
-        "这份文件超过附件大小上限，没有上传。要长期入库请改用知识库的入库入口。";
+        "这份文件超过附件大小上限，没有上传。大文件请在入库流程里处理。";
       break;
     case "attachment_not_text":
       message =
-        "附件只支持文本文件；PDF / Word / Excel 等格式请改用知识库的入库入口。";
+        "附件只支持文本文件。PDF / Word / Excel 等请在入库流程里处理，再在对话里提问。";
       break;
     case "attachment_store_failed":
       message = "附件保存失败，请重试。";

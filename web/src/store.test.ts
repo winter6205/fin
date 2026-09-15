@@ -4,7 +4,11 @@
 // the composer had already cleared the draft.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ConcurrentRunError, IngestMissingError } from "./api";
+import {
+  ConcurrentRunError,
+  IngestMissingError,
+  KnowledgeMcpFaultError,
+} from "./api";
 import { describeSendFailure } from "./sendFailure";
 import { useWorkspaceStore } from "./store";
 import type { Citation, ThreadDetail, Turn } from "./types";
@@ -259,6 +263,37 @@ describe("sendQuestion failure surfacing", () => {
     const notice = describeSendFailure(rejection);
     expect(notice.kind).toBe("concurrent_run");
     expect(notice.message.length).toBeGreaterThan(0);
+  });
+
+  it("maps a 409 knowledge_mcp_fault body to the typed MCP fault, not concurrency", async () => {
+    seedThread();
+    stubSendStatus(409, {
+      error: "knowledge_mcp_fault",
+      message: "知识 MCP 故障",
+    });
+
+    const rejection = await useWorkspaceStore
+      .getState()
+      .sendQuestion(THREAD_ID, "现金流怎么样？")
+      .then(() => null)
+      .catch((error: unknown) => error);
+
+    expect(rejection).toBeInstanceOf(KnowledgeMcpFaultError);
+    expect(rejection).not.toBeInstanceOf(ConcurrentRunError);
+    expect((rejection as KnowledgeMcpFaultError).message).toBe("知识 MCP 故障");
+    expect(describeSendFailure(rejection).kind).toBe("knowledge_mcp_fault");
+  });
+
+  it("resume maps the same knowledge_mcp_fault 409", async () => {
+    seedResumableThread();
+    stubSendStatus(409, {
+      error: "knowledge_mcp_fault",
+      message: "知识 MCP 故障",
+    });
+
+    await expect(
+      useWorkspaceStore.getState().resumeThread(THREAD_ID),
+    ).rejects.toBeInstanceOf(KnowledgeMcpFaultError);
   });
 
   it("keeps a partially streamed turn but clears its live flag", async () => {
@@ -1072,7 +1107,7 @@ describe("loadStatus 重连 in-flight guard", () => {
     resolveFetch!(
       new Response(
         JSON.stringify({
-          retrieve_reachability: "reachable",
+          knowledge_mcp: "reachable",
           retrieve_adapter_kind: "mcp",
           model_identity: "fin/MiniMax-M3",
           corpus_filing_count: 12,
@@ -1085,7 +1120,7 @@ describe("loadStatus 重连 in-flight guard", () => {
     const state = useWorkspaceStore.getState();
     expect(state.loadingStatus).toBe(false);
     expect(state.statusLoaded).toBe(true);
-    expect(state.status?.retrieve_reachability).toBe("reachable");
+    expect(state.status?.knowledge_mcp).toBe("reachable");
   });
 
   it("flips loadingStatus true while the fetch is pending and false after", async () => {
@@ -1095,7 +1130,7 @@ describe("loadStatus 重连 in-flight guard", () => {
       loadingStatus: false,
     });
     stubStatus(200, {
-      retrieve_reachability: "reachable",
+      knowledge_mcp: "reachable",
       retrieve_adapter_kind: "mcp",
       model_identity: "fin/MiniMax-M3",
       corpus_filing_count: 12,

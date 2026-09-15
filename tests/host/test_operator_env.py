@@ -117,6 +117,9 @@ def test_serve_applies_dotenv_before_uvicorn(monkeypatch) -> None:
     monkeypatch.setattr(
         "fin.host.http.compile_for_http", lambda: order.append("compile")
     )
+    # The knowledge-MCP probe is a separate boot step; stub it so this
+    # ordering assertion does not depend on a live/absent MCP binary.
+    monkeypatch.setattr("fin.host.http.publish_knowledge_mcp", lambda: None)
     import uvicorn
 
     monkeypatch.setattr(uvicorn, "run", _run)
@@ -195,10 +198,13 @@ def test_boot_probe_silent_when_adapter_is_not_mcp(
 def test_serve_warns_about_unreachable_mcp_and_still_serves(
     tmp_path: Path, monkeypatch, caplog
 ) -> None:
-    """``fin-serve`` boot logs the WARNING and keeps booting.
+    """``fin-serve`` boot publishes 缺, logs the WARNING, keeps booting.
 
-    The WARNING is informational: uvicorn must still start, exactly
-    like the missing-``web/dist`` case.
+    The product seam (workbench retrieve product seam) replaces the
+    PATH-only ``warn_if_mcp_retrieve_unreachable`` call with
+    ``publish_knowledge_mcp``, which probes a real handshake and stores
+    the three-state snapshot. The WARNING still must not stop the boot,
+    exactly like the missing-``web/dist`` case.
     """
     served: list[str] = []
 
@@ -211,17 +217,24 @@ def test_serve_warns_about_unreachable_mcp_and_still_serves(
     monkeypatch.delenv("FIN_RETRIEVE_ADAPTER", raising=False)
 
     from fin.host.http import serve
+    from fin.host.knowledge_mcp import (
+        KNOWLEDGE_MCP_MISSING,
+        knowledge_mcp_state,
+        reset_knowledge_mcp_state,
+    )
 
-    with caplog.at_level(logging.WARNING, logger="fin.host.operator_env"):
+    reset_knowledge_mcp_state()
+    with caplog.at_level(logging.WARNING, logger="fin.host.knowledge_mcp"):
         serve()
 
     assert served == ["uvicorn"], "the WARNING must not stop the boot"
+    assert knowledge_mcp_state() == KNOWLEDGE_MCP_MISSING
     warnings = [
         r.getMessage()
         for r in caplog.records
-        if r.levelno == logging.WARNING and r.name == "fin.host.operator_env"
+        if r.levelno == logging.WARNING and r.name == "fin.host.knowledge_mcp"
     ]
-    assert any("FIN_RETRIEVE_ADAPTER" in m for m in warnings), warnings
+    assert any("knowledge_mcp_fault" in m for m in warnings), warnings
 
 
 # ----- shared reachability probe (T10, ADR 0033) -----

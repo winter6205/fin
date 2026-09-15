@@ -48,8 +48,29 @@ describe("noticeSummary", () => {
     });
     expect(text).toContain("AAPL-2023FY");
     expect(text).toContain("10-K");
-    expect(text).toContain("知识库");
+    // The notices panel is retired with the /kb chrome, so the helper
+    // (still exported) must not name the retired 知识库 surface either.
+    expect(text).toContain("已入库");
+    expect(text).not.toContain("知识库");
     expect(text).not.toContain("catalog");
+  });
+
+  it("keeps the issuer and period for a notice without a form", () => {
+    const text = noticeSummary({
+      id: "n2",
+      watch_id: "w1",
+      issuer: "MSFT",
+      form: "",
+      document_id: "MSFT-2024FY",
+      period: "2024 FY",
+      created_at: "2026-08-27T00:00:00Z",
+      read: false,
+    });
+    expect(text).toContain("MSFT");
+    expect(text).toContain("MSFT-2024FY");
+    expect(text).toContain("2024 FY");
+    expect(text).toContain("已入库");
+    expect(text).not.toContain("知识库");
   });
 });
 

@@ -2,10 +2,9 @@
 // restores turns from GET (no re-invoke).
 
 import { memo, useEffect, useState } from "react";
-import { useLocation, useParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
 import AnswerWithCitations from "../components/CitationChips";
 import Composer from "../components/Composer";
-import CorpusCard from "../components/CorpusCard";
 import type { Comparison, ToolSummary, Turn } from "../types";
 import {
   cellTitle,
@@ -88,15 +87,7 @@ function OccupancyBadge({
 
 export default function ThreadPage() {
   const { thread_id } = useParams<{ thread_id: string }>();
-  const location = useLocation();
   const activeThread = useWorkspaceStore((s) => s.activeThread);
-  const sendingQuestion = useWorkspaceStore((s) => s.sendingQuestion);
-
-  // Prefill from navigation state (corpus card click).
-  const navState = location.state as { prefill?: string } | null;
-  const [prefill, setPrefill] = useState<string | null>(
-    navState?.prefill ?? null,
-  );
 
   // Re-sync from the persisted turn table when we arrive at a
   // thread (reload / switch back). GET only - no graph invoke.
@@ -176,18 +167,18 @@ export default function ThreadPage() {
           />
         ))}
 
-        {/* Spec #2: a freshly-created (zero-turn) thread must still
-            surface the corpus cards so the operator can pick a
-            filing without going back to home. Same createThread
-            ({prefill}) flow as the home grid; never auto-sends. */}
-        {activeThread.turns.length === 0 ? <EmptyThreadCorpusGrid /> : null}
+        {/* Zero-turn thread: a plain empty state. The corpus-card
+            grid was retired with the /kb chrome
+            (workbench-retrieve-product-seam): the catalog lives
+            outside fin, so the composer is the only entry. */}
+        {activeThread.turns.length === 0 ? (
+          <p className="max-w-3xl mx-auto pt-4 text-sm text-gray-500">
+            还没有提问。在下方输入框写下你的问题，开始这个 research thread。
+          </p>
+        ) : null}
       </div>
 
-      <Composer
-        threadId={thread_id}
-        prefill={sendingQuestion ? null : prefill}
-        onPrefillConsumed={() => setPrefill(null)}
-      />
+      <Composer threadId={thread_id} />
     </main>
   );
 }
@@ -250,23 +241,6 @@ function ExportLinks({ threadId, turns }: { threadId: string; turns: Turn[] }) {
         </a>
       ) : null}
     </nav>
-  );
-}
-
-function EmptyThreadCorpusGrid() {
-  const corpus = useWorkspaceStore((s) => s.corpus);
-  if (corpus.length === 0) return null;
-  return (
-    <section aria-label="从一份文件开始" className="max-w-3xl mx-auto pt-4">
-      <h3 className="text-sm font-semibold text-gray-500 mb-2">
-        或从一份文件开始
-      </h3>
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-        {corpus.map((f) => (
-          <CorpusCard key={f.document_id} filing={f} />
-        ))}
-      </div>
-    </section>
   );
 }
 

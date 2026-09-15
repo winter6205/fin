@@ -69,6 +69,22 @@ def pytest_collection_modifyitems(
 
 
 @pytest.fixture(autouse=True)
+def _reset_knowledge_mcp_snapshot():
+    """Clear the in-process knowledge-MCP snapshot around every host test.
+
+    The snapshot is module-level state in ``fin.host.knowledge_mcp``
+    (one process = one boot). Tests that publish 缺 / 坏 / 可达 must not
+    leak that state into an unrelated test's conversation mouth, so this
+    autouse fixture resets before and after each ``tests/host`` case.
+    """
+    from fin.host.knowledge_mcp import reset_knowledge_mcp_state
+
+    reset_knowledge_mcp_state()
+    yield
+    reset_knowledge_mcp_state()
+
+
+@pytest.fixture(autouse=True)
 def _memory_on_env_for_marked_tests(
     monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> None:

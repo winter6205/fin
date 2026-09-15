@@ -1,7 +1,7 @@
-// T4 workflow (the tracked change): pure helpers for the watchlist + in-app notice
-// panel. Parsing lives here (not in the components) so the wire
+// T4 workflow: pure helpers for the watchlist + in-app notice
+// HTTP. Parsing lives here (not in any component) so the wire
 // boundary is unit-tested without a DOM, the same split
-// ``comparison.ts`` / ``statusStrip.ts`` already use.
+// ``comparison.ts`` already uses.
 //
 // Shape SSOT is src/fin/host/watchlist.py; a payload that does not
 // match is DROPPED rather than half-rendered — a watch row the
@@ -32,7 +32,7 @@ export function watchSummary(entry: WatchEntry): string {
 export function noticeSummary(notice: Notice): string {
   const form = notice.form ? ` ${notice.form}` : "";
   const period = notice.period ? `（${notice.period}）` : "";
-  return `${notice.issuer}${form} ${notice.document_id}${period} 已加入知识库`;
+  return `${notice.issuer}${form} ${notice.document_id}${period} 已入库`;
 }
 
 export function unreadCount(notices: Notice[]): number {

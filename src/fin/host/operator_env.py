@@ -9,16 +9,19 @@ Existing process env wins (``setdefault``): CI and explicit exports
 are not overwritten. A missing file is a no-op — production can
 inject vars without shipping a file.
 
-Once the env is assembled, :func:`warn_if_mcp_retrieve_unreachable`
-checks the one setting whose default silently disables research:
-``FIN_RETRIEVE_ADAPTER`` defaults to ``mcp``, so a machine without
-the ``iknow-memory`` server serves a UI whose every retrieve call
-answers with the typed ``retrieve_unavailable`` EXIT.
+The product boot path no longer warns from here. ``fin.host.http.serve()``
+calls :func:`fin.host.knowledge_mcp.publish_knowledge_mcp`, which probes the
+iknow-memory MCP with a real ``initialize`` + ``tools/list`` handshake and
+publishes the three states 缺 / 坏 / 可达 into the in-process snapshot shared
+by ``GET /api/status`` and the conversation-entry gate. ADR 0033 was amended
+2026-09-13 (ADR 0051) accordingly.
 
-That boot warning and the workspace status surface
-(``GET /api/status``, ADR 0033) answer the same question, so the
-lookup lives once in :func:`probe_retrieve_reachability` and the
-warning is a thin logging wrapper over it.
+Retained here for backward compatibility is a PATH-only diagnostic,
+:func:`probe_retrieve_reachability` (with its thin logging wrapper
+:func:`warn_if_mcp_retrieve_unreachable`). It is legacy, NOT product truth:
+it reads only whether ``DEFAULT_MCP_COMMAND[0]`` sits on ``PATH`` and cannot
+see whether the server completes the handshake. New code should read the
+``fin.host.knowledge_mcp`` snapshot instead.
 """
 
 from __future__ import annotations
@@ -150,6 +153,11 @@ def probe_retrieve_reachability(
 ) -> str:
     """Return ``RETRIEVE_REACHABLE`` / ``RETRIEVE_UNREACHABLE``.
 
+    LEGACY diagnostic, not the product boot path (ADR 0033 amended
+    2026-09-13 / ADR 0051). ``fin.host.http.serve()`` now calls
+    :func:`fin.host.knowledge_mcp.publish_knowledge_mcp`; this PATH-only
+    helper is retained for compatibility and its own tests.
+
     Unreachable is exactly one situation: the product ``mcp``
     adapter is configured and the launch command ``compile_graph``
     would spawn (``DEFAULT_MCP_COMMAND``) is not on ``PATH``, so
@@ -162,7 +170,8 @@ def probe_retrieve_reachability(
 
     ``PATH`` lookup only. No process is started and no health-check
     RPC is issued: a probe spawn costs a subprocess per call and
-    still cannot prove the server answers ``tools/call``.
+    still cannot prove the server answers ``tools/call``. That blind
+    spot is why it is no longer product truth.
     """
     import os
     import shutil
@@ -183,6 +192,11 @@ def warn_if_mcp_retrieve_unreachable(
 ) -> bool:
     """Log a boot WARNING when retrieve is wired to an absent MCP server.
 
+    LEGACY diagnostic, not the product boot path (ADR 0033 amended
+    2026-09-13 / ADR 0051). The product boot warning lives in
+    :func:`fin.host.knowledge_mcp.publish_knowledge_mcp`, which reflects
+    the real handshake the status route and conversation gate share.
+
     Returns ``True`` when the warning fired. This is a diagnostic,
     NOT a gate: the operator keeps a serving process (the API, the
     SPA, and every non-research track still work), exactly like the
@@ -191,9 +205,8 @@ def warn_if_mcp_retrieve_unreachable(
     only way to start on a laptop, which is the wrong default.
 
     The reachability decision itself is
-    :func:`probe_retrieve_reachability` — the same value the
-    workspace status route reports, so the boot log and the Sidebar
-    strip cannot drift.
+    :func:`probe_retrieve_reachability` — a PATH-only prediction, with
+    the blind spot documented there. It is no longer the boot path.
     """
     import os
 

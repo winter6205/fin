@@ -43,6 +43,16 @@ describe("describeAttachFailure", () => {
     expect(notice.message).toContain("入库");
   });
 
+  it("names the 入库 process without pointing at a retired fin page", () => {
+    // /kb / KnowledgeBasePage left the product surface, so the copy
+    // must not tell the operator to open the 知识库 page by name.
+    for (const code of ["attachment_too_large", "attachment_not_text"]) {
+      const notice = describeAttachFailure(attachError(code));
+      expect(notice.message).toContain("入库");
+      expect(notice.message).not.toContain("知识库");
+    }
+  });
+
   it("never borrows ingest-door vocabulary for the attach door's own code", () => {
     // The two doors must not blur: attach failures that are NOT a
     // size/type rejection say what happened to the ATTACHMENT, not

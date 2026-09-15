@@ -6,8 +6,8 @@
 // vs ``SESSION_TOKEN_BUDGET``). The wording and the neutral-state
 // decision live here so they are unit-testable without a DOM;
 // rendering is a 1-line use in ThreadPage.tsx. This NEVER touches
-// ``statusStrip.ts`` — ADR 0033 keeps ``GET /api/status`` free of
-// any occupancy / context-window figure.
+// the boot-scoped ``GET /api/status`` snapshot — ADR 0033 keeps that
+// surface free of any occupancy / context-window figure.
 
 import type { ThreadDetail } from "./types";
 

@@ -5,8 +5,7 @@
 // corpus-serve-ingest T5 (ADR 0047): the thread-attach door lives
 // here — a file picker button AND a drop on the composer both upload
 // the file to POST /threads/{id}/attachments and reference the minted
-// id on the NEXT send. This door never touches /api/corpus/ingest;
-// corpus ingest lives in the home corpus area (IngestCorpusControl).
+// id on the NEXT send. This door never touches /api/corpus/ingest.
 
 import { useRef, useState } from "react";
 import {
@@ -19,16 +18,9 @@ import { useWorkspaceStore } from "../store";
 
 interface ComposerProps {
   threadId: string;
-  /** External prefill (empty-corpus card click). */
-  prefill?: string | null;
-  onPrefillConsumed?: () => void;
 }
 
-export default function Composer({
-  threadId,
-  prefill,
-  onPrefillConsumed,
-}: ComposerProps) {
+export default function Composer({ threadId }: ComposerProps) {
   const sendQuestion = useWorkspaceStore((s) => s.sendQuestion);
   const sending = useWorkspaceStore((s) => s.sendingQuestion);
   // T4 (spec line 38): disable the composer while the thread's
@@ -104,15 +96,6 @@ export default function Composer({
       return next;
     });
   };
-
-  // Apply external prefill once (corpus card click -> composer).
-  const appliedPrefillRef = useRef<string | null>(null);
-  if (prefill && prefill !== appliedPrefillRef.current) {
-    appliedPrefillRef.current = prefill;
-    setDraft(prefill);
-    onPrefillConsumed?.();
-    requestAnimationFrame(() => textareaRef.current?.focus());
-  }
 
   const submit = async () => {
     const q = draft.trim();

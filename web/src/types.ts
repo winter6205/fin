@@ -264,23 +264,27 @@ export interface Notice {
   read: boolean;
 }
 
-// T10 (ADR 0033): the boot-scoped workspace status surface behind
+// T10 (ADR 0033, amended by workbench-retrieve-product-seam
+// ADR 0051): the boot-scoped workspace status surface behind
 // ``GET /api/status``. Boot-scoped means configuration plus
 // dependency reachability — nothing run- or turn-scoped rides here
 // (no step budget, no token usage, no soft-track confidence, no
 // "% of context window"). Mirrors
 // fin.host.workspace_http.WorkspaceStatusResponse.
 
-// ``unreachable`` means every retrieve call answers with the typed
-// ``retrieve_unavailable`` EXIT — a value to render, never an error.
-export type RetrieveReachability = "reachable" | "unreachable";
+// The product **知识 MCP** handshake outcome published at boot:
+// 缺 (``missing``, no command) / 坏 (``fault``, handshake failed) /
+// 可达 (``reachable``, ``initialize`` + ``tools/list`` succeeded).
+// This REPLACES the retired two-state ``retrieve_reachability``.
+export type KnowledgeMcpState = "missing" | "fault" | "reachable";
 
 // Which port is behind the retrieve seam: the product iknow-memory
-// client, or the hermetic fake that answers with no corpus.
+// client, or the hermetic fake that answers with no corpus. A fake
+// boot publishes ``knowledge_mcp: "missing"`` — never 可达.
 export type RetrieveAdapterKind = "mcp" | "fake";
 
 export interface WorkspaceStatus {
-  retrieve_reachability: RetrieveReachability;
+  knowledge_mcp: KnowledgeMcpState;
   retrieve_adapter_kind: RetrieveAdapterKind;
   // The resolved ``FIN_MODEL`` slug only — the host never puts the
   // endpoint or key material on this wire.

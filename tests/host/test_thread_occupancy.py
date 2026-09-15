@@ -150,7 +150,7 @@ def test_status_has_no_occupancy_field(client: TestClient, fresh_store) -> None:
     assert r.status_code == 200
     body = r.json()
     assert set(body.keys()) == {
-        "retrieve_reachability",
+        "knowledge_mcp",
         "retrieve_adapter_kind",
         "model_identity",
         "corpus_filing_count",

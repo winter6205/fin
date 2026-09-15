@@ -36,8 +36,13 @@ from pydantic import BaseModel, Field
 
 from fin.corpus.errors import IngestMissingError
 from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER
-from fin.host.graph import ConcurrentRunError, compile_graph
-from fin.host.operator_env import apply_dotenv, warn_if_mcp_retrieve_unreachable
+from fin.host.graph import ConcurrentRunError, KnowledgeMCPFaultError, compile_graph
+from fin.host.knowledge_mcp import (
+    KNOWLEDGE_MCP_FAULT_ERROR,
+    KNOWLEDGE_MCP_FAULT_MESSAGE,
+    publish_knowledge_mcp,
+)
+from fin.host.operator_env import apply_dotenv
 from fin.host.run_payload import _run_to_response_payload
 from fin.host.state import EVIDENCE_RESET, reset_input_state
 from fin.host.thread_store import default_thread_store
@@ -332,6 +337,27 @@ async def concurrent_run_handler(request: Request, exc: ConcurrentRunError) -> J
     return JSONResponse(status_code=409, content={"error": "concurrent_run"})
 
 
+@app.exception_handler(KnowledgeMCPFaultError)
+async def knowledge_mcp_fault_handler(
+    request: Request, exc: KnowledgeMCPFaultError
+) -> JSONResponse:
+    """Map ``KnowledgeMCPFaultError`` → 409 with the stable
+    ``knowledge_mcp_fault`` token and the operator copy 「知识 MCP 故障」.
+
+    The three conversation mouths raise this when the boot snapshot
+    (``GET /api/status``'s ``knowledge_mcp``) is 缺 or 坏. The body copy
+    is the SAME string the SPA left corner renders, so the surface and
+    the server cannot drift.
+    """
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": KNOWLEDGE_MCP_FAULT_ERROR,
+            "message": KNOWLEDGE_MCP_FAULT_MESSAGE,
+        },
+    )
+
+
 @app.exception_handler(IngestMissingError)
 async def ingest_missing_handler(request: Request, exc: IngestMissingError) -> JSONResponse:
     """Map ``IngestMissingError`` → 503 with
@@ -487,9 +513,22 @@ def mount_spa(app: FastAPI, dist_path: str | None = None) -> None:
 
     app.mount("/assets", StaticFiles(directory=str(dist / "assets")), name="assets")
 
-    @app.get("/{path:path}", include_in_schema=False)
-    def spa_catchall(path: str):  # type: ignore[no-redef]
+    @app.api_route(
+        "/{path:path}",
+        methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"],
+        include_in_schema=False,
+    )
+    def spa_catchall(path: str, request: Request):  # type: ignore[no-redef]
         from fastapi.responses import FileResponse
+
+        # Unmapped ``/api/*`` is missing API, not a client-side route.
+        # A GET-only catch-all would serve ``index.html`` (200) on GET
+        # and 405 on POST — which re-animates unshipped surfaces such
+        # as ``/api/workspaces`` whenever ``web/dist`` exists.
+        if path == "api" or path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="not found")
+        if request.method not in ("GET", "HEAD"):
+            raise HTTPException(status_code=405, detail="method not allowed")
 
         # Path-traversal containment: resolve the candidate
         # against the dist root and reject anything that
@@ -540,7 +579,12 @@ def serve() -> None:
     first ``/ask``.
     """
     apply_dotenv()
-    warn_if_mcp_retrieve_unreachable()
+    # T1 (workbench retrieve seam): probe the knowledge MCP with a real
+    # ``initialize`` + ``tools/list`` handshake and publish 缺 / 坏 / 可达
+    # into the in-process snapshot the status route and the conversation
+    # gate share. A missing / unhealthy MCP is a WARNING (logged inside
+    # ``publish_knowledge_mcp``) — never a boot failure.
+    publish_knowledge_mcp()
     compile_for_http()
     import uvicorn
 

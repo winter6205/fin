@@ -54,6 +54,53 @@ apply_dotenv(start=Path(__file__).resolve().parent.parent)
 # ``memory_on_env`` fixture in ``tests/host/conftest.py``.
 os.environ.pop("FIN_MEMORY_ENABLED", None)
 
+# Default pytest must stay hermetic (spec: Fake / no live MCP). Operator
+# ``.env`` may point retrieve spawn at a sibling checkout; that hangs
+# unit tests. Product ``fin-serve`` still reads the var via apply_dotenv.
+os.environ.pop("FIN_KNOWLEDGE_MCP_CWD", None)
+os.environ.pop("FIN_MODEL", None)
+os.environ.pop("FIN_BASE_URL", None)
+os.environ.pop("FIN_API_KEY", None)
+
+
+def _drop_unreachable_checkpoint_url() -> None:
+    """If ``FIN_CHECKPOINT_URL`` cannot accept a connection, unset it.
+
+    ``apply_dotenv`` loads the operator DSN so Postgres-backed tests can
+    run. A down listener (or a stale port after Compose stop) makes
+    ``psycopg.connect`` block ingest/host tests for minutes. Unset the
+    DSN so those paths use in-memory stores, matching a machine with no
+    ``.env``. A reachable DSN is left in place for CI / live Postgres.
+    """
+    url = (os.environ.get("FIN_CHECKPOINT_URL") or "").strip()
+    if not url:
+        return
+    try:
+        import psycopg
+
+        with psycopg.connect(url, connect_timeout=2) as connection:
+            connection.execute("SELECT 1")
+    except Exception:
+        # EXIT: DSN not reachable; default pytest uses in-memory stores
+        os.environ.pop("FIN_CHECKPOINT_URL", None)
+
+
+_drop_unreachable_checkpoint_url()
+
+
+@pytest.fixture(autouse=True)
+def _strip_operator_llm_and_mcp_cwd_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep default pytest off the operator LLM / live-MCP .env.
+
+    Session-level ``pop`` is not enough: a sibling test can put the
+    vars back, and ``apply_dotenv`` setdefault would refill them.
+    Tests that need a value call ``monkeypatch.setenv`` after this.
+    """
+    monkeypatch.delenv("FIN_KNOWLEDGE_MCP_CWD", raising=False)
+    monkeypatch.delenv("FIN_MODEL", raising=False)
+    monkeypatch.delenv("FIN_BASE_URL", raising=False)
+    monkeypatch.delenv("FIN_API_KEY", raising=False)
+
 
 # One row per form the operator should be able to see in the library.
 _MULTI_FORM_ROWS: tuple[tuple[str, str, str], ...] = (

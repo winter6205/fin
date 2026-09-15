@@ -208,7 +208,7 @@ def test_health_stays_out_of_the_boot_scoped_status_route(
 
     status_body: dict[str, Any] = client.get("/api/status").json()
     assert set(status_body) == {
-        "retrieve_reachability",
+        "knowledge_mcp",
         "retrieve_adapter_kind",
         "model_identity",
         "corpus_filing_count",
