@@ -24,7 +24,7 @@ empty — flushed 2026-09-16 with spec persist.
    - **Inherits:** spec SC3; 2026-09-16 empty `chunks` envelope.
    - **Surface:** `fin.retrieve` MCP adapter
    - **Acceptance:** Documented opt-in command (same adapter as product) prints `n_chunks` and mapping ledger count; default pytest still Fake.
-   - Status: [ ] pending
+   - Status: [x] done — `scripts/retrieve_probe.py` + README「Retrieve 探针（opt-in）」; measured against a real stdio server on an empty store: `n_chunks=0`, `mapping_failures=0`, envelope `{"chunks": []}`, exit 0 (SC3 shape).
    - `[parallel]` with iknow T1–T2
 
 2. **Corpus ingest fixture reaches MCP with ≥1 chunk** — tag: `[implementation]`
