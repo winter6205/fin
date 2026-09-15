@@ -112,7 +112,7 @@ DEFAULT_BASE_URL = "https://api.minimaxi.com/v1"
 # ``.env.example`` and asserted by the URL-match acceptance gate
 # (spec success-criteria item 7).
 EXPECTED_CHECKPOINT_URL = (
-    "postgresql://fin:fin@localhost:5432/fin?sslmode=disable"
+    "postgresql://fin:fin@localhost:5433/fin?sslmode=disable"
 )
 
 # ADR 0030: product retrieve is the iknow-memory MCP client. Both
