@@ -132,6 +132,21 @@ The verify step records an honest `known_gaps` list: every scene in the T1 scope
 
 Product compile path (ADR 0039) is unaffected: the capability-off switches remain absent from production code, and live-mode opt-ins sit behind the same `--eval-set live` / `--llm real` gate that the existing eval lane already owns.
 
+### Retrieve 探针（opt-in；空库 vs 映射丢）
+
+`scripts/retrieve_probe.py` answers the two numbers the first closed loop turns on, through the **same adapter the product uses** (`MCPRetrieveAdapter` over the real stdio server), so the probe cannot drift from the product seam:
+
+```bash
+uv run python scripts/retrieve_probe.py "operating revenue"
+uv run python scripts/retrieve_probe.py "operating revenue" --limit 5
+uv run python scripts/retrieve_probe.py "revenue" \
+    --command node --arg ../iknow-memory/dist/index.js
+```
+
+It prints exactly two lines on stdout — `n_chunks=<n>` and `mapping_failures=<n>` — so a shell can read the integers without parsing the envelope; the full envelope goes to stderr. `mapping_failures` is **this call's** drop count (the ledger read around the retrieve), not the process-wide total: with `FIN_MAPPING_FAILURE_LOG` replaying an earlier process's drops, an absolute count would print a non-zero number beside `n_chunks=0` for a healthy empty collection. Reading the pair is the point: an empty **资料集合** is `n_chunks=0` **and** `mapping_failures=0` (the 2026-09-16 probe shape, `{"chunks": []}`, no `degraded`), whereas hits that the mapper dropped are `n_chunks=0` with a **non-zero** per-call delta. Collapsing those two into one number is exactly what the probe exists to prevent — and a process-wide total would reintroduce the collapse for any replayed log.
+
+Exit codes: `0` the probe ran, `1` the port answered with a typed failure envelope (`{"error": "retrieve_unavailable"}` — still printed with both integers), `2` the probe could not run (no launch command resolved: the binary is not on `PATH`). This command is never reached by `uv run pytest`; the default suite keeps the Fake port.
+
 The count command prints exactly two lines on stdout (`done=6`, `refuse=3`) and forwards pytest's own report to stderr, so a CI step can read the integers without parsing test output. The numbers are **observed**: `tests/eval/conftest.py` wraps the graph each case invokes and records that run's terminal status, so the tally reflects what the runs did, not what the assertions expect. No live LLM and no LLM-as-judge are involved — the lane runs `ScriptedChatModel` against the frozen corpus. Exit code is pytest's, so a red eval suite fails the command; a lane that reports no count line exits `2` rather than printing zeros.
 
 ### Process health (`GET /health`)
