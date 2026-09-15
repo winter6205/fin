@@ -2264,17 +2264,10 @@ def compile_graph(
         )
 
     bound_model = model.bind_tools(model_bound_tools)
-    # T3 (#34): the off-preference binding layers the MiniMax
-    # ``extra_body`` (``thinking.type=disabled``) on top of the same
-    # bound tools. ``reasoning_split`` STAYS ``True`` so
-    # ``reasoning_details`` round-trip / replay is unaffected by the
-    # preference (spec line 28). ``model_node`` selects per run via
-    # ``configurable.thinking_type`` — no shared model mutation, so
-    # concurrent runs on other threads cannot leak the preference.
-    _thinking_off_body = {
-        "thinking": {"type": "disabled"},
-        "reasoning_split": True,
-    }
+    # Operator thinking off: OpenAI-compatible / 方舟 extra_body
+    # ``thinking.type=disabled`` (docs: enabled | disabled | auto).
+    # Do NOT send MiniMax ``adaptive`` or ``reasoning_split``.
+    _thinking_off_body = {"thinking": {"type": "disabled"}}
     bound_model_no_thinking = bound_model.bind(extra_body=_thinking_off_body)
     # Soft-Track T1: non-research leaves call the UNBOUND model
     # (no bind_tools) with call-scoped per-track prompts.

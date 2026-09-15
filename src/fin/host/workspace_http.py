@@ -2281,7 +2281,7 @@ def build_router(
             # T3 (#34): the operator's thinking preference rides the
             # run config — ``model_node`` swaps to the pre-built
             # no-thinking binding (``extra_body`` thinking.type=
-            # disabled, reasoning_split stays on). Only the OFF
+            # disabled, OpenAI/方舟; no MiniMax reasoning_split). Only the OFF
             # preference is stamped; the default (on) keeps the boot
             # binding untouched.
             config["configurable"]["thinking_type"] = thinking_type

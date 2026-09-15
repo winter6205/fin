@@ -284,22 +284,16 @@ def _build_default_model(
     # placeholder so the provider returns 401 instead of
     # silently answering with an unexpected key.
     api_key = _read_env(env, FIN_API_KEY_ENV) or "sk-no-key-required"
+    # OpenAI-compatible only: ``FIN_MODEL`` / ``FIN_BASE_URL`` /
+    # ``FIN_API_KEY``. Vendor extras (MiniMax ``thinking.type=adaptive``)
+    # are not injected — a gateway that is not MiniMax rejects them as
+    # InvalidParameter, and MiniMax still answers without them.
     return chat_openai(
         model=model_name,
         base_url=base_url,
         api_key=api_key,
-        # Nested ``model_kwargs={"extra_body": ...}`` is rejected by
-        # ChatOpenAI ("specify extra_body explicitly"). Without the
-        # split channel MiniMax inlines ``<think>`` into content and
-        # the workspace turn looks like a failed chat.
-        extra_body={
-            "thinking": {"type": "adaptive"},
-            "reasoning_split": True,
-        },
-        # A hung completion holds the per-thread lock and disables
-        # the composer for that research thread. Bound the wait.
         timeout=120.0,
-        max_retries=1,
+        max_retries=0,
     )
 
 

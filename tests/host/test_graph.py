@@ -1253,9 +1253,8 @@ class _ExtraBodyRecordingModel(ScriptedChatModel):
 
 def test_thinking_type_disabled_config_selects_disabled_binding() -> None:
     """``configurable.thinking_type == "disabled"`` makes every
-    model call in the run carry the MiniMax ``extra_body`` with
-    ``thinking.type=disabled`` while ``reasoning_split`` STAYS on
-    (converter replay continuity, spec line 28)."""
+    model call carry OpenAI/方舟 ``extra_body``
+    ``thinking.type=disabled`` (not MiniMax ``reasoning_split``)."""
     from langchain_core.messages import AIMessageChunk
 
     model = _ExtraBodyRecordingModel(
@@ -1274,7 +1273,7 @@ def test_thinking_type_disabled_config_selects_disabled_binding() -> None:
     )
     assert model.seen_extra_bodies
     assert all(
-        body == {"thinking": {"type": "disabled"}, "reasoning_split": True}
+        body == {"thinking": {"type": "disabled"}}
         for body in model.seen_extra_bodies
     )
 
