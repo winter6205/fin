@@ -78,3 +78,7 @@ docs/design-references/
 docs/verify/
 plans/archive/
 docs/guides/knowledge-agent.md
+
+# Local operator shims (not product)
+.local-bin/
+

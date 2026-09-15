@@ -121,8 +121,8 @@ def _service_url(env_map: dict[str, str]) -> str:
     for entry in ports:
         if isinstance(entry, str):
             short = entry.split(":")
-            # "5432:5432" → ["5432", "5432"];
-            # "127.0.0.1:5432:5432" → 3 items (published is
+            # "5433:5433" → ["5433", "5433"];
+            # "127.0.0.1:5433:5433" → 3 items (published is
             # always the second-to-last).
             published_port = short[-2]
             break
@@ -190,7 +190,7 @@ def test_env_example_url_is_well_formed_postgres() -> None:
     parsed = urlparse(url)
     assert parsed.scheme == "postgresql"
     assert parsed.hostname == "localhost"
-    assert parsed.port == 5432
+    assert parsed.port == 5433
     assert parsed.path == "/fin"
     assert parsed.username == "fin"
     assert parsed.password == "fin"
@@ -251,18 +251,24 @@ def test_compose_service_url_matches_env_example_url() -> None:
     assert env_map["POSTGRES_PASSWORD"] == "fin"
     assert env_map["POSTGRES_DB"] == "fin"
 
-    # Port mapping must publish 5432 — that's what the
-    # ``localhost:5432`` in ``.env.example`` connects to.
+    # Host and container use the same port (5433:5433). 5432 is
+    # left for iknow-memory-infra, which is also 5432:5432.
     ports = pg.get("ports", [])
-    published_ports = [
-        entry.split(":")[-2]
-        if isinstance(entry, str)
-        else str(entry.get("published"))
-        for entry in ports
-    ]
-    assert "5432" in published_ports, (
-        f"postgres service must publish port 5432, got "
-        f"{published_ports}"
+    mappings: list[tuple[str, str]] = []
+    for entry in ports:
+        if isinstance(entry, str):
+            short = entry.split(":")
+            mappings.append((short[-2], short[-1]))
+        elif isinstance(entry, dict):
+            mappings.append(
+                (str(entry.get("published")), str(entry.get("target")))
+            )
+    assert mappings == [("5433", "5433")], (
+        f"postgres must publish 5433:5433 (host=container), got {mappings}"
+    )
+    command = pg.get("command")
+    assert command == ["postgres", "-p", "5433"], (
+        f"postgres must listen on 5433 inside the container, got {command}"
     )
 
     # The compose-derived URL (without sslmode — compose does
@@ -271,7 +277,7 @@ def test_compose_service_url_matches_env_example_url() -> None:
     derived = (
         f"postgresql://{env_map['POSTGRES_USER']}:"
         f"{env_map['POSTGRES_PASSWORD']}@localhost:"
-        f"5432/{env_map['POSTGRES_DB']}"
+        f"5433/{env_map['POSTGRES_DB']}"
     )
     expected = EXPECTED_CHECKPOINT_URL.split("?", 1)[0]
     assert derived == expected, (
