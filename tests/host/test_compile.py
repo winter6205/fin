@@ -459,11 +459,11 @@ def test_compile_for_runtime_reads_fin_model_from_env(
 def test_compile_passes_minimax_extra_body_as_chatopenai_field(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """ChatOpenAI warns and drops ``extra_body`` when it is nested
-    under ``model_kwargs``. MiniMax then inlines ``<think>`` into
-    ``content`` instead of ``reasoning_details``, and the live
-    turn looks like a broken chat. The field must be a top-level
-    constructor argument (ADR 0022)."""
+    """Default compile is a plain OpenAI-compatible ChatOpenAI.
+
+    MiniMax ``thinking.type=adaptive`` must NOT ride every request:
+    other gateways (Volcengine Ark, etc.) reject it as InvalidParameter.
+    """
     monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
     captured: dict[str, object] = {}
     _install_fake_langchain_openai(monkeypatch, captured)
@@ -473,16 +473,31 @@ def test_compile_passes_minimax_extra_body_as_chatopenai_field(
     )
 
     compile_for_runtime()
-    extra = captured["extra_body"]
-    assert isinstance(extra, dict)
-    assert extra.get("reasoning_split") is True
-    thinking = extra.get("thinking")
-    assert isinstance(thinking, dict)
-    assert thinking.get("type") == "adaptive"
-    model_kwargs = captured["model_kwargs"]
-    if isinstance(model_kwargs, dict):
-        assert "extra_body" not in model_kwargs
+    assert captured["extra_body"] is None
     assert captured["timeout"] is not None
+
+
+def test_compile_omits_minimax_thinking_body_for_non_minimax_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Volcengine / any OpenAI-compatible gateway must not receive
+    MiniMax ``thinking.type=adaptive``. The wire is ``FIN_MODEL`` +
+    ``FIN_BASE_URL`` + ``FIN_API_KEY`` only."""
+    monkeypatch.setenv(
+        "FIN_BASE_URL", "https://arkcn-beijing.volces.com/api/coding/v1"
+    )
+    monkeypatch.setenv("FIN_MODEL", "glm-5.3-flash")
+    monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
+    captured: dict[str, object] = {}
+    _install_fake_langchain_openai(monkeypatch, captured)
+    _install_fake_postgres_saver(monkeypatch, _FakePostgresSaver)
+    monkeypatch.setattr(
+        "fin.host.compile.compile_graph", lambda **kw: "compiled-graph"
+    )
+
+    compile_for_runtime()
+    assert captured["extra_body"] is None
+    assert captured["model"] == "glm-5.3-flash"
 
 
 def test_compile_for_runtime_reads_fin_base_url_from_env(

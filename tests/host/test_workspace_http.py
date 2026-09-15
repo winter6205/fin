@@ -2920,7 +2920,6 @@ def test_send_message_thinking_false_applies_disabled_extra_body(
     status_event = next(d for n, d in events if n == "status")
     assert model.seen_extra_bodies[-1] == {
         "thinking": {"type": "disabled"},
-        "reasoning_split": True,
     }
     assert status_event.get("thinking_type") == "disabled"
 
