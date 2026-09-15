@@ -1,11 +1,9 @@
-// /: minimal home. The workbench chrome has no 对话总览 — research
-// threads live in the sidebar 会话 disclosure
-// (specs/workbench-sidebar-rail.md T2), so this page renders only an
-// empty placeholder pointing at the composer / 知识库. What stays is
-// the last-thread restore for returning visits (decideLastThreadRestore
-// + the /kb, /monitor session gates): a restorable thread still
-// bounces straight to /t/{id}; the gates keep the operator on the
-// chrome surface they picked.
+// /: minimal home. The workbench has no 对话总览 — research threads
+// live in the sidebar 会话 disclosure (specs/workbench-sidebar-rail.md
+// T2), so this page renders only an empty placeholder pointing at the
+// composer. What stays is the last-thread restore for returning visits
+// (decideLastThreadRestore): a restorable thread bounces straight to
+// /t/{id}; the retired /kb and /monitor session gates are gone.
 
 import { useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
@@ -15,16 +13,7 @@ import {
   forgetLastThread,
   readLastThread,
 } from "../lastThread";
-import { KB_GATE_KEY, MONITOR_GATE_KEY } from "../sessionKeys";
 import { useWorkspaceStore } from "../store";
-
-function readSessionGate(key: string): boolean {
-  try {
-    return window.sessionStorage.getItem(key) === "1";
-  } catch {
-    return false; /* storage unavailable - no gate. */
-  }
-}
 
 export default function HomePage() {
   const threads = useWorkspaceStore((s) => s.threads);
@@ -34,11 +23,8 @@ export default function HomePage() {
   // T5 (#35, spec line 42): a RETURNING visit restores the last
   // opened `/t/{id}` when that id still exists. First visit (no
   // stored id, or the thread was deleted / is unknown) stays on
-  // home — never a blank chat. T1 /kb and T2 /monitor add their own
-  // session gates so a returning visit lands back on the surface
-  // the operator picked rather than bouncing onto the last thread.
-  // One-shot per mount so a deliberate later navigation home does
-  // not bounce the operator away again.
+  // home — never a blank chat. One-shot per mount so a deliberate
+  // later navigation home does not bounce the operator away again.
   const threadsLoaded = useWorkspaceStore((s) => s.threadsLoaded);
   const restoreAttempted = useRef(false);
   useEffect(() => {
@@ -47,8 +33,6 @@ export default function HomePage() {
       threadsLoaded,
       lastThreadId: readLastThread(),
       threadIds: threads.map((t) => t.id),
-      kbGateActive: readSessionGate(KB_GATE_KEY),
-      monitorGateActive: readSessionGate(MONITOR_GATE_KEY),
     });
     if (decision.action === "wait") return;
     restoreAttempted.current = true;

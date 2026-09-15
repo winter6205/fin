@@ -47,15 +47,14 @@ interface WorkspaceState {
   // the one-shot restore treats a valid marker as stale.
   threadsLoaded: boolean;
   corpusLoaded: boolean;
-  // T10 (ADR 0033): the Sidebar strip's slice. ``null`` after
-  // ``statusLoaded`` means the status route itself did not answer —
-  // the strip renders its unavailable copy rather than nothing.
+  // T10 (ADR 0033): the boot-scoped status slice behind the
+  // left-corner 知识 MCP line. ``null`` after ``statusLoaded`` means
+  // the status route itself did not answer — the line renders its
+  // neutral state rather than nothing.
   status: WorkspaceStatus | null;
   statusLoaded: boolean;
-  // T3 (specs/workbench-chrome.md): ``true`` while a GET /api/status
-  // is in flight, so the 重连 button can disable itself and a
-  // concurrent second dispatch is ignored (SC7: double-click must
-  // not look like success twice).
+  // ``true`` while a GET /api/status is in flight, so a concurrent
+  // second dispatch is ignored (one wire call per boot/refresh).
   loadingStatus: boolean;
   sendingQuestion: boolean;
   // T4: ``resumeThread(threadId)`` sets this while the resume SSE
@@ -76,11 +75,10 @@ interface WorkspaceState {
 
   refreshThreads: () => Promise<void>;
   loadCorpus: () => Promise<void>;
-  // T3: also re-driven by the 重连 button on /monitor (re-GETs
-  // ``GET /api/status``). Boot-scoped fields do not change mid-
-  // session, so a successful reconnect updates the store; a thrown
-  // fetch still flips ``statusLoaded`` so the panel renders its
-  // unavailable copy rather than a silent OK.
+  // Re-GETs ``GET /api/status`` (boot effect). Boot-scoped fields do
+  // not change mid-session, so a successful read updates the store; a
+  // thrown fetch still flips ``statusLoaded`` so the left-corner line
+  // renders its neutral state rather than a silent OK.
   loadStatus: () => Promise<void>;
   openThread: (threadId: string) => Promise<void>;
   createThread: (firstMessage: string | null) => Promise<string>;
@@ -240,18 +238,15 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   async loadStatus() {
-    // T3 (specs/workbench-chrome.md): a failing or malformed status
-    // read is a panel state, not an error the operator has to act
-    // on: the workspace keeps working without it. ``statusLoaded``
-    // still flips so the panel stops showing "读取中" and shows
-    // its unavailable copy instead (no silent OK on probe miss).
+    // A failing or malformed status read is a left-corner line state,
+    // not an error the operator has to act on: the workspace keeps
+    // working without it. ``statusLoaded`` still flips so the line
+    // stops showing "检查中" and shows its unknown copy instead (no
+    // silent OK on a probe miss).
     //
-    // SC7 in-flight guard: a double-click on 重连 while the first
-    // GET is in flight MUST issue ONE wire call. The store tracks
-    // ``loadingStatus`` and treats a concurrent caller as a no-op
-    // while it is set — the first call drives the outcome and the
-    // 重连 button is disabled while ``loadingStatus`` is true, so a
-    // second click cannot reach this branch.
+    // In-flight guard: a concurrent caller MUST NOT issue a second
+    // wire call. The store tracks ``loadingStatus`` and treats a
+    // concurrent call as a no-op while it is set.
     const existing = get();
     if (existing.loadingStatus) {
       return;

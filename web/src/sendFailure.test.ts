@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { ConcurrentRunError, IngestMissingError } from "./api";
+import {
+  ConcurrentRunError,
+  IngestMissingError,
+  KnowledgeMcpFaultError,
+} from "./api";
 import { classifySendFailure, describeSendFailure } from "./sendFailure";
 
 describe("classifySendFailure", () => {
@@ -7,6 +11,12 @@ describe("classifySendFailure", () => {
     expect(classifySendFailure(new ConcurrentRunError("concurrent_run"))).toBe(
       "concurrent_run",
     );
+  });
+
+  it("maps the knowledge-MCP 409 to its own kind, not concurrent_run", () => {
+    const fault = new KnowledgeMcpFaultError("知识 MCP 故障");
+    expect(classifySendFailure(fault)).toBe("knowledge_mcp_fault");
+    expect(classifySendFailure(fault)).not.toBe("concurrent_run");
   });
 
   it("maps the 503 typed EXIT to ingest_missing", () => {
@@ -23,7 +33,9 @@ describe("classifySendFailure", () => {
 
 describe("describeSendFailure", () => {
   it("gives 409 non-empty ordinary-person copy, not the raw enum", () => {
-    const notice = describeSendFailure(new ConcurrentRunError("concurrent_run"));
+    const notice = describeSendFailure(
+      new ConcurrentRunError("concurrent_run"),
+    );
     expect(notice.kind).toBe("concurrent_run");
     expect(notice.message.length).toBeGreaterThan(0);
     expect(notice.message).not.toContain("concurrent_run");
@@ -35,6 +47,26 @@ describe("describeSendFailure", () => {
     expect(ingest.kind).toBe("ingest_missing");
     expect(ingest.message.length).toBeGreaterThan(0);
     expect(ingest.message).not.toBe(concurrent.message);
+  });
+
+  it("surfaces 知识 MCP 故障 and the put-back for the knowledge-MCP 409", () => {
+    const fault = describeSendFailure(
+      new KnowledgeMcpFaultError("知识 MCP 故障"),
+    );
+    expect(fault.kind).toBe("knowledge_mcp_fault");
+    expect(fault.message).toContain("知识 MCP 故障");
+    expect(fault.message).toContain("放回输入框");
+    // NOT the wrong concurrency claim.
+    expect(fault.message).not.toContain("还有一轮在运行");
+    expect(fault.message).not.toBe(
+      describeSendFailure(new ConcurrentRunError("concurrent_run")).message,
+    );
+  });
+
+  it("still names the fault even when the server message is empty", () => {
+    const fault = describeSendFailure(new KnowledgeMcpFaultError(""));
+    expect(fault.message.length).toBeGreaterThan(0);
+    expect(fault.message).toContain("知识 MCP 故障");
   });
 
   it("still says something for an untyped failure", () => {

@@ -10,8 +10,8 @@
 ### Product identity
 
 **fin**:
-An enterprise knowledge-base Agent: the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held filings behind the **retrieve port**.
-_Avoid_: research-agent product, workspace-as-kind, 10-Q as the product name, Q&A API as the product, treating research-track contracts as the whole product personality
+An enterprise knowledge-base Agent (the 入口, not the 库): the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held **资料** behind the **retrieve port**.
+_Avoid_: research-agent product, workspace-as-kind, 10-Q as the product name, Q&A API as the product, treating research-track contracts as the whole product personality, treating fin as a parallel corpus store or 库门
 
 **host agent**:
 fin as the LangGraph runtime that routes tracks and calls research tools behind the **retrieve port**; it is not the ranking or vector store.
@@ -30,8 +30,8 @@ One append-only per-turn record of research working context (e.g. company, perio
 _Avoid_: overwriting away prior snapshots, dual-writing into thread_store as SSOT, replacing full message history with snapshots
 
 **iknow-memory**:
-A separate TypeScript MCP server (own repo). After ingest/push, product **company corpus** is queried through fin's **retrieve port** against this backend (ADR 0045); a distinct **memory port** channel may hold explicit pins and must not share one config key.
-_Avoid_: treating fin as the long-term vector backend, lockstep releases with fin, collapsing retrieve MCP and memory MCP into one config key, mirroring fin consumer ADRs into that repo, using dream to ingest filings
+A separate TypeScript MCP server (own repo). It is the product 库: after ingest/push, **资料** are queried through fin's **retrieve port** against this backend (ADR 0045); a distinct **memory port** channel may hold explicit pins and must not share one config key.
+_Avoid_: treating fin as the long-term vector backend or 库, lockstep releases with fin, collapsing retrieve MCP and memory MCP into one config key, mirroring fin consumer ADRs into that repo, using dream to ingest filings
 
 **memory port**:
 The only dependency fin is allowed for switchable session/buffer memory (extract, recall, GC, dream): port in, typed results out. Boot default is **OFF**; this checkout turns it **ON** in project env so local evals see auto-extract and **memory prefetch**; default pytest stays **OFF** even when that env is set (ADR 0035, ADR 0048).
@@ -79,13 +79,21 @@ _Avoid_: running dream inside model_node, per-turn SSE dream, auto-writing every
 
 ### Seams
 
+**资料**:
+Operator-facing name for one corpus body held behind the **retrieve port** after ingest. It is not a 10-Q product name and not a **工作台** catalog page.
+_Avoid_: filings as the operator word, freeze-slice cards as the product 库, treating **thread attach** as **资料** ingest
+
+**知识 MCP**:
+The retrieve MCP (**iknow-memory**) as the operator-visible dependency of the **工作台**. Boot publishes 缺 / 坏 / 可达 from `initialize` + `tools/list`; non-可达 copy is 知识 MCP 故障 (ADR 0051).
+_Avoid_: Fake as healthy search, dashboard HTTP as this signal, PATH-only as 可达, 能聊不能搜
+
 **retrieve port**:
 The only retrieve dependency fin is allowed to have: `query` (+ optional filters) in, ranked chunks with `source_ref` out — MCP-shaped, transport-agnostic.
 _Avoid_: search API, vector store, conflating with the memory port
 
 **retrieve adapter**:
 The implementation behind the retrieve port. Default pytest uses a Fake port. When configured, product retrieve is an MCP 2.0 client (protocol-testable against a compliant public or fixture server); hits map to fin locators as `source_ref` and their returned text is serve-time citation evidence (ADR 0046). In-process BM25 is archived (ADR 0007; ADR 0030 superseded by 0032). Ranking stays outside fin; **切分** is fin's at ingest (ADR 0037) and the retrieval service stores and returns pushed chunk text byte-for-byte without re-splitting.
-_Avoid_: shipping BM25 as the product path, hybrid/RRF implemented in this repo, re-splitting / truncating / rewriting pushed chunk text on the retrieval side, compile-time coupling to one memory repo, reusing the memory-backend URL as the retrieve adapter by implication
+_Avoid_: shipping BM25 as the product path, hybrid/RRF implemented in this repo, re-splitting / truncating / rewriting pushed chunk text on the retrieval side, compile-time coupling to one memory repo, reusing the memory-backend URL as the retrieve adapter by implication, treating Fake as a product-healthy **知识 MCP**
 
 **降级标记** (`degraded`):
 检索响应信封上的布尔字段 `degraded`（连同同处的 `degraded_reasons` 有限枚举列表）：置位表示存在失败或无法尝试的能力臂，缺省即未降级。已尝试而未命中、以及调用方显式关闭的能力都不置位；fin 必须读取该标记，为真时按部分失败语义处置，不得把降级当合法空结果。
@@ -198,8 +206,8 @@ The product conversation: one `thread_id` the operator talks in; each question i
 _Avoid_: Q&A session, demo ask, one-shot invoke as the product UX, forbidding greetings or clarification on the thread
 
 **工作台**:
-The local web UI: chrome is **知识库** / **监控**; **research thread**s live in a 会话 list, not a 对话 nav; create, list, open, resume, and delete a **research thread**; **thinking fold**s and **tool fold**s stream then collapse; citations sit on the assistant turn.
-_Avoid_: 知识库 as the UI name, 工作区 directory, CLI REPL as the product, hosted accounts this increment, POST /ask as the conversation surface, Corpus / MCP / Status as nav labels, 对话 as a chrome overview
+The local web UI: **research thread**s live in a 会话 list (create, list, open, resume, delete); **thinking fold**s and **tool fold**s stream then collapse; citations sit on the assistant turn; **知识 MCP** health is one left-corner line.
+_Avoid_: 知识库 or 监控 as nav labels, `/kb` or `/monitor` as product routes, 工作区 directory, CLI REPL as the product, hosted accounts this increment, POST /ask as the conversation surface, Corpus / Status as nav labels, 对话 as a chrome overview, Fake 「演示搜索」 as healthy chrome
 
 **thinking fold**:
 A per-burst collapsible thinking region on a **research thread** turn: streams expanded while that burst is live; auto-collapses when the burst ends; collapsed is header-only (UI label 深度思考, plus duration when measured) with the burst text hidden until expand.
@@ -218,20 +226,20 @@ The one global default operator directory `$HOME/.fin/default` (created if missi
 _Avoid_: Path.cwd() as implicit 工作区, `$HOME/.fin/workspaces/<slug>`, left-rail 指定/新建, a second 知识库, calling the **工作台** a 工作区
 
 **知识库**:
-The one process-wide corpus (catalog, ingest tree, **retrieve port**) shared by every **research thread**.
-_Avoid_: sidebar "new knowledge base", per-工作区 retrieve index, identity text listing filings
+The one process-wide corpus of **资料** behind the **retrieve port**, shared by every **research thread**. It is not a **工作台** route.
+_Avoid_: sidebar 「知识库」, `/kb` as product chrome, per-工作区 retrieve index, identity text listing filings, fin as a second 库
 
 **workspace**:
 Retired alias: the UI is **工作台**; the operator directory is **工作区**. Kept so older specs remain readable.
 _Avoid_: using workspace as the product kind, as the 知识库, or as Path.cwd()
 
 **监控**:
-The **工作台** route `/monitor`: issuer watchlist, in-app notices, and retrieve-reachability (with reconnect as a re-read of `GET /api/status`). It is not a second **知识库**.
-_Avoid_: MCP as a nav label, StatusStrip in the sidebar footer, treating 监控 as a 工作区 picker
+Retired **工作台** chrome (`/monitor` watchlist + retrieve-reachability). Product MCP state is **知识 MCP**, not this page.
+_Avoid_: `/monitor` as a product route, MCP as a nav label, watchlist as fin chrome, treating 监控 as a 工作区 picker
 
 **Corpus 首页**:
-Retired chrome name. The **知识库** catalog and ingest live on **工作台** route `/kb`. Distinct from `/` (last-thread restore or empty composer — not a 对话总览) and from `/t/{thread_id}`.
-_Avoid_: `/` as corpus cards, `/` as a thread-card overview, Corpus as a nav label, 对话 as a chrome entry, auto-send from a corpus card, treating fetch of `GET /api/corpus` as ingest
+Retired chrome name. `/kb` is not a product route; catalog and upload live outside fin (iknow 看板 / 中台). `/` remains last-thread restore or empty composer, not a 对话总览.
+_Avoid_: `/` as corpus cards, `/` as a thread-card overview, Corpus as a nav label, 对话 as a chrome entry, auto-send from a corpus card, treating fetch of `GET /api/corpus` as ingest, deep-link `/kb` as a dashboard handoff
 
 **v1 surface**:
 The first ship binary is a CLI that compiles the host graph; v1 HTTP exposes that same compiled graph and must call sync `invoke` (not `ainvoke`) so the sync `PostgresSaver` stays valid. HITL / interrupt UX is not a v1 product surface; crash resume continues the in-flight run on that `thread_id`.

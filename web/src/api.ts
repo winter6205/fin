@@ -21,8 +21,8 @@ import type {
   WorkspaceStatus,
 } from "./types";
 import { parseComparison } from "./comparison";
+import { parseWorkspaceStatus } from "./knowledgeMcp";
 import { parseSoftTrack, parseTrackDecision } from "./softTrack";
-import { parseWorkspaceStatus } from "./statusStrip";
 import { parseStreamErrorKind } from "./streamErrorKind";
 import { foldSendResultAnswer } from "./turnStream";
 import { parseNotices, parseWatchlist } from "./watchlist";
@@ -57,11 +57,19 @@ export async function createThread(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ first_message: firstMessage }),
   });
+  // The 知识 MCP gate refuses creation on a 缺 / 坏 boot (ADR 0051).
+  // jsonOrThrow would leak the bare ``knowledge_mcp_fault`` token into
+  // the operator-facing notice.
+  if (res.status === 409) throw await threadConflictError(res);
   return jsonOrThrow<ThreadListItem>(res);
 }
 
 export async function getThread(threadId: string): Promise<ThreadDetail> {
   const res = await fetch(`/api/threads/${encodeURIComponent(threadId)}`);
+  // The knowledge-MCP gate also refuses OPENING an existing thread on a
+  // 缺 / 坏 boot. Surfacing it as a plain 404 would tell the operator
+  // the thread is gone when it is not (ADR 0051).
+  if (res.status === 409) throw await threadConflictError(res);
   return jsonOrThrow<ThreadDetail>(res);
 }
 
@@ -79,11 +87,11 @@ export async function getCorpus(): Promise<Filing[]> {
 }
 
 /**
- * T10 (ADR 0033): the boot-scoped status surface. The host answers
- * 200 in both retrieve states — ``unreachable`` is a field value, not
- * an HTTP error — so a rejection here means the route itself is
- * unreachable or malformed, which the store renders as its own
- * degraded strip state.
+ * T10 (ADR 0033, amended by ADR 0051): the boot-scoped status
+ * surface. The host answers 200 for every **知识 MCP** state — 缺 /
+ * 坏 / 可达 is a field value, not an HTTP error — so a rejection here
+ * means the route itself is unreachable or malformed, which the
+ * left-corner line renders as its own neutral state.
  */
 export async function getStatus(): Promise<WorkspaceStatus> {
   const res = await fetch("/api/status");
@@ -151,10 +159,9 @@ export async function listNotices(): Promise<Notice[]> {
 }
 
 export async function markNoticeRead(noticeId: string): Promise<void> {
-  const res = await fetch(
-    `/api/notices/${encodeURIComponent(noticeId)}/read`,
-    { method: "POST" },
-  );
+  const res = await fetch(`/api/notices/${encodeURIComponent(noticeId)}/read`, {
+    method: "POST",
+  });
   await jsonOrThrow<unknown>(res);
 }
 
@@ -166,10 +173,9 @@ export async function markNoticeRead(noticeId: string): Promise<void> {
  * with the terminal ``refuse`` / ``stopped`` frames.
  */
 export async function stopRun(threadId: string): Promise<boolean> {
-  const res = await fetch(
-    `/api/threads/${encodeURIComponent(threadId)}/stop`,
-    { method: "POST" },
-  );
+  const res = await fetch(`/api/threads/${encodeURIComponent(threadId)}/stop`, {
+    method: "POST",
+  });
   if (res.status === 204) return false;
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return true;
@@ -255,6 +261,58 @@ export type SendEvent =
 export class ConcurrentRunError extends Error {}
 export class IngestMissingError extends Error {}
 
+/** The host's 409 knowledge-MCP conversation gate (create / open /
+ * send). A DISTINCT type from ``ConcurrentRunError``: on a 缺 / 坏
+ * boot the send is refused because the knowledge MCP cannot answer,
+ * NOT because another run holds the thread — rendering it as a
+ * concurrency conflict would be a wrong claim. Carries the host's
+ * operator ``message`` so the copy can surface it verbatim. */
+export class KnowledgeMcpFaultError extends Error {
+  readonly code = "knowledge_mcp_fault";
+
+  constructor(message: string) {
+    super(message || "knowledge_mcp_fault");
+    this.name = "KnowledgeMcpFaultError";
+  }
+}
+
+/** The ``error`` token of a 409 body, or ``""`` when unreadable. */
+async function conflictToken(res: Response): Promise<[string, string]> {
+  try {
+    const body = (await res.json()) as { error?: unknown; message?: unknown };
+    return [
+      typeof body?.error === "string" ? body.error : "",
+      typeof body?.message === "string" ? body.message : "",
+    ];
+  } catch {
+    return ["", ""];
+  }
+}
+
+/** 409 on the SEND doors (messages / resume). Two refusals share the
+ * status: a held run and the 知识 MCP gate. Every other (or
+ * unparseable) 409 keeps the historical concurrent-run meaning — that
+ * reading is true of these doors. */
+async function sendConflictError(res: Response): Promise<Error> {
+  const [token, message] = await conflictToken(res);
+  if (token === "knowledge_mcp_fault") {
+    return new KnowledgeMcpFaultError(message);
+  }
+  return new ConcurrentRunError("concurrent_run");
+}
+
+/** 409 on the THREAD doors (create / get). Only the gate is known to
+ * refuse here, so an unrecognised token must not be reported as a
+ * held run — 「还有一轮在运行」 would be a false attribution about a
+ * brand-new thread. Falls back to the generic HTTP error instead. */
+async function threadConflictError(res: Response): Promise<Error> {
+  const [token, message] = await conflictToken(res);
+  if (token === "knowledge_mcp_fault") {
+    return new KnowledgeMcpFaultError(message);
+  }
+  return new Error(`HTTP ${res.status}: ${token || res.statusText}`);
+}
+
 /** Request body for the send path. ``thinking`` is the operator's
  * reasoning preference toggle (T3); the backend forwards it to the
  * model provider. */
@@ -289,8 +347,10 @@ export async function sendMessage(
     },
   );
 
-  // Error paths happen BEFORE any SSE frame per spec.
-  if (res.status === 409) throw new ConcurrentRunError("concurrent_run");
+  // Error paths happen BEFORE any SSE frame per spec. The 409 body
+  // carries the token: ``knowledge_mcp_fault`` on a 缺 / 坏 boot is a
+  // different refusal from a held run and must not read as one.
+  if (res.status === 409) throw await sendConflictError(res);
   if (res.status === 503) throw new IngestMissingError("ingest_missing");
   if (res.status === 204) {
     // Empty submit no-op; caller should not have called this.
@@ -538,7 +598,7 @@ export async function resumeThread(
   // resolves BEFORE the SSE header, so we read the response body
   // for the typed error and throw.
   if (res.status === 404) throw new Error("HTTP 404: thread_not_found");
-  if (res.status === 409) throw new ConcurrentRunError("concurrent_run");
+  if (res.status === 409) throw await sendConflictError(res);
   if (res.status === 204) {
     // Nothing-to-resume no-op. Return an empty terminal result so
     // the caller still reconciles its state cleanly.

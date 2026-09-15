@@ -198,6 +198,18 @@ class ConcurrentRunError(HostGraphError):
     """
 
 
+class KnowledgeMCPFaultError(HostGraphError):
+    """Conversation entry was refused because the knowledge MCP is not 可达.
+
+    The published three-state snapshot (``fin.host.knowledge_mcp``) is
+    缺 or 坏 while the product ``mcp`` adapter is configured: create /
+    open / send cannot produce evidence this turn, so the server refuses
+    rather than running a research turn with no retrieve. The HTTP
+    surface translates this to 409 ``knowledge_mcp_fault`` with the
+    operator copy 「知识 MCP 故障」.
+    """
+
+
 class RetrieveAdapterConfigError(HostGraphError):
     """The requested retrieve adapter cannot be built as configured.
 
@@ -3640,6 +3652,7 @@ __all__ = [
     "RETRIEVE_ADAPTER_MCP",
     "ConcurrentRunError",
     "HostGraphError",
+    "KnowledgeMCPFaultError",
     "RetrieveAdapterConfigError",
     "compile_graph",
     "analysis_from_tool_message",

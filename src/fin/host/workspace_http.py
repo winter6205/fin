@@ -97,14 +97,15 @@ Routes
                                           surface that calls 切分;
                                           never a research tool.
 * ``GET    /api/status``                - the boot-scoped status
-                                          surface the Sidebar strip
-                                          renders (T10 / ADR 0033):
-                                          retrieve reachability +
-                                          adapter kind + model slug +
-                                          corpus filing count. Its own
-                                          handler with no dependencies
-                                          — never a branch inside send
-                                          or GET-thread.
+                                          surface the left corner
+                                          renders (ADR 0033, amended):
+                                          knowledge MCP three-state
+                                          (缺/坏/可达) + adapter kind +
+                                          model slug + corpus filing
+                                          count. Its own handler with
+                                          no dependencies — never a
+                                          branch inside send or
+                                          GET-thread.
 * ``GET    /api/observability``         - the per-process counters
                                           surface (T9): terminal-status
                                           counts (``done`` / ``refuse``
@@ -204,8 +205,14 @@ from fin.host.filing_monitor import FilingMonitor, default_filing_monitor
 from fin.host.filing_monitor_errors import FilingSourceUnavailableError
 from fin.host.graph import (
     ConcurrentRunError,
+    KnowledgeMCPFaultError,
     analysis_from_tool_message,
     comparison_from_tool_message,
+)
+from fin.host.knowledge_mcp import (
+    KNOWLEDGE_MCP_STATES,
+    knowledge_mcp_gate_closed,
+    knowledge_mcp_state,
 )
 from fin.host.memory_dream import run_dream_after_turn
 from fin.host.memory_port import build_memory_port
@@ -213,10 +220,7 @@ from fin.host.observability import (
     ObservabilityCollector,
     ObservabilityError,
 )
-from fin.host.operator_env import (
-    probe_retrieve_reachability,
-    resolve_retrieve_adapter_kind,
-)
+from fin.host.operator_env import resolve_retrieve_adapter_kind
 from fin.host.run_payload import RunResponsePayload, _run_to_response_payload
 from fin.host.stream_map import (
     InlineFilterState,
@@ -735,18 +739,19 @@ class TurnRow(BaseModel):
 
 
 class WorkspaceStatusResponse(BaseModel):
-    """The boot-scoped workspace status surface (T10, ADR 0033).
+    """The boot-scoped workspace status surface (ADR 0033, amended).
 
-    Exactly four fields, and the ADR fixes each one:
+    Exactly four fields, and the ADR amendment fixes each one:
 
-    * ``retrieve_reachability`` — ``unreachable`` says every retrieve
-      call answers with the typed ``retrieve_unavailable`` EXIT. It
-      is payload DATA with degraded copy behind it, never an HTTP
-      500 and never an empty body: a blank strip tells the operator
-      nothing.
+    * ``knowledge_mcp`` — the three-state knowledge-MCP field
+      (缺 ``missing`` / 坏 ``fault`` / 可达 ``reachable``) from the
+      SAME in-process snapshot the conversation gate reads. It
+      REPLACES the former PATH-only ``retrieve_reachability``: the
+      ADR 0033 amendment makes the real ``initialize`` + ``tools/list``
+      handshake the product truth. It is payload DATA with degraded
+      copy behind it, never an HTTP 500 and never an empty body.
     * ``retrieve_adapter_kind`` — which port is behind the seam, so a
-      healthy ``fake`` boot is distinguishable from a healthy
-      product boot.
+      ``fake`` boot is distinguishable from a product boot.
     * ``model_identity`` — the resolved ``FIN_MODEL`` slug ONLY.
       ``FIN_BASE_URL`` and key material stay off this wire.
     * ``corpus_filing_count`` — from the same in-process catalog that
@@ -759,7 +764,7 @@ class WorkspaceStatusResponse(BaseModel):
     list (plan exclusion).
     """
 
-    retrieve_reachability: Literal["reachable", "unreachable"]
+    knowledge_mcp: Literal["missing", "fault", "reachable"]
     retrieve_adapter_kind: Literal["mcp", "fake"]
     model_identity: str
     corpus_filing_count: int
@@ -1959,6 +1964,11 @@ def build_router(
         body: CreateThreadRequest,
         store: ThreadStore = Depends(get_thread_store),
     ) -> dict:
+        # T2 (workbench retrieve seam): a new research thread cannot be
+        # opened while the product knowledge MCP is not 可达 — there is
+        # no thread to 404 on, so the gate is the first check.
+        if knowledge_mcp_gate_closed():
+            raise KnowledgeMCPFaultError()
         # WHY the route does NOT mint the id: the store owns id
         # allocation (uuid4 inside ``create_thread``), matching the
         # checkpointer's own auto-id pattern and keeping the HTTP
@@ -1981,6 +1991,10 @@ def build_router(
             return JSONResponse(
                 status_code=404, content={"error": "thread_not_found"}
             )
+        # T2: existence check wins (404 above); the MCP gate runs right
+        # after it, so an unknown id is never masked by this 409.
+        if knowledge_mcp_gate_closed():
+            raise KnowledgeMCPFaultError()
         runs = store.list_runs(thread_id)
         # T8: ONE ``list_feedback()`` for the whole turn table (never a
         # query per row), then matched by run id at serialization time.
@@ -2131,6 +2145,13 @@ def build_router(
             return JSONResponse(
                 status_code=404, content={"error": "thread_not_found"}
             )
+
+        # T2 (workbench retrieve seam): existence is settled (404 above),
+        # so the knowledge-MCP gate runs HERE — before the concurrency
+        # probe and before any side effect. A gated send must not consume
+        # attachments, rewrite the title, or start a run.
+        if knowledge_mcp_gate_closed():
+            raise KnowledgeMCPFaultError()
 
         # T2 (ADR 0044 / plan session-compaction T2): ``/compact`` is
         # intercepted BEFORE Soft-Track classify — Soft-Track classify
@@ -3013,20 +3034,27 @@ def build_router(
 
     @router.get("/status", response_model=WorkspaceStatusResponse)
     def workspace_status() -> dict:
-        """The Sidebar strip's boot-scoped surface (T10, ADR 0033).
+        """The left corner's boot-scoped surface (ADR 0033, amended).
 
-        No ``Depends``: the read seam is fin-local config plus the
-        in-process catalog, so the handler needs neither the
-        compiled graph nor the thread store. It builds no MCP
-        client, issues no health-check RPC, and makes no cross-repo
-        call — the reachability value comes from the same probe the
-        boot warning logs (``fin.host.operator_env``).
+        No ``Depends``: the read seam is the in-process knowledge-MCP
+        snapshot plus fin-local config and the catalog, so the handler
+        needs neither the compiled graph nor the thread store. It
+        builds no MCP client and issues no health-check RPC — the
+        snapshot is filled once by ``publish_knowledge_mcp()`` at
+        ``fin-serve`` boot.
 
-        Every state is a 200 with all four fields populated. The
-        route has no failure branch to hide a blank strip behind.
+        Every state is a 200 with all four fields populated. A process
+        that never probed (plain ``TestClient`` tests) reports 缺 —
+        this process has no confirmed reachable MCP — while the
+        conversation gate stays open for that same hermetic case (see
+        ``fin.host.knowledge_mcp``).
         """
+        published = knowledge_mcp_state()
+        knowledge_mcp = (
+            published if published in KNOWLEDGE_MCP_STATES else "missing"
+        )
         return {
-            "retrieve_reachability": probe_retrieve_reachability(),
+            "knowledge_mcp": knowledge_mcp,
             "retrieve_adapter_kind": resolve_retrieve_adapter_kind(),
             "model_identity": _model_identity(),
             "corpus_filing_count": _corpus_filing_count(),

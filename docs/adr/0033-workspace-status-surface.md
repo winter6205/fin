@@ -9,4 +9,6 @@ Amended 2026-08-26 (T10 landed, `winter/fidelity-integrate-8400`): the reachabil
 
 Amendment 2026-09-07 (ADR 0050): the operator-visible render target moves from the Sidebar StatusStrip to **监控** (`/monitor`), with an optional degraded mark on that chrome entry. The SPA may re-GET `/api/status` on **重连**. The route still does not construct an MCP client or issue a health-check RPC; `probe_retrieve_reachability` stays PATH-only. Model identity and adapter kind are not chrome labels.
 
+Amendment 2026-09-13 (ADR 0051, `specs/workbench-retrieve-product-seam.md`): product **知识 MCP** derivation is `initialize` + `tools/list` (缺 / 坏 / 可达), not PATH-only `probe_retrieve_reachability`. Fake must not publish 可达. Render target is the **工作台** left-corner line, not `/monitor`. `GET /api/status` stays 200 with a typed payload. The conversation-entry 409 is ADR 0051, not this route.
+
 Considered Options: HTTP 500 / empty body on unreachable retrieve (breaks the typed two-state route and the never-blank strip); per-run counters on the route (turns a boot surface into run telemetry and duplicates the stream); a dedicated MCP health-check client inside the route (adds the client the spec keeps out of scope); exposing `FIN_BASE_URL` alongside the model id (leaks operator endpoint config for no strip value).

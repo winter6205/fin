@@ -1295,6 +1295,25 @@ def test_spa_catchall_serves_files_inside_dist(spa_client: TestClient) -> None:
     assert r.text.strip() == "<svg/>"
 
 
+def test_spa_catchall_does_not_claim_unmapped_api_paths(
+    spa_client: TestClient,
+) -> None:
+    """Unmapped ``/api/*`` is missing API, not a client route.
+
+    A GET-only ``/{path:path}`` catch-all would answer GET with the
+    SPA shell (200) and POST with 405. ``GET /api/workspaces`` and
+    ``POST /api/workspaces/bind`` must stay 404 JSON (unshipped
+    surface), even when ``web/dist`` is present.
+    """
+    listed = spa_client.get("/api/workspaces")
+    assert listed.status_code == 404
+    assert '<div id="root">' not in listed.text
+
+    bound = spa_client.post("/api/workspaces/bind", json={"path": "/tmp"})
+    assert bound.status_code == 404
+    assert bound.status_code != 405
+
+
 @pytest.mark.skipif(
     not REAL_DIST.is_dir(),
     reason="web/dist is a gitignored Vite artifact; run `cd web && npm run build`",
@@ -3521,18 +3540,21 @@ def test_send_message_classify_deltas_never_reach_the_wire(
 
 # ----- status surface (T10, ADR 0033) -----
 #
-# ``GET /api/status`` is the boot-scoped surface the Sidebar strip
-# renders. ADR 0033 fixes the field set exactly: retrieve
-# reachability, the resolved adapter kind, the model slug, and the
-# corpus filing count — nothing run- or turn-scoped, no "% of
-# context window", no skill list, no MCP client in the route.
+# ``GET /api/status`` is the boot-scoped surface the left corner
+# renders. The ADR 0033 amendment (workbench retrieve product seam)
+# replaces the PATH-only ``retrieve_reachability`` with the three-state
+# ``knowledge_mcp`` field derived from a real ``initialize`` +
+# ``tools/list`` handshake. The other three fields are unchanged:
+# the resolved adapter kind, the model slug, and the corpus filing
+# count — nothing run- or turn-scoped, no "% of context window", no
+# skill list, no MCP client in the route.
 
 
-# ADR 0033's IN list. The route's payload keys must be exactly this
-# set: a missing key blanks part of the strip, an extra key smuggles
-# run telemetry onto a boot surface.
+# The ADR 0033 amendment's IN list. The route's payload keys must be
+# exactly this set: a missing key blanks part of the left corner, an
+# extra key smuggles run telemetry onto a boot surface.
 STATUS_FIELDS = {
-    "retrieve_reachability",
+    "knowledge_mcp",
     "retrieve_adapter_kind",
     "model_identity",
     "corpus_filing_count",
@@ -3567,15 +3589,13 @@ def _bin_dir_with_mcp(tmp_path: Path) -> str:
     return str(bindir)
 
 
-def test_status_reports_reachable_retrieve_on_a_fake_adapter_boot(
+def test_status_reports_missing_knowledge_mcp_on_a_fake_adapter_boot(
     client: TestClient, fresh_store, tmp_path: Path, monkeypatch
 ) -> None:
-    """``FIN_RETRIEVE_ADAPTER=fake`` is a healthy boot, not a failure.
+    """``FIN_RETRIEVE_ADAPTER=fake`` must never publish MCP 可达.
 
-    ADR 0033: the adapter kind is what distinguishes a healthy fake
-    boot from a healthy product boot, so the fake port reports
-    ``reachable`` — it answers every call, just with no corpus behind
-    it — while ``retrieve_adapter_kind`` says ``fake``.
+    The ADR 0033 amendment: Fake is a test-only retrieve story, so a
+    fake boot reports 缺 while ``retrieve_adapter_kind`` says ``fake``.
     """
     monkeypatch.setenv("FIN_RETRIEVE_ADAPTER", "fake")
     monkeypatch.setenv("PATH", _bin_dir_without_mcp(tmp_path))
@@ -3585,20 +3605,21 @@ def test_status_reports_reachable_retrieve_on_a_fake_adapter_boot(
     assert r.status_code == 200
     body = r.json()
     assert set(body.keys()) == STATUS_FIELDS, body
-    assert body["retrieve_reachability"] == "reachable"
+    assert body["knowledge_mcp"] == "missing"
+    assert body["knowledge_mcp"] != "reachable"
     assert body["retrieve_adapter_kind"] == "fake"
 
 
-def test_status_reports_unreachable_retrieve_as_payload_not_500(
+def test_status_reports_missing_knowledge_mcp_as_payload_not_500(
     client: TestClient, fresh_store, tmp_path: Path, monkeypatch
 ) -> None:
-    """The unreachable state is DATA (ADR 0033), never an error.
+    """A non-reachable MCP state is DATA (ADR 0033 amendment), never 500.
 
     Default adapter (``mcp``) with no ``iknow-memory`` on ``PATH`` is
-    the laptop boot whose every retrieve call answers the typed
-    ``retrieve_unavailable`` EXIT. The route must answer 200 with a
-    typed field so the strip renders degraded copy — a 500 or an
-    empty body would blank the strip.
+    the laptop boot. A process that never probed (this plain
+    ``TestClient`` test) reports 缺 — it has no confirmed reachable MCP
+    — and the route answers 200 so the left corner renders degraded
+    copy rather than blanking.
     """
     monkeypatch.delenv("FIN_RETRIEVE_ADAPTER", raising=False)
     monkeypatch.setenv("PATH", _bin_dir_without_mcp(tmp_path))
@@ -3609,23 +3630,35 @@ def test_status_reports_unreachable_retrieve_as_payload_not_500(
     assert r.headers["content-type"].startswith("application/json")
     body = r.json()
     assert set(body.keys()) == STATUS_FIELDS, body
-    assert body["retrieve_reachability"] == "unreachable"
+    assert body["knowledge_mcp"] == "missing"
     assert body["retrieve_adapter_kind"] == "mcp"
     # Still a full payload: the other three fields carry real values
-    # so the strip never renders a hole next to the degraded line.
+    # so the left corner never renders a hole next to the degraded line.
     assert body["model_identity"]
     assert isinstance(body["corpus_filing_count"], int)
 
 
-def test_status_reports_reachable_when_mcp_command_is_on_path(
+def test_status_echoes_the_published_snapshot(
     client: TestClient, fresh_store, tmp_path: Path, monkeypatch
 ) -> None:
+    """The status route echoes the in-process snapshot verbatim.
+
+    This test does NOT prove PATH-vs-handshake truth — it publishes 坏
+    directly (with an ``iknow-memory`` binary on ``PATH``) and asserts the
+    route surfaces that published value, so the route can never drift back
+    to a PATH lookup. The handshake truth (SC9: a PATH binary that cannot
+    complete ``initialize`` / ``tools/list`` is 坏, not 可达) is owned by
+    ``tests/host/test_knowledge_mcp_probe.py``.
+    """
+    from fin.host.knowledge_mcp import publish_knowledge_mcp_state
+
     monkeypatch.delenv("FIN_RETRIEVE_ADAPTER", raising=False)
     monkeypatch.setenv("PATH", _bin_dir_with_mcp(tmp_path))
+    publish_knowledge_mcp_state("fault")
 
     body = client.get("/api/status").json()
 
-    assert body["retrieve_reachability"] == "reachable"
+    assert body["knowledge_mcp"] == "fault"
     assert body["retrieve_adapter_kind"] == "mcp"
 
 

@@ -325,9 +325,9 @@ def test_serve_refuses_boot_when_checkpoint_url_is_unset(monkeypatch) -> None:
 
     served: list[str] = []
     monkeypatch.setattr(http_module, "apply_dotenv", lambda: None)
-    monkeypatch.setattr(
-        http_module, "warn_if_mcp_retrieve_unreachable", lambda: None
-    )
+    # The boot probe is not what this test exercises; stub it so the
+    # assertion stays about the checkpoint-url refusal, not a handshake.
+    monkeypatch.setattr(http_module, "publish_knowledge_mcp", lambda: None)
     monkeypatch.setattr(uvicorn, "run", lambda *a, **k: served.append("uvicorn"))
     monkeypatch.setattr(http_module, "_http_graph_singleton", None, raising=False)
     monkeypatch.delenv(SCRIPTED_BOOT_ENV_VAR, raising=False)

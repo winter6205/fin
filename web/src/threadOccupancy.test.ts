@@ -1,9 +1,8 @@
 // T3 (ADR 0044): the thread-detail occupancy indicator.
 //
 // The project's vitest setup runs without a DOM testing library,
-// so — following the ``statusStrip.ts`` convention — the wording
-// and the neutral-state decision are pinned here as pure helpers,
-// and the ThreadPage render is a 1-line use of them.
+// so the wording and the neutral-state decision are pinned here as
+// pure helpers, and the ThreadPage render is a 1-line use of them.
 
 import { describe, expect, it } from "vitest";
 
