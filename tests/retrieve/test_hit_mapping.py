@@ -252,6 +252,57 @@ def test_limit_is_applied_to_the_mapped_subset() -> None:
     assert ledger.count() == 0
 
 
+# ----- per-call attribution on a process-wide ledger -----
+
+
+def test_count_on_this_thread_excludes_another_threads_records() -> None:
+    """One ledger serves every run in the process (``compile_graph``
+    injects it into both the adapter and the tool), so a caller that has
+    to measure ITS OWN call cannot difference ``count()``: a concurrent
+    run's drop lands inside that window. The per-thread counter
+    attributes each record to the thread that made it."""
+    ledger = MappingFailureLedger()
+    seen: dict[str, int] = {}
+    go = threading.Barrier(2)
+
+    def other_thread() -> None:
+        go.wait(timeout=5)
+        ledger.record(
+            code=MAPPING_FAILURE_UNMAPPED_SOURCE_REF,
+            stage=MAPPING_STAGE_RETRIEVE,
+            retrieval_ref="id-other",
+            message="another run's drop",
+        )
+
+    worker = threading.Thread(target=other_thread)
+    worker.start()
+    go.wait(timeout=5)
+    worker.join(timeout=10)
+    seen["other"] = ledger.count()
+    seen["mine"] = ledger.count_on_this_thread()
+
+    assert seen["other"] == 1, "the record is on the shared ledger"
+    assert seen["mine"] == 0, "but it was not made by this thread"
+
+
+def test_replayed_records_are_not_charged_to_this_thread(tmp_path: Path) -> None:
+    """``FIN_MAPPING_FAILURE_LOG`` replays an earlier process's drops
+    without passing through ``record``; they must never count as a
+    present call's own failures."""
+    path = tmp_path / "replayed.jsonl"
+    map_hits_to_chunks(
+        [{"text": "t", "source_ref": "id-MISSING", "score": 1.0}],
+        locator_map={},
+        limit=10,
+        ledger=MappingFailureLedger(path=path),
+    )
+
+    reloaded = MappingFailureLedger(path=path)
+
+    assert reloaded.count() == 1
+    assert reloaded.count_on_this_thread() == 0
+
+
 # ----- persistence: the count outlives the process -----
 
 

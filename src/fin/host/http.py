@@ -394,8 +394,9 @@ def ask(
     * ``done`` → ``answer`` + ``citations`` populated; ``reason``
       omitted.
     * ``refuse`` → empty ``answer`` + empty ``citations``;
-      ``reason`` = ``status_reason`` (``unknown_locator`` or
-      ``citation_repair_cap``).
+      ``reason`` = ``status_reason``. The vocabulary is not
+      re-listed here: ``fin.host.named_failures`` owns the 具名失败
+      codes and ``fin.host.citation_gate`` owns its own verdicts.
     * ``step_cap`` → empty ``answer`` + empty ``citations``;
       ``reason`` = ``"step_cap"``.
 

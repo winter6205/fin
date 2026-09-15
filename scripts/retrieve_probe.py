@@ -4,17 +4,19 @@ Prints, for a query, the two numbers the closed loop turns on:
 
 * ``n_chunks`` — how many chunks the **retrieve port** returned, and
 * ``mapping_failures`` — how many of the received hits THIS CALL's
-  mapper dropped: the ledger's delta around the retrieve, never the
-  process-wide total and never inferred from an empty ``chunks``.
+  mapper dropped: the ledger's per-thread delta around the retrieve,
+  never the process-wide total and never inferred from an empty
+  ``chunks``.
 
 The shape this exists to make observable: on an empty **资料集合** the
 envelope is ``chunks: []`` with ``mapping_failures=0`` (the 2026-09-16
 probe), whereas a drop shows ``0`` chunks *and* a non-zero delta. Read
 as one line each so a shell can grep the integers without parsing the
-whole envelope. The count is a delta because the ledger is
-process-wide: ``FIN_MAPPING_FAILURE_LOG` replays an earlier process's
-drops, and printing those beside ``n_chunks=0`` would be the very
-collapse the probe exists to prevent.
+whole envelope. The count is a delta, and per-thread, because the
+ledger is process-wide: ``FIN_MAPPING_FAILURE_LOG`` replays an earlier
+process's drops, and a concurrent run's drops land on the same ledger
+while this one is in flight — printing either beside ``n_chunks=0``
+would be the very collapse the probe exists to prevent.
 
 Same adapter the product uses (``MCPRetrieveAdapter`` over the real
 stdio server), so the probe cannot drift from the product seam. This
@@ -108,19 +110,22 @@ def run_probe(
 ) -> int:
     """Run one retrieve and print the two greppable integers to ``out``.
 
-    ``mapping_failures`` is the ledger DELTA this call produced, never
-    the process-wide total: ``FIN_MAPPING_FAILURE_LOG`` may replay an
-    earlier process's drops, and printing those beside ``n_chunks=0``
-    for a healthy empty collection would be exactly the collapse this
-    probe exists to prevent. The full envelope rides stderr.
+    ``mapping_failures`` is the drop count THIS CALL produced, never the
+    process-wide total: ``FIN_MAPPING_FAILURE_LOG`` may replay an
+    earlier process's drops, and a concurrent run's drops land on the
+    same process-wide ledger while this one is in flight — printing
+    either beside ``n_chunks=0`` for a healthy empty collection would be
+    exactly the collapse this probe exists to prevent. The counter is
+    read per-thread for the same reason the host tool reads it that way.
+    The full envelope rides stderr.
 
     Returns the documented exit code: ``1`` when the port answered with
     a typed failure envelope (counts still printed), ``0`` otherwise.
     """
-    before = adapter.mapping_failures.count()
+    before = adapter.mapping_failures.count_on_this_thread()
     envelope = adapter.retrieve(query, limit=limit)
     chunks = envelope.get("chunks") or []
-    failures = adapter.mapping_failures.count()
+    failures = adapter.mapping_failures.count_on_this_thread()
     print(f"n_chunks={len(chunks)}", file=out)
     print(f"mapping_failures={max(failures - before, 0)}", file=out)
     print(json.dumps(envelope, ensure_ascii=False, indent=2), file=sys.stderr)

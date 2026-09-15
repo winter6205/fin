@@ -223,9 +223,11 @@ class StatusSnapshot(TypedDict, total=False):
 # ``add_messages`` so prior chat survives across model_node cycles.
 #
 # ``answer`` / ``citations`` are populated only on ``status ==
-# "done"``. ``status_reason`` carries the gate's refuse reason
-# (``"unknown_locator"`` or ``"citation_repair_cap"``) or
-# ``"step_cap"``.
+# "done"``. ``status_reason`` carries the gate's refuse reason or
+# ``"step_cap"``; the full vocabulary lives in ONE place,
+# ``fin.host.named_failures`` (the 具名失败 codes) plus the
+# ``fin.host.citation_gate`` verdicts — this comment deliberately
+# does not re-list them, because a re-listed set drifts.
 class AgentState(TypedDict, total=False):
     """The state the host graph (T6) writes to.
 
@@ -339,6 +341,21 @@ class AgentState(TypedDict, total=False):
         the citation gate (ADR 0046). Storage is a turn blob in the
         workspace router's memory; nothing is written to the corpus
         store or any extracted tree, and nothing is pushed.
+    retrieve_outcomes
+        T3 (spec SC4–SC5): one ``{"chunks": int, "mapping_failures":
+        int}`` record per completed ``retrieve`` call this run —
+        admitted chunk count plus the drops THAT CALL produced, read
+        off the ledger's per-thread counter so a concurrent run's drop
+        is never charged here (the ledger is process-wide, the
+        concurrent-run guard is per ``thread_id``). The citation gate
+        reads the channel to name an empty-bound 资料集合
+        (``corpus_not_ready``) or a mapping drop
+        (``mapping_drop``) instead of letting one verifier reason
+        stand for three different product facts. Overwrite semantics
+        with a single writer (``tool_node_with_summaries``, which
+        folds prior + new itself), so ``reset_input_state``'s ``[]``
+        genuinely clears it and a follow-up send cannot inherit the
+        previous run's verdict.
     """
 
     messages: Annotated[list[BaseMessage], add_messages]
@@ -398,6 +415,13 @@ class AgentState(TypedDict, total=False):
     # Overwrite semantics (single writer: the run input); see the
     # field docstring above for the citation/isolation contract.
     attachments: list[dict[str, str]]
+    # T3 (spec SC4–SC5): OVERWRITE semantics, not ``operator.add``.
+    # ``tool_node_with_summaries`` already reads ``state`` and so folds
+    # prior + new itself; an additive reducer would make
+    # ``reset_input_state``'s ``[]`` a no-op (``prior + [] == prior``)
+    # and a follow-up send would inherit the previous run's outcome —
+    # the exact stale verdict the run-scoped reset exists to prevent.
+    retrieve_outcomes: list[dict[str, int]]
 
 
 def reset_input_state(
@@ -465,6 +489,11 @@ def reset_input_state(
         # (default ``None``) clears the channel so attachment text is
         # this-turn only.
         "attachments": list(attachments or []),
+        # T3 (spec SC4–SC5): the retrieve-outcome channel is run
+        # scoped, so a follow-up send's verdict comes from its OWN
+        # retrieve calls — a stale ``corpus_not_ready`` cannot outlive
+        # its run.
+        "retrieve_outcomes": [],
     }
 
 
