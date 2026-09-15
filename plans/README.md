@@ -2,6 +2,8 @@
 
 **进度：** `docs/handoff/` 为本地会话笔记（不入库）；契约以本树 `plans/` + `specs/` + `docs/CONTEXT.md` 为准。
 
+**第一闭环（ingest + live retrieve + cite；iknow 对票 corpus-ready-retrieve）：** [`first-closed-loop.md`](first-closed-loop.md) · spec [`../specs/first-closed-loop.md`](../specs/first-closed-loop.md)
+
 **总计划（阶段表，不再当实施队列）：** [`retrieval-upgrade.md`](retrieval-upgrade.md)
 
 **已闭合（本树近期）：** [`workbench-sidebar-rail.md`](workbench-sidebar-rail.md)（that pull request）；[`workbench-chrome.md`](workbench-chrome.md)（that pull request）；[`corpus-serve-ingest.md`](corpus-serve-ingest.md)（that pull request）；[`session-compaction.md`](session-compaction.md)（that pull request）。MDP 见 [`memory-dialogue-platform.md`](memory-dialogue-platform.md)——T1–T4 / T7–T9 已闭合；T5/T6 按 ADR 0045 非入库必做波。

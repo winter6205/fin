@@ -1,5 +1,7 @@
 # Spec: corpus-serve-ingest
 
+> **See also (2026-09-16):** live empty iknow + closed-loop ingest is [`first-closed-loop.md`](./first-closed-loop.md) (does not replace this spec’s two-door contract).
+
 ## Assumption gate (confirmed 2026-09-04)
 
 Operator confirmed scope A in-thread. These are in force:

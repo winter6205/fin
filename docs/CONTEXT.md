@@ -229,6 +229,18 @@ _Avoid_: Path.cwd() as implicit 工作区, `$HOME/.fin/workspaces/<slug>`, left-
 The one process-wide corpus of **资料** behind the **retrieve port**, shared by every **research thread**. It is not a **工作台** route.
 _Avoid_: sidebar 「知识库」, `/kb` as product chrome, per-工作区 retrieve index, identity text listing filings, fin as a second 库
 
+**资料集合**:
+The operator-visible set of **资料** already pushed to **iknow-memory** (ready when successful **chunk** count ≥ 1). The **工作台** binds a knowledge question to this set; local `corpus_filing_count` is not 就绪.
+_Avoid_: freeze-slice catalog as 就绪, treating MCP 可达 as nonempty retrieve, **thread attach** as membership in the set
+
+**检索档**:
+Which retrieve path a knowledge question uses after it has entered the 问答 leaf: A 查找 (lexical-first), B 知识问答 (default; iknow graph-priority then vector∥BM25 fill), C 综述 (explicit, not automatic), D 真数据库 (real SQL/business DB; document tables stay B).
+_Avoid_: open business-intent labels, one unnamed retrieve for every question, treating Fake as a 档
+
+**具名失败**:
+A typed product failure that names empty-bound 资料, mapping-drop, citation-verifier refuse, 档未开, or 真库未接 as distinct exits — not one `unknown_locator` plus empty citations.
+_Avoid_: collapsing those cases, Fake health, `degraded` as a synonym for empty hits
+
 **workspace**:
 Retired alias: the UI is **工作台**; the operator directory is **工作区**. Kept so older specs remain readable.
 _Avoid_: using workspace as the product kind, as the 知识库, or as Path.cwd()
