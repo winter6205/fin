@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import sys
+import threading
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from fin.corpus.extracted import Locator
 from fin.retrieve.hit_mapping import (
     MAPPING_FAILURE_UNMAPPED_SOURCE_REF,
     MAPPING_STAGE_RETRIEVE,
@@ -51,10 +52,6 @@ def _load_probe() -> ModuleType:
     return module
 
 
-def _locator(page: int = 1) -> Locator:
-    return Locator(document_id="DOC-1", version="v-" + "a" * 60, page=page)
-
-
 class _ScriptedProbeAdapter(MCPRetrieveAdapter):
     """The real adapter with ``_call_mcp`` scripted; no subprocess."""
 
@@ -76,7 +73,8 @@ class _ScriptedProbeAdapter(MCPRetrieveAdapter):
 def test_a_replayed_ledger_does_not_show_as_this_calls_drop() -> None:
     """``FIN_MAPPING_FAILURE_LOG`` from an earlier process is not this
     call's drop: an empty collection must still print
-    ``mapping_failures=0``."""
+    ``mapping_failures=0``. A concurrent run's drop is the same case one
+    step later — one ledger serves the whole process."""
     ledger = MappingFailureLedger()
     ledger.record(
         code=MAPPING_FAILURE_UNMAPPED_SOURCE_REF,
@@ -91,6 +89,59 @@ def test_a_replayed_ledger_does_not_show_as_this_calls_drop() -> None:
     code = module.run_probe(adapter, "revenue", limit=8, out=out)
 
     assert code == 0
+    assert out.getvalue().splitlines() == [
+        "n_chunks=0",
+        "mapping_failures=0",
+    ]
+
+
+def test_a_concurrent_runs_drop_is_not_this_calls_number() -> None:
+    """Same ledger, one more thread: a drop recorded by another run while
+    this one is in flight must not print beside ``n_chunks=0``. Counting
+    per-thread instead of over the process is what keeps that apart."""
+    ledger = MappingFailureLedger()
+    inside = threading.Event()
+    return_to_probe = threading.Event()
+    other_done = threading.Event()
+
+    class _GatedProbeAdapter(_ScriptedProbeAdapter):
+        async def _call_mcp(self, payload: dict[str, Any]) -> dict[str, Any]:  # type: ignore[override]
+            inside.set()
+            return_to_probe.wait(timeout=10)
+            return {"chunks": []}
+
+    adapter = _GatedProbeAdapter(response={"chunks": []}, ledger=ledger)
+    module = _load_probe()
+    out = io.StringIO()
+    codes: list[int] = []
+    failures: list[BaseException] = []
+
+    def other_run() -> None:
+        try:
+            inside.wait(timeout=10)
+            ledger.record(
+                code=MAPPING_FAILURE_UNMAPPED_SOURCE_REF,
+                stage=MAPPING_STAGE_RETRIEVE,
+                retrieval_ref="id-other-run",
+                message="another run's drop",
+            )
+            other_done.set()
+        except BaseException as exc:  # noqa: BLE001 - collect worker failures
+            failures.append(exc)
+        finally:
+            return_to_probe.set()
+
+    worker = threading.Thread(target=other_run, name="other-run")
+    worker.start()
+    try:
+        codes.append(module.run_probe(adapter, "revenue", limit=8, out=out))
+    finally:
+        return_to_probe.set()
+        worker.join(timeout=10)
+
+    assert not failures, failures
+    assert other_done.is_set()
+    assert codes == [0]
     assert out.getvalue().splitlines() == [
         "n_chunks=0",
         "mapping_failures=0",
@@ -135,12 +186,15 @@ def test_a_missing_binary_is_an_exit_2() -> None:
 
 
 def test_a_resolvable_binary_is_returned_with_its_args() -> None:
+    """``sys.executable`` is the interpreter running this test, so the
+    binary is on ``PATH`` by construction — a literal ``python3`` would
+    fail on a PATH that has no such entry."""
     module = _load_probe()
     ns = module._parse_args(
-        ["revenue", "--command", "python3", "--arg", "server.py"]
+        ["revenue", "--command", sys.executable, "--arg", "server.py"]
     )
 
-    assert module._resolve_command(ns) == ["python3", "server.py"]
+    assert module._resolve_command(ns) == [sys.executable, "server.py"]
 
 
 def test_main_reports_exit_2_for_an_unresolvable_command(

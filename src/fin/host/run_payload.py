@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Any, Final, TypedDict
 
 from fin.host.citation_gate import strip_hidden_bounce_marker
+from fin.host.named_failures import CORPUS_NOT_READY, MAPPING_DROP
 from fin.host.state import STEP_CAP
 from fin.host.thread_store import RunStatus
 
@@ -106,6 +107,21 @@ ORDINARY_PERSON_COPY: Final[dict[str, str]] = {
         f"Hit the {STEP_CAP}-step fuse. Try breaking this into a "
         "smaller question."
     ),
+    # T3 / SC4 — 资料集合 is empty (0 usable chunks, 0 drops).
+    # A retrieve that ran and matched nothing is a product fact, not
+    # a wording problem: "rephrase" would be the wrong instruction.
+    CORPUS_NOT_READY: (
+        "The bound 资料 collection has nothing to cite yet. Add "
+        "documents (corpus ingest) and ask again."
+    ),
+    # T3 / SC5 — hits came back but none carried a locator fin can
+    # cite, so the run must say so instead of reading as a plain
+    # empty corpus.
+    MAPPING_DROP: (
+        "Retrieval returned matches, but none could be tied to a "
+        "citable source. The collection's locator map may be stale — "
+        "re-run corpus ingest."
+    ),
 }
 
 
@@ -114,7 +130,8 @@ def ordinary_person_copy(status: str, reason: str) -> str:
 
     ``done`` -> ``""`` (the run produced a real ``answer``).
     ``refuse`` -> keyed by ``reason`` (``unknown_locator`` /
-    ``citation_repair_cap`` / ``numeric_gate_fail``).
+    ``citation_repair_cap`` / ``numeric_gate_fail`` /
+    ``corpus_not_ready`` / ``mapping_drop``).
     ``step_cap`` -> the step-cap string regardless of ``reason``.
     Unknown terminal -> ``""`` (defensive; the gate never
     produces one).

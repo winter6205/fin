@@ -103,6 +103,10 @@ from fin.host.evidence_admission import (
     evidence_from_chunks,
 )
 from fin.host.memory_port import MemoryPort
+from fin.host.named_failures import (
+    named_refusal_reason,
+    retrieve_outcomes_delta,
+)
 from fin.host.session_compaction import (
     OccupancyCompactor,
     SessionSummaryError,
@@ -651,6 +655,29 @@ def _make_retrieve_tool(
                     exhausted=outcome.exhausted
                 )
 
+        # T3 (spec SC4–SC5): the drops this call caused are measured on
+        # the ledger's PER-THREAD counter, read before and after the
+        # retrieve. Both halves matter:
+        #
+        # * Before, not after: the product adapter records its
+        #   mapper-drops into the same shared ledger from INSIDE
+        #   ``retrieve``, so a baseline taken after the transport returns
+        #   already contains this call's drops and the delta is
+        #   structurally zero — which mislabels a real mapping drop as
+        #   ``corpus_not_ready``.
+        # * Per-thread, not process-wide: ONE ledger serves every run in
+        #   the process (``compile_graph`` injects it into the adapter and
+        #   the tool alike), while the concurrent-run guard is per
+        #   ``thread_id``. A process-wide delta would charge a concurrent
+        #   run's drop to this one and refuse a genuinely empty collection
+        #   as ``mapping_drop`` — the same false accusation, one race
+        #   later. A retrieve call runs on one thread, so the per-thread
+        #   counter needs no window at all.
+        #
+        # The retry helper may call the port twice (one rewrite); both
+        # attempts belong to this call, and both are counted here.
+        failures_before = ledger.count_on_this_thread()
+
         retry_outcome: RewriteRetryResult | None = None
         degraded_to_empty_hit = False
         try:
@@ -720,6 +747,17 @@ def _make_retrieve_tool(
         # SC22: hits that did not map back to a locator are dropped and
         # counted here, so neither the evidence list nor the serialized
         # envelope below can carry a retrieval-side identifier.
+        #
+        # T3 (spec SC4–SC5): the record this call contributes is
+        # measured against ``failures_before`` (read before the port
+        # ran, above), so it covers every drop this call caused — the
+        # adapter's mapper-drops, the retry's second attempt, and the
+        # ``admit_retrieved_chunks`` drop below. The counter is
+        # per-thread, so a concurrent run's drop is never charged here
+        # and the delta cannot go negative; ``retrieve_outcomes_delta``
+        # still clamps it defensively. The run-scoped record lets the
+        # citation gate tell an empty-bound 资料集合 from a mapping
+        # drop, and it changes neither admission nor the envelope below.
         chunks = admit_retrieved_chunks(raw_chunks, ledger=ledger)
         new_evidence: list[EvidenceItem] = evidence_from_chunks(chunks)
         # Serialize the chunks with their Locator as a dict so the
@@ -746,7 +784,25 @@ def _make_retrieve_tool(
             name="retrieve",
         )
         return Command(
-            update={"messages": [tool_message], "evidence": new_evidence}
+            update={
+                "messages": [tool_message],
+                "evidence": new_evidence,
+                # T3 (SC4–SC5): the run-scoped outcome record. The
+                # envelope the MODEL reads keeps the miss shape —
+                # fin's internal map is not the model's business —
+                # and the failure is named on the run, where the
+                # operator reads it. ``retrieve_outcomes_delta``
+                # guards the negative-delta case defensively.
+                "retrieve_outcomes": retrieve_outcomes_delta(
+                    [
+                        {
+                            "chunks": len(serialized_chunks),
+                            "mapping_failures": ledger.count_on_this_thread(),
+                        }
+                    ],
+                    baseline=failures_before,
+                ),
+            }
         )
 
     return retrieve_tool
@@ -1569,6 +1625,51 @@ def analysis_from_tool_message(message: BaseMessage) -> dict | None:
         **analysis,
         "tool_call_id": getattr(message, "tool_call_id", "") or "",
     }
+
+
+def _fold_tool_update(raw_update: Any) -> dict[str, list[Any]]:
+    """The unwrapped ``ToolNode`` result as ONE flat state update.
+
+    Contract: when ANY wrapped tool returns a ``Command``, the prebuilt
+    ``ToolNode._func`` answers a LIST of per-call entries — each either
+    a ``Command(update={...})``, a plain ``{"messages": [...]}`` dict,
+    or a LIST of those. LangGraph merges that list itself when a node
+    returns it verbatim; the summarising wrapper must merge it manually
+    and must keep every channel the tools wrote.
+
+    Only ``messages`` / ``evidence`` / ``retrieve_outcomes`` are copied,
+    which is exactly the set the wrapped tools (``read_file``,
+    ``retrieve``) write and the wrapper re-emits. An unknown key would
+    be silently dropped, so a tool that grows a new state channel must
+    be added here too — the fold is the single place that knows the
+    ToolNode return shape, so the node body does not restate it per
+    branch.
+    """
+    merged: dict[str, list[Any]] = {
+        "messages": [],
+        "evidence": [],
+        "retrieve_outcomes": [],
+    }
+    if isinstance(raw_update, dict):
+        merged["messages"].extend(raw_update.get("messages", []))
+        return merged
+    if not isinstance(raw_update, list):
+        return merged
+    for entry in raw_update:
+        items = entry if isinstance(entry, list) else [entry]
+        for item in items:
+            if isinstance(item, Command):
+                payload = item.update or {}
+                merged["messages"].extend(payload.get("messages", []))
+                merged["evidence"].extend(payload.get("evidence", []))
+                merged["retrieve_outcomes"].extend(
+                    payload.get("retrieve_outcomes", [])
+                )
+            elif isinstance(item, dict):
+                merged["messages"].extend(item.get("messages", []))
+            elif isinstance(item, BaseMessage):
+                merged["messages"].append(item)
+    return merged
 
 
 def _collect_comparisons(messages: list[BaseMessage]) -> list[dict]:
@@ -2534,41 +2635,23 @@ def compile_graph(
 
         Return-shape note: when ANY wrapped tool returns a
         ``Command`` (``read_file`` / ``retrieve`` do), the prebuilt
-        ``ToolNode._func`` returns a LIST of per-call updates —
-        each either a ``Command(update={...})`` or a plain
-        ``{messages: [ToolMessage]}`` dict — instead of one flat
-        dict. LangGraph merges that list itself when a node returns
-        it verbatim, but this wrapper must merge it manually to
-        attach ``tool_summaries``. We fold every entry's
-        ``messages`` / ``evidence`` into ONE state update so the
-        reducer semantics are identical to the unwrapped node.
+        ``ToolNode._func`` answers a list instead of one flat dict.
+        LangGraph merges that list itself when a node returns it
+        verbatim, but this wrapper must merge it manually to attach
+        ``tool_summaries``. ``_fold_tool_update`` owns that shape (see
+        its docstring); this node keeps only the channel semantics.
+        ``retrieve_outcomes`` is folded here (over the prior channel)
+        because it is overwrite-semantics: a channel this wrapper did
+        not copy would be silently discarded, and the citation gate's
+        具名失败 (T3) reads it.
         """
         pending = list(_pending_tool_calls(state))
         raw_update: Any = tool_dispatcher.invoke(state)
 
-        merged_messages: list[Any] = []
-        merged_evidence: list[Any] = []
-        if isinstance(raw_update, dict):
-            merged_messages.extend(raw_update.get("messages", []))
-        elif isinstance(raw_update, list):
-            # Per-call entries in tool-call order; flatten.
-            for entry in raw_update:
-                if isinstance(entry, Command):
-                    payload = entry.update or {}
-                    merged_messages.extend(payload.get("messages", []))
-                    merged_evidence.extend(payload.get("evidence", []))
-                elif isinstance(entry, dict):
-                    merged_messages.extend(entry.get("messages", []))
-                elif isinstance(entry, list):
-                    for item in entry:
-                        if isinstance(item, Command):
-                            payload = item.update or {}
-                            merged_messages.extend(payload.get("messages", []))
-                            merged_evidence.extend(payload.get("evidence", []))
-                        elif isinstance(item, BaseMessage):
-                            merged_messages.append(item)
-                elif isinstance(entry, BaseMessage):
-                    merged_messages.append(entry)
+        merged = _fold_tool_update(raw_update)
+        merged_messages = merged["messages"]
+        merged_evidence = merged["evidence"]
+        merged_outcomes = merged["retrieve_outcomes"]
 
         new_summaries = _build_tool_summaries(pending, merged_messages)
         update: dict[str, Any] = {"messages": merged_messages}
@@ -2588,6 +2671,13 @@ def compile_graph(
         update["analysis_results"] = list(
             state.get("analysis_results") or []
         ) + _collect_analysis_results(merged_messages)
+        # T3 (SC4–SC5): the retrieve outcomes accumulate WITHIN the
+        # run (several retrieve calls are several records) and the
+        # channel is overwrite-semantics, so the fold is explicit —
+        # same shape as the comparison / analysis channels above.
+        update["retrieve_outcomes"] = list(
+            state.get("retrieve_outcomes") or []
+        ) + merged_outcomes
         return update
 
     def _fanout_tool_update(
@@ -2846,10 +2936,22 @@ def compile_graph(
             }
 
         if gate_result.outcome == "refuse":
+            # T3: the run had NOTHING to cite and retrieve is the
+            # reason. The verifier's own vocabulary is untouched
+            # (ADR 0008) — the refusal it produced is RE-LABELLED
+            # with the more specific retrieve-side fact, which is
+            # the whole point of 「具名失败」: an operator must not
+            # have to read three different product facts as one
+            # ``unknown_locator``. With evidence present, or with no
+            # retrieve at all, the gate's verdict stands unchanged.
             return {
                 "messages": [],
                 "status": "refuse",
-                "status_reason": gate_result.reason,
+                "status_reason": named_refusal_reason(
+                    evidence=evidence,
+                    outcomes=state.get("retrieve_outcomes"),
+                    verifier_reason=gate_result.reason,
+                ),
                 "repair_count": repair_count,
             }
 

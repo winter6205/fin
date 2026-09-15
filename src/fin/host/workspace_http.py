@@ -216,6 +216,11 @@ from fin.host.knowledge_mcp import (
 )
 from fin.host.memory_dream import run_dream_after_turn
 from fin.host.memory_port import build_memory_port
+from fin.host.named_failures import (
+    RetrieveTier,
+    TIER_UNAVAILABLE_CODE,
+    unavailable_tier,
+)
 from fin.host.observability import (
     ObservabilityCollector,
     ObservabilityError,
@@ -623,6 +628,18 @@ class SendMessageRequest(BaseModel):
     # text rides ``reset_input_state(attachments=...)`` as turn-scoped
     # context and never enters the corpus/ingest path.
     attachment_ids: list[str] = Field(default_factory=list)
+    # T6 (spec SC9): the explicit 检索档 selector. Empty (the default)
+    # is the ordinary send — the model resolves the track as it always
+    # has. A caller that NAMES an unimplemented 档 (C 综述 / D 真数据
+    # 库) gets the named 400 BEFORE any run starts; the product never
+    # opens a document retrieve dressed as SQL, and never guesses a 档
+    # from the question prose (the wayfinder doc forbids an open-ended
+    # 业务意图桶). Typed as a closed enum so a bogus token is a 422
+    # input error rather than a silently ignored field. The enum is
+    # derived from ``fin.host.named_failures.RETRIEVE_TIERS`` (via
+    # ``RetrieveTier``) rather than re-spelled here, so a 档 added to
+    # the SSOT cannot leave this schema silently accepting the old set.
+    tiers: list[RetrieveTier] = Field(default_factory=list)
 
 
 class CreateWatchRequest(BaseModel):
@@ -2144,6 +2161,20 @@ def build_router(
         if thread is None:
             return JSONResponse(
                 status_code=404, content={"error": "thread_not_found"}
+            )
+
+        # T6 (spec SC9): an explicitly named 检索档 that this product
+        # does not implement refuses HERE — before the concurrency
+        # probe, before any side effect, and long before a retrieve
+        # could be dressed up as the tier the operator asked for. The
+        # code is named per 档 (综述未开 / 真库未接), never collapsed
+        # into one token; A/B fall through to the ordinary run because
+        # 查找 is openable on the default stack today.
+        requested_tier = unavailable_tier(body.tiers)
+        if requested_tier is not None:
+            return JSONResponse(
+                status_code=400,
+                content={"error": TIER_UNAVAILABLE_CODE[requested_tier]},
             )
 
         # T2 (workbench retrieve seam): existence is settled (404 above),

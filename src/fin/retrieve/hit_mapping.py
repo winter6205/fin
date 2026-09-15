@@ -192,6 +192,9 @@ class MappingFailureLedger:
         self._path = path
         self._lock = threading.RLock()
         self._failures: list[MappingFailure] = []
+        # One counter per THREAD, for callers that must measure their own
+        # call rather than the process (see ``count_on_this_thread``).
+        self._thread_counts = threading.local()
         if path is not None and path.exists():
             self._failures.extend(self._replay(path))
 
@@ -205,6 +208,33 @@ class MappingFailureLedger:
         """Total recorded mapping failures (the SC22 counter)."""
         with self._lock:
             return len(self._failures)
+
+    def count_on_this_thread(self) -> int:
+        """Failures recorded FROM THE CALLING THREAD so far.
+
+        ``count()`` is process-wide, and one ledger is shared by every
+        run in the process: ``compile_graph`` builds a single ledger and
+        hands it to both the retrieve adapter and the tool, while the
+        concurrent-run guard is per ``thread_id``, not global. A call
+        that measured itself by differencing ``count()`` would therefore
+        charge a *concurrent* run's drop to itself — refusing a
+        genuinely empty collection as ``mapping_drop``.
+
+        A retrieve call runs top to bottom on one thread (the port's
+        drop-recording included, since the adapter's ``asyncio.run``
+        executes on the calling thread), so a per-thread counter
+        attributes each record to the call that made it with no timing
+        window to get wrong. Replayed ``FIN_MAPPING_FAILURE_LOG``
+        records are loaded without passing through :meth:`record` and
+        so never count here: they belong to an earlier process.
+        """
+        return self._thread_count()
+
+    def _thread_count(self) -> int:
+        return int(getattr(self._thread_counts, "count", 0))
+
+    def _bump_thread_count(self) -> None:
+        self._thread_counts.count = self._thread_count() + 1
 
     def count_by_code(self) -> dict[str, int]:
         """Per-code totals, omitting codes with no occurrences."""
@@ -254,6 +284,7 @@ class MappingFailureLedger:
             )
             self._append(failure)
             self._failures.append(failure)
+            self._bump_thread_count()
             return failure
 
     # ----- persistence -----
