@@ -102,9 +102,12 @@ Routes
                                           knowledge MCP three-state
                                           (缺/坏/可达) + adapter kind +
                                           model slug + corpus filing
-                                          count. Its own handler with
-                                          no dependencies — never a
-                                          branch inside send or
+                                          count + the bound 资料集合
+                                          name (T4 mirror of iknow's
+                                          constant; ``unbound`` when
+                                          not bound). Its own handler
+                                          with no dependencies — never
+                                          a branch inside send or
                                           GET-thread.
 * ``GET    /api/observability``         - the per-process counters
                                           surface (T9): terminal-status
@@ -190,6 +193,7 @@ from fin.corpus.ingest_endpoint import (
     IngestUploadTooLargeError,
 )
 from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER, strip_hidden_bounce_marker
+from fin.host.collection_bind import resolve_bound_collection_name
 from fin.host.export import (
     ExportError,
     UnsupportedExportError,
@@ -756,9 +760,9 @@ class TurnRow(BaseModel):
 
 
 class WorkspaceStatusResponse(BaseModel):
-    """The boot-scoped workspace status surface (ADR 0033, amended).
+    """The boot-scoped workspace status surface (ADR 0033, amended; T4).
 
-    Exactly four fields, and the ADR amendment fixes each one:
+    Five fields, each fixed by an ADR or a plan ticket:
 
     * ``knowledge_mcp`` — the three-state knowledge-MCP field
       (缺 ``missing`` / 坏 ``fault`` / 可达 ``reachable``) from the
@@ -773,6 +777,18 @@ class WorkspaceStatusResponse(BaseModel):
       ``FIN_BASE_URL`` and key material stay off this wire.
     * ``corpus_filing_count`` — from the same in-process catalog that
       serves ``GET /api/corpus``. Zero is a valid rendered value.
+    * ``bound_collection_name`` — T4 (``specs/first-closed-loop.md``
+      "工作台 shows the bound 资料集合 identity"): the 资料集合 this
+      process is bound to, or ``unbound`` when it is bound to none.
+      The v1 bind is the one process-wide collection ADR 0049 settles
+      (spec Open Question 2 → yes), and the name is a documented
+      MIRROR of iknow-memory's ``SOURCE_DOC_COLLECTION_NAME`` because
+      no MCP tool returns a collection identity — see
+      :mod:`fin.host.collection_bind`. It is NOT a 就绪 signal and is
+      never derived from ``corpus_filing_count`` (SC7). The ``unbound``
+      sentinel is itself hand-mirrored in the SPA
+      (``web/src/knowledgeMcp.ts``), which carries no copy of the
+      host's name space by design — a rename here must move both.
 
     Deliberately absent (ADR 0033 OUT): ``step_budget_live``,
     ``token_usage_absolute``, ``soft_track_confidence`` — run- and
@@ -785,6 +801,7 @@ class WorkspaceStatusResponse(BaseModel):
     retrieve_adapter_kind: Literal["mcp", "fake"]
     model_identity: str
     corpus_filing_count: int
+    bound_collection_name: str
 
 
 class Occupancy(BaseModel):
@@ -3074,11 +3091,16 @@ def build_router(
         snapshot is filled once by ``publish_knowledge_mcp()`` at
         ``fin-serve`` boot.
 
-        Every state is a 200 with all four fields populated. A process
+        Every state is a 200 with all five fields populated. A process
         that never probed (plain ``TestClient`` tests) reports 缺 —
         this process has no confirmed reachable MCP — while the
         conversation gate stays open for that same hermetic case (see
         ``fin.host.knowledge_mcp``).
+
+        ``bound_collection_name`` reads config + that same snapshot (no
+        extra call, no catalog) and reports ``unbound`` whenever the
+        process is not bound to a live iknow 资料集合; see
+        :mod:`fin.host.collection_bind`.
         """
         published = knowledge_mcp_state()
         knowledge_mcp = (
@@ -3089,6 +3111,7 @@ def build_router(
             "retrieve_adapter_kind": resolve_retrieve_adapter_kind(),
             "model_identity": _model_identity(),
             "corpus_filing_count": _corpus_filing_count(),
+            "bound_collection_name": resolve_bound_collection_name(),
         }
 
     @router.post("/corpus/ingest")

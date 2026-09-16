@@ -5,19 +5,36 @@
 // (and so must the retired fake-retrieve 「可用」 copy). The helper is
 // plain data, no DOM.
 
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  BOUND_COLLECTION_UNBOUND,
+  boundCollectionLine,
   KNOWLEDGE_MCP_FAULT_COPY,
   knowledgeMcpLine,
   parseWorkspaceStatus,
 } from "./knowledgeMcp";
 import type { WorkspaceStatus } from "./types";
 
+/** The host SSOT for the ``GET /api/status`` payload. */
+const HOST_WORKSPACE_HTTP_PATH = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "src",
+  "fin",
+  "host",
+  "workspace_http.py",
+);
+
 const BASE: WorkspaceStatus = {
   knowledge_mcp: "reachable",
   retrieve_adapter_kind: "mcp",
   model_identity: "fin/MiniMax-M3",
   corpus_filing_count: 12,
+  bound_collection_name: "默认资料集合",
 };
 
 describe("knowledgeMcpLine", () => {
@@ -79,8 +96,94 @@ describe("knowledgeMcpLine", () => {
   });
 });
 
+// T4 (specs/first-closed-loop.md): the bound 资料集合 line. A sibling
+// of the 知识 MCP line — a collection can be named while the MCP is
+// 可达, and the 未绑定 state must read differently from the bound one.
+describe("boundCollectionLine", () => {
+  it("names the bound collection", () => {
+    const line = boundCollectionLine(BASE, true);
+    expect(line.state).toBe("bound");
+    expect(line.tone).toBe("ok");
+    expect(line.text).toBe("资料集合：默认资料集合");
+  });
+
+  it("renders the 未绑定 state distinctly from the bound one", () => {
+    const bound = boundCollectionLine(BASE, true);
+    const unbound = boundCollectionLine(
+      { ...BASE, bound_collection_name: BOUND_COLLECTION_UNBOUND },
+      true,
+    );
+    expect(unbound.state).toBe("unbound");
+    expect(unbound.text).toBe("资料集合：未绑定");
+    expect(unbound.text).not.toBe(bound.text);
+    // 未绑定 is a configuration fact, not a fault — no accusation.
+    expect(unbound.tone).toBe("neutral");
+    expect(unbound.text).not.toContain(KNOWLEDGE_MCP_FAULT_COPY);
+  });
+
+  it("never claims 就绪, and never renders the local filing count", () => {
+    // SC7: the bind line names the collection. It must not turn the
+    // local catalog count into a readiness word — the exact confusion
+    // the spec names. Load-bearing on ``BASE.corpus_filing_count``
+    // (12) being non-zero.
+    expect(BASE.corpus_filing_count).toBeGreaterThan(0);
+    const lines = [
+      boundCollectionLine(BASE, true),
+      boundCollectionLine(
+        { ...BASE, bound_collection_name: BOUND_COLLECTION_UNBOUND },
+        true,
+      ),
+      boundCollectionLine(null, true),
+    ];
+    for (const line of lines) {
+      expect(line.text).not.toContain("就绪");
+      expect(line.text).not.toContain("12");
+      expect(line.text).not.toContain("可用");
+    }
+  });
+
+  it("renders a neutral unknown line before the status lands", () => {
+    const loading = boundCollectionLine(null, false);
+    expect(loading.state).toBe("unknown");
+    expect(loading.tone).toBe("neutral");
+    // Not-yet-loaded is distinct from 未绑定: the boot has not said.
+    expect(loading.text).not.toContain("未绑定");
+  });
+
+  it("renders unknown, not 未绑定, when the status route never answered", () => {
+    const unavailable = boundCollectionLine(null, true);
+    expect(unavailable.state).toBe("unknown");
+    expect(unavailable.text).not.toContain("未绑定");
+  });
+
+  it("never renders a blank line in any state", () => {
+    const lines = [
+      boundCollectionLine(BASE, true),
+      boundCollectionLine(
+        { ...BASE, bound_collection_name: BOUND_COLLECTION_UNBOUND },
+        true,
+      ),
+      boundCollectionLine(null, false),
+      boundCollectionLine(null, true),
+    ];
+    for (const line of lines) {
+      expect(line.text.length, `${line.state} text`).toBeGreaterThan(0);
+    }
+  });
+
+  it("renders the wire name verbatim, holding no copy of the name space", () => {
+    // The SPA must not carry the iknow literal: a host-side rename has
+    // to move this line without an SPA change.
+    const line = boundCollectionLine(
+      { ...BASE, bound_collection_name: "某资料集合" },
+      true,
+    );
+    expect(line.text).toContain("某资料集合");
+  });
+});
+
 describe("parseWorkspaceStatus", () => {
-  it("accepts the four pinned /api/status fields", () => {
+  it("accepts the five pinned /api/status fields", () => {
     expect(parseWorkspaceStatus({ ...BASE })).toEqual(BASE);
   });
 
@@ -129,5 +232,65 @@ describe("parseWorkspaceStatus", () => {
     expect(
       parseWorkspaceStatus({ ...BASE, retrieve_adapter_kind: "bm25" }),
     ).toBeNull();
+  });
+
+  it("rejects a payload missing the bind field", () => {
+    const { bound_collection_name: _dropped, ...partial } = BASE;
+    expect(parseWorkspaceStatus(partial)).toBeNull();
+  });
+
+  it("rejects an empty bind name instead of rendering a blank line", () => {
+    expect(
+      parseWorkspaceStatus({ ...BASE, bound_collection_name: "" }),
+    ).toBeNull();
+    expect(
+      parseWorkspaceStatus({ ...BASE, bound_collection_name: null }),
+    ).toBeNull();
+  });
+
+  it("keeps the 未绑定 sentinel parseable as a real value", () => {
+    expect(
+      parseWorkspaceStatus({
+        ...BASE,
+        bound_collection_name: BOUND_COLLECTION_UNBOUND,
+      }),
+    ).toEqual({ ...BASE, bound_collection_name: BOUND_COLLECTION_UNBOUND });
+  });
+
+  it("keeps the wire mirror in lockstep with the host response model", () => {
+    // The parser REQUIRES every known field, so the two sides have to
+    // move together: a host-side field addition that skips this file
+    // makes ``parseWorkspaceStatus`` reject every real payload and the
+    // left corner degrade to 未知 with no test failing anywhere else.
+    // Same cross-language source guard this repo already runs in
+    // ``comparisonStream.test.ts``, and deliberately NOT a name list:
+    // a list would have to be edited in the same commit as the drift
+    // it is meant to catch.
+    const hostSource = readFileSync(HOST_WORKSPACE_HTTP_PATH, "utf8");
+    const test = readFileSync(fileURLToPath(import.meta.url), "utf8");
+
+    for (const field of Object.keys(BASE)) {
+      expect(hostSource, `${field} missing from the host response`).toContain(
+        `${field}:`,
+      );
+      expect(test, `${field} unpinned in the parser cases`).toContain(field);
+    }
+  });
+
+  it("pins the same field set as the host response model", () => {
+    const hostSource = readFileSync(HOST_WORKSPACE_HTTP_PATH, "utf8");
+    const body = hostSource.slice(
+      hostSource.indexOf("class WorkspaceStatusResponse(BaseModel):"),
+    );
+    const fields = new Set(
+      body
+        .slice(0, body.indexOf("\nclass "))
+        .split("\n")
+        .map((line) => /^ {4}([a-z_]+): /.exec(line)?.[1])
+        .filter((name): name is string => name !== undefined),
+    );
+
+    expect(fields.size).toBeGreaterThan(0);
+    expect(fields).toEqual(new Set(Object.keys(BASE)));
   });
 });

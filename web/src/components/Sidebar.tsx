@@ -1,10 +1,13 @@
-// Sidebar: 280px, brand + left-corner 知识 MCP line + 会话 disclosure.
+// Sidebar: 280px, brand + left-corner 知识 MCP line + T4 bound
+// 资料集合 line + 会话 disclosure.
 // Spec workbench-retrieve-product-seam retires the two nav entries
 // (知识库 + the status page): the sidebar has no nav chrome (the 会话
 // list below is a content list, not nav). The left-corner line reports
 // the boot-scoped
 // 知识 MCP three-state via ``knowledgeMcpLine`` (same snapshot as
-// ``GET /api/status``, no polling). T2 (specs/workbench-sidebar-rail.md)
+// ``GET /api/status``, no polling); T4 adds the sibling
+// ``boundCollectionLine`` under it from the SAME snapshot — the name
+// only, never a 就绪 claim. T2 (specs/workbench-sidebar-rail.md)
 // wraps 新建 + the thread list in a foldable 会话 group under the
 // brand; the disclosure is a real <button aria-expanded> so Enter/Space
 // toggle it natively; folding is remembered for the session via
@@ -19,7 +22,7 @@ import { useState } from "react";
 // copy helper keeps the two surfaces from naming it differently.
 import { describeThreadCreateFailure } from "../sendFailure";
 import { NavLink, useNavigate } from "react-router-dom";
-import { knowledgeMcpLine } from "../knowledgeMcp";
+import { boundCollectionLine, knowledgeMcpLine } from "../knowledgeMcp";
 import { readSessionsOpen, writeSessionsFolded } from "../sessionKeys";
 import { useWorkspaceStore } from "../store";
 
@@ -101,6 +104,11 @@ export default function Sidebar() {
   const status = useWorkspaceStore((s) => s.status);
   const statusLoaded = useWorkspaceStore((s) => s.statusLoaded);
   const mcpLine = knowledgeMcpLine(status, statusLoaded);
+  // T4: the 资料集合 this process is bound to, from the SAME boot
+  // snapshot. A sibling line, not a second state on the MCP line:
+  // reachability and bind are different facts. It names the
+  // collection and never claims the collection is 就绪.
+  const bindLine = boundCollectionLine(status, statusLoaded);
   // Fold state starts from sessionStorage and persists on every
   // toggle, so the rail stays as the operator left it this session.
   // (Explicit over Implicit: the write happens on the event path,
@@ -114,9 +122,10 @@ export default function Sidebar() {
 
   return (
     <aside className="w-[280px] shrink-0 border-r border-black bg-page flex flex-col h-full">
-      {/* Brand + the 知识 MCP left-corner line. The 1px rule on this
-          block separates it from the 会话 disclosure below. The former
-          nav entries left the product IA with the retired pages. */}
+      {/* Brand + the two boot-scoped left-corner lines (知识 MCP, then
+          the bound 资料集合). The 1px rule on this block separates it
+          from the 会话 disclosure below. The former nav entries left
+          the product IA with the retired pages. */}
       <div className="border-b border-black">
         <div className="p-4">
           <h1 className="text-lg font-bold tracking-tight">fin</h1>
@@ -131,6 +140,17 @@ export default function Sidebar() {
             }`}
           >
             {mcpLine.text}
+          </p>
+          {/* T4: the bound 资料集合, distinct from the line above and
+              from 就绪 — the name only, no filing or chunk count. */}
+          <p
+            data-testid="bound-collection-line"
+            data-state={bindLine.state}
+            className={`mt-1 text-xs ${
+              bindLine.tone === "ok" ? "text-gray-600" : "text-gray-500"
+            }`}
+          >
+            {bindLine.text}
           </p>
         </div>
       </div>

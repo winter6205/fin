@@ -12,9 +12,10 @@ Two design pins asserted here:
 * the response value equals a fresh ``OccupancyCompactor().occupancy``
   over the SAME checkpoint messages the test reads through the
   compiled graph — one shared figure, no second estimator;
-* ``GET /api/status`` still answers exactly the four ADR 0033
-  fields — adding occupancy there would smuggle run-scoped
-  telemetry onto a boot surface.
+* ``GET /api/status`` still answers exactly its boot-scoped field
+  set (the four ADR 0033 fields plus T4's ``bound_collection_name``)
+  — adding occupancy there would smuggle run-scoped telemetry onto a
+  boot surface.
 """
 
 from __future__ import annotations
@@ -154,6 +155,7 @@ def test_status_has_no_occupancy_field(client: TestClient, fresh_store) -> None:
         "retrieve_adapter_kind",
         "model_identity",
         "corpus_filing_count",
+        "bound_collection_name",
     }
     assert "occupancy" not in body
     assert "context_window_pct" not in body

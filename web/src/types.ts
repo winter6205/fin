@@ -290,8 +290,19 @@ export interface WorkspaceStatus {
   // endpoint or key material on this wire.
   model_identity: string;
   // From the same catalog that serves ``GET /api/corpus``; zero is a
-  // valid value, not an error.
+  // valid value, not an error. NOT a 就绪 signal (spec SC7) — read
+  // ``bound_collection_name`` for the bind, and iknow's own 资料页 for
+  // readiness.
   corpus_filing_count: number;
+  // T4 (specs/first-closed-loop.md): the 资料集合 this process is bound
+  // to, or the sentinel ``"unbound"`` when it is bound to none (a
+  // test-only adapter, or a product boot whose 知识 MCP never reached
+  // 可达). The v1 bind is the one process-wide collection ADR 0049
+  // settles. The name itself is a documented MIRROR of iknow-memory's
+  // ``SOURCE_DOC_COLLECTION_NAME``: no MCP tool returns a collection
+  // identity, and iknow's separate dashboard HTTP process is not a
+  // dependency fin may take. Carries no readiness claim.
+  bound_collection_name: string;
 }
 
 export interface Filing {

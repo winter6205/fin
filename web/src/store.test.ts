@@ -1111,6 +1111,7 @@ describe("loadStatus 重连 in-flight guard", () => {
           retrieve_adapter_kind: "mcp",
           model_identity: "fin/MiniMax-M3",
           corpus_filing_count: 12,
+          bound_collection_name: "默认资料集合",
         }),
         { status: 200, headers: { "content-type": "application/json" } },
       ),
@@ -1134,6 +1135,7 @@ describe("loadStatus 重连 in-flight guard", () => {
       retrieve_adapter_kind: "mcp",
       model_identity: "fin/MiniMax-M3",
       corpus_filing_count: 12,
+      bound_collection_name: "默认资料集合",
     });
 
     expect(useWorkspaceStore.getState().loadingStatus).toBe(false);
