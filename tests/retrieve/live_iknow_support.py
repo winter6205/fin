@@ -38,6 +38,16 @@ IKNOW_ENTRY = IKNOW_ROOT / "dist" / "index.js"
 IKNOW_WORKTREE_ROOT = Path(
     "/home/winner/projects/iknow-memory-wt-operator-console"
 )
+# A second worktree checkout whose build carries the corpus-ready branch
+# (pushed-slice persistence + 资料 status/collection tools). The
+# operator-console build predates that branch, so the live corpus-ingest
+# acceptance cannot use it. Machine-local, same convention as
+# ``IKNOW_WORKTREE_ROOT``; it becomes the default root once the
+# corpus-ready branch is merged and rebuilt. Pass ``root=`` to
+# :func:`live_iknow` to select it.
+IKNOW_CORPUS_READY_ROOT = Path(
+    "/home/winner/projects/iknow-memory-wt-corpus-ready-retrieve"
+)
 EMBED_DIMENSIONS = 8
 
 
