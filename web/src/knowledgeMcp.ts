@@ -9,6 +9,11 @@
 // — the same string the host returns as the 409 body message, so the
 // left corner and the refused conversation mouth cannot drift apart.
 // Icon / expand copy are not pinned; this helper keeps the line only.
+//
+// T4 (specs/first-closed-loop.md) adds the sibling ``boundCollectionLine``
+// below: the 资料集合 identity the host publishes on the same payload.
+// It is a separate line with a separate contract — the 知识 MCP line's
+// copy and states are unchanged.
 
 import type { KnowledgeMcpState, WorkspaceStatus } from "./types";
 
@@ -56,11 +61,17 @@ function asMember<T extends string>(
 /**
  * Defensive parse of the ``GET /api/status`` body.
  *
- * Returns ``null`` for anything that is not the pinned four-field set.
+ * Returns ``null`` for anything that is not the pinned five-field set.
  * The retired ``retrieve_reachability`` field and any unknown
  * ``knowledge_mcp`` value are REJECTED, never coerced: a line that
  * vouches for a port it cannot read is worse than one that says
  * unknown.
+ *
+ * ``bound_collection_name`` is a free-form string, not a typed state:
+ * the host mirrors iknow's collection name, so the SPA must not carry
+ * its own copy of the name space. An empty string is rejected — it
+ * would render a blank bind line, and the host's 未绑定 sentinel is a
+ * real value, not a missing one.
  */
 export function parseWorkspaceStatus(raw: unknown): WorkspaceStatus | null {
   if (!raw || typeof raw !== "object") return null;
@@ -78,14 +89,17 @@ export function parseWorkspaceStatus(raw: unknown): WorkspaceStatus | null {
   );
   const model = obj.model_identity;
   const count = obj.corpus_filing_count;
+  const bound = obj.bound_collection_name;
   if (mcp === null || adapterKind === null) return null;
   if (typeof model !== "string") return null;
   if (typeof count !== "number" || !Number.isFinite(count)) return null;
+  if (typeof bound !== "string" || bound.length === 0) return null;
   return {
     knowledge_mcp: mcp,
     retrieve_adapter_kind: adapterKind,
     model_identity: model,
     corpus_filing_count: count,
+    bound_collection_name: bound,
   };
 }
 
@@ -117,5 +131,85 @@ export function knowledgeMcpLine(
     state: status.knowledge_mcp,
     text: KNOWLEDGE_MCP_FAULT_COPY,
     tone: "degraded",
+  };
+}
+
+// ----- T4: the bound 资料集合 line -----
+//
+// A SIBLING of the 知识 MCP line, deliberately not a second state on
+// it: "the MCP answered" and "this process is bound to a 资料集合" are
+// different facts, and the host models them as different fields
+// (``knowledge_mcp`` vs ``bound_collection_name``). Copy lives here so
+// it is unit-testable without a DOM, same as the MCP line.
+//
+// The line names the collection; it never claims the collection is
+// 就绪. Readiness is iknow's own 资料页 (spec assumption 9), and
+// ``corpus_filing_count`` is the local catalog (spec SC7) — neither is
+// rendered here.
+
+/** The host's 未绑定 sentinel (``fin.host.collection_bind``).
+ * HAND-MIRRORED: the SPA carries no copy of the host's name space by
+ * design, so this literal is a second spelling of
+ * ``fin.host.collection_bind.BOUND_COLLECTION_UNBOUND`` — a host-side
+ * rename must be applied here too (the lockstep guard in
+ * ``knowledgeMcp.test.ts`` covers the field set, not this sentinel). */
+export const BOUND_COLLECTION_UNBOUND = "unbound";
+
+/** Bound: the operator reads which 资料集合 回答 will come from. */
+const BOUND_COLLECTION_PREFIX = "资料集合：";
+
+/** 未绑定: a configuration statement, not an error — a test-only
+ * adapter, or a product boot whose 知识 MCP never reached 可达. */
+const BOUND_COLLECTION_UNBOUND_COPY = "资料集合：未绑定";
+
+/** Neutral line while the first status read is in flight, or when the
+ * route never answered: this boot has not said which collection it
+ * holds, so the line does not guess one. */
+const BOUND_COLLECTION_UNKNOWN_COPY = "资料集合：未知";
+
+export interface BoundCollectionLine {
+  /** ``bound`` / ``unbound``, plus ``unknown`` for the not-yet-loaded
+   * and route-unavailable views. */
+  state: "bound" | "unbound" | "unknown";
+  /** The exact one-line copy the left corner renders. Never blank. */
+  text: string;
+  /** ``ok`` when a collection is named, ``neutral`` otherwise — an
+   * unbound boot is a configuration fact, not a fault. */
+  tone: "ok" | "neutral";
+}
+
+/**
+ * Map the boot snapshot's bind field to the left-corner line.
+ *
+ *  - a name → ``bound``, text ``资料集合：<name>``.
+ *  - ``unbound`` → ``unbound``, text exactly the 未绑定 copy.
+ *  - ``null`` / not-yet-loaded → ``unknown``, no collection named.
+ *
+ * The name is rendered verbatim from the wire: the SPA holds no copy
+ * of the iknow name space, so a host-side rename cannot leave the two
+ * sides disagreeing.
+ */
+export function boundCollectionLine(
+  status: WorkspaceStatus | null,
+  loaded: boolean,
+): BoundCollectionLine {
+  if (!loaded || status === null) {
+    return {
+      state: "unknown",
+      text: BOUND_COLLECTION_UNKNOWN_COPY,
+      tone: "neutral",
+    };
+  }
+  if (status.bound_collection_name === BOUND_COLLECTION_UNBOUND) {
+    return {
+      state: "unbound",
+      text: BOUND_COLLECTION_UNBOUND_COPY,
+      tone: "neutral",
+    };
+  }
+  return {
+    state: "bound",
+    text: `${BOUND_COLLECTION_PREFIX}${status.bound_collection_name}`,
+    tone: "ok",
   };
 }

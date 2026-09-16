@@ -41,6 +41,19 @@ const CHROME_HEALTH_FILES = [
   "knowledgeMcp.ts",
 ];
 
+/** The JSX returned by the default export, comments stripped.
+ *
+ * Source-level guards must not fire on the comments that explain WHY
+ * the code is correct — the docstrings here legitimately name the
+ * concepts the rendered chrome must not carry. */
+function jsxBody(source: string): string {
+  const start = source.indexOf("return (");
+  return (start === -1 ? source : source.slice(start)).replace(
+    /\/\*[\s\S]*?\*\/|\/\/[^\n]*/g,
+    "",
+  );
+}
+
 function collectSourceFiles(dir: string): string[] {
   const out: string[] = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -101,6 +114,23 @@ describe("Sidebar chrome", () => {
     // not the brand line.
     expect(source).toContain("企业知识库助手");
     expect(source).not.toContain("本地研究工作台");
+  });
+
+  it("renders the T4 bound 资料集合 line from the shared helper", () => {
+    // SC8-style source guard (this file's existing pattern): the line
+    // must come from ``boundCollectionLine`` so the copy and the
+    // 未绑定 / bound split stay unit-tested in ``knowledgeMcp.ts``
+    // rather than hardcoded in the component.
+    expect(source).toContain("boundCollectionLine");
+    expect(source).toContain('data-testid="bound-collection-line"');
+    // The 就绪 word is pinned nowhere in the chrome's COPY — the
+    // source's own comments explain that the line makes no readiness
+    // claim (spec assumption 9: readiness is iknow's own 资料页), so
+    // the guard is over the JSX body, not the file text.
+    expect(source).not.toContain(">就绪");
+    expect(source).not.toContain("就绪<");
+    expect(jsxBody(source)).not.toContain("就绪");
+    expect(jsxBody(source)).not.toContain("corpus_filing_count");
   });
 });
 

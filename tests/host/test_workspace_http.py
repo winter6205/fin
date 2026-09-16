@@ -37,6 +37,10 @@ from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.host import ScriptedChatModel, compile_graph
+from fin.host.collection_bind import (
+    BOUND_COLLECTION_NAME,
+    BOUND_COLLECTION_UNBOUND,
+)
 from fin.host.state import reset_input_state
 
 
@@ -3543,20 +3547,23 @@ def test_send_message_classify_deltas_never_reach_the_wire(
 # renders. The ADR 0033 amendment (workbench retrieve product seam)
 # replaces the PATH-only ``retrieve_reachability`` with the three-state
 # ``knowledge_mcp`` field derived from a real ``initialize`` +
-# ``tools/list`` handshake. The other three fields are unchanged:
-# the resolved adapter kind, the model slug, and the corpus filing
-# count — nothing run- or turn-scoped, no "% of context window", no
-# skill list, no MCP client in the route.
+# ``tools/list`` handshake. The other four fields are unchanged:
+# the resolved adapter kind, the model slug, the corpus filing
+# count, and (T4, first-first-closed-loop) the bound 资料集合 name —
+# nothing run- or turn-scoped, no "% of context window", no skill
+# list, no MCP client in the route.
 
 
-# The ADR 0033 amendment's IN list. The route's payload keys must be
-# exactly this set: a missing key blanks part of the left corner, an
-# extra key smuggles run telemetry onto a boot surface.
+# The ADR 0033 amendment's IN list plus the T4 bind field. The route's
+# payload keys must be exactly this set: a missing key blanks part of
+# the left corner, an extra key smuggles run telemetry onto a boot
+# surface.
 STATUS_FIELDS = {
     "knowledge_mcp",
     "retrieve_adapter_kind",
     "model_identity",
     "corpus_filing_count",
+    "bound_collection_name",
 }
 
 # ADR 0033's OUT list plus the plan's explicit exclusions. Asserted
@@ -3570,6 +3577,12 @@ STATUS_FORBIDDEN_FIELDS = (
     "skills",
     "base_url",
     "api_key",
+    # T4: the bind field carries the NAME only. A readiness flag, a
+    # chunk count or a source list would be an iknow 就绪 claim this
+    # process cannot read over MCP (SC7) — the field's own value
+    # (``unbound``) is the honest state, not a second key.
+    "collection_ready",
+    "bound_collection_chunk_count",
 )
 
 
@@ -3607,6 +3620,8 @@ def test_status_reports_missing_knowledge_mcp_on_a_fake_adapter_boot(
     assert body["knowledge_mcp"] == "missing"
     assert body["knowledge_mcp"] != "reachable"
     assert body["retrieve_adapter_kind"] == "fake"
+    # T4: a fake boot binds no iknow 资料集合 — it must not name one.
+    assert body["bound_collection_name"] == BOUND_COLLECTION_UNBOUND
 
 
 def test_status_reports_missing_knowledge_mcp_as_payload_not_500(
@@ -3757,6 +3772,94 @@ def test_status_route_is_separate_from_send_and_get_thread(
     # code-only assertion would pass with no route at all.
     assert r.headers["content-type"].startswith("application/json")
     assert set(r.json().keys()) == STATUS_FIELDS
+
+
+# ----- T4: the bound 资料集合 field on the boot surface -----
+#
+# ``bound_collection_name`` names the 资料集合 this process is bound
+# to, or ``unbound``. It is a configuration + reachability statement
+# (ADR 0033's boot scope), never a 就绪 claim: readiness lives on
+# iknow's own 资料页, and ``corpus_filing_count`` is the local catalog
+# (spec assumption 5 / SC7).
+
+
+def test_status_names_the_bound_collection_on_a_reachable_product_boot(
+    client: TestClient, fresh_store, tmp_path: Path, monkeypatch
+) -> None:
+    """Product adapter + a published 可达 handshake → the v1 name.
+
+    ADR 0049 settles the v1 shape: the one process-wide 知识库, so the
+    bound identity is the single default 资料集合 and there is no
+    switching rail. The literal is pinned here (not imported twice) so
+    a rename of fin's mirror shows up as a failing test rather than as
+    a line that silently names a collection nobody has.
+    """
+    from fin.host.knowledge_mcp import publish_knowledge_mcp_state
+
+    monkeypatch.delenv("FIN_RETRIEVE_ADAPTER", raising=False)
+    monkeypatch.setenv("PATH", _bin_dir_with_mcp(tmp_path))
+    publish_knowledge_mcp_state("reachable")
+
+    body = client.get("/api/status").json()
+
+    assert set(body.keys()) == STATUS_FIELDS, body
+    assert body["retrieve_adapter_kind"] == "mcp"
+    assert body["bound_collection_name"] == BOUND_COLLECTION_NAME
+    assert body["bound_collection_name"] == "默认资料集合"
+
+
+def test_status_reports_unbound_when_the_handshake_never_reached(
+    client: TestClient, fresh_store, tmp_path: Path, monkeypatch
+) -> None:
+    """Product adapter, MCP 缺 / 坏 → 未绑定, never a live collection name.
+
+    Mirror of the ``retrieve_adapter_kind`` split: a configured product
+    port whose handshake did not complete must not claim a bind to a
+    store it cannot reach. Parametrized over the two non-reachable
+    states plus the never-probed (``None``) boot.
+    """
+    from fin.host.knowledge_mcp import reset_knowledge_mcp_state
+
+    monkeypatch.delenv("FIN_RETRIEVE_ADAPTER", raising=False)
+    monkeypatch.setenv("PATH", _bin_dir_with_mcp(tmp_path))
+    # ``tests/host/conftest.py`` resets the snapshot around every case,
+    # so the never-probed view is the state at entry.
+    reset_knowledge_mcp_state()
+    assert client.get("/api/status").json()["bound_collection_name"] == (
+        BOUND_COLLECTION_UNBOUND
+    )
+
+    for state in ("missing", "fault"):
+        from fin.host.knowledge_mcp import publish_knowledge_mcp_state
+
+        publish_knowledge_mcp_state(state)
+        body = client.get("/api/status").json()
+        assert body["retrieve_adapter_kind"] == "mcp"
+        assert body["bound_collection_name"] == BOUND_COLLECTION_UNBOUND, state
+
+
+def test_status_never_derives_the_bind_from_the_local_filing_count(
+    client: TestClient, fresh_store, tmp_path: Path, monkeypatch
+) -> None:
+    """SC7, load-bearing: a FULL local catalog does not manufacture a bind.
+
+    The catalog on this machine has filings — that is exactly the
+    confusion the spec names. A fake boot (test-only adapter) with a
+    non-empty ``corpus_filing_count`` must still report 未绑定, so a
+    later ticket cannot make the bind line claim 就绪 off the local
+    count.
+
+    The counter is asserted non-zero in the same test, so the case
+    cannot pass vacuously on a machine with an empty catalog.
+    """
+    monkeypatch.setenv("FIN_RETRIEVE_ADAPTER", "fake")
+    monkeypatch.setenv("PATH", _bin_dir_without_mcp(tmp_path))
+
+    body = client.get("/api/status").json()
+
+    assert body["corpus_filing_count"] > 0, body
+    assert body["bound_collection_name"] == BOUND_COLLECTION_UNBOUND
+    assert body["bound_collection_name"] != BOUND_COLLECTION_NAME
 
 
 # ----- workspace_root inject seam (spec SC8 / ADR 0049) -----

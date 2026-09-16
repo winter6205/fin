@@ -454,6 +454,7 @@ def test_status_serves_200_with_the_published_state(state: str) -> None:
         "retrieve_adapter_kind",
         "model_identity",
         "corpus_filing_count",
+        "bound_collection_name",
     }
     assert body["knowledge_mcp"] == state
 

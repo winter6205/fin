@@ -202,8 +202,9 @@ def test_health_body_never_echoes_the_connection_url(
 def test_health_stays_out_of_the_boot_scoped_status_route(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """ADR 0033: ``/api/status`` keeps its four boot-scoped fields and
-    grows no database probe; ``/health`` keeps no boot config."""
+    """ADR 0033: ``/api/status`` keeps its boot-scoped field set (four
+    ADR 0033 fields + T4's bind field) and grows no database probe;
+    ``/health`` keeps no boot config."""
     monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
 
     status_body: dict[str, Any] = client.get("/api/status").json()
@@ -212,6 +213,7 @@ def test_health_stays_out_of_the_boot_scoped_status_route(
         "retrieve_adapter_kind",
         "model_identity",
         "corpus_filing_count",
+        "bound_collection_name",
     }
 
     health_body: dict[str, Any] = client.get("/health").json()
