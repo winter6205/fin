@@ -32,7 +32,7 @@ iteration is in document order, no clock / locale / randomness enters
 the pipeline. The full-corpus sha256 assertion is T12's deliverable.
 
 Versioning: any change to splitting, merging, or granularity constants
-must bump :data:`PARSE_RULE_VERSION` (``parse-1``); the params-table
+must bump :data:`PARSE_RULE_VERSION` (``parse-2``); the params-table
 version is :data:`PARAMS_TABLE_VERSION` (``params-1``), owned by
 ``fin.corpus.params`` — the versioned (document type x section x
 content density) lookup table landed by T9, consumed by the T11

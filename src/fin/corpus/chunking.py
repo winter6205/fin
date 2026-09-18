@@ -4,8 +4,11 @@ The splitter consumes the T6 parse products (``ParsedUnit``) and
 produces the two-level block shape the citation gate's hard constraint
 is stated over (SC11 / CONTEXT「父子分块」):
 
-* **parent blocks** — bounded context for the model; every parent text
-  is a contiguous substring of its frozen unit text;
+* **parent blocks** — the title-scoped **抽图窗** (ADR 0053 / 0060):
+  the rule lives in :mod:`fin.corpus.window`, the parent level is its
+  output verbatim (heading + body, or the overflow slices of one
+  oversized body), and every parent text is a contiguous substring of
+  its frozen unit text;
 * **child blocks** — the only retrievable units (the hit set); every
   child text is a contiguous substring of its parent text;
 * **push payload** — one payload per child, carrying its parent's text
@@ -34,10 +37,11 @@ Every decision is an integer table lookup or an integer comparison:
   triad lookup; unknown doc types (e.g. the dataset's ``mixed``) land
   on the global default row, never on a code branch;
 * boundaries — the row's ``boundary_priority`` integer chain, tried in
-  ascending rank order (1 = heading … 5 = char_cap): parent blocks are
-  split at heading boundaries first, oversized pieces fall through the
-  remaining ranks, and ``char_cap`` is the last-resort hard cut. No
-  float, no model judgment.
+  ascending rank order (1 = heading … 5 = char_cap) for the CHILD
+  level, where ``char_cap`` is the last-resort hard cut. The PARENT
+  level is :func:`fin.corpus.window.window_spans` — the params row
+  never shrinks or grows a window (ADR 0060: density sizes in-window
+  children only). No float, no model judgment.
 
 Deterministic block identity: ``block_id`` is the sha256 of a canonical
 ``\\x1f``-joined string mixing kind, locator, ordinal, block text and
@@ -69,12 +73,15 @@ from fin.corpus.params import (
 # integer decisions can never drift apart.
 from fin.corpus.params import _LIST_ITEM_RE
 from fin.corpus.parsers._common import ParseResult, ParsedUnit, UnitLocator
+from fin.corpus.window import (
+    ExtractWindow,
+    is_heading_line,
+    line_offsets,
+    window_spans,
+)
 
 KIND_PARENT: Final[str] = "parent"
 KIND_CHILD: Final[str] = "child"
-
-# Markdown ATX headings are headings verbatim.
-_MD_HEADING_RE: Final[re.Pattern[str]] = re.compile(r"^#{1,6}\s")
 
 # Sentence-ending punctuation; a '.' between digits (3.14) is not a
 # sentence end. CJK and ASCII punctuation alike.
@@ -83,49 +90,12 @@ _SENTENCE_END_RE: Final[re.Pattern[str]] = re.compile(r"[。！？；;!?]|\.(?!\
 # Whitespace consumed into the left block after a sentence end.
 _TRAILING_WS: Final[str] = " \t\r\n\v\f"
 
-# Punctuation that disqualifies an uppercase line from being a heading.
-_NOT_HEADING_TAIL: Final[tuple[str, ...]] = (
-    ".",
-    ",",
-    ";",
-    ":",
-    "!",
-    "?",
-    "。",
-    "，",
-    "；",
-    "：",
-    "！",
-    "？",
-)
-
 _ID_SEPARATOR: Final[str] = "\x1f"
 
 
 # ---------------------------------------------------------------------------
 # Deterministic section classification (integer shares only)
 # ---------------------------------------------------------------------------
-
-
-def _is_heading_line(line: str) -> bool:
-    """Deterministic heading test: markdown ATX headings, or a short
-    uppercase-only line with no sentence punctuation and at least four
-    letters. Pure character classing — no float, no model.
-    """
-    if _MD_HEADING_RE.match(line):
-        return True
-    stripped = line.strip()
-    if not 4 <= len(stripped) <= 80:
-        return False
-    if stripped.endswith(_NOT_HEADING_TAIL):
-        return False
-    letters = 0
-    for ch in stripped:
-        if ch.isalpha():
-            if ch.islower():
-                return False
-            letters += 1
-    return letters >= 4
 
 
 def classify_section(text: str) -> str:
@@ -146,7 +116,7 @@ def classify_section(text: str) -> str:
         return "table"
     if item_lines > 0 and item_lines * 2 >= n:
         return "list"
-    if lines and _is_heading_line(lines[0]):
+    if lines and is_heading_line(lines[0]):
         return "heading"
     return "body"
 
@@ -154,18 +124,6 @@ def classify_section(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Boundary cut computation (integer offsets, one rank at a time)
 # ---------------------------------------------------------------------------
-
-
-def _line_offsets(text: str, start: int, end: int):
-    """Yield ``(line_start, line_end)`` for every line in ``[start, end)``."""
-    pos = start
-    while pos < end:
-        nl = text.find("\n", pos, end)
-        if nl == -1:
-            yield pos, end
-            return
-        yield pos, nl
-        pos = nl + 1
 
 
 def _cuts_of_rank(
@@ -182,15 +140,15 @@ def _cuts_of_rank(
     """
     cuts: list[tuple[int, int]] = []
     if rank == BOUNDARY_HEADING:
-        for ls, le in _line_offsets(text, start, end):
-            if ls > start and _is_heading_line(text[ls:le]):
+        for ls, le in line_offsets(text, start, end):
+            if ls > start and is_heading_line(text[ls:le]):
                 cuts.append((ls - 1, ls))  # cut before the newline, next at line start
     elif rank == BOUNDARY_CLAUSE_ITEM:
-        for ls, le in _line_offsets(text, start, end):
+        for ls, le in line_offsets(text, start, end):
             if ls > start and _LIST_ITEM_RE.match(text[ls:le]):
                 cuts.append((ls - 1, ls))
     elif rank == BOUNDARY_TABLE_ROW:
-        for ls, le in _line_offsets(text, start, end):
+        for ls, le in line_offsets(text, start, end):
             if le + 1 < end and ("|" in text[ls:le] or "\t" in text[ls:le]):
                 cuts.append((le, le + 1))  # cut after the row, newline skipped
     elif rank == BOUNDARY_SENTENCE:
@@ -217,156 +175,30 @@ def _hard_cut(text: str, start: int, end: int, cap: int) -> tuple[int, int]:
     return p, n
 
 
-def _split_span_at_all(
-    text: str, start: int, end: int, cuts: list[tuple[int, int]]
-) -> list[tuple[int, int]]:
-    """Split ``[start, end)`` at EVERY given cut (used for the rank-1
-    heading pass: each heading starts a new parent)."""
-    pieces: list[tuple[int, int]] = []
-    seg = start
-    for cut, nxt in sorted(set(cuts)):
-        if not start < cut < end:
-            continue
-        if seg < cut:
-            pieces.append((seg, cut))
-        seg = max(seg, nxt)
-    if seg < end:
-        pieces.append((seg, end))
-    return pieces
+def _parent_windows(text: str, chain: tuple[int, ...]) -> tuple[ExtractWindow, ...]:
+    """The parent level: the title-scoped **抽图窗** of the unit.
 
-
-def _split_span_greedy(
-    text: str, start: int, end: int, cuts: list[tuple[int, int]], cap: int
-) -> list[tuple[int, int]]:
-    """Cut ``[start, end)`` into the largest possible pieces under
-    ``cap`` using the given cuts. A remainder with no usable cut stays
-    oversized — the next rank in the chain takes it.
+    The window rule is :func:`fin.corpus.window.window_spans` — the
+    single authority (ADR 0053 / 0060) — and the params row must not
+    retarget it: density sizes the in-window children only. The row's
+    boundary chain still tells the window rule which line shapes its
+    own classifier counts as headings (the ``heading`` rank is in every
+    row today, but an out-of-row chain is the caller's statement about
+    its own corpus, so the spaces are handed in verbatim).
     """
-    cuts = sorted({c for c in cuts if start < c[0] < end})
-    if not cuts:
-        return [(start, end)]
-    pieces: list[tuple[int, int]] = []
-    seg = start
-    while end - seg > cap:
-        usable = [c for c in cuts if seg < c[0] <= seg + cap]
-        if not usable:
-            break
-        cut, nxt = max(usable)
-        pieces.append((seg, cut))
-        seg = nxt
-    if seg < end:
-        pieces.append((seg, end))
-    return pieces
+    if BOUNDARY_HEADING not in chain:
+        return window_spans(text, heading_lines=())
+    return window_spans(text)
 
 
-def _hard_cap_span(
-    text: str, start: int, end: int, cap: int
+def _merge_small_spans(
+    spans: list[tuple[int, int]], *, min_chars: int, max_chars: int
 ) -> list[tuple[int, int]]:
-    """The char_cap rank: deterministic hard cuts every ``cap`` chars."""
-    pieces: list[tuple[int, int]] = []
-    cur = start
-    while end - cur > cap:
-        p, n = _hard_cut(text, cur, end, cap)
-        pieces.append((cur, p))
-        cur = n
-    if cur < end:
-        pieces.append((cur, end))
-    return pieces
-
-
-def _bounded_spans(
-    text: str, start: int, end: int, cap: int, chain: tuple[int, ...]
-) -> list[tuple[int, int]]:
-    """Bound ``[start, end)`` into pieces of at most ``cap`` chars by
-    trying the boundary chain in ascending rank order (SC13: the
-    integer chain is tried in order — heading first, char_cap last).
+    """Merge children below ``min_chars`` into a neighbour (same parent
+    — a child must stay inside its parent), keeping every merged span
+    within ``max_chars``. Merging uses the spanning slice, which is
+    still a contiguous substring of the parent.
     """
-    pieces = [(start, end)]
-    for rank in sorted(set(chain)):
-        if all(e - s <= cap for s, e in pieces):
-            break
-        if rank == BOUNDARY_CHAR_CAP:
-            hard: list[tuple[int, int]] = []
-            for s, e in pieces:
-                hard.extend(_hard_cap_span(text, s, e, cap))
-            pieces = hard
-            break
-        next_pieces: list[tuple[int, int]] = []
-        for s, e in pieces:
-            if e - s <= cap:
-                next_pieces.append((s, e))
-                continue
-            cuts = _cuts_of_rank(text, s, e, rank)
-            if cuts:
-                next_pieces.extend(_split_span_greedy(text, s, e, cuts, cap))
-            else:
-                next_pieces.append((s, e))
-        pieces = next_pieces
-    return pieces
-
-
-def _parent_spans(
-    text: str, chain: tuple[int, ...], cap: int
-) -> list[tuple[int, int]]:
-    """Parent spans: heading-delimited regions first (a heading governs
-    the block that follows it), then bounded through the chain."""
-    pieces = [(0, len(text))]
-    if BOUNDARY_HEADING in chain:
-        heading_cuts = _cuts_of_rank(text, 0, len(text), BOUNDARY_HEADING)
-        if heading_cuts:
-            pieces = _split_span_at_all(text, 0, len(text), heading_cuts)
-    spans: list[tuple[int, int]] = []
-    for s, e in pieces:
-        spans.extend(_bounded_spans(text, s, e, cap, chain))
-    return spans
-
-
-def _child_spans(
-    text: str, start: int, end: int, params: ChunkParams
-) -> list[tuple[int, int]]:
-    """Child spans inside one parent: pack towards ``target_chars``,
-    never above ``max_chars``, cutting at the best available boundary
-    (any non-char_cap rank in the chain; char_cap is the implicit hard
-    fallback), then merge children below ``min_chars`` into a
-    neighbour. Every span is a slice of ``text[start:end]``.
-    """
-    target = params.target_chars
-    min_chars = params.min_chars
-    max_chars = params.max_chars
-    cuts: list[tuple[int, int]] = []
-    for rank in sorted(set(params.boundary_priority)):
-        if rank != BOUNDARY_CHAR_CAP:
-            cuts.extend(_cuts_of_rank(text, start, end, rank))
-    cuts = sorted(set(cuts))
-
-    spans: list[tuple[int, int]] = []
-    cur = start
-    while end - cur > target:
-        limit = cur + max_chars
-        usable = [c for c in cuts if cur < c[0] <= limit]
-        reached = [c for c in usable if c[0] >= cur + target]
-        if reached:
-            chosen = min(reached)  # target reached → cut at the next boundary
-        elif usable:
-            chosen = max(usable)  # best boundary below the target+cap window
-        else:
-            chosen = None  # no boundary at all
-        if chosen is None:
-            if end - cur <= max_chars:
-                break  # remainder below the cap: it becomes the final child
-            p, n = _hard_cut(text, cur, end, max_chars)
-            spans.append((cur, p))
-            cur = n
-        else:
-            spans.append((cur, chosen[0]))
-            cur = chosen[1]
-    if cur < end:
-        spans.append((cur, end))
-
-    # Merge children below min_chars into a neighbour (same parent — a
-    # child must stay inside its parent), keeping every merged span
-    # within max_chars. Merging uses the spanning slice, which is still
-    # a contiguous substring of the parent.
     i = 0
     while i < len(spans):
         s, e = spans[i]
@@ -389,6 +221,82 @@ def _child_spans(
     return spans
 
 
+def _boundary_cuts(
+    text: str, start: int, end: int, params: ChunkParams
+) -> list[tuple[int, int]]:
+    """Every boundary cut of the row's chain inside ``[start, end)``,
+    in ascending rank order, deduplicated (``char_cap`` is the implicit
+    hard fallback, so it contributes no candidate here).
+    """
+    cuts: list[tuple[int, int]] = []
+    for rank in sorted(set(params.boundary_priority)):
+        if rank != BOUNDARY_CHAR_CAP:
+            cuts.extend(_cuts_of_rank(text, start, end, rank))
+    return sorted(set(cuts))
+
+
+def _child_spans(
+    text: str,
+    start: int,
+    end: int,
+    params: ChunkParams,
+    *,
+    floor: int | None = None,
+) -> list[tuple[int, int]]:
+    """Child spans inside one parent: pack towards ``target_chars``,
+    never above ``max_chars``, cutting at the best available boundary
+    (any non-char_cap rank in the chain; char_cap is the implicit hard
+    fallback), then merge children below ``min_chars`` into a
+    neighbour. Every span is a slice of ``text[start:end]``.
+
+    ``floor`` is the monotone lower bound the packing must start at —
+    normally the cursor the PREVIOUS window's children left on the unit
+    text. Adjacent windows overlap by ``WINDOW_OVERLAP_PERCENT``, so
+    packing each window from its own start would re-emit that overlap
+    as child-on-child overlap across the seam — the identity ADR 0063
+    reserves for windows. The floor is clamped to ``[start, end)``, so
+    every span still lies inside this window (SC5) while the unit-wide
+    child sequence stays monotone (the wire's freeze invariant).
+    """
+    target = params.target_chars
+    max_chars = params.max_chars
+    cuts = _boundary_cuts(text, start, end, params)
+
+    spans: list[tuple[int, int]] = []
+    cur = start if floor is None else max(start, floor)
+    # The floor can land on whitespace the previous window's packing
+    # skipped: a child text must stay a fixed point of the normalization
+    # outlet (SC17), so the first child starts on the first content
+    # character at or after the floor.
+    while cur < end and text[cur] in _TRAILING_WS:
+        cur += 1
+    while end - cur > target:
+        limit = cur + max_chars
+        usable = [c for c in cuts if cur < c[0] <= limit]
+        reached = [c for c in usable if c[0] >= cur + target]
+        if reached:
+            chosen = min(reached)  # target reached → cut at the next boundary
+        elif usable:
+            chosen = max(usable)  # best boundary below the target+cap window
+        else:
+            chosen = None  # no boundary at all
+        if chosen is None:
+            if end - cur <= max_chars:
+                break  # remainder below the cap: it becomes the final child
+            p, n = _hard_cut(text, cur, end, max_chars)
+            spans.append((cur, p))
+            cur = n
+        else:
+            spans.append((cur, chosen[0]))
+            cur = chosen[1]
+    if cur < end:
+        spans.append((cur, end))
+
+    return _merge_small_spans(
+        spans, min_chars=params.min_chars, max_chars=max_chars
+    )
+
+
 # ---------------------------------------------------------------------------
 # Block / payload shapes
 # ---------------------------------------------------------------------------
@@ -403,6 +311,14 @@ class ChunkBlock:
     parent blocks exist to ride along as context and never enter the
     hit set. ``ordinal`` is the 1-based position of the block within
     its unit, counted per kind.
+
+    ``title`` is the governing heading text of the parent window
+    (``None`` on the OCR / textless shape and on every child — the
+    parent carries the window's heading, children are in-window keys).
+    It rides the block shape but not the identity hash: ``block_id``
+    mixes kind / locator / ordinal / text / versions (see
+    ``_block_id``), so a title change cannot silently re-key a block
+    whose text is unchanged.
     """
 
     kind: str  # KIND_PARENT or KIND_CHILD
@@ -412,6 +328,7 @@ class ChunkBlock:
     ordinal: int
     parent_ordinal: int | None  # None for parents
     parent_block_id: str | None  # None for parents
+    title: str | None = None  # governing heading; parents only
 
     @property
     def is_retrievable(self) -> bool:
@@ -556,6 +473,67 @@ def _block_id(
 # ---------------------------------------------------------------------------
 
 
+def _parent_block(unit: ParsedUnit, text: str, window: ExtractWindow) -> ChunkBlock:
+    """One window as a parent block: span text plus its governing title."""
+    parent_text = window.text_of(text)
+    return ChunkBlock(
+        kind=KIND_PARENT,
+        block_id=_block_id(
+            kind=KIND_PARENT, unit=unit, ordinal=window.ordinal, text=parent_text
+        ),
+        text=parent_text,
+        char_count=window.end - window.start,
+        ordinal=window.ordinal,
+        parent_ordinal=None,
+        parent_block_id=None,
+        title=window.title,
+    )
+
+
+def _child_blocks(
+    unit: ParsedUnit,
+    text: str,
+    parents: list[ChunkBlock],
+    windows: tuple[ExtractWindow, ...],
+    params: ChunkParams,
+) -> list[ChunkBlock]:
+    """Pack every window's children: contiguous substrings of the
+    window, ordinaled across the unit (SC16 hit set).
+
+    The windows of one body overlap by ``WINDOW_OVERLAP_PERCENT``, so
+    the child packing carries a unit-wide cursor: window k+1 cuts its
+    first child from the floor its predecessor's children left (its own
+    span start while that floor is behind it). Every child stays inside
+    its own window, but the children of the unit read end-to-end over
+    the unit text — the dense monotone ``chunks[]`` the receiving
+    service's freeze invariant walks (ADR 0063: the 8% is a window
+    property, never an ES child property).
+    """
+    blocks: list[ChunkBlock] = []
+    cursor = 0
+    for parent, window in zip(parents, windows):
+        for cs, ce in _child_spans(
+            text, window.start, window.end, params, floor=cursor
+        ):
+            child_text = text[cs:ce]
+            ordinal = len(blocks) + 1
+            blocks.append(
+                ChunkBlock(
+                    kind=KIND_CHILD,
+                    block_id=_block_id(
+                        kind=KIND_CHILD, unit=unit, ordinal=ordinal, text=child_text
+                    ),
+                    text=child_text,
+                    char_count=ce - cs,
+                    ordinal=ordinal,
+                    parent_ordinal=parent.ordinal,
+                    parent_block_id=parent.block_id,
+                )
+            )
+            cursor = ce
+    return blocks
+
+
 def split_unit(unit: ParsedUnit, *, doc_type: str) -> UnitChunking:
     """Split one frozen unit into parent + child blocks.
 
@@ -570,46 +548,8 @@ def split_unit(unit: ParsedUnit, *, doc_type: str) -> UnitChunking:
     density = classify_text_density(text)
     params = lookup_chunk_params(doc_type, section, density)
 
-    parent_blocks: list[ChunkBlock] = []
-    parent_spans = _parent_spans(text, params.boundary_priority, params.max_chars)
-    for ordinal, (ps, pe) in enumerate(parent_spans, start=1):
-        parent_text = text[ps:pe]
-        parent_blocks.append(
-            ChunkBlock(
-                kind=KIND_PARENT,
-                block_id=_block_id(
-                    kind=KIND_PARENT, unit=unit, ordinal=ordinal, text=parent_text
-                ),
-                text=parent_text,
-                char_count=pe - ps,
-                ordinal=ordinal,
-                parent_ordinal=None,
-                parent_block_id=None,
-            )
-        )
-
-    child_blocks: list[ChunkBlock] = []
-    child_ordinal = 0
-    for parent, (ps, pe) in zip(parent_blocks, parent_spans):
-        for cs, ce in _child_spans(text, ps, pe, params):
-            child_ordinal += 1
-            child_text = text[cs:ce]
-            child_blocks.append(
-                ChunkBlock(
-                    kind=KIND_CHILD,
-                    block_id=_block_id(
-                        kind=KIND_CHILD,
-                        unit=unit,
-                        ordinal=child_ordinal,
-                        text=child_text,
-                    ),
-                    text=child_text,
-                    char_count=ce - cs,
-                    ordinal=child_ordinal,
-                    parent_ordinal=parent.ordinal,
-                    parent_block_id=parent.block_id,
-                )
-            )
+    windows = _parent_windows(text, params.boundary_priority)
+    parent_blocks = [_parent_block(unit, text, window) for window in windows]
 
     return UnitChunking(
         locator=unit.locator,
@@ -620,7 +560,7 @@ def split_unit(unit: ParsedUnit, *, doc_type: str) -> UnitChunking:
         density=density,
         params=params,
         parents=tuple(parent_blocks),
-        children=tuple(child_blocks),
+        children=tuple(_child_blocks(unit, text, parent_blocks, windows, params)),
         source_sha256=unit.source_sha256,
         parse_rule_version=unit.parse_rule_version,
         params_table_version=unit.params_table_version,
