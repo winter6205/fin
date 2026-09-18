@@ -8,13 +8,18 @@ const SOFT_TRACKS: ReadonlySet<string> = new Set([
   "dialogue",
   "clarify",
   "off_topic",
-  "research",
+  "grounded",
 ]);
+
+const TRACK_ALIASES: Readonly<Record<string, SoftTrack>> = {
+  research: "grounded",
+};
 
 /** Defensive parse: unknown / missing values become ``undefined``. */
 export function parseSoftTrack(raw: unknown): SoftTrack | undefined {
   if (typeof raw !== "string") return undefined;
-  return SOFT_TRACKS.has(raw) ? (raw as SoftTrack) : undefined;
+  const mapped = TRACK_ALIASES[raw] ?? raw;
+  return SOFT_TRACKS.has(mapped) ? (mapped as SoftTrack) : undefined;
 }
 
 /** Defensive parse of the optional RunRecord audit blob. */
@@ -42,9 +47,9 @@ export function resolveTurnTrack(
   return turn.track ?? turn.track_decision?.track;
 }
 
-/** Light research-only hint — never for dialogue / clarify / off_topic. */
+/** Light grounded-leaf hint — never for dialogue / clarify / off_topic. */
 export function showResearchTrackHint(
   track: SoftTrack | undefined | null,
 ): boolean {
-  return track === "research";
+  return track === "grounded";
 }

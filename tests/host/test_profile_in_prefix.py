@@ -187,7 +187,7 @@ def test_profile_block_after_identity_before_pointer() -> None:
     profile = "Operator prefers quarterly revenue comparisons."
     msgs = [HumanMessage(content="q")]
     out = messages_for_model(
-        msgs, track="research", memory_on=True, user_profile=profile
+        msgs, track="grounded", memory_on=True, user_profile=profile
     )
     content = str(out[0].content)
 
@@ -229,7 +229,7 @@ def test_profile_present_when_memory_on() -> None:
     profile = "Operator prefers quarterly revenue comparisons."
     msgs = [HumanMessage(content="q")]
     out = messages_for_model(
-        msgs, track="research", memory_on=True, user_profile=profile
+        msgs, track="grounded", memory_on=True, user_profile=profile
     )
     content = str(out[0].content)
 
@@ -252,7 +252,7 @@ def test_profile_idempotent_on_pre_injected_block() -> None:
     )
     out = messages_for_model(
         [pre_existing, HumanMessage(content="q")],
-        track="research",
+        track="grounded",
         memory_on=True,
         user_profile=profile,
     )

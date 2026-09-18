@@ -410,7 +410,7 @@ def compile_for_runtime(
     # ``classify_model`` so the LLM tier is reachable in
     # production — the default of ``None`` would silently skip
     # it and force every ambiguous utterance onto the residual
-    # ``track="research"`` branch (specs/soft-track.md — "no
+    # ``track="grounded"`` branch (specs/soft-track.md — "no
     # single global default track").
     compiled = compile_graph(
         checkpointer=saver,

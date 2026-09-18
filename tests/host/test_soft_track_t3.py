@@ -37,7 +37,7 @@ def test_two_research_context_turns_append_two_snapshots():
         },
         config=_thread_config(tid),
     )
-    assert out1["track"] == "research"
+    assert out1["track"] == "grounded"
     snaps1 = list(out1.get("status_snapshots") or [])
     assert len(snaps1) >= 1
     assert snaps1[-1].get("company") in ("AAPL", "Apple") or snaps1[-1].get(
@@ -70,7 +70,7 @@ def test_short_followup_inherits_research_from_snapshot():
             }
         ],
     )
-    assert decision.track == "research"
+    assert decision.track == "grounded"
     assert decision.decision_tier == "inherit"
 
     model = ScriptedChatModel(script=[AIMessage(content="need evidence")])
@@ -94,7 +94,7 @@ def test_short_followup_inherits_research_from_snapshot():
         },
         config=_thread_config(tid),
     )
-    assert out["track"] == "research"
+    assert out["track"] == "grounded"
     assert out["track_decision"]["decision_tier"] == "inherit"
 
 

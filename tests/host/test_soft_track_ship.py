@@ -362,10 +362,10 @@ def test_must_research_tools_span_done_with_citation(aapl_page1_text: str) -> No
         },
         config=_cfg("ship-research"),
     )
-    assert out["track"] == "research"
+    assert out["track"] == "grounded"
     assert out["status"] == "done"
     assert len(out["citations"]) >= 1
-    _assert_track_decision(out["track_decision"], track="research")
+    _assert_track_decision(out["track_decision"], track="grounded")
 
 
 def test_must_research_boundary_bare_q_is_dialogue(aapl_page1_text: str) -> None:
@@ -460,16 +460,16 @@ def test_must_research_boundary_workspace_sse_track_and_history(
         status_frames = [d for e, d in events if e == "status"]
         assert status_frames
         terminal = status_frames[-1]
-        assert terminal.get("track") == "research"
+        assert terminal.get("track") == "grounded"
         assert terminal.get("status") == "done"
 
         detail = client.get(f"/api/threads/{created['id']}").json()
         assert detail["turns"]
         td = detail["turns"][-1].get("track_decision") or {}
-        _assert_track_decision(td, track="research")
+        _assert_track_decision(td, track="grounded")
         runs = store.list_runs(created["id"])
         assert runs
-        _assert_track_decision(runs[-1].track_decision, track="research")
+        _assert_track_decision(runs[-1].track_decision, track="grounded")
     finally:
         app.dependency_overrides.clear()
 
@@ -504,9 +504,9 @@ def test_must_prior_snapshot_short_followup_inherits_research() -> None:
         {**reset_input_state("and EPS?"), "evidence": []},
         config=_cfg(tid),
     )
-    assert out["track"] == "research"
+    assert out["track"] == "grounded"
     assert out["track_decision"]["decision_tier"] == "inherit"
-    _assert_track_decision(out["track_decision"], track="research")
+    _assert_track_decision(out["track_decision"], track="grounded")
 
 
 def test_must_inherit_boundary_decide_track_unit() -> None:
@@ -520,7 +520,7 @@ def test_must_inherit_boundary_decide_track_unit() -> None:
             }
         ],
     )
-    assert decision.track == "research"
+    assert decision.track == "grounded"
     assert decision.decision_tier == "inherit"
 
 
@@ -575,7 +575,7 @@ def test_matrix_negative_off_domain_wrong_track() -> None:
         config=_cfg("ship-neg"),
     )
     assert out["track"] == "off_topic"
-    assert out["track"] != "research"
+    assert out["track"] != "grounded"
     assert out["status"] == "done"
     assert out["status"] != "refuse"
 
@@ -604,7 +604,7 @@ def test_matrix_overflow_caps_research_only_snapshots_retained(
         },
         config=_cfg(tid),
     )
-    assert out["track"] == "research"
+    assert out["track"] == "grounded"
     # Overflow terminals only: ``done`` is not an overflow outcome and
     # must stay out of the accepted set (spec SC2).
     assert out["status"] in ("refuse", "step_cap"), out["status"]
@@ -720,7 +720,7 @@ def test_matrix_exception_classify_exit_defined_track() -> None:
         classify_model=stub,
     )
     assert stub.calls == 1
-    assert decision.track in ("dialogue", "clarify", "off_topic", "research")
+    assert decision.track in ("dialogue", "clarify", "off_topic", "grounded")
     assert decision.signals.get("classify_exit") == "invalid_track"
     assert decision.decision_tier != "llm"
 
@@ -741,8 +741,8 @@ def test_matrix_exception_classify_exit_defined_track() -> None:
         },
         config=_cfg("ship-exc"),
     )
-    assert out["track"] in ("dialogue", "clarify", "off_topic", "research")
+    assert out["track"] in ("dialogue", "clarify", "off_topic", "grounded")
     assert out["track_decision"]["signals"].get("classify_exit") == "invalid_track"
-    if out["track"] != "research":
+    if out["track"] != "grounded":
         assert out["status"] == "done"
         assert HIDDEN_BOUNCE_MARKER not in str(out.get("messages", []))

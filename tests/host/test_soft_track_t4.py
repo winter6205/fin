@@ -42,7 +42,7 @@ def test_invalid_track_enum_exits_llm_and_finishes_defined():
         classify_model=stub,
     )
     assert stub.calls == 1
-    assert decision.track in ("dialogue", "clarify", "off_topic", "research")
+    assert decision.track in ("dialogue", "clarify", "off_topic", "grounded")
     assert decision.signals.get("classify_exit") == "invalid_track"
     # Must have left the llm tier via EXIT (landed on a later tier).
     assert decision.decision_tier in (
@@ -59,7 +59,7 @@ def test_schema_parse_fail_exits_llm_and_finishes_defined():
         classify_model=stub,
     )
     assert stub.calls == 1
-    assert decision.track in ("dialogue", "clarify", "off_topic", "research")
+    assert decision.track in ("dialogue", "clarify", "off_topic", "grounded")
     assert decision.signals.get("classify_exit") == "schema_parse"
     assert decision.decision_tier != "llm"
 
@@ -71,14 +71,14 @@ def test_classify_model_error_exits_and_finishes_defined():
         classify_model=stub,
     )
     assert stub.calls == 1
-    assert decision.track in ("dialogue", "clarify", "off_topic", "research")
+    assert decision.track in ("dialogue", "clarify", "off_topic", "grounded")
     assert decision.signals.get("classify_exit") == "model_error"
     assert decision.decision_tier != "llm"
 
 
 def test_high_confidence_rules_skip_llm():
     """Greeting/off-domain/full research must not call classify_model."""
-    stub = _ClassifyStub(content='{"track": "research"}')
+    stub = _ClassifyStub(content='{"track": "grounded"}')
     greeting = decide_track(
         [HumanMessage(content="Hello!")],
         classify_model=stub,
@@ -129,9 +129,9 @@ def test_graph_classify_exit_does_not_crash_or_enter_gate():
         },
         config=_thread_config("t-soft-t4-exit"),
     )
-    assert out["track"] in ("dialogue", "clarify", "off_topic", "research")
+    assert out["track"] in ("dialogue", "clarify", "off_topic", "grounded")
     assert out["track_decision"]["signals"].get("classify_exit") == "model_error"
-    if out["track"] != "research":
+    if out["track"] != "grounded":
         assert out["status"] == "done"
         assert HIDDEN_BOUNCE_MARKER not in str(out.get("messages", []))
         assert out.get("citations", ()) == () or out.get("citations") == []

@@ -29,7 +29,7 @@ plumbing — the simplest shape that satisfies the contract.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol
+from typing import Final, Protocol
 
 
 class OCREngine(Protocol):
@@ -63,6 +63,10 @@ class OcrRequiredUnavailableError(OCRError):
     code = "ocr_required_unavailable"
 
 
+# Mixed CN/EN scans. OS tessdata must include ``chi_sim`` and ``eng``.
+DEFAULT_TESSERACT_LANG: Final[str] = "chi_sim+eng"
+
+
 class TesseractEngine:
     """Production OCR engine backed by ``pytesseract``.
 
@@ -72,9 +76,11 @@ class TesseractEngine:
     every ``recognize`` call raises the typed
     ``OcrRequiredUnavailableError`` so callers can fail fast without
     us swallowing the missing-extra condition.
+
+    Default ``lang`` is :data:`DEFAULT_TESSERACT_LANG` (``chi_sim+eng``).
     """
 
-    def __init__(self, *, lang: str = "eng") -> None:
+    def __init__(self, *, lang: str = DEFAULT_TESSERACT_LANG) -> None:
         # Lazy import: do not pull pytesseract on module import
         # (default pytest contract — see ``test_default_pytest_does_not_import_pytesseract``).
         try:
@@ -86,6 +92,11 @@ class TesseractEngine:
             self._pytesseract = pytesseract  # type: ignore[assignment]
             self._import_error = None
         self._lang = lang
+
+    @property
+    def lang(self) -> str:
+        """Tesseract ``-l`` language string passed to ``image_to_string``."""
+        return self._lang
 
     def recognize(self, *, source: Path, page: int) -> str:
         """OCR ``page`` (1-based) of ``source``.
@@ -162,6 +173,7 @@ def detect_ocr_required(
 
 
 __all__ = [
+    "DEFAULT_TESSERACT_LANG",
     "OCREngine",
     "OCRError",
     "OcrRequiredUnavailableError",

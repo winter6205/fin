@@ -38,13 +38,20 @@ def test_messages_for_model_unknown_track_falls_back_to_dialogue_prompt():
 
 
 def test_messages_for_model_research_still_selects_host_prompt() -> None:
-    """Explicit ``track="research"`` keeps the citation / tool contract."""
+    """Explicit ``track="grounded"`` keeps the citation / tool contract."""
     msgs = [HumanMessage(content="What was AAPL net sales in 2023 Q3?")]
-    out = messages_for_model(msgs, track="research")
+    out = messages_for_model(msgs, track="grounded")
     assert isinstance(out[0], SystemMessage)
     assert HOST_INSTRUCTIONS_MARKER in str(out[0].content)
     assert out[0].content == HOST_SYSTEM_PROMPT
     assert out[1:] == msgs
+
+
+def test_messages_for_model_research_alias_selects_grounded_prompt() -> None:
+    """Wire alias ``research`` still selects the grounded host prompt."""
+    msgs = [HumanMessage(content="What was AAPL net sales in 2023 Q3?")]
+    out = messages_for_model(msgs, track="research")  # type: ignore[arg-type]
+    assert out[0].content == HOST_SYSTEM_PROMPT
 
 
 def test_messages_for_model_dialogue_selects_dialogue_prompt() -> None:

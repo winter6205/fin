@@ -42,7 +42,15 @@ def test_filing_ask_decides_research() -> None:
     decision = decide_track(
         [HumanMessage(content="What was AAPL net sales in 2023 Q3?")]
     )
-    assert decision.track == "research"
+    assert decision.track == "grounded"
+
+
+def test_normalize_track_maps_research_alias() -> None:
+    from fin.host.track_decision import normalize_track
+
+    assert normalize_track("research") == "grounded"
+    assert normalize_track("grounded") == "grounded"
+    assert normalize_track("nope") is None
 
 
 def test_underspecified_metric_ask_decides_clarify() -> None:
@@ -79,7 +87,7 @@ def test_underspec_filing_ask_skips_llm_that_would_steal_research() -> None:
     classifier on ``What was net sales?`` must land clarify with
     zero classify calls.
     """
-    stub = _StealClassify("research")
+    stub = _StealClassify("grounded")
     decision = decide_track(
         [HumanMessage(content="What was net sales?")],
         classify_model=stub,
@@ -106,14 +114,14 @@ def test_underspec_followup_inherits_before_llm_steal() -> None:
         classify_model=stub,
     )
     assert stub.calls == 0
-    assert decision.track == "research"
+    assert decision.track == "grounded"
     assert decision.decision_tier == "inherit"
 
 
 @pytest.mark.soft_track
 def test_low_confidence_classify_routes_to_clarify() -> None:
     """An uncertain optional classifier must not select a track silently."""
-    stub = _StealClassify("research", confidence=0.2)
+    stub = _StealClassify("grounded", confidence=0.2)
 
     decision = decide_track(
         [HumanMessage(content="maybe compare these?")],
@@ -125,7 +133,18 @@ def test_low_confidence_classify_routes_to_clarify() -> None:
     assert decision.decision_tier == "clarify"
     assert decision.confidence == 0.2
     assert decision.signals.get("classify_exit") == "low_confidence"
-    assert decision.signals.get("llm_track") == "research"
+    assert decision.signals.get("llm_track") == "grounded"
+
+
+def test_llm_research_alias_normalizes_to_grounded() -> None:
+    stub = _StealClassify("research")
+    decision = decide_track(
+        [HumanMessage(content="maybe compare these?")],
+        classify_model=stub,
+    )
+    assert stub.calls == 1
+    assert decision.track == "grounded"
+    assert decision.signals.get("llm_track") == "grounded"
 
 
 def test_metric_with_company_missing_period_decides_clarify() -> None:
@@ -150,7 +169,7 @@ def test_fully_specified_filing_ask_stays_research() -> None:
     decision = decide_track(
         [HumanMessage(content="What was AAPL net sales in 2023 Q3?")]
     )
-    assert decision.track == "research"
+    assert decision.track == "grounded"
 
 
 @pytest.mark.soft_track

@@ -153,7 +153,7 @@ def test_run_record_track_decision_roundtrip() -> None:
     store = InMemoryThreadStore()
     store.create_thread(id="t-td", title="x")
     td = {
-        "track": "research",
+        "track": "grounded",
         "confidence": 0.9,
         "decision_tier": "rules",
         "signals": {"cue": "filing"},

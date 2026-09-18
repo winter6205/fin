@@ -10,16 +10,20 @@
 ### Product identity
 
 **fin**:
-An enterprise knowledge-base Agent (the 入口, not the 库): the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held **资料** behind the **retrieve port**.
-_Avoid_: research-agent product, workspace-as-kind, 10-Q as the product name, Q&A API as the product, treating research-track contracts as the whole product personality, treating fin as a parallel corpus store or 库门
+An enterprise knowledge-base Agent (the 入口, not the 库): the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **grounded** track. First corpus is operator-held **资料** behind the **retrieve port**.
+_Avoid_: research-agent product, workspace-as-kind, 10-Q as the product name, Q&A API as the product, treating grounded-track contracts as the whole product personality, treating fin as a parallel corpus store or 库门
 
 **host agent**:
-fin as the LangGraph runtime that routes tracks and calls research tools behind the **retrieve port**; it is not the ranking or vector store.
+fin as the LangGraph runtime that routes tracks and calls grounded-track tools behind the **retrieve port**; it is not the ranking or vector store.
 _Avoid_: client, treating fin as only a FAQ bot, treating fin as the long-term memory server
 
 **track**:
-The per-turn contract on the host graph: `dialogue`, `clarify`, `off_topic`, or `research`. Chosen in-graph before execution; tools and the citation verifier bind only to `research`.
-_Avoid_: Chat|Research UI mode, HTTP-only router, single global research contract for every utterance
+The per-turn contract on the host graph: `dialogue`, `clarify`, `off_topic`, or `grounded`. Chosen in-graph before execution; tools and the citation verifier bind only to `grounded`.
+_Avoid_: Chat|Research UI mode, HTTP-only router, single global grounded contract for every utterance, search mode as a track
+
+**grounded**:
+The Soft-Track leaf that binds corpus tools and the **citation verifier** (ADR 0061). Not a product name, not **search mode**, and not the `retrieve` tool. Wire value `research` is an alias for this leaf.
+_Avoid_: Research mode picker, retrieve as the track enum, four retrieve nodes, renaming **research thread**
 
 **Soft-Track**:
 The v1 turn-orchestration shape: one compiled host graph, multi-track routing, tiered track decision (rules → ambiguous LLM → inherit → grounded clarify → conditional policy), flat graph until upgrade triggers in ADR 0027.
@@ -116,7 +120,7 @@ _Avoid_: 第二份数据, 备份, 与权威源互为校验的对等副本
 ### Agent
 
 **agent loop**:
-On the **research track**, the model repeatedly picks `list_files`, `retrieve`, `read_file`, or `get_xbrl_fact` until it stops calling tools, or hits refuse (unknown locator or citation-repair cap) or step cap. Research `done` is only after the citation verifier (and numeric fact gate when a fact is claimed) passes; non-research tracks may `done` without tools or citations. Step order is not hardcoded.
+On the **grounded** track, the model repeatedly picks `list_files`, `retrieve`, `read_file`, or `get_xbrl_fact` until it stops calling tools, or hits refuse (unknown locator or citation-repair cap) or step cap. Grounded `done` is only after the citation verifier (and numeric fact gate when a fact is claimed) passes; other tracks may `done` without tools or citations. Step order is not hardcoded.
 _Avoid_: pipeline, chain, fixed graph of retrieve-then-generate, requiring the citation verifier on dialogue/clarify/off_topic
 
 **list_files**:
@@ -124,11 +128,11 @@ Catalog tool over ingested/pushed **filings** (not a serve-time extracted-tree S
 _Avoid_: list_filings, list_documents, glob, requiring ticker, treating company as forever equal to ticker, a generic CMS file browser
 
 **get_xbrl_fact**:
-Research-track **lookup** of one tagged financial fact from an ingest-built fact table (concept, period, issuer/document). XBRL is the reporting format, not a website. A numeric citation gate matches the claimed value to that row; the model does not invent the arithmetic. Embeddings may later resolve concept aliases; they do not author the number.
+Grounded-track **lookup** of one tagged financial fact from an ingest-built fact table (concept, period, issuer/document). XBRL is the reporting format, not a website. A numeric citation gate matches the claimed value to that row; the model does not invent the arithmetic. Embeddings may later resolve concept aliases; they do not author the number.
 _Avoid_: treating XBRL as a site name, OCR or vision as the number SSOT, a `verify` tool, using retrieve/embeddings as the fact SSOT
 
 **compare_facts**:
-Research-track host tool that resolves one XBRL concept over a grid of rows (issuers or documents) x columns (periods) against the same fact table `get_xbrl_fact` reads, and returns the `fin.comparison.v1` envelope. Deltas are computed in the tool, not by the model. Every column is an implicit `(concept, period)` claim for the numeric gate, so an answer quoting figures the table never reported cannot `done`. It contributes no citation evidence: a fact row is not page text.
+Grounded-track host tool that resolves one XBRL concept over a grid of rows (issuers or documents) x columns (periods) against the same fact table `get_xbrl_fact` reads, and returns the `fin.comparison.v1` envelope. Deltas are computed in the tool, not by the model. Every column is an implicit `(concept, period)` claim for the numeric gate, so an answer quoting figures the table never reported cannot `done`. It contributes no citation evidence: a fact row is not page text.
 _Avoid_: a prose table the model authors, a chart tool, treating a comparison cell as a citation, computing the delta in the SPA or the export
 
 **comparison result** (`fin.comparison.v1`):
@@ -144,7 +148,7 @@ Ordinary read of a known locator: fetch that body's text (from the retrieve back
 _Avoid_: read_locator, read_page, treating read as retrieve, reading embeddings
 
 **ingest endpoint**:
-The product job that parses, applies **切分** from the format parameter table, and **入库推送** or invalidates via MCP. Version close/replace is an MCP call. Not a research-track tool.
+The product job that parses, applies **切分** from the format parameter table, and **入库推送** or invalidates via MCP. Version close/replace is an MCP call. Not a grounded-track tool.
 _Avoid_: chunk-any-string tool, model-chosen split points, EDGAR form name as the root document type
 
 **thread attach**:
@@ -160,7 +164,7 @@ Cite identity `{document_id, version, unit}`. The claimed span is a quote string
 _Avoid_: chunk_id, char offset, bbox, page-less citation, unofficial PDF page as live EDGAR identity, verifying an HTML quote against a PDF page
 
 **citation verifier**:
-A code gate on the **research track** path to END: a supporting span is a contiguous substring of the answer (v1 minimum 32 characters) that appears in text this run received from **retrieve** / **read_file** (ADR 0046). Passed spans become the user-visible citations; unknown locators refuse immediately; missing or unmatched spans bounce with a hidden template until the citation-repair cap, then refuse. Non-research tracks skip this gate.
+A code gate on the **grounded** track path to END: a supporting span is a contiguous substring of the answer (v1 minimum 32 characters) that appears in text this run received from **retrieve** / **read_file** (ADR 0046). Passed spans become the user-visible citations; unknown locators refuse immediately; missing or unmatched spans bounce with a hidden template until the citation-repair cap, then refuse. Other tracks skip this gate.
 _Avoid_: faithfulness prompt, LLM-as-judge as the only gate, model-authored citation block, `verify` as a tool, running the gate on greetings or soft off-topic replies, web-search text as gate evidence, a second serve-time extracted tree as citation SSOT
 
 **citation span**:
@@ -182,8 +186,8 @@ LangGraph compiled around the agent loop plus code gates (verifier, caps, interr
 _Avoid_: retrieval graph
 
 **session compaction**:
-A host gate on the **research thread**: occupancy is estimated tokens of the model-facing payload (track prompt, messages, research tool schemas, and when memory is ON any **memory prefetch** or **recall injection**) against a 256_000 session budget; at ≥90% occupancy, or when the operator sends `/compact`, old checkpoint `messages` are summarized and removed, aiming at ~40% occupancy. The summarizer is injectable (v1 the **v1 model**); occupancy may render on the thread, not on `GET /api/status`.
-_Avoid_: message-count windows, treating `/compact` as a research tool, putting occupancy on the boot status strip, using the vendor 1M window as the compact threshold, treating a memory row-count cap as the occupancy gate
+A host gate on the **research thread**: occupancy is estimated tokens of the model-facing payload (track prompt, messages, grounded-track tool schemas, and when memory is ON any **memory prefetch** or **recall injection**) against a 256_000 session budget; at ≥90% occupancy, or when the operator sends `/compact`, old checkpoint `messages` are summarized and removed, aiming at ~40% occupancy. The summarizer is injectable (v1 the **v1 model**); occupancy may render on the thread, not on `GET /api/status`.
+_Avoid_: message-count windows, treating `/compact` as a grounded-track tool, putting occupancy on the boot status strip, using the vendor 1M window as the compact threshold, treating a memory row-count cap as the occupancy gate
 
 **recall injection**:
 When memory is ON, advisory recall or **memory prefetch** text placed in the model-facing payload. It counts toward the same occupancy ledger as **session compaction**; a row-count limit is only a fuse, not the budget.
@@ -233,12 +237,28 @@ _Avoid_: sidebar 「知识库」, `/kb` as product chrome, per-工作区 retriev
 The operator-visible set of **资料** already pushed to **iknow-memory** (ready when successful **chunk** count ≥ 1). The **工作台** binds a knowledge question to this set; local `corpus_filing_count` is not 就绪.
 _Avoid_: freeze-slice catalog as 就绪, treating MCP 可达 as nonempty retrieve, **thread attach** as membership in the set
 
-**检索档**:
-Which retrieve path a knowledge question uses after it has entered the 问答 leaf: A 查找 (lexical-first), B 知识问答 (default; iknow graph-priority then vector∥BM25 fill), C 综述 (explicit, not automatic), D 真数据库 (real SQL/business DB; document tables stay B).
-_Avoid_: open business-intent labels, one unnamed retrieve for every question, treating Fake as a 档
+**检索档** (`search mode`):
+Which retrieve path a knowledge question uses after it has entered **grounded**: A 查找 (lexical-first), B 知识问答 (iknow graph-priority then vector∥BM25 fill), C 综述 (index-time community summaries; report text ES ∥ report vectors, then optional drop to windows — ADR 0070), D 真数据库 (real SQL/business DB; document tables stay B). Assignment reuses the Soft-Track cascade (ADR 0027 / 0062): rules, then structured classify when ambiguous, then inherit, then clarify or typed fail — not a required picker and not silent C. Cascade **clarify** opens a **choice window** (structured options → operator pick → resume execute). Search-mode copy is call-scoped (ADR 0061): inject once in near context, never rewrite history; after **session compaction**, re-inject the mode this turn needs.
+_Avoid_: open business-intent labels, one unnamed retrieve for every question, treating Fake as a 档, retrieve as this enum, four host retrieve nodes, per-turn 档 picker as the default UX, clarify with no selectable options
+
+**社区**:
+Entity-graph clusters from **hierarchical Leiden** after extract and merge (ADR 0056 / 0065), on the **largest connected component** by default (ADR 0074), split until **max_cluster_size** (default 10, tunable — ADR 0072), with a **fixed default seed** (ADR 0075). Graph changes **rebuild** Leiden and summaries; C is not-ready until that succeeds (ADR 0064 / 0078); B does not wait on communities.
+_Avoid_: 文档父子, 查询期现写综述当默认, 社区报告当唯一答案且无出处, 空摘要当 C, 部分社区成功也开 C, 扁平 Louvain 当产品聚类, Fast 抽图当社区前置步骤
+
+**Fast 抽图**:
+The NLP / co-occurrence **extract method** (index job): mixed **Chinese/English noun-phrase regex** (ADR 0076), co-occurrence on **in-window children** then **prune** and Leiden, community reports from **抽图窗** text (ADR 0067 / 0073 / 0077). An **operator switch** selects it (default **standard**, **one method per corpus version** — ADR 0079); the model may propose Fast in a **choice window** and must not silent-apply (ADR 0068).
+_Avoid_: Fast as search mode, Fast as a stage after Leiden, Fast as the only C path, silent auto Fast, prune as canonical merge, regex_english as product Fast default
+
+**实体描述**:
+One index-time summary of an entity’s merged description list on the **standard** extract job, written after **canonical merge** (duplicate gates first — ADR 0052 / 0069) and before Leiden. It is the text ADR 0058 embeds. Fast has none; query and memory dream do not write it.
+_Avoid_: biography as a query tool, every-turn filing extract, Fast 路上的描述, 查询期补写
+
+**claim**:
+A time-bounded factual assertion extracted from a **抽图窗** on the **standard** extract job (ADR 0071), after merge and before Leiden. Default on for standard; Fast skips. Not an XBRL fact row and not D.
+_Avoid_: 指标 as this term, claim as citation-gate span, query-time claim extract, Fast claims
 
 **具名失败**:
-A typed product failure that names empty-bound 资料, mapping-drop, citation-verifier refuse, 档未开, or 真库未接 as distinct exits — not one `unknown_locator` plus empty citations.
+A typed product failure that names empty-bound 资料, mapping-drop, citation-verifier refuse, 档未开, 真库未接, or community-summary index failure as distinct exits — not one `unknown_locator` plus empty citations.
 _Avoid_: collapsing those cases, Fake health, `degraded` as a synonym for empty hits
 
 **workspace**:
@@ -254,12 +274,12 @@ Retired chrome name. `/kb` is not a product route; catalog and upload live outsi
 _Avoid_: `/` as corpus cards, `/` as a thread-card overview, Corpus as a nav label, 对话 as a chrome entry, auto-send from a corpus card, treating fetch of `GET /api/corpus` as ingest, deep-link `/kb` as a dashboard handoff
 
 **v1 surface**:
-The first ship binary is a CLI that compiles the host graph; v1 HTTP exposes that same compiled graph and must call sync `invoke` (not `ainvoke`) so the sync `PostgresSaver` stays valid. HITL / interrupt UX is not a v1 product surface; crash resume continues the in-flight run on that `thread_id`.
-_Avoid_: HTTP-only first ship, separate graphs per transport, approval UI as v1
+The first ship binary is a CLI that compiles the host graph; v1 HTTP exposes that same compiled graph and must call sync `invoke` (not `ainvoke`) so the sync `PostgresSaver` stays valid. Crash resume continues the in-flight run on that `thread_id`. Plan-approval and tool-approval HITL are not v1; **choice window** on cascade clarify is (ADR 0062).
+_Avoid_: HTTP-only first ship, separate graphs per transport, treating plan-approval as the clarify surface
 
 **HITL**:
-LangGraph `interrupt` may be compiled into the host graph. v1 does not ship plan-approval or tool-approval UI; durability is crash resume of the in-flight run.
-_Avoid_: declarative plan-mode as v1, Studio as the required v1 interface
+LangGraph `interrupt` may be compiled into the host graph. Durability is crash resume of the in-flight run. **Choice window** is the v1 interrupt UX for Soft-Track / search-mode clarify (structured options, operator pick, then execute). Plan-approval and tool-approval UI stay out of v1.
+_Avoid_: declarative plan-mode as v1, Studio as the required v1 interface, free-text clarify with no options as the only confirm path
 
 **reference checkout**:
 Read-only sibling clone of the reference implementation (workspace folder, not fin git). Consulted, never edited as fin source.
@@ -299,6 +319,14 @@ _Avoid_: current catalog, gold SSOT, demo FAQ
 The CLI/job (and the product **ingest endpoint**) that parses filings, **切分**s, and **入库推送** to the retrieve backend. The ask path does not fetch EDGAR or open source filings.
 _Avoid_: extract-on-query, host-graph ingest node, putting filing bytes in the checkpointer database, 切分 as a research-track tool
 
+**资料主体**:
+The issuer already stored on a **资料** (company name and optional ticker/CIK): the document an extract window came from. Extract prompts and deictic rewrite use this, not a reread of the whole body.
+_Avoid_: 全文回读当主体, ticker as a required equal of company, a global 本公司 entity
+
+**指示语**:
+A company mention in window text that is not a proper name (本公司, the Company). It binds to that window’s **资料主体** (ADR 0052), not to same-string merge across 资料.
+_Avoid_: treating 指示语 as a canonical name, alias as the only word, LLM-as-judge on the full 资料 as the default
+
 **object store**:
 MinIO/S3-compatible storage for raw filing (and later multi-format) bytes. Postgres holds metadata and pointers. Git is not the byte warehouse once configured. Raw object keys are not citation locators; citable text after ingest lives on the retrieve backend (ADR 0046 / 0047).
 _Avoid_: Postgres bytea as the primary raw store, putting raw PDFs in the checkpointer, treating object keys as citation locators
@@ -321,15 +349,19 @@ _Avoid_: chunk, 原始文件, 任意段落, 未冻结的中间解析产物
 
 **切分**:
 fin 把冻结单元文本切成块的过程与规则，是 fin 的职责；切分必须确定性可复现，同一（字节输入 + 规则版本 + 参数表版本）两次切分产物逐字节相同。检索服务对推送文本不做二次切分、截断、重组或归一化改写。
-_Avoid_: chunking, sliding window, 检索侧切分, 按字符硬切, 模型判断切点
+_Avoid_: chunking, 检索侧二次切分, 按字符硬切, 模型判断切点
+
+**抽图窗**:
+Title-scoped extract-and-cite unit: current heading plus a body span (≤1200 tokens one window; overflow splits body only, ~8% overlap between those windows). It is the parent of in-window **父子** keys (ADR 0060 / 0063), derived at extract from frozen text (ADR 0054), not a second document cut.
+_Avoid_: 两种切法, 整篇定长滑, 用子块抽图, 大节=整份财报, 抽图再OCR, 视觉模型当标题切点, 把窗 8% 抄到 ES
 
 **父子分块**:
-fin 切分的产物形态：子块用于精准匹配与引用定位，父块用于给模型完整上下文，命中集是子块且每个子块携带其父块文本。子块文本是父块文本的连续子串，父块文本是冻结单元文本的连续子串；父块不单独作为可命中单元。
-_Avoid_: 双层切分, 段落切分, 父块参与命中, 父子共用一份可召回文本
+Search keys inside one **抽图窗**: children are the lexical/ES hit set and the **Fast** co-occurrence scope (ADR 0077), not standard LLM extract input; each is a contiguous substring of its parent window, returned for extract, citation, and A after a hit (ADR 0060). Default child overlap is 0; narrative may overlap at most one sentence; not the window 8% (ADR 0063).
+_Avoid_: 对全文另切一套父块, 子块抽图, 父块参与词法命中, 双层切分当两套原文, ES 强制百分比重叠
 
 **场景适配颗粒度**:
-按（文档类型 × 板块 × 内容密度）查一张确定性参数表决定分块参数的做法；同一三元组两次查表返回同一参数组，参数表版本进元数据、版本变更就地全量重建。
-_Avoid_: 自适应切分, 固定统一块长, 用模型判断颗粒度, 双版本参数并存
+Deterministic (document type × section × density) lookup that sizes in-window child packing, child overlap (0 or one sentence), and overflow packing under the 1200-token cap, not a second extract splitter (ADR 0060 / 0063). Same triad, same row; table version in metadata, bump rebuilds in place.
+_Avoid_: 用密度缩小抽图窗, 自适应切分, 用模型判断颗粒度, 双版本参数并存
 
 **结构化元数据**:
 随块一同推送、可被检索侧作为过滤条件消费的字段集，至少包含格式、来源字节哈希、locator 三元组、单元序号、字符数、语言、解析规则版本、参数表版本。缺字段的推送被拒并返回具名失败。

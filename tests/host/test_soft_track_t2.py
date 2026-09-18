@@ -215,4 +215,4 @@ def test_filled_slots_follow_up_after_clarify_enters_research():
         },
         config=_thread_config(tid),
     )
-    assert second["track"] == "research"
+    assert second["track"] == "grounded"

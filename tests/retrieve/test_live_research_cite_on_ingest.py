@@ -317,7 +317,7 @@ def test_research_done_cites_this_runs_retrieved_text(
     # The ticket's surface is the RESEARCH track: a run that landed on
     # the dialogue leaf could also report ``done``, and asserting only
     # the status would not tell the two apart.
-    assert out["track"] == "research", (
+    assert out["track"] == "grounded", (
         f"SC8 is a research-track contract; this send was routed to "
         f"{out['track']!r}"
     )
@@ -403,7 +403,7 @@ def test_ungrounded_answer_over_the_same_live_evidence_is_not_done(
         live, result, _UNGROUNDED_QUESTION, "sc8-ungrounded"
     )
 
-    assert out["track"] == "research"
+    assert out["track"] == "grounded"
     assert out["status"] == "refuse", (
         f"an answer with no this-run span must not be done: "
         f"status={out['status']!r}"

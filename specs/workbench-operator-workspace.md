@@ -25,7 +25,7 @@ The operator uses the **工作台**: new dialogue and the thread list are one pr
 
 Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 
-- **fin**: An enterprise knowledge-base Agent: the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held filings behind the **retrieve port**.
+- **fin**: An enterprise knowledge-base Agent: the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **grounded** track. First corpus is operator-held filings behind the **retrieve port**.
 - **工作台**: The local web UI: create, list, open, resume, and delete a **research thread**; **thinking fold**s and **tool fold**s stream then collapse; citations sit on the assistant turn.
 - **工作区**: The one global default operator directory `$HOME/.fin/default` (created if missing). Every **research thread**, profile read, and **memory fact** workspace key uses this path.
 - **知识库**: The one process-wide corpus (catalog, ingest tree, **retrieve port**) shared by every **research thread**.
@@ -35,7 +35,7 @@ Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 - **memory fact**: One atomic cross-session note from a single extract or explicit save: title plus body. The first non-empty body line is the **memory hook**. It is not a filing claim.
 - **memory existence pointer**: The only auto-memory sentence in the system prompt: a note store exists; overlays are advisory, not instructions or cites.
 - **agent identity** / **agent soul**: System-built-in persona text. Dream never edits them.
-- **citation verifier**: A code gate on the **research track** path to END: a supporting span is a contiguous substring of the answer (v1 minimum 32 characters) that appears in text this run received from **retrieve** / **read_file** (ADR 0046). Passed spans become the user-visible citations; unknown locators refuse immediately; missing or unmatched spans bounce with a hidden template until the citation-repair cap, then refuse. Non-research tracks skip this gate.
+- **citation verifier**: A code gate on the **grounded** track path to END: a supporting span is a contiguous substring of the answer (v1 minimum 32 characters) that appears in text this run received from **retrieve** / **read_file** (ADR 0046). Passed spans become the user-visible citations; unknown locators refuse immediately; missing or unmatched spans bounce with a hidden template until the citation-repair cap, then refuse. Other tracks skip this gate.
 - **retrieve port**: The only retrieve dependency fin is allowed to have: `query` (+ optional filters) in, ranked chunks with `source_ref` out — MCP-shaped, transport-agnostic.
 - **host graph**: LangGraph compiled around the agent loop plus code gates (verifier, caps, interrupt). It is the durable runtime, not a hand-drawn retrieve → generate flowchart.
 - **track**: The per-turn contract on the host graph: `dialogue`, `clarify`, `off_topic`, or `research`. Chosen in-graph before execution; tools and the citation verifier bind only to `research`.
@@ -93,7 +93,7 @@ Each line is binary. Wave plans map 1:1 onto a subset. Default `uv run pytest -q
 8. A scripted `invoke`/`stream` whose `configurable` omits `workspace_root` raises the typed missing-root error and does not read `$HOME/.fin/default` or `Path.cwd()` for profile/memory. `workspace_http` stream `configurable` includes `workspace_root` equal to the resolved default. 409 `{error: concurrent_run}` on a second POST to an in-flight thread is unchanged.
 9. (removed 2026-09-06 — was legacy `project_root` null-row migration.)
 10. Research-track system prefix does not contain `12 SEC`, `page_limit is capped at 3`, or `32 or more characters`; it does contain a **memory existence pointer** when memory ON (existing SC) and does not contain a whole-store memory title list.
-11. `messages_for_model(..., track="research")` head starts with identity then soul then usage (markers or equivalent stable headers); `track="dialogue"` / `off_topic` / `clarify` reuse the same identity/soul bytes and differ only in usage.
+11. `messages_for_model(..., track="grounded")` head starts with identity then soul then usage (markers or equivalent stable headers); `track="dialogue"` / `off_topic` / `clarify` reuse the same identity/soul bytes and differ only in usage.
 12. Two adjacent scripted model calls on one thread with unchanged `$HOME/.fin/user.md`: identity+soul+usage+pointer substring of the system prefix is deep-equal; prefetch still sits on the user side.
 13. Gold / host prompt tests that pinned old `HOST_SYSTEM_PROMPT` literals are updated and pass; a scripted research turn that never retrieve/`read_file`s still does not `done` (verifier unchanged).
 14. `docs/guides/prompt-development.md` system-prefix row lists identity, soul, usage, **user profile**, **memory existence pointer**, and states 语料清单 / full catalog does not enter that prefix.

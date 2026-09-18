@@ -162,7 +162,11 @@ from fin.host.tools.issuer_fanout import (
     join_issuer_findings,
     plan_issuer_fanout,
 )
-from fin.host.track_decision import decide_track, snapshot_delta_for_utterance
+from fin.host.track_decision import (
+    decide_track,
+    normalize_track,
+    snapshot_delta_for_utterance,
+)
 from fin.retrieve import MCPRetrieveAdapter, FakeRetrievePort
 from fin.retrieve.degradation import (
     DegradationLedger,
@@ -2585,7 +2589,7 @@ def compile_graph(
             state,
             messages_for_model(
                 state["messages"],
-                track="research",
+                track="grounded",
                 memory_on=memory_enabled,
                 user_profile=_read_profile_text(),
             ),
@@ -2615,7 +2619,7 @@ def compile_graph(
             "status": "running",
             "repair_count": int(state.get("repair_count", 0)),
             "thinking_text": thinking_text,
-            "track": "research",
+            "track": "grounded",
         }
 
     def tool_node_with_summaries(state: AgentState) -> dict[str, Any]:
@@ -3080,7 +3084,7 @@ def compile_graph(
                 return "issuer_fanout"
             return "tools"
         # Soft-Track: citation verifier is research-only.
-        if state.get("track") == "research":
+        if normalize_track(state.get("track")) == "grounded":
             return "citation_gate"
         return END
 
