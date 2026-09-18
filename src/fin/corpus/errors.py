@@ -179,6 +179,24 @@ class ParseMetadataIncompleteError(ParseError):
     code = "metadata_incomplete"
 
 
+class ParseHeadingSpanError(ParseError):
+    """A parser's claimed heading lines are not a valid, locatable
+    claim about the text it produced.
+
+    The heading-span channel exists so a format whose structure is a
+    TAG (HTML ``h1``-``h6``) can name its heading lines without
+    widening the window classifier (ADR 0053 / 0060: the classifier
+    stays ATX + UPPERCASE-only). A claim that cannot be located in the
+    text it describes is a parser bug, not a corpus property: an index
+    outside the line range, a repeated index, an unsorted sequence, or
+    a claim whose raw→frozen mapping premise does not hold all land
+    here. Silently dropping the claim would make the title quietly
+    disappear, which is exactly the SC7 gap this channel closes.
+    """
+
+    code = "heading_span_invalid"
+
+
 __all__ = [
     "IngestMissingError",
     "CatalogCorruptError",
@@ -192,5 +210,6 @@ __all__ = [
     "EncryptedSourceParseError",
     "FormatMismatchParseError",
     "NoUnitsParseError",
+    "ParseHeadingSpanError",
     "ParseMetadataIncompleteError",
 ]

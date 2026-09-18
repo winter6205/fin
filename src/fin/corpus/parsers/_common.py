@@ -11,8 +11,10 @@ This module owns the pieces every format parser needs:
   ``ParseMetadataIncompleteError`` if any of the eight fields would be
   missing (SC10: no "field missing but still successful" unit);
 * ``detect_language`` — a deterministic heuristic (CJK share);
-* ``merge_blocks`` — the deterministic "heading split + cap merge"
-  assembly used by the HTML / Markdown / Word structure-block rule.
+* ``merge_blocks`` / ``merge_structured_blocks`` — the deterministic
+  "heading split + cap merge" assembly used by the HTML / Markdown /
+  Word structure-block rule (both delegate to the one merge rule;
+  the structured door also shifts the blocks' heading indices).
 
 Granularity decisions finalized in this package (plan T6, "已决"):
 
@@ -25,10 +27,14 @@ Granularity decisions finalized in this package (plan T6, "已决"):
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final
 
-from fin.corpus.errors import ParseMetadataIncompleteError
+from fin.corpus.errors import (
+    ParseHeadingSpanError,
+    ParseMetadataIncompleteError,
+)
 from fin.corpus.normalization import normalize_frozen_text
 from fin.corpus.params import TABLE_VERSION as _PARAMS_TABLE_VERSION
 
@@ -54,6 +60,13 @@ PARAMS_TABLE_VERSION: Final[str] = _PARAMS_TABLE_VERSION
 # Parse-rule version of this package. Any change to granularity
 # constants, splitting, or freezing behavior must bump it (the spec's
 # "就地全量重建" rule keys off this stamp).
+#
+# NOT bumped for the structural heading-span channel: ``_block_id``
+# mixes this stamp, so a bump re-keys EVERY block of EVERY format,
+# while the frozen unit TEXT stays byte-identical across all seven
+# formats here — only the HTML window regions move, and windowing
+# carries no version stamp of its own (it did not stamp one when it
+# landed either).
 PARSE_RULE_VERSION: Final[str] = "parse-2"
 
 # The seven supported formats (plan T6 order).
@@ -137,6 +150,24 @@ class UnitLocator:
 
 
 @dataclass(frozen=True)
+class StructuredBlock:
+    """One pre-freeze block plus the 0-based indices of its lines that
+    came from a structural heading tag.
+
+    A format whose heading is a TAG (HTML ``h1``-``h6``) knows its
+    heading lines structurally, but the frozen text keeps the heading
+    *text* only — re-guessing it from the line would need a widened
+    window classifier, which the spec forbids (ADR 0053 / 0060). The
+    block therefore carries the fact beside the lines: ``heading_lines``
+    indexes ``lines``, and :func:`merge_structured_blocks` shifts those
+    indices when the cap merges two blocks.
+    """
+
+    lines: tuple[str, ...]
+    heading_lines: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class ParsedUnit:
     """One frozen unit with the eight SC10 metadata fields.
 
@@ -161,6 +192,10 @@ class ParsedUnit:
     # The frozen unit text itself (not one of the eight metadata
     # fields, but the payload they describe).
     text: str
+    # Spans (start, end) in ``text`` of the lines this unit's source
+    # marked as structural headings (HTML ``h1``-``h6``). Empty when
+    # the format has no heading tags — the classifier then decides.
+    heading_spans: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -200,6 +235,72 @@ def detect_language(text: str) -> str:
     return "zh"
 
 
+def _frozen_line_spans(
+    text: str, frozen: str, raw_indexes: Sequence[int]
+) -> tuple[tuple[int, int], ...]:
+    """Map 0-based raw line indices to spans in the frozen text.
+
+    ``raw_indexes`` are indices into ``text.split("\\n")`` — the
+    pre-freeze lines the parser knows structurally (an HTML heading
+    tag's line, say). The parser counts lines; it never re-implements
+    a replacement rule: this helper calls :func:`freeze_text` once per
+    raw line, checks that the per-line pieces re-join into the whole
+    frozen text (loudly failing if that premise ever breaks), and walks
+    the pieces to get each one's ``(start, end)``. A raw line the
+    outlet drops (an empty heading) yields no pieces and simply
+    contributes no span.
+
+    Raises :class:`ParseHeadingSpanError` when the claim itself is
+    malformed — an index outside ``text``'s line range, a repeated
+    index, an unsorted sequence, or a frozen text that the per-line
+    walk cannot reproduce (the mapping premise failed, so every
+    returned offset would be a guess).
+    """
+    raw_lines = text.split("\n")
+    previous = -1
+    for index in raw_indexes:
+        if not 0 <= index < len(raw_lines):
+            raise ParseHeadingSpanError(
+                f"heading line index {index} outside the {len(raw_lines)} "
+                "raw line(s) of the unit text"
+            )
+        if index <= previous:
+            raise ParseHeadingSpanError(
+                "heading line indices must be strictly increasing, got "
+                f"{index} after {previous}"
+            )
+        previous = index
+    if not raw_indexes:
+        return ()
+    # A raw line yields 0 pieces when the outlet drops it (blank /
+    # whitespace-only): the empty heading case, silently skipped. The
+    # outlet joins only its non-empty lines, though, so the empty
+    # element ``"".split("\\n")`` yields must be filtered per line too.
+    pieces = [
+        [piece for piece in freeze_text(line).split("\n") if piece]
+        for line in raw_lines
+    ]
+    flat = [piece for group in pieces for piece in group]
+    if "\n".join(flat) != frozen:
+        raise ParseHeadingSpanError(
+            "the per-line freeze walk does not reproduce the frozen unit "
+            "text; the raw-to-frozen heading mapping cannot be trusted"
+        )
+    # Every raw line is walked, not only the claimed ones: the cursor
+    # must count the pieces of the lines in between, or an index would
+    # resolve to a span of a preceding line. The claimed indices are
+    # strictly increasing, so the emitted spans are in text order.
+    wanted = set(raw_indexes)
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for index, group in enumerate(pieces):
+        for piece in group:
+            if index in wanted:
+                spans.append((cursor, cursor + len(piece)))
+            cursor += len(piece) + 1  # the joining newline
+    return tuple(spans)
+
+
 def build_unit(
     *,
     fmt: str,
@@ -208,10 +309,21 @@ def build_unit(
     version: str,
     unit: int,
     text: str,
+    heading_lines: Sequence[int] = (),
 ) -> ParsedUnit:
     """Assemble one unit, failing named if any metadata field is
     missing. This is the single construction point for units — the
     SC10 guarantee lives here, not in each format parser.
+
+    ``heading_lines`` names the 0-based indices of ``text``'s lines
+    whose heading status is structural (an HTML ``h1``-``h6`` tag)
+    rather than a classifier decision. The freeze walks the text line
+    by line, so the index numbering is the OUTLET's, not the caller's:
+    with ``text = "\\nAB\\nCD"`` the claim is ``(2,)`` — ``split("\\n")``
+    yields ``["", "AB", "CD"]`` and the dropped blank shifts ``"CD"``
+    to index 2. The indices are mapped to spans of the frozen text and
+    carried on the unit; default ``()`` is the classifier-only shape
+    every format without heading tags has.
     """
     missing: list[str] = []
     if not fmt:
@@ -248,25 +360,70 @@ def build_unit(
         parse_rule_version=PARSE_RULE_VERSION,
         params_table_version=PARAMS_TABLE_VERSION,
         text=frozen,
+        heading_spans=_frozen_line_spans(text, frozen, heading_lines),
     )
+
+
+def _merge_blocks(
+    blocks: Sequence[StructuredBlock], cap: int
+) -> tuple[StructuredBlock, ...]:
+    """The ONE authority for the deterministic cap-merge rule.
+
+    Walks the blocks in order and folds the next block into the
+    current unit while the combined length stays within ``cap``. A
+    block longer than ``cap`` is never split — the cap bounds merging,
+    not the unit ceiling. Same input, same output (no randomness, no
+    locale, no clock).
+
+    The comparison is stated over the joined line text, so it is the
+    same decision the plain-string rule made; on a merge the incoming
+    block's heading indices shift by the predecessor's line count.
+    """
+    merged: list[StructuredBlock] = []
+    for block in blocks:
+        if (
+            merged
+            and len("\n".join(merged[-1].lines))
+            + len("\n".join(block.lines))
+            + 1
+            <= cap
+        ):
+            previous = merged[-1]
+            shift = len(previous.lines)
+            merged[-1] = StructuredBlock(
+                lines=previous.lines + block.lines,
+                heading_lines=previous.heading_lines
+                + tuple(index + shift for index in block.heading_lines),
+            )
+        else:
+            merged.append(block)
+    return tuple(merged)
 
 
 def merge_blocks(blocks: list[str], cap: int = BLOCK_MERGE_CAP_CHARS) -> list[str]:
     """Deterministically merge consecutive blocks under ``cap``.
 
-    Walks the block list in order and folds the next block into the
-    current unit while the combined length stays within ``cap``. A
-    block longer than ``cap`` is never split — the cap bounds merging,
-    not the unit ceiling. Same input, same output (no randomness, no
-    locale, no clock).
+    The plain-string door onto :func:`_merge_blocks` (the merge rule's
+    single authority) for the formats whose blocks carry no structural
+    heading claim. ``"\\n".join(b.split("\\n")) == b`` always, so this
+    is a byte-for-byte no-op over the previous implementation.
     """
-    merged: list[str] = []
-    for block in blocks:
-        if merged and len(merged[-1]) + len(block) + 1 <= cap:
-            merged[-1] = merged[-1] + "\n" + block
-        else:
-            merged.append(block)
-    return merged
+    structured = [
+        StructuredBlock(tuple(block.split("\n"))) for block in blocks
+    ]
+    return ["\n".join(block.lines) for block in _merge_blocks(structured, cap)]
+
+
+def merge_structured_blocks(
+    blocks: Sequence[StructuredBlock], cap: int = BLOCK_MERGE_CAP_CHARS
+) -> tuple[StructuredBlock, ...]:
+    """The cap merge for blocks that carry structural heading indices.
+
+    Same merge decisions as :func:`merge_blocks` (both delegate to
+    :func:`_merge_blocks`), with each merged block's heading indices
+    shifted into the merged line numbering.
+    """
+    return _merge_blocks(blocks, cap)
 
 
 __all__ = [
@@ -284,10 +441,12 @@ __all__ = [
     "ZIP_MAGIC",
     "ParseResult",
     "ParsedUnit",
+    "StructuredBlock",
     "UnitLocator",
     "build_unit",
     "content_family",
     "detect_language",
     "freeze_text",
     "merge_blocks",
+    "merge_structured_blocks",
 ]

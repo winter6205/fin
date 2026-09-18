@@ -175,8 +175,17 @@ def line_offsets(
     return tuple(offsets)
 
 
-def _heading_lines(text: str) -> tuple[tuple[int, int], ...]:
-    """Spans of the unit's heading lines, in text order."""
+def classifier_heading_lines(text: str) -> tuple[tuple[int, int], ...]:
+    """Spans of the unit's heading lines, in text order, by the
+    classifier alone.
+
+    Public because a caller outside this module now needs the same
+    set: the splitter unions it with the parser-carried heading spans
+    (markup the classifier must not be taught to recognize) before
+    handing ``window_spans`` its ``heading_lines``. Both sides of that
+    union must be the *classifier's* own spans, so the set is exported
+    rather than re-walked.
+    """
     return tuple(
         (ls, le) for ls, le in line_offsets(text) if is_heading_line(text[ls:le])
     )
@@ -365,7 +374,9 @@ def window_spans(
     if not text:
         return ()
     headings = (
-        _heading_lines(text) if heading_lines is None else tuple(heading_lines)
+        classifier_heading_lines(text)
+        if heading_lines is None
+        else tuple(heading_lines)
     )
     starts = _region_starts(text, headings)
     heading_end_of = {ls: le for ls, le in headings}
@@ -399,6 +410,7 @@ __all__ = [
     "WINDOW_OVERLAP_PERCENT",
     "WINDOW_OVERLAP_TOLERANCE",
     "ExtractWindow",
+    "classifier_heading_lines",
     "count_window_tokens",
     "is_heading_line",
     "line_offsets",

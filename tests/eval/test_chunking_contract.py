@@ -23,7 +23,10 @@ The frozen-unit source per sample kind mirrors the build pipeline
 (:mod:`fin.corpus.dataset.build`): primary PDFs are parsed with the T6
 entry point, live-fetched HTML primaries come from the committed
 extracted tree, and derived samples are parsed from their exported
-bytes. Summary numbers are printed with a stable ``T11 chunk contract:``
+bytes. The units are consumed verbatim — a ``ParsedUnit`` carries the
+parser's ``heading_spans`` (HTML ``h1``-``h6`` lines) beside its text,
+and re-building units from their text alone would drop those spans.
+Summary numbers are printed with a stable ``T11 chunk contract:``
 prefix so the eval run log carries the observed counts (sample count,
 unit count, parent count, child count, violations, B1 chunk band).
 """
@@ -35,7 +38,7 @@ from pathlib import Path
 
 import pytest
 
-from fin.corpus.chunking import split_unit
+from fin.corpus.chunking import effective_heading_lines, split_unit
 from fin.corpus.dataset.build import _load_registry, _load_units, default_paths
 from fin.corpus.dataset.manifest import (
     B1_MAX_CHUNKS,
@@ -62,12 +65,19 @@ def _repo_root(corpus_dir: Path) -> Path:
 
 def _frozen_units(
     sample: dict, corpus_dir: Path, dataset_dir: Path, units_by_doc: dict
-) -> list[tuple[int, str, str]]:
-    """The (document_id, unit ordinal, frozen text) triples of one
-    sample, produced by the same pipeline the build counts with:
-    primary PDFs via ``parse_document``, live-fetched HTML primaries
-    via the committed extracted tree, derived samples via their
-    exported bytes."""
+) -> list[ParsedUnit]:
+    """The frozen units of one sample, produced by the same pipeline the
+    build counts with: primary PDFs via ``parse_document``,
+    live-fetched HTML primaries via the committed extracted tree,
+    derived samples via their exported bytes.
+
+    The units are returned verbatim (not re-built from their text):
+    a ``ParsedUnit`` carries more than text now — the HTML parser
+    records its ``<h1>``-``<h6>`` lines as ``heading_spans``, and the
+    splitter reads them. Re-building through ``build_unit(text=...)``
+    would drop those spans and disagree with the manifest on every
+    HTML sample.
+    """
     if sample["origin"] == "primary":
         if sample["source_kind"] == "pdf":
             result = parse_document(
@@ -76,12 +86,19 @@ def _frozen_units(
                 document_id=sample["document_id"],
                 version=sample["sha256"],
             )
-            return [
-                (sample["document_id"], u.locator.unit, u.text)
-                for u in result.units
-            ]
+            return list(result.units)
+        # html_live: the committed extracted tree is the frozen-unit
+        # SSOT (not the tags — the tree holds pre-parsed pages), so
+        # these units correctly carry no structural heading spans.
         return [
-            (sample["document_id"], u.unit, u.text)
+            build_unit(
+                fmt=sample["format"],
+                source_sha256=sample["sha256"],
+                document_id=sample["document_id"],
+                version=sample["sha256"],
+                unit=u.unit,
+                text=u.text,
+            )
             for u in units_by_doc[sample["document_id"]]
             if u.text.strip()
         ]
@@ -97,7 +114,7 @@ def _frozen_units(
         document_id=sample["sample_id"],
         version=sample["sha256"],
     )
-    return [(sample["sample_id"], u.locator.unit, u.text) for u in result.units]
+    return list(result.units)
 
 
 def _samples_with_units():
@@ -112,15 +129,27 @@ def _samples_with_units():
         yield sample, units
 
 
-def _window_violations(uc, text: str, sid: str) -> list[str]:
+def _window_violations(
+    uc, text: str, sid: str, heading_spans: tuple[tuple[int, int], ...]
+) -> list[str]:
     """SC8 / SC11: the parent level is the title-scoped 抽图窗 — every
     parent is its window's span verbatim and the window BODY stays
     within the extract-window cap (ADR 0053 / 0060). The density row's
     ``max_chars`` bounds in-window children only; it must not shrink a
     window to child size, so it is not the cap asserted here.
+
+    The window set is re-derived with the SAME heading set the splitter
+    used — the classifier's lines unioned with the unit's parser-carried
+    spans — or the ordinals of a unit whose source has heading tags
+    would not line up with the parents the splitter produced.
     """
     out: list[str] = []
-    windows_by_ordinal = {w.ordinal: w for w in window_spans(text)}
+    headings = effective_heading_lines(
+        text, heading_spans, uc.params.boundary_priority
+    )
+    windows_by_ordinal = {
+        w.ordinal: w for w in window_spans(text, heading_lines=headings)
+    }
     for parent in uc.parents:
         if parent.text not in text:
             out.append(f"{sid}: parent not a substring of the unit")
@@ -170,22 +199,17 @@ def test_two_level_substring_on_full_dataset() -> None:
     for sample, units in _samples_with_units():
         stats["samples"] += 1
         sample_children = 0
-        for document_id, unit_ordinal, text in units:
+        for parsed in units:
             stats["units"] += 1
-            parsed: ParsedUnit = build_unit(
-                fmt=sample["format"],
-                source_sha256=sample["sha256"],
-                document_id=document_id,
-                version=sample["sha256"],
-                unit=unit_ordinal,
-                text=text,
-            )
+            text = parsed.text
             uc = split_unit(parsed, doc_type=sample["doc_type"])
-            sid = f"{sample['sample_id']}#{unit_ordinal}"
+            sid = f"{sample['sample_id']}#{parsed.locator.unit}"
             parents_by_id = {p.block_id: p for p in uc.parents}
             stats["parents"] += len(uc.parents)
             sample_children += len(uc.children)
-            violations.extend(_window_violations(uc, text, sid))
+            violations.extend(
+                _window_violations(uc, text, sid, parsed.heading_spans)
+            )
             violations.extend(_wire_walk_violations(uc, text, sid))
             for child in uc.children:
                 # SC11 level 1: child ⊂ parent
