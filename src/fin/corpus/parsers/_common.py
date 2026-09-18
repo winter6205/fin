@@ -36,12 +36,12 @@ from fin.corpus.params import TABLE_VERSION as _PARAMS_TABLE_VERSION
 # Markdown / Word). Consecutive blocks whose combined length stays
 # within this cap are merged into one unit; a single block larger than
 # the cap is never split (the cap bounds merging, not the unit ceiling).
-# The value is a fixed constant of parse rule version ``parse-1`` —
+# The value is a fixed constant of parse rule version ``parse-2`` —
 # changing it is a rule-version bump.
 BLOCK_MERGE_CAP_CHARS: Final[int] = 6000
 
 # Excel granularity: one unit per 64 consecutive non-empty rows within
-# a worksheet. Fixed constant of ``parse-1``; changing it is a
+# a worksheet. Fixed constant of ``parse-2``; changing it is a
 # rule-version bump.
 XLSX_ROWS_PER_UNIT: Final[int] = 64
 
@@ -54,7 +54,7 @@ PARAMS_TABLE_VERSION: Final[str] = _PARAMS_TABLE_VERSION
 # Parse-rule version of this package. Any change to granularity
 # constants, splitting, or freezing behavior must bump it (the spec's
 # "就地全量重建" rule keys off this stamp).
-PARSE_RULE_VERSION: Final[str] = "parse-1"
+PARSE_RULE_VERSION: Final[str] = "parse-2"
 
 # The seven supported formats (plan T6 order).
 SUPPORTED_FORMATS: Final[tuple[str, ...]] = (

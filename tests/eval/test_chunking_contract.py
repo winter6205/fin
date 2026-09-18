@@ -46,6 +46,7 @@ from fin.corpus.dataset.manifest import (
 from fin.corpus.normalization import normalize_frozen_text
 from fin.corpus.parsers import parse_document
 from fin.corpus.parsers._common import ParsedUnit, build_unit
+from fin.corpus.window import EXTRACT_WINDOW_CHARS, window_spans
 
 pytestmark = pytest.mark.eval
 
@@ -111,6 +112,50 @@ def _samples_with_units():
         yield sample, units
 
 
+def _window_violations(uc, text: str, sid: str) -> list[str]:
+    """SC8 / SC11: the parent level is the title-scoped 抽图窗 — every
+    parent is its window's span verbatim and the window BODY stays
+    within the extract-window cap (ADR 0053 / 0060). The density row's
+    ``max_chars`` bounds in-window children only; it must not shrink a
+    window to child size, so it is not the cap asserted here.
+    """
+    out: list[str] = []
+    windows_by_ordinal = {w.ordinal: w for w in window_spans(text)}
+    for parent in uc.parents:
+        if parent.text not in text:
+            out.append(f"{sid}: parent not a substring of the unit")
+        if parent.is_retrievable:
+            out.append(f"{sid}: parent marked retrievable")
+        window = windows_by_ordinal.get(parent.ordinal)
+        if window is None:
+            out.append(f"{sid}: parent has no matching window")
+            continue
+        if parent.text != window.text_of(text):
+            out.append(f"{sid}: parent is not its window span")
+        if len(window.body_of(text)) > EXTRACT_WINDOW_CHARS:
+            out.append(f"{sid}: window body above the cap")
+    return out
+
+
+def _wire_walk_violations(uc, text: str, sid: str) -> list[str]:
+    """SC11 wire invariant: the children in ordinal order must be
+    findable by a monotone cursor over the unit text. The envelope body
+    is the unit text, so a break here is the receiving service's
+    ``chunks[k] is not a contiguous substring of content`` refusal
+    (iknow ``src/tools/slice-invariants.ts``).
+    """
+    cursor = 0
+    for child in uc.children:
+        found = text.find(child.text, cursor)
+        if found == -1:
+            return [
+                f"{sid}: child ordinal {child.ordinal} not reachable "
+                f"at/after cursor {cursor}"
+            ]
+        cursor = found + len(child.text)
+    return []
+
+
 def test_two_level_substring_on_full_dataset() -> None:
     violations: list[str] = []
     stats = {
@@ -140,15 +185,8 @@ def test_two_level_substring_on_full_dataset() -> None:
             parents_by_id = {p.block_id: p for p in uc.parents}
             stats["parents"] += len(uc.parents)
             sample_children += len(uc.children)
-            for parent in uc.parents:
-                # SC11 level 2: parent ⊂ frozen unit text
-                if parent.text not in text:
-                    violations.append(f"{sid}: parent not a substring of the unit")
-                # SC16: parents are never retrievable
-                if parent.is_retrievable:
-                    violations.append(f"{sid}: parent marked retrievable")
-                if len(parent.text) > uc.params.max_chars:
-                    violations.append(f"{sid}: parent above max_chars")
+            violations.extend(_window_violations(uc, text, sid))
+            violations.extend(_wire_walk_violations(uc, text, sid))
             for child in uc.children:
                 # SC11 level 1: child ⊂ parent
                 parent = parents_by_id[child.parent_block_id]

@@ -5,7 +5,7 @@ Stdlib ``html.parser.HTMLParser`` only (no BeautifulSoup — the ACR
 restraint rule and "优先纯 stdlib" both point at the stdlib here; HTML
 text extraction does not justify a dependency).
 
-Rule (parse rule version ``parse-1``):
+Rule (parse rule version ``parse-2``):
 
 * ``h1``–``h6`` start a new block; the heading text is the block's
   first line;

@@ -1,7 +1,7 @@
 """Markdown parser: heading structure blocks -> frozen units (T6
 granularity).
 
-Rule (parse rule version ``parse-1``):
+Rule (parse rule version ``parse-2``):
 
 * ATX headings (``#``–``######`` at line start) start a new block; the
   heading line is the block's first line;

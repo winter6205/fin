@@ -241,7 +241,7 @@ def test_rebuilt_products_carry_only_current_versions(tmp_path) -> None:
 
     report = rebuild(target, manifest_path, corpus_dir=corpus_dir)
 
-    assert report.parse_rule_version == PARSE_RULE_VERSION == "parse-1"
+    assert report.parse_rule_version == PARSE_RULE_VERSION == "parse-2"
     assert report.params_table_version == PARAMS_TABLE_VERSION == "params-1"
     for path in target.glob("*.json"):
         payload = json.loads(path.read_text("utf-8"))
