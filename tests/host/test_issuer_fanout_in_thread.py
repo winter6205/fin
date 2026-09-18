@@ -298,7 +298,7 @@ def test_soft_track_classify_stays_flat_for_a_fanout_turn() -> None:
         adapter=port,
         thread_id="t-fanout-flat",
     )
-    assert out["track"] == "research"
+    assert out["track"] == "grounded"
     assert out["track_decision"]["decision_tier"] == "rules"
 
 

@@ -521,6 +521,18 @@ def test_tesseract_engine_raises_typed_when_pytesseract_missing(
         engine.recognize(source=tmp_path / "anything.pdf", page=1)
 
 
+def test_tesseract_engine_default_lang_includes_simplified_chinese() -> None:
+    """Default Tesseract langs cover mixed CN/EN scans (chi_sim+eng).
+
+    English-only default would drop 年报扫描件. Callers may still pass
+    ``lang=``; ingest's TesseractEngine() uses this default.
+    """
+    from fin.corpus.ocr import TesseractEngine
+
+    engine = TesseractEngine()
+    assert engine.lang == "chi_sim+eng"
+
+
 # ---------- ingest with no OCR configured stays on text-layer path ----------
 
 

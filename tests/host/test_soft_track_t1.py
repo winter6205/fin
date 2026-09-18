@@ -181,7 +181,7 @@ def test_research_fact_script_still_done_with_citation(aapl_page1_text):
         },
         config=_thread_config("t-soft-research"),
     )
-    assert out["track"] == "research"
+    assert out["track"] == "grounded"
     assert out["status"] == "done"
     assert len(out["citations"]) >= 1
 

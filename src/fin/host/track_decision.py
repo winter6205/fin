@@ -1,7 +1,7 @@
 """Soft-Track track decision cascade (rules → LLM → inherit → clarify → policy).
 
 ``decide_track`` chooses ``dialogue`` / ``clarify`` / ``off_topic`` /
-``research`` before the host graph executes a leaf.
+``grounded`` before the host graph executes a leaf.
 
 Tier order (no single global default track):
 
@@ -31,7 +31,7 @@ from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
-Track = Literal["dialogue", "clarify", "off_topic", "research"]
+Track = Literal["dialogue", "clarify", "off_topic", "grounded"]
 
 DecisionTier = Literal[
     "rules",
@@ -42,8 +42,10 @@ DecisionTier = Literal[
 ]
 
 _VALID_TRACKS: frozenset[str] = frozenset(
-    {"dialogue", "clarify", "off_topic", "research"}
+    {"dialogue", "clarify", "off_topic", "grounded"}
 )
+# Checkpoint / classify wire alias (ADR 0061).
+_TRACK_ALIASES: dict[str, Track] = {"research": "grounded"}
 _MIN_CLASSIFY_CONFIDENCE = 0.6
 
 # Canonical ticker spellings for snapshot storage.
@@ -59,7 +61,7 @@ _COMPANY_CANON: dict[str, str] = {
 _CLASSIFY_SYSTEM = (
     "Classify the operator utterance into exactly one Soft-Track track. "
     "Reply with JSON only: {\"track\": \"dialogue\"|\"clarify\"|"
-    "\"off_topic\"|\"research\"}."
+    "\"off_topic\"|\"grounded\"}."
 )
 
 
@@ -74,6 +76,16 @@ class TrackDecision:
     confidence: float
     decision_tier: DecisionTier
     signals: dict[str, Any] = field(default_factory=dict)
+
+
+def normalize_track(raw: object) -> Track | None:
+    """Map a wire/checkpoint track string onto the live enum (ADR 0061)."""
+    if not isinstance(raw, str):
+        return None
+    mapped = _TRACK_ALIASES.get(raw, raw)
+    if mapped in _VALID_TRACKS:
+        return mapped  # type: ignore[return-value]
+    return None
 
 
 # ----- rules patterns -----
@@ -281,7 +293,7 @@ def _rules_decision(text: str, signals: dict[str, Any]) -> TrackDecision | None:
         signals["filing_ask"] = True
         signals["research_signals"] = _research_signal_hits(text)
         return TrackDecision(
-            track="research",
+            track="grounded",
             confidence=0.9,
             decision_tier="rules",
             signals=signals,
@@ -298,7 +310,7 @@ def _rules_decision(text: str, signals: dict[str, Any]) -> TrackDecision | None:
         if _extract_company(text) and _extract_period(text):
             signals["research_signals"] = research_hits
             return TrackDecision(
-                track="research",
+                track="grounded",
                 confidence=0.9,
                 decision_tier="rules",
                 signals=signals,
@@ -310,7 +322,7 @@ def _rules_decision(text: str, signals: dict[str, Any]) -> TrackDecision | None:
         ):
             signals["research_signals"] = research_hits
             return TrackDecision(
-                track="research",
+                track="grounded",
                 confidence=0.9,
                 decision_tier="rules",
                 signals=signals,
@@ -320,7 +332,7 @@ def _rules_decision(text: str, signals: dict[str, Any]) -> TrackDecision | None:
         if not _FILING_ASK_RE.search(text or ""):
             signals["research_signals"] = research_hits
             return TrackDecision(
-                track="research",
+                track="grounded",
                 confidence=0.9,
                 decision_tier="rules",
                 signals=signals,
@@ -374,10 +386,11 @@ def _try_llm_classify(
         signals["classify_exit"] = "schema_parse"
         return None
 
-    track = data.get("track")
-    if track not in _VALID_TRACKS:
+    raw_track = data.get("track")
+    track = normalize_track(raw_track)
+    if track is None:
         signals["classify_exit"] = "invalid_track"
-        signals["invalid_track"] = track
+        signals["invalid_track"] = raw_track
         return None
 
     confidence = data.get("confidence", 0.7)
@@ -429,7 +442,7 @@ def _inherit_decision(
     signals["snapshot_company"] = latest.get("company") if latest else None
     signals["snapshot_period"] = latest.get("period") if latest else None
     return TrackDecision(
-        track="research",
+        track="grounded",
         confidence=0.75,
         decision_tier="inherit",
         signals=signals,
@@ -505,5 +518,6 @@ __all__ = [
     "Track",
     "TrackDecision",
     "decide_track",
+    "normalize_track",
     "snapshot_delta_for_utterance",
 ]

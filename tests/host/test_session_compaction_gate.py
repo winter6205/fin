@@ -681,7 +681,7 @@ def test_snapshot_slots_survive_for_classify_inherit(
             },
             config=_thread_config("t-gate-inherit"),
         )
-    assert follow["track"] == "research"
+    assert follow["track"] == "grounded"
     assert follow["track_decision"]["decision_tier"] == "inherit"
     assert follow["track_decision"]["signals"].get("snapshot_company") == "AAPL"
     # No re-compaction on the follow-up (still under 90%).

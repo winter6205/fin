@@ -8,11 +8,11 @@ copies and GET history never dumps them as a turn.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any, Literal
+from typing import Any
 
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
-from fin.host.track_decision import Track
+from fin.host.track_decision import Track, normalize_track
 
 HOST_INSTRUCTIONS_MARKER: str = "[FIN_HOST_INSTRUCTIONS]"
 THREAD_ATTACHMENTS_MARKER: str = "[FIN_THREAD_ATTACHMENTS]"
@@ -83,8 +83,8 @@ FIN_MEMORY_PREFETCH_MARKER: str = "[FIN_MEMORY_PREFETCH]"
 # enforce on the whole prompt).
 AGENT_IDENTITY: str = (
     "fin — enterprise knowledge-base Agent on the operator 工作台. "
-    "Each turn is a track (dialogue / clarify / off_topic / research); "
-    "tools and the citation verifier bind only to the research track. "
+    "Each turn is a track (dialogue / clarify / off_topic / grounded); "
+    "tools and the citation verifier bind only to the grounded track. "
     "The 知识库 is the one process-wide corpus shared by every "
     "research thread."
 )
@@ -268,7 +268,7 @@ def attachment_context_message(
 
 
 _TRACK_PROMPTS: dict[str, tuple[str, str]] = {
-    "research": (HOST_INSTRUCTIONS_MARKER, HOST_SYSTEM_PROMPT),
+    "grounded": (HOST_INSTRUCTIONS_MARKER, HOST_SYSTEM_PROMPT),
     "dialogue": (DIALOGUE_INSTRUCTIONS_MARKER, DIALOGUE_SYSTEM_PROMPT),
     "off_topic": (OFF_TOPIC_INSTRUCTIONS_MARKER, OFF_TOPIC_SYSTEM_PROMPT),
     "clarify": (CLARIFY_INSTRUCTIONS_MARKER, CLARIFY_SYSTEM_PROMPT),
@@ -277,7 +277,7 @@ _TRACK_PROMPTS: dict[str, tuple[str, str]] = {
 
 def messages_for_model(
     messages: list[BaseMessage],
-    track: Track | Literal["research"] = "dialogue",
+    track: Track | str = "dialogue",
     *,
     missing_slots: Sequence[str] | None = None,
     memory_on: bool | None = False,
@@ -322,10 +322,11 @@ def messages_for_model(
     call so callers that have no profile files on disk keep their
     prefix stable.
     """
+    resolved = normalize_track(track) or "dialogue"
     marker, prompt = _TRACK_PROMPTS.get(
-        track, (DIALOGUE_INSTRUCTIONS_MARKER, DIALOGUE_SYSTEM_PROMPT)
+        resolved, (DIALOGUE_INSTRUCTIONS_MARKER, DIALOGUE_SYSTEM_PROMPT)
     )
-    if track == "clarify":
+    if resolved == "clarify":
         prompt = clarify_prompt(missing_slots)
     if (
         messages

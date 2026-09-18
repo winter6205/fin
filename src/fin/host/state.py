@@ -286,7 +286,7 @@ class AgentState(TypedDict, total=False):
         wrote. Overwrite semantics; defaults ``False``.
     track
         Soft-Track T1: the per-run track chosen by ``classify``
-        (``dialogue`` / ``clarify`` / ``off_topic`` / ``research``).
+        (``dialogue`` / ``clarify`` / ``off_topic`` / ``grounded``).
     track_decision
         Soft-Track T1: auditable dict with ``track``, ``confidence``,
         ``decision_tier``, and structured ``signals``. Cleared by

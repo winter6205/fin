@@ -31,7 +31,7 @@ export type StreamErrorKind =
 
 // Soft-Track (specs/soft-track.md): per-turn host contract. Optional
 // on the wire until the host peer exposes SSE/GET ``track``.
-export type SoftTrack = "dialogue" | "clarify" | "off_topic" | "research";
+export type SoftTrack = "dialogue" | "clarify" | "off_topic" | "grounded";
 
 // Soft-Track RunRecord audit blob. Fields beyond ``track`` stay
 // optional so older rows / partial peers still typecheck.

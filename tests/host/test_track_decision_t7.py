@@ -38,7 +38,7 @@ def test_empty_messages_keep_deterministic_dialogue_fallback() -> None:
 @pytest.mark.soft_track
 def test_negative_classify_confidence_becomes_zero_and_clarifies() -> None:
     model = _ClassifyResponse(
-        '{"track": "research", "confidence": -0.25}'
+        '{"track": "grounded", "confidence": -0.25}'
     )
 
     decision = decide_track(
@@ -54,7 +54,7 @@ def test_negative_classify_confidence_becomes_zero_and_clarifies() -> None:
 @pytest.mark.soft_track
 def test_overflow_classify_confidence_is_capped() -> None:
     model = _ClassifyResponse(
-        '{"track": "research", "confidence": 1.25}'
+        '{"track": "grounded", "confidence": 1.25}'
     )
 
     decision = decide_track(
@@ -62,7 +62,7 @@ def test_overflow_classify_confidence_is_capped() -> None:
         classify_model=model,
     )
 
-    assert decision.track == "research"
+    assert decision.track == "grounded"
     assert decision.decision_tier == "llm"
     assert decision.confidence == 1.0
 

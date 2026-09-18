@@ -5,7 +5,7 @@ Spec rule (specs/soft-track.md): ``classify_model`` must reuse ``FIN_MODEL``,
 i.e. the same model already wired through ``compile_for_runtime``. The default
 of ``compile_graph(classify_model=None)`` permanently skips the LLM tier of
 Soft-Track, so every ambiguous utterance falls through to the residual
-``track="research"`` branch in :mod:`fin.host.track_decision`. That violates
+``track="grounded"`` branch in :mod:`fin.host.track_decision`. That violates
 the "no single global default track" rule and breaks the
 ``conditional_policy`` contract.
 

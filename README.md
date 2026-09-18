@@ -1,6 +1,6 @@
 # fin
 
-**Enterprise knowledge-base Agent** (企业知识库 Agent): the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. The first corpus is operator-held filings behind the **retrieve port** — a **source**, not the product. Citation checks run in code; LangGraph is the durable runtime (checkpoint / resume), not a retrieve-then-generate flowchart.
+**Enterprise knowledge-base Agent** (企业知识库 Agent): the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **grounded** track. The first corpus is operator-held filings behind the **retrieve port** — a **source**, not the product. Citation checks run in code; LangGraph is the durable runtime (checkpoint / resume), not a retrieve-then-generate flowchart.
 
 Product identity is SSOT'd in [`docs/CONTEXT.md`](docs/CONTEXT.md); the program contract is [`specs/enterprise-kb-agent.md`](specs/enterprise-kb-agent.md), mapped by wayfinder.
 
@@ -24,7 +24,7 @@ Upstream freeze: [docugami/private fixture source](https://github.com/docugami/p
 
 ## Status
 
-v1 host-agent ships: ingest artifacts are in git; CLI (`python -m fin`) and HTTP `POST /ask` share one compiled host graph. Default model is `MiniMax-M3` via `FIN_MODEL` + official MiniMax Chat Completions `FIN_BASE_URL` (ADR 0022). Soft-Track (ADR 0027, that pull request) routes each turn to `dialogue` / `clarify` / `off_topic` / `research`; only the research track binds tools and the citation verifier. Opt-in contracts: `uv run pytest -q -m soft_track`.
+v1 host-agent ships: ingest artifacts are in git; CLI (`python -m fin`) and HTTP `POST /ask` share one compiled host graph. Default model is `MiniMax-M3` via `FIN_MODEL` + official MiniMax Chat Completions `FIN_BASE_URL` (ADR 0022). Soft-Track (ADR 0027, that pull request) routes each turn to `dialogue` / `clarify` / `off_topic` / `grounded`; only the grounded track binds tools and the citation verifier. Opt-in contracts: `uv run pytest -q -m soft_track`.
 
 **NOW (2026-08-30):** the destination is **fin as an enterprise knowledge-base Agent** — wayfinder, contracted by `specs/enterprise-kb-agent.md` in five foci:
 
@@ -34,11 +34,19 @@ v1 host-agent ships: ingest artifacts are in git; CLI (`python -m fin`) and HTTP
 4. **Multi-issuer synthesize** — fan out in the host graph, then synthesize; every surviving claim still passes the verifier; over-cap is a typed overflow.
 5. **Trust in the workspace** — `evidence_locators` persisted on the run row, `GET /health`, and the eval count command.
 
-The **工作台** web UI is the only product entry; SEC filings are the first corpus, not the product name. the tracked change and the tracked change stay useful as **workstream** notes (vertical slice, quality loop) and are superseded as the product destination. Naming rule from the tracked change: the internal `research` track enum may stay (rename cost), but product copy and `docs/CONTEXT.md` must not call fin a research agent. Opt-in eval: `uv run pytest -q -m eval` (9 gold cases).
+The **工作台** web UI is the only product entry; SEC filings are the first corpus, not the product name. the tracked change and the tracked change stay useful as **workstream** notes (vertical slice, quality loop) and are superseded as the product destination. Naming rule from the tracked change: the internal track enum is `grounded` (ADR 0061); product copy and `docs/CONTEXT.md` must not call fin a research agent. Opt-in eval: `uv run pytest -q -m eval` (9 gold cases).
 
 ## Running the workspace server (T1)
 
-`fin-serve` binds `0.0.0.0:8000` and serves both the API routes and the built SPA same-origin. The SPA is NOT committed — it is a build artifact:
+One command from the repo root (fin Postgres, iknow-memory infra + `iknow-memory` on `PATH`, SPA build, then `fin-serve`):
+
+```bash
+bash scripts/dev-up.sh
+```
+
+Open **http://127.0.0.1:8000**. Needs Docker, Node, `uv`, a sibling `../iknow-memory` checkout (or `FIN_IKNOW_ROOT`), and `FIN_API_KEY` in `.env` for model calls. Ingest/retrieve embeddings need `GRAPHRAG_MEMORY_EMBED_API_KEY` in that iknow checkout's `.env.local`. Preflight only: `bash scripts/dev-up.sh --check`.
+
+`fin-serve` binds `0.0.0.0:8000` and serves both the API routes and the built SPA same-origin. The SPA is NOT committed — it is a build artifact. Manual split (same outcome as the script):
 
 ```bash
 cd web && npm install && npm run build   # produces web/dist/

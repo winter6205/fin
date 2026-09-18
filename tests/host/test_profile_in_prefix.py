@@ -1,7 +1,7 @@
 """Unconditional user-profile injection into the system prefix.
 
 The user profile is operator-profile machinery, NOT memory-fact
-machinery (operator decision on that pull request, cross-session-operator-memory
+machinery (operator decision, cross-session-operator-memory
 spec SC13). Its READ path (merged profile text into the system
 prefix) must work regardless of ``FIN_MEMORY_ENABLED`` — even with
 memory OFF, the operator's profile reaches the model. Only the
@@ -187,7 +187,7 @@ def test_profile_block_after_identity_before_pointer() -> None:
     profile = "Operator prefers quarterly revenue comparisons."
     msgs = [HumanMessage(content="q")]
     out = messages_for_model(
-        msgs, track="research", memory_on=True, user_profile=profile
+        msgs, track="grounded", memory_on=True, user_profile=profile
     )
     content = str(out[0].content)
 
@@ -229,7 +229,7 @@ def test_profile_present_when_memory_on() -> None:
     profile = "Operator prefers quarterly revenue comparisons."
     msgs = [HumanMessage(content="q")]
     out = messages_for_model(
-        msgs, track="research", memory_on=True, user_profile=profile
+        msgs, track="grounded", memory_on=True, user_profile=profile
     )
     content = str(out[0].content)
 
@@ -252,7 +252,7 @@ def test_profile_idempotent_on_pre_injected_block() -> None:
     )
     out = messages_for_model(
         [pre_existing, HumanMessage(content="q")],
-        track="research",
+        track="grounded",
         memory_on=True,
         user_profile=profile,
     )

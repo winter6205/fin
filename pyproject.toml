@@ -21,7 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 object-store = ["boto3>=1.43.83"]  # required for CLI S3/MinIO client creation
-ocr = ["pytesseract>=0.3.10"]  # requires system tesseract binary
+ocr = ["pytesseract>=0.3.10"]  # system tesseract + traineddata eng and chi_sim
 
 [build-system]
 requires = ["hatchling"]
