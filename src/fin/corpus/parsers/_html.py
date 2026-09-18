@@ -17,6 +17,15 @@ Rule (parse rule version ``parse-2``):
 * consecutive blocks are merged under
   :data:`~fin.corpus.parsers._common.BLOCK_MERGE_CAP_CHARS` (the
   deterministic cap; a block larger than the cap is never split).
+
+Heading tags are carried as STRUCTURAL SPANS, not re-guessed from the
+frozen text: each produced line records whether it came from inside an
+``h1``–``h6`` tag, and the block hands those line indices to
+:func:`~fin.corpus.parsers._common.build_unit` as ``heading_lines``.
+The tag itself never reaches the frozen text (SC7's contiguity rule),
+and the window classifier stays ATX + UPPERCASE-only — a title-case
+``<h2>Revenue</h2>`` resolves its title from the span, not from a
+widened classifier (ADR 0053 / 0060).
 """
 
 from __future__ import annotations
@@ -29,8 +38,9 @@ from fin.corpus.errors import (
 )
 from fin.corpus.parsers._common import (
     ParsedUnit,
+    StructuredBlock,
     build_unit,
-    merge_blocks,
+    merge_structured_blocks,
 )
 
 _HEADING_TAGS = frozenset(("h1", "h2", "h3", "h4", "h5", "h6"))
@@ -65,12 +75,24 @@ class _HeadingBlockParser(HTMLParser):
     element and table-row boundaries; within a line, cell boundaries
     emit ``" "``. The raw (non-normalized) block list is returned;
     freezing happens in ``build_unit``.
+
+    Each block also records which of its lines came from inside a
+    heading tag: ``self._in_heading`` is the open-tag state,
+    ``self._heading_lines`` collects the indices. The two flags are
+    kept strictly apart — a line index may only be appended inside
+    :meth:`_flush_line`, and the block's list may only be captured and
+    reset inside :meth:`_flush_block` — so a line index can never
+    outlive the block it belongs to. An unclosed heading tag keeps
+    marking its trailing lines (malformed input; deterministic all the
+    same).
     """
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self._blocks: list[str] = []
+        self._blocks: list[StructuredBlock] = []
         self._current: list[str] = []
+        self._heading_lines: list[int] = []
+        self._in_heading = False
         self._line: list[str] = []
         self._cell: list[str] = []
         self._in_cell = 0
@@ -83,12 +105,21 @@ class _HeadingBlockParser(HTMLParser):
         self._line = []
         if text:
             self._current.append(text)
+            if self._in_heading:
+                self._heading_lines.append(len(self._current) - 1)
 
     def _flush_block(self) -> None:
         self._flush_line()
         if self._current:
-            self._blocks.append("\n".join(self._current))
+            self._blocks.append(
+                StructuredBlock(
+                    tuple(self._current), tuple(self._heading_lines)
+                )
+            )
+            # Both reset together: an index left behind would mark a
+            # line of the NEXT block.
             self._current = []
+            self._heading_lines = []
 
     # -- tag handlers ---------------------------------------------------
 
@@ -103,8 +134,10 @@ class _HeadingBlockParser(HTMLParser):
             return
         if tag in _HEADING_TAGS:
             # A heading starts a new block; its text becomes the
-            # block's first line.
+            # block's first line, and the lines it contributes are
+            # marked as structural headings until the close tag.
             self._flush_block()
+            self._in_heading = True
         elif tag in _CELL_TAGS:
             self._in_cell += 1
             self._cell = []
@@ -129,6 +162,8 @@ class _HeadingBlockParser(HTMLParser):
             or tag in ("body", "html")
         ):
             self._flush_line()
+            if tag in _HEADING_TAGS:
+                self._in_heading = False
 
     # -- data handlers ---------------------------------------------------
 
@@ -140,9 +175,25 @@ class _HeadingBlockParser(HTMLParser):
         else:
             self._line.append(data)
 
-    def blocks(self) -> list[str]:
+    def structured_blocks(self) -> tuple[StructuredBlock, ...]:
         self._flush_block()
-        return self._blocks
+        return tuple(self._blocks)
+
+
+def _joined_line_index(lines: tuple[str, ...], index: int) -> int:
+    """Map a ``StructuredBlock.lines`` index to its index in
+    ``"\\n".join(lines)``.
+
+    The two spaces are not the same one: ``_flush_line`` appends a
+    line's whole text, and a ``<pre>`` block's text carries real
+    newlines, so ONE parser line becomes SEVERAL frozen lines. An index
+    counted over the block's lines must therefore be shifted by the
+    extra newlines the lines before it contribute — otherwise the
+    heading claim lands on a body line of the same block (measured on
+    the committed fixtures: a ``<h2>`` after a ``<pre>`` block was
+    mapped to the middle of that block's prose).
+    """
+    return sum(len(line.split("\n")) for line in lines[:index])
 
 
 def parse_html(
@@ -169,10 +220,14 @@ def parse_html(
             document_id=document_id,
             version=version,
             unit=ordinal,
-            text=block,
+            text="\n".join(block.lines),
+            heading_lines=tuple(
+                _joined_line_index(block.lines, index)
+                for index in block.heading_lines
+            ),
         )
         for ordinal, block in enumerate(
-            merge_blocks(parser.blocks()), start=1
+            merge_structured_blocks(parser.structured_blocks()), start=1
         )
     ]
     if not units:

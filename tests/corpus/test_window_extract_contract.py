@@ -37,26 +37,27 @@ call — import or attribute — trips it. The assertion is deliberately
 specific: an OCR call anywhere on the split path fails this test, and
 nothing else does.
 
-A known gap this module records rather than hides
--------------------------------------------------
-SC7 says HTML headings are the title source. A frozen HTML unit
-carries the heading **text** only (``parse_html`` flattens the tags —
-``_html.py``'s heading block contributes its text as the block's first
-line), so the window rule sees a bare line like ``Revenue``. The
-window rule's classifier accepts markdown ATX and uppercase-only
-lines, so ``<h2>Revenue</h2>`` lands on ``title is None`` while
-``<h2>REVENUE</h2>`` lands on ``"REVENUE"``. Every committed HTML
-dataset fixture is of the first shape (``<h2>Unit 1</h2>``), so the
-gap is load-bearing, not hypothetical.
+The parser-carried heading span contract
+----------------------------------------
+SC7 says HTML heading **tags** are the window title source. The frozen
+unit text still carries the heading text only (``parse_html`` flattens
+the tag; SC7's contiguity rule forbids re-emitting markup), so the
+title source cannot be a re-guess over the frozen text — the window
+classifier deliberately accepts markdown ATX and uppercase-only lines
+and nothing else. A title-case ``<h2>Revenue</h2>`` would be invisible
+to it.
 
-That is a real contract gap, reported and not fixed here (the fix
-touches ``src/fin/corpus/window.py`` / the parsers, owned by another
-worker). The HTML test below uses an uppercase heading fixture, so it
-locks the *convention* — heading text becomes the title and tags never
-leak into the frozen text — and
-``test_sc7_html_title_case_heading_becomes_the_window_title`` states
-the SC7 claim positively under a strict ``xfail``, so a later fix
-flips it to XPASS loudly instead of changing a title silently.
+The structural fact therefore travels *beside* the text: the HTML
+parser records which lines came from inside an ``h1``–``h6`` tag
+(``ParsedUnit.heading_spans``), the splitter unions those spans with
+the classifier's own set (``chunking.effective_heading_lines``) and
+hands the union to :func:`fin.corpus.window.window_spans`. The union
+is additive: a unit with no heading tags yields exactly the union's
+classifier half, i.e. the pre-fix behavior, and an UPPERCASE HTML
+heading keeps working through the classifier arm.
+``test_sc7_html_title_case_heading_becomes_the_window_title`` asserts
+both halves of that contract — the title-case heading resolves, and
+``is_heading_line("Revenue")`` is still ``False``.
 """
 
 from __future__ import annotations
@@ -366,36 +367,62 @@ def test_sc7_html_heading_tag_becomes_the_window_title() -> None:
     assert [p.title for p in costs.parents] == ["COSTS"]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "SC7 gap (reported, not fixed here): HTML heading tags are the "
-        "title source, but the frozen unit drops the tag and the window "
-        "classifier does not recognize a title-case line, so "
-        "<h2>Revenue</h2> yields title None. Remove this mark when the "
-        "fix lands (strict: it will XPASS the moment it does)."
-    ),
-)
 def test_sc7_html_title_case_heading_becomes_the_window_title() -> None:
-    # The SC7 contract stated positively: a reverse-case HTML heading
-    # yields the heading text as the title. It does not hold today —
-    # the frozen HTML unit drops the tags (``_html.py`` contributes
-    # only the heading text as the block's first line), so the window
-    # rule sees a bare ``Revenue`` line, and its classifier accepts
-    # markdown ATX and UPPERCASE-only lines but not a title-case line.
-    # Every committed HTML dataset fixture is this shape
-    # (``<h2>Unit 1</h2>``), so the gap is load-bearing.
+    # The SC7 contract stated positively and through the real product
+    # path: a title-case HTML heading yields the heading text as the
+    # title. The title source is the ``<h2>`` TAG, carried as a
+    # structural span beside the frozen text (the tag itself never
+    # reaches the frozen text — SC7's contiguity rule), NOT a re-guess
+    # over the frozen line: the classifier deliberately stays
+    # ATX + UPPERCASE-only, so ``is_heading_line("Revenue")`` is
+    # asserted False below. Every committed derived HTML fixture is
+    # this shape (``<h2>Unit N</h2>``), so the contract is load-bearing.
     source = (
         "<html><body><main>"
-        "<h2>Revenue</h2><p>Total net sales increased.</p>"
+        "<h2>Revenue</h2><p>" + _big_body() + "</p>"
+        "<h2>Costs</h2><p>Cost of sales were flat.</p>"
         "</main></body></html>"
     ).encode("utf-8")
     parsed = _parse_html(source)
-    unit = parsed.units[0]
-    assert unit.text.startswith("Revenue")
-    windows = window_spans(unit.text)
-    assert [w.title for w in windows] == ["Revenue"]
-    assert is_heading_line("Revenue")
+    revenue_unit = next(
+        candidate
+        for candidate in parsed.units
+        if candidate.text.startswith("Revenue")
+    )
+    assert "<h2>" not in revenue_unit.text, "tags never enter the frozen text"
+    assert "</h2>" not in revenue_unit.text
+    assert is_heading_line("Revenue") is False, (
+        "the classifier stays ATX + UPPERCASE-only; the title comes from "
+        "the parser-carried span, not from a widened classifier"
+    )
+    revenue = split_unit(revenue_unit, doc_type="narrative")
+    revenue_titles = [p.title for p in revenue.parents]
+    assert set(revenue_titles) == {"Revenue"}, revenue_titles
+    # the revenue heading's body overflows, so several windows share it
+    assert len(revenue_titles) >= 2, revenue_titles
+    assert revenue.parents[0].text.startswith("Revenue")
+    assert all(
+        not p.text.startswith("Revenue") for p in revenue.parents[1:]
+    ), "later overflow windows do not re-emit the heading line"
+    # the second heading's own unit carries its own title
+    costs_unit = next(
+        candidate
+        for candidate in parsed.units
+        if candidate.text.startswith("Costs")
+    )
+    costs = split_unit(costs_unit, doc_type="narrative")
+    assert [p.title for p in costs.parents] == ["Costs"]
+
+
+def test_sc7_classifier_stays_atx_and_uppercase_only() -> None:
+    # The negative half of the SC7 title-source contract: the fix is
+    # the parser-carried span, never a widened classifier. Widening
+    # ``is_heading_line`` to Title Case would re-cut every window of
+    # the committed dataset (measured: 374/386 samples move,
+    # ``chunk_total`` 36015 → 56262), so the classifier arms stay
+    # exactly ATX + UPPERCASE-only.
+    for line in ("Three Months Ended", "Total", "Item 1", "Revenue"):
+        assert is_heading_line(line) is False, line
 
 
 def test_sc7_ocr_write_back_windows_share_the_one_frozen_unit() -> None:

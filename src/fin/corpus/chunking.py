@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final
 
@@ -75,6 +76,7 @@ from fin.corpus.params import _LIST_ITEM_RE
 from fin.corpus.parsers._common import ParseResult, ParsedUnit, UnitLocator
 from fin.corpus.window import (
     ExtractWindow,
+    classifier_heading_lines,
     is_heading_line,
     line_offsets,
     window_spans,
@@ -116,6 +118,10 @@ def classify_section(text: str) -> str:
         return "table"
     if item_lines > 0 and item_lines * 2 >= n:
         return "list"
+    # The section label stays the frozen-text classifier's: the parser-
+    # carried heading spans are a TITLE-scoping fact of the window
+    # level, not a lexical key of the child level (widening the label
+    # would re-cut every child block of the dataset).
     if lines and is_heading_line(lines[0]):
         return "heading"
     return "body"
@@ -140,6 +146,10 @@ def _cuts_of_rank(
     """
     cuts: list[tuple[int, int]] = []
     if rank == BOUNDARY_HEADING:
+        # Child cuts keep the frozen-text classifier only: the parser-
+        # carried spans scope window TITLES, they are not child-level
+        # lexical boundaries (moving them would re-cut the dataset's
+        # children, a subtractive regression the ticket forbids).
         for ls, le in line_offsets(text, start, end):
             if ls > start and is_heading_line(text[ls:le]):
                 cuts.append((ls - 1, ls))  # cut before the newline, next at line start
@@ -175,7 +185,32 @@ def _hard_cut(text: str, start: int, end: int, cap: int) -> tuple[int, int]:
     return p, n
 
 
-def _parent_windows(text: str, chain: tuple[int, ...]) -> tuple[ExtractWindow, ...]:
+def effective_heading_lines(
+    text: str, heading_spans: Sequence[tuple[int, int]], chain: tuple[int, ...]
+) -> tuple[tuple[int, int], ...]:
+    """The heading set the window rule is handed for one unit: the
+    classifier's own spans UNION the parser-carried structural spans.
+
+    The union is additive by design. ``heading_spans`` names the lines
+    a parser knows structurally (HTML ``h1``-``h6`` tags) and the
+    classifier names the ATX / UPPERCASE lines; replacing one set with
+    the other would either drop the tag-backed titles this channel
+    exists to add or delete the UPPERCASE titles the classifier
+    already resolves. Sorted and deduplicated because
+    :func:`fin.corpus.window.window_spans` reads the spans in the given
+    order — an unsorted sequence silently produces a wrong tree. The
+    ``heading`` rank gates both halves: a chain without it states that
+    this corpus has no headings at all.
+    """
+    if BOUNDARY_HEADING not in chain:
+        return ()
+    classifier = set(classifier_heading_lines(text))
+    return tuple(sorted(classifier | set(heading_spans)))
+
+
+def _parent_windows(
+    text: str, chain: tuple[int, ...], heading_spans: Sequence[tuple[int, int]]
+) -> tuple[ExtractWindow, ...]:
     """The parent level: the title-scoped **抽图窗** of the unit.
 
     The window rule is :func:`fin.corpus.window.window_spans` — the
@@ -184,11 +219,14 @@ def _parent_windows(text: str, chain: tuple[int, ...]) -> tuple[ExtractWindow, .
     boundary chain still tells the window rule which line shapes its
     own classifier counts as headings (the ``heading`` rank is in every
     row today, but an out-of-row chain is the caller's statement about
-    its own corpus, so the spaces are handed in verbatim).
+    its own corpus, so the spaces are handed in verbatim). The unit's
+    parser-carried spans join that set through
+    :func:`effective_heading_lines`; a unit with none (every format
+    without heading tags) yields exactly the classifier's own set.
     """
-    if BOUNDARY_HEADING not in chain:
-        return window_spans(text, heading_lines=())
-    return window_spans(text)
+    return window_spans(
+        text, heading_lines=effective_heading_lines(text, heading_spans, chain)
+    )
 
 
 def _merge_small_spans(
@@ -548,7 +586,9 @@ def split_unit(unit: ParsedUnit, *, doc_type: str) -> UnitChunking:
     density = classify_text_density(text)
     params = lookup_chunk_params(doc_type, section, density)
 
-    windows = _parent_windows(text, params.boundary_priority)
+    windows = _parent_windows(
+        text, params.boundary_priority, unit.heading_spans
+    )
     parent_blocks = [_parent_block(unit, text, window) for window in windows]
 
     return UnitChunking(
@@ -586,6 +626,7 @@ __all__ = [
     "DocumentChunking",
     "UnitChunking",
     "classify_section",
+    "effective_heading_lines",
     "split_document",
     "split_unit",
 ]
