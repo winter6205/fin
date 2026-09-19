@@ -11,13 +11,18 @@
 // a failure for that check id — never a skip, never an aborted run.
 
 // Checks that run on every invocation, in report order.
+// ``1-kb-corpus`` was renamed to ``1-home-chrome`` and
+// ``6-status-strip`` to ``6-boot-status``: ``specs/workbench-
+// retrieve-product-seam.md`` retired the /kb corpus grid and the
+// /monitor status panel (see each check's comment), so the old names
+// pinned surfaces that no longer exist.
 const BASE_CHECK_IDS = [
-  "1-kb-corpus",
+  "1-home-chrome",
   "2-stream-no-retract",
   "4-dom-separation",
   "5-trace-collapse",
   "3-reload-persist",
-  "6-status-strip",
+  "6-boot-status",
 ];
 
 // Runs only when the workspace under test replays a transcript that
@@ -143,31 +148,77 @@ export default async function runStreamChecks(page, options = {}) {
     return ((await node.first().textContent()) ?? "").replace(/\s+/g, " ").trim();
   };
 
-  // T1 workbench chrome: corpus cards + IngestCorpusControl moved off
-  // ``/`` onto ``/kb`` (specs/workbench-chrome.md). The check drives
-  // ``/kb`` and asserts the catalog surface is intact; ``/`` is the
-  // 对话 empty / last-thread restore surface and does not carry the
-  // card grid.
-  await check("1-kb-corpus", async () => {
-    await page.goto(cfg.baseUrl + "/kb", { timeout: cfg.navTimeoutMs });
-    await page
-      .locator("button")
-      .filter({ hasText: "pages" })
+  // specs/workbench-retrieve-product-seam.md SC6/SC7 retired the whole
+  // corpus surface: ``/kb`` + its card grid + the ingest control left
+  // the product path ("KnowledgeBasePage / MonitorPage / freeze corpus
+  // cards / fin upload shell from the product path"), and deep links
+  // to them must 404 — deliberately NOT a redirect home. This check
+  // pins the current home chrome (the SPA boot + sidebar that every
+  // later check drives) and the retired-route 404. The former
+  // ``corpusCards >= 12`` / ``ingestVisible > 0`` assertions flipped to
+  // absence assertions: the grid existing again on a product route is
+  // exactly what the spec forbids.
+  await check("1-home-chrome", async () => {
+    await page.goto(cfg.baseUrl + "/", { timeout: cfg.navTimeoutMs });
+    const homeHeadingVisible = await page
+      .getByText("研究对话")
       .first()
-      .waitFor({ timeout: cfg.navTimeoutMs });
+      .isVisible()
+      .catch(() => false);
+    const newThreadVisible = await page
+      .getByRole("button", { name: "+ 新建 thread" })
+      .isVisible();
+    const mcpLineCount = await page
+      .locator('[data-testid="knowledge-mcp-line"]')
+      .count();
+    const bindLineCount = await page
+      .locator('[data-testid="bound-collection-line"]')
+      .count();
     const corpusCards = await page
       .locator("button")
       .filter({ hasText: "pages" })
       .count();
-    const newThreadVisible = await page
-      .getByRole("button", { name: "+ 新建 thread" })
-      .isVisible();
     const ingestVisible = await page
       .locator('[data-testid="ingest-control"]')
       .count();
+
+    // The retired deep links must render the plain 404 and keep the
+    // address bar (no silent bounce to ``/``). Pathname is sliced off
+    // the known baseUrl, not parsed with ``URL``: the snippet runs in
+    // the driver context, where the global ``URL`` is not defined.
+    const pathname = () => page.url().slice(cfg.baseUrl.length);
+    await page.goto(cfg.baseUrl + "/kb", { timeout: cfg.navTimeoutMs });
+    const kbNotFound =
+      (await page.getByText("页面不存在").count()) === 1 &&
+      pathname() === "/kb";
+    await page.goto(cfg.baseUrl + "/monitor", { timeout: cfg.navTimeoutMs });
+    const monitorNotFound =
+      (await page.getByText("页面不存在").count()) === 1 &&
+      pathname() === "/monitor";
+
+    // Leave the SPA on the home route for the stream checks.
+    await page.goto(cfg.baseUrl + "/", { timeout: cfg.navTimeoutMs });
+
     return {
-      pass: corpusCards >= 12 && newThreadVisible && ingestVisible > 0,
-      detail: { corpusCards, newThreadVisible, ingestVisible },
+      pass:
+        homeHeadingVisible &&
+        newThreadVisible &&
+        mcpLineCount === 1 &&
+        bindLineCount === 1 &&
+        corpusCards === 0 &&
+        ingestVisible === 0 &&
+        kbNotFound &&
+        monitorNotFound,
+      detail: {
+        homeHeadingVisible,
+        newThreadVisible,
+        mcpLineCount,
+        bindLineCount,
+        corpusCards,
+        ingestVisible,
+        kbNotFound,
+        monitorNotFound,
+      },
     };
   });
 
@@ -417,108 +468,161 @@ export default async function runStreamChecks(page, options = {}) {
     };
   });
 
-  // T3 (specs/workbench-chrome.md): the Sidebar footer strip is
-  // gone. The status copy now lives on /monitor, and an
-  // unreachable retrieve paints a non-text-only mark on the 监控
-  // entry. This check asserts the new IA on three surfaces:
-  //   1. on /monitor, the panel + 重连 button are present;
-  //   2. on a thread route, the strip selector is gone;
-  //   3. on the home route, the strip selector is gone.
-  // The probe answer is checked against the rendered headline so
-  // a healthy vs unreachable boot reads distinctly.
-  await check("6-status-strip", async () => {
+  // specs/workbench-retrieve-product-seam.md retired BOTH status
+  // surfaces this check used to drive: the sidebar footer strip
+  // (``status-retrieve``) and the /monitor panel (headline / detail /
+  // 重连). The host retired the two-state ``retrieve_reachability``
+  // field with them — ``GET /api/status`` now publishes the five-field
+  // boot snapshot (``knowledge_mcp`` three-state,
+  // ``retrieve_adapter_kind``, ``model_identity``,
+  // ``corpus_filing_count``, ``bound_collection_name``) and the SPA
+  // REJECTS any payload still carrying the old field
+  // (``web/src/knowledgeMcp.ts:parseWorkspaceStatus``). The operator
+  // surface is the sidebar's two boot-scoped lines on every route.
+  // The old invariants map over unchanged in kind:
+  //   - "headline agrees with the route" -> the 知识 MCP line's
+  //     state/copy must equal the snapshot's ``knowledge_mcp`` (缺/坏 →
+  //     「知识 MCP 故障」; 可达 → 「知识 MCP 已连接」, exactly, not
+  //     substring);
+  //   - "a healthy vs unreachable boot reads distinctly" -> kept, the
+  //     verdict is still derived from the route value, never hardcoded;
+  //   - "detail text non-empty" -> the sibling bind line must name the
+  //     route's ``bound_collection_name`` (or the 未绑定 copy);
+  //   - the 重连 control is gone by spec, so its presence assertion
+  //     flips to absence on every chrome surface, together with the
+  //     legacy strip and panel selectors;
+  //   - a line stuck in 检查中 is never a verdict — the poll timeout
+  //     reports it, same as the old panel-loading rule.
+  // Copy strings are hand-mirrored from ``web/src/knowledgeMcp.ts``
+  // (the harness drives the product from outside and pins its copy).
+  await check("6-boot-status", async () => {
     const route = await page.evaluate(async (base) => {
       const response = await fetch(base + "/api/status");
       return { ok: response.ok, body: await response.json() };
     }, cfg.baseUrl);
 
-    const unreachable = route.body?.retrieve_reachability === "unreachable";
+    // One predicate row per snapshot field instead of one growing `&&`
+    // chain: adding a field to the contract adds a row, not branching.
+    const wireContractOk = (b) =>
+      [
+        !("retrieve_reachability" in b),
+        ["missing", "fault", "reachable"].includes(b.knowledge_mcp),
+        ["mcp", "fake"].includes(b.retrieve_adapter_kind),
+        typeof b.model_identity === "string" && b.model_identity.length > 0,
+        typeof b.corpus_filing_count === "number" &&
+          Number.isFinite(b.corpus_filing_count),
+        typeof b.bound_collection_name === "string" &&
+          b.bound_collection_name.length > 0,
+      ].every(Boolean);
 
-    // /monitor — the status panel must render with a headline +
-    // 重连 control. Headline agrees with the route: unreachable
-    // → 不可用, reachable (mcp or fake) → 可用 (excluding the
-    // negation, since 不可用 contains 可用). The panel starts in
-    // the 读取中 loading state until the status fetch lands, so the
-    // headline is polled until it settles (loading never counts as
-    // a verdict — a panel stuck loading is what a poll timeout
-    // reports).
-    await page.goto(cfg.baseUrl + "/monitor", { timeout: cfg.navTimeoutMs });
-    const panel = page.locator('[data-testid="monitor-status-panel"]');
-    const panelCount = await panel.count();
-    let headlineText = "";
-    let detailText = "";
-    let reconnectCount = 0;
-    if (panelCount > 0) {
-      const readHeadline = async () =>
-        (
-          (await panel
-            .locator('[data-testid="monitor-status-headline"]')
-            .first()
-            .textContent()) ?? ""
-        ).replace(/\s+/g, " ").trim();
-      const deadline = Date.now() + cfg.navTimeoutMs;
-      while (Date.now() < deadline) {
-        headlineText = await readHeadline();
-        if (headlineText.length > 0 && !headlineText.includes("读取中")) break;
-        await page.waitForTimeout(100);
+    // The sidebar copy is a pure function of the snapshot. Every
+    // knowledge_mcp state gets an explicit row so a new state must be
+    // added to the table rather than silently falling into an else.
+    const expectedCopies = (b) => {
+      const mcpCopy = {
+        missing: "知识 MCP 故障",
+        fault: "知识 MCP 故障",
+        reachable: "知识 MCP 已连接",
+      };
+      const bindState =
+        b.bound_collection_name === "unbound" ? "unbound" : "bound";
+      const bindCopy = {
+        unbound: "资料集合：未绑定",
+        bound: `资料集合：${b.bound_collection_name}`,
+      };
+      return {
+        mcpText: mcpCopy[b.knowledge_mcp] ?? "知识 MCP 故障",
+        bindState,
+        bindText: bindCopy[bindState],
+      };
+    };
+
+    const readLineText = async (selector) =>
+      ((await page.locator(selector).first().textContent()) ?? "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    // detail must print null, not undefined, for absent wire fields.
+    const orNull = (value) => value ?? null;
+
+    const body = route.body ?? {};
+    const expected = expectedCopies(body);
+
+    // The lines are boot-scoped and render ``unknown`` until the
+    // status fetch lands; poll the state-pinned selectors until they
+    // arm (or the nav budget runs out, which reads as a failure).
+    const mcpLineSelector = `[data-testid="knowledge-mcp-line"][data-state="${body.knowledge_mcp ?? "unknown"}"]`;
+    const bindLineSelector = `[data-testid="bound-collection-line"][data-state="${expected.bindState}"]`;
+    const legacySelectors = [
+      '[data-testid="status-retrieve"]',
+      '[data-testid="monitor-status-panel"]',
+      '[data-testid="monitor-reconnect"]',
+    ];
+    const countLegacy = async () => {
+      let total = 0;
+      for (const selector of legacySelectors) {
+        total += await page.locator(selector).count();
       }
-      detailText = (
-        (await panel
-          .locator('[data-testid="monitor-status-detail"]')
-          .first()
-          .textContent()) ?? ""
-      ).replace(/\s+/g, " ").trim();
-      reconnectCount = await panel
-        .locator('[data-testid="monitor-reconnect"]')
-        .count();
-    }
+      return total;
+    };
 
-    const headlineMatchesRoute = unreachable
-      ? headlineText.includes("不可用")
-      : headlineText.includes("可用") &&
-        !headlineText.includes("不可用");
+    // 1. thread route (check 3 left the browser on /t/{id}).
+    await page.waitForSelector(mcpLineSelector, {
+      timeout: cfg.navTimeoutMs,
+    });
+    await page.waitForSelector(bindLineSelector, {
+      timeout: cfg.navTimeoutMs,
+    });
+    const mcpLineText = await readLineText(mcpLineSelector);
+    const bindLineText = await readLineText(bindLineSelector);
+    const legacyOnThread = await countLegacy();
 
-    // Sidebar — the legacy footer strip selector must be gone on
-    // every chrome surface. /monitor is already loaded; we hop
-    // through / and /t/{id} to assert each.
-    async function legacyStripAbsent(label) {
-      await page.goto(cfg.baseUrl + label, { timeout: cfg.navTimeoutMs });
-      const legacy = await page
-        .locator('[data-testid="status-retrieve"]')
-        .count();
-      return legacy;
-    }
-    const onHomeLegacy = await legacyStripAbsent("/");
-    // New thread so we have a /t/{id} to verify against.
+    // 2. retired deep link: /monitor must render the 404, not the
+    // retired panel or its controls.
     await page.goto(cfg.baseUrl + "/monitor", { timeout: cfg.navTimeoutMs });
-    await page
-      .getByRole("button", { name: "+ 新建 thread" })
-      .click({ timeout: cfg.navTimeoutMs });
-    await page.waitForURL(/\/t\//, { timeout: cfg.navTimeoutMs });
-    const onThreadLegacy = await page
-      .locator('[data-testid="status-retrieve"]')
-      .count();
-    await page.goto(cfg.baseUrl + "/monitor", { timeout: cfg.navTimeoutMs });
+    const monitorRetired =
+      (await page.getByText("页面不存在").count()) === 1 &&
+      (await page.locator('[data-testid="monitor-status-panel"]').count()) ===
+        0;
+    const legacyOnMonitor = await countLegacy();
+
+    // 3. home route: the sidebar lines ride every product route, so
+    // the same copy must arm here too (last-thread restore may bounce
+    // / to /t/{id}; either way the chrome must be current).
+    await page.goto(cfg.baseUrl + "/", { timeout: cfg.navTimeoutMs });
+    await page.waitForSelector(mcpLineSelector, {
+      timeout: cfg.navTimeoutMs,
+    });
+    const legacyOnHome = await countLegacy();
+
+    // The pass conjunction as data rows, same reason as the wire
+    // contract: each invariant is one named line, none is a branch.
+    const invariants = {
+      routeOk: route.ok === true,
+      wireContractOk: wireContractOk(body),
+      mcpCopyMatchesState: mcpLineText === expected.mcpText,
+      bindCopyMatchesRoute: bindLineText === expected.bindText,
+      monitorRetired,
+      legacyOnThread: legacyOnThread === 0,
+      legacyOnMonitor: legacyOnMonitor === 0,
+      legacyOnHome: legacyOnHome === 0,
+    };
 
     return {
-      pass:
-        route.ok === true &&
-        panelCount === 1 &&
-        headlineMatchesRoute &&
-        headlineText.length > 0 &&
-        detailText.length > 0 &&
-        reconnectCount === 1 &&
-        onHomeLegacy === 0 &&
-        onThreadLegacy === 0,
+      pass: Object.values(invariants).every(Boolean),
       detail: {
-        reachability: route.body?.retrieve_reachability ?? null,
-        adapter: route.body?.retrieve_adapter_kind ?? null,
-        headlineText,
-        detailLen: detailText.length,
-        reconnectCount,
-        onHomeLegacy,
-        onThreadLegacy,
-        headlineMatchesRoute,
+        knowledgeMcp: orNull(body.knowledge_mcp),
+        adapter: orNull(body.retrieve_adapter_kind),
+        modelIdentity: orNull(body.model_identity),
+        corpusFilings: orNull(body.corpus_filing_count),
+        boundCollection: orNull(body.bound_collection_name),
+        wireContractOk: invariants.wireContractOk,
+        mcpLineText,
+        bindLineText,
+        monitorRetired,
+        legacyOnThread,
+        legacyOnMonitor,
+        legacyOnHome,
       },
     };
   });

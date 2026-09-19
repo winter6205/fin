@@ -24,7 +24,7 @@ empty
    - **Inherits:** ADR 0062; spec Does rules → classify → inherit → clarify/typed fail; residual must not open C.
    - **Surface:** `fin.host` (beside `track_decision`)
    - **Acceptance:** Opt-in suite: grounded + rule/pin assigns `search_mode` before retrieve; greeting has no 档; invalid classify never silent-C; five boundary classes named in spec.
-   - Status: [ ] pending
+   - Status: [x] done
    - `[blocks: plans/search-mode-retrieve.md T2]` for live retrieve flag, not for cascade unit tests
 
 2. **Choice window interrupt** — tag: `[implementation]`
@@ -32,7 +32,7 @@ empty
    - **Surface:** `fin.host` graph interrupt + workspace HTTP; `web` stub allowed
    - **Acceptance:** Ambiguous grounded ask → interrupt options; resume pick assigns that 档; payload contract test without requiring painted SPA.
    - `[blocks: T1]`
-   - Status: [ ] pending
+   - Status: [x] done
 
 3. **Call-scoped 档 copy + compaction re-inject** — tag: `[implementation]`
    - **Inherits:** ADR 0061.
@@ -40,11 +40,11 @@ empty
    - **Acceptance:** Checkpointed messages do not store that turn’s search-mode usage as rewritten history; after compact, the 档 this turn needs is injected once again.
    - `[blocks: T1]`
    - `[parallel]` with T2
-   - Status: [ ] pending
+   - Status: [x] done
 
 4. **Fast propose window (not a 档)** — tag: `[implementation]`
    - **Inherits:** ADR 0068 / 0079; no silent Fast.
    - **Surface:** same choice-window path
    - **Acceptance:** Propose path opens options; no pick keeps extract method **standard**; `search_mode` is never the string Fast.
    - `[blocks: T2]`
-   - Status: [ ] pending
+   - Status: [x] done

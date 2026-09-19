@@ -118,5 +118,9 @@ export function mergeReconciledTurn(streamed: Turn, persisted: Turn): Turn {
       (persisted.comparisons?.length ?? 0) > 0
         ? persisted.comparisons
         : streamed.comparisons,
+    // search-mode-host T2: a suspended run's painted window must
+    // survive a reconcile — the server row carries no field for it
+    // (the window is live-only; the body-less resume re-emits it).
+    choice_window: persisted.choice_window ?? streamed.choice_window,
   };
 }

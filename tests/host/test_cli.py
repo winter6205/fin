@@ -503,6 +503,103 @@ def test_render_result_strips_marker_and_keeps_schema_stable():
     assert len(lines) == 3
 
 
+# ----- interrupt (choice_window) pause surface -----
+
+
+class _FakeInterrupt:
+    """Duck-typed stand-in for a ``langgraph.types.Interrupt``: the
+    runner only reads ``.value`` (the payload dict)."""
+
+    def __init__(self, value: dict) -> None:
+        self.value = value
+
+
+def _paused_state() -> dict:
+    """The exact shape the real boot produced: a still-``running``
+    status with a pending choice_window interrupt in the final state
+    (LangGraph puts pending Interrupts under ``__interrupt__``)."""
+    return {
+        "status": "running",
+        "answer": "",
+        "citations": (),
+        "messages": [],
+        "__interrupt__": (
+            _FakeInterrupt(
+                {
+                    "kind": "choice_window",
+                    "title": "选择检索档",
+                    "prompt": "为本次 grounded 提问选择检索档后继续。",
+                    "options": [
+                        {"id": "A", "label": "单跳速答", "opened": True},
+                        {"id": "B", "label": "标准检索", "opened": True},
+                        {"id": "C", "label": "综述", "opened": False},
+                    ],
+                }
+            ),
+        ),
+    }
+
+
+_PAUSED_TEXT = "\n".join(
+    [
+        "paused: choice_window —— 选择检索档",
+        "- A 单跳速答",
+        "- B 标准检索",
+        "- C 综述 (未开放)",
+        "在工作台该 thread 上选择后继续（HTTP resume），CLI 本增量不支持 pick",
+    ]
+)
+
+
+def test_render_result_interrupt_replacement_is_exact():
+    """Unit: a final state carrying ``__interrupt__`` renders the
+    paused block byte-for-byte — the misleading ``status: running`` +
+    empty answer/citations triple is REPLACED, not appended to."""
+    text = render_result(_paused_state())
+    assert text == _PAUSED_TEXT
+    assert "status: running" not in text
+    assert "answer:" not in text
+    assert "citations:" not in text
+
+
+def test_render_result_empty_interrupt_tuple_keeps_normal_schema():
+    """Boundary 'empty': ``__interrupt__: ()`` (the post-resume shape)
+    must NOT trigger the paused block — the three-section schema is
+    unchanged."""
+    state = {
+        "status": "done",
+        "answer": "ok",
+        "citations": (),
+        "__interrupt__": (),
+    }
+    assert render_result(state) == "status: done\nanswer: ok\ncitations:"
+
+
+def test_run_prints_paused_block_on_stdout(capsys):
+    """End-to-end runner: the fake graph returns the paused state; the
+    CLI prints the paused block on stdout, echoes the thread id on
+    stderr, and never prints the misleading running-status triple."""
+    fake = _FakeGraph(_paused_state())
+    run("ambiguous question", graph=fake, thread_id="t-pause")
+    captured = capsys.readouterr()
+    assert captured.out == _PAUSED_TEXT + "\n"
+    assert "thread_id: t-pause" in captured.err
+    assert "status: running" not in captured.out
+
+
+def test_main_exit_code_zero_when_paused(capsys):
+    """The pause is a non-crash semantic: ``main`` still exits 0 (the
+    operator must pick in the workbench; nothing failed)."""
+    fake = _FakeGraph(_paused_state())
+    rc = main(
+        ["q", "--thread-id", "t-pause-rc"], graph_factory=lambda: fake
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "paused: choice_window" in captured.out
+    assert "error:" not in captured.err
+
+
 # ===== ask-path hygiene: no pdfplumber, no LLM-provider deps =====
 
 

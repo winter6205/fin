@@ -6,6 +6,7 @@
 // carry JSON. This matches spec ADR 0026.
 
 import type {
+  ChoiceWindow,
   Citation,
   Comparison,
   Filing,
@@ -20,6 +21,7 @@ import type {
   WatchEntry,
   WorkspaceStatus,
 } from "./types";
+import { parseChoiceWindow } from "./choiceWindow";
 import { parseComparison } from "./comparison";
 import { parseWorkspaceStatus } from "./knowledgeMcp";
 import { parseSoftTrack, parseTrackDecision } from "./softTrack";
@@ -256,7 +258,13 @@ export type SendEvent =
   // only structured payload on this wire — tool-computed data, not
   // model prose — so the live view can render the table before the
   // answer is authored.
-  | { type: "comparison"; comparison: Comparison };
+  | { type: "comparison"; comparison: Comparison }
+  // search-mode-host T2 (ADR 0062 HITL): the run suspended for an
+  // operator pick. NO terminal status/answer/citations frames follow
+  // on this stream — the turn resumes on POST /resume with a pick.
+  // Dispatch is by the payload's own ``kind`` (carried on the window)
+  // so a future Fast-propose window (T4) rides the same frame.
+  | { type: "choice_window"; window: ChoiceWindow };
 
 export class ConcurrentRunError extends Error {}
 export class IngestMissingError extends Error {}
@@ -543,6 +551,15 @@ async function consumeSseStream(
           }
           break;
         }
+        case "choice_window": {
+          // T2 (host-locked): same skip-don't-crash boundary as
+          // ``comparison``. The frame is the stream's LAST one — no
+          // terminal frames follow while the run waits for a pick —
+          // so nothing here touches ``result``.
+          const window = parseChoiceWindow(payload);
+          if (window !== null) onEvent?.({ type: "choice_window", window });
+          break;
+        }
         case "answer": {
           const a = payload as { text: string; reset?: boolean };
           result.answerText = foldSendResultAnswer(
@@ -581,16 +598,24 @@ async function consumeSseStream(
  * operator has navigated to a different thread by the time the
  * resumed stream finishes, the store must NOT paint the result
  * onto the new thread.
+ *
+ * search-mode-host T2: ``pick`` is the choice-window option id, sent
+ * as the JSON body ``{"pick": "<id>"}`` (host reads it
+ * case-insensitively). OMITTING it keeps the historical body-less
+ * call: with a window pending the host re-emits the ``choice_window``
+ * frame — that is how a SPA reload re-opens the window.
  */
 export async function resumeThread(
   threadId: string,
   onEvent?: (e: SendEvent) => void,
+  pick?: string,
 ): Promise<SendResult> {
   const res = await fetch(
     `/api/threads/${encodeURIComponent(threadId)}/resume`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      body: pick === undefined ? undefined : JSON.stringify({ pick }),
     },
   );
 

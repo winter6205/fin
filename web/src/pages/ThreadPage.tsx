@@ -15,6 +15,10 @@ import {
   locatorLabel,
   turnComparisons,
 } from "../comparison";
+import {
+  choiceOptionDisabled,
+  choiceRejectedText,
+} from "../choiceWindow";
 import { exportAvailability, exportUrl } from "../exportBundle";
 import { resolveTurnTrack, showResearchTrackHint } from "../softTrack";
 import {
@@ -210,6 +214,79 @@ function CrashResumeBanner({ threadId }: { threadId: string }) {
   );
 }
 
+// search-mode-host T2 (ADR 0062 HITL): the choice window. The host
+// suspended this run on a clarify interrupt; the payload IS the
+// contract (title / prompt / structured options), so the card renders
+// exactly what arrived — no client-side option table, no invented
+// copy. opened:false options stay visible but disabled (档未开放); a
+// re-issued window after an invalid pick shows the rejected ids. The
+// click drives ``pickChoice`` → POST /resume {"pick": id}.
+function ChoiceWindowCard({
+  threadId,
+  turn,
+}: {
+  threadId: string;
+  turn: Turn;
+}) {
+  const choice = turn.choice_window;
+  const pickChoice = useWorkspaceStore((s) => s.pickChoice);
+  // While the pick stream is open the buttons go dead: the window
+  // already collapsed on click, but a re-issued window (invalid
+  // pick) must not accept a second concurrent pick.
+  const busy = useWorkspaceStore((s) => s.resumingThreadId === threadId);
+  if (!choice) return null;
+  const rejected = choiceRejectedText(choice);
+  return (
+    <section
+      data-testid="choice-window"
+      className="border border-black bg-tool px-3 py-2"
+    >
+      <p className="text-sm font-semibold text-gray-800">
+        {choice.title || "请选择"}
+      </p>
+      {choice.prompt ? (
+        <p className="mt-0.5 text-xs text-gray-600">{choice.prompt}</p>
+      ) : null}
+      {rejected ? (
+        <p data-testid="choice-window-rejected" className="mt-1 text-xs text-red-700">
+          {rejected}
+        </p>
+      ) : null}
+      <div className="mt-2 flex flex-wrap gap-2">
+        {choice.options.map((option) => {
+          const unopened = choiceOptionDisabled(option);
+          return (
+            <button
+              key={option.id}
+              type="button"
+              data-testid={`choice-option-${option.id}`}
+              disabled={busy || unopened}
+              onClick={() => {
+                void pickChoice(threadId, turn.run_id, option.id);
+              }}
+              className={
+                unopened
+                  ? "border border-gray-300 bg-card px-3 py-1 text-sm text-gray-400 cursor-not-allowed"
+                  : "border border-black bg-card px-3 py-1 text-sm font-medium hover:bg-accent hover:text-white disabled:opacity-50"
+              }
+            >
+              {option.label}
+              <span className="ml-1 font-mono text-xs text-gray-500">
+                {option.id}
+              </span>
+              {unopened ? (
+                <span data-testid="choice-option-unopened" className="ml-1 text-xs">
+                  （未开放）
+                </span>
+              ) : null}
+            </button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 // T4 workflow (#138): download this thread's comparison or citation
 // bundle. Plain anchors — the browser performs the GET and saves the
 // file, so there is no blob juggling and no second copy of the data in
@@ -319,6 +396,13 @@ const TurnView = memo(function TurnView({
           comparison={comparison}
         />
       ))}
+      {/* search-mode-host T2: the run suspended for an operator pick.
+          The window takes the answer-bubble slot's attention while it
+          is pending; a pick collapses it and the resumed stream
+          renders into this same row. */}
+      {turn.choice_window ? (
+        <ChoiceWindowCard threadId={threadId} turn={turn} />
+      ) : null}
       {live && !turn.answer && !turn.assistant_message ? null : (
         <div
           data-testid="turn-answer-card"

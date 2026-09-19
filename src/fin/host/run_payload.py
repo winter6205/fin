@@ -54,6 +54,13 @@ class RunResponsePayload(TypedDict):
     SSE status frame; ``track_decision`` is the full auditable
     dict persisted on ``RunRecord`` / GET history.
 
+    search-mode host T1: ``search_mode_decision`` mirrors the
+    ``track_decision`` pattern for the 检索档 audit (``search_mode``
+    or explicit ``null`` on typed fail, ``confidence``,
+    ``decision_tier``, structured ``signals``, clarify ``options``
+    and the ``failure_code`` 具名失败). Empty dict on runs that never
+    reached grounded.
+
     T3 (enterprise-kb Focus 1): ``comparisons`` carries the
     ``fin.comparison.v1`` envelopes this run's ``compare_facts``
     calls produced (shape SSOT:
@@ -78,6 +85,7 @@ class RunResponsePayload(TypedDict):
     tool_summaries: list[dict[str, str]]
     track: str
     track_decision: dict[str, Any]
+    search_mode_decision: dict[str, Any]
     comparisons: list[dict[str, Any]]
     analysis_results: list[dict[str, Any]]
     evidence_locators: list[dict[str, Any]]
@@ -279,6 +287,14 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
         or ""
     )
 
+    # search-mode host T1: structured graph-owned data (same passthrough
+    # policy as ``track_decision`` / ``comparisons`` — no marker strip,
+    # no re-validation of the envelope).
+    raw_smd = raw.get("search_mode_decision") or {}
+    search_mode_decision_value: dict[str, Any] = (
+        dict(raw_smd) if isinstance(raw_smd, dict) else {}
+    )
+
     if status_value == "done":
         citations_payload: list[dict[str, Any]] = [
             {
@@ -302,6 +318,7 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
             tool_summaries=summaries_value,
             track=track_value,
             track_decision=track_decision_value,
+            search_mode_decision=search_mode_decision_value,
             comparisons=comparisons_value,
             analysis_results=analysis_value,
             evidence_locators=locators_value,
@@ -333,6 +350,7 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
         tool_summaries=summaries_value,
         track=track_value,
         track_decision=track_decision_value,
+        search_mode_decision=search_mode_decision_value,
         # The comparison SURVIVES the refusal (unlike answer /
         # citations): a ``numeric_gate_fail`` row that hid the fact
         # table would hide the evidence for its own refusal.
