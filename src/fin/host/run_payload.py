@@ -18,7 +18,11 @@ from __future__ import annotations
 from typing import Any, Final, TypedDict
 
 from fin.host.citation_gate import strip_hidden_bounce_marker
-from fin.host.named_failures import CORPUS_NOT_READY, MAPPING_DROP
+from fin.host.named_failures import (
+    COMMUNITY_SUMMARY_INDEX_FAILURE,
+    CORPUS_NOT_READY,
+    MAPPING_DROP,
+)
 from fin.host.state import STEP_CAP
 from fin.host.thread_store import RunStatus
 
@@ -122,6 +126,15 @@ ORDINARY_PERSON_COPY: Final[dict[str, str]] = {
         "citable source. The collection's locator map may be stale — "
         "re-run corpus ingest."
     ),
+    # search-mode-retrieve T1 / SC4 — the C 综述 档 is open but its
+    # 社区 summary index is not-ready (the build failed or is
+    # incomplete). Distinct from 「档未开」: re-naming the 档 is not the
+    # fix; re-running the summary index job is.
+    COMMUNITY_SUMMARY_INDEX_FAILURE: (
+        "The review 档's summary index is not ready — its last build "
+        "failed or is incomplete. Re-run the summary index job, then "
+        "ask again."
+    ),
 }
 
 
@@ -131,7 +144,8 @@ def ordinary_person_copy(status: str, reason: str) -> str:
     ``done`` -> ``""`` (the run produced a real ``answer``).
     ``refuse`` -> keyed by ``reason`` (``unknown_locator`` /
     ``citation_repair_cap`` / ``numeric_gate_fail`` /
-    ``corpus_not_ready`` / ``mapping_drop``).
+    ``corpus_not_ready`` / ``mapping_drop`` /
+    ``community_summary_index_failure``).
     ``step_cap`` -> the step-cap string regardless of ``reason``.
     Unknown terminal -> ``""`` (defensive; the gate never
     produces one).

@@ -23,6 +23,12 @@ never by matching prose::
                        map to a fin locator (mapping ledger count > 0)
     tier_not_open      检索档 C 综述 is a plan slot, not implemented
     real_db_not_wired  检索档 D 真数据库 is a plan slot, not implemented
+    community_summary_index_failure
+                       reserved for once C 综述 ships as an open 档:
+                       its 社区 summary index is then not-ready (the
+                       Leiden/community-summary job failed or summaries
+                       are incomplete, ADR 0064 / 0078) — a runtime
+                       fact, distinct from 「档未开」
 
 ``corpus_not_ready`` / ``mapping_drop`` ride ``AgentState.status_reason``
 on the run record / SSE ``status`` frame and resolve to ordinary-person
@@ -59,6 +65,17 @@ MAPPING_DROP: Final[str] = "mapping_drop"
 TIER_NOT_OPEN: Final[str] = "tier_not_open"
 
 REAL_DB_NOT_WIRED: Final[str] = "real_db_not_wired"
+
+# Reserved for once C 综述 ships as an open 档: its 社区 summary index
+# can then be not-ready (the Leiden / community-summary job failed or
+# produced incomplete summaries — ADR 0064 / 0078). That would be a
+# runtime index fact, deliberately NOT ``tier_not_open``: today C is
+# still a plan slot (``TIER_UNAVAILABLE_CODE`` routes it there), and
+# once C is open, telling the operator to name a different 档 for an
+# index-job failure would be wrong advice. Public wire token pinned by
+# ``specs/search-mode-retrieve.md`` (Boundaries), shared with the
+# iknow-memory side.
+COMMUNITY_SUMMARY_INDEX_FAILURE: Final[str] = "community_summary_index_failure"
 
 # The 档 selectors whose product surfaces accept (spec Open Question 1).
 # The list is deliberately closed: the wayfinder doc (闭环与分档
@@ -205,6 +222,7 @@ def unavailable_tier(requested_tiers: Iterable[str] | None) -> str | None:
 
 
 __all__ = [
+    "COMMUNITY_SUMMARY_INDEX_FAILURE",
     "CORPUS_NOT_READY",
     "MAPPING_DROP",
     "REAL_DB_NOT_WIRED",
