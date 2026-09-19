@@ -88,7 +88,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.prebuilt import ToolNode
 from langchain_core.runnables import RunnableConfig
-from langgraph.types import Command, Send
+from langgraph.types import Command, Send, interrupt
 
 from fin.corpus.extracted import Locator
 from fin.host.compaction import CompactionInputError
@@ -166,6 +166,17 @@ from fin.host.track_decision import (
     decide_track,
     normalize_track,
     snapshot_delta_for_utterance,
+)
+from fin.host.search_mode_decision import (
+    apply_operator_pick,
+    clarify_options,
+    search_mode_update_for_turn,
+)
+from fin.host.extract_method_proposal import (
+    build_proposal_audit,
+    normalize_extract_method,
+    propose_window_payload,
+    proposal_is_pending,
 )
 from fin.retrieve import MCPRetrieveAdapter, FakeRetrievePort
 from fin.retrieve.degradation import (
@@ -2017,6 +2028,7 @@ def compile_graph(
     summarizer: Any | None = None,
     memory_port: MemoryPort | None = None,
     user_profile_store: UserProfileStore | None = None,
+    enable_choice_window: bool = False,
 ) -> "_LockedGraph":
     """Build the v1 host graph (T6).
 
@@ -2198,6 +2210,17 @@ def compile_graph(
         tool) stays ON-gated per spec SC12. Tests inject an explicit
         store rooted at a ``tmp_path`` so the suite never touches the
         real ``$HOME``.
+    enable_choice_window
+        search-mode host T2 / ADR 0062 HITL: when ``True``, a grounded
+        turn whose 检索档 cascade resolves to ``clarify`` pauses the run
+        on a LangGraph ``interrupt`` (the choice window) BEFORE the
+        grounded leaf executes, and ``POST /threads/{id}/resume`` (or
+        ``Command(resume=pick)``) continues it with the operator's 档.
+        Default ``False`` keeps the pre-T2 flow intact — the opt-in
+        suites and the durable production boot (``compile_for_runtime``)
+        are what turn the HITL lane on. Requires a checkpointer (the
+        factory always has one; the interrupt's durability IS the
+        checkpoint).
 
     Returns
     -------
@@ -2386,13 +2409,25 @@ def compile_graph(
 
     # ----- node functions -----
 
-    def classify_node(state: AgentState) -> dict[str, Any]:
+    def classify_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         """Soft-Track: tiered track decision before leaves.
 
         Passes ``status_snapshots`` and optional ``classify_model``
         into ``decide_track``. Appends snapshots when the utterance
-        sets or changes research context.
+        sets or changes research context. When the track is
+        ``grounded``, also runs the 检索档 cascade
+        (``fin.host.search_mode_decision``) — graph routing is
+        unchanged: retrieve stays ONE tool.
+
+        search-mode host T2 (SC4): an optional documented pin rides the
+        run config (``configurable.pinned_search_mode``, stamped by the
+        workspace send's ``tiers`` selector) — a pin assigns its 档 in
+        the rules tier and never opens the choice window. The pin is
+        run-scoped CONFIG, never checkpointed state, so a follow-up send
+        cannot inherit a stale pin.
         """
+        configurable = dict((config or {}).get("configurable") or {})
+        pinned = configurable.get("pinned_search_mode")
         messages = list(state.get("messages") or [])
         prior_snapshots = list(state.get("status_snapshots") or [])
         decision = decide_track(
@@ -2420,6 +2455,23 @@ def compile_graph(
         delta = snapshot_delta_for_utterance(text, prior_snapshots)
         if delta and decision.track not in ("dialogue", "off_topic"):
             update["status_snapshots"] = delta
+        if decision.track == "grounded":
+            # The assigned 档 rides the append-only snapshot history —
+            # the inherit source next turn; a company-change wipe
+            # carries none and blocks cross-job inheritance.
+            merged = [*prior_snapshots, *(update.get("status_snapshots") or [])]
+            sm_update = search_mode_update_for_turn(
+                messages,
+                snapshots=merged,
+                classify_model=classify_model,
+                pinned_mode=str(pinned) if pinned else None,
+            )
+            update["search_mode_decision"] = sm_update["audit"]
+            if sm_update["snapshot_patch"]:
+                update["status_snapshots"] = [
+                    *(update.get("status_snapshots") or []),
+                    *sm_update["snapshot_patch"],
+                ]
         return update
 
     def _select_unbound_model(config: RunnableConfig) -> Any:
@@ -2527,6 +2579,78 @@ def compile_graph(
     ) -> dict[str, Any]:
         return _non_research_leaf(state, config, track="off_topic")
 
+    def mode_choice_node(state: AgentState) -> dict[str, Any]:
+        """检索档 choice window (search-mode host T2 / ADR 0062 HITL).
+
+        Reached ONLY on ``from_classify`` when the grounded cascade
+        resolved to ``clarify`` — the run pauses here on ``interrupt``
+        until the operator picks a 档, then proceeds to the SAME
+        compaction-gate → grounded leaf path (retrieve stays ONE tool).
+        The loop is the documented validate-then-reopen shape: an
+        out-of-list pick reopens the window (never a silent C), and a
+        pick of an UNOPENED option is merged as the 具名失败 typed_fail
+        by ``apply_operator_pick``. No LLM call happens in this node, so
+        LangGraph's replay-on-resume of the node body is side-effect
+        free.
+        """
+        decision = dict(state.get("search_mode_decision") or {})
+        options = list(decision.get("options") or []) or clarify_options()
+        rejected: list[str] = []
+        while True:
+            window: dict[str, Any] = {
+                "kind": "choice_window",
+                "title": "选择检索档",
+                "prompt": "为本次 grounded 提问选择检索档后继续。",
+                "options": options,
+            }
+            if rejected:
+                window["rejected_picks"] = list(rejected)
+            raw = str(interrupt(window) or "").strip()
+            key = raw.upper()
+            if any(str(option.get("id")) == key for option in options):
+                break
+            rejected.append(raw)
+        merged = apply_operator_pick(
+            decision,
+            pick=key,
+            snapshots=state.get("status_snapshots"),
+            rejected=rejected,
+        )
+        update: dict[str, Any] = {"search_mode_decision": merged["audit"]}
+        if merged["snapshot_patch"]:
+            update["status_snapshots"] = merged["snapshot_patch"]
+        return update
+
+    def extract_method_choice_node(state: AgentState) -> dict[str, Any]:
+        """Fast 抽图 propose window (search-mode host T4 / ADR 0068 / 0079).
+
+        Reached ONLY on ``from_classify`` when the run input carries an
+        explicit ``{"proposed": "fast"}`` seed — the ordinary grounded
+        flow never opens it. Same validate-then-reopen interrupt loop as
+        ``mode_choice`` (no LLM call, so replay-on-resume is
+        side-effect free), and the payload stays
+        ``kind="choice_window"`` so the SPA renders it unchanged.
+
+        The node records the proposal RESULT only: ``applied`` is
+        always ``False`` (build_proposal_audit), because flipping the
+        extract method rebuilds the corpus version and is the index
+        job's operator switch (spec 2) — this run touches no
+        extract/index state, snapshots included.
+        """
+        request = dict(state.get("extract_method_proposal") or {})
+        rejected: list[str] = []
+        while True:
+            raw = str(interrupt(propose_window_payload(rejected)) or "").strip()
+            picked = normalize_extract_method(raw)
+            if picked is not None:
+                break
+            rejected.append(raw)
+        return {
+            "extract_method_proposal": build_proposal_audit(
+                request, picked=picked, rejected=rejected
+            )
+        }
+
     def model_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         # Step 1: step-cap fuse. Increment ``step_count`` and check
         # BEFORE invoking the model — when the fuse fires we never
@@ -2585,6 +2709,14 @@ def compile_graph(
         # compile time) so a file edit between calls is visible on
         # the next turn. The user profile is operator-profile
         # machinery and surfaces regardless of memory_on.
+        # ADR 0061 (search-mode host T3): the 档 usage copy rides this
+        # call's head SystemMessage, read from the run's audit — an
+        # unassigned turn (clarify awaiting a pick, typed fail) carries
+        # ``search_mode=None`` and injects nothing. Because the copy is
+        # call-time only, the compaction gate's history rebuild needs no
+        # extra seam: the next call re-adds it, and checkpointed
+        # messages are never rewritten when the mode changes.
+        search_mode_audit = state.get("search_mode_decision") or {}
         model_messages = _with_turn_attachments(
             state,
             messages_for_model(
@@ -2592,6 +2724,7 @@ def compile_graph(
                 track="grounded",
                 memory_on=memory_enabled,
                 user_profile=_read_profile_text(),
+                search_mode=search_mode_audit.get("search_mode"),
             ),
         )
         stream = selected_model.stream(model_messages)
@@ -3020,9 +3153,21 @@ def compile_graph(
 
     # ----- conditional edges -----
 
+    def _clarify_window_pending(state: AgentState) -> bool:
+        """True while a grounded turn's 档 cascade still waits on the
+        clarify choice window (T2; reused by the T4 post-propose route
+        so the two window lanes cannot drift)."""
+        audit = state.get("search_mode_decision") or {}
+        return bool(
+            enable_choice_window
+            and normalize_track(state.get("track")) == "grounded"
+            and audit.get("decision_tier") == "clarify"
+            and audit.get("options")
+        )
+
     def from_classify(
         state: AgentState,
-    ) -> Literal["compaction_gate"]:
+    ) -> Literal["extract_method_choice", "mode_choice", "compaction_gate"]:
         """Route EVERY track through the compaction gate (ADR 0044).
 
         The gate must run before EVERY LLM call — the research
@@ -3037,7 +3182,37 @@ def compile_graph(
         ``decide_track`` sends only the LAST human utterance to the
         classify model, so no evictable context reaches that call
         and there is nothing for the gate to compact first.
+
+        search-mode host T2: with the HITL lane on, a grounded turn
+        whose 档 cascade resolved to ``clarify`` first visits
+        ``mode_choice`` — the window pauses the run BEFORE any model
+        or retrieve call (pin / rules / inherit / llm assignments never
+        route here; there is no required per-turn picker).
+
+        search-mode host T4: an explicit Fast propose seed runs the
+        extract-method window FIRST (still before any model call), then
+        normal 档 routing resumes — a clarify turn sees both windows in
+        sequence. Without the seed this lane does not exist.
         """
+        if (
+            enable_choice_window
+            and normalize_track(state.get("track")) == "grounded"
+            and proposal_is_pending(state.get("extract_method_proposal"))
+        ):
+            return "extract_method_choice"
+        if _clarify_window_pending(state):
+            return "mode_choice"
+        return "compaction_gate"
+
+    def from_extract_method(
+        state: AgentState,
+    ) -> Literal["mode_choice", "compaction_gate"]:
+        """Continue normal classify-time routing after the propose
+        window resolved: a clarify 档 still owed opens ``mode_choice``
+        next; otherwise proceed to the leaf path. The just-resolved
+        proposal is no longer pending, so this edge cannot loop."""
+        if _clarify_window_pending(state):
+            return "mode_choice"
         return "compaction_gate"
 
     def from_compaction_gate(
@@ -3127,6 +3302,21 @@ def compile_graph(
     graph.add_node("dialogue", dialogue_node)
     graph.add_node("clarify", clarify_node)
     graph.add_node("off_topic", off_topic_node)
+    if enable_choice_window:
+        # search-mode host T2: the HITL lane adds a PAUSE node, not a
+        # retrieve node — the graph stays one compiled graph with ONE
+        # retrieve tool (spec complexity ACR).
+        # search-mode host T4: the Fast propose window is a second
+        # PAUSE node on the same lane (ADR 0068: propose only, never
+        # apply), reached only from an explicit seed.
+        graph.add_node("extract_method_choice", extract_method_choice_node)
+        graph.add_conditional_edges(
+            "extract_method_choice",
+            from_extract_method,
+            ["mode_choice", "compaction_gate"],
+        )
+        graph.add_node("mode_choice", mode_choice_node)
+        graph.add_edge("mode_choice", "compaction_gate")
     graph.add_node("model", model_node)
     # ADR 0044 / plan T1: the compaction gate is a SEPARATE graph
     # node (NOT nested inside ``model_node``). It runs before every
@@ -3151,7 +3341,17 @@ def compile_graph(
     graph.add_node("citation_gate", citation_gate_node)
 
     graph.add_edge(START, "classify")
-    graph.add_conditional_edges("classify", from_classify)
+    # Explicit path map: with the HITL lane OFF ``mode_choice`` (T2) and
+    # ``extract_method_choice`` (T4) are not nodes on this graph, and
+    # LangGraph would reject the branch return annotation's unknown
+    # target at compile time.
+    graph.add_conditional_edges(
+        "classify",
+        from_classify,
+        ["extract_method_choice", "mode_choice", "compaction_gate"]
+        if enable_choice_window
+        else ["compaction_gate"],
+    )
     graph.add_edge("dialogue", END)
     graph.add_edge("clarify", END)
     graph.add_edge("off_topic", END)
@@ -3185,6 +3385,7 @@ def compile_graph(
         recursion_limit=recursion_limit,
         summarizer=summarizer,
         compiled_graph=compiled,
+        enable_choice_window=enable_choice_window,
         # T2 (ADR 0044): the SAME compactor instance the graph gate
         # uses, so ``/compact`` and the >=90% auto path share one
         # eviction unit walker, one summarizer seam, one floor.
@@ -3258,6 +3459,7 @@ def _make_locked_graph(
     bound_tools: list[Any] | None = None,
     tool_node: Any | None = None,
     memory_port_id: int = 0,
+    enable_choice_window: bool = False,
 ) -> "_LockedGraph":
     key = (
         id(checkpointer),
@@ -3277,6 +3479,10 @@ def _make_locked_graph(
         # without this key the first OFF compile would hand a later
         # ON compile a cached OFF proxy.
         int(memory_port_id),
+        # search-mode host T2: the HITL flag adds the ``mode_choice``
+        # node + routing — same reasoning as ``memory_port_id``, an OFF
+        # compile must never be served to an ON caller from cache.
+        int(enable_choice_window),
     )
     cached = _IDEMPOTENCE_CACHE.get(key)
     if cached is not None:
@@ -3410,6 +3616,31 @@ class _LockedGraph:
             {"configurable": {"thread_id": thread_id}}
         )
         return tuple(snapshot.next or ())
+
+    def interrupt_pending(self, thread_id: str) -> dict[str, Any] | None:
+        """The payload of the choice window pending on ``thread_id``, or
+        ``None`` when no HITL interrupt is pending (search-mode host T2).
+
+        Why a separate probe from ``is_locked``: a paused ``interrupt``
+        RELEASES the per-thread lock (the run's stream generator has
+        ended), so the send route's 409 guard for "a choice window is
+        waiting for the operator" must read the checkpoint's pending
+        task interrupts, not the lock. Typed-fail / crash mid-run
+        checkpoints carry pending NODES but no INTERRUPTS, so a plain
+        crash resume is never mistaken for a pending window.
+
+        Read-only path (mirrors :meth:`pending_nodes`): does NOT
+        acquire the per-thread lock.
+        """
+        snapshot = self._graph.get_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        for task in snapshot.tasks or ():
+            for pending in getattr(task, "interrupts", ()) or ():
+                value = getattr(pending, "value", None)
+                if isinstance(value, dict):
+                    return value
+        return None
 
     def checkpoint_run_id(self, thread_id: str) -> str | None:
         """Return the canonical run id stored on the latest checkpoint.

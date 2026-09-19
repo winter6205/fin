@@ -149,6 +149,37 @@ export interface Comparison {
   tool_call_id?: string;
 }
 
+// ----- search-mode-host T2: the choice window (ADR 0062 HITL) -----
+//
+// The clarify payload the host emits when the search-mode cascade
+// cannot name a 档: a structured option list the operator picks from.
+// Mirrors the SSE ``choice_window`` frame (SSOT:
+// src/fin/host/workspace_http.py). The minimal contract is
+// ``kind`` + non-empty ``options[{id,label}]``; ``title`` / ``prompt``
+// / ``opened`` / ``rejected_picks`` are additive, so the same channel
+// carries a future Fast-propose window (T4) without a new frame type.
+
+export interface ChoiceOption {
+  id: string;
+  label: string;
+  // False = the 档 exists but is not open: the button stays visible
+  // and disabled. Absent on an older peer — treat as open.
+  opened?: boolean;
+}
+
+export interface ChoiceWindow {
+  // Payload-level dispatch key. This client renders any kind on this
+  // channel the same way (options + pick); the label copy comes from
+  // the host payload, never from a client-side per-kind table.
+  kind: string;
+  title?: string;
+  prompt?: string;
+  options: ChoiceOption[];
+  // Ids the host refused on a previous resume; non-empty only when
+  // the window is re-issued after an invalid pick.
+  rejected_picks?: string[];
+}
+
 export interface Turn {
   run_id: string;
   question: string;
@@ -206,6 +237,12 @@ export interface Turn {
   // run_id (mirrors ``fin.host.workspace_http.TurnRow.feedback``) —
   // setting or flipping it never changes the run's citations.
   feedback?: "up" | "down" | null;
+  // search-mode-host T2: the choice window this suspended run is
+  // waiting on. Present = the run paused before any terminal frame
+  // and the row is NOT done; a pick (or a terminal status frame)
+  // clears it. Live-only: the GET row has no field for it — the
+  // body-less resume re-emits the window (host contract).
+  choice_window?: ChoiceWindow;
   created_at: string;
 }
 

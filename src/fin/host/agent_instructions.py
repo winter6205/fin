@@ -188,6 +188,53 @@ CLARIFY_SYSTEM_PROMPT: str = (
     f"{USAGE_CLARIFY}"
 )
 
+# ----- per-档 usage copy (search-mode host T3 / ADR 0061) ------------
+# 检索档 is NOT a fifth track: the copy rides INSIDE the head
+# SystemMessage after the track prompt, added at model-call time when
+# this turn's cascade ASSIGNED a 档 (rules / llm / inherit /
+# operator_pick). An unassigned turn (clarify awaiting a pick, typed
+# fail) carries no copy. Like every block here the copy is call-scoped
+# only — checkpointed history is never rewritten when the mode changes,
+# and after session compaction the next model call re-adds the copy
+# (ADR 0061). Each copy names exactly its own 档 label so a reader can
+# tell which mode a call ran under.
+SEARCH_MODE_INSTRUCTIONS_MARKER: str = "[FIN_SEARCH_MODE]"
+
+SEARCH_MODE_USAGE_COPY: dict[str, str] = {
+    "A": (
+        f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
+        "检索档 A 查找 (lexical-first): retrieve answers with "
+        "keyword-first matches over the corpus. Query retrieve "
+        "with the operator's own keywords, open a hit with "
+        "read_file before quoting it. If the exact keywords miss, "
+        "rephrase them once, then tell the operator plainly that "
+        "the 资料 has no lexical hit."
+    ),
+    "B": (
+        f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
+        "检索档 B 知识问答 (graph-priority): retrieve walks the "
+        "iknow graph neighborhoods first, then fills with vector "
+        "and BM25 passages. Ask retrieve the question as phrased; "
+        "quote only page text this run returned — graph relations "
+        "are not citable evidence."
+    ),
+    "C": (
+        f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
+        "检索档 C 综述 (report synthesis): retrieve draws on "
+        "community summaries and report text prepared at index "
+        "time, then drops to windows for exact spans when needed. "
+        "Assemble the answer from report text this run returned "
+        "and keep quoted spans verbatim."
+    ),
+    "D": (
+        f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
+        "检索档 D 真数据库: the ask targets business data, not the "
+        "filings corpus. Route figures through the real-DB path; "
+        "when it is not wired, report the 真库未接 named failure. "
+        "Document tables in this corpus stay on 档 B."
+    ),
+}
+
 # Operator-facing ask per slot the clarify track can be missing.
 # A slot absent from this map is never named in the prompt: the
 # corpus only has company and period as routing slots, and an
@@ -282,6 +329,7 @@ def messages_for_model(
     missing_slots: Sequence[str] | None = None,
     memory_on: bool | None = False,
     user_profile: str | None = None,
+    search_mode: str | None = None,
 ) -> list[BaseMessage]:
     """Return the model-facing list with the track prompt first.
 
@@ -321,6 +369,17 @@ def messages_for_model(
     SystemMessage bytes are then byte-identical to the no-profile
     call so callers that have no profile files on disk keep their
     prefix stable.
+
+    ``search_mode`` (search-mode host T3 / ADR 0061): the 检索档
+    this turn's cascade ASSIGNED (``"A"``–``"D"``). When set and
+    recognized, that 档's usage copy is appended to the head
+    SystemMessage after the blocks above — call-scoped, exactly
+    once, idempotent on re-entry. ``None`` / empty / an out-of-set
+    token (clarify awaiting a pick, typed fail, non-grounded
+    tracks) injects nothing: the bytes are then identical to the
+    pre-T3 call. Compaction re-inject needs no extra seam: history
+    rebuild never touches this call-time head, so the next model
+    call re-adds the copy by construction.
     """
     resolved = normalize_track(track) or "dialogue"
     marker, prompt = _TRACK_PROMPTS.get(
@@ -349,27 +408,65 @@ def messages_for_model(
         # OFF path: byte-identical to today's output for callers that
         # do not opt in. The track prompt + tail of messages is exactly
         # what messages_for_model produced before T5.
-        return existing
+        result = existing
+    else:
+        result = _append_memory_pointer(existing)
 
-    # ON path: append the existence pointer to the SystemMessage
-    # exactly once. The pointer is appended AFTER the track prompt so
-    # the track prompt stays the contract first; it is a NOTE about a
-    # second channel, not a re-write of the track contract.
-    head = existing[0]
+    mode_block = SEARCH_MODE_USAGE_COPY.get(
+        search_mode.strip().upper() if isinstance(search_mode, str) else ""
+    )
+    if mode_block is None:
+        return result
+    return _append_block_to_head(
+        result, SEARCH_MODE_INSTRUCTIONS_MARKER, mode_block
+    )
+
+
+def _append_memory_pointer(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Append the memory existence pointer to the head SystemMessage.
+
+    Split out of :func:`messages_for_model` (T3) — behaviour is the
+    T5 ON path verbatim: a non-SystemMessage head or an already
+    present pointer leaves the payload unchanged (idempotent).
+    """
+    head = messages[0]
     if not isinstance(head, SystemMessage):
         # Defensive: a non-SystemMessage head is not the expected shape,
         # but we must not crash a model call over a pointer that the
         # spec marks advisory. Skip silently rather than inject a
         # second SystemMessage (which would break call-scoped-only).
-        return existing
+        return messages
     head_content = str(head.content)
     if MEMORY_POINTER_MARKER in head_content:
         # Pointer already present (caller pre-injected it, or this is
         # a re-entry): leave the message unchanged. Idempotent.
-        return existing
-    new_content = f"{head_content}\n\n{MEMORY_POINTER_BLOCK}"
-    rebuilt = list(existing)
-    rebuilt[0] = SystemMessage(content=new_content)
+        return messages
+    rebuilt = list(messages)
+    rebuilt[0] = SystemMessage(content=f"{head_content}\n\n{MEMORY_POINTER_BLOCK}")
+    return rebuilt
+
+
+def _append_block_to_head(
+    messages: list[BaseMessage], block_marker: str, block_text: str
+) -> list[BaseMessage]:
+    """Append a marker-prefixed advisory block to the head SystemMessage.
+
+    Same idempotence / never-crash shape as :func:`_inject_profile_block`:
+    the block rides the existing head message (one SystemMessage, no
+    stacking on re-entry); a non-SystemMessage or empty payload gets a
+    fresh head rather than a crashed model call.
+    """
+    if not messages:
+        return [SystemMessage(content=block_text)]
+    head = messages[0]
+    if not isinstance(head, SystemMessage):
+        return [SystemMessage(content=block_text), *messages]
+    if block_marker in str(head.content):
+        return messages
+    rebuilt = list(messages)
+    rebuilt[0] = SystemMessage(
+        content=f"{str(head.content)}\n\n{block_text}"
+    )
     return rebuilt
 
 
@@ -507,6 +604,8 @@ __all__ = [
     "MEMORY_POINTER_TEXT",
     "OFF_TOPIC_INSTRUCTIONS_MARKER",
     "OFF_TOPIC_SYSTEM_PROMPT",
+    "SEARCH_MODE_INSTRUCTIONS_MARKER",
+    "SEARCH_MODE_USAGE_COPY",
     "THREAD_ATTACHMENTS_MARKER",
     "USAGE_CLARIFY",
     "USAGE_DIALOGUE",

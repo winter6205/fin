@@ -381,7 +381,7 @@ def ask(
     body: AskRequest,
     graph: Any = Depends(get_graph),
     workspace_root: Path = Depends(_get_workspace_root),
-) -> AskResponse:
+) -> "AskResponse | JSONResponse":
     """Run one v1 host-graph ``invoke`` on a ``POST /ask`` request.
 
     The handler is a sync ``def`` and calls ``graph.invoke`` — never
@@ -423,6 +423,18 @@ def ask(
             }
         },
     )
+
+    # search-mode host T2: when the grounded ask PAUSES on the 检索档
+    # choice window, the sync ``invoke`` returns with the pending
+    # interrupt (the ADR 0015 sync contract — it never raises on
+    # /ask). The unattended surface answers typed 409 ``choice_pending``
+    # and closes nothing: the run stays resumable on the workspace
+    # ``POST /threads/{id}/resume`` with the operator pick. /ask must
+    # never pick a 档 on the operator's behalf (no silent C).
+    if raw.get("__interrupt__"):
+        return JSONResponse(
+            status_code=409, content={"error": "choice_pending"}
+        )
 
     # Shared mapping (also used by the workspace send route) so the
     # two endpoints cannot drift on status extraction / bounce-marker

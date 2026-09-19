@@ -87,6 +87,14 @@ Choice-window language above is the SSOT phrase this spec implements: **structur
 
 **Does not change:** retrieve ranking; extract/Leiden jobs; Soft-Track track enum; citation verifier; checkpoint message history rewrite policy (still forbidden).
 
+**Landed contract notes (implementation decisions, recorded 2026-09-20):**
+
+1. **Rules-tier marker adjacency:** an explicit 档 letter or CONTEXT label triggers the rules tier only adjacent to a `档` marker (e.g. `B档` / `档B` / `知识问答档`); a bare label with no marker falls through to classify / inherit / clarify — legal cascade paths, never silent-C.
+2. **`/ask` on a paused run:** the unattended v1 surface answers typed `409 {"error":"choice_pending"}`; it never picks a 档 on the operator's behalf.
+3. **Pin field:** send body `tiers` with exactly one OPEN 档 is the documented pin (assumption 4's "request/state field"): assigns that 档 without opening the window; `["C"]` / `["D"]` keep the existing 具名 400.
+4. **Fast propose seed:** send body optional `propose_extract_method:"fast"` seeds the propose window on grounded turns; absent field keeps the run byte-identical to before, and the seed is run-scoped (never leaks to the next send).
+5. **CLI on a paused run:** the CLI renders the paused window (title + options + where to pick) instead of the terminal status/answer/citations triple; interactive CLI pick is not this increment (pick happens on the 工作台 / HTTP resume).
+
 ## 待写入 (persist after ACR)
 
 empty — CONTEXT **检索档** / **HITL** / **v1 surface** / **Fast 抽图** / **grounded** and ADRs 0061 / 0062 / 0068 / 0079 already landed.

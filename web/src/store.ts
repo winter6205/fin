@@ -9,7 +9,11 @@ import { submitFeedback, type FeedbackValue } from "./feedback";
 // T5 (#35): the last opened thread id, persisted so a returning
 // visit lands back on that thread.
 import { forgetLastThreadIf, rememberLastThread } from "./lastThread";
+import {
+  hasPendingChoiceWindow,
+} from "./choiceWindow";
 import type {
+  ChoiceWindow,
   Filing,
   IngestResult,
   Notice,
@@ -98,6 +102,17 @@ interface WorkspaceState {
   // by re-checking ``get().activeThread?.id`` against ``threadId``
   // on every patch.
   resumeThread: (threadId: string) => Promise<api.SendResult | null>;
+  // search-mode-host T2: operator picks a choice-window option.
+  // ``runId`` identifies the suspended turn (run_id is the turn key
+  // in this store). Collapses the window locally, then POSTs
+  // /resume {"pick": optionId} and keeps streaming into the SAME
+  // turn; an invalid pick streams the window back with
+  // ``rejected_picks``.
+  pickChoice: (
+    threadId: string,
+    runId: string,
+    optionId: string,
+  ) => Promise<api.SendResult | null>;
   // T4 workflow (the tracked change). ``addWatch`` rejects with the host's typed
   // error so the panel can show it inline; the rest resolve quietly
   // and leave the slice consistent.
@@ -200,6 +215,132 @@ function makeTurnPatcherQueue(patch: (patcher: (t: Turn) => Turn) => void) {
   };
 }
 
+type TurnPatcherQueue = ReturnType<typeof makeTurnPatcherQueue>;
+
+// Mutable per-stream fold shared by the resume / pick paths: the
+// answer delta accumulator plus the two end-of-stream signals.
+// ``windowPending`` set at stream end = the run suspended again
+// (invalid pick) and the row must stay not-done.
+interface StreamFold {
+  statusSeen: boolean;
+  windowPending: ChoiceWindow | null;
+  answerFold: LiveAnswerState;
+}
+
+// Fold one wire frame into the turn a resume stream is continuing.
+// Identical semantics for the crash-resume (``resumeThread``) and the
+// choice-window pick (``pickChoice``) paths — only the patch target
+// differs, and that is already bound inside ``patches`` — so the two
+// cannot drift on frame handling (same reasoning as
+// ``consumeSseStream``).
+function foldResumeFrame(
+  patches: TurnPatcherQueue,
+  fold: StreamFold,
+  event: api.SendEvent,
+): void {
+  switch (event.type) {
+    case "thinking":
+      patches.coalesce((t) => ({
+        ...foldTraceFrameOntoTurn(t, event),
+        thinking_text: t.thinking_text + event.text,
+      }));
+      break;
+    case "tool_call": {
+      const placeholder: ToolSummary = {
+        name: event.name,
+        summary: RUNNING_SUMMARY,
+        tool_call_id: event.tool_call_id,
+      };
+      patches.flushThen((t) => ({
+        ...foldTraceFrameOntoTurn(t, event),
+        tool_summaries: [...(t.tool_summaries ?? []), placeholder],
+      }));
+      break;
+    }
+    case "tool_result":
+      patches.flushThen((t) => ({
+        ...foldTraceFrameOntoTurn(t, event),
+        tool_summaries: (t.tool_summaries ?? []).map((s) =>
+          s.tool_call_id === event.tool_call_id
+            ? { ...s, summary: event.summary }
+            : s,
+        ),
+      }));
+      break;
+    case "status":
+      fold.statusSeen = true;
+      fold.windowPending = null;
+      patches.flushThen((t) => ({
+        ...closeOpenBurstsOnTurn(t),
+        status: event.status,
+        status_reason: event.reason ?? "",
+        assistant_message: event.assistant_message,
+        track: event.track ?? t.track,
+        track_decision: event.track_decision ?? t.track_decision,
+        // Mid-flight stream taxonomy (see sendQuestion's status
+        // branch for the same handling rationale).
+        status_classified:
+          event.status_classified !== undefined
+            ? event.status_classified
+            : t.status_classified,
+        in_flight: false,
+        thinking_duration_ms: event.thinking_ms ?? t.thinking_duration_ms,
+      }));
+      break;
+    case "answer":
+      fold.answerFold = foldLiveAnswer(fold.answerFold, {
+        text: event.text,
+        reset: event.reset,
+        statusSeen: fold.statusSeen,
+      });
+      patches.coalesce((t) => ({
+        // Same answer-closes-burst contract as sendQuestion.
+        ...foldTraceFrameOntoTurn(t, { type: "answer" }),
+        answer: fold.answerFold.visible,
+      }));
+      break;
+    case "citations":
+      patches.flushThen((t) => ({ ...t, citations: event.citations }));
+      break;
+    case "comparison":
+      patches.flushThen((t) => ({
+        ...t,
+        comparisons: [...(t.comparisons ?? []), event.comparison],
+      }));
+      break;
+    case "choice_window":
+      // Either a reload re-emission (body-less resume) or the host
+      // refusing the pick (``rejected_picks`` set). The row goes back
+      // to suspended.
+      fold.windowPending = event.window;
+      patches.flushThen((t) => ({ ...t, choice_window: event.window }));
+      break;
+  }
+}
+
+// The finalize patch both resume-shaped streams run once their SSE
+// body closes: keep the row suspended when a window is pending, and
+// never re-GET over the streamed row.
+function finalizeResumedTurn(
+  patches: TurnPatcherQueue,
+  threadId: string,
+  fold: StreamFold,
+  result: api.SendResult,
+): void {
+  const cur = useWorkspaceStore.getState().activeThread;
+  if (cur?.id !== threadId) return;
+  // Drain queued deltas before the finalize patch (same ghost-burst
+  // risk as the status branch).
+  patches.flushThen((t) => ({
+    ...closeOpenBurstsOnTurn(t),
+    in_flight: fold.windowPending !== null,
+    citations: result.citations.length > 0 ? result.citations : t.citations,
+    track: result.track ?? t.track,
+    track_decision: result.track_decision ?? t.track_decision,
+    status_classified: result.status_classified ?? t.status_classified,
+  }));
+}
+
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   threads: [],
   corpus: [],
@@ -299,6 +440,15 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   async sendQuestion(threadId, question, thinkingOn = true, attachmentIds) {
     if (!question.trim()) return null; // Empty submit is a no-op.
     if (get().sendingQuestion) return null; // No queue in T1.
+    // search-mode-host T2: while a choice window is pending the run
+    // holds the thread — the host answers 409 concurrent_run, so the
+    // SPA rejects with the SAME typed error instead of firing a
+    // doomed POST. Surfacing it (not a silent no-op) keeps the
+    // composer's notice + draft-restoration path honest.
+    const gate = get().activeThread;
+    if (gate && gate.id === threadId && hasPendingChoiceWindow(gate.turns)) {
+      throw new api.ConcurrentRunError("concurrent_run");
+    }
     set({ sendingQuestion: true });
 
     // T3: optimistic turn the SSE frames thread into. Allocated
@@ -376,6 +526,12 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // The fold state lives here rather than on the turn row because a
     // bounce retry accumulates behind the visible draft.
     let statusSeen = false;
+    // search-mode-host T2: the window a ``choice_window`` frame
+    // painted on this turn, or null. The host sends NO terminal
+    // frames on a suspended stream — while this is set the run is
+    // waiting on a pick, so the row must not be finalized (not done,
+    // still in_flight).
+    let windowPending: ChoiceWindow | null = null;
     let answerFold: LiveAnswerState = EMPTY_LIVE_ANSWER;
     // corpus-serve-ingest T5 (ADR 0047 thread attach): the ids the
     // attach door minted ride THIS send and are consumed by it
@@ -424,6 +580,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           }
           case "status": {
             statusSeen = true;
+            // A terminal status ends any earlier suspension: the run
+            // (possibly after a resume in another stream) is over.
+            windowPending = null;
             // turn-trace-folds: the run ended — close any still-live
             // burst so the folds auto-collapse (spec line 34).
             // Drain queued deltas first so a pending thinking/answer
@@ -483,6 +642,17 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
               comparisons: [...(t.comparisons ?? []), event.comparison],
             }));
             break;
+          case "choice_window":
+            // The run suspended on this frame; the stream closes
+            // without terminal frames. The row keeps its live flag
+            // (see the finalize patch) and the window renders as the
+            // operator's next action.
+            windowPending = event.window;
+            turnPatches.flushThen((t) => ({
+              ...t,
+              choice_window: event.window,
+            }));
+            break;
         }
       });
       // The SSE stream already delivered terminal status, answer, and
@@ -497,7 +667,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         // status branch).
         turnPatches.flushThen((t) => ({
           ...closeOpenBurstsOnTurn(t),
-          in_flight: false,
+          // A pending window means the stream ended WITHOUT a
+          // terminal frame — the run is suspended, not done.
+          in_flight: windowPending !== null,
           citations:
             result.citations.length > 0 ? result.citations : t.citations,
           track: result.track ?? t.track,
@@ -515,14 +687,16 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       // row when no frame ever landed on it; keep (but un-live) a
       // row the stream had already started painting, then rethrow so
       // the composer can show the failure.
-      if (statusSeen) {
+      if (statusSeen || windowPending !== null) {
         // Drain any queued deltas before un-living the row so a late
         // flush cannot patch a row the stream already abandoned; the
         // closeOpenBursts also guarantees a queued delta folded after
         // the terminal status cannot leave a live burst on the row.
+        // A suspended row (window painted, then transport error)
+        // stays in_flight — the pick path can still resume it.
         turnPatches.flushThen((t) => ({
           ...closeOpenBurstsOnTurn(t),
-          in_flight: false,
+          in_flight: windowPending !== null,
         }));
       } else {
         dropTurnByRunId(threadId, optimisticRunId);
@@ -561,10 +735,13 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       // streaming; post-status empty frame clears refuse/step_cap draft.
       // The fold starts from the prose already painted on the resumed
       // row so the first delta extends it instead of replacing it.
-      let statusSeen = false;
-      let answerFold: LiveAnswerState = {
-        ...EMPTY_LIVE_ANSWER,
-        visible: latestTurnAnswer(threadId),
+      const fold: StreamFold = {
+        statusSeen: false,
+        windowPending: null,
+        answerFold: {
+          ...EMPTY_LIVE_ANSWER,
+          visible: latestTurnAnswer(threadId),
+        },
       };
       // Coalesced patcher (see sendQuestion): SSE deltas land in one
       // animation-frame flush instead of one patch per wire frame.
@@ -581,103 +758,62 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         // patchTurn.
         const cur = get().activeThread;
         if (!cur || cur.id !== threadId) return;
-
-        switch (event.type) {
-          case "thinking":
-            latestTurnPatches.coalesce((t) => ({
-              ...foldTraceFrameOntoTurn(t, event),
-              thinking_text: t.thinking_text + event.text,
-            }));
-            break;
-          case "tool_call": {
-            const placeholder: ToolSummary = {
-              name: event.name,
-              summary: RUNNING_SUMMARY,
-              tool_call_id: event.tool_call_id,
-            };
-            latestTurnPatches.flushThen((t) => ({
-              ...foldTraceFrameOntoTurn(t, event),
-              tool_summaries: [...(t.tool_summaries ?? []), placeholder],
-            }));
-            break;
-          }
-          case "tool_result": {
-            latestTurnPatches.flushThen((t) => ({
-              ...foldTraceFrameOntoTurn(t, event),
-              tool_summaries: (t.tool_summaries ?? []).map((s) =>
-                s.tool_call_id === event.tool_call_id
-                  ? { ...s, summary: event.summary }
-                  : s,
-              ),
-            }));
-            break;
-          }
-          case "status":
-            statusSeen = true;
-            latestTurnPatches.flushThen((t) => ({
-              ...closeOpenBurstsOnTurn(t),
-              status: event.status,
-              status_reason: event.reason ?? "",
-              assistant_message: event.assistant_message,
-              track: event.track ?? t.track,
-              track_decision: event.track_decision ?? t.track_decision,
-              // Mid-flight stream taxonomy (see sendQuestion's
-              // status branch for the same handling rationale).
-              status_classified:
-                event.status_classified !== undefined
-                  ? event.status_classified
-                  : t.status_classified,
-              in_flight: false,
-              thinking_duration_ms: event.thinking_ms ?? t.thinking_duration_ms,
-            }));
-            break;
-          case "answer":
-            answerFold = foldLiveAnswer(answerFold, {
-              text: event.text,
-              reset: event.reset,
-              statusSeen,
-            });
-            latestTurnPatches.coalesce((t) => ({
-              // Same answer-closes-burst contract as sendQuestion.
-              ...foldTraceFrameOntoTurn(t, { type: "answer" }),
-              answer: answerFold.visible,
-            }));
-            break;
-          case "citations":
-            latestTurnPatches.flushThen((t) => ({
-              ...t,
-              citations: event.citations,
-            }));
-            break;
-          case "comparison":
-            latestTurnPatches.flushThen((t) => ({
-              ...t,
-              comparisons: [...(t.comparisons ?? []), event.comparison],
-            }));
-            break;
-        }
+        foldResumeFrame(latestTurnPatches, fold, event);
       });
 
       // Same as sendQuestion: do not re-GET over the streamed row.
-      const cur = get().activeThread;
-      if (cur?.id === threadId) {
-        // Drain queued deltas before the finalize patch (same
-        // ghost-burst risk as the status branch).
-        latestTurnPatches.flushThen((t) => ({
-          ...closeOpenBurstsOnTurn(t),
-          in_flight: false,
-          citations:
-            result.citations.length > 0 ? result.citations : t.citations,
-          track: result.track ?? t.track,
-          track_decision: result.track_decision ?? t.track_decision,
-          status_classified: result.status_classified ?? t.status_classified,
-        }));
-      }
+      finalizeResumedTurn(latestTurnPatches, threadId, fold, result);
       await get().refreshThreads();
       return result;
     } finally {
       // Only clear if still pointing at THIS thread — never clobber
       // a freshly-started resume on another thread.
+      if (get().resumingThreadId === threadId) {
+        set({ resumingThreadId: null });
+      }
+    }
+  },
+
+  async pickChoice(threadId, runId, optionId) {
+    // Local gates: one resume/pick per thread, and a send cannot slip
+    // in while a pick stream is open. The host answers 409 for both;
+    // the SPA blocks first so the operator never sees a doomed POST.
+    if (get().resumingThreadId === threadId || get().sendingQuestion) {
+      return null;
+    }
+    const current = get().activeThread;
+    if (!current || current.id !== threadId) return null;
+    const turn = current.turns.find((t) => t.run_id === runId);
+    if (!turn || turn.choice_window === undefined) return null;
+
+    set({ resumingThreadId: threadId });
+    // Collapse the window immediately: pick 后窗口收起. An invalid
+    // pick re-emits a fresh ``choice_window`` frame (with
+    // ``rejected_picks``) and re-opens this same turn.
+    const patchTarget = (patcher: (t: Turn) => Turn) =>
+      patchTurnByRunIdOn(threadId, runId, patcher);
+    patchTarget((t) => ({ ...t, choice_window: undefined, in_flight: true }));
+
+    try {
+      const fold: StreamFold = {
+        statusSeen: false,
+        windowPending: null,
+        answerFold: { ...EMPTY_LIVE_ANSWER, visible: turn.answer },
+      };
+      const patches = makeTurnPatcherQueue(patchTarget);
+      const result = await api.resumeThread(
+        threadId,
+        (event) => {
+          const cur = get().activeThread;
+          if (!cur || cur.id !== threadId) return;
+          foldResumeFrame(patches, fold, event);
+        },
+        optionId,
+      );
+      finalizeResumedTurn(patches, threadId, fold, result);
+      await get().refreshThreads();
+      return result;
+    } finally {
       if (get().resumingThreadId === threadId) {
         set({ resumingThreadId: null });
       }
@@ -851,5 +987,27 @@ function patchLatestTurn(threadId: string, patcher: (t: Turn) => Turn): void {
   const nextTurns = current.turns.map((t, i) => (i === idx ? patcher(t) : t));
   useWorkspaceStore.setState({
     activeThread: { ...current, turns: nextTurns },
+  });
+}
+
+// search-mode-host T2 helper: patch ONE turn by run_id — the pick
+// continues the turn that showed the window, which is not necessarily
+// the latest row after a reload. No-op when the operator has
+// navigated away.
+function patchTurnByRunIdOn(
+  threadId: string,
+  runId: string,
+  patcher: (t: Turn) => Turn,
+): void {
+  const current = useWorkspaceStore.getState().activeThread;
+  if (!current || current.id !== threadId) return;
+  if (!current.turns.some((t) => t.run_id === runId)) return;
+  useWorkspaceStore.setState({
+    activeThread: {
+      ...current,
+      turns: current.turns.map((t) =>
+        t.run_id === runId ? patcher(t) : t,
+      ),
+    },
   });
 }

@@ -208,11 +208,18 @@ class StatusSnapshot(TypedDict, total=False):
 
     Latest snapshot is the active routing view. On company change,
     dependent fields (``period``, ``document_ids``) may be empty.
+
+    ``search_mode`` (search-mode host T1): the 检索档 assigned to this
+    retrieve job, carried by the mode-patch append
+    (``fin.host.search_mode_decision.mode_snapshot_patch``). A
+    company-change wipe emits no such key, which is exactly what makes
+    the inherit tier stop inheriting across a new job.
     """
 
     company: str
     period: str
     document_ids: list[str]
+    search_mode: str
 
 
 # ----- AgentState -----
@@ -291,6 +298,28 @@ class AgentState(TypedDict, total=False):
         Soft-Track T1: auditable dict with ``track``, ``confidence``,
         ``decision_tier``, and structured ``signals``. Cleared by
         ``reset_input_state`` for each new run.
+    search_mode_decision
+        search-mode host T1: auditable dict mirroring the
+        ``track_decision`` shape — ``search_mode`` (explicit ``None``
+        on clarify / typed fail), ``confidence``, ``decision_tier``,
+        structured ``signals``, ``options`` (choice-window data for
+        T2) and ``failure_code`` (具名失败 on typed fail). Written only
+        on ``grounded`` runs; cleared by ``reset_input_state`` for each
+        new run. The 档 is NOT a fifth track: ``track`` stays the
+        Soft-Track leaf.
+    extract_method_proposal
+        search-mode host T4 (ADR 0068 / 0079): the Fast 抽图 PROPOSE
+        audit — ``{proposed, picked, applied, operator_confirmed,
+        decision_tier}`` (shape SSOT:
+        ``fin.host.extract_method_proposal``). Doubles as the minimal
+        trigger: an input seed ``{"proposed": "fast"}`` with no
+        ``picked`` opens the propose window on a grounded run; the node
+        completes the audit with the operator pick. ``applied`` is
+        always ``False`` this increment — the extract method is the
+        index job's operator switch (spec 2), never flipped here. The
+        Fast string is NOT a 检索档 and never rides
+        ``search_mode_decision``. Overwrite semantics; run-scoped via
+        ``reset_input_state``.
     status_snapshots
         Soft-Track T3: append-only research working-context history
         (``company``, ``period``, ``document_ids``). Latest entry is
@@ -394,6 +423,12 @@ class AgentState(TypedDict, total=False):
     in_flight: bool
     track: Track
     track_decision: dict[str, Any]
+    # search-mode host T1: run-scoped 档 audit (overwrite semantics,
+    # single writer ``classify_node``); see the field docstring above.
+    search_mode_decision: dict[str, Any]
+    # search-mode host T4: run-scoped Fast propose audit AND the
+    # explicit propose-request seed; see the field docstring above.
+    extract_method_proposal: dict[str, Any]
     status_snapshots: Annotated[list[StatusSnapshot], operator.add]
     # T3 (enterprise-kb Focus 1): OVERWRITE semantics, not
     # ``operator.add``. ``tool_node`` already reads ``state`` and so
@@ -484,6 +519,14 @@ def reset_input_state(
         # rewrites track + track_decision on the new run.
         # status_snapshots are durable thread history (T3) — omit.
         "track_decision": {},
+        # search-mode host T1: the 档 audit is run-scoped like the track
+        # audit; the durable 档 lives on ``status_snapshots`` (inherit
+        # source), not here — omit that channel as above.
+        "search_mode_decision": {},
+        # search-mode host T4: the propose audit/seed is run-scoped — a
+        # stale Fast proposal must never reopen the window on a fresh
+        # send (``proposal_is_pending`` only fires on an unpicked seed).
+        "extract_method_proposal": {},
         # corpus-serve-ingest T4 (ADR 0047): the incoming attachment
         # blobs ride THIS run's input; every run without attachments
         # (default ``None``) clears the channel so attachment text is

@@ -417,6 +417,13 @@ def compile_for_runtime(
         model=model,
         classify_model=model,
         retrieve_adapter=_resolve_retrieve_adapter(env),
+        # search-mode host T2 / ADR 0062: the durable PRODUCTION boot
+        # ships the 检索档 choice-window HITL lane (clarify pauses on
+        # ``interrupt``; the workspace resumes with the operator pick).
+        # The checkpointer above is what makes the pause durable. The
+        # dev / scripted-e2e / eval lanes keep the factory default OFF
+        # so their pre-T2 flows are untouched.
+        enable_choice_window=True,
     )
 
     # Step 6: keep the stack alive for process lifetime. We do

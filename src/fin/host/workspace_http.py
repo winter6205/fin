@@ -159,6 +159,7 @@ from typing import Any, Final, Iterator, Literal
 from fastapi import (
     APIRouter,
     BackgroundTasks,
+    Body,
     Depends,
     FastAPI,
     File,
@@ -175,6 +176,7 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from fin.corpus.catalog import list_filings, record_filings
@@ -549,6 +551,12 @@ class RunStreamOutcome:
     # the caller writes the ``stopped`` turn row and its own terminal
     # frames rather than a stream-error refusal.
     stopped: bool = False
+    # search-mode host T2: the run PAUSED on a 检索档 choice window
+    # (LangGraph HITL interrupt, ADR 0062). The engine already emitted
+    # the ``choice_window`` SSE frame; the caller persists NOTHING (a
+    # paused run is not a finished turn — the resumed remainder's
+    # completion writes the row) and closes the stream.
+    choice_window: dict[str, Any] | None = None
 
 
 # Graph nodes whose model deltas are the operator-visible reply.
@@ -644,6 +652,32 @@ class SendMessageRequest(BaseModel):
     # ``RetrieveTier``) rather than re-spelled here, so a 档 added to
     # the SSOT cannot leave this schema silently accepting the old set.
     tiers: list[RetrieveTier] = Field(default_factory=list)
+    # search-mode host T4 (HTTP surface): an explicit Fast 抽图 PROPOSE
+    # request. The send seeds the run's ``extract_method_proposal``
+    # STATE field with ``{"proposed": "fast"}`` (the graph-side trigger
+    # locked in tests/host/test_search_mode_fast_propose.py) so a
+    # grounded run pauses on the propose window — the workbench has no
+    # other channel to reach it. Omitted (the default) injects nothing:
+    # the wire stays byte-identical to the pre-T4 send. Typed as a
+    # closed Literal (proposing anything but Fast is not a request the
+    # host makes, per ``PROPOSED_EXTRACT_METHOD``) so a bogus token is
+    # a 422 input error, not a silently ignored field — same style as
+    # ``tiers`` above.
+    propose_extract_method: Literal["fast"] | None = None
+
+
+class ResumeRequest(BaseModel):
+    """Optional body for ``POST /threads/{id}/resume`` (search-mode host T2).
+
+    ``pick`` answers a pending 检索档 choice window: the run continues
+    with ``Command(resume=pick)`` on the SAME SSE wire. The body stays
+    OPTIONAL on purpose — a body-less resume keeps the pre-T2 crash-
+    resume contract (``graph.stream(None)``) untouched, and against a
+    pending window it REDRAWS the ``choice_window`` frame (the SPA's
+    reload path).
+    """
+
+    pick: str | None = None
 
 
 class CreateWatchRequest(BaseModel):
@@ -1167,6 +1201,9 @@ def _stream_run_frames(
         return data
 
     stopped = False
+    # search-mode host T2: set when the run paused on a choice window
+    # (the final ``values`` frame carries ``__interrupt__``).
+    choice_window: dict[str, Any] | None = None
     graph_stream = graph.stream(
         input_value,
         config=config,
@@ -1223,6 +1260,19 @@ def _stream_run_frames(
                         message, pending_args
                     ):
                         yield _frame(event, data)
+                # A paused HITL interrupt surfaces on the LAST
+                # ``values`` frame under the reserved ``__interrupt__``
+                # key (LangGraph contract). The choice-window payload is
+                # the frame's data verbatim — the host/HTTP contract the
+                # SPA paints (spec search-mode-host SC2, stub allowed).
+                for pending in payload.get("__interrupt__") or ():
+                    value = getattr(pending, "value", None)
+                    if (
+                        isinstance(value, dict)
+                        and value.get("kind") == "choice_window"
+                    ):
+                        choice_window = value
+                        yield _frame("choice_window", value)
 
         # Stream end: release any held-back inline-filter fragment so
         # the live view never silently loses trailing text. Skipped on
@@ -1303,6 +1353,7 @@ def _stream_run_frames(
         thinking_ms=clock.total_ms,
         answer_reset=pending_answer_reset,
         stopped=stopped,
+        choice_window=choice_window,
     )
 
 
@@ -2292,6 +2343,21 @@ def build_router(
                 f"another run is already in flight on thread_id={thread_id!r}"
             )
 
+        # search-mode host T2: a PAUSED choice window releases the
+        # per-thread lock (the run's stream ended on the interrupt), so
+        # the same-thread send needs this second probe to keep the 409
+        # semantics: the run is still in flight on the checkpoint,
+        # waiting for the operator's pick. Same typed 409
+        # ``concurrent_run`` answer — placed BEFORE the attachment
+        # consumption below, so a rejected send keeps its attachments.
+        if (
+            hasattr(graph, "interrupt_pending")
+            and graph.interrupt_pending(thread_id) is not None
+        ):
+            raise ConcurrentRunError(
+                f"a choice window is pending on thread_id={thread_id!r}"
+            )
+
         # corpus-serve-ingest T4: the run is definitely starting, so
         # NOW the referenced blobs are consumed (turn-blob single-use
         # semantics). A later send replaying the same id is the named
@@ -2324,6 +2390,16 @@ def build_router(
                 "workspace_root": str(workspace_root),
             }
         }
+        # search-mode host T2 (SC4): the existing ``tiers`` selector is
+        # the documented pin field — naming EXACTLY ONE open 档 pins it
+        # for this run (the rules tier assigns without opening the
+        # window; the audit records the pin). An unopened 档 was already
+        # the named 400 above; a multi-select names nothing (the
+        # ordinary cascade decides, same as an empty selector today).
+        # The pin rides the run CONFIG, never the checkpointed state, so
+        # a follow-up send cannot inherit it.
+        if len(body.tiers) == 1:
+            config["configurable"]["pinned_search_mode"] = body.tiers[0]
         thinking_type = "adaptive" if body.thinking else "disabled"
         if not body.thinking:
             # T3 (#34): the operator's thinking preference rides the
@@ -2333,6 +2409,22 @@ def build_router(
             # preference is stamped; the default (on) keeps the boot
             # binding untouched.
             config["configurable"]["thinking_type"] = thinking_type
+
+        # search-mode host T4: the propose seed is a run STATE field, not
+        # a configurable (unlike the T2 pin above) — ``reset_input_state``
+        # zeroes ``extract_method_proposal`` on every run, so the seed is
+        # stamped ON TOP of the fresh reset dict here: the overwrite
+        # channel takes the input value, the next send's reset clears it
+        # (no checkpoint leak). Without the field the key stays the
+        # reset's ``{}`` — ``proposal_is_pending`` never fires.
+        input_state = reset_input_state(
+            body.question,
+            attachments=resolved_attachments,
+        )
+        if body.propose_extract_method is not None:
+            input_state["extract_method_proposal"] = {
+                "proposed": body.propose_extract_method
+            }
 
         def event_stream() -> Iterator[str]:
             """Yield the delta wire for this run, then persist + close.
@@ -2386,10 +2478,7 @@ def build_router(
                 outcome = yield from _stream_run_frames(
                     graph,
                     run_id=run_id,
-                    input_value=reset_input_state(
-                        body.question,
-                        attachments=resolved_attachments,
-                    ),
+                    input_value=input_state,
                     config=config,
                     seen_message_ids=seen_message_ids,
                     thread_id=thread_id,
@@ -2410,6 +2499,16 @@ def build_router(
                     question=body.question,
                     thinking_ms=outcome.thinking_ms,
                 )
+                return
+
+            if outcome.choice_window is not None:
+                # search-mode host T2: the run PAUSED on the choice
+                # window — the engine already emitted the frame. Persist
+                # NOTHING and emit no terminal frames: a paused run is
+                # not a finished turn (the resumed remainder's
+                # completion writes the row under the SAME checkpoint
+                # run_id). The stream close is the SPA's cue to paint
+                # the window.
                 return
 
             if outcome.final_state is None:
@@ -2648,12 +2747,14 @@ def build_router(
     def resume_thread(
         thread_id: str,
         background: BackgroundTasks,
+        body: ResumeRequest | None = Body(default=None),
         graph: Any = Depends(get_graph),
         store: ThreadStore = Depends(get_thread_store),
         memory_port: Any = Depends(get_memory_port),
         workspace_root: Path = Depends(get_workspace_root),
     ) -> Response:
-        """T4 crash resume (spec line 39 / ADR 0026 / ADR 0018).
+        """T4 crash resume (spec line 39 / ADR 0026 / ADR 0018) +
+        search-mode host T2 choice-window pick.
 
         Continues an interrupted run from the LAST COMPLETE
         host-graph node via ``graph.stream(None, config=...)`` —
@@ -2665,18 +2766,28 @@ def build_router(
         resumes at the pending node (``tools`` after a model-complete
         crash).
 
-        Rejection order mirrors the send path so every failure mode
-        resolves BEFORE any SSE header:
+        ``{"pick": ...}`` body (T2): answers a pending 检索档 choice
+        window via ``Command(resume=pick)`` on the SAME delta wire.
+        Rejection order keeps every failure mode before any SSE
+        header:
 
         * 404 - unknown thread metadata row;
         * 409 - a run is currently in flight on this thread
           (lock probe; ``application/json`` body, no stream);
+        * 400 ``choice_not_pending`` - a pick arrived while NO window
+          is pending (typed, never a silently ignored field nor a
+          crash-resume hijack);
         * 204 - nothing to resume: the prior run reached a terminal
           node (LangGraph's ``stream(None)`` on a terminal
           checkpoint is a documented no-op and the spec forbids
           calling it);
         * 503 - ingest missing (shared handler, raised by the graph
           dependency itself).
+
+        A body-less resume against a pending window REDRAWS the
+        ``choice_window`` frame (``stream(None)`` re-raises the
+        interrupt) — the SPA's reload path, with no new endpoint to
+        learn.
         """
         # Unknown thread -> 404 BEFORE any probe or stream.
         thread = store.get_thread(thread_id)
@@ -2692,6 +2803,22 @@ def build_router(
             raise ConcurrentRunError(
                 f"another run is already in flight on thread_id={thread_id!r}"
             )
+
+        # search-mode host T2: a pick answers a PENDING window — with
+        # none open it is a typed 400 (never a hijacked crash resume,
+        # never a silently dropped field). A body-less resume is the
+        # pre-T2 crash path unchanged.
+        pick = body.pick if body is not None else None
+        if pick is not None:
+            pending_choice = (
+                graph.interrupt_pending(thread_id)
+                if hasattr(graph, "interrupt_pending")
+                else None
+            )
+            if pending_choice is None:
+                return JSONResponse(
+                    status_code=400, content={"error": "choice_not_pending"}
+                )
 
         # Nothing to resume -> 204 No Content. A terminal checkpoint
         # (``pending_nodes() == ()``) means the prior run finished;
@@ -2747,11 +2874,16 @@ def build_router(
             # too, so Stop must reach it (the composer is disabled for
             # its whole duration).
             stop_token = run_control.begin(thread_id, run_id)
+            # search-mode host T2: with a validated pick the resume
+            # INPUT is LangGraph's ``Command(resume=pick)``; without
+            # one it stays the crash-resume ``None`` (or, against a
+            # pending window, redraws the window frame).
+            resume_input: Any = Command(resume=pick) if pick is not None else None
             try:
                 outcome = yield from _stream_run_frames(
                     graph,
                     run_id=run_id,
-                    input_value=None,
+                    input_value=resume_input,
                     config=resume_config,
                     seen_message_ids=seen_message_ids,
                     thread_id=thread_id,
@@ -2768,6 +2900,13 @@ def build_router(
                 yield from _stopped_terminal_frames(
                     run_id, thinking_ms=outcome.thinking_ms
                 )
+                return
+
+            if outcome.choice_window is not None:
+                # Re-draw (body-less resume onto a pending window) or
+                # an invalid pick that REOPENED the window: the frame
+                # is out, the run is still paused, so persist nothing
+                # and close — the operator picks again.
                 return
 
             if outcome.final_state is None:

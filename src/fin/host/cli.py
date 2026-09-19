@@ -126,14 +126,53 @@ def _format_citation_line(citation) -> str:
     return f"  - {citation.document_id} v{citation.version} p{citation.page}: {quote}"
 
 
+def _pending_interrupt(state: dict[str, Any]) -> dict[str, Any] | None:
+    """The first pending Interrupt payload, or ``None``.
+
+    LangGraph parks an ``interrupt()`` call by sticking a tuple of
+    ``Interrupt`` objects under ``__interrupt__`` in the invoke
+    result; ``.value`` is the payload the node passed in (here a
+    ``choice_window`` dict). Same read shape as the T2 graph tests.
+    """
+    interrupts = state.get("__interrupt__") or ()
+    if not interrupts:
+        return None
+    value = getattr(interrupts[0], "value", None)
+    return value if isinstance(value, dict) else {}
+
+
+def _render_paused(payload: dict[str, Any]) -> str:
+    """The paused-run surface that REPLACES the status/answer/citations
+    triple. The triple would be actively misleading here (``status:
+    running`` + empty answer), so the operator gets the window title,
+    the pickable options, and where to pick instead."""
+    kind = payload.get("kind", "unknown")
+    title = payload.get("title", "")
+    lines = [f"paused: {kind} —— {title}"]
+    for option in payload.get("options") or ():
+        if not isinstance(option, dict):
+            continue
+        suffix = "" if option.get("opened") else " (未开放)"
+        lines.append(f"- {option.get('id', '')} {option.get('label', '')}{suffix}")
+    lines.append(
+        "在工作台该 thread 上选择后继续（HTTP resume），CLI 本增量不支持 pick"
+    )
+    return "\n".join(lines)
+
+
 def render_result(state: dict[str, Any]) -> str:
     """Render the canonical three-section stdout from a graph result.
 
     Pure function — no I/O — so callers (and tests) can capture the
     output string directly. The schema is stable across terminal
     statuses: the ``citations:`` header is always present, even when
-    the run was ``refuse`` / ``step_cap``.
+    the run was ``refuse`` / ``step_cap``. A run that is still parked
+    on an interrupt is NOT terminal: the paused block replaces the
+    triple (see ``_render_paused``).
     """
+    payload = _pending_interrupt(state)
+    if payload is not None:
+        return _render_paused(payload)
     status = state.get("status", "")
     answer = _derive_answer(state)
     # The ``reset_input_state`` helper at invoke time clears
@@ -189,7 +228,9 @@ def run(
 
     Stdout sections (in order): ``status:``, ``answer:``, ``citations:``.
     Stderr: ``thread_id: <value>`` always; for ``refuse`` also
-    ``refuse reason: <status_reason>``.
+    ``refuse reason: <status_reason>``. When the run is still parked
+    on an interrupt (``__interrupt__`` pending), the paused block
+    replaces the three stdout sections and the exit code stays 0.
 
     Concurrent-run guard
     --------------------
