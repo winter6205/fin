@@ -31,24 +31,33 @@ from fin.retrieve.mcp_session import MCPStdioSession
 
 IKNOW_ROOT = Path("/home/winner/projects/iknow-memory")
 IKNOW_ENTRY = IKNOW_ROOT / "dist" / "index.js"
-# A worktree checkout whose build carries a newer tool surface (e.g. the
-# operator-console worktree's ``read_source``). Pass ``root=`` to
-# :func:`live_iknow` to test against it; the default keeps the main
-# checkout so existing opt-in tests are unaffected.
-IKNOW_WORKTREE_ROOT = Path(
-    "/home/winner/projects/iknow-memory-wt-operator-console"
-)
-# A second worktree checkout whose build carries the corpus-ready branch
-# (pushed-slice persistence + 资料 status/collection tools). The
-# operator-console build predates that branch, so the live corpus-ingest
-# acceptance cannot use it. Machine-local, same convention as
-# ``IKNOW_WORKTREE_ROOT``; it becomes the default root once the
-# corpus-ready branch is merged and rebuilt. Pass ``root=`` to
-# :func:`live_iknow` to select it.
-IKNOW_CORPUS_READY_ROOT = Path(
-    "/home/winner/projects/iknow-memory-wt-corpus-ready-retrieve"
-)
+# Both worktree roots have collapsed back to the main checkout: the surfaces
+# they once carried ahead of main are now merged and rebuilt there. The
+# operator-console ``read_source`` tool, the corpus-ready push/资料 surface,
+# and the search-mode retrieve stack (iknow #238/#243/#244/#245) all live in
+# main's ``dist`` now, so the live acceptance runs against the single
+# authoritative main build (issue fin #276 task 1: "对合并后的 iknow main
+# build"). The aliases are kept because the opt-in tests import them by name.
+IKNOW_WORKTREE_ROOT = IKNOW_ROOT
+IKNOW_CORPUS_READY_ROOT = IKNOW_ROOT
 EMBED_DIMENSIONS = 8
+
+# Live backing services for the ``pg_es`` storage branch (fin #276 task 2).
+# These are the docker-compose dev endpoints of the iknow checkout above —
+# local test infra, not production credentials — and each is env-overridable
+# so the operator can point the live run at another cluster without an edit.
+IKNOW_PG_URL = os.environ.get(
+    "FIN_LIVE_IKNOW_DB_URL",
+    "postgresql://iknow_memory:iknow_memory@localhost:5432/iknow_memory",
+)
+IKNOW_ES_URL = os.environ.get("FIN_LIVE_IKNOW_ES_URL", "http://127.0.0.1:9200")
+IKNOW_NEO4J_URI = os.environ.get(
+    "FIN_LIVE_IKNOW_NEO4J_URI", "bolt://localhost:7687"
+)
+IKNOW_NEO4J_USER = os.environ.get("FIN_LIVE_IKNOW_NEO4J_USER", "neo4j")
+IKNOW_NEO4J_PASSWORD = os.environ.get(
+    "FIN_LIVE_IKNOW_NEO4J_PASSWORD", "iknow-memory-dev"
+)
 
 
 class _EmbeddingHandler(BaseHTTPRequestHandler):
@@ -250,12 +259,25 @@ def live_iknow(
     monkeypatch: pytest.MonkeyPatch,
     *,
     root: Path = IKNOW_ROOT,
+    storage: str = "memory",
+    es_chunk_index: str | None = None,
+    es_entity_index: str | None = None,
 ) -> Iterator[LiveIknow]:
     """Run the real compiled iknow stdio server over one shared process.
 
     ``root`` selects the iknow-memory checkout whose ``dist/index.js``
-    is spawned; pass ``IKNOW_WORKTREE_ROOT`` for a worktree build that
-    carries tools the main checkout does not have yet.
+    is spawned; it defaults to the single authoritative main build
+    (``IKNOW_WORKTREE_ROOT`` / ``IKNOW_CORPUS_READY_ROOT`` are aliases
+    of that same root now, kept only for import compatibility).
+
+    ``storage`` selects the backing services the spawned process is
+    wired to: ``"memory"`` (the default — in-process store, the
+    original harness shape) or ``"pg_es"`` for the real PG (pgvector) +
+    Elasticsearch + Neo4j stack the task-2 search-mode driver needs.
+    ``es_chunk_index`` / ``es_entity_index`` apply only to ``pg_es`` and
+    are **required** there with no default: the cluster is shared with
+    iknow's own live suites, so every pg_es caller must pass explicit
+    isolated (ideally per-run unique) index names it owns and cleans up.
     """
 
     entry = root / "dist" / "index.js"
@@ -272,22 +294,75 @@ def live_iknow(
     )
     thread.start()
 
-    env = {
-        "GRAPHRAG_MEMORY_STORAGE": "memory",
-        "GRAPHRAG_MEMORY_EMBED_DIMENSIONS": str(EMBED_DIMENSIONS),
-        "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS": "2000",
-        "GRAPHRAG_MEMORY_EMBED_API_KEY": "fin-live-test",
-        "GRAPHRAG_MEMORY_EMBED_BASE_URL": (
-            f"http://127.0.0.1:{embedding_server.server_port}/v1"
-        ),
-        "GRAPHRAG_MEMORY_EMBED_MODEL": "fin-live-test",
-        "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED": "true",
-        "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED": "false",
-        "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED": "false",
-        "GRAPHRAG_MEMORY_NEO4J_URI": "",
-        "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL": "",
-        "ANTHROPIC_AUTH_TOKEN": "",
-    }
+    if storage == "memory":
+        env = {
+            "GRAPHRAG_MEMORY_STORAGE": "memory",
+            "GRAPHRAG_MEMORY_EMBED_DIMENSIONS": str(EMBED_DIMENSIONS),
+            "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS": "2000",
+            "GRAPHRAG_MEMORY_EMBED_API_KEY": "fin-live-test",
+            "GRAPHRAG_MEMORY_EMBED_BASE_URL": (
+                f"http://127.0.0.1:{embedding_server.server_port}/v1"
+            ),
+            "GRAPHRAG_MEMORY_EMBED_MODEL": "fin-live-test",
+            # Vector-only on purpose. This harness runs STORAGE=memory with no
+            # Elasticsearch; iknow ADR-0007 makes the BM25/precision layer
+            # default-on-with-no-address an out-of-contract config (the in-process
+            # memory BM25 is a test seam, not a sanctioned fallback), so a B-tier
+            # retrieve escalates to retrieve_degraded_failure
+            # (keyword_bm25:attempted-and-failed). Disabling BM25 is the
+            # ADR-sanctioned vector-only escape hatch; A-tier lexical is still
+            # exercised because mode-a-arm sources lexical from the memory backend
+            # independent of this flag. Real-ES lexical is covered by the task-2
+            # PG+ES driver, not this memory harness.
+            "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED": "false",
+            "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED": "false",
+            "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED": "false",
+            "GRAPHRAG_MEMORY_NEO4J_URI": "",
+            "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL": "",
+            "ANTHROPIC_AUTH_TOKEN": "",
+        }
+    elif storage == "pg_es":
+        if es_chunk_index is None or es_entity_index is None:
+            raise ValueError(
+                "storage='pg_es' requires explicit es_chunk_index and "
+                "es_entity_index: the cluster is shared with iknow's own "
+                "live suites, so a built-in default name would cross their "
+                "queries — pass per-run isolated fin-owned indices instead"
+            )
+        env = {
+            "GRAPHRAG_MEMORY_STORAGE": "pgvector",
+            "GRAPHRAG_MEMORY_DB_URL": IKNOW_PG_URL,
+            "GRAPHRAG_MEMORY_EMBED_DIMENSIONS": str(EMBED_DIMENSIONS),
+            "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS": "2000",
+            "GRAPHRAG_MEMORY_EMBED_API_KEY": "fin-live-test",
+            "GRAPHRAG_MEMORY_EMBED_BASE_URL": (
+                f"http://127.0.0.1:{embedding_server.server_port}/v1"
+            ),
+            "GRAPHRAG_MEMORY_EMBED_MODEL": "fin-live-test",
+            "GRAPHRAG_MEMORY_ES_URL": IKNOW_ES_URL,
+            # fin-owned indices (the driver passes per-run unique names and
+            # deletes them at teardown): iknow's own live suites share this
+            # cluster, and a shared index would cross their queries.
+            "GRAPHRAG_MEMORY_ES_CHUNK_INDEX": es_chunk_index,
+            "GRAPHRAG_MEMORY_ES_ENTITY_INDEX": es_entity_index,
+            "GRAPHRAG_MEMORY_NEO4J_URI": IKNOW_NEO4J_URI,
+            "GRAPHRAG_MEMORY_NEO4J_USER": IKNOW_NEO4J_USER,
+            "GRAPHRAG_MEMORY_NEO4J_PASSWORD": IKNOW_NEO4J_PASSWORD,
+            # Unlike the memory branch, BM25 stays ON: with a real ES
+            # precision layer configured, ADR-0007's default-on-with-address
+            # contract is satisfied, and that layer is exactly what the
+            # task-2 A tier must lexically hit (and B fuses with vectors).
+            # Rerank stays OFF so the fused order is observable end to end.
+            "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED": "true",
+            "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED": "true",
+            "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED": "false",
+            "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL": "",
+            "ANTHROPIC_AUTH_TOKEN": "",
+        }
+    else:
+        raise ValueError(
+            f"live_iknow supports storage='memory' or 'pg_es', got {storage!r}"
+        )
     for key, value in env.items():
         monkeypatch.setenv(key, value)
 
