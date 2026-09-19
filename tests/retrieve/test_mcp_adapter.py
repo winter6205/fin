@@ -968,6 +968,134 @@ def test_a_mode_outside_the_closed_set_raises_invalid_search_mode(
     assert adapter.payloads == []
 
 
+# ----- T3: the five boundary classes under a 档 (product adapter) -----
+#
+# The same matrix as ``test_fake_port``'s T3 section, on the PRODUCT
+# adapter: an accepted 档 must not bend the empty / overflow /
+# concurrent / exception contracts, and a refused 档 keeps its OWN
+# name even when the transport is down (spec SC4/SC7 — the exits never
+# cross).
+
+
+def test_an_open_tier_with_an_empty_wire_answer_is_the_legal_miss() -> None:
+    """Boundary 'empty' × 档: an accepted 档 that reaches the server and
+    finds nothing is the miss shape ``{"chunks": []}`` — and, unlike a
+    refused 档, the request DID go out (one payload), so an operator
+    can tell "searched at A, nothing there" from "the port never
+    opened that 档"."""
+    adapter = _CapturingAdapter()
+    assert adapter.retrieve("foo", search_mode="A") == {"chunks": []}
+    assert len(adapter.payloads) == 1
+    assert (
+        adapter.payloads[0]["params"]["arguments"]["filters"]
+        == {SEARCH_MODE_FILTER_KEY: "A"}
+    )
+
+
+def test_a_tiered_request_sends_the_clamped_limit() -> None:
+    """Boundary 'overflow' × 档: the ADR 0009 cap resolves BEFORE the
+    wire, so a tiered over-cap request sends ``limit == 20`` beside
+    its 档 — the cap is a port rule, not a 档 knob."""
+    adapter = _CapturingAdapter()
+    adapter.retrieve("foo", limit=999, search_mode="A")
+    arguments = adapter.payloads[0]["params"]["arguments"]
+    assert arguments["limit"] == 20
+    assert arguments["filters"] == {SEARCH_MODE_FILTER_KEY: "A"}
+
+
+def test_transport_down_with_an_open_tier_is_still_retrieve_unavailable() -> None:
+    """Boundary 'exception' × 档: the round trip of an ACCEPTED 档
+    failing names ``retrieve_unavailable`` — the transport is the
+    thing that broke, and neither the miss shape (a corpus with
+    nothing) nor a silent default-B answer may wear the 档's request."""
+    adapter = _ScriptedAdapter(scripted_exception=OSError("down"))
+    assert adapter.retrieve("foo", search_mode="B") == {
+        "error": "retrieve_unavailable"
+    }
+
+
+@pytest.mark.parametrize(
+    ("tier", "code"),
+    [
+        pytest.param("C", TIER_NOT_OPEN, id="tier-c"),
+        pytest.param("D", REAL_DB_NOT_WIRED, id="tier-d"),
+    ],
+)
+def test_a_closed_tier_keeps_its_name_even_when_the_transport_is_down(
+    tier: str, code: str
+) -> None:
+    """Named-exit ordering under fault: the 档 check runs BEFORE the
+    transport, so even a down MCP answers the 档's own code, never
+    ``retrieve_unavailable``. The distinction is actionable: retrying
+    the transport changes nothing for 「档未开」, while
+    ``retrieve_unavailable`` means the 档 IS open and the call is
+    worth retrying."""
+    adapter = _ScriptedAdapter(scripted_exception=OSError("down"))
+    assert adapter.retrieve("foo", search_mode=tier) == {"error": code}
+
+
+def test_an_illegal_mode_is_named_before_a_broken_transport() -> None:
+    """The same ordering one class further back: an out-of-set token is
+    the CALLER's error and raises even with the transport scripted to
+    fail — a down MCP must not launder an illegal 档 into
+    ``retrieve_unavailable``."""
+    adapter = _ScriptedAdapter(scripted_exception=OSError("down"))
+    with pytest.raises(InvalidSearchModeError):
+        adapter.retrieve("foo", search_mode="c")
+
+
+def test_concurrent_tiered_calls_answer_per_call() -> None:
+    """Boundary 'concurrent' × 档: one shared adapter, parallel calls
+    mixing accepted and unopened 档 — each call gets its OWN named
+    answer (hit dict or ``{"error": tier_not_open}``), and only the
+    accepted modes ever reach the wire."""
+    chunks_wire = [
+        {
+            "id": "chunk-1",
+            "content": "hit",
+            "source_ref": _canonical_source_ref("DOC-2023Q1", page=1),
+            "valid_window": ["2023-01-01T00:00:00Z", None],
+            "score": 1.0,
+        }
+    ]
+
+    class _ConcurrentTierAdapter(_ScriptedAdapter):
+        """Scripted adapter that also records every wire payload."""
+
+        def __init__(self) -> None:
+            super().__init__(scripted_response={"chunks": chunks_wire})
+            self.payloads: list[dict] = []
+
+        async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
+            self.payloads.append(payload)
+            return await super()._call_mcp(payload)
+
+    adapter = _ConcurrentTierAdapter()
+
+    def _go(i: int) -> dict:
+        mode = ("A", "B", "C")[i % 3]
+        return adapter.retrieve("foo", search_mode=mode)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        results = list(ex.map(_go, range(12)))
+
+    expected_chunks = {"chunks": [_chunk("hit", "DOC-2023Q1", score=1.0)]}
+    modes = [("A", "B", "C")[i % 3] for i in range(12)]
+    for mode, result in zip(modes, results):
+        if mode == "C":
+            assert result == {"error": TIER_NOT_OPEN}
+        else:
+            assert result == expected_chunks
+
+    sent_modes = [
+        payload["params"]["arguments"]["filters"][SEARCH_MODE_FILTER_KEY]
+        for payload in adapter.payloads
+    ]
+    assert sorted(sent_modes) == sorted(
+        m for m in modes if m in ("A", "B")
+    ), "a refused 档 reached the wire, or an accepted one did not"
+
+
 # ----- locator_map injection -----
 
 

@@ -189,3 +189,39 @@ def test_a_hit_scripted_under_no_capability_is_rejected() -> None:
     with pytest.raises(CapabilityConfigurationError) as excinfo:
         CapabilityAwareFakePort(bogus)
     assert excinfo.value.code == "capability_configuration_incomplete"
+
+
+# ----- search_mode mirroring (search-mode-retrieve T2 / T3) -----
+#
+# This fake is not a 档 (SC8): an accepted token answers with the SAME
+# all-on script, while the port's named exits for unopened / illegal
+# tokens are mirrored rather than swallowed — the eval lane must reject
+# the same calls the product adapter rejects.
+
+
+def test_an_open_tier_answers_with_the_same_script(port) -> None:
+    plain = port.retrieve("营业收入同比")
+    tiered = port.retrieve("营业收入同比", search_mode="A")
+    assert tiered == plain
+
+
+@pytest.mark.parametrize(
+    ("mode", "code"),
+    [("C", "tier_not_open"), ("D", "real_db_not_wired")],
+)
+def test_the_capability_fake_refuses_an_unopened_tier_like_the_port(
+    port, mode: str, code: str
+) -> None:
+    from fin.retrieve.port import TierUnavailableError
+
+    with pytest.raises(TierUnavailableError) as excinfo:
+        port.retrieve("营业收入同比", search_mode=mode)
+    assert excinfo.value.code == code
+
+
+def test_the_capability_fake_refuses_an_illegal_mode_like_the_port(port) -> None:
+    from fin.retrieve.port import InvalidSearchModeError
+
+    with pytest.raises(InvalidSearchModeError) as excinfo:
+        port.retrieve("营业收入同比", search_mode="b")
+    assert excinfo.value.code == "invalid_search_mode"

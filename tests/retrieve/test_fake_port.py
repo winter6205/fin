@@ -401,3 +401,94 @@ def test_fake_raises_invalid_search_mode_like_the_product_adapter() -> None:
         port.retrieve("foo", search_mode="summary")
     assert excinfo.value.code == "invalid_search_mode"
     assert port.calls == []
+
+
+# ----- T3: the five boundary classes under a 档 -----
+#
+# ``specs/search-mode-retrieve.md`` Boundaries: the five classes (empty /
+# negative / overflow / concurrent / exception) must hold on the port
+# contract once ``filters.search_mode`` rides it. Fake is not a 档 (SC8),
+# so these assert CONTRACT shapes — never an A/B/C/D ranking difference.
+
+
+def test_an_open_tier_never_turns_the_legal_empty_miss_into_an_error() -> None:
+    """Boundary 'empty' × 档: a query the corpus has no hits for stays
+    the legal miss shape when an open 档 is set — naming the 档 is not
+    a licence to answer MCP-down or raise. ``calls`` still records the
+    accepted token (the miss ran *at* that 档)."""
+    port = FakeRetrievePort(
+        hits_by_query={"alpha": [_chunk("hit")]},
+        known_document_ids={"DOC-2023Q1"},
+    )
+    assert port.retrieve("nonexistent query", search_mode="A") == {
+        "chunks": []
+    }
+    assert port.calls[-1]["search_mode"] == "A"
+
+
+def test_an_empty_query_is_named_before_the_tier_is_consulted() -> None:
+    """Named-exit ordering on the empty class: an empty query is
+    ``EmptyQueryError`` even beside a refused 档 — the port names what
+    the caller got wrong FIRST and never lets the tier error mask it
+    (both are invalid input, but only the query is on the §B2 ledger)."""
+    port = FakeRetrievePort()
+    with pytest.raises(EmptyQueryError):
+        port.retrieve("   ", search_mode="C")
+    assert port.input_validation_failures.count() == 1
+    assert port.calls == []
+
+
+def test_the_limit_cap_holds_under_an_open_tier() -> None:
+    """Boundary 'overflow' × 档: the 档 asks the ranking service HOW to
+    score; the port's default-8 / cap-20 rules (ADR 0009) do not move
+    with the request."""
+    chunks = [_chunk(f"hit {i}") for i in range(50)]
+    port = FakeRetrievePort(hits_by_query={"foo": chunks})
+    over = port.retrieve("foo", limit=999, search_mode="B")
+    zero = port.retrieve("foo", limit=0, search_mode="B")
+    assert len(over["chunks"]) == 20
+    assert len(zero["chunks"]) == 8
+
+
+def test_concurrent_tiered_calls_answer_per_call() -> None:
+    """Boundary 'concurrent' × 档: parallel calls on one shared fake —
+    an accepted 档 answers with the same hit list, an unopened one
+    raises its own named error, an illegal one raises
+    ``InvalidSearchModeError``, and ``calls`` records ONLY the accepted
+    requests each carrying its OWN mode (a refused 档 must not leak a
+    record, another thread's or its own)."""
+    from fin.retrieve.port import InvalidSearchModeError, TierUnavailableError
+
+    chunks = [_chunk(f"hit {i}") for i in range(5)]
+    port = FakeRetrievePort(
+        hits_by_query={"foo": chunks},
+        known_document_ids={"DOC-2023Q1"},
+    )
+
+    def _go(i: int) -> tuple[str, object]:
+        mode = ("A", "B", "C", "Z")[i % 4]
+        try:
+            out = port.retrieve("foo", limit=5, search_mode=mode)
+            return mode, [c.text for c in out["chunks"]]
+        except TierUnavailableError as exc:
+            return mode, ("tier", exc.code)
+        except InvalidSearchModeError:
+            return mode, ("invalid",)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(_go, range(16)))
+
+    expected_texts = [c.text for c in chunks]
+    for mode, payload in results:
+        if mode in ("A", "B"):
+            assert payload == expected_texts, mode
+        elif mode == "C":
+            assert payload == ("tier", "tier_not_open")
+        else:
+            assert payload == ("invalid",)
+
+    recorded = [call["search_mode"] for call in port.calls]
+    assert len(recorded) == 8
+    assert recorded.count("A") == 4
+    assert recorded.count("B") == 4
+    assert "C" not in recorded and "Z" not in recorded
