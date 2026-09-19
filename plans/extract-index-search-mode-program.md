@@ -49,4 +49,4 @@ empty
    - **Surface:** `fin.host` + 工作台 interrupt
    - **Acceptance:** Child plan `search-mode-host.md` complete; default pytest still deselects opt-in marks.
    - `[blocks: T3]`
-   - Status: [ ] pending
+   - Status: [x] done — merged PR (`d09db62`, 2026-09-20); child plan `plans/search-mode-host.md` all four bullets `[x] done`

@@ -32,6 +32,7 @@ empty — `community_summary_index_failure` is a wire token in `named_failures`,
    - **Surface:** `fin.retrieve` adapter / retrieve tool
    - **Acceptance:** Fake or recorded MCP call includes `filters.search_mode` when host set a 档; invalid 档 from a pin still uses `tier_not_open` / `real_db_not_wired` without starting a silent C retrieve.
    - `[blocks: T1]`
+   - Cross-plan blocker lifted 2026-09-20: `plans/search-mode-host.md` T1 (live retrieve flag — host assigns 档 before retrieve) merged PR (`d09db62`). This lift alone does not close the bullet; the file's own `[blocks:]` markers and `Status` lines stay as they are.
    - Status: [ ] pending
 
 3. **Five-class Fake contract** — tag: `[implementation]`
