@@ -334,3 +334,70 @@ def test_fake_retrieve_with_hits_has_no_full_body_field_per_chunk() -> None:
             f"chunk carries forbidden full-body fields: {leaked} "
             f"(chunk keys: {sorted(chunk_keys)})"
         )
+
+
+# ----- search_mode mirroring (search-mode-retrieve T2) -----
+
+
+def test_fake_records_the_search_mode_it_received() -> None:
+    """The fake mirrors the port contract AND records each call so a
+    test can assert what the caller asked for without a live MCP."""
+    port = FakeRetrievePort(hits_by_query={"foo": [_chunk("hit")]})
+    port.retrieve("foo")
+    port.retrieve("foo", search_mode="A")
+    assert [call["search_mode"] for call in port.calls] == [None, "A"]
+    assert port.calls[1]["query"] == "foo"
+
+
+def test_tool_wrapper_forwards_search_mode_to_the_port() -> None:
+    """``fin.retrieve.tool.retrieve`` is pass-through: the 档 the host
+    assigned must reach the port, not be dropped on the floor."""
+    from fin.retrieve import retrieve as retrieve_tool
+
+    port = FakeRetrievePort(hits_by_query={"foo": [_chunk("hit")]})
+    out = retrieve_tool("foo", search_mode="A", adapter=port)
+    assert out["chunks"], "the lexical answer is unchanged by the mode"
+    assert port.calls == [
+        {
+            "query": "foo",
+            "document_id": None,
+            "cik": None,
+            "form": None,
+            "ticker": None,
+            "filing_date": None,
+            "limit": 8,
+            "search_mode": "A",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("tier", "code"),
+    [
+        pytest.param("C", "tier_not_open", id="tier-c"),
+        pytest.param("D", "real_db_not_wired", id="tier-d"),
+    ],
+)
+def test_fake_refuses_an_unopened_tier_like_the_product_adapter(
+    tier: str, code: str
+) -> None:
+    """Fake is not a 档: it mirrors the named exit rather than quietly
+    answering with its dictionary lookup (spec SC8 — Fake covers the
+    contract, not the ranking)."""
+    from fin.retrieve.port import TierUnavailableError
+
+    port = FakeRetrievePort(hits_by_query={"foo": [_chunk("hit")]})
+    with pytest.raises(TierUnavailableError) as excinfo:
+        port.retrieve("foo", search_mode=tier)
+    assert excinfo.value.code == code
+    assert port.calls == []
+
+
+def test_fake_raises_invalid_search_mode_like_the_product_adapter() -> None:
+    from fin.retrieve.port import InvalidSearchModeError
+
+    port = FakeRetrievePort(hits_by_query={"foo": [_chunk("hit")]})
+    with pytest.raises(InvalidSearchModeError) as excinfo:
+        port.retrieve("foo", search_mode="summary")
+    assert excinfo.value.code == "invalid_search_mode"
+    assert port.calls == []

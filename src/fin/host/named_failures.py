@@ -29,6 +29,14 @@ never by matching prose::
                        Leiden/community-summary job failed or summaries
                        are incomplete, ADR 0064 / 0078) — a runtime
                        fact, distinct from 「档未开」
+    invalid_search_mode
+                       the documented invalid-mode code on the retrieve
+                       side: a filters.search_mode outside A|B|C|D
+                       (spec search-mode-retrieve.md Boundaries allows
+                       it next to tier_not_open; the iknow retrieve
+                       schema answers with this token and
+                       fin.retrieve.port.InvalidSearchModeError mirrors
+                       it port-side)
 
 ``corpus_not_ready`` / ``mapping_drop`` ride ``AgentState.status_reason``
 on the run record / SSE ``status`` frame and resolve to ordinary-person
@@ -53,18 +61,28 @@ shared ledger (``_issuer_evidence``), so they remain auditable.
 
 from __future__ import annotations
 
-from typing import Final, Iterable, Literal, Mapping, Sequence
+from typing import Final, Iterable, Mapping, Sequence
+
+# The 档 SSOT — closed set, the Literal derived from it, and the two
+# routing-time codes — is DEFINED in the neutral leaf
+# :mod:`fin.retrieve.tiers` because the retrieve port validates against
+# it and may not import ``fin.host`` (``fin.host.graph`` imports the
+# port; review F3). Re-exported here unchanged: this stays the import
+# surface every host-side consumer already uses.
+from fin.retrieve.tiers import (
+    REAL_DB_NOT_WIRED,
+    RETRIEVE_TIERS,
+    RetrieveTier,
+    TIER_NOT_OPEN,
+    TIER_UNAVAILABLE_CODE,
+)
 
 
-# ----- the codes (ONE place; every surface imports from here) -----
+# ----- the codes (ONE import surface; every surface imports from here) -----
 
 CORPUS_NOT_READY: Final[str] = "corpus_not_ready"
 
 MAPPING_DROP: Final[str] = "mapping_drop"
-
-TIER_NOT_OPEN: Final[str] = "tier_not_open"
-
-REAL_DB_NOT_WIRED: Final[str] = "real_db_not_wired"
 
 # Reserved for once C 综述 ships as an open 档: its 社区 summary index
 # can then be not-ready (the Leiden / community-summary job failed or
@@ -77,30 +95,9 @@ REAL_DB_NOT_WIRED: Final[str] = "real_db_not_wired"
 # iknow-memory side.
 COMMUNITY_SUMMARY_INDEX_FAILURE: Final[str] = "community_summary_index_failure"
 
-# The 档 selectors whose product surfaces accept (spec Open Question 1).
-# The list is deliberately closed: the wayfinder doc (闭环与分档
-# §1) forbids an open-ended 业务意图桶, so the only way to ask for C/D
-# is to NAME them.
-#
-# This tuple is the SSOT for the closed set. :data:`RetrieveTier` is the
-# SAME list spelled as a ``Literal`` so the wire schema cannot drift
-# from it: adding a 档 here (and only here) updates the enum the send
-# door validates against, and ``TIER_UNAVAILABLE_CODE``'s keys must stay
-# a subset (a code for a 档 outside the closed list is unreachable).
-RETRIEVE_TIERS: Final[tuple[str, ...]] = ("A", "B", "C", "D")
-
-RetrieveTier = Literal[*RETRIEVE_TIERS]
-
-# The named failure each unimplemented 档 yields. A is 查找 — the
-# lexical fallback the same doc leaves openable, so it is NOT in this
-# table: an A send runs the ordinary (default B) path today.
-TIER_UNAVAILABLE_CODE: Final[dict[str, str]] = {
-    "C": TIER_NOT_OPEN,
-    "D": REAL_DB_NOT_WIRED,
-}
-
 # NOTE (T6 reach): a 档 is invoked ONLY through the explicit selector
-# above. Question prose is never scanned for 档 words —「综述这几份
+# (:data:`RETRIEVE_TIERS` and the send door's ``RetrieveTier`` enum).
+# Question prose is never scanned for 档 words —「综述这几份
 # 10-Q」 is a perfectly ordinary B ask about a small set of filings,
 # and reading it as a C invocation would be the 开放业务意图桶 the
 # wayfinder doc forbids. See ``plans/first-closed-loop.md`` T6.
