@@ -129,6 +129,61 @@ def test_the_closed_tier_list_is_a_b_c_d() -> None:
     assert RETRIEVE_TIERS == ("A", "B", "C", "D")
 
 
+# ----- T1 (search-mode-retrieve): the public C-not-ready code -----
+
+
+def test_community_summary_index_failure_is_public_with_its_wire_token() -> (
+    None
+):
+    """The code is a public wire token (spec Boundaries): asserted by
+    NAME and exact value, never by matching prose."""
+    import fin.host.named_failures as named_failures
+
+    assert named_failures.COMMUNITY_SUMMARY_INDEX_FAILURE == (
+        "community_summary_index_failure"
+    )
+    assert "COMMUNITY_SUMMARY_INDEX_FAILURE" in named_failures.__all__
+
+
+def test_community_summary_index_failure_is_not_tier_not_open() -> None:
+    """``tier_not_open`` stays「档未发/点了关闭的档」(routing-time 400);
+    the C not-ready code names the failed community-summary JOB.
+    Collapsing them would tell an operator to open a 档 that IS open."""
+    from fin.host.named_failures import (
+        COMMUNITY_SUMMARY_INDEX_FAILURE,
+        TIER_NOT_OPEN,
+        TIER_UNAVAILABLE_CODE,
+    )
+
+    assert COMMUNITY_SUMMARY_INDEX_FAILURE != TIER_NOT_OPEN
+    # It is a runtime not-ready fact, not a routing table entry: the
+    # 档-unavailable map keeps its two「未开」codes only.
+    assert COMMUNITY_SUMMARY_INDEX_FAILURE not in TIER_UNAVAILABLE_CODE
+    assert COMMUNITY_SUMMARY_INDEX_FAILURE not in TIER_UNAVAILABLE_CODE.values()
+
+
+def test_community_summary_index_failure_does_not_collapse_into_unknown_locator() -> (
+    None
+):
+    """具名失败 means the run/错误 surface shows its OWN copy: the code
+    must ride the SSE ``reason`` (the existing passthrough in
+    ``workspace_http``) and resolve through ``ordinary_person_copy``,
+    never falling through to the verifier's ``unknown_locator`` wording
+    or an empty string."""
+    from fin.host.named_failures import COMMUNITY_SUMMARY_INDEX_FAILURE
+    from fin.host.run_payload import ORDINARY_PERSON_COPY, ordinary_person_copy
+
+    assert COMMUNITY_SUMMARY_INDEX_FAILURE in ORDINARY_PERSON_COPY
+    copy = ordinary_person_copy(
+        "refuse", COMMUNITY_SUMMARY_INDEX_FAILURE
+    )
+    assert copy.strip()
+    assert copy != ORDINARY_PERSON_COPY["unknown_locator"]
+    # Ordinary-person prose: the internal token never leaks (same rule
+    # as ``test_numeric_gate_fail_copy_is_ordinary_prose``).
+    assert COMMUNITY_SUMMARY_INDEX_FAILURE not in copy
+
+
 def test_the_send_schema_enum_is_derived_from_the_tier_ssot() -> None:
     """Drift guard: the send door's enum must BE the SSOT's closed set.
 
