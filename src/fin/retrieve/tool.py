@@ -35,6 +35,7 @@ def retrieve(
     ticker: str | None = None,
     filing_date: str | None = None,
     limit: int = 8,
+    search_mode: str | None = None,
     adapter: RetrievePort | None = None,
 ) -> dict[str, list[Chunk]]:
     """Adapter-bound retrieve: returns the ADR 0009 contract shape.
@@ -55,6 +56,11 @@ def retrieve(
     limit
         Default 8, hard cap 20 (ADR 0009). The adapter resolves the
         cap internally; we just pass through.
+    search_mode
+        检索档 token (spec ``search-mode-retrieve.md``): passed
+        through untouched — the wrapper neither assigns a 档 (that is
+        the host cascade's job) nor validates one (the port's named
+        failures stay single-sourced behind the port).
     adapter
         The shared ``RetrievePort`` implementation. The host graph
         (T6) constructs one adapter per run and threads it through
@@ -83,6 +89,7 @@ def retrieve(
         ticker=ticker,
         filing_date=filing_date,
         limit=limit,
+        search_mode=search_mode,
     )
 
 

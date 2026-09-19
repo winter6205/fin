@@ -867,6 +867,107 @@ def test_retrieve_payload_filters_is_plural_record() -> None:
     }
 
 
+# ----- search_mode forwarding + named 档 exits (search-mode-retrieve T2) -----
+
+from fin.host.named_failures import (  # noqa: E402  (section-local imports)
+    REAL_DB_NOT_WIRED,
+    TIER_NOT_OPEN,
+)
+from fin.retrieve.port import (  # noqa: E402
+    InvalidSearchModeError,
+    SEARCH_MODE_FILTER_KEY,
+    TierUnavailableError,
+)
+
+
+def test_unset_search_mode_is_absent_from_the_wire() -> None:
+    """``search_mode=None`` means "do not send" — iknow's own default
+    (B) answers, and an explicit ``null`` on the wire would be a
+    filter the server tries to match (the same rule as every other
+    unset filter)."""
+    adapter = _CapturingAdapter()
+    adapter.retrieve("revenue")
+    arguments = adapter.payloads[0]["params"]["arguments"]
+    assert "filters" not in arguments, arguments
+
+
+def test_search_mode_a_is_forwarded_as_filters_search_mode() -> None:
+    """The wire token is pinned exactly once per spec
+    (``filters.search_mode`` ∈ ``A|B|C|D``, sibling iknow spec);
+    elsewhere the constant is used so a rename cannot drift silently."""
+    adapter = _CapturingAdapter()
+    adapter.retrieve("revenue", search_mode="A")
+    arguments = adapter.payloads[0]["params"]["arguments"]
+    assert arguments["filters"] == {"search_mode": "A"}
+    assert SEARCH_MODE_FILTER_KEY == "search_mode"
+
+
+def test_search_mode_b_rides_alongside_the_edgar_filters() -> None:
+    adapter = _CapturingAdapter()
+    adapter.retrieve("revenue", cik="0000320193", search_mode="B")
+    arguments = adapter.payloads[0]["params"]["arguments"]
+    assert arguments["filters"] == {
+        "cik": "0000320193",
+        "search_mode": "B",
+    }
+
+
+@pytest.mark.parametrize(
+    ("tier", "code"),
+    [
+        pytest.param("C", TIER_NOT_OPEN, id="tier-c"),
+        pytest.param("D", REAL_DB_NOT_WIRED, id="tier-d"),
+    ],
+)
+def test_an_unopened_tier_is_a_named_exit_without_an_mcp_call(
+    tier: str, code: str
+) -> None:
+    """A 档 pin that names an unopened 档 gets the SAME public code the
+    send door uses (``TIER_UNAVAILABLE_CODE`` mapping), not a silent
+    default-B retrieve: the request never reaches the transport
+    (payloads stays empty), and the exit is not the miss shape
+    ``{"chunks": []}`` (that would read as "the corpus has nothing")."""
+    adapter = _CapturingAdapter()
+    result = adapter.retrieve("revenue", search_mode=tier)
+    assert result == {"error": code}
+    assert "chunks" not in result
+    assert adapter.payloads == []
+
+
+@pytest.mark.parametrize(
+    ("tier", "code"),
+    [
+        pytest.param("C", TIER_NOT_OPEN, id="tier-c"),
+        pytest.param("D", REAL_DB_NOT_WIRED, id="tier-d"),
+    ],
+)
+def test_aretrieve_raises_the_typed_tier_error_before_transport(
+    tier: str, code: str
+) -> None:
+    """The async seam carries the named failure as its typed error
+    (the sync ``retrieve`` translates it to the product dict, the same
+    split as ``RetrieveUnavailableError``)."""
+    adapter = _CapturingAdapter()
+    with pytest.raises(TierUnavailableError) as excinfo:
+        asyncio.run(adapter.aretrieve("revenue", search_mode=tier))
+    assert excinfo.value.code == code
+    assert adapter.payloads == []
+
+
+@pytest.mark.parametrize("bogus", ["Z", "E", "a", "b", " c ", "", "summary"])
+def test_a_mode_outside_the_closed_set_raises_invalid_search_mode(
+    bogus: str,
+) -> None:
+    """The port takes wire tokens, not prose and not case variants —
+    the send door normalizes human input, so guessing here would be
+    the silent-degradation path the spec forbids."""
+    adapter = _CapturingAdapter()
+    with pytest.raises(InvalidSearchModeError) as excinfo:
+        adapter.retrieve("revenue", search_mode=bogus)
+    assert excinfo.value.code == "invalid_search_mode"
+    assert adapter.payloads == []
+
+
 # ----- locator_map injection -----
 
 

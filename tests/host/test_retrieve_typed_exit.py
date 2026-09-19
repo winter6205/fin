@@ -165,6 +165,10 @@ def test_retrieve_tool_forwards_edgar_filters_to_the_port() -> None:
             "ticker": "AAPL",
             "filing_date": "2023-08-04",
             "limit": 8,
+            # The host tool assigns no 档 (that is the host cascade's
+            # job, another spec): the port receives an explicit
+            # ``None`` = "do not send", iknow's default B.
+            "search_mode": None,
         }
     ]
 

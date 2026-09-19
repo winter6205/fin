@@ -41,7 +41,7 @@ from fin.retrieve.input_validation import (
     InputValidationLedger,
     validate_query,
 )
-from fin.retrieve.port import Chunk
+from fin.retrieve.port import Chunk, resolve_search_mode
 
 
 _DEFAULT_LIMIT = 8
@@ -140,13 +140,18 @@ class CapabilityAwareFakePort:
         ticker: str | None = None,
         filing_date: str | None = None,
         limit: int = 8,
+        search_mode: str | None = None,
     ) -> dict[str, list[Chunk]]:
         """Return ``{"chunks": [...]}`` with every capability on.
 
         The product path does not choose: the service's default is all-on, so
         the fake resolves the configuration itself rather than reading one off
-        the call.
+        the call. ``search_mode`` joins the port signature (T2): this fake is
+        not a 档, so it mirrors only the token validation — an open 档 is
+        answered with the same all-on script, an unopened or illegal one
+        raises the port's named error.
         """
+        resolve_search_mode(search_mode)
         effective = all_on_configuration(self._keys)
         self.product_calls.append(
             RecordedCall(

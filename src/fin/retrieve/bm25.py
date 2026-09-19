@@ -76,7 +76,7 @@ from fin.retrieve.input_validation import (
     validate_filters,
     validate_query,
 )
-from fin.retrieve.port import Chunk
+from fin.retrieve.port import Chunk, resolve_search_mode
 
 
 # A small hardcoded set of ~30 English stopwords. Stripped at
@@ -251,6 +251,7 @@ class BM25Adapter:
         ticker: str | None = None,
         filing_date: str | None = None,
         limit: int = 8,
+        search_mode: str | None = None,
     ) -> dict[str, list[Chunk]]:
         """Return ``{"chunks": [...]}`` ranked descending by BM25 score.
 
@@ -273,6 +274,13 @@ class BM25Adapter:
             filters are no-ops and no conflict is provable.
         limit
             Default 8, hard cap 20 (see ``_resolve_limit``).
+        search_mode
+            Accepted for port-signature parity only. This adapter is
+            archived from the product path (ADR 0030) and its one
+            ranking IS lexical, so an open 档 answers with that
+            ranking; the token validation (unopened / illegal → the
+            port's named errors) still runs, so a caller cannot slip
+            a 档 request past unnoticed.
 
         Returns
         -------
@@ -284,6 +292,7 @@ class BM25Adapter:
         # on the adapter's ledger, and never the miss shape.
         ledger = self.input_validation_failures
         validate_query(query, ledger=ledger)
+        resolve_search_mode(search_mode)
         validate_filters(
             document_id=document_id,
             cik=cik,

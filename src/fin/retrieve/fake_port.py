@@ -40,7 +40,7 @@ from fin.retrieve.input_validation import (
     validate_filters,
     validate_query,
 )
-from fin.retrieve.port import Chunk
+from fin.retrieve.port import Chunk, resolve_search_mode
 from fin.retrieve.read_port import read_from_pages
 
 
@@ -127,6 +127,11 @@ class FakeRetrievePort:
             dict(pages_by_doc) if pages_by_doc is not None else {}
         )
         self._input_validation_ledger = input_validation_ledger
+        # Every completed ``retrieve`` call, in order, as the kwargs the
+        # port received (``test_retrieve_typed_exit``'s recording style).
+        # Rejected calls (named input errors) are NOT recorded: nothing
+        # was received.
+        self.calls: list[dict[str, Any]] = []
 
     @property
     def input_validation_failures(self) -> InputValidationLedger:
@@ -178,6 +183,7 @@ class FakeRetrievePort:
         ticker: str | None = None,
         filing_date: str | None = None,
         limit: int = 8,
+        search_mode: str | None = None,
     ) -> dict[str, list[Chunk]]:
         """Return ``{"chunks": [...]}`` or ``{"chunks": []}``.
 
@@ -186,6 +192,12 @@ class FakeRetrievePort:
         * empty / whitespace ``query`` → ``EmptyQueryError``
         * provably conflicting filters (needs ``manifest_docs``)
           → ``ConflictingFiltersError``
+        * ``search_mode`` mirrors the port's 档 contract exactly
+          (T2): out-of-set → ``InvalidSearchModeError``, unopened
+          C/D → ``TierUnavailableError`` (Fake is not a 档 and does
+          not rank differently per 档 — spec SC8); an accepted token
+          is recorded on ``self.calls`` so tests can assert what the
+          caller asked for
         * unknown ``document_id`` (when ``known_document_ids`` is
           set) → ``{"chunks": []}``
         * empty EDGAR-shaped filter values
@@ -199,11 +211,13 @@ class FakeRetrievePort:
           answer with an empty list
         * ``limit`` defaults to 8, hard cap 20 (ADR 0009)
         """
-        # Invalid input first, before any lookup: an empty query and a
-        # provably unsatisfiable filter set are named failures (T21),
-        # never the miss shape.
+        # Invalid input first, before any lookup: an empty query, a
+        # provably unsatisfiable filter set, and an illegal / unopened
+        # 档 are named failures (T21 / search-mode T2), never the miss
+        # shape.
         ledger = self.input_validation_failures
         validate_query(query, ledger=ledger)
+        effective_search_mode = resolve_search_mode(search_mode)
         validate_filters(
             document_id=document_id,
             cik=cik,
@@ -212,6 +226,18 @@ class FakeRetrievePort:
             filing_date=filing_date,
             manifest_docs=self._manifest_docs,
             ledger=ledger,
+        )
+        self.calls.append(
+            {
+                "query": query,
+                "document_id": document_id,
+                "cik": cik,
+                "form": form,
+                "ticker": ticker,
+                "filing_date": filing_date,
+                "limit": limit,
+                "search_mode": effective_search_mode,
+            }
         )
 
         # Unknown document_id filter: the call is well-formed

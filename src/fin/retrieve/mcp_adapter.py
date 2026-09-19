@@ -119,6 +119,11 @@ from fin.retrieve.mcp_session import (
     MCPStdioProtocolError,
     MCPStdioSession,
 )
+from fin.retrieve.port import (
+    SEARCH_MODE_FILTER_KEY,
+    TierUnavailableError,
+    resolve_search_mode,
+)
 
 
 _DEFAULT_LIMIT = 8
@@ -575,6 +580,7 @@ class MCPRetrieveAdapter:
         ticker: str | None = None,
         filing_date: str | None = None,
         limit: int = 8,
+        search_mode: str | None = None,
     ) -> dict[str, Any]:
         """Sync retrieve: returns ``{"chunks": [...]}`` or
         ``{"error": "retrieve_unavailable"}``.
@@ -586,7 +592,9 @@ class MCPRetrieveAdapter:
         flattened into an envelope the model reads as "no hits").
         Any MCP transport / protocol failure surfaces as
         ``{"error": "retrieve_unavailable"}`` (no BM25
-        fallback).
+        fallback). A 档 that is legal but not open on this port
+        surfaces as its named ``{"error": <TIER_UNAVAILABLE_CODE>}``
+        — the request never starts, so no silent B dressed as C.
         """
         try:
             return asyncio.run(
@@ -598,12 +606,20 @@ class MCPRetrieveAdapter:
                     ticker=ticker,
                     filing_date=filing_date,
                     limit=limit,
+                    search_mode=search_mode,
                 )
             )
         except RetrieveUnavailableError as exc:
             # Typed EXIT — the product shape is the error dict. A
             # degraded failure carries its §B3 reasons along (T20).
             return exc.error_dict()
+        except TierUnavailableError as exc:
+            # Typed EXIT — the routing-time named 未开/未接 code,
+            # translated at the same sync seam as the transport EXIT.
+            # Distinct from the branch above: a retry answers the same
+            # way, so this is NOT the 「retrieve_unavailable, try
+            # later」 shape.
+            return {"error": exc.code}
         except DegradationError as exc:
             # The service answered with an unreadable / renamed
             # degradation signal (§B3). Named EXIT rather than a
@@ -740,10 +756,17 @@ class MCPRetrieveAdapter:
         ticker: str | None = None,
         filing_date: str | None = None,
         limit: int = 8,
+        search_mode: str | None = None,
     ) -> dict[str, Any]:
         """Async retrieve: raises ``RetrieveUnavailableError``
         on transport failure; ``retrieve`` translates that to
         the structured error dict.
+
+        A 档 token outside the closed set raises
+        ``InvalidSearchModeError`` and an unopened one raises
+        ``TierUnavailableError`` — both BEFORE any round trip, so an
+        illegal or unopened 档 never starts a silent default-B
+        retrieve.
 
         Tests subclass and override ``_call_mcp`` for scripted
         transport. The default transport launches a subprocess.
@@ -753,6 +776,10 @@ class MCPRetrieveAdapter:
         # short-circuits below stay miss shapes — they are legal empty
         # results, and the split is the whole point of the ticket.
         validate_query(query, ledger=self.input_validation_failures)
+        # 档 token: validated against the closed set before the
+        # round-trip like every other invalid input (the raise is the
+        # named EXIT; ``retrieve`` maps the 未开 codes to error dicts).
+        effective_search_mode = resolve_search_mode(search_mode)
         # Empty / whitespace document_id filter: miss shape.
         if document_id is not None and not document_id.strip():
             return {"chunks": []}
@@ -806,6 +833,11 @@ class MCPRetrieveAdapter:
         ):
             if value is not None:
                 filters[key] = value
+        # The 档 rides the same record: iknow reads
+        # ``filters.search_mode`` ∈ A|B|C|D and defaults to B when the
+        # key is missing — so an unset mode is NOT sent as null.
+        if effective_search_mode is not None:
+            filters[SEARCH_MODE_FILTER_KEY] = effective_search_mode
         if filters:
             arguments["filters"] = filters
 
