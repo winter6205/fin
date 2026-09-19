@@ -1042,3 +1042,34 @@ def test_bm25_metadata_filter_is_noop_when_manifest_docs_unset(
     assert [c.text for c in filtered["chunks"]] == [
         c.text for c in baseline["chunks"]
     ]
+
+
+# ===== search_mode mirroring (search-mode-retrieve T2 / T3) =====
+
+
+def test_bm25_mirrors_the_tier_named_exits_without_ranking() -> None:
+    """The archived adapter takes the 档 parameter for port parity only
+    (ADR 0030: BM25 is off the product path, its one ranking IS
+    lexical): an open 档 answers with the ordinary result, while an
+    unopened or illegal token raises the port's named errors — so a
+    caller can never slip a 档 request past this implementation
+    unnoticed, and the Fake-class negative exits are mirrored on
+    EVERY ``RetrievePort`` shape, not just the live adapter."""
+    from fin.retrieve.port import InvalidSearchModeError, TierUnavailableError
+
+    adapter = BM25Adapter({})
+
+    assert adapter.retrieve("revenue", search_mode="A") == {"chunks": []}
+    assert adapter.retrieve("revenue", search_mode="B") == {"chunks": []}
+
+    with pytest.raises(TierUnavailableError) as excinfo:
+        adapter.retrieve("revenue", search_mode="C")
+    assert excinfo.value.code == "tier_not_open"
+
+    with pytest.raises(TierUnavailableError) as excinfo:
+        adapter.retrieve("revenue", search_mode="D")
+    assert excinfo.value.code == "real_db_not_wired"
+
+    with pytest.raises(InvalidSearchModeError) as excinfo:
+        adapter.retrieve("revenue", search_mode="summary")
+    assert excinfo.value.code == "invalid_search_mode"
