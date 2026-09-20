@@ -38,15 +38,60 @@ The **工作台** web UI is the only product entry; SEC filings are the first co
 
 ## Running the workspace server (T1)
 
-One command from the repo root (fin Postgres, iknow-memory infra + `iknow-memory` on `PATH`, SPA build, then `fin-serve`):
+Install the `fin` entrypoint once, then a bare `fin` starts everything:
 
 ```bash
-bash scripts/dev-up.sh
+bash scripts/install-fin-shim.sh    # writes ~/.local/bin/fin (idempotent)
+fin                                 # up + readiness verdict
 ```
 
-Open **http://127.0.0.1:8000**. Needs Docker, Node, `uv`, a sibling `../iknow-memory` checkout (or `FIN_IKNOW_ROOT`), and `FIN_API_KEY` in `.env` for model calls. Ingest/retrieve embeddings need `GRAPHRAG_MEMORY_EMBED_API_KEY` in that iknow checkout's `.env.local`. Preflight only: `bash scripts/dev-up.sh --check`.
+Open **http://127.0.0.1:8000**. `fin up` brings up fin Postgres, the iknow-memory infra, `iknow-memory` on `PATH`, the SPA build, and `fin-serve` — then **reports whether the knowledge MCP actually became reachable**, so starting fin cannot silently leave the memory service behind.
 
-`fin-serve` binds `0.0.0.0:8000` and serves both the API routes and the built SPA same-origin. The SPA is NOT committed — it is a build artifact. Manual split (same outcome as the script):
+The installed `fin` is a shim, not a copy: it hands `scripts/fin` the checkout it was installed from and lets the launcher do the walk-up from the current directory first, so a bare `fin` inside a worktree drives that worktree. From a directory with no checkout above it, the launcher falls back to the install-time checkout and says so on stderr: `fin: not inside a fin checkout; using <path>`.
+
+| Command          | What it does                                                                 |
+| ---------------- | ---------------------------------------------------------------------------- |
+| `fin` / `fin up` | Start the whole stack, then print the readiness verdict                      |
+| `fin check`      | Preflight only (docker daemon, checkout, shim) — starts nothing              |
+| `fin status`     | Is it up, and is the knowledge MCP reachable?                                |
+| `fin down`       | Stop serve + both compose projects (`--keep-infra` to spare the iknow infra) |
+| `fin logs`       | Tail this checkout's serve log (`<checkout>/.fin/serve.log`)                 |
+
+`up` / `check` / `status` / `logs` accept an optional checkout path, so a worktree can be driven from anywhere: `fin status ../fin-wt-search-mode-retrieve`. The path selects **which checkout's scripts run**; `status` still reads its verdict from the local port, of which there is at most one server. Without a path, the checkout is discovered from the current directory. `down` takes only its own flags and acts on the checkout under `$PWD`.
+
+Needs Docker (daemon **running**, not just installed), Node, `uv`, `curl`, `jq`, a sibling `../iknow-memory` checkout (or `FIN_IKNOW_ROOT`), and `FIN_API_KEY` in `.env` for model calls. Ingest/retrieve embeddings need `GRAPHRAG_MEMORY_EMBED_API_KEY` in that iknow checkout's `.env.local`.
+
+**Exit codes** (`check` / `status` report their own):
+
+| Code | Meaning                                                             |
+| ---- | ------------------------------------------------------------------- |
+| `0`  | Ready — serve answers **and** `knowledge_mcp=reachable`             |
+| `1`  | Usage error / not a fin checkout                                    |
+| `2`  | Not ready — serve is not answering (down, or boot failed)           |
+| `3`  | Gated — serve answers but `knowledge_mcp` is 缺 / 坏, so entry 409s |
+
+`up` does **not** return 0/2/3. It ends in `exec uv run fin-serve`, so it inherits serve's exit status and runs in the foreground until you stop it; its readiness verdict is written to `<checkout>/.fin/ready` as `<code> <word>` (for example `0 ready`). `fin status` is the scriptable gate — use it in scripts, not `up`.
+
+`WORKBENCH_SERVE_PORT` (default `8000`) is a **probe port, not a knob**. `fin-serve` hardcodes 8000 (`uvicorn.run(..., port=8000)`); the variable moves the port `fin status` and `fin down` probe, and `fin up` refuses to run when it is set to anything else. The test suite sets it to point the classifier at a stub server.
+
+`fin down` resolves the iknow-memory checkout exactly as `fin up` does — both call the shared resolver in `scripts/lib/fin-root.sh`, which steps out to the main checkout when the current one is a linked worktree. It exits non-zero when a `compose down` fails or when the iknow checkout cannot be found, so a `down` that reports success has actually stopped both stacks.
+
+The verdict is read from `GET /api/status`, and its classification lives in one place (`scripts/lib/readiness.sh`) shared by `fin status` and the boot reporter. An answer that is not the status payload — for example an HTML error page from whatever else holds the port — is classified **not ready**, never ready.
+
+### Why the knowledge MCP is checked at all
+
+`fin-serve` probes the iknow-memory MCP **once at boot** and publishes 缺 / 坏 / 可达 into an in-process snapshot (`fin.host.knowledge_mcp`). That snapshot gates conversation entry: with the default `mcp` adapter, 缺 / 坏 makes create / open / send return `409 knowledge_mcp_fault` for the whole process lifetime — the probe never re-runs.
+
+A missing or unhealthy MCP is therefore a **WARNING, never a boot failure**: serve keeps running and serves the UI. `fin` surfaces the distinction up front rather than letting the first question fail:
+
+- `missing` — the `iknow-memory` launch command is not on `PATH` (check the checkout and `node`).
+- `fault` — the binary exists but `initialize` + `tools/list` failed; usually infra was cold at boot. Because the probe runs once, **restart after infra is warm**: `fin down && fin up`.
+
+Boot order is load-bearing for the same reason: both compose stacks reaching HEALTHY _before_ `fin-serve` starts is what keeps a cold infra from being published as 坏.
+
+Only `adapter=mcp` is gated. A `fake` / scripted boot publishes 缺 with the gate **open**, and `fin status` reports that as ready — classifying by state alone would report a false failure on the scripted lane.
+
+Manual split (what `fin up` does, minus the verdict):
 
 ```bash
 cd web && npm install && npm run build   # produces web/dist/

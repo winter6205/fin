@@ -3838,6 +3838,44 @@ def test_status_reports_unbound_when_the_handshake_never_reached(
         assert body["bound_collection_name"] == BOUND_COLLECTION_UNBOUND, state
 
 
+def test_status_publishes_the_bound_port_on_a_scripted_boot(
+    client: TestClient, fresh_store, monkeypatch
+) -> None:
+    """The divergent pair, at the route: scripted boot + configured ``mcp``.
+
+    ``compile_for_scripted_e2e`` binds the fake retrieve port while
+    ``FIN_RETRIEVE_ADAPTER`` may name the product adapter (or be unset,
+    which resolves to it). While the route published the configured
+    string, the left corner classified as GATED for a process whose gate
+    was open — the operator copy said create / open / send would 409 on
+    a lane that answers all three. The classifier mirrors the gate in
+    ``tests/host/test_knowledge_mcp_gate.py``; this case pins the route
+    side of the equivalence for both configured spellings.
+    """
+    from fin.host.knowledge_mcp import publish_knowledge_mcp_state
+
+    publish_knowledge_mcp_state("missing")
+    for configured in (None, "mcp"):
+        monkeypatch.setenv("FIN_SCRIPTED_MODEL", "1")
+        if configured is None:
+            monkeypatch.delenv("FIN_RETRIEVE_ADAPTER", raising=False)
+        else:
+            monkeypatch.setenv("FIN_RETRIEVE_ADAPTER", configured)
+
+        body = client.get("/api/status").json()
+
+        assert set(body.keys()) == STATUS_FIELDS, body
+        assert body["retrieve_adapter_kind"] == "fake", (configured, body)
+        assert body["knowledge_mcp"] == "missing", body
+
+        # The gate itself stays open, so the field set cannot be read as
+        # a 409 on this lane — the whole point of publishing the bound
+        # port rather than the configured one.
+        from fin.host.knowledge_mcp import knowledge_mcp_gate_closed
+
+        assert knowledge_mcp_gate_closed() is False
+
+
 def test_status_never_derives_the_bind_from_the_local_filing_count(
     client: TestClient, fresh_store, tmp_path: Path, monkeypatch
 ) -> None:

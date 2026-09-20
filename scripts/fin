@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# `fin` — the local 工作台 entrypoint.
+#
+# Starting fin must not leave half the stack behind. `fin up` brings up
+# fin Postgres AND the iknow-memory infra, puts the MCP server on PATH,
+# builds the SPA, starts fin-serve, and then REPORTS whether the
+# knowledge MCP actually became reachable. Without that last step "fin is
+# up" was only ever true of the web process, and the missing memory
+# service surfaced later as a 409 on the first question.
+#
+# usage:begin
+# Usage:
+#   fin              # same as `fin up` (start everything, then report)
+#   fin up           # start the stack
+#   fin check        # preflight only, start nothing
+#   fin status       # is it up, and is the knowledge MCP reachable?
+#   fin down         # stop serve + both compose projects
+#   fin logs         # tail this workspace's serve log
+#   fin --help
+#
+# `up` / `check` / `status` / `logs` accept one optional checkout path to
+# operate on instead of the one discovered from the current directory. It
+# selects WHICH checkout's scripts run — `status` still inspects the
+# server on the local port, of which there is at most one:
+#   fin status /home/winner/projects/fin-wt-search-mode-retrieve
+# `down` takes only its own flags and acts on the checkout under $PWD:
+#   fin down --keep-infra
+#
+# Exit codes. `check` / `status` report their own and are the scriptable
+# gate; `up` ends in `exec uv run fin-serve`, so it inherits serve's status
+# and its readiness verdict goes to <checkout>/.fin/ready instead of a code
+# (the reporter runs detached and cannot set the script's status).
+#   0  ready        — serve answers AND the knowledge MCP is reachable
+#   1  usage / not a fin checkout
+#   2  not ready    — serve is not answering (down, or boot failed)
+#   3  gated        — serve answers but knowledge_mcp is 缺 / 坏, so
+#                     conversation entry 409s
+# usage:end
+set -euo pipefail
+
+EXIT_USAGE=1
+
+die() {
+  printf 'fin: %s\n' "$*" >&2
+  exit "$EXIT_USAGE"
+}
+
+# Walk up from a directory to the fin checkout. Two markers so a stray
+# directory named `fin` cannot match: the dev script and the product HTTP
+# entrypoint.
+#
+# This is the ONE walk-up. It cannot move into scripts/lib/fin-root.sh:
+# finding a checkout has to happen before any file inside it can be
+# sourced. The PATH shim used to carry a hand-maintained copy whose
+# markers had already diverged; it now hands its install-time checkout
+# over as a fallback and lets this function do the walking.
+find_checkout() {
+  local dir="$1" parent
+  while :; do
+    if [[ -f "$dir/scripts/dev-up.sh" && -f "$dir/src/fin/host/http.py" ]]; then
+      printf '%s\n' "$dir"
+      return 0
+    fi
+    parent="$(dirname "$dir")"
+    if [[ "$parent" == "$dir" ]]; then
+      return 1
+    fi
+    dir="$parent"
+  done
+}
+
+# The bootstrap fallback: `--checkout-for-shim <path>` lets the installed
+# shim name the checkout it was installed from when $PWD has none. Hidden
+# on purpose — operators use the commands below, and the shim is the only
+# caller.
+shim_fallback_checkout() {
+  if [[ -f "$1/scripts/dev-up.sh" && -f "$1/src/fin/host/http.py" ]]; then
+    printf '%s\n' "$1"
+    return 0
+  fi
+  return 1
+}
+
+cmd_up() {
+  exec bash "$1/scripts/dev-up.sh"
+}
+
+cmd_check() {
+  bash "$1/scripts/dev-up.sh" --check
+}
+
+# Ask the live route. The classification (and therefore the exit code)
+# lives in scripts/lib/readiness.sh, shared with the boot-time reporter so
+# the two can never disagree.
+cmd_status() {
+  local root="$1" body=""
+  body="$(readiness_fetch)" || body=""
+  readiness_classify "$body" fin
+}
+
+cmd_down() {
+  local root="$1"
+  shift
+  bash "$root/scripts/dev-down.sh" "$@"
+}
+
+cmd_logs() {
+  local file="$1/.fin/serve.log"
+  if [ -f "$file" ]; then
+    exec tail -n "${FIN_LOG_LINES:-50}" -f "$file"
+  fi
+  printf 'fin: no serve log at %s yet (fin up writes one)\n' "$file" >&2
+  return 2
+}
+
+# The help text is the header block between the two markers, so adding a
+# comment line to the header cannot silently truncate or spill into the
+# usage body the way a hardcoded line range did.
+usage() {
+  sed -n '/^# usage:begin$/,/^# usage:end$/p' "${BASH_SOURCE[0]}" |
+    sed '1d;$d' | sed 's/^# \{0,1\}//'
+}
+
+main() {
+  local command="up"
+  local target_dir="$PWD"
+  local shim_fallback=""
+  local root
+  local -a argv=()
+
+  # The installed shim calls `fin --checkout-for-shim <path> <command>`, so
+  # the flag arrives BEFORE the command word. Lift it out wherever it
+  # appears and parse the rest exactly as before; without this the flag
+  # position the shim actually uses made `status` / `--help` land in the
+  # optional-checkout-path slot and die as "not a directory".
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+    --checkout-for-shim)
+      [[ -n "${2:-}" ]] || die "--checkout-for-shim needs a path"
+      shim_fallback="$2"
+      shift 2
+      ;;
+    *)
+      argv+=("$1")
+      shift
+      ;;
+    esac
+  done
+  set -- ${argv[@]+"${argv[@]}"}
+
+  if [ "$#" -gt 0 ]; then
+    case "$1" in
+    -h | --help | help)
+      usage
+      exit 0
+      ;;
+    up | check | status | down | logs)
+      command="$1"
+      shift
+      ;;
+    -*)
+      die "unknown option $1 (try: fin --help)"
+      ;;
+    *)
+      # Bare path: `fin /path/to/checkout` starts that checkout.
+      command="up"
+      ;;
+    esac
+  fi
+
+  # `down` forwards its own flags and acts on the checkout under $PWD;
+  # every other command takes at most one optional checkout path.
+  if [ "$command" != "down" ] && [ "$#" -gt 0 ]; then
+    target_dir="$1"
+    shift
+    if [ ! -d "$target_dir" ]; then
+      die "not a directory: $target_dir"
+    fi
+  fi
+
+  if [ "$command" != "down" ] && [ "$#" -gt 0 ]; then
+    die "unexpected extra argument: $1"
+  fi
+
+  # The checkout must be found BEFORE anything inside it can be sourced.
+  root="$(find_checkout "$target_dir")" || root=""
+  if [[ -z "$root" && -n "$shim_fallback" ]]; then
+    root="$(shim_fallback_checkout "$shim_fallback")" || root=""
+    # Announce the fallback: a `fin down` from an unrelated directory must
+    # never silently act on a tree the operator did not name. The
+    # installed shim no longer walks or cds — it hands its install-time
+    # checkout over and lets the walk-up above do the choosing — so the
+    # announcement belongs here, next to the decision. Stay quiet when
+    # $PWD is already inside the fallback: that target is not a surprise.
+    if [[ -n "$root" ]]; then
+      case "$target_dir/" in
+      "$root"/*) ;;
+      *) printf 'fin: not inside a fin checkout; using %s\n' "$root" >&2 ;;
+      esac
+    fi
+  fi
+  [[ -n "$root" ]] ||
+    die "no fin checkout at or above $target_dir (expected scripts/dev-up.sh and src/fin/host/http.py)"
+
+  # `--help` returned above, so the modules are only needed from here on.
+  # shellcheck source=scripts/lib/fin-root.sh
+  if ! source "$root/scripts/lib/fin-root.sh" 2>/dev/null; then
+    die "$root/scripts/lib/fin-root.sh is missing — $root is not a complete fin checkout. Update it, or run fin from a current checkout."
+  fi
+  # shellcheck source=scripts/lib/readiness.sh
+  if ! source "$root/scripts/lib/readiness.sh" 2>/dev/null; then
+    die "$root/scripts/lib/readiness.sh is missing — $root is not a complete fin checkout (or predates this launcher). Update it, or run fin from a current checkout."
+  fi
+
+  # The modules shell out; a missing tool would otherwise surface as a
+  # bare `command not found` and an exit code outside the 0/1/2/3 table.
+  # `logs` only tails a file, so it needs neither.
+  case "$command" in
+  logs) ;;
+  *)
+    command -v curl >/dev/null || die "curl is required"
+    command -v jq >/dev/null || die "jq is required"
+    ;;
+  esac
+
+  case "$command" in
+  up) cmd_up "$root" ;;
+  check) cmd_check "$root" ;;
+  status) cmd_status "$root" ;;
+  logs) cmd_logs "$root" ;;
+  down) cmd_down "$root" "$@" ;;
+  *) die "unreachable command $command" ;;
+  esac
+}
+
+main "$@"

@@ -139,12 +139,15 @@ function childEnv(port, deltaMs, scenario) {
   }
   env.FIN_SCRIPTED_MODEL = "1";
   env.FIN_SCRIPTED_SCENARIO = scenario;
-  // `compile_for_scripted_e2e` binds the fake retrieve port
-  // unconditionally, but `GET /api/status` reports the CONFIGURED
-  // adapter (`FIN_RETRIEVE_ADAPTER`, default `mcp`). Left unset, the
-  // Sidebar strip told the operator "检索：不可用 · 回答不会带引用来源"
-  // on a lane whose every run ends `done` with real citations. Saying
-  // `fake` makes the configured kind match the bound port.
+  // `compile_for_scripted_e2e` binds the fake retrieve port, and
+  // `GET /api/status` now publishes that BOUND port (`resolve_bound_retrieve_adapter_kind`),
+  // so the status payload reads `fake` with or without this variable.
+  // It stays for the OTHER port the same string selects:
+  // `_build_default_ingest_service` reads the configured
+  // `FIN_RETRIEVE_ADAPTER` for the ingest door's push / invalidation
+  // ports, and left unset that door would be wired to the MCP adapters
+  // on a lane with no MCP server. The lane drives no upload today, so
+  // this is the port it would get if it ever did.
   env.FIN_RETRIEVE_ADAPTER = "fake";
   if (deltaMs !== "") env.FIN_SCRIPTED_DELTA_MS = String(deltaMs);
   env.FIN_E2E_BASE_URL = `http://127.0.0.1:${port}`;

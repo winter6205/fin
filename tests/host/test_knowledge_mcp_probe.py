@@ -40,6 +40,7 @@ from fin.host.knowledge_mcp import (
     probe_knowledge_mcp,
     publish_knowledge_mcp,
     publish_knowledge_mcp_state,
+    resolve_bound_retrieve_adapter_kind,
 )
 
 FIXTURE_SERVER = (
@@ -393,6 +394,100 @@ def test_publish_mcp_adapter_with_working_wrapper_is_reachable(
 
     assert state == KNOWLEDGE_MCP_REACHABLE
     assert knowledge_mcp_state() == KNOWLEDGE_MCP_REACHABLE
+
+
+# ----- the BOUND adapter kind (ADR 0033 amendment 2026-09-20) -----
+#
+# The route publishes, and the gate reads, the port this process
+# actually bound — not the ``FIN_RETRIEVE_ADAPTER`` string. A scripted
+# boot compiles the fake port whatever that string names, so the two
+# resolutions diverge on exactly that lane; the classifier in
+# ``scripts/lib/readiness.sh`` reads the published value and must land
+# on the same verdict as ``knowledge_mcp_gate_closed``.
+
+
+@pytest.mark.parametrize("configured_adapter", [None, "mcp"])
+def test_bound_kind_is_fake_on_a_scripted_boot(
+    configured_adapter: str | None,
+) -> None:
+    """``FIN_SCRIPTED_MODEL`` binds the fake port whatever is configured.
+
+    ``compile_for_scripted_e2e`` passes ``retrieve_adapter="fake"`` to
+    ``compile_graph``, so the seam a scripted process serves is the fake
+    one even when ``FIN_RETRIEVE_ADAPTER=mcp``.
+    """
+    environ: dict[str, str] = {"FIN_SCRIPTED_MODEL": "1"}
+    if configured_adapter is not None:
+        environ["FIN_RETRIEVE_ADAPTER"] = configured_adapter
+
+    assert resolve_bound_retrieve_adapter_kind(environ=environ) == "fake"
+
+
+def test_bound_kind_is_fake_when_the_configured_adapter_is_fake() -> None:
+    environ = {"FIN_RETRIEVE_ADAPTER": "fake"}
+    assert resolve_bound_retrieve_adapter_kind(environ=environ) == "fake"
+
+
+@pytest.mark.parametrize(
+    "environ",
+    [
+        {},
+        {"FIN_RETRIEVE_ADAPTER": ""},
+        {"FIN_SCRIPTED_MODEL": "0"},
+        {"FIN_SCRIPTED_MODEL": ""},
+        {"FIN_SCRIPTED_MODEL": "false"},
+    ],
+)
+def test_bound_kind_is_the_product_default_without_a_fake_boot(
+    environ: dict[str, str],
+) -> None:
+    """Absent / falsy switches keep the product ``mcp`` port.
+
+    Covers the unset var, a blank value, and the falsy spellings the
+    scripted switch accepts — the gate must stay closed on all of them
+    when the snapshot is not 可达.
+    """
+    assert resolve_bound_retrieve_adapter_kind(environ=environ) == "mcp"
+
+
+def test_unreadable_scripted_switch_is_not_confirmed_scripted() -> None:
+    """A malformed ``FIN_SCRIPTED_MODEL`` keeps the product kind here.
+
+    ``compile_for_http`` raises ``ScriptedBootConfigError`` on such a
+    value, so no process serves on it; the resolver only refuses to
+    claim "scripted" without confirmation — it never raises on a
+    read-only route.
+    """
+    environ = {"FIN_SCRIPTED_MODEL": "maybe"}
+    assert resolve_bound_retrieve_adapter_kind(environ=environ) == "mcp"
+
+
+def test_bound_kind_keeps_scripted_boot_out_of_the_import_graph() -> None:
+    """The resolver never imports ``scripted_boot`` at module scope.
+
+    Checked on the module's IMPORT graph, which is what would break the
+    import cycle this helper was told to avoid: a fresh process that
+    imports ``fin.host.knowledge_mcp`` must not pull the scripted boot
+    (a model + a corpus reader) into ``sys.modules``. The functions do
+    import it lazily on the scripted branch — asserted by the
+    ``fake``-on-a-scripted-boot case above, which cannot answer without
+    it.
+    """
+    import subprocess
+    import sys as _sys
+
+    probe = (
+        "import sys; import fin.host.knowledge_mcp; "
+        "print('fin.host.scripted_boot' in sys.modules)"
+    )
+    completed = subprocess.run(
+        [_sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert completed.stdout.strip() == "False", completed.stdout
 
 
 # ----- snapshot lifecycle -----

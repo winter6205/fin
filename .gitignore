@@ -82,3 +82,11 @@ docs/guides/knowledge-agent.md
 # Local operator shims (not product)
 .local-bin/
 
+# `fin up` runtime state: serve pid file, verdict file and log. Per-checkout,
+# never committed.
+.fin/
+
+# Scratch harnesses written while exercising the launcher's kill/stop paths
+# against a live pid. Throwaway by construction — never a product artifact.
+.fin-selftest/
+
