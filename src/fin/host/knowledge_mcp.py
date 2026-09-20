@@ -13,6 +13,23 @@ The probe result is published into one in-process snapshot, guarded by
 a lock. ``GET /api/status`` and the conversation-entry gate read the
 SAME snapshot, so the left corner and the 409 cannot drift.
 
+Why the adapter kind is the BOUND one
+-------------------------------------
+The snapshot alone does not say whether 缺 closes the gate: that depends
+on which retrieve port the process bound. A scripted boot
+(``FIN_SCRIPTED_MODEL``) compiles the graph with the fake retrieve port
+whatever ``FIN_RETRIEVE_ADAPTER`` names
+(``scripted_boot.compile_for_scripted_e2e`` passes
+``retrieve_adapter="fake"``), so reading the configured string published
+``mcp`` for a scripted process whose gate was open — and the
+operator-facing classifier in ``scripts/lib/readiness.sh``, which
+mirrors this module's gate, read that payload as GATED and told the
+operator that create / open / send would 409 on a process that answers
+all three. :func:`resolve_bound_retrieve_adapter_kind` is the ONE
+resolution of the bound port; the gate and the status route both read
+it, so the published field and the gate cannot disagree (ADR 0033
+amendment 2026-09-20).
+
 Why ``None`` means "gate open"
 ------------------------------
 ``knowledge_mcp_state()`` returns ``None`` when this process never
@@ -20,7 +37,7 @@ probed — the case for a plain ``TestClient`` boot that never goes
 through ``fin.host.http.serve()``. The gate treats ``None`` as open so
 the hermetic default pytest suite (which never boots ``fin-serve``)
 keeps its current conversation contracts. Only a boot that actually
-published 缺 / 坏 closes the gate for the ``mcp`` adapter.
+published 缺 / 坏 closes the gate for the bound ``mcp`` adapter.
 """
 
 from __future__ import annotations
@@ -31,7 +48,7 @@ import shutil
 import threading
 from typing import Mapping, Sequence
 
-from fin.host.graph import RETRIEVE_ADAPTER_MCP
+from fin.host.graph import RETRIEVE_ADAPTER_FAKE, RETRIEVE_ADAPTER_MCP
 from fin.host.operator_env import resolve_retrieve_adapter_kind
 from fin.retrieve.mcp_session import (
     MCPStdioProtocolError,
@@ -104,21 +121,50 @@ def reset_knowledge_mcp_state() -> None:
         _state = None
 
 
-def knowledge_mcp_gate_closed(*, environ: Mapping[str, str] | None = None) -> bool:
-    """Return whether conversation entry must be refused.
+def resolve_bound_retrieve_adapter_kind(
+    *, environ: Mapping[str, str] | None = None
+) -> str:
+    """Return the kind of retrieve port this process actually BOUND.
 
-    Closed iff the configured adapter is the product ``mcp`` adapter
-    AND the published snapshot is 缺 or 坏. A snapshot of ``None``
-    (never probed — e.g. plain ``TestClient`` tests) is NOT closed; see
-    the module docstring. Fake / scripted boots are never gated: the
-    scripted lane forces the fake adapter while leaving
-    ``FIN_RETRIEVE_ADAPTER`` unset, so ``resolve_retrieve_adapter_kind``
-    alone would misread it as the product adapter.
+    The resolution ``fin.host.http.compile_for_http`` performs when it
+    compiles the serving graph: the scripted boot
+    (:func:`fin.host.scripted_boot.compile_for_scripted_e2e`) hands
+    ``compile_graph`` the fake port unconditionally, so a scripted
+    process published the configured string alone is a lie about the
+    seam it serves. Every other boot takes
+    :func:`fin.host.operator_env.resolve_retrieve_adapter_kind` verbatim.
+
+    ``scripted_boot`` stays lazily imported (the ``_scripted_requested``
+    seam below): this module is imported at boot by the HTTP surface, and
+    the scripted path pulls a model + a corpus reader that a product boot
+    must not pay for.
+
+    ONE resolution, read by the conversation gate AND by the status
+    route's ``retrieve_adapter_kind`` field, so the published port and
+    the gate cannot drift (ADR 0033 amendment 2026-09-20; the shell
+    classifier in ``scripts/lib/readiness.sh`` mirrors the same
+    reading).
     """
     source: Mapping[str, str] = os.environ if environ is None else environ
     if _scripted_requested(source):
-        return False
-    if resolve_retrieve_adapter_kind(environ=source) != RETRIEVE_ADAPTER_MCP:
+        return RETRIEVE_ADAPTER_FAKE
+    return resolve_retrieve_adapter_kind(environ=source)
+
+
+def knowledge_mcp_gate_closed(*, environ: Mapping[str, str] | None = None) -> bool:
+    """Return whether conversation entry must be refused.
+
+    Closed iff the BOUND adapter is the product ``mcp`` adapter AND the
+    published snapshot is 缺 or 坏. A snapshot of ``None`` (never probed
+    — e.g. plain ``TestClient`` tests) is NOT closed; see the module
+    docstring. Fake / scripted boots are never gated: both bound the
+    fake port, and :func:`resolve_bound_retrieve_adapter_kind` is what
+    says so — the configured ``FIN_RETRIEVE_ADAPTER`` string alone
+    misreads the scripted lane (which leaves it unset) as the product
+    adapter.
+    """
+    source: Mapping[str, str] = os.environ if environ is None else environ
+    if resolve_bound_retrieve_adapter_kind(environ=source) != RETRIEVE_ADAPTER_MCP:
         return False
     return knowledge_mcp_state() in (KNOWLEDGE_MCP_MISSING, KNOWLEDGE_MCP_FAULT)
 
@@ -204,9 +250,11 @@ def _scripted_requested(environ: Mapping[str, str]) -> bool:
 
     The scripted boot forces the fake retrieve adapter
     (``compile_for_scripted_e2e``), so it must publish 缺 like any
-    other fake boot. A malformed ``FIN_SCRIPTED_MODEL`` is a typed boot
-    failure that ``compile_for_http`` will raise anyway; here it only
-    means "not confirmed scripted".
+    other fake boot and resolve to the fake bound kind
+    (:func:`resolve_bound_retrieve_adapter_kind`). A malformed
+    ``FIN_SCRIPTED_MODEL`` is a typed boot failure that
+    ``compile_for_http`` will raise anyway; here it only means "not
+    confirmed scripted".
     """
     from fin.host.scripted_boot import (
         ScriptedBootConfigError,
@@ -231,10 +279,8 @@ def publish_knowledge_mcp(*, environ: Mapping[str, str] | None = None) -> str:
     conversation, not a failed boot.
     """
     source: Mapping[str, str] = os.environ if environ is None else environ
-    scripted = _scripted_requested(source)
     product_mcp = (
-        not scripted
-        and resolve_retrieve_adapter_kind(environ=source) == RETRIEVE_ADAPTER_MCP
+        resolve_bound_retrieve_adapter_kind(environ=source) == RETRIEVE_ADAPTER_MCP
     )
     state = (
         probe_knowledge_mcp(environ=source)
@@ -283,4 +329,5 @@ __all__ = [
     "publish_knowledge_mcp",
     "publish_knowledge_mcp_state",
     "reset_knowledge_mcp_state",
+    "resolve_bound_retrieve_adapter_kind",
 ]

@@ -219,6 +219,7 @@ from fin.host.knowledge_mcp import (
     KNOWLEDGE_MCP_STATES,
     knowledge_mcp_gate_closed,
     knowledge_mcp_state,
+    resolve_bound_retrieve_adapter_kind,
 )
 from fin.host.memory_dream import run_dream_after_turn
 from fin.host.memory_port import build_memory_port
@@ -806,7 +807,15 @@ class WorkspaceStatusResponse(BaseModel):
       handshake the product truth. It is payload DATA with degraded
       copy behind it, never an HTTP 500 and never an empty body.
     * ``retrieve_adapter_kind`` — which port is behind the seam, so a
-      ``fake`` boot is distinguishable from a product boot.
+      ``fake`` boot is distinguishable from a product boot. It is the
+      BOUND port (``fin.host.knowledge_mcp``'s
+      ``resolve_bound_retrieve_adapter_kind``), never the raw
+      ``FIN_RETRIEVE_ADAPTER`` string: a scripted boot compiles the
+      fake port whatever that string names, so publishing the
+      configured kind made the operator-facing classifier report
+      GATED — "create / open / send will 409" — for a process whose
+      gate is open (ADR 0033 amendment 2026-09-20). This field is the
+      adapter half of the same predicate the conversation gate uses.
     * ``model_identity`` — the resolved ``FIN_MODEL`` slug ONLY.
       ``FIN_BASE_URL`` and key material stay off this wire.
     * ``corpus_filing_count`` — from the same in-process catalog that
@@ -3236,6 +3245,14 @@ def build_router(
         conversation gate stays open for that same hermetic case (see
         ``fin.host.knowledge_mcp``).
 
+        ``retrieve_adapter_kind`` publishes the BOUND port, not the
+        configured string: the (adapter, state) pair this payload
+        carries is then read by the same predicate the conversation
+        gate answers with, which is what
+        ``scripts/lib/readiness.sh`` classifies on. Publishing the
+        configured kind made a scripted boot (fake port, gate open)
+        read as the product port and therefore as GATED.
+
         ``bound_collection_name`` reads config + that same snapshot (no
         extra call, no catalog) and reports ``unbound`` whenever the
         process is not bound to a live iknow 资料集合; see
@@ -3247,7 +3264,7 @@ def build_router(
         )
         return {
             "knowledge_mcp": knowledge_mcp,
-            "retrieve_adapter_kind": resolve_retrieve_adapter_kind(),
+            "retrieve_adapter_kind": resolve_bound_retrieve_adapter_kind(),
             "model_identity": _model_identity(),
             "corpus_filing_count": _corpus_filing_count(),
             "bound_collection_name": resolve_bound_collection_name(),

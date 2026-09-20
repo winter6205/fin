@@ -241,3 +241,99 @@ def test_never_probed_snapshot_leaves_mouths_unchanged(
     created = client.post("/api/threads", json={"first_message": "q"})
     assert created.status_code == 200
     assert client.get(f"/api/threads/{created.json()['id']}").status_code == 200
+
+
+# ----- the published port classifies exactly like the gate -----
+#
+# ``FIN_SCRIPTED_MODEL`` binds the fake retrieve port while
+# ``FIN_RETRIEVE_ADAPTER`` may still name the product adapter (or be
+# unset, which resolves to it). While the route published the CONFIGURED
+# kind, ``scripts/lib/readiness.sh`` — which mirrors
+# ``knowledge_mcp_gate_closed`` below — read that payload as GATED and
+# printed "create / open / send will 409 (knowledge_mcp_fault)" for a
+# process whose gate was open. The route now publishes the BOUND port
+# (``resolve_bound_retrieve_adapter_kind``), which is the same
+# resolution the gate reads, so the two cannot disagree.
+
+
+def _classify_like_readiness_sh(body: dict) -> bool:
+    """``scripts/lib/readiness.sh``'s gate verdict, transcribed.
+
+    The shell classifier consumes the same ``GET /api/status`` payload
+    an operator would: bound adapter != ``mcp`` → ready (gate n/a);
+    bound adapter == ``mcp`` and state == ``reachable`` → ready;
+    otherwise gated. Transcribed rather than sourced because the shell
+    file drives the operator CLI and this test drives the route — a
+    drift between the two readings is exactly the finding it pins.
+    """
+    adapter = body.get("retrieve_adapter_kind") or "mcp"
+    state = body.get("knowledge_mcp") or "missing"
+    return adapter == "mcp" and state != "reachable"
+
+
+@pytest.mark.parametrize("configured_adapter", [None, "mcp"])
+def test_scripted_lane_publishes_the_fake_port_it_bound(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+    configured_adapter: str | None,
+) -> None:
+    """The divergent pair: scripted boot, product adapter configured.
+
+    The lane binds the fake port (``compile_for_scripted_e2e``) whatever
+    ``FIN_RETRIEVE_ADAPTER`` says, so the route must publish ``fake``
+    and the classifier must read the same open gate
+    ``knowledge_mcp_gate_closed()`` answers.
+    """
+    monkeypatch.setenv("FIN_SCRIPTED_MODEL", "1")
+    if configured_adapter is None:
+        monkeypatch.delenv("FIN_RETRIEVE_ADAPTER", raising=False)
+    else:
+        monkeypatch.setenv("FIN_RETRIEVE_ADAPTER", configured_adapter)
+    publish_knowledge_mcp_state(KNOWLEDGE_MCP_MISSING)
+
+    body = client.get("/api/status").json()
+
+    assert body["retrieve_adapter_kind"] == "fake", body
+    assert knowledge_mcp_gate_closed() is False
+    assert _classify_like_readiness_sh(body) is False
+
+
+@pytest.mark.parametrize("scripted", [False, True])
+@pytest.mark.parametrize("configured_adapter", [None, "mcp", "fake"])
+@pytest.mark.parametrize(
+    "state",
+    [KNOWLEDGE_MCP_MISSING, KNOWLEDGE_MCP_FAULT, KNOWLEDGE_MCP_REACHABLE],
+)
+def test_status_payload_classifies_exactly_like_the_gate(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    scripted: bool,
+    configured_adapter: str | None,
+    state: str,
+) -> None:
+    """Pins the EQUIVALENCE, not either side alone.
+
+    Every combination of (scripted × configured adapter × published
+    state) must classify identically through the route's payload and
+    through ``knowledge_mcp_gate_closed()``. Asserting one side alone
+    would have passed on the divergent pair — the gate was already
+    right and only the published adapter kind was wrong.
+    """
+    if scripted:
+        monkeypatch.setenv("FIN_SCRIPTED_MODEL", "1")
+    else:
+        monkeypatch.delenv("FIN_SCRIPTED_MODEL", raising=False)
+    if configured_adapter is None:
+        monkeypatch.delenv("FIN_RETRIEVE_ADAPTER", raising=False)
+    else:
+        monkeypatch.setenv("FIN_RETRIEVE_ADAPTER", configured_adapter)
+    publish_knowledge_mcp_state(state)
+
+    body = client.get("/api/status").json()
+
+    assert _classify_like_readiness_sh(body) is knowledge_mcp_gate_closed(), (
+        scripted,
+        configured_adapter,
+        state,
+        body["retrieve_adapter_kind"],
+        body["knowledge_mcp"],
+    )

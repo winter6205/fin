@@ -33,18 +33,24 @@ def pytest_collection_modifyitems(
 ) -> None:
     """Deselect opt-in suites unless the matching ``-m`` is on the CLI.
 
-    Two marks live here:
+    Three marks live here:
 
     * ``soft_track``: Soft-Track ship suites (spec Soft-Track ship gate).
     * ``memory_on``: cases that exercise the ON memory path under
       pytest (T3 / SC3). Default ``uv run pytest -q`` must stay OFF
       even when the operator ``.env`` has ``FIN_MEMORY_ENABLED=true``
       (ADR 0035); the marker is the opt-in switch the gold set uses.
+    * ``mcp``: live boot acceptance that drives the real
+      `fin up` stack (Docker + a sibling iknow-memory checkout +
+      minutes). `tests/retrieve/conftest.py` owns this mark for its own
+      directory; the launcher's live acceptance lives under
+      ``tests/host/``, so the same deselection has to exist here or it
+      would run under the default hermetic suite.
 
-    Both are register-style deselection: a CLI ``-m memory_on`` or
-    ``-m soft_track`` re-runs them. The check is per-mark so a CLI
-    ``-m memory_on`` keeps the ``soft_track`` items deselected and vice
-    versa — they are independent opt-in switches.
+    All three are register-style deselection: a CLI ``-m mcp`` (etc.)
+    re-runs them. The check is per-mark so a CLI ``-m memory_on`` keeps
+    the ``soft_track`` items deselected and vice versa — they are
+    independent opt-in switches.
     """
     markexpr = config.getoption("markexpr") or ""
 
@@ -54,6 +60,7 @@ def pytest_collection_modifyitems(
         markers = (
             "soft_track" if item.get_closest_marker("soft_track") is not None else None,
             "memory_on" if item.get_closest_marker("memory_on") is not None else None,
+            "mcp" if item.get_closest_marker("mcp") is not None else None,
         )
         # Drop only the opt-in marks that the CLI did NOT request. An
         # unmarked test stays kept.
