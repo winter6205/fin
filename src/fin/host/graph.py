@@ -173,6 +173,7 @@ from fin.host.search_mode_decision import (
     search_mode_update_for_turn,
 )
 from fin.host.extract_method_proposal import (
+    apply_extract_method_pick,
     build_proposal_audit,
     normalize_extract_method,
     propose_window_payload,
@@ -185,7 +186,7 @@ from fin.retrieve.degradation import (
 )
 from fin.retrieve.hit_mapping import MappingFailureLedger, ledger_from_env
 from fin.retrieve.input_validation import InputValidationError
-from fin.retrieve.port import RetrievePort
+from fin.retrieve.port import RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY, RetrievePort
 from fin.retrieve.read_port import MissReadPort, ReadPort
 from fin.retrieve.tool import retrieve
 
@@ -798,6 +799,14 @@ def _make_retrieve_tool(
             tool_call_id=tool_call_id,
             name="retrieve",
         )
+        call_outcome: dict[str, Any] = {
+            "chunks": len(serialized_chunks),
+            "mapping_failures": ledger.count_on_this_thread(),
+        }
+        if result.get(RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY) is True:
+            # A RECORDED Fast job fact rides the run record so the
+            # citation gate can name the method, not just the empty set.
+            call_outcome[RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY] = True
         return Command(
             update={
                 "messages": [tool_message],
@@ -809,12 +818,7 @@ def _make_retrieve_tool(
                 # operator reads it. ``retrieve_outcomes_delta``
                 # guards the negative-delta case defensively.
                 "retrieve_outcomes": retrieve_outcomes_delta(
-                    [
-                        {
-                            "chunks": len(serialized_chunks),
-                            "mapping_failures": ledger.count_on_this_thread(),
-                        }
-                    ],
+                    [call_outcome],
                     baseline=failures_before,
                 ),
             }
@@ -2627,15 +2631,17 @@ def compile_graph(
         Reached ONLY on ``from_classify`` when the run input carries an
         explicit ``{"proposed": "fast"}`` seed — the ordinary grounded
         flow never opens it. Same validate-then-reopen interrupt loop as
-        ``mode_choice`` (no LLM call, so replay-on-resume is
-        side-effect free), and the payload stays
+        ``mode_choice`` (no LLM call), and the payload stays
         ``kind="choice_window"`` so the SPA renders it unchanged.
 
-        The node records the proposal RESULT only: ``applied`` is
-        always ``False`` (build_proposal_audit), because flipping the
-        extract method rebuilds the corpus version and is the index
-        job's operator switch (spec 2) — this run touches no
-        extract/index state, snapshots included.
+        A resolved pick routes onto the corpus version switch through
+        ``apply_extract_method_pick``: only a valid ``fast`` pick on a request
+        naming a recorded ``(document_id, version)`` flips that version
+        (the catalog then marks the rebuild intent and the audit reads
+        ``applied is True``). Every other outcome applies nothing —
+        the switch call is idempotent, so LangGraph's replay-on-resume
+        of the node body cannot double-apply. No snapshot channel is
+        touched: the extract method never rides the 档 audit.
         """
         request = dict(state.get("extract_method_proposal") or {})
         rejected: list[str] = []
@@ -2645,9 +2651,16 @@ def compile_graph(
             if picked is not None:
                 break
             rejected.append(raw)
+        applied, apply_error = apply_extract_method_pick(
+            request, picked, catalog_path=cpath
+        )
         return {
             "extract_method_proposal": build_proposal_audit(
-                request, picked=picked, rejected=rejected
+                request,
+                picked=picked,
+                rejected=rejected,
+                applied=applied,
+                apply_error=apply_error,
             )
         }
 

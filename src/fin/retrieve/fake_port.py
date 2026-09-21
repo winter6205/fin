@@ -40,7 +40,11 @@ from fin.retrieve.input_validation import (
     validate_filters,
     validate_query,
 )
-from fin.retrieve.port import Chunk, resolve_search_mode
+from fin.retrieve.port import (
+    Chunk,
+    resolve_search_mode,
+    RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY,
+)
 from fin.retrieve.read_port import read_from_pages
 
 
@@ -95,6 +99,15 @@ class FakeRetrievePort:
     input_validation_ledger
         Optional「输入校验失败」count (T21). Omitted, the port
         keeps an in-memory one — quiet, never blind.
+    fast_graph_empty
+        Optional recorded Fast 抽图 job fact (spec
+        graph-index-standard-fast SC5): the Fast extractor built an
+        EMPTY entity-relation graph over this 资料 set. When set,
+        every legal ``retrieve`` answer carries the
+        ``fast_graph_empty`` key next to an empty chunk list — a named
+        fact, never the silent ``{"chunks": []}`` shape an ordinary
+        empty collection keeps. Default ``False``: ordinary fakes must
+        not teach every empty corpus a Fast failure.
     """
 
     def __init__(
@@ -105,6 +118,7 @@ class FakeRetrievePort:
         manifest_docs: Mapping[str, Mapping[str, Any]] | None = None,
         pages_by_doc: Mapping[str, Sequence[ExtractedPage]] | None = None,
         input_validation_ledger: InputValidationLedger | None = None,
+        fast_graph_empty: bool = False,
     ) -> None:
         # Defensive copy so a caller mutating the source dict
         # after construction cannot affect the fake.
@@ -127,6 +141,7 @@ class FakeRetrievePort:
             dict(pages_by_doc) if pages_by_doc is not None else {}
         )
         self._input_validation_ledger = input_validation_ledger
+        self._fast_graph_empty = fast_graph_empty
         # Every completed ``retrieve`` call, in order, as the kwargs the
         # port received (``test_retrieve_typed_exit``'s recording style).
         # Rejected calls (named input errors) are NOT recorded: nothing
@@ -210,6 +225,12 @@ class FakeRetrievePort:
           document's bindings, so an unknown value really does
           answer with an empty list
         * ``limit`` defaults to 8, hard cap 20 (ADR 0009)
+        * constructed with ``fast_graph_empty=True``: every legal
+          call answers ``{"chunks": [], "fast_graph_empty": True}`` —
+          the RECORDED Fast 抽图 job fact (an empty entity-relation
+          graph over the 资料 set, spec graph-index-standard-fast
+          SC5). Invalid input still names first: the job fact is not
+          a licence to swallow an ``EmptyQueryError``.
         """
         # Invalid input first, before any lookup: an empty query, a
         # provably unsatisfiable filter set, and an illegal / unopened
@@ -244,6 +265,13 @@ class FakeRetrievePort:
         # but the corpus has no such document. ``None`` (the
         # default) means "no membership test" so the filter
         # passes through.
+        if self._fast_graph_empty:
+            # The recorded Fast job fact: an empty entity-relation
+            # graph can cite no chunk, so the hit table is deliberately
+            # shadowed — and the emptiness arrives NAMED, which is the
+            # whole difference from a silent empty collection (the host
+            # decision must not have to guess 未就绪 here, spec SC5).
+            return {"chunks": [], RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY: True}
         if (
             document_id is not None
             and self._known_doc_ids is not None

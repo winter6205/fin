@@ -14,9 +14,12 @@ SPA renders it with zero web changes — but must never silent-apply:
   run on an extract-method window whose options name Fast vs standard;
 * NO pick (window still pending) / an invalid pick / an empty pick
   keep the effective extract method **standard** and never crash;
-* even a confirmed ``fast`` pick only records the proposal result on
-  the run audit (``applied`` stays ``False`` — the operator switch on
-  the index job is spec 2); nothing touches snapshots / the corpus.
+* a confirmed ``fast`` pick on a request that carries a recorded
+  ``(document_id, version)`` applies the ONE sanctioned path — the corpus
+  ``switch_extract_method`` operator switch — and the audit reads
+  ``applied is True``; without that version context (or on a declined
+  / bad pick) nothing reaches the catalog and ``applied`` stays
+  ``False``: there is no silent Fast.
 * the string ``Fast`` is NEVER a 检索档: it is not an option id in the
   mode window, an out-of-list pick there reopens (no crash), and
   ``search_mode`` after every flow here stays ``None`` or ``A|B|C|D``.
@@ -27,7 +30,7 @@ Five boundary classes map to: empty -> ``test_empty_pick_reopens_window_and_keep
 negative -> ``test_out_of_list_pick_reopens_then_resolves``;
 overflow -> ``test_mode_window_rejects_fast_then_operator_pick_assigns_real_tier``
 (repeated cross-window picks never accumulate a Fast 档);
-concurrent -> the 409 guard is the run-level lock T2 already locks in
+concurrent -> the 409 guard is the run-level lock already locked in
 ``test_search_mode_choice_window.py`` (this ticket adds no new HTTP
 surface); exception -> ``test_lane_off_seed_never_opens_window`` (no
 interrupt machinery runs when the HITL lane is off).
@@ -35,6 +38,8 @@ interrupt machinery runs when the HITL lane is off).
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -42,6 +47,7 @@ from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
+from fin.corpus.catalog import record_filings
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.extract_method_proposal import DEFAULT_EXTRACT_METHOD
 from fin.host.state import reset_input_state
@@ -89,12 +95,14 @@ def _compile(
     script: list[AIMessage],
     *,
     choice_window: bool = True,
+    catalog_path: Path | str | None = None,
 ) -> Any:
     return compile_graph(
         checkpointer=InMemorySaver(),
         model=ScriptedChatModel(script=script),
         known_document_ids=KNOWN_IDS,
         enable_choice_window=choice_window,
+        catalog_path=catalog_path,
     )
 
 
@@ -118,7 +126,7 @@ def test_propose_seed_opens_extract_method_window() -> None:
     )
     payload = _interrupt_payload(out)
     assert payload is not None
-    # Wire-compatible with the T2 SPA renderer: same kind, options of
+    # Wire-compatible with the SPA renderer: same kind, options of
     # {id,label} — no web change needed to paint this window.
     assert payload["kind"] == "choice_window"
     # The title/prompt say what this window selects (抽图方法), so the
@@ -172,11 +180,11 @@ def test_empty_pick_reopens_window_and_keeps_standard() -> None:
 
 
 def test_pick_fast_records_proposal_never_applies() -> None:
-    """ADR 0068 "no silent-apply", read maximally: even the operator
-    CONFIRMING fast only records the proposal result. ``applied`` stays
-    ``False`` (the switch lives on the index job — spec 2), the
-    effective method stays standard, and no snapshot/corpus channel
-    gains an extract-method fact. The 档 audit is untouched."""
+    """ADR 0068 "no silent-apply", read maximally: a context-free seed
+    is only a proposal record — even CONFIRMING fast on it applies
+    nothing (there is no version to switch), the effective method stays
+    standard, and no snapshot/corpus channel gains an extract-method
+    fact. The 档 audit is untouched."""
     g = _compile(_ANSWER)
     tid = "fp-pick-fast"
     g.invoke(_propose_input(AMBIGUOUS), config=_cfg(tid, pinned_search_mode="B"))
@@ -322,3 +330,184 @@ def test_lane_off_seed_never_opens_window() -> None:
     assert out["search_mode_decision"]["search_mode"] == "B"
     assert out["extract_method_proposal"].get("applied") is not True
     assert out["extract_method_proposal"].get("picked") is None
+
+
+# ---------------------------------------------------------------------------
+# the operator pick lands on the version switch (ADR 0068/0079)
+# ---------------------------------------------------------------------------
+
+
+def _catalog_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "document_id": "AAPL-2022Q3",
+        "company": "Apple",
+        "period": "2022 Q3",
+        "version": "a" * 64,
+        "page_count": 3,
+    }
+    row.update(overrides)
+    return row
+
+
+def _stored_rows(catalog_path: Path) -> list[dict[str, object]]:
+    return json.loads(catalog_path.read_text())["filings"]
+
+
+def _seed_catalog(tmp_path: Path) -> Path:
+    """A tmp catalog whose one version records the default standard."""
+    catalog_path = tmp_path / "catalog.json"
+    record_filings([_catalog_row()], catalog_path=catalog_path)
+    return catalog_path
+
+
+def _propose_input_for_version(
+    text: str, document_id: str, version: str
+) -> dict[str, Any]:
+    """The seed the HTTP send stamps when the caller names the switch
+    target: the propose request plus its ``(document_id, version)``."""
+    return {
+        **reset_input_state(text),
+        "evidence": [],
+        "extract_method_proposal": {
+            "proposed": "fast",
+            "document_id": document_id,
+            "version": version,
+        },
+    }
+
+
+def test_fast_pick_with_version_context_applies_the_switch(
+    tmp_path: Path,
+) -> None:
+    """Acceptance "operator 有效 pick fast → 该 (document_id, version)
+    记录 fast，audit applied=true": the window routes the pick through
+    the ONLY sanctioned path (``switch_extract_method``), so the
+    stored row flips to fast AND carries the rebuild intent. The 档
+    pin survives untouched — fast is not a search mode."""
+    catalog_path = _seed_catalog(tmp_path)
+    g = _compile(_ANSWER, catalog_path=catalog_path)
+    tid = "fp-apply-fast"
+    g.invoke(
+        _propose_input_for_version(AMBIGUOUS, "AAPL-2022Q3", "a" * 64),
+        config=_cfg(tid, pinned_search_mode="B"),
+    )
+    done = g.invoke(Command(resume="fast"), config=_cfg(tid, pinned_search_mode="B"))
+    assert not done.get("__interrupt__")
+    proposal = done["extract_method_proposal"]
+    assert proposal["picked"] == "fast"
+    assert proposal["applied"] is True
+    assert proposal["operator_confirmed"] is True
+    stored = _stored_rows(catalog_path)[0]
+    assert stored["extract_method"] == "fast"
+    assert stored["rebuild_pending"] is True
+    assert done["search_mode_decision"]["search_mode"] == "B"
+    assert done["search_mode_decision"]["search_mode"] not in ("fast", "Fast")
+
+
+def test_fast_pick_without_version_context_never_touches_catalog(
+    tmp_path: Path,
+) -> None:
+    """The apply gate is the version context itself: a recorded
+    standard version plus a confirmed fast pick on a seed that names NO
+    ``(document_id, version)`` must leave the row standard — the switch
+    may never guess its target, so this is the no-silent-Fast wall."""
+    catalog_path = _seed_catalog(tmp_path)
+    g = _compile(_ANSWER, catalog_path=catalog_path)
+    tid = "fp-apply-nocontext"
+    g.invoke(_propose_input(AMBIGUOUS), config=_cfg(tid, pinned_search_mode="B"))
+    done = g.invoke(Command(resume="fast"), config=_cfg(tid, pinned_search_mode="B"))
+    proposal = done["extract_method_proposal"]
+    assert proposal["picked"] == "fast"
+    assert proposal["applied"] is False
+    assert proposal["apply_error"] == "missing_version_context"
+    assert _stored_rows(catalog_path)[0]["extract_method"] == "standard"
+    assert "rebuild_pending" not in _stored_rows(catalog_path)[0]
+
+
+def test_fast_pick_for_unrecorded_version_is_typed_noop(tmp_path: Path) -> None:
+    """A named-but-unrecorded target is the catalog's typed
+    ``ExtractMethodTargetMissingError`` surfaced as an audit code: the
+    switch never creates a version (ADR 0079), the run finishes, and
+    nothing is applied."""
+    catalog_path = _seed_catalog(tmp_path)
+    g = _compile(_ANSWER, catalog_path=catalog_path)
+    tid = "fp-apply-missing"
+    g.invoke(
+        _propose_input_for_version(AMBIGUOUS, "AAPL-2022Q3", "b" * 64),
+        config=_cfg(tid, pinned_search_mode="B"),
+    )
+    done = g.invoke(Command(resume="fast"), config=_cfg(tid, pinned_search_mode="B"))
+    assert not done.get("__interrupt__")
+    proposal = done["extract_method_proposal"]
+    assert proposal["applied"] is False
+    assert proposal["apply_error"] == "extract_method_target_missing"
+    assert _stored_rows(catalog_path)[0]["extract_method"] == "standard"
+    assert len(_stored_rows(catalog_path)) == 1
+
+
+def test_standard_pick_with_context_declines_without_writing(
+    tmp_path: Path,
+) -> None:
+    """Picking standard is declining the proposal: the version already
+    records the default, so NO switch runs — no flip, no rebuild
+    intent, ``applied`` stays False."""
+    catalog_path = _seed_catalog(tmp_path)
+    g = _compile(_ANSWER, catalog_path=catalog_path)
+    tid = "fp-apply-decline"
+    g.invoke(
+        _propose_input_for_version(AMBIGUOUS, "AAPL-2022Q3", "a" * 64),
+        config=_cfg(tid, pinned_search_mode="B"),
+    )
+    done = g.invoke(
+        Command(resume="standard"), config=_cfg(tid, pinned_search_mode="B")
+    )
+    proposal = done["extract_method_proposal"]
+    assert proposal["picked"] == "standard"
+    assert proposal["applied"] is False
+    assert "apply_error" not in proposal
+    stored = _stored_rows(catalog_path)[0]
+    assert stored["extract_method"] == "standard"
+    assert "rebuild_pending" not in stored
+
+
+def test_bad_picks_with_context_keep_version_standard_until_valid(
+    tmp_path: Path,
+) -> None:
+    """Acceptance "坏 pick → version 保持 standard": every rejected
+    answer reopens the window with the catalog untouched; only the
+    first valid fast pick writes the switch, exactly once."""
+    catalog_path = _seed_catalog(tmp_path)
+    g = _compile(_ANSWER, catalog_path=catalog_path)
+    tid = "fp-apply-bads"
+    g.invoke(
+        _propose_input_for_version(AMBIGUOUS, "AAPL-2022Q3", "a" * 64),
+        config=_cfg(tid, pinned_search_mode="B"),
+    )
+    for bad in ("turbo", ""):
+        again = g.invoke(Command(resume=bad), config=_cfg(tid, pinned_search_mode="B"))
+        assert _interrupt_payload(again) is not None
+        assert again["extract_method_proposal"] == {
+            "proposed": "fast",
+            "document_id": "AAPL-2022Q3",
+            "version": "a" * 64,
+        }
+        assert _stored_rows(catalog_path)[0]["extract_method"] == "standard"
+    done = g.invoke(Command(resume="fast"), config=_cfg(tid, pinned_search_mode="B"))
+    assert done["extract_method_proposal"]["applied"] is True
+    assert done["extract_method_proposal"]["rejected_picks"] == ["turbo", ""]
+    assert _stored_rows(catalog_path)[0]["extract_method"] == "fast"
+
+
+def test_lane_off_with_context_applies_nothing(tmp_path: Path) -> None:
+    """Lane off = no window = no operator confirmation possible, so
+    even a version-naming seed applies nothing — the pick, not the
+    seed, is what switches."""
+    catalog_path = _seed_catalog(tmp_path)
+    g = _compile(_ANSWER, choice_window=False, catalog_path=catalog_path)
+    out = g.invoke(
+        _propose_input_for_version(AMBIGUOUS, "AAPL-2022Q3", "a" * 64),
+        config=_cfg("fp-apply-laneoff", pinned_search_mode="B"),
+    )
+    assert not out.get("__interrupt__")
+    assert out["extract_method_proposal"].get("applied") is not True
+    assert _stored_rows(catalog_path)[0]["extract_method"] == "standard"

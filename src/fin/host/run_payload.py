@@ -21,6 +21,7 @@ from fin.host.citation_gate import strip_hidden_bounce_marker
 from fin.host.named_failures import (
     COMMUNITY_SUMMARY_INDEX_FAILURE,
     CORPUS_NOT_READY,
+    EMPTY_FAST_GRAPH_FAILURE,
     MAPPING_DROP,
 )
 from fin.host.state import STEP_CAP
@@ -143,6 +144,16 @@ ORDINARY_PERSON_COPY: Final[dict[str, str]] = {
         "failed or is incomplete. Re-run the summary index job, then "
         "ask again."
     ),
+    # graph-index-standard-fast SC5 — the Fast 抽图 job built an empty
+    # entity-relation graph over this 资料 set. Neither fix reads the
+    # other exits' advice: the documents are there (not 未就绪), and no
+    # 档 is closed (not 未开) — the EXTRACT METHOD failed them.
+    EMPTY_FAST_GRAPH_FAILURE: (
+        "The Fast extract found no entity graph in this 资料 set — the "
+        "method does not fit these documents. Switch the version back "
+        "to standard extract (or fix the Fast extractor), re-run the "
+        "index, then ask again."
+    ),
 }
 
 
@@ -153,7 +164,8 @@ def ordinary_person_copy(status: str, reason: str) -> str:
     ``refuse`` -> keyed by ``reason`` (``unknown_locator`` /
     ``citation_repair_cap`` / ``numeric_gate_fail`` /
     ``corpus_not_ready`` / ``mapping_drop`` /
-    ``community_summary_index_failure``).
+    ``community_summary_index_failure`` /
+    ``empty_fast_graph_failure``).
     ``step_cap`` -> the step-cap string regardless of ``reason``.
     Unknown terminal -> ``""`` (defensive; the gate never
     produces one).
