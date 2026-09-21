@@ -398,9 +398,10 @@ def compile_for_scripted_e2e(
 
     ``InMemorySaver`` for state, ``FakeRetrievePort`` for retrieve (no
     MCP subprocess), :class:`PacedScriptedChatModel` for the model, and
-    no ``classify_model`` — the rules tier already routes the lane's
-    fully-slotted question to ``research`` and an LLM classify call
-    would consume transcript responses meant for the run itself.
+    no ``classify_model`` / ``jev_client`` — the rules tier already routes
+    the lane's fully-slotted question to ``grounded`` and a gray-zone
+    judge call would consume transcript responses meant for the run
+    itself.
 
     ``FIN_SCRIPTED_SCENARIO`` picks the transcript; see
     :func:`scripted_scenario`.

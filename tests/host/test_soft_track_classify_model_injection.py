@@ -1,20 +1,17 @@
-"""Soft-Track: classify_model must be threaded into ``compile_graph`` at every
+"""Jev / classify wiring must be threaded into ``compile_graph`` at every
 production compile entry point.
 
-Spec rule (specs/soft-track.md): ``classify_model`` must reuse ``FIN_MODEL``,
-i.e. the same model already wired through ``compile_for_runtime``. The default
-of ``compile_graph(classify_model=None)`` permanently skips the LLM tier of
-Soft-Track, so every ambiguous utterance falls through to the residual
-``track="grounded"`` branch in :mod:`fin.host.track_decision`. That violates
-the "no single global default track" rule and breaks the
-``conditional_policy`` contract.
+ADR 0080 splits the two seams:
 
-These tests assert that both runtime entry points — durable
-(:func:`fin.host.compile.compile_for_runtime`) and in-memory
-(:func:`fin.host.compile.compile_for_runtime_dev`) — pass the SAME model
-object as both ``model=`` and ``classify_model=`` when handing control off
-to ``compile_graph``. We mock ``compile_graph`` so the test stays hermetic
-(no Postgres, no live LLM).
+* ``jev_client`` — the Soft-Track gray zone. ``compile_for_runtime`` /
+  ``compile_for_runtime_dev`` build it via ``build_jev_client`` from the
+  same env; a missing key means ``None`` and the cascade fail-closes to
+  clarify (never a MiniMax JSON fallback).
+* ``classify_model`` — kept ONLY for the grounded turn's 检索档 cascade
+  (search-mode host), still reusing ``FIN_MODEL`` identity.
+
+We mock ``compile_graph`` so the tests stay hermetic (no Postgres, no
+live LLM, no network).
 """
 
 from __future__ import annotations
@@ -29,6 +26,7 @@ from fin.host.compile import (
     compile_for_runtime,
     compile_for_runtime_dev,
 )
+from fin.host.jev_choice import JevChoiceClient
 
 
 # ----- fake runtime deps -----
@@ -202,5 +200,120 @@ def test_compile_for_runtime_dev_injects_classify_model(
     assert call.get("classify_model") is model, (
         "compile_for_runtime_dev must thread the SAME model "
         "object through to compile_graph as classify_model= "
-        "(spec specs/soft-track.md)."
+        "(the search-mode 检索档 cascade uses it)."
     )
+
+
+# ----- ADR 0080: the gray-zone Jev client wiring -----
+
+
+def _clear_jev_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in (
+        "FIN_JEV_API_KEY",
+        "TYPESAFE_API_KEY",
+        "FIN_JEV_MODEL",
+        "FIN_JEV_BASE_URL",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def _capture_compile_graph(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    graph_calls: list[dict[str, Any]] = []
+
+    def _fake_compile_graph(**kw: Any) -> str:
+        graph_calls.append(kw)
+        return "compiled-graph"
+
+    monkeypatch.setattr("fin.host.compile.compile_graph", _fake_compile_graph)
+    return graph_calls
+
+
+@pytest.mark.soft_track
+def test_compile_for_runtime_threads_jev_client_when_key_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With ``FIN_JEV_API_KEY`` set, both runtime entry points must hand
+    ``compile_graph`` a real ``JevChoiceClient`` for the gray zone."""
+    _clear_jev_env(monkeypatch)
+    monkeypatch.setenv("FIN_JEV_API_KEY", "test-only-not-a-real-key")
+    monkeypatch.delenv("FIN_MODEL", raising=False)
+    monkeypatch.delenv("FIN_BASE_URL", raising=False)
+    monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
+
+    _install_fake_langchain_openai(monkeypatch, {})
+    _install_fake_postgres_saver(monkeypatch)
+    graph_calls = _capture_compile_graph(monkeypatch)
+
+    compile_for_runtime()
+    assert len(graph_calls) == 1
+    client = graph_calls[0].get("jev_client")
+    assert isinstance(client, JevChoiceClient), (
+        "compile_for_runtime must build the gray-zone Jev client via "
+        "build_jev_client when a TypeSafe key exists (ADR 0080)."
+    )
+
+
+@pytest.mark.soft_track
+def test_compile_for_runtime_dev_jev_client_none_when_key_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing key → ``jev_client=None``: the cascade fail-closes to
+    clarify at the gray zone — no MiniMax fallback is wired (ADR 0080)."""
+    _clear_jev_env(monkeypatch)
+    monkeypatch.delenv("FIN_MODEL", raising=False)
+    monkeypatch.delenv("FIN_BASE_URL", raising=False)
+    monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
+
+    _install_fake_langchain_openai(monkeypatch, {})
+    graph_calls = _capture_compile_graph(monkeypatch)
+
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        compile_for_runtime_dev()
+    assert len(graph_calls) == 1
+    assert graph_calls[0].get("jev_client") is None
+
+
+@pytest.mark.soft_track
+def test_compile_for_runtime_dev_threads_jev_client_when_key_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dev mirror of the runtime threading contract: key present → real
+    client, so the dev boot exercises the same gray-zone tier."""
+    _clear_jev_env(monkeypatch)
+    monkeypatch.setenv("FIN_JEV_API_KEY", "test-only-not-a-real-key")
+    monkeypatch.delenv("FIN_MODEL", raising=False)
+    monkeypatch.delenv("FIN_BASE_URL", raising=False)
+
+    _install_fake_langchain_openai(monkeypatch, {})
+    graph_calls = _capture_compile_graph(monkeypatch)
+
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        compile_for_runtime_dev()
+    assert len(graph_calls) == 1
+    assert isinstance(graph_calls[0].get("jev_client"), JevChoiceClient)
+
+
+@pytest.mark.soft_track
+def test_compile_for_runtime_jev_client_none_when_key_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime mirror of the dev contract: key missing → ``None`` client,
+    the gray zone fail-closes to clarify with no fallback wired."""
+    _clear_jev_env(monkeypatch)
+    monkeypatch.delenv("FIN_MODEL", raising=False)
+    monkeypatch.delenv("FIN_BASE_URL", raising=False)
+    monkeypatch.setenv("FIN_CHECKPOINT_URL", "postgresql://placeholder")
+
+    _install_fake_langchain_openai(monkeypatch, {})
+    _install_fake_postgres_saver(monkeypatch)
+    graph_calls = _capture_compile_graph(monkeypatch)
+
+    compile_for_runtime()
+    assert len(graph_calls) == 1
+    assert graph_calls[0].get("jev_client") is None

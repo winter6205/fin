@@ -1,4 +1,4 @@
-"""Soft-Track track decision cascade (rules → LLM → inherit → clarify → policy).
+"""Soft-Track track decision cascade (rules → Jev → inherit → clarify → policy).
 
 ``decide_track`` chooses ``dialogue`` / ``clarify`` / ``off_topic`` /
 ``grounded`` before the host graph executes a leaf.
@@ -6,15 +6,16 @@
 Tier order (no single global default track):
 
 1. **rules** — high-confidence greeting / off-domain / fully slotted
-   research / strong research cues (never replaced by LLM).
-2. **llm** — only when ambiguous (inherit/clarify would not already
-   decide) and ``classify_model`` is provided; structured
-   ``{"track": ...}``; typed EXITs (``invalid_track`` /
-   ``schema_parse`` / ``model_error``) fall through.
+   research / strong research cues (never replaced by the judge).
+2. **jev** — only when ambiguous (inherit/clarify would not already
+   decide); one TypeSafe Jev closed-set Choice over the four tracks
+   (ADR 0080). Every failure path — missing client, typed exit, low
+   confidence — resolves to ``clarify`` (fail-closed, no fallback).
 3. **inherit** — short / underspec follow-up with latest status snapshot
    research context (not across company change).
 4. **clarify** — filing-shaped ask missing company and/or period.
-5. **conditional_policy** — residual (no signal → ``dialogue``).
+5. **conditional_policy** — residual for utterances the judge cannot be
+   asked about (empty text) → ``dialogue``.
 
 ``snapshot_delta_for_utterance`` builds the append-only
 ``status_snapshots`` delta for classify (company change clears
@@ -23,30 +24,41 @@ dependents).
 
 from __future__ import annotations
 
-import json
-import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage
+
+from fin.host.jev_choice import JevChoice, JevChoiceError
 
 Track = Literal["dialogue", "clarify", "off_topic", "grounded"]
 
 DecisionTier = Literal[
     "rules",
-    "llm",
+    "jev",
     "inherit",
     "clarify",
     "conditional_policy",
 ]
 
-_VALID_TRACKS: frozenset[str] = frozenset(
-    {"dialogue", "clarify", "off_topic", "grounded"}
-)
+# The Jev gray-zone closed set (ADR 0080): the four Soft-Track leaves.
+_JEV_TRACK_OPTIONS: tuple[str, ...] = ("dialogue", "clarify", "off_topic", "grounded")
+_VALID_TRACKS: frozenset[str] = frozenset(_JEV_TRACK_OPTIONS)
 # Checkpoint / classify wire alias (ADR 0061).
 _TRACK_ALIASES: dict[str, Track] = {"research": "grounded"}
-_MIN_CLASSIFY_CONFIDENCE = 0.6
+_MIN_JEV_CONFIDENCE = 0.6
+
+# Live smoke: the client's generic default instructions misjudge
+# off-domain asks as grounded; leaf semantics must come with the question.
+_JEV_TRACK_INSTRUCTIONS: str = (
+    "Classify the operator utterance into exactly one Soft-Track track: "
+    "dialogue = conversational reply needing no filing data; "
+    "clarify = a filing-shaped ask missing company or period; "
+    "off_topic = outside US-filing financial research; "
+    "grounded = a research ask answerable from SEC filings."
+)
 
 # Canonical ticker spellings for snapshot storage.
 _COMPANY_CANON: dict[str, str] = {
@@ -57,13 +69,6 @@ _COMPANY_CANON: dict[str, str] = {
     "amzn": "AMZN",
     "amazon": "AMZN",
 }
-
-_CLASSIFY_SYSTEM = (
-    "Classify the operator utterance into exactly one Soft-Track track. "
-    "Reply with JSON only: {\"track\": \"dialogue\"|\"clarify\"|"
-    "\"off_topic\"|\"grounded\"}."
-)
-
 
 @dataclass(frozen=True)
 class TrackDecision:
@@ -76,6 +81,23 @@ class TrackDecision:
     confidence: float
     decision_tier: DecisionTier
     signals: dict[str, Any] = field(default_factory=dict)
+
+
+class JevChoiceProvider(Protocol):
+    """The gray-zone seam: a closed-set Choice ``choose`` (ADR 0080).
+
+    ``JevChoiceClient.choose`` is the product implementation; tests
+    inject the Fake from ``tests/host/jev_fake.py``.
+    """
+
+    def choose(
+        self,
+        *,
+        utterance: str,
+        options: Sequence[str],
+        question_id: str = "track",
+        instructions: str | None = None,
+    ) -> JevChoice: ...
 
 
 def normalize_track(raw: object) -> Track | None:
@@ -305,7 +327,7 @@ def _rules_decision(text: str, signals: dict[str, Any]) -> TrackDecision | None:
     if research_hits and not (
         text and _FILING_ASK_RE.search(text) and _missing_slots(text)
     ):
-        # Underspec filing asks are ambiguous (LLM → inherit → clarify).
+        # Underspec filing asks are ambiguous (Jev → inherit → clarify).
         # Bare ticker/period/tool cues remain high-confidence research.
         if _extract_company(text) and _extract_period(text):
             signals["research_signals"] = research_hits
@@ -341,81 +363,61 @@ def _rules_decision(text: str, signals: dict[str, Any]) -> TrackDecision | None:
     return None
 
 
-def _message_text(message: Any) -> str:
-    if isinstance(message, AIMessage):
-        content = message.content
-        if isinstance(content, str):
-            return content
-        return str(content)
-    content = getattr(message, "content", None)
-    if isinstance(content, str):
-        return content
-    return str(message)
-
-
-def _try_llm_classify(
-    text: str,
-    classify_model: Any,
+def _gray_zone_clarify(
     signals: dict[str, Any],
-) -> TrackDecision | None:
-    """Attempt LLM classify. On EXIT, record ``classify_exit`` and return None."""
-    try:
-        raw = classify_model.invoke(
-            [
-                SystemMessage(content=_CLASSIFY_SYSTEM),
-                HumanMessage(content=text),
-            ]
-        )
-    except Exception as exc:  # noqa: BLE001 — typed EXIT, must not crash
-        signals["classify_exit"] = "model_error"
-        signals["classify_error_type"] = type(exc).__name__
-        return None
-
-    payload_text = _message_text(raw).strip()
-    # Allow optional fenced JSON.
-    if payload_text.startswith("```"):
-        payload_text = re.sub(r"^```(?:json)?\s*", "", payload_text)
-        payload_text = re.sub(r"\s*```$", "", payload_text)
-    try:
-        data = json.loads(payload_text)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        signals["classify_exit"] = "schema_parse"
-        return None
-
-    if not isinstance(data, dict):
-        signals["classify_exit"] = "schema_parse"
-        return None
-
-    raw_track = data.get("track")
-    track = normalize_track(raw_track)
-    if track is None:
-        signals["classify_exit"] = "invalid_track"
-        signals["invalid_track"] = raw_track
-        return None
-
-    confidence = data.get("confidence", 0.7)
-    try:
-        confidence_f = float(confidence)
-    except (TypeError, ValueError):
-        confidence_f = 0.7
-    if not math.isfinite(confidence_f):
-        confidence_f = 0.0
-    confidence_f = min(max(confidence_f, 0.0), 1.0)
-
-    signals["llm_track"] = track
-    if confidence_f < _MIN_CLASSIFY_CONFIDENCE:
-        signals["classify_exit"] = "low_confidence"
-        signals["low_confidence"] = True
-        return TrackDecision(
-            track="clarify",
-            confidence=confidence_f,
-            decision_tier="clarify",
-            signals=signals,
-        )
+    *,
+    confidence: float = 0.0,
+) -> TrackDecision:
     return TrackDecision(
-        track=track,  # type: ignore[arg-type]
-        confidence=confidence_f,
-        decision_tier="llm",
+        track="clarify",
+        confidence=confidence,
+        decision_tier="clarify",
+        signals=signals,
+    )
+
+
+def _try_jev_classify(
+    text: str,
+    jev_client: JevChoiceProvider | None,
+    signals: dict[str, Any],
+) -> TrackDecision:
+    """Gray-zone tier: one Jev closed-set Choice (ADR 0080).
+
+    Fail-closed by design: a missing client, any typed ``JevChoiceError``
+    exit, or sub-threshold confidence all resolve to ``clarify`` — the
+    cascade never falls through to a MiniMax JSON classifier (removed)
+    and never silently picks ``grounded`` or ``dialogue`` for an
+    utterance the judge was supposed to decide.
+    """
+    if jev_client is None:
+        signals["jev_exit"] = "no_jev_client"
+        return _gray_zone_clarify(signals)
+    try:
+        choice = jev_client.choose(
+            utterance=text,
+            options=_JEV_TRACK_OPTIONS,
+            question_id="track",
+            instructions=_JEV_TRACK_INSTRUCTIONS,
+        )
+    except JevChoiceError as exc:
+        signals["jev_exit"] = exc.exit_code
+        return _gray_zone_clarify(signals)
+    except Exception as exc:  # noqa: BLE001 — fail-closed at the cascade boundary
+        signals["jev_exit"] = "unexpected_error"
+        signals["jev_error_type"] = type(exc).__name__
+        return _gray_zone_clarify(signals)
+
+    # ``choice.label`` is in the closed set by the client contract
+    # (``invalid_label`` raises before returning), so no remap here.
+    signals["jev_label"] = choice.label
+    signals["jev_confidence"] = choice.confidence
+    if choice.confidence < _MIN_JEV_CONFIDENCE:
+        signals["jev_exit"] = "low_confidence"
+        return _gray_zone_clarify(signals, confidence=choice.confidence)
+    return TrackDecision(
+        track=choice.label,  # type: ignore[arg-type]
+        confidence=choice.confidence,
+        decision_tier="jev",
         signals=signals,
     )
 
@@ -469,7 +471,7 @@ def decide_track(
     messages: list[BaseMessage],
     *,
     snapshots: list[Any] | None = None,
-    classify_model: Any | None = None,
+    jev_client: JevChoiceProvider | None = None,
 ) -> TrackDecision:
     """Return the Soft-Track decision for this turn (tiered cascade)."""
     text = _last_human_text(messages)
@@ -480,19 +482,15 @@ def decide_track(
     if rules_hit is not None:
         return rules_hit
 
-    # Peek inherit/clarify once: if either would decide, skip LLM so a
-    # production classify_model cannot steal MUST (2)/(5).
+    # Peek inherit/clarify once: if either would decide, skip the judge
+    # so it cannot steal MUST (2)/(5).
     inherit_hit = _inherit_decision(text, latest, dict(signals))
     clarify_hit = _clarify_decision(text, dict(signals))
-    if (
-        classify_model is not None
-        and text
-        and inherit_hit is None
-        and clarify_hit is None
-    ):
-        llm_hit = _try_llm_classify(text, classify_model, signals)
-        if llm_hit is not None:
-            return llm_hit
+    if text and inherit_hit is None and clarify_hit is None:
+        # Gray zone (ADR 0080): the judge owns this utterance — including
+        # a key-less boot, which fail-closes to clarify rather than
+        # resolving to a default track.
+        return _try_jev_classify(text, jev_client, signals)
 
     if inherit_hit is not None:
         return inherit_hit
@@ -500,10 +498,9 @@ def decide_track(
     if clarify_hit is not None:
         return clarify_hit
 
-    # No single global default track (specs/soft-track.md): when the
-    # cascade exhausts rules + (optional) LLM + inherit + clarify,
-    # resolve to "dialogue" so the residual branch never silently
-    # pins every ambiguous utterance onto a single track.
+    # No single global default track (specs/soft-track.md): only an
+    # utterance the judge cannot be asked about (empty text) reaches
+    # this residual, which resolves to "dialogue".
     signals["fallback"] = "dialogue"
     return TrackDecision(
         track="dialogue",
@@ -515,6 +512,7 @@ def decide_track(
 
 __all__ = [
     "DecisionTier",
+    "JevChoiceProvider",
     "Track",
     "TrackDecision",
     "decide_track",

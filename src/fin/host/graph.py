@@ -2023,6 +2023,7 @@ def compile_graph(
     issuer_cap: int = MAX_ISSUERS,
     recursion_limit: int = RECURSION_LIMIT,
     classify_model: Any | None = None,
+    jev_client: Any | None = None,
     retrieve_adapter: str = RETRIEVE_ADAPTER_FAKE,
     mcp_command: list[str] | None = None,
     locator_map: dict[str, "Locator"] | None = None,
@@ -2112,11 +2113,15 @@ def compile_graph(
         ``get_xbrl_fact`` host tool to read from this root.
         Tests inject a synthetic ``tmp_path``-rooted tree.
     classify_model
-        Soft-Track T4: optional model for ambiguous LLM classify.
-        When ``None`` (default), the LLM tier is skipped. The
-        residual branch in ``decide_track`` then resolves the
-        bare-``q`` cascade to ``track="dialogue"`` (not research),
-        so the model leaf is not the silent global default.
+        Search-mode host: optional MiniMax model for the grounded
+        turn's 检索档 cascade (``search_mode_update_for_turn``).
+        Not used by the Soft-Track track decision any more (ADR 0080).
+    jev_client
+        Soft-Track gray zone (ADR 0080): a Jev closed-set Choice
+        provider (``JevChoiceProvider``) for ambiguous utterances.
+        When ``None`` (missing ``FIN_JEV_API_KEY``) the gray zone
+        fail-closes to ``track="clarify"`` in ``decide_track`` —
+        never a silent default track.
     retrieve_adapter
         T3 (#76): which adapter to auto-build when ``adapter`` is
         ``None`` — ``"fake"`` (the factory default: hermetic
@@ -2416,8 +2421,9 @@ def compile_graph(
     def classify_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         """Soft-Track: tiered track decision before leaves.
 
-        Passes ``status_snapshots`` and optional ``classify_model``
-        into ``decide_track``. Appends snapshots when the utterance
+        Passes ``status_snapshots`` and the optional ``jev_client``
+        into ``decide_track`` (ADR 0080 gray-zone Choice). Appends
+        snapshots when the utterance
         sets or changes research context. When the track is
         ``grounded``, also runs the 检索档 cascade
         (``fin.host.search_mode_decision``) — graph routing is
@@ -2437,7 +2443,7 @@ def compile_graph(
         decision = decide_track(
             messages,
             snapshots=prior_snapshots,
-            classify_model=classify_model,
+            jev_client=jev_client,
         )
         update: dict[str, Any] = {
             "track": decision.track,
@@ -3189,11 +3195,11 @@ def compile_graph(
         budget; :func:`from_compaction_gate` then applies the track
         decision.
 
-        Recorded deviation: ``decide_track``'s own LLM tier (the
-        ambiguous ``classify`` call) runs BEFORE this gate. It is
-        safe because the classifier never sees the fat history —
+        Recorded deviation: ``decide_track``'s own Jev gray-zone tier
+        (the ambiguous ``choose`` call) runs BEFORE this gate. It is
+        safe because the judge never sees the fat history —
         ``decide_track`` sends only the LAST human utterance to the
-        classify model, so no evictable context reaches that call
+        Jev Choice client, so no evictable context reaches that call
         and there is nothing for the gate to compact first.
 
         search-mode host T2: with the HITL lane on, a grounded turn
@@ -3236,6 +3242,8 @@ def compile_graph(
         Mirrors the residual branch in ``decide_track``: a missing
         track defaults to the dialogue leaf rather than the research
         model (specs/soft-track.md — no single global default track).
+        The gray-zone judge itself fail-closes to clarify (ADR 0080),
+        so this default only covers pre-classify state.
         """
         track = state.get("track", "dialogue")
         if track == "dialogue":
@@ -3393,6 +3401,7 @@ def compile_graph(
         checkpointer=checkpointer,
         model=model,
         classify_model=classify_model,
+        jev_client=jev_client,
         step_cap=step_cap,
         issuer_cap=issuer_cap,
         recursion_limit=recursion_limit,
@@ -3466,6 +3475,7 @@ def _make_locked_graph(
     model: Any,
     step_cap: int,
     classify_model: Any | None = None,
+    jev_client: Any | None = None,
     issuer_cap: int = MAX_ISSUERS,
     summarizer: Any | None = None,
     compactor: OccupancyCompactor | None = None,
@@ -3478,6 +3488,9 @@ def _make_locked_graph(
         id(checkpointer),
         id(model),
         id(classify_model) if classify_model is not None else 0,
+        # ADR 0080: the gray-zone judge is part of the compiled graph's
+        # behavior — same-object threading as ``classify_model``.
+        id(jev_client) if jev_client is not None else 0,
         int(step_cap),
         # T6: two graphs that differ ONLY in the issuer cap are two
         # different graphs; without this the cache would hand a test

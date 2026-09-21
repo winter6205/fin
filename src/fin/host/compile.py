@@ -72,6 +72,7 @@ import psycopg
 # it via ``monkeypatch.setattr("fin.host.compile.compile_graph",
 # ...)``. Lazy imports below cover the runtime deps.
 from fin.host.graph import compile_graph
+from fin.host.jev_choice import build_jev_client
 from fin.host.memory_port import (
     DEFAULT_MEMORY_DREAM_BACKEND,
     MEMORY_DREAM_BACKEND_ENV_VAR,
@@ -406,16 +407,15 @@ def compile_for_runtime(
     # ``PostgresSaver`` instance return the SAME proxy object.
     # That identity is what T9 will assert between the CLI
     # helper's graph and the HTTP handler's graph.
-    # Soft-Track T4: thread the SAME model object as
-    # ``classify_model`` so the LLM tier is reachable in
-    # production — the default of ``None`` would silently skip
-    # it and force every ambiguous utterance onto the residual
-    # ``track="grounded"`` branch (specs/soft-track.md — "no
-    # single global default track").
+    # Soft-Track gray zone (ADR 0080): the Jev Choice client is built
+    # here; a missing FIN_JEV_API_KEY yields ``None`` and the cascade
+    # fail-closes to clarify — no MiniMax JSON fallback. ``classify_model``
+    # stays threaded to the grounded turn's 检索档 cascade only.
     compiled = compile_graph(
         checkpointer=saver,
         model=model,
         classify_model=model,
+        jev_client=build_jev_client(environ=env),
         retrieve_adapter=_resolve_retrieve_adapter(env),
         # search-mode host T2 / ADR 0062: the durable PRODUCTION boot
         # ships the 检索档 choice-window HITL lane (clarify pauses on
@@ -487,15 +487,15 @@ def compile_for_runtime_dev(
         model_name=model_name, base_url=base_url, env=env
     )
     saver = InMemorySaver()
-    # Soft-Track T4: mirror the durable path's contract — pass
-    # the SAME model object as ``classify_model`` so the dev
-    # compile exercises the same LLM tier as production
-    # (specs/soft-track.md — "classify_model must reuse
-    # FIN_MODEL").
+    # Soft-Track gray zone (ADR 0080): mirror the durable path — the dev
+    # compile exercises the same Jev tier (or the same key-less
+    # fail-closed clarify). ``classify_model`` still mirrors production
+    # for the grounded turn's 检索档 cascade.
     return compile_graph(
         checkpointer=saver,
         model=model,
         classify_model=model,
+        jev_client=build_jev_client(environ=env),
         retrieve_adapter=_resolve_retrieve_adapter(env),
     )
 
