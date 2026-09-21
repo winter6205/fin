@@ -3454,58 +3454,26 @@ def test_send_message_soft_track_reply_streams_deltas_before_status(
     assert events[-1][1] == []
 
 
-class _StreamingClassifyModel(ScriptedChatModel):
-    """Classify tier that genuinely emits token chunks.
-
-    ``decide_track`` calls ``classify_model.invoke``; assembling the
-    reply from ``self.stream`` routes those chunks through the same
-    LangGraph callback the leaves use, so the chunks carry
-    ``langgraph_node="classify"`` onto the messages stream. That is
-    the boundary the send generator must keep off the wire.
-    """
-
-    def invoke(self, input, config=None, **kwargs):  # type: ignore[override]
-        merged = None
-        for chunk in self.stream(input, config=config, **kwargs):
-            merged = chunk if merged is None else merged + chunk
-        return merged
-
-
-def test_send_message_classify_deltas_never_reach_the_wire(
+def test_send_message_gray_zone_judge_output_never_reaches_the_wire(
     client: TestClient, fresh_store, http_app: FastAPI
 ) -> None:
-    """The classify tier authors no answer: its chunks paint nothing.
+    """The gray-zone judge authors no answer: its pick paints nothing.
 
-    Widening the delta predicate to the Soft-Track leaves must not
-    widen it to every node — the LLM classify tier streams its
-    routing JSON (and may stream reasoning) inside the ``classify``
-    node, and none of that is operator-visible prose.
+    ADR 0080 moved the ambiguous tier to a Jev closed-set Choice — the
+    judge speaks outside the LangChain callback stream entirely, so
+    widening the delta predicate to the Soft-Track leaves cannot leak
+    judge payloads onto the wire. The dialogue leaf still streams.
     """
-    from langchain_core.messages import AIMessageChunk
-
     from fin.host.http import get_graph
 
+    from jev_fake import FakeJevChoice
+
     reply = "I can pull numbers out of the 10-Q filings loaded here."
-    classify_model = _StreamingClassifyModel(
-        stream_responses=[
-            [
-                AIMessageChunk(
-                    content="",
-                    additional_kwargs={
-                        "reasoning_details": [
-                            {"text": "classify scratchpad: sounds chatty"}
-                        ]
-                    },
-                ),
-                AIMessageChunk(content='{"track": '),
-                AIMessageChunk(content='"dialogue"}'),
-            ]
-        ],
-    )
+    fake = FakeJevChoice([("dialogue", 0.9)])
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=_soft_track_streaming_model(reply),
-        classify_model=classify_model,
+        jev_client=fake,
         known_document_ids=KNOWN_IDS,
         read_port=_TREE_READ_PORT,
     )
@@ -3520,20 +3488,21 @@ def test_send_message_classify_deltas_never_reach_the_wire(
     status_i = names.index("status")
     answer_idx = [i for i, n in enumerate(names) if n == "answer"]
 
-    # The LLM tier really did decide this turn (otherwise the test
-    # would pass without ever exercising a streaming classify node).
+    # The Jev tier really did decide this turn (otherwise the test
+    # would pass without ever exercising the gray-zone routing).
+    assert len(fake.calls) == 1
     status_body = events[status_i][1]
     assert status_body["track"] == "dialogue"
     detail = client.get(f"/api/threads/{created['id']}").json()
-    assert detail["turns"][-1]["track_decision"]["decision_tier"] == "llm"
+    assert detail["turns"][-1]["track_decision"]["decision_tier"] == "jev"
 
     # The dialogue leaf still streamed.
     deltas = [i for i in answer_idx if i < status_i]
     assert len(deltas) >= 2, names
     assert "".join(events[i][1]["text"] for i in deltas) == reply
 
-    # Nothing the classify node emitted reached the wire — not the
-    # routing JSON on ``answer``, not its reasoning on ``thinking``.
+    # Nothing judge-shaped reached the wire — no routing label echo on
+    # ``answer``, no reasoning on ``thinking``.
     for i in answer_idx:
         text = events[i][1]["text"]
         assert "track" not in text

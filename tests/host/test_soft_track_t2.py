@@ -12,6 +12,7 @@ from fin.host.agent_instructions import (
     HOST_INSTRUCTIONS_MARKER,
 )
 from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER
+from jev_fake import FakeJevChoice
 
 KNOWN_IDS = {"AAPL-2022Q3", "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
@@ -154,15 +155,17 @@ def test_company_without_period_metric_ask_is_clarify():
     assert out["status"] == "done"
 
 
-def test_bare_q_dialogue_not_clarify():
-    """Regression: HumanMessage('q') stays dialogue (no single global
-    default track — bare ``q`` falls past rules / inherit /
-    clarify, so the residual branch lands on dialogue, NOT
-    research and NOT clarify). Specs/soft-track.md."""
-    model = ScriptedChatModel(script=[AIMessage(content="need tools")])
+def test_bare_q_follows_judge_to_dialogue_not_research():
+    """Regression (ADR 0080 retarget): bare ``q`` is gray-zone — the
+    Jev Choice decides it. A judged ``dialogue`` must land the dialogue
+    leaf, NOT research (no single global default track). Without a
+    client the same utterance fail-closes to clarify (covered by
+    ``test_track_decision`` gray-zone units)."""
+    model = ScriptedChatModel(script=[AIMessage(content="plain reply")])
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
+        jev_client=FakeJevChoice([("dialogue", 0.9)]),
         known_document_ids=KNOWN_IDS,
     )
     out = g.invoke(
@@ -175,6 +178,7 @@ def test_bare_q_dialogue_not_clarify():
         config=_thread_config("t-soft-clarify-q"),
     )
     assert out["track"] == "dialogue"
+    assert out["track_decision"]["decision_tier"] == "jev"
 
 
 def test_filled_slots_follow_up_after_clarify_enters_research():

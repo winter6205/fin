@@ -1,8 +1,6 @@
-"""Soft-Track T4: classify-tier EXITs down the cascade."""
+"""Soft-Track gray-zone exits (ADR 0080): gray-zone Jev tier exits and tier order."""
 
 from __future__ import annotations
-
-from typing import Any
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
@@ -10,7 +8,14 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER
+from fin.host.jev_choice import (
+    JEV_CHOICE_EXIT_INVALID_LABEL,
+    JEV_CHOICE_EXIT_SCHEMA,
+    JEV_CHOICE_EXIT_TRANSPORT,
+    JevChoiceError,
+)
 from fin.host.track_decision import decide_track
+from jev_fake import FakeJevChoice
 
 KNOWN_IDS = {"AAPL-2022Q3", "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
@@ -19,105 +24,69 @@ def _thread_config(thread_id: str) -> dict:
     return {"configurable": {"thread_id": thread_id}}
 
 
-class _ClassifyStub:
-    """Minimal chat-model stand-in for ``decide_track`` LLM tier."""
-
-    def __init__(self, *, content: str | None = None, error: Exception | None = None):
-        self.content = content
-        self.error = error
-        self.calls = 0
-
-    def invoke(self, messages: Any, **kwargs: Any) -> AIMessage:
-        self.calls += 1
-        if self.error is not None:
-            raise self.error
-        return AIMessage(content=self.content or "")
-
-
-def test_invalid_track_enum_exits_llm_and_finishes_defined():
-    """Invalid/missing track from classify → EXIT → cascade continues."""
-    stub = _ClassifyStub(content='{"track": "supervisor"}')
+@pytest.mark.parametrize(
+    "exit_code",
+    [
+        JEV_CHOICE_EXIT_INVALID_LABEL,
+        JEV_CHOICE_EXIT_SCHEMA,
+        JEV_CHOICE_EXIT_TRANSPORT,
+    ],
+)
+def test_jev_exit_codes_all_fail_closed_to_clarify(exit_code: str):
+    """Any typed judge exit is clarify (ADR 0080) — no fall-through to
+    a MiniMax JSON classify or a silent default track."""
+    fake = FakeJevChoice([JevChoiceError("judge down", exit_code=exit_code)])
     decision = decide_track(
         [HumanMessage(content="hmm maybe this?")],
-        classify_model=stub,
+        jev_client=fake,
     )
-    assert stub.calls == 1
-    assert decision.track in ("dialogue", "clarify", "off_topic", "grounded")
-    assert decision.signals.get("classify_exit") == "invalid_track"
-    # Must have left the llm tier via EXIT (landed on a later tier).
-    assert decision.decision_tier in (
-        "inherit",
-        "clarify",
-        "conditional_policy",
-    )
+    assert len(fake.calls) == 1
+    assert decision.track == "clarify"
+    assert decision.decision_tier == "clarify"
+    assert decision.signals.get("jev_exit") == exit_code
 
 
-def test_schema_parse_fail_exits_llm_and_finishes_defined():
-    stub = _ClassifyStub(content="not-json{{{")
-    decision = decide_track(
-        [HumanMessage(content="hmm maybe this?")],
-        classify_model=stub,
-    )
-    assert stub.calls == 1
-    assert decision.track in ("dialogue", "clarify", "off_topic", "grounded")
-    assert decision.signals.get("classify_exit") == "schema_parse"
-    assert decision.decision_tier != "llm"
-
-
-def test_classify_model_error_exits_and_finishes_defined():
-    stub = _ClassifyStub(error=RuntimeError("classify down"))
-    decision = decide_track(
-        [HumanMessage(content="hmm maybe this?")],
-        classify_model=stub,
-    )
-    assert stub.calls == 1
-    assert decision.track in ("dialogue", "clarify", "off_topic", "grounded")
-    assert decision.signals.get("classify_exit") == "model_error"
-    assert decision.decision_tier != "llm"
-
-
-def test_high_confidence_rules_skip_llm():
-    """Greeting/off-domain/full research must not call classify_model."""
-    stub = _ClassifyStub(content='{"track": "grounded"}')
+def test_high_confidence_rules_skip_judge():
+    """Greeting/off-domain/full research must not call the judge."""
+    fake = FakeJevChoice([("grounded", 0.99)])
     greeting = decide_track(
         [HumanMessage(content="Hello!")],
-        classify_model=stub,
+        jev_client=fake,
     )
     assert greeting.track == "dialogue"
     assert greeting.decision_tier == "rules"
-    assert stub.calls == 0
 
     off = decide_track(
         [HumanMessage(content="What's the weather in Seattle today?")],
-        classify_model=stub,
+        jev_client=fake,
     )
     assert off.track == "off_topic"
-    assert stub.calls == 0
+    assert fake.calls == []
 
 
-def test_llm_valid_track_used_when_ambiguous():
-    stub = _ClassifyStub(content='{"track": "dialogue", "confidence": 0.7}')
+def test_jev_valid_label_used_when_ambiguous():
+    fake = FakeJevChoice([("dialogue", 0.7)])
     decision = decide_track(
         [HumanMessage(content="hmm maybe this?")],
-        classify_model=stub,
+        jev_client=fake,
     )
-    assert stub.calls == 1
+    assert len(fake.calls) == 1
     assert decision.track == "dialogue"
-    assert decision.decision_tier == "llm"
+    assert decision.decision_tier == "jev"
 
 
-def test_graph_classify_exit_does_not_crash_or_enter_gate():
-    """Injected classify_model error → defined track; non-research skips gate."""
-    stub = _ClassifyStub(error=RuntimeError("boom"))
-    # Ambiguous utterance + LLM exit → cascade; may land dialogue/clarify/
-    # research/off_topic. Use snapshot-less ambiguous text.
+def test_graph_jev_error_does_not_crash_and_skips_gate():
+    """Injected judge throw → clarify leaf; non-research skips the gate."""
+    fake = FakeJevChoice(
+        [JevChoiceError("boom", exit_code=JEV_CHOICE_EXIT_TRANSPORT)]
+    )
     model = ScriptedChatModel(
-        script=[AIMessage(content="Soft reply after classify EXIT.")]
+        script=[AIMessage(content="Soft reply after judge EXIT.")]
     )
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
-        classify_model=stub,
+        jev_client=fake,
         known_document_ids=KNOWN_IDS,
     )
     out = g.invoke(
@@ -129,19 +98,19 @@ def test_graph_classify_exit_does_not_crash_or_enter_gate():
         },
         config=_thread_config("t-soft-t4-exit"),
     )
-    assert out["track"] in ("dialogue", "clarify", "off_topic", "grounded")
-    assert out["track_decision"]["signals"].get("classify_exit") == "model_error"
-    if out["track"] != "grounded":
-        assert out["status"] == "done"
-        assert HIDDEN_BOUNCE_MARKER not in str(out.get("messages", []))
-        assert out.get("citations", ()) == () or out.get("citations") == []
+    assert out["track"] == "clarify"
+    assert (
+        out["track_decision"]["signals"].get("jev_exit") == "transport"
+    )
+    assert out["status"] == "done"
+    assert HIDDEN_BOUNCE_MARKER not in str(out.get("messages", []))
+    assert out.get("citations", ()) == () or out.get("citations") == []
 
 
-def test_scripted_research_q_still_rules_path_without_classify_model():
-    """Default compile (no classify_model): bare q stays conditional_policy.
-
-    No single global default track: the residual cascade lands on
-    dialogue, not research (specs/soft-track.md)."""
-    decision = decide_track([HumanMessage(content="q")])
-    assert decision.track == "dialogue"
-    assert decision.decision_tier == "conditional_policy"
+def test_scripted_research_q_rules_path_without_client():
+    """Default compile (no client): a fully-slotted ask stays rules."""
+    decision = decide_track(
+        [HumanMessage(content="What was AAPL net sales in 2023 Q3?")]
+    )
+    assert decision.track == "grounded"
+    assert decision.decision_tier == "rules"

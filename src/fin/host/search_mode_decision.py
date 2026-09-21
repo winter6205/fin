@@ -45,7 +45,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 # The 档 SSOT (closed set + per-档 availability codes) is reused, not
 # re-enumerated; ``named_failures`` is the host-side import surface for
@@ -63,10 +63,22 @@ from fin.host.track_decision import (
     _company_changed,
     _last_human_text,
     _latest_snapshot,
-    _message_text,
     _normalize_company,
     _snapshot_has_research_context,
 )
+
+
+def _message_text(message: Any) -> str:
+    if isinstance(message, AIMessage):
+        content = message.content
+        if isinstance(content, str):
+            return content
+        return str(content)
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+    return str(message)
+
 
 # A 档 is NOT a fifth track: ``SearchMode`` is the retrieve-tier token
 # re-aliased from the SSOT (``fin.retrieve.tiers`` via

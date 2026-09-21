@@ -22,8 +22,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER
+from fin.host.jev_choice import JEV_CHOICE_EXIT_SCHEMA, JevChoiceError
 from fin.host.state import REPAIR_CAP, reset_input_state
 from fin.host.track_decision import decide_track
+from jev_fake import FakeJevChoice
 
 pytestmark = [pytest.mark.soft_track]
 
@@ -368,34 +370,18 @@ def test_must_research_tools_span_done_with_citation(aapl_page1_text: str) -> No
     _assert_track_decision(out["track_decision"], track="grounded")
 
 
-def test_must_research_boundary_bare_q_is_dialogue(aapl_page1_text: str) -> None:
-    """Boundary (no single global default track): bare ``q`` → dialogue
-    via the residual conditional_policy branch, NOT research."""
-    span = aapl_page1_text[:80]
+def test_must_gray_zone_bare_q_follows_judged_dialogue() -> None:
+    """Boundary (no single global default track): bare ``q`` is
+    gray-zone — the Jev Choice decides it (ADR 0080). A judged
+    ``dialogue`` lands the dialogue leaf, NOT research."""
     model = ScriptedChatModel(
-        script=[
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "read_file",
-                        "args": {
-                            "document_id": AAPL_2022Q3,
-                            "version": AAPL_2022Q3_VERSION,
-                            "page": 1,
-                            "page_limit": 1,
-                        },
-                        "id": "c-read-q",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
-            AIMessage(content=f"Per the filing: {span}"),
-        ]
+        script=[AIMessage(content="I can help with 10-Q questions.")]
     )
+    fake = FakeJevChoice([("dialogue", 0.9)])
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
+        jev_client=fake,
         known_document_ids=KNOWN_IDS,
         read_port=_TREE_READ_PORT,
     )
@@ -403,8 +389,11 @@ def test_must_research_boundary_bare_q_is_dialogue(aapl_page1_text: str) -> None
         {**reset_input_state("q"), "evidence": []},
         config=_cfg("ship-research-q"),
     )
+    assert fake.calls  # the judge was asked exactly for the gray zone
     assert out["track"] == "dialogue"
+    assert out["track_decision"]["decision_tier"] == "jev"
     assert out["status"] == "done"
+    _no_tools(out["messages"])
 
 
 def test_must_research_boundary_workspace_sse_track_and_history(
@@ -703,34 +692,30 @@ def test_matrix_concurrent_soft_track_send_409() -> None:
         app.dependency_overrides.clear()
 
 
-def test_matrix_exception_classify_exit_defined_track() -> None:
-    """Exception: invalid structured classify → typed tier EXIT, not crash."""
-
-    class _Stub:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def invoke(self, messages: Any, **kwargs: Any) -> AIMessage:
-            self.calls += 1
-            return AIMessage(content='{"track": "supervisor"}')
-
-    stub = _Stub()
+def test_matrix_exception_judge_exit_defined_track() -> None:
+    """Exception: a typed judge exit fail-closes to clarify — never a
+    crash, never a silent track (ADR 0080)."""
+    fake = FakeJevChoice(
+        [JevChoiceError("bad schema", exit_code=JEV_CHOICE_EXIT_SCHEMA)]
+    )
     decision = decide_track(
         [HumanMessage(content="hmm maybe this?")],
-        classify_model=stub,
+        jev_client=fake,
     )
-    assert stub.calls == 1
-    assert decision.track in ("dialogue", "clarify", "off_topic", "grounded")
-    assert decision.signals.get("classify_exit") == "invalid_track"
-    assert decision.decision_tier != "llm"
+    assert decision.track == "clarify"
+    assert decision.signals.get("jev_exit") == "schema"
+    assert decision.decision_tier == "clarify"
 
     model = ScriptedChatModel(
-        script=[AIMessage(content="Soft reply after classify EXIT.")]
+        script=[AIMessage(content="Soft reply after judge EXIT.")]
+    )
+    fake_graph = FakeJevChoice(
+        [JevChoiceError("bad schema", exit_code=JEV_CHOICE_EXIT_SCHEMA)]
     )
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
-        classify_model=stub,
+        jev_client=fake_graph,
         known_document_ids=KNOWN_IDS,
         read_port=_TREE_READ_PORT,
     )
@@ -741,8 +726,7 @@ def test_matrix_exception_classify_exit_defined_track() -> None:
         },
         config=_cfg("ship-exc"),
     )
-    assert out["track"] in ("dialogue", "clarify", "off_topic", "grounded")
-    assert out["track_decision"]["signals"].get("classify_exit") == "invalid_track"
-    if out["track"] != "grounded":
-        assert out["status"] == "done"
-        assert HIDDEN_BOUNCE_MARKER not in str(out.get("messages", []))
+    assert out["track"] == "clarify"
+    assert out["track_decision"]["signals"].get("jev_exit") == "schema"
+    assert out["status"] == "done"
+    assert HIDDEN_BOUNCE_MARKER not in str(out.get("messages", []))

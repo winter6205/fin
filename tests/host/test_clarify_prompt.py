@@ -21,6 +21,7 @@ from fin.host.agent_instructions import (
     messages_for_model,
 )
 from fin.host.scripted_model import ScriptedChatModel
+from jev_fake import FakeJevChoice
 
 KNOWN_IDS = {"AAPL-2022Q3", "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
@@ -167,19 +168,15 @@ def test_clarify_leaf_prompt_names_both_gaps(recording_model):
 
 
 def test_clarify_leaf_falls_back_to_the_latest_snapshot_gap(recording_model):
-    """Clarify reached via the LLM tier records no slots on the
-    decision, so the gap comes from the latest status snapshot:
+    """Clarify reached via the Jev gray-zone tier records no slots on
+    the decision, so the gap comes from the latest status snapshot:
     company already known, period still empty → ask for period."""
-
-    class ClarifyClassifier:
-        def invoke(self, messages):
-            return AIMessage(content='{"track": "clarify"}')
 
     model, seen = recording_model
     graph = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
-        classify_model=ClarifyClassifier(),
+        jev_client=FakeJevChoice([("clarify", 0.9)]),
         known_document_ids=KNOWN_IDS,
     )
     out = graph.invoke(

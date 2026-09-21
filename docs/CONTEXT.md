@@ -26,8 +26,8 @@ The Soft-Track leaf that binds corpus tools and the **citation verifier** (ADR 0
 _Avoid_: Research mode picker, retrieve as the track enum, four retrieve nodes, renaming **research thread**
 
 **Soft-Track**:
-The v1 turn-orchestration shape: one compiled host graph, multi-track routing, tiered track decision (rules → ambiguous LLM → inherit → grounded clarify → conditional policy), flat graph until upgrade triggers in ADR 0027.
-_Avoid_: supervisor handoff as v1, dual product shells, treating flat topology as permanent
+The v1 turn-orchestration shape: one compiled host graph, multi-track routing, tiered track decision (rules → ambiguous **Jev** four-label Choice → inherit → grounded clarify → conditional policy). Ambiguous low confidence or judge-down is `clarify`, not silent `grounded`. Flat graph until upgrade triggers in ADR 0027. _Stage: rules on main; product gray-zone is Jev Choice (ADR 0080); default pytest Fake; `specs/soft-track-judge-route.md`._
+_Avoid_: supervisor handoff as v1, dual product shells, treating flat topology as permanent, MiniMax JSON as the product gray-zone classifier, MiniMax as Jev fallback
 
 **status snapshot**:
 One append-only per-turn record of research working context (e.g. company, period, document ids, active track cues) stored on `AgentState` in the checkpointer. History is retained; the latest snapshot is the active view for routing; dependent fields may be empty on a new snapshot.
@@ -164,8 +164,8 @@ Cite identity `{document_id, version, unit}`. The claimed span is a quote string
 _Avoid_: chunk_id, char offset, bbox, page-less citation, unofficial PDF page as live EDGAR identity, verifying an HTML quote against a PDF page
 
 **citation verifier**:
-A code gate on the **grounded** track path to END: a supporting span is a contiguous substring of the answer (v1 minimum 32 characters) that appears in text this run received from **retrieve** / **read_file** (ADR 0046). Passed spans become the user-visible citations; unknown locators refuse immediately; missing or unmatched spans bounce with a hidden template until the citation-repair cap, then refuse. Other tracks skip this gate.
-_Avoid_: faithfulness prompt, LLM-as-judge as the only gate, model-authored citation block, `verify` as a tool, running the gate on greetings or soft off-topic replies, web-search text as gate evidence, a second serve-time extracted tree as citation SSOT
+A code gate on the **grounded** track path to END: a supporting span is a contiguous substring of the answer (v1 minimum 32 characters) that appears in text this run received from **retrieve** / **read_file** (ADR 0046). Passed spans become the user-visible citations; unknown locators refuse immediately; missing or unmatched spans bounce with a hidden template until the citation-repair cap, then refuse. Other tracks skip this gate. _Stage: substring gate on main; Jev support pick out of this host Jev program (ADR 0082)._
+_Avoid_: faithfulness prompt, LLM-as-judge as the citation gate, model-authored citation block, `verify` as a tool, running the gate on greetings or soft off-topic replies, web-search text as gate evidence, a second serve-time extracted tree as citation SSOT
 
 **citation span**:
 One user-visible citation row from the verifier: a ≥32-character contiguous substring of the answer that matched on a retrieved or read page. The workspace sources list may show many spans per page (sliding-window overlap); that granularity is expected, not a send failure.
@@ -238,8 +238,8 @@ The operator-visible set of **资料** already pushed to **iknow-memory** (ready
 _Avoid_: freeze-slice catalog as 就绪, treating MCP 可达 as nonempty retrieve, **thread attach** as membership in the set
 
 **检索档** (`search mode`):
-Which retrieve path a knowledge question uses after it has entered **grounded**: A 查找 (lexical-first), B 知识问答 (iknow graph-priority then vector∥BM25 fill), C 综述 (index-time community summaries; report text ES ∥ report vectors, then optional drop to windows — ADR 0070), D 真数据库 (real SQL/business DB; document tables stay B). Assignment reuses the Soft-Track cascade (ADR 0027 / 0062): rules, then structured classify when ambiguous, then inherit, then clarify or typed fail — not a required picker and not silent C. Cascade **clarify** opens a **choice window** (structured options → operator pick → resume execute). Search-mode copy is call-scoped (ADR 0061): inject once in near context, never rewrite history; after **session compaction**, re-inject the mode this turn needs.
-_Avoid_: open business-intent labels, one unnamed retrieve for every question, treating Fake as a 档, retrieve as this enum, four host retrieve nodes, per-turn 档 picker as the default UX, clarify with no selectable options
+Which retrieve path a knowledge question uses after it has entered **grounded**: A 查找 (lexical-first), **graph** 知识问答 (iknow graph-priority then vector∥BM25 fill; community summaries may mix in, capped by **community level** — MCP `filters.search_mode=graph`, formerly `B`; missing key defaults to graph), **global** 综述 (index-time community summaries; report text ES ∥ report vectors, then optional drop to windows — ADR 0070; MCP `filters.search_mode=global`, formerly `C`), D 真数据库 (real SQL/business DB; document tables stay graph). Assignment reuses the Soft-Track cascade (ADR 0027 / 0062 / 0081): rules, then **Jev** Choice when ambiguous, then inherit, then clarify or typed fail — not a required picker and not silent global. _Stage: 档 Jev gray zone pending host-jev T4/T5; on main the 档 ambiguous tier still runs MiniMax structured classify._ Cascade **clarify** opens a **choice window** (structured options → operator pick → resume execute). Search-mode copy is call-scoped (ADR 0061): inject once in near context, never rewrite history; after **session compaction**, re-inject the mode this turn needs.
+_Avoid_: open business-intent labels, one unnamed retrieve for every question, treating Fake as a 档, retrieve as this enum, four host retrieve nodes, per-turn 档 picker as the default UX, clarify with no selectable options, `search_mode=C` as the lasting 综述 token, `search_mode=B` as the lasting 知识问答 token, **local** as the 知识问答 MCP value
 
 **社区**:
 Entity-graph clusters from **hierarchical Leiden** after extract and merge (ADR 0056 / 0065), on the **largest connected component** by default (ADR 0074), split until **max_cluster_size** (default 10, tunable — ADR 0072), with a **fixed default seed** (ADR 0075). Graph changes **rebuild** Leiden and summaries; C is not-ready until that succeeds (ADR 0064 / 0078); B does not wait on communities.
@@ -285,9 +285,13 @@ _Avoid_: declarative plan-mode as v1, Studio as the required v1 interface, free-
 Read-only sibling clone of the reference implementation (workspace folder, not fin git). Consulted, never edited as fin source.
 _Avoid_: vendoring under fin/, copying that tree into src/fin
 
+**Jev**:
+TypeSafe System One for host closed-set **Choice**: Soft-Track's four **track** leaves, then (only after **grounded**) 检索档 `A|graph|global|D`. Product path only (ADR 0080 / 0081); default pytest injects Fake Choice; live Jev is required to land; no MiniMax fallback.
+_Avoid_: v1 model, retrieve rerank, MiniMax JSON classify, MiniMax as Jev fallback, Fake as the product classifier, counting a Fake pass as live, four retrieve nodes
+
 **v1 model**:
 The agent-loop LLM is `ChatOpenAI` selected at runtime by `FIN_MODEL` (default `MiniMax-M3`) and `FIN_BASE_URL` (default official MiniMax CN Chat Completions `https://api.minimaxi.com/v1`; the URL includes `/v1`). Keys stay in environment variables (`FIN_API_KEY`); slash ids do not go through `init_chat_model`.
-_Avoid_: compiled-in model name as the only option, `init_chat_model` for slash ids, `minimax-cn/MiniMax-M3` as the v1 default, LLM-as-judge as the citation gate
+_Avoid_: compiled-in model name as the only option, `init_chat_model` for slash ids, `minimax-cn/MiniMax-M3` as the v1 default, LLM-as-judge as the citation gate, using this client as the product Soft-Track gray-zone classifier
 
 **FIN_API_KEY**:
 项目自有的 LLM API key 环境变量名（2026-08-27 由 `ANTHROPIC_AUTH_TOKEN` 硬切而来，无 fallback）
