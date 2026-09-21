@@ -61,6 +61,12 @@ os.environ.pop("FIN_KNOWLEDGE_MCP_CWD", None)
 os.environ.pop("FIN_MODEL", None)
 os.environ.pop("FIN_BASE_URL", None)
 os.environ.pop("FIN_API_KEY", None)
+os.environ.pop("FIN_JEV_API_KEY", None)
+os.environ.pop("FIN_JEV_MODEL", None)
+os.environ.pop("FIN_JEV_BASE_URL", None)
+os.environ.pop("TYPESAFE_API_KEY", None)
+os.environ.pop("TYPESAFE_DEFAULT_MODEL", None)
+os.environ.pop("TYPESAFE_BASE_URL", None)
 
 
 def _drop_unreachable_checkpoint_url() -> None:
@@ -100,6 +106,12 @@ def _strip_operator_llm_and_mcp_cwd_env(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.delenv("FIN_MODEL", raising=False)
     monkeypatch.delenv("FIN_BASE_URL", raising=False)
     monkeypatch.delenv("FIN_API_KEY", raising=False)
+    monkeypatch.delenv("FIN_JEV_API_KEY", raising=False)
+    monkeypatch.delenv("FIN_JEV_MODEL", raising=False)
+    monkeypatch.delenv("FIN_JEV_BASE_URL", raising=False)
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.delenv("TYPESAFE_DEFAULT_MODEL", raising=False)
+    monkeypatch.delenv("TYPESAFE_BASE_URL", raising=False)
 
 
 # One row per form the operator should be able to see in the library.
