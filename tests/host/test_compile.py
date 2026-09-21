@@ -178,6 +178,12 @@ def test_env_example_has_required_keys() -> None:
         "(Bearer token for official MiniMax Chat Completions — "
         "ADR 0022 update 2026-08-27 hard switch)"
     )
+    assert "FIN_JEV_API_KEY" in env, (
+        ".env.example must define FIN_JEV_API_KEY "
+        "(TypeSafe Jev host judge; operator pastes the key)"
+    )
+    assert env["FIN_JEV_MODEL"] == "jev-latest"
+    assert env["FIN_JEV_BASE_URL"] == "https://api.typesafe.ai"
 
 
 def test_env_example_url_matches_expected() -> None:
