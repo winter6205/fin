@@ -83,7 +83,7 @@ ASSUMPTIONS CONFIRMED 2026-09-17 (four-spec split). This is **spec 2 of 4**. Spe
 
 ## Open Questions
 
-1. Public JSON/SSE/MCP **error code** strings for: empty Fast graph on Chinese **资料**; community-summary index failure; C not-ready during Leiden/report rebuild — vs existing 档未开 / 资料未就绪.
+1. Public JSON/SSE/MCP **error code** strings for: empty Fast graph on Chinese **资料**; community-summary index failure; C not-ready during Leiden/report rebuild — vs existing 档未开 / 资料未就绪. **Partially resolved 2026-09-21:** operator confirmed the empty-Fast wire spelling `empty_fast_graph_failure` (fin refuse `reason` / SSE `status_reason`), same construct as the reserved `community_summary_index_failure`; the C-not-ready spelling follows the iknow job codes when that job lands.
 2. Integer value of Leiden’s **fixed default seed** (ADR 0075 requires fixed; does not name the integer).
 3. Embedding **model id / dimension** for the three index embedding classes (ADR 0058 requires the three classes, not the model).
 

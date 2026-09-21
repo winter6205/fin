@@ -492,3 +492,53 @@ def test_concurrent_tiered_calls_answer_per_call() -> None:
     assert recorded.count("A") == 4
     assert recorded.count("B") == 4
     assert "C" not in recorded and "Z" not in recorded
+
+
+# ----- recorded Fast 抽图 job fact (spec graph-index-standard-fast SC5) -----
+
+
+def test_fast_graph_empty_answers_the_emptiness_named() -> None:
+    """A Fast job that built an empty entity-relation graph over the
+    资料 set must not read as a silent empty collection: the emptiness
+    arrives under the recorded job-fact key so the host decision can
+    name it (never 未就绪, never a healthy miss)."""
+    from fin.retrieve.port import RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY
+
+    port = FakeRetrievePort(
+        hits_by_query={"中文资料问题": [_chunk("不该出现的命中")]},
+        fast_graph_empty=True,
+    )
+
+    result = port.retrieve("中文资料问题")
+
+    # The hit table is shadowed: an empty graph can cite no chunk.
+    assert result == {"chunks": [], RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY: True}
+    assert len(port.calls) == 1
+
+
+def test_an_ordinary_fake_never_learns_the_fast_job_key() -> None:
+    """Default-off both ways: without the flag the result keeps the
+    plain ``{"chunks": [...]}`` contract — otherwise every empty
+    corpus would read as a Fast failure at the host."""
+    from fin.retrieve.port import RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY
+
+    empty = FakeRetrievePort().retrieve("what was revenue")
+    with_hits = FakeRetrievePort(
+        hits_by_query={"foo": [_chunk("hit")]}
+    ).retrieve("foo")
+
+    assert empty == {"chunks": []}
+    assert RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY not in empty
+    assert RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY not in with_hits
+
+
+def test_the_fast_job_fact_never_masks_invalid_input() -> None:
+    """Boundary 'exception': invalid input names first, exactly as it
+    does for an ordinary fake — a recorded job fact is not a licence
+    to swallow the named ``EmptyQueryError``."""
+    port = FakeRetrievePort(fast_graph_empty=True)
+
+    with pytest.raises(EmptyQueryError):
+        port.retrieve("   ")
+
+    assert port.calls == []

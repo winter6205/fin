@@ -50,6 +50,17 @@ from fin.retrieve.tiers import RETRIEVE_TIERS, TIER_UNAVAILABLE_CODE
 # One place; the adapters and the tests import it.
 SEARCH_MODE_FILTER_KEY: Final[str] = "search_mode"
 
+# The outcome-record key by which a RECORDED Fast 抽图 job fact travels:
+# the Fast extractor built an empty entity-relation graph over the
+# 资料 set (spec graph-index-standard-fast SC5). Only an explicit
+# ``True`` is the fact — a silent empty result is 资料未就绪
+# (``corpus_not_ready``), and fin must never upgrade absence into
+# this code. The port layer owns the KEY (the fake port answers with
+# it, the host decision reads it; ``fin.host.named_failures``
+# re-exports it onto the codes surface); the public CODE spelling is
+# that module's reserved token and awaits the spec's Open Question 1.
+RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY: Final[str] = "fast_graph_empty"
+
 
 class InvalidSearchModeError(InputValidationError):
     """``search_mode`` is not one of the closed 档 tokens.

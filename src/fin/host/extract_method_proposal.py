@@ -2,9 +2,14 @@
 
 **Fast 抽图** vs **standard** is the *extract method* of the index job:
 an **operator switch** (default standard, ADR 0068) with exactly **one
-method per corpus version** (ADR 0079). Owning and applying that switch
-lives in spec 2 (``graph-index-standard-fast``) — NOTHING here writes to
-the extract/index pipeline.
+method per corpus version** (ADR 0079). The switch itself lives in
+:func:`fin.corpus.catalog.switch_extract_method`; this module opens
+the **choice window**, records the operator's answer, and routes ONE
+answer onto that switch: a valid ``fast`` pick on a request that names
+a recorded ``(document_id, version)``. Every other outcome — no pick,
+bad pick, a declined ``standard`` pick, or a fast pick without version
+context — applies nothing, which is what "no silent Fast" means on the
+host side.
 
 What the host may do (spec search-mode-host "Fast 抽图 propose"
 bullet): open a **choice window** whose options distinguish Fast
@@ -22,28 +27,29 @@ extract-method vocabulary deliberately shares no token space with the
 
 from __future__ import annotations
 
-from typing import Any, Final, Literal
+from pathlib import Path
+from typing import Any, Final
 
-# The closed extract-method set (ADR 0079's two members). NOT the 档
-# set: ``fast``/``standard`` never appear as ``search_mode`` values and
-# vice versa.
-ExtractMethod = Literal["standard", "fast"]
-
-EXTRACT_METHOD_STANDARD: Final[ExtractMethod] = "standard"
-EXTRACT_METHOD_FAST: Final[ExtractMethod] = "fast"
-
-# ADR 0068: the operator switch defaults to standard, and the host has
-# no authority to flip it — so the EFFECTIVE method stays standard for
-# every audit this increment can produce (``applied`` is hardcoded
-# ``False`` in :func:`build_proposal_audit`).
-DEFAULT_EXTRACT_METHOD: Final[ExtractMethod] = EXTRACT_METHOD_STANDARD
+from fin.corpus.catalog import switch_extract_method
+from fin.corpus.errors import (
+    CatalogCorruptError,
+    CatalogRowError,
+    ExtractMethodTargetMissingError,
+)
+from fin.corpus.extract_method import (
+    DEFAULT_EXTRACT_METHOD,
+    EXTRACT_METHOD_FAST,
+    EXTRACT_METHOD_STANDARD,
+    ExtractMethod,
+)
 
 # The only method the host may PROPOSE (ADR 0068: AI may suggest Fast).
 # Proposing standard is a no-op — it already is the default.
 PROPOSED_EXTRACT_METHOD: Final[ExtractMethod] = EXTRACT_METHOD_FAST
 
-# Operator-visible labels. ``opened`` is True for both: this window
-# records a pick, it cannot apply one, so no option is 具名失败-bound.
+# Operator-visible labels. ``opened`` is True for both options; a fast
+# pick only becomes a switch when the request also names a recorded
+# ``(document_id, version)`` — see :func:`apply_extract_method_pick`.
 EXTRACT_METHOD_LABELS: Final[dict[str, str]] = {
     EXTRACT_METHOD_STANDARD: "标准抽图",
     EXTRACT_METHOD_FAST: "Fast 抽图（更便宜、更噪）",
@@ -89,7 +95,7 @@ def propose_window_payload(
 ) -> dict[str, Any]:
     """The ``interrupt`` payload for one propose window.
 
-    ``kind`` stays ``"choice_window"`` (T2 wire contract) so the SPA
+    ``kind`` stays ``"choice_window"`` (the SPA contract) so the SPA
     needs no change; the title/prompt say this selects the 抽图方法, so
     the operator never mistakes it for a 档 picker.
     """
@@ -97,8 +103,9 @@ def propose_window_payload(
         "kind": "choice_window",
         "title": "选择抽图方法",
         "prompt": (
-            "host 提议改用 Fast 抽图（更便宜、更噪）。此处选择只记录"
-            "提议与你的选择，不切换抽图方法（默认 standard，ADR 0068）。"
+            "host 提议改用 Fast 抽图（更便宜、更噪）。选择 Fast 会把本提议"
+            "指向的资料版本切换为 Fast 并标记待重建；未指向已记录版本、"
+            "不选或选 standard 时保持默认 standard（ADR 0068/0079）。"
         ),
         "options": propose_options(),
     }
@@ -122,41 +129,118 @@ def proposal_is_pending(request: object) -> bool:
     return normalize_extract_method(request.get("proposed")) == EXTRACT_METHOD_FAST
 
 
+# Typed no-apply reasons surfaced on the audit (never a bare False
+# without a recorded cause): the switch target is half-named, the
+# named version has no catalog row, or the catalog refused.
+APPLY_ERROR_MISSING_CONTEXT: Final[str] = "missing_version_context"
+APPLY_ERROR_TARGET_MISSING: Final[str] = "extract_method_target_missing"
+APPLY_ERROR_ROW_REJECTED: Final[str] = "catalog_row_rejected"
+APPLY_ERROR_CATALOG_UNREADABLE: Final[str] = "catalog_unreadable"
+
+
+def version_context(request: dict[str, Any]) -> tuple[str, str] | None:
+    """The ``(document_id, version)`` a propose request names, if any.
+
+    Both halves must be non-empty strings: half a target is ambiguous
+    and the operator switch may never guess the other half (ADR 0079
+    keys the switch on the exact version row)."""
+    document_id = request.get("document_id")
+    version = request.get("version")
+    if not isinstance(document_id, str) or not document_id.strip():
+        return None
+    if not isinstance(version, str) or not version.strip():
+        return None
+    return document_id.strip(), version.strip()
+
+
+def apply_extract_method_pick(
+    request: dict[str, Any],
+    picked: ExtractMethod,
+    *,
+    catalog_path: Path | str,
+) -> tuple[bool, str | None]:
+    """Route the operator's resolved pick onto the corpus version switch.
+
+    Only ``fast`` is a real switch: ``standard`` is the ADR 0068
+    default, so declining records nothing and writes nothing. Applying
+    requires a version context on the request — without it the window
+    stays a proposal record and NOTHING reaches the catalog, which is
+    the no-silent-Fast wall. The catalog call is idempotent
+    (re-switching the same method is a no-op), so LangGraph's
+    replay-on-resume of the node body cannot double-apply.
+
+    Returns ``(applied, apply_error)``: the run always continues — a
+    refused switch is recorded, never raised into a broken wire.
+    """
+    if picked != EXTRACT_METHOD_FAST:
+        return False, None
+    context = version_context(request)
+    if context is None:
+        return False, APPLY_ERROR_MISSING_CONTEXT
+    document_id, version = context
+    try:
+        switch_extract_method(
+            document_id,
+            version,
+            EXTRACT_METHOD_FAST,
+            catalog_path=catalog_path,
+        )
+    except ExtractMethodTargetMissingError:
+        return False, APPLY_ERROR_TARGET_MISSING
+    except CatalogRowError:
+        return False, APPLY_ERROR_ROW_REJECTED
+    except CatalogCorruptError:
+        return False, APPLY_ERROR_CATALOG_UNREADABLE
+    return True, None
+
+
 def build_proposal_audit(
     request: dict[str, Any],
     *,
     picked: ExtractMethod,
     rejected: list[str] | None = None,
+    applied: bool = False,
+    apply_error: str | None = None,
 ) -> dict[str, Any]:
     """The run-audit record of one resolved propose window.
 
-    ``applied`` is hardcoded ``False``: applying the method means
-    rebuilding the corpus version (ADR 0079) and belongs to the index
-    job (spec 2), so no host-side pick — not even a confirmed
-    ``fast`` — may flip it this increment. ``operator_confirmed`` is
-    what the future switch consumes as evidence, nothing more.
+    ``applied`` mirrors what :func:`apply_extract_method_pick` actually did:
+    ``True`` only when a valid fast pick on a version-naming request
+    flipped the catalog switch (the catalog then carries the rebuild
+    intent); every other outcome — declined, context-free, or typed
+    refusal — keeps ``False``, with ``apply_error`` naming the refusal.
     """
     audit: dict[str, Any] = {
         "proposed": normalize_extract_method(request.get("proposed"))
         or PROPOSED_EXTRACT_METHOD,
         "picked": picked,
-        "applied": False,
+        "applied": applied,
         "operator_confirmed": picked == EXTRACT_METHOD_FAST,
         "decision_tier": "operator_pick",
     }
+    if apply_error:
+        audit["apply_error"] = apply_error
     if rejected:
         audit["rejected_picks"] = list(rejected)
     return audit
 
 
 __all__ = [
+    "APPLY_ERROR_CATALOG_UNREADABLE",
+    "APPLY_ERROR_MISSING_CONTEXT",
+    "APPLY_ERROR_ROW_REJECTED",
+    "APPLY_ERROR_TARGET_MISSING",
     "DEFAULT_EXTRACT_METHOD",
+    "EXTRACT_METHOD_FAST",
     "EXTRACT_METHOD_LABELS",
+    "EXTRACT_METHOD_STANDARD",
     "ExtractMethod",
     "PROPOSED_EXTRACT_METHOD",
+    "apply_extract_method_pick",
     "build_proposal_audit",
     "normalize_extract_method",
     "propose_options",
     "propose_window_payload",
     "proposal_is_pending",
+    "version_context",
 ]

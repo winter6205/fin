@@ -14,7 +14,9 @@ Ticket 4 落地了 graph 侧的 propose 窗（seed
   方法窗（options standard/fast，title 区别于档窗）；
 * resume ``{"pick":"fast"}`` → 审计 ``applied is False`` +
   ``operator_confirmed True`` + ``picked "fast"``，run 走完
-  （terminal 帧齐）；
+  （terminal 帧齐）；seed 若带 ``propose_document_id``+``propose_version``
+  指向已记录版本，同一 resume 经 ``switch_extract_method`` 把该
+  version 记为 fast 且 ``applied is True``（见下文 apply 小节）；
 * 不带字段 → 无方法窗（现状回归锁）；
 * 非 grounded（greeting）带字段 → 不开窗（spec assumption 2）；
 * 非法值 ``"turbo"`` → pydantic 422（closed Literal，同 ``tiers`` 风格），
@@ -33,6 +35,7 @@ semantics beyond feeding the SAME window.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -41,6 +44,7 @@ from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+from fin.corpus.catalog import record_filings
 from fin.host import ScriptedChatModel, compile_graph
 
 pytestmark = [pytest.mark.soft_track]
@@ -284,3 +288,133 @@ def test_send_with_invalid_method_is_422_and_run_never_starts(
     # No run started: nothing is pending and the thread has no state.
     assert installed.interrupt_pending(thread_id) is None
     assert not installed._graph.get_state(_cfg(thread_id)).values
+
+
+# ---------------------------------------------------------------------------
+# send 面把开关目标 (document_id, version) 带进 seed；resume fast 落版本开关
+# ---------------------------------------------------------------------------
+
+
+def _install_catalog_window_graph(
+    http_app: FastAPI, script: list[AIMessage], catalog_path: Any
+) -> Any:
+    from fin.host.http import get_graph
+
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=ScriptedChatModel(script=script),
+        known_document_ids=KNOWN_IDS,
+        enable_choice_window=True,
+        catalog_path=catalog_path,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+    return g
+
+
+def _seed_standard_catalog(tmp_path: Path) -> Path:
+    catalog_path = tmp_path / "catalog.json"
+    record_filings(
+        [
+            {
+                "document_id": "AAPL-2022Q3",
+                "company": "Apple",
+                "period": "2022 Q3",
+                "version": "a" * 64,
+                "page_count": 3,
+            }
+        ],
+        catalog_path=catalog_path,
+    )
+    return catalog_path
+
+
+def test_send_with_version_context_resume_fast_applies_switch(
+    client: TestClient, store, http_app: FastAPI, tmp_path: Path
+) -> None:
+    """Switch-target wire contract: ``propose_document_id`` + ``propose_version``
+    ride the seed; the operator's fast pick on the SAME resume route
+    flips that recorded version to fast through the catalog switch and
+    the state audit reads ``applied is True``."""
+    catalog_path = _seed_standard_catalog(tmp_path)
+    installed = _install_catalog_window_graph(http_app, _ANSWER, catalog_path)
+    thread_id = _new_thread(client)
+    sent = client.post(
+        f"/api/threads/{thread_id}/messages",
+        json={
+            "question": AMBIGUOUS,
+            "tiers": ["B"],
+            "propose_extract_method": "fast",
+            "propose_document_id": "AAPL-2022Q3",
+            "propose_version": "a" * 64,
+        },
+    )
+    assert sent.status_code == 200
+    assert _parse_sse_events(sent.text)[-1][0] == "choice_window"
+    seed = _state_values(installed, thread_id)["extract_method_proposal"]
+    assert seed["document_id"] == "AAPL-2022Q3"
+    assert seed["version"] == "a" * 64
+
+    resumed = client.post(
+        f"/api/threads/{thread_id}/resume", json={"pick": "fast"}
+    )
+    assert resumed.status_code == 200
+    proposal = _state_values(installed, thread_id)["extract_method_proposal"]
+    assert proposal["applied"] is True
+    assert proposal["picked"] == "fast"
+    stored = json.loads(catalog_path.read_text())["filings"][0]
+    assert stored["extract_method"] == "fast"
+    assert stored["rebuild_pending"] is True
+
+
+def test_send_with_half_version_context_never_applies(
+    client: TestClient, store, http_app: FastAPI, tmp_path: Path
+) -> None:
+    """A seed naming only ONE of document/version is an ambiguous
+    target: the window still opens, but the fast pick records the typed
+    ``missing_version_context`` and the catalog stays standard — the
+    switch never guesses half a target."""
+    catalog_path = _seed_standard_catalog(tmp_path)
+    installed = _install_catalog_window_graph(http_app, _ANSWER, catalog_path)
+    thread_id = _new_thread(client)
+    sent = client.post(
+        f"/api/threads/{thread_id}/messages",
+        json={
+            "question": AMBIGUOUS,
+            "tiers": ["B"],
+            "propose_extract_method": "fast",
+            "propose_document_id": "AAPL-2022Q3",
+        },
+    )
+    assert _parse_sse_events(sent.text)[-1][0] == "choice_window"
+    client.post(f"/api/threads/{thread_id}/resume", json={"pick": "fast"})
+    proposal = _state_values(installed, thread_id)["extract_method_proposal"]
+    assert proposal["applied"] is False
+    assert proposal["apply_error"] == "missing_version_context"
+    stored = json.loads(catalog_path.read_text())["filings"][0]
+    assert stored["extract_method"] == "standard"
+
+
+def test_send_without_context_fields_keeps_wire_shape(
+    client: TestClient, store, http_app: FastAPI, tmp_path: Path
+) -> None:
+    """Regression: omitting the new optional fields leaves the seed
+    byte-identical to the pre-switch shape (``{"proposed": "fast"}`` only) and
+    a context-free fast pick still applies nothing — the workbench
+    cannot send an accidental apply target."""
+    catalog_path = _seed_standard_catalog(tmp_path)
+    installed = _install_catalog_window_graph(http_app, _ANSWER, catalog_path)
+    thread_id = _new_thread(client)
+    client.post(
+        f"/api/threads/{thread_id}/messages",
+        json={"question": AMBIGUOUS, "tiers": ["B"], "propose_extract_method": "fast"},
+    )
+    seed = _state_values(installed, thread_id)["extract_method_proposal"]
+    assert seed == {"proposed": "fast"}
+    resumed = client.post(
+        f"/api/threads/{thread_id}/resume", json={"pick": "fast"}
+    )
+    assert resumed.status_code == 200
+    proposal = _state_values(installed, thread_id)["extract_method_proposal"]
+    assert proposal["applied"] is False
+    stored = json.loads(catalog_path.read_text())["filings"][0]
+    assert stored["extract_method"] == "standard"

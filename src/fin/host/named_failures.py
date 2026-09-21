@@ -29,6 +29,17 @@ never by matching prose::
                        Leiden/community-summary job failed or summaries
                        are incomplete, ADR 0064 / 0078) — a runtime
                        fact, distinct from 「档未开」
+    empty_fast_graph_failure
+                       the Fast 抽图 job built an EMPTY entity-relation
+                       graph over the 资料 set (spec
+                       graph-index-standard-fast SC5) — neither 资料
+                       未就绪 (the documents are there, the method
+                       failed them) nor 档未开 (Fast is an extract
+                       method, never a 检索档 token). Rides the same
+                       ``status_reason`` channel as the two above.
+                       Public spelling confirmed 2026-09-21
+                       (spec Open Question 1); the TYPE and
+                       distinctness are settled and tested.
     invalid_search_mode
                        the documented invalid-mode code on the retrieve
                        side: a filters.search_mode outside A|B|C|D
@@ -69,6 +80,7 @@ from typing import Final, Iterable, Mapping, Sequence
 # it and may not import ``fin.host`` (``fin.host.graph`` imports the
 # port; review F3). Re-exported here unchanged: this stays the import
 # surface every host-side consumer already uses.
+from fin.retrieve.port import RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY
 from fin.retrieve.tiers import (
     REAL_DB_NOT_WIRED,
     RETRIEVE_TIERS,
@@ -94,6 +106,15 @@ MAPPING_DROP: Final[str] = "mapping_drop"
 # ``specs/search-mode-retrieve.md`` (Boundaries), shared with the
 # iknow-memory side.
 COMMUNITY_SUMMARY_INDEX_FAILURE: Final[str] = "community_summary_index_failure"
+
+# The Fast 抽图 job's empty-graph exit (spec graph-index-standard-fast
+# SC5): a typed 具名失败, deliberately NOT ``corpus_not_ready`` (the
+# 资料 are present; the extract method found no entity-relation graph
+# in them) and NOT ``tier_not_open`` (Fast is an extract method, never
+# a 检索档). Same reserved-token construct as the code above; the
+# public spelling confirmed 2026-09-21 (spec Open Question 1) — the
+# tests assert the TYPE and the distinctness.
+EMPTY_FAST_GRAPH_FAILURE: Final[str] = "empty_fast_graph_failure"
 
 # NOTE (T6 reach): a 档 is invoked ONLY through the explicit selector
 # (:data:`RETRIEVE_TIERS` and the send door's ``RetrieveTier`` enum).
@@ -121,8 +142,18 @@ def retrieve_blocking_failure(
     (non-int counts, missing keys) contributes nothing rather than
     guessing a cause: an invented failure is worse than the verifier's
     reason.
+
+    A record may additionally carry the RECORDED Fast job fact under
+    :data:`RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY`, and only an explicit
+    ``True`` is that fact: fin never upgrades a plain empty collection
+    into the Fast failure (that would blame a job which never reported
+    one). When the run ends with no chunk anywhere, the job fact wins
+    over the mapping / empty-collection readings — an empty Fast graph
+    EXPLAINS why nothing mapped or matched, and the operator's fix is
+    the extract method, not ingest.
     """
     saw_call = False
+    saw_fast_graph_empty = False
     mapping_failures = 0
     for record in outcomes or ():
         if not isinstance(record, Mapping):
@@ -136,9 +167,13 @@ def retrieve_blocking_failure(
             # Retrieval worked at least once this run: a later refusal
             # is the verifier's to make, not retrieve's to pre-empt.
             return None
+        if record.get(RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY) is True:
+            saw_fast_graph_empty = True
         mapping_failures = max(mapping_failures, failures)
     if not saw_call:
         return None
+    if saw_fast_graph_empty:
+        return EMPTY_FAST_GRAPH_FAILURE
     if mapping_failures > 0:
         return MAPPING_DROP
     return CORPUS_NOT_READY
@@ -185,6 +220,14 @@ def retrieve_outcomes_delta(
     malformed record could invent a 具名失败, and raising would make an
     unreadable measurement take down a tool call that is otherwise
     fine.
+
+    A RECORDED Fast job fact (an explicit ``True`` under
+    :data:`RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY`) rides the rebuild — the
+    tool seam reconstructs records through this helper, and dropping
+    the fact here would erase the only path the decision has to see
+    it. Any other flag value (absent, False, a lookalike) is left off
+    the rebuilt record: the output shape stays the plain two-count
+    contract for every ordinary call.
     """
     out: list[dict[str, int]] = []
     for record in records or ():
@@ -194,12 +237,13 @@ def retrieve_outcomes_delta(
         failures = record.get("mapping_failures")
         if not isinstance(chunks, int) or not isinstance(failures, int):
             continue
-        out.append(
-            {
-                "chunks": chunks,
-                "mapping_failures": max(failures - baseline, 0),
-            }
-        )
+        entry: dict[str, int] = {
+            "chunks": chunks,
+            "mapping_failures": max(failures - baseline, 0),
+        }
+        if record.get(RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY) is True:
+            entry[RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY] = True
+        out.append(entry)
     return out
 
 
@@ -221,8 +265,10 @@ def unavailable_tier(requested_tiers: Iterable[str] | None) -> str | None:
 __all__ = [
     "COMMUNITY_SUMMARY_INDEX_FAILURE",
     "CORPUS_NOT_READY",
+    "EMPTY_FAST_GRAPH_FAILURE",
     "MAPPING_DROP",
     "REAL_DB_NOT_WIRED",
+    "RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY",
     "RETRIEVE_TIERS",
     "RetrieveTier",
     "TIER_NOT_OPEN",

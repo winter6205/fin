@@ -665,6 +665,15 @@ class SendMessageRequest(BaseModel):
     # a 422 input error, not a silently ignored field — same style as
     # ``tiers`` above.
     propose_extract_method: Literal["fast"] | None = None
+    # The SWITCH TARGET. The operator pick on the propose
+    # window only reaches ``switch_extract_method`` when the request
+    # names the exact ``(document_id, version)`` row; both fields are
+    # optional and half a target stays a proposal record (the graph
+    # gate records ``missing_version_context``), never a guessed
+    # apply. Free strings on purpose: the row's existence — not a
+    # client-side format — is what the catalog checks.
+    propose_document_id: str | None = None
+    propose_version: str | None = None
 
 
 class ResumeRequest(BaseModel):
@@ -2431,9 +2440,15 @@ def build_router(
             attachments=resolved_attachments,
         )
         if body.propose_extract_method is not None:
-            input_state["extract_method_proposal"] = {
-                "proposed": body.propose_extract_method
-            }
+            seed: dict[str, Any] = {"proposed": body.propose_extract_method}
+            # The apply target rides the SAME run-scoped channel; a
+            # named half is carried verbatim so the audit can say WHY
+            # nothing applied (missing_version_context).
+            if body.propose_document_id is not None:
+                seed["document_id"] = body.propose_document_id
+            if body.propose_version is not None:
+                seed["version"] = body.propose_version
+            input_state["extract_method_proposal"] = seed
 
         def event_stream() -> Iterator[str]:
             """Yield the delta wire for this run, then persist + close.

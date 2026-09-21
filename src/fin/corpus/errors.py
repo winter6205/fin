@@ -68,11 +68,36 @@ class CatalogCorruptError(IngestMissingError):
 class CatalogRowError(ValueError):
     """A row handed to ``fin.corpus.catalog.record_filings`` violates
     the catalog row contract (``{document_id, company, period,
-    version, page_count}``, optional ``source_sha256``).
+    version, page_count}``, optional ``source_sha256`` /
+    ``extract_method``), or ``switch_extract_method`` is called with a
+    method outside the closed set.
 
     This is the named failure for bad rows — never a silent
     skip-as-success: the rejected write does not happen and the
     existing table is left untouched.
+    """
+
+
+class ExtractMethodConflictError(ValueError):
+    """A second, DIFFERENT extract method was recorded on one corpus
+    version through the ingest seam (ADR 0079: exactly one method per
+    version).
+
+    This is the typed rejection of the dual-graph shape — the table is
+    left untouched, and the request is never silently merged into two
+    graphs or silently overwritten. Changing a version's method is the
+    operator switch's job (:func:`fin.corpus.catalog.switch_extract_method`),
+    which records a rebuild intent instead.
+    """
+
+
+class ExtractMethodTargetMissingError(ValueError):
+    """The operator switch targeted a ``(document_id, version)`` with
+    no catalog row.
+
+    The switch changes the method of a recorded version only — it is
+    never a create path, so a missing row is a named failure rather
+    than a half-initialized version.
     """
 
 
@@ -201,6 +226,8 @@ __all__ = [
     "IngestMissingError",
     "CatalogCorruptError",
     "CatalogRowError",
+    "ExtractMethodConflictError",
+    "ExtractMethodTargetMissingError",
     "MalformedExtractedIndexError",
     "ManifestShaMismatchError",
     "ParseError",

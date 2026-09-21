@@ -310,13 +310,15 @@ class AgentState(TypedDict, total=False):
     extract_method_proposal
         search-mode host T4 (ADR 0068 / 0079): the Fast 抽图 PROPOSE
         audit — ``{proposed, picked, applied, operator_confirmed,
-        decision_tier}`` (shape SSOT:
-        ``fin.host.extract_method_proposal``). Doubles as the minimal
-        trigger: an input seed ``{"proposed": "fast"}`` with no
+        decision_tier}`` plus ``apply_error`` on a typed refusal (shape
+        SSOT: ``fin.host.extract_method_proposal``). Doubles as the
+        minimal trigger: an input seed ``{"proposed": "fast"}`` with no
         ``picked`` opens the propose window on a grounded run; the node
         completes the audit with the operator pick. ``applied`` is
-        always ``False`` this increment — the extract method is the
-        index job's operator switch (spec 2), never flipped here. The
+        ``True`` ONLY when a valid fast pick named a recorded
+        ``(document_id, version)`` (the seed's optional context keys)
+        and the catalog switch flipped that row — every other
+        outcome keeps ``False``: no silent Fast. The
         Fast string is NOT a 检索档 and never rides
         ``search_mode_decision``. Overwrite semantics; run-scoped via
         ``reset_input_state``.

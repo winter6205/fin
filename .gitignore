@@ -12,7 +12,17 @@ build/
 *.egg-info/
 
 # Node / JS (workspace prototype frontend)
-node_modules/
+# `node_modules` carries no trailing slash on purpose. A `node_modules/`
+# rule matches only a real directory, so a worktree sharing the main
+# checkout's modules through a SYMLINK of that name was not ignored — and
+# once such a link got committed (224b1fe / PR #261, pointing at itself)
+# every `npm run` in a checkout carrying it died with ELOOP, which is how
+# husky's pre-commit came to fail for reasons unrelated to the staged
+# change. Matching the bare name covers directory, symlink and
+# not-yet-on-disk alike. Safe because no tracked path has a
+# `node_modules` component, so nothing under that name needs un-ignoring
+# (tests/test_repo_hygiene.py pins both of those halves).
+node_modules
 .vite/
 *.tsbuildinfo
 vite.config.js
@@ -81,6 +91,7 @@ docs/guides/knowledge-agent.md
 
 # Local operator shims (not product)
 .local-bin/
+.qoder
 
 # `fin up` runtime state: serve pid file, verdict file and log. Per-checkout,
 # never committed.
@@ -89,4 +100,3 @@ docs/guides/knowledge-agent.md
 # Scratch harnesses written while exercising the launcher's kill/stop paths
 # against a live pid. Throwaway by construction — never a product artifact.
 .fin-selftest/
-
