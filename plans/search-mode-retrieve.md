@@ -43,6 +43,13 @@ empty — `community_summary_index_failure` is a wire token in `named_failures`,
    - `[blocks: T2]`
    - Status: [x] done — five classes across Fake port matrix (tests/retrieve/test_fake_port.py:450 ff: empty/ordering/omit-no-token/overflow-cap/concurrent/negative-invalid/exception), product adapter matrix (tests/retrieve/test_mcp_adapter.py:988 ff, exception as port-level retrieve_unavailable), named-exit half (tests/host/test_search_mode_named_exits.py:144/:163/:186/:209)
 
+4. **Open the global 档 + runtime emit of `community_summary_index_failure`** — tag: `[implementation]`, operator-gated
+   - **Inherits:** today `global` is deliberately gated to `tier_not_open` (TIER_UNAVAILABLE_CODE, src/fin/retrieve/tiers.py) so the reserved token has no runtime emit path — no silent global. Opening the 档 is a product decision, not an automatic consequence of the iknow seam landing.
+   - **Surface:** tiers.py TIER_UNAVAILABLE_CODE (remove the global→tier_not_open row when opened), host copy, named-failure mapping (community_summary_index_failure becomes reachable at runtime from the iknow typed failure)
+   - **Acceptance:** with the 档 open, a global retrieve against a not-ready summary index surfaces `community_summary_index_failure` end-to-end (run/SSE copy), distinct from tier_not_open; live proof `-m mcp tests/retrieve/test_live_search_modes_pg_es.py` re-run against the real server post-iknow-T5b.
+   - `[blocks: iknow search-mode-retrieve T5b, operator ruling]`
+   - Status: [ ] pending (awaiting operator decision to open the 档)
+
 ## End of round
 
-`community_summary_index_failure` runtime emit is deliberately reserved while the global 档 maps to `tier_not_open` (no silent global); once the iknow ES report-lexical seam (3a task 5) lands and the 档 opens, re-run live `-m mcp tests/retrieve/test_live_search_modes_pg_es.py` against the real server as the cross-repo proof. Vocabulary letters A/B/C/D are fully retired (#293); zero letter tier values remain in src/fin.
+`community_summary_index_failure` runtime emit stays deliberately reserved while the global 档 maps to `tier_not_open` (no silent global). Opening the 档 and the cross-repo live proof are owned by task 4 above, blocked on iknow search-mode-retrieve T5b (the production ES write side T5a plus the read seam) and an operator ruling — the flip is not an automatic consequence of the iknow seam landing. Vocabulary letters A/B/C/D are fully retired (#293); zero letter tier values remain in src/fin.
