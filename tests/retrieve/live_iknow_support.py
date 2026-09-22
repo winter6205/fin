@@ -10,6 +10,7 @@ service.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import threading
 from contextlib import contextmanager
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
+
+import psycopg
 
 from fin.corpus.chunking import split_unit
 from fin.corpus.parsers._common import build_unit
@@ -58,6 +61,53 @@ IKNOW_NEO4J_USER = os.environ.get("FIN_LIVE_IKNOW_NEO4J_USER", "neo4j")
 IKNOW_NEO4J_PASSWORD = os.environ.get(
     "FIN_LIVE_IKNOW_NEO4J_PASSWORD", "iknow-memory-dev"
 )
+
+# A schema name is interpolated into DDL, so it never comes from a caller's
+# free text: only the lowercase-identifier shape the driver generates is legal.
+_PG_SCHEMA_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+
+
+def _db_url_for_schema(db_url: str, schema: str) -> str:
+    """The same PG endpoint, with every connection of the spawned process
+    pointed at ``schema`` through libpq's ``options`` search_path.
+
+    Isolation, not convenience: the embedding generation ledger is a
+    **per-schema singleton** that boot guards against the configured
+    embedder (``guardEmbeddingBoot``), and this cluster's ``public`` schema
+    is owned by iknow's own suites with a real 1536-dim model active. A
+    fake 8-dim embedder booting there is therefore a typed config refuse —
+    the shared 资料 store is not this driver's to realign. iknow's own
+    ``*-pg.test.ts`` suites isolate the same way.
+    """
+
+    if not _PG_SCHEMA_RE.match(schema):
+        raise ValueError(f"unsafe pg_schema name: {schema!r}")
+    separator = "&" if "?" in db_url else "?"
+    return f"{db_url}{separator}options=-c%20search_path%3D{schema}%2Cpublic"
+
+
+def _create_pg_schema(schema: str) -> None:
+    """Create the empty fin-owned schema; iknow's own boot bootstrap fills it."""
+
+    if not _PG_SCHEMA_RE.match(schema):
+        raise ValueError(f"unsafe pg_schema name: {schema!r}")
+    with psycopg.connect(IKNOW_PG_URL, autocommit=True) as connection:
+        connection.execute(f"CREATE SCHEMA {schema}")
+
+
+def _drop_pg_schema(schema: str) -> None:
+    """Teardown of the per-run schema only — CASCADE drops what this run's
+    subprocess boot created inside it, never anything in ``public``."""
+
+    if not _PG_SCHEMA_RE.match(schema):
+        raise ValueError(f"unsafe pg_schema name: {schema!r}")
+    try:
+        with psycopg.connect(IKNOW_PG_URL, autocommit=True) as connection:
+            connection.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+    except psycopg.Error:
+        # best-effort cleanup; the run's unique name keeps a leftover schema
+        # out of every later run's way, exactly as the unique ES indices do.
+        pass
 
 
 class _EmbeddingHandler(BaseHTTPRequestHandler):
@@ -262,6 +312,7 @@ def live_iknow(
     storage: str = "memory",
     es_chunk_index: str | None = None,
     es_entity_index: str | None = None,
+    pg_schema: str | None = None,
 ) -> Iterator[LiveIknow]:
     """Run the real compiled iknow stdio server over one shared process.
 
@@ -278,6 +329,8 @@ def live_iknow(
     are **required** there with no default: the cluster is shared with
     iknow's own live suites, so every pg_es caller must pass explicit
     isolated (ideally per-run unique) index names it owns and cleans up.
+    ``pg_schema`` follows the same rule for the PG side — required, unique
+    per run, created before the spawn and dropped (CASCADE) at teardown.
     """
 
     entry = root / "dist" / "index.js"
@@ -293,6 +346,8 @@ def live_iknow(
         daemon=True,
     )
     thread.start()
+
+    created_schema: str | None = None
 
     if storage == "memory":
         env = {
@@ -329,9 +384,21 @@ def live_iknow(
                 "live suites, so a built-in default name would cross their "
                 "queries — pass per-run isolated fin-owned indices instead"
             )
+        if pg_schema is None:
+            raise ValueError(
+                "storage='pg_es' requires an explicit pg_schema: the "
+                "embedding generation ledger is per-schema and the shared "
+                "public schema carries another suite's active generation, "
+                "so a per-run fin-owned schema is the only boot that does "
+                "not realign storage the driver does not own"
+            )
+        _create_pg_schema(pg_schema)
+        created_schema = pg_schema
         env = {
             "GRAPHRAG_MEMORY_STORAGE": "pgvector",
-            "GRAPHRAG_MEMORY_DB_URL": IKNOW_PG_URL,
+            "GRAPHRAG_MEMORY_DB_URL": _db_url_for_schema(
+                IKNOW_PG_URL, pg_schema
+            ),
             "GRAPHRAG_MEMORY_EMBED_DIMENSIONS": str(EMBED_DIMENSIONS),
             "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS": "2000",
             "GRAPHRAG_MEMORY_EMBED_API_KEY": "fin-live-test",
@@ -384,3 +451,5 @@ def live_iknow(
         embedding_server.shutdown()
         embedding_server.server_close()
         thread.join(timeout=5)
+        if created_schema is not None:
+            _drop_pg_schema(created_schema)

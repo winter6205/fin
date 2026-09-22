@@ -207,7 +207,7 @@ def test_an_open_tier_answers_with_the_same_script(port) -> None:
 
 @pytest.mark.parametrize(
     ("mode", "code"),
-    [("C", "tier_not_open"), ("D", "real_db_not_wired")],
+    [("global", "tier_not_open"), ("D", "real_db_not_wired")],
 )
 def test_the_capability_fake_refuses_an_unopened_tier_like_the_port(
     port, mode: str, code: str

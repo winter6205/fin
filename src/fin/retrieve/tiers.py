@@ -23,53 +23,35 @@ TIER_NOT_OPEN: Final[str] = "tier_not_open"
 
 REAL_DB_NOT_WIRED: Final[str] = "real_db_not_wired"
 
-# The 档 selectors whose product surfaces accept (spec Open Question 1).
-# The list is deliberately closed: the wayfinder doc (闭环与分档
-# §1) forbids an open-ended 业务意图桶, so the only way to ask for a
-# 档 is to NAME its token.
+# The 档 tokens in operator-facing order (查找 / 知识问答 / 综述 / 真数据库,
+# CONTEXT 检索档). Everything the host PRODUCES — the cascade, a pin, an
+# operator pick, the audit — lands on one of these; the retired spellings
+# below are read, never written.
 #
-# This tuple is the SSOT for the closed set. :data:`RetrieveTier` is the
-# SAME list spelled as a ``Literal`` so the wire schema cannot drift
-# from it: adding a 档 here (and only here) updates the enum the send
-# door validates against, and ``TIER_UNAVAILABLE_CODE``'s keys must stay
-# a subset (a code for a 档 outside the closed list is unreachable).
-#
-# The lasting MCP tokens are ``A`` / ``graph`` / ``global`` / ``D``
-# (:data:`LASTING_RETRIEVE_TIERS`). ``B`` and ``C`` stay members of this
-# tuple for one more increment — the send door still TYPES a request with
-# them, so dropping a letter here would reject a live request's own
-# token — but nothing that READS a 档 resolves to one any more:
-# :func:`normalize_tier_token` maps them onto their lasting token first.
-RETRIEVE_TIERS: Final[tuple[str, ...]] = (
-    "A",
-    "B",
-    "C",
-    "D",
-    "graph",
-    "global",
-)
+# This tuple IS the closed set the port forwards from — one definition, so
+# the wire can never accept a token the host does not produce, or refuse
+# one it does. It is deliberately closed: the wayfinder doc (闭环与分档
+# §1) forbids an open-ended 业务意图桶, so the only way to ask for a 档 is
+# to NAME its token.
+LASTING_RETRIEVE_TIERS: Final[tuple[str, ...]] = ("A", "graph", "global", "D")
+
+RETRIEVE_TIERS: Final[tuple[str, ...]] = LASTING_RETRIEVE_TIERS
 
 RetrieveTier = Literal[*RETRIEVE_TIERS]
 
 # The named failure each unimplemented 档 yields. A is 查找 — the
 # lexical fallback the same doc leaves openable, so it is NOT in this
 # table: an A send runs the ordinary (default 知识问答) path today.
-# Neither is ``graph``: it IS that default 档, renamed from ``B``.
-# ``C`` keeps its own row only until the send door stops accepting the
-# letter at all: the port validates raw wire tokens exactly, so a
-# leftover ``C`` must name itself instead of falling to
-# ``invalid_search_mode``.
+# Neither is ``graph``: it IS that default 档.
+#
+# No retired letter has a row here. The port validates the CLOSED SET
+# first, so a leftover ``C`` is ``invalid_search_mode`` before this table
+# is consulted; keeping its row would suggest the letter can still be
+# routed, which is the silent mapping the rename forbids.
 TIER_UNAVAILABLE_CODE: Final[dict[str, str]] = {
-    "C": TIER_NOT_OPEN,
     "global": TIER_NOT_OPEN,
     "D": REAL_DB_NOT_WIRED,
 }
-
-# The 档 tokens in operator-facing order (查找 / 知识问答 / 综述 / 真数据库,
-# CONTEXT 检索档). Everything the host PRODUCES — the cascade, a pin, an
-# operator pick, the audit — lands on one of these; the retired spellings
-# below are read, never written.
-LASTING_RETRIEVE_TIERS: Final[tuple[str, ...]] = ("A", "graph", "global", "D")
 
 # Operator-visible names keyed by the lasting token. The choice window
 # renders these and an utterance is READ against them, so the four names
@@ -86,6 +68,21 @@ TIER_LABELS: Final[dict[str, str]] = {
 # the rename, a stored pin, a client's cached pick) resolves to the 档
 # it named rather than forwarding a token the wire no longer carries.
 RETIRED_TIER_TOKENS: Final[dict[str, str]] = {"B": "graph", "C": "global"}
+
+# What an INPUT surface (the send door's schema, a choice-window option)
+# may receive: the forwarded tokens PLUS the retired letters still in
+# live clients' requests. Deliberately wider than
+# :data:`RETRIEVE_TIERS` — and the difference is the whole point. The
+# boundary has to TYPE these letters long enough to normalize them, so a
+# ``tiers: ["B"]`` send is a 200 whose 档 was resolved, not a schema 422
+# that silently drops the operator's request; inside the seam only the
+# closed set survives, so a letter that gets past the boundary is named
+# as the wiring mistake it is instead of quietly becoming a different 档.
+TIER_INPUT_TOKENS: Final[tuple[str, ...]] = RETRIEVE_TIERS + tuple(
+    RETIRED_TIER_TOKENS
+)
+
+TierInputToken = Literal[*TIER_INPUT_TOKENS]
 
 # Case-folded lookup: a 档 selector is a small closed token, not prose,
 # so ``a`` and ``GRAPH`` are the same request; anything unlisted resolves
@@ -122,9 +119,11 @@ __all__ = [
     "REAL_DB_NOT_WIRED",
     "RETIRED_TIER_TOKENS",
     "RETRIEVE_TIERS",
-    "RetrieveTier",
+    "TIER_INPUT_TOKENS",
     "TIER_LABELS",
     "TIER_NOT_OPEN",
     "TIER_UNAVAILABLE_CODE",
+    "RetrieveTier",
+    "TierInputToken",
     "normalize_tier_token",
 ]

@@ -42,17 +42,10 @@ External blocker: iknow `plans/search-mode-graph-global.md` T1 (library accepts 
    - **Surface:** retrieve port / Fake adapter + named_failures mapping
    - **Acceptance:** Fake or recorded call sends `graph`/`global` for those 档; leftover `B`/`C` on the port is typed invalid; global not-ready → `community_summary_index_failure`; D unwired → `real_db_not_wired`; unopened 综述 → `tier_not_open` on **`global`**; overflow `limit` and concurrent 409 unchanged; no hybrid/RRF in `src/fin`.
    - `[blocks: T2]`
-   - Status: [ ] pending
+   - Status: [x] done
 
 ## End of round
 
 After T1–T3 land: one code-review phase vs `specs/search-mode-graph-global.md`, then verification-before-completion. Unblocks iknow contract (`B`/`C` refuse).
 
-Host-side normalization is done (T2): `fin.retrieve.tiers.RETIRED_TIER_TOKENS` +
-`normalize_tier_token` are the one authority, and every host entry point (utterance
-rules, HTTP pin, choice-window ids, cascade output, audit `search_mode`) resolves
-through it. `RETRIEVE_TIERS` deliberately stays the superset
-(`A|B|C|D|graph|global`) until T3 lands on `src/fin/retrieve/port.py`; that is where
-it shrinks to `LASTING_RETRIEVE_TIERS` (`A|graph|global|D`) — the port seam still
-accepts `B`/`C` today (`resolve_search_mode("B") == "B"`), so enforcement remains
-T3's job and nothing about the wire changed here.
+Landed state: `RETRIEVE_TIERS` is the closed `A|graph|global|D` and is NOT a superset of `B`/`C`; the retired letters live only on the wider entry-input tuple (`TIER_INPUT_TOKENS`) so the send door can still type and normalize a live request that names them. Live proof: `-m mcp tests/retrieve/test_live_search_modes_pg_es.py` (10 passed) over real PG + ES + Neo4j.

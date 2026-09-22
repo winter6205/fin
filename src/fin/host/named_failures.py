@@ -89,9 +89,11 @@ from fin.retrieve.tiers import (
     RETIRED_TIER_TOKENS,
     RETRIEVE_TIERS,
     RetrieveTier,
+    TIER_INPUT_TOKENS,
     TIER_LABELS,
     TIER_NOT_OPEN,
     TIER_UNAVAILABLE_CODE,
+    TierInputToken,
     normalize_tier_token,
 )
 
@@ -123,11 +125,12 @@ COMMUNITY_SUMMARY_INDEX_FAILURE: Final[str] = "community_summary_index_failure"
 EMPTY_FAST_GRAPH_FAILURE: Final[str] = "empty_fast_graph_failure"
 
 # NOTE (T6 reach): a 档 is invoked ONLY through the explicit selector
-# (:data:`RETRIEVE_TIERS` and the send door's ``RetrieveTier`` enum).
-# Question prose is never scanned for 档 words —「综述这几份
-# 10-Q」 is a perfectly ordinary B ask about a small set of filings,
-# and reading it as a C invocation would be the 开放业务意图桶 the
-# wayfinder doc forbids. See ``plans/first-closed-loop.md`` T6.
+# (the send door's ``TierInputToken`` enum, whose accepted spellings
+# resolve onto :data:`RETRIEVE_TIERS`). Question prose is never scanned
+# for 档 words —「综述这几份 10-Q」 is a perfectly ordinary 知识问答 ask
+# about a small set of filings, and reading it as a 综述 invocation would
+# be the 开放业务意图桶 the wayfinder doc forbids. See
+# ``plans/first-closed-loop.md`` T6.
 
 
 # ----- the retrieve-side decision -----
@@ -285,9 +288,11 @@ __all__ = [
     "RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY",
     "RETRIEVE_TIERS",
     "RetrieveTier",
+    "TIER_INPUT_TOKENS",
     "TIER_LABELS",
     "TIER_NOT_OPEN",
     "TIER_UNAVAILABLE_CODE",
+    "TierInputToken",
     "named_refusal_reason",
     "normalize_tier_token",
     "retrieve_blocking_failure",

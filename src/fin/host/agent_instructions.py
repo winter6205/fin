@@ -13,6 +13,7 @@ from typing import Any
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
 from fin.host.track_decision import Track, normalize_track
+from fin.retrieve.tiers import normalize_tier_token
 
 HOST_INSTRUCTIONS_MARKER: str = "[FIN_HOST_INSTRUCTIONS]"
 THREAD_ATTACHMENTS_MARKER: str = "[FIN_THREAD_ATTACHMENTS]"
@@ -200,9 +201,8 @@ CLARIFY_SYSTEM_PROMPT: str = (
 # tell which mode a call ran under.
 SEARCH_MODE_INSTRUCTIONS_MARKER: str = "[FIN_SEARCH_MODE]"
 
-# One body per 档, bound by name: a former letter and its lasting token
-# must resolve the SAME text, because two bodies would teach the model two
-# different tokens for one 档 (and let them drift). Operator labels stay
+# One body per 档, bound by its lasting token: one 档 means one text, so
+# the model is never shown two tokens for it. Operator labels stay
 # 查找 / 知识问答 / 综述 / 真数据库 — only the MCP token is named here.
 _USAGE_LEXICAL: str = (
     f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
@@ -243,36 +243,34 @@ _USAGE_REAL_DB: str = (
     "(MCP filters.search_mode=graph), never on this one."
 )
 
-# Every host entry point resolves a retired letter onto its lasting token
-# before it reaches this dict, so ``B`` / ``C`` are read only by a turn
-# whose audit predates the rename (an old checkpoint's ``search_mode``).
-# They go when a run no longer starts with such a thread; until then a
-# legacy turn that asks for its copy must get it.
+# Keyed by the lasting tokens alone. A retired letter is resolved onto its
+# lasting token by :func:`fin.retrieve.tiers.normalize_tier_token` BEFORE
+# this dict is read, which is the condition that lets a legacy spelling
+# carry no key here: the copy stays reachable for a pre-rename turn while
+# the retired spellings live in exactly one place (the SSOT map), so
+# retiring or adding one never touches this file.
 SEARCH_MODE_USAGE_COPY: dict[str, str] = {
     "A": _USAGE_LEXICAL,
     "graph": _USAGE_KNOWLEDGE_QA,
-    "B": _USAGE_KNOWLEDGE_QA,
     "global": _USAGE_REVIEW,
-    "C": _USAGE_REVIEW,
     "D": _USAGE_REAL_DB,
 }
 
 
 def _usage_copy_for(search_mode: object) -> str | None:
-    """The 档 copy keyed by THIS turn's token, or ``None`` for no copy.
+    """The 档 copy for THIS turn's token, or ``None`` for no copy.
 
-    Exact match first: ``graph`` / ``global`` are lowercase words, so an
-    unconditional ``upper()`` would swallow every one of them. The
-    upper-cased retry stays behind it because the letters have always been
-    fed in mixed case (pin text, choice-window picks) and a pre-rename
-    audit can still carry one.
+    Spelling→token resolution is delegated to the SSOT's
+    :func:`normalize_tier_token` — one authority for casing and for the
+    retired letters, instead of a second case-folding rule beside this
+    dict. Anything outside the accepted spellings resolves to nothing,
+    never to the nearest 档; a lasting token with no copy (an unwired 档)
+    likewise injects nothing rather than another 档's instructions.
     """
-    if not isinstance(search_mode, str):
+    token = normalize_tier_token(search_mode)
+    if token is None:
         return None
-    token = search_mode.strip()
-    return SEARCH_MODE_USAGE_COPY.get(token) or SEARCH_MODE_USAGE_COPY.get(
-        token.upper()
-    )
+    return SEARCH_MODE_USAGE_COPY.get(token)
 
 
 # Operator-facing ask per slot the clarify track can be missing.

@@ -22,7 +22,8 @@ SPA renders it with zero web changes — but must never silent-apply:
   ``False``: there is no silent Fast.
 * the string ``Fast`` is NEVER a 检索档: it is not an option id in the
   mode window, an out-of-list pick there reopens (no crash), and
-  ``search_mode`` after every flow here stays ``None`` or ``A|B|C|D``.
+  ``search_mode`` after every flow here stays ``None`` or a member of
+  ``fin.retrieve.tiers.LASTING_RETRIEVE_TIERS``.
 * default grounded flow (no seed) and the lane-off factory default
   never open the window.
 
@@ -51,6 +52,7 @@ from fin.corpus.catalog import record_filings
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.extract_method_proposal import DEFAULT_EXTRACT_METHOD
 from fin.host.state import reset_input_state
+from fin.retrieve.tiers import LASTING_RETRIEVE_TIERS
 
 pytestmark = [pytest.mark.soft_track]
 
@@ -267,10 +269,12 @@ def test_propose_then_mode_window_chain_never_yields_fast_mode() -> None:
     assert resolved["extract_method_proposal"]["picked"] == "fast"
     assert resolved["extract_method_proposal"]["applied"] is False
     # ...and the run then pauses on the SECOND window: the 档 clarify
-    # window, with the A/B/C/D option list (Fast is not among them).
+    # window, whose option ids are the SSOT's lasting tokens
+    # (``LASTING_RETRIEVE_TIERS``), in operator order. Fast is not among
+    # them.
     mode_payload = _interrupt_payload(resolved)
     assert mode_payload is not None
-    assert _option_ids(mode_payload) == ["A", "graph", "global", "D"]
+    assert _option_ids(mode_payload) == list(LASTING_RETRIEVE_TIERS)
     assert resolved["search_mode_decision"]["search_mode"] not in ("Fast", "fast")
 
     # "fast" is NOT a 档 id: the mode window reopens, never crash.

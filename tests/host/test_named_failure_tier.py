@@ -1,12 +1,12 @@
 """global 综述 / D 真数据库 未开未接 是具名失败, 不是文档检索 (T6, spec SC9).
 
-SC9: "C and D remain unused: if invoked, named 未开/未接, no fake SQL
-retrieve." The wayfinder doc (闭环与分档 §1) fixes both halves of the
-contract:
+SC9: "``global`` (formerly C) and D remain unused: if invoked, named
+未开/未接, no fake SQL retrieve." The wayfinder doc (闭环与分档 §1) fixes
+both halves of the contract:
 
-* "分类输出仅为 ``A|B|C|D``（不确定则澄清）；每档一套问答模板。
-  **禁止开放业务意图桶**" — C/D are asked for by NAME, never inferred
-  from business intent.
+* "分类输出仅为 ``A|graph|global|D``（不确定则澄清）；每档一套问答模板。
+  **禁止开放业务意图桶**" — the unopened 档 are asked for by NAME, never
+  inferred from business intent.
 * "A/C/D 未开或未就绪：**具名失败**（查找未开 / 综述未开 / 真库未接），
   不得一律 ``unknown_locator`` + 空 citations."
 
@@ -42,11 +42,16 @@ from langgraph.checkpoint.memory import InMemorySaver
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.named_failures import (
     REAL_DB_NOT_WIRED,
+    RETIRED_TIER_TOKENS,
+    RETRIEVE_TIERS,
+    TIER_INPUT_TOKENS,
     TIER_NOT_OPEN,
     TIER_UNAVAILABLE_CODE,
-    RETRIEVE_TIERS,
     unavailable_tier,
 )
+from fin.host.search_mode_decision import normalize_search_mode
+from fin.retrieve.fake_port import FakeRetrievePort
+from fin.retrieve.port import resolve_search_mode
 
 
 KNOWN_IDS = {"AAPL-2022Q3"}
@@ -126,15 +131,28 @@ def test_the_open_tiers_are_not_refused(tier: str) -> None:
 
 def test_an_unknown_token_is_not_guessed_at() -> None:
     """Only the closed tier list can request a 档 — an arbitrary
-    string is never read as C/D (禁止开放业务意图桶)."""
+    string is never read as 综述 / 真数据库 (禁止开放业务意图桶)."""
     assert unavailable_tier(["summary", "sql", "database"]) is None
 
 
-def test_the_closed_tier_list_is_the_migration_superset() -> None:
-    """``graph`` / ``global`` join the closed set while the letters are
-    still what the cascade and the pin produce; they leave when normalize
-    retires them, not before."""
-    assert RETRIEVE_TIERS == ("A", "B", "C", "D", "graph", "global")
+def test_the_closed_tier_list_is_the_lasting_set() -> None:
+    """The letters left the closed set when normalize took over their
+    input duty: ``graph`` / ``global`` ARE the list the port forwards from,
+    and nothing else can join it without being a lasting token."""
+    assert RETRIEVE_TIERS == ("A", "graph", "global", "D")
+
+
+def test_the_door_still_reads_the_retired_letters_the_port_refuses() -> None:
+    """The two sets answer two different questions, and the rename needs
+    both. ``RETRIEVE_TIERS`` is what the port FORWARDS;
+    ``TIER_INPUT_TOKENS`` is what the send schema ACCEPTS. The letters live
+    only in the second — which is why retiring them from the wire set cannot
+    turn a live client's own token into a 422, and why a 档 added to the
+    closed set reaches the port without ever being an input spelling."""
+    assert TIER_INPUT_TOKENS == RETRIEVE_TIERS + tuple(RETIRED_TIER_TOKENS)
+    for letter in RETIRED_TIER_TOKENS:
+        assert letter not in RETRIEVE_TIERS
+        assert letter in TIER_INPUT_TOKENS
 
 
 # ----- T1 (search-mode-retrieve): the public C-not-ready code -----
@@ -193,12 +211,15 @@ def test_community_summary_index_failure_does_not_collapse_into_unknown_locator(
 
 
 def test_the_send_schema_enum_is_derived_from_the_tier_ssot() -> None:
-    """Drift guard: the send door's enum must BE the SSOT's closed set.
+    """Drift guard: the send door's enum must BE the SSOT's accepted-input
+    tuple, and the port's Literal must BE its closed set.
 
-    Re-spelling the four tokens in the Pydantic model would let a 档
-    added to ``RETRIEVE_TIERS`` keep validating against the old set —
-    the drift this asserts against. Both faces are read here, so the
-    test fails whichever side is edited alone.
+    Re-spelling the tokens in the Pydantic model would let a 档 added to
+    ``RETRIEVE_TIERS`` keep validating against the old set — the drift this
+    asserts against. The field is deliberately the INPUT tuple, not the
+    forwarded one: that difference is the whole reason a retired letter can
+    still arrive over HTTP (see
+    :func:`test_a_retired_letter_pin_reaches_the_port_as_its_lasting_token`).
     """
     from typing import get_args
 
@@ -209,11 +230,79 @@ def test_the_send_schema_enum_is_derived_from_the_tier_ssot() -> None:
     schemas = [field.annotation, *get_args(field.annotation)]
 
     assert get_args(RetrieveTier) == RETRIEVE_TIERS
-    # The Literal the SSOT derives is what the field actually carries:
-    # edit either side alone and this stops holding.
     assert any(
-        get_args(schema) == RETRIEVE_TIERS for schema in schemas
+        get_args(schema) == TIER_INPUT_TOKENS for schema in schemas
     ), schemas
+
+
+def test_a_retired_letter_pin_reaches_the_port_as_its_lasting_token(
+    client: TestClient, store, http_app: FastAPI
+) -> None:
+    """The trap the closed set shrinks into, pinned on the real HTTP path.
+
+    An operator pin spelled ``B档`` is a LIVE request, not a legacy curiosity:
+    if the send schema typed the forwarded set it would be a schema 422 and
+    the run would never start. So the boundary normalizes onto the lasting
+    token and the enum stays pure — proven by the facts that have to hold
+    together: the door answers 200, the run's audit reads ``graph``, that
+    value is one the port's own seam accepts, and no letter is recorded on
+    any call the port took.
+    """
+    from fin.host.http import get_graph
+
+    port = FakeRetrievePort(
+        hits_by_query={"revenue": []},
+        known_document_ids=KNOWN_IDS,
+    )
+    built = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=ScriptedChatModel(
+            script=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "retrieve",
+                            "args": {"query": "revenue"},
+                            "id": "c-pin",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="The answer."),
+            ]
+        ),
+        adapter=port,
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: built
+    thread_id = _new_thread(client)
+
+    sent = client.post(
+        f"/api/threads/{thread_id}/messages",
+        json={
+            "question": "What was AAPL net sales in 2023 Q3?",
+            "tiers": ["B"],
+        },
+    )
+
+    assert sent.status_code == 200, sent.text
+    assert port.calls, "the grounded retrieve must have reached the port"
+    audit = built._graph.get_state(
+        {"configurable": {"thread_id": thread_id}}
+    ).values["search_mode_decision"]
+    assert audit["search_mode"] == "graph"
+    assert audit["signals"].get("pinned") is True
+    # The seam's own verdict on the value this run assigned: exactly what
+    # shrinking ``RETRIEVE_TIERS`` to the lasting set must leave intact.
+    assert resolve_search_mode(audit["search_mode"]) == "graph"
+    # The normalizer the send door itself calls is what turned the letter
+    # into that token; the seam never sees the letter.
+    assert normalize_search_mode("B") == "graph"
+    assert resolve_search_mode(normalize_search_mode("B")) == "graph"
+    assert all(
+        call["search_mode"] not in RETIRED_TIER_TOKENS for call in port.calls
+    ), [call["search_mode"] for call in port.calls]
 
 
 def test_every_tier_code_key_is_a_tier_the_door_accepts() -> None:

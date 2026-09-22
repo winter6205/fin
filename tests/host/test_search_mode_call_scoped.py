@@ -44,7 +44,6 @@ from fin.host.agent_instructions import (
 )
 from fin.host.graph import compile_graph
 from fin.host.scripted_model import ScriptedChatModel
-from fin.host.named_failures import RETIRED_TIER_TOKENS
 from fin.host.search_mode_decision import MODE_LABELS
 from fin.host.session_compaction import session_token_budget
 from fin.host.state import reset_input_state
@@ -228,14 +227,9 @@ def test_unassigned_or_unknown_mode_injects_nothing() -> None:
 
 def test_each_mode_copy_names_only_its_tier() -> None:
     """Every 档 carries its own usage copy naming exactly its label —
-    查找 / 知识问答 / 综述 / 真数据库 (CONTEXT 检索档)."""
-    # The copy still answers the retired letters (one more increment) and
-    # says the same thing for them as for their lasting tokens.
-    assert set(SEARCH_MODE_USAGE_COPY) == set(MODE_LABELS) | set(
-        RETIRED_TIER_TOKENS
-    )
-    for retired, lasting in RETIRED_TIER_TOKENS.items():
-        assert SEARCH_MODE_USAGE_COPY[retired] == SEARCH_MODE_USAGE_COPY[lasting]
+    查找 / 知识问答 / 综述 / 真数据库 (CONTEXT 检索档). The copy-key /
+    retired-spelling superset is pinned once in
+    ``test_search_mode_usage_copy_keys.py``, not re-derived here."""
     for mode, label in MODE_LABELS.items():
         content = str(
             messages_for_model(

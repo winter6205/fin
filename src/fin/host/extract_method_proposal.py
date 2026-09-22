@@ -19,7 +19,8 @@ pick → resume contract the 档 clarify window uses (ADR 0062), so the v1
 SPA renders this window with no web change.
 
 Why this module is NOT part of :mod:`fin.host.search_mode_decision`:
-a 检索档 is A/B/C/D and ``Fast`` must never be one (spec SC3), so the
+a 检索档 is one of ``fin.retrieve.tiers.LASTING_RETRIEVE_TIERS`` and
+``Fast`` is never one of them, so the
 extract-method vocabulary deliberately shares no token space with the
 档 cascade — a single module boundary per concept keeps a stray
 ``"Fast"`` from ever typing itself into ``search_mode``.
