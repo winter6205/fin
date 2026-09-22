@@ -21,17 +21,23 @@ Focus assertions — what this fin-side driver PROVES (spec
 
 * **A** — a real-ES lexical hit on a child resolves through the ledger
   back-pointer and cites the PARENT body, never a child-only slice.
-* **B on the wire** — an explicit B carries ``filters.search_mode``
-  while a missing mode does not send it.
-* **B equivalence** — the missing mode and explicit B answer the same
-  fused ranking (iknow's own default is B).
-* **B fusion** — the fused answer carries NO degradation reason, so
+* **graph on the wire** — an explicit ``graph`` carries
+  ``filters.search_mode=graph`` while a missing mode does not send it.
+* **graph equivalence** — the missing mode and explicit ``graph`` answer
+  the same fused ranking (iknow's own default is ``graph``).
+* **graph fusion** — the fused answer carries NO degradation reason, so
   BOTH core arms — vector and the ES/BM25 lexical arm — participated.
-* **B order** — the adapter faithfully preserves iknow's descending
+* **graph order** — the adapter faithfully preserves iknow's descending
   fused-score order.
-* **C / D / invalid** — the named exits (``tier_not_open``,
-  ``real_db_not_wired``, ``invalid_search_mode``) are unchanged when
-  the full stack is live: the 档 check still runs before the transport.
+* **global is a token the SERVER knows** — fin's port has not opened 综述
+  yet, so the ordinary call refuses 「档未开」 before the wire; the raw
+  round trip still proves iknow accepts ``global`` and answers with its
+  own not-ready fact (``community_summary_index_failure``), never with a
+  refused enum value.
+* **D / leftover letters / invalid** — the named exits
+  (``real_db_not_wired``, ``invalid_search_mode`` for a leftover ``B`` /
+  ``C`` and for ``local``) are unchanged when the full stack is live: the
+  档 check still runs before the transport.
 
 What this driver does NOT prove: graph-priority REORDERING is iknow's
 internal contract, validated against real Neo4j + GDS in iknow #242
@@ -44,14 +50,17 @@ consistent ranking. The assertions above therefore pin the
 fin-observable wire/fusion/order contract instead of impersonating
 graph-priority coverage.
 
-Isolation on the shared cluster: per-run unique document/version ids
-and per-run fin-owned ES indices (deleted at teardown). The PG rows
-stay namespaced by the unique document id — shared-authoritative
-storage is not this driver's to drop.
+Isolation on the shared cluster: per-run unique document/version ids, per-run
+fin-owned ES indices and one per-run fin-owned PG schema (all deleted at
+teardown). The schema is what makes the boot legal at all: the embedding
+generation ledger iknow guards against its configured embedder is per-schema,
+and ``public`` on this cluster belongs to another suite's 1536-dim generation,
+which no fake-embedding driver may realign.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 import string
@@ -65,7 +74,11 @@ import pytest
 from fin.corpus.chunking import split_unit
 from fin.corpus.parsers._common import build_unit
 from fin.corpus.push import envelope_of_unit
-from fin.host.named_failures import REAL_DB_NOT_WIRED, TIER_NOT_OPEN
+from fin.host.named_failures import (
+    COMMUNITY_SUMMARY_INDEX_FAILURE,
+    REAL_DB_NOT_WIRED,
+    TIER_NOT_OPEN,
+)
 from fin.retrieve.port import InvalidSearchModeError, SEARCH_MODE_FILTER_KEY
 
 from live_iknow_support import IKNOW_ES_URL, IKNOW_ROOT, live_iknow
@@ -78,6 +91,7 @@ _DOCUMENT_ID = f"T2-{_RUN.upper()}"
 _VERSION = uuid.uuid4().hex + uuid.uuid4().hex
 _CHUNK_INDEX = f"fin_task2_chunks_{_RUN}"
 _ENTITY_INDEX = f"fin_task2_entities_{_RUN}"
+_PG_SCHEMA = f"fin_task2_pg_{_RUN}"
 
 
 def _rare_token(prefix: str) -> str:
@@ -98,16 +112,16 @@ _ES_VISIBLE_TIMEOUT_SECONDS = 10.0
 
 def _fixture_text() -> str:
     """One unit whose narrative 切分 yields ≥2 children, each carrying
-    one tier's rare token so A and B hit different children of the
-    same parent."""
+    one 档's rare token so A and graph hit different children of the same
+    parent."""
 
     filler_a = "Revenue discussion continues across the first child slice. " * 20
     filler_b = "Cost of revenue discussion continues across the second child slice. " * 20
     return (
         f"{_A_TOKEN} opens the first child slice of this live parent "
         "window fixture for the A tier lexical check. " + filler_a
-        + f"{_B_TOKEN} marks the second child slice reserved for the B "
-        "tier fused ranking check. " + filler_b
+        + f"{_B_TOKEN} marks the second child slice reserved for the graph "
+        "档 fused ranking check. " + filler_b
     )
 
 
@@ -190,6 +204,7 @@ def live() -> Iterator[Any]:
             storage="pg_es",
             es_chunk_index=_CHUNK_INDEX,
             es_entity_index=_ENTITY_INDEX,
+            pg_schema=_PG_SCHEMA,
         ) as session:
             yield session
     finally:
@@ -260,12 +275,12 @@ def test_a_tier_real_es_lexical_hit_cites_the_parent_body(
         assert chunk.source_ref.page == 1
 
 
-def test_b_tier_sends_search_mode_on_the_wire_and_matches_the_default(
+def test_graph_tier_sends_search_mode_on_the_wire_and_matches_the_default(
     live: Any, parent_envelope: Any
 ) -> None:
-    """Spec SC3 + the port's「missing → do not send」rule: the explicit
-    B request carries ``filters.search_mode`` on the wire, the missing
-    mode sends no such key, and BOTH answer the same fused
+    """Spec SC2 + the port's「missing → do not send」rule: the explicit
+    ``graph`` request carries ``filters.search_mode=graph`` on the wire,
+    the missing mode sends no such key, and BOTH answer the same fused
     vector∥BM25 ranking that contains the pushed child, with no
     degradation reason on either. The fused score order is preserved
     by the adapter. Graph-priority REORDERING is NOT claimed here —
@@ -276,26 +291,26 @@ def test_b_tier_sends_search_mode_on_the_wire_and_matches_the_default(
     before = len(_retrieve_requests(live))
     default_answer = live.retrieve.retrieve(_B_TOKEN, limit=8)
     explicit_answer = live.retrieve.retrieve(
-        _B_TOKEN, limit=8, search_mode="B"
+        _B_TOKEN, limit=8, search_mode="graph"
     )
 
     assert "error" not in default_answer, default_answer
     assert "error" not in explicit_answer, explicit_answer
-    # B is contractually vector∥BM25 fused. A healthy B on this real
-    # stack answers with NO degradation at all (observed: the
+    # graph is contractually vector∥BM25 fused. A healthy graph arm on
+    # this real stack answers with NO degradation at all (observed: the
     # ``degraded_reasons`` field is absent, and even the graph arm of
     # this entity-less corpus emits no emptiness reason), so the
     # strongest honest check is an empty reason list. It covers both
     # core arms symmetrically: a ``vector:*`` reason (BM25-only
     # fallback) fails just as hard as a ``keyword_bm25:*`` one
-    # (vector-only fallback) — neither degraded shape is the B
+    # (vector-only fallback) — neither degraded shape is the graph
     # contract and none may pass as one.
     for answer in (default_answer, explicit_answer):
         reasons = list(answer.get("degraded_reasons") or [])
         assert reasons == [], (
-            "B's fused ranking must include BOTH core arms (vector and "
-            "ES/BM25 lexical); any degradation reason means one arm "
-            f"answered alone: {answer!r}"
+            "the graph 档's fused ranking must include BOTH core arms "
+            "(vector and ES/BM25 lexical); any degradation reason means "
+            f"one arm answered alone: {answer!r}"
         )
 
     requests = _retrieve_requests(live)
@@ -304,10 +319,11 @@ def test_b_tier_sends_search_mode_on_the_wire_and_matches_the_default(
     explicit_args = requests[before + 1]["params"]["arguments"]
     assert SEARCH_MODE_FILTER_KEY not in default_args.get("filters", {}), (
         "a missing search_mode must not ride the wire (iknow's own "
-        f"default B answers): {default_args!r}"
+        f"default 档 answers): {default_args!r}"
     )
-    assert explicit_args["filters"][SEARCH_MODE_FILTER_KEY] == "B", (
-        f"explicit B must send filters.search_mode: {explicit_args!r}"
+    assert explicit_args["filters"][SEARCH_MODE_FILTER_KEY] == "graph", (
+        "explicit graph must send filters.search_mode=graph: "
+        f"{explicit_args!r}"
     )
 
     def shape(answer: dict) -> list[tuple[str, str, int, float]]:
@@ -322,12 +338,12 @@ def test_b_tier_sends_search_mode_on_the_wire_and_matches_the_default(
         ]
 
     assert shape(default_answer) == shape(explicit_answer), (
-        "missing mode and explicit B diverged — iknow's own default "
-        "mode is B, so both requests must answer identically"
+        "missing mode and explicit graph diverged — iknow's own default "
+        "mode is graph, so both requests must answer identically"
     )
     texts = [chunk.text for chunk in explicit_answer["chunks"]]
     assert any(_B_TOKEN in text for text in texts), (
-        f"档 B's fused ranking omitted the child carrying "
+        f"档 graph's fused ranking omitted the child carrying "
         f"{_B_TOKEN!r}: {explicit_answer!r}"
     )
     scores = [chunk.score for chunk in explicit_answer["chunks"]]
@@ -336,21 +352,89 @@ def test_b_tier_sends_search_mode_on_the_wire_and_matches_the_default(
     )
 
 
+def test_the_global_token_is_one_the_server_accepts_even_though_fin_has_not_opened_it(
+    live: Any, parent_envelope: Any
+) -> None:
+    """The two halves of the 综述 fact, on one real round trip.
+
+    fin's port refuses ``global`` as 「档未开」 and never spends a wire
+    call on it. That is fin's own routing state, NOT evidence that the
+    token is unknown to iknow — so the raw transport is used here to
+    check the other half: the server takes ``global`` as a legal
+    ``filters.search_mode`` value and answers with its own not-ready
+    fact. A server-side enum refusal (``invalid_search_mode``) here would
+    mean fin renamed a token the sibling contract never carried.
+    """
+
+    before = len(_retrieve_requests(live))
+    response = asyncio.run(
+        live.retrieve._call_mcp(
+            {
+                "jsonrpc": "2.0",
+                # The same request id the adapter's own payload uses; the
+                # session answers one request at a time, so the value is
+                # transport-local.
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "retrieve",
+                    "arguments": {
+                        "query": _B_TOKEN,
+                        "limit": 8,
+                        "filters": {SEARCH_MODE_FILTER_KEY: "global"},
+                    },
+                },
+            }
+        )
+    )
+    requests = _retrieve_requests(live)
+    assert len(requests) == before + 1, (
+        "the raw round trip did not reach the server, so it proves nothing "
+        "about what the server accepts"
+    )
+    assert (
+        requests[before]["params"]["arguments"]["filters"][
+            SEARCH_MODE_FILTER_KEY
+        ]
+        == "global"
+    )
+
+    observed = json.dumps(response, default=str)
+    assert "invalid_search_mode" not in observed, (
+        "the server refused the ``global`` token itself, so fin's closed "
+        f"set does not match what iknow accepts: {observed}"
+    )
+    assert COMMUNITY_SUMMARY_INDEX_FAILURE in observed, (
+        "the 综述 arm is not ready on this stack, and that is the fact the "
+        f"server should answer with: {observed}"
+    )
+
+    # And fin's own seam still keeps its routing-time name for the same
+    # token: the server accepting it is not an invitation to open it.
+    assert live.retrieve.retrieve(_B_TOKEN, search_mode="global") == {
+        "error": TIER_NOT_OPEN
+    }
+    assert len(_retrieve_requests(live)) == before + 1, (
+        "an unopened 档 must be refused before the wire, even though the "
+        "server would have answered"
+    )
+
+
 @pytest.mark.parametrize(
     ("mode", "code"),
     [
-        pytest.param("C", TIER_NOT_OPEN, id="tier-c"),
+        pytest.param("global", TIER_NOT_OPEN, id="tier-global"),
         pytest.param("D", REAL_DB_NOT_WIRED, id="tier-d"),
     ],
 )
 def test_unopened_tier_keeps_its_named_exit_with_the_full_stack_live(
     live: Any, mode: str, code: str
 ) -> None:
-    """C/D exits are routing-time, not transport-time: even with real
-    ES/PG/Neo4j behind iknow (where a B-shaped answer WOULD succeed),
-    the port still refuses 「档未开」/「真库未接」 by name and the
-    request never reaches the wire — no silent default-B dressed as C
-    or D."""
+    """The unopened 档 exits are routing-time, not transport-time: even
+    with real ES/PG/Neo4j behind iknow (where a graph-shaped answer WOULD
+    succeed), the port still refuses 「档未开」/「真库未接」 by name and
+    the request never reaches the wire — no silent default answer dressed
+    as 综述 or D."""
 
     before = len(_retrieve_requests(live))
     assert live.retrieve.retrieve(_B_TOKEN, search_mode=mode) == {
@@ -359,17 +443,21 @@ def test_unopened_tier_keeps_its_named_exit_with_the_full_stack_live(
     assert len(_retrieve_requests(live)) == before
 
 
+@pytest.mark.parametrize("leftover", ["B", "C", "b", "c", "local"])
 def test_invalid_mode_raises_before_the_wire_with_the_full_stack_live(
     live: Any,
+    leftover: str,
 ) -> None:
     """An out-of-set token is the caller's error: it raises
     ``InvalidSearchModeError`` (code ``invalid_search_mode``) before
     the round trip even though iknow itself is fully wired and could
-    answer B-shaped hits — guessing around it would be the silent
-    degradation the spec forbids."""
+    answer graph-shaped hits — guessing around it would be the silent
+    degradation the spec forbids. The retired letters are in this list on
+    purpose: they are the tokens a stale client is most likely to still
+    send, and the port is exactly where they stop."""
 
     before = len(_retrieve_requests(live))
     with pytest.raises(InvalidSearchModeError) as excinfo:
-        live.retrieve.retrieve(_B_TOKEN, search_mode="c")
+        live.retrieve.retrieve(_B_TOKEN, search_mode=leftover)
     assert excinfo.value.code == "invalid_search_mode"
     assert len(_retrieve_requests(live)) == before

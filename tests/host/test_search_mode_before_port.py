@@ -41,7 +41,11 @@ from fin.host.search_mode_decision import normalize_search_mode
 from fin.host.scripted_model import ScriptedChatModel
 from fin.host.state import reset_input_state
 from fin.retrieve.fake_port import FakeRetrievePort
-from fin.retrieve.port import TierUnavailableError, resolve_search_mode
+from fin.retrieve.port import (
+    InvalidSearchModeError,
+    TierUnavailableError,
+    resolve_search_mode,
+)
 from fin.retrieve.tiers import RETIRED_TIER_TOKENS
 
 pytestmark = [pytest.mark.soft_track]
@@ -241,4 +245,13 @@ def test_the_value_handed_to_the_port_is_never_a_letter() -> None:
     else:
         raise AssertionError("global accepted as an open 档")
 
-    assert resolve_search_mode("B") == "B"
+    # And the seam keeps its own name for a letter that arrives UN-normalized:
+    # the host's pin may be spelled either way, but the port forwards only the
+    # closed set, so a leftover letter is a wiring bug it refuses rather than a
+    # 档 it quietly reroutes.
+    try:
+        resolve_search_mode("B")
+    except InvalidSearchModeError as exc:
+        assert exc.code == "invalid_search_mode"
+    else:
+        raise AssertionError("a retired letter still crossed the port seam")

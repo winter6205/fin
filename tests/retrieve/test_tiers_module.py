@@ -45,27 +45,37 @@ def test_tiers_module_exists_with_the_closed_set() -> None:
         TIER_UNAVAILABLE_CODE,
     )
 
-    assert RETRIEVE_TIERS == ("A", "B", "C", "D", "graph", "global")
+    assert RETRIEVE_TIERS == ("A", "graph", "global", "D")
     assert TIER_NOT_OPEN == "tier_not_open"
     assert REAL_DB_NOT_WIRED == "real_db_not_wired"
     assert TIER_UNAVAILABLE_CODE == {
-        "C": "tier_not_open",
         "global": "tier_not_open",
         "D": "real_db_not_wired",
     }
 
 
-# ----- 1b. the lasting tokens sit BESIDE the letters this increment -----
+# ----- 1b. the retired letters are INPUT spellings, never wire tokens -----
 
 
-def test_the_former_letters_are_still_members() -> None:
-    """The rename ships in two increments: normalize (the next bullet)
-    has to retire ``B``/``C``, so removing them here would break the
-    surfaces that still produce them."""
-    from fin.retrieve.tiers import RETRIEVE_TIERS
+def test_the_retired_letters_are_accepted_input_but_not_wire_tokens() -> None:
+    """The two halves of the rename live in different sets on purpose.
+
+    A request can still ARRIVE as ``B`` / ``C`` (an old client, a stored
+    pin), so those spellings stay in the accepted-input tuple the send
+    schema validates against. They are no longer in the closed set the
+    port forwards from: a letter that reaches the port is a wiring
+    mistake, and the only honest answer to a mistake is a named one.
+    """
+    from fin.retrieve.tiers import (
+        RETIRED_TIER_TOKENS,
+        RETRIEVE_TIERS,
+        TIER_INPUT_TOKENS,
+    )
 
     for letter in ("B", "C"):
-        assert letter in RETRIEVE_TIERS
+        assert letter not in RETRIEVE_TIERS
+        assert letter in TIER_INPUT_TOKENS
+    assert TIER_INPUT_TOKENS == RETRIEVE_TIERS + tuple(RETIRED_TIER_TOKENS)
 
 
 def test_graph_is_an_open_tier_and_global_is_not() -> None:
@@ -86,17 +96,35 @@ def test_graph_is_an_open_tier_and_global_is_not() -> None:
         raise AssertionError("global accepted as an open 档")
 
 
-def test_the_letters_route_exactly_as_before() -> None:
-    """A superset must not move an existing exit: ``B`` stays open and
-    ``C``/``D`` keep their own「未开」codes."""
-    from fin.retrieve.port import TierUnavailableError, resolve_search_mode
+def test_a_retired_letter_at_the_port_is_invalid_not_routed() -> None:
+    """Negative class, and the whole point of the closed set shrinking.
+
+    ``B`` used to be an open 档 on the port and ``C`` an unopened one;
+    both now answer ``invalid_search_mode``. Normalizing them here would
+    be the silent mapping the spec forbids — the host already resolved
+    its own spellings before the seam, so a letter that got this far is a
+    wiring bug whose name must survive.
+    """
+    from fin.retrieve.port import (
+        InvalidSearchModeError,
+        TierUnavailableError,
+        resolve_search_mode,
+    )
 
     assert resolve_search_mode("A") == "A"
-    assert resolve_search_mode("B") == "B"
+    assert resolve_search_mode("graph") == "graph"
     assert resolve_search_mode(None) is None
 
+    for token in ("B", "C"):
+        try:
+            resolve_search_mode(token)
+        except InvalidSearchModeError as exc:
+            assert exc.code == "invalid_search_mode", token
+        else:
+            raise AssertionError(f"{token} still crosses the port")
+
     for token, code in (
-        ("C", "tier_not_open"),
+        ("global", "tier_not_open"),
         ("D", "real_db_not_wired"),
     ):
         try:
@@ -131,12 +159,23 @@ def test_tiers_module_is_public_via_dunder_all() -> None:
         "REAL_DB_NOT_WIRED",
         "RETIRED_TIER_TOKENS",
         "RETRIEVE_TIERS",
-        "RetrieveTier",
+        "TIER_INPUT_TOKENS",
         "TIER_LABELS",
         "TIER_NOT_OPEN",
         "TIER_UNAVAILABLE_CODE",
+        "RetrieveTier",
+        "TierInputToken",
         "normalize_tier_token",
     }
+
+
+def test_the_closed_set_is_one_definition_not_a_copy() -> None:
+    """The port's closed set and the operator-ordered lasting tuple are the
+    SAME object: two literals would let the wire accept a token the host
+    never produces (or refuse one it does)."""
+    from fin.retrieve.tiers import LASTING_RETRIEVE_TIERS, RETRIEVE_TIERS
+
+    assert RETRIEVE_TIERS is LASTING_RETRIEVE_TIERS
 
 
 def test_the_alias_map_is_the_one_authority_for_retired_spellings() -> None:
@@ -164,12 +203,12 @@ def test_the_alias_map_is_the_one_authority_for_retired_spellings() -> None:
         assert normalize_tier_token(retired) == lasting
         assert normalize_tier_token(retired.lower()) == lasting
         assert lasting not in RETIRED_TIER_TOKENS
-    # The letters are still accepted as wire tokens by the closed set
-    # until the port retires them; the map is what keeps them OUT of the
-    # host's own output.
-    assert set(RETRIEVE_TIERS) == set(LASTING_RETRIEVE_TIERS) | set(
-        RETIRED_TIER_TOKENS
-    )
+    # The retired letters are in NO set the port reads: they belong to the
+    # accepted-INPUT tuple only, so the map is the single place a letter can
+    # still be turned into a 档 — and the map, not the closed set, is what
+    # keeps an old client's request working.
+    assert set(RETRIEVE_TIERS) == set(LASTING_RETRIEVE_TIERS)
+    assert not set(RETRIEVE_TIERS) & set(RETIRED_TIER_TOKENS)
 
 
 # ----- 2. named_failures re-exports the SAME objects -----
@@ -223,11 +262,17 @@ import fin.retrieve.port as p
 assert p.resolve_search_mode("A") == "A"
 assert p.resolve_search_mode(None) is None
 try:
-    p.resolve_search_mode("C")
+    p.resolve_search_mode("global")
 except p.TierUnavailableError as e:
     assert e.code == "tier_not_open"
 else:
-    raise AssertionError("C not refused")
+    raise AssertionError("global not refused")
+try:
+    p.resolve_search_mode("B")
+except p.InvalidSearchModeError as e:
+    assert e.code == "invalid_search_mode"
+else:
+    raise AssertionError("retired letter still crosses the port")
 try:
     p.resolve_search_mode("Z")
 except p.InvalidSearchModeError as e:

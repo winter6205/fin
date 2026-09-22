@@ -882,7 +882,7 @@ from fin.retrieve.port import (  # noqa: E402
 
 def test_unset_search_mode_is_absent_from_the_wire() -> None:
     """``search_mode=None`` means "do not send" — iknow's own default
-    (B) answers, and an explicit ``null`` on the wire would be a
+    (``graph``) answers, and an explicit ``null`` on the wire would be a
     filter the server tries to match (the same rule as every other
     unset filter)."""
     adapter = _CapturingAdapter()
@@ -893,7 +893,7 @@ def test_unset_search_mode_is_absent_from_the_wire() -> None:
 
 def test_search_mode_a_is_forwarded_as_filters_search_mode() -> None:
     """The wire token is pinned exactly once per spec
-    (``filters.search_mode`` ∈ ``A|B|C|D``, sibling iknow spec);
+    (``filters.search_mode`` ∈ ``A|graph|global|D``, sibling iknow spec);
     elsewhere the constant is used so a rename cannot drift silently."""
     adapter = _CapturingAdapter()
     adapter.retrieve("revenue", search_mode="A")
@@ -902,20 +902,33 @@ def test_search_mode_a_is_forwarded_as_filters_search_mode() -> None:
     assert SEARCH_MODE_FILTER_KEY == "search_mode"
 
 
-def test_search_mode_b_rides_alongside_the_edgar_filters() -> None:
+def test_graph_rides_alongside_the_edgar_filters() -> None:
     adapter = _CapturingAdapter()
-    adapter.retrieve("revenue", cik="0000320193", search_mode="B")
+    adapter.retrieve("revenue", cik="0000320193", search_mode="graph")
     arguments = adapter.payloads[0]["params"]["arguments"]
     assert arguments["filters"] == {
         "cik": "0000320193",
-        "search_mode": "B",
+        "search_mode": "graph",
     }
+
+
+def test_the_wire_never_carries_a_retired_letter() -> None:
+    """The last honest separation: ``B``/``C`` are host-side spellings of
+    an input, never tokens of this protocol. The adapter hands the letter
+    to the SAME seam the fake uses, so a retired letter cannot be
+    serialized to iknow as if the rename had never happened."""
+    adapter = _CapturingAdapter()
+    for letter in ("B", "C"):
+        with pytest.raises(InvalidSearchModeError) as excinfo:
+            adapter.retrieve("revenue", search_mode=letter)
+        assert excinfo.value.code == "invalid_search_mode"
+    assert adapter.payloads == []
 
 
 @pytest.mark.parametrize(
     ("tier", "code"),
     [
-        pytest.param("C", TIER_NOT_OPEN, id="tier-c"),
+        pytest.param("global", TIER_NOT_OPEN, id="tier-global"),
         pytest.param("D", REAL_DB_NOT_WIRED, id="tier-d"),
     ],
 )
@@ -924,7 +937,7 @@ def test_an_unopened_tier_is_a_named_exit_without_an_mcp_call(
 ) -> None:
     """A 档 pin that names an unopened 档 gets the SAME public code the
     send door uses (``TIER_UNAVAILABLE_CODE`` mapping), not a silent
-    default-B retrieve: the request never reaches the transport
+    default-``graph`` retrieve: the request never reaches the transport
     (payloads stays empty), and the exit is not the miss shape
     ``{"chunks": []}`` (that would read as "the corpus has nothing")."""
     adapter = _CapturingAdapter()
@@ -937,7 +950,7 @@ def test_an_unopened_tier_is_a_named_exit_without_an_mcp_call(
 @pytest.mark.parametrize(
     ("tier", "code"),
     [
-        pytest.param("C", TIER_NOT_OPEN, id="tier-c"),
+        pytest.param("global", TIER_NOT_OPEN, id="tier-global"),
         pytest.param("D", REAL_DB_NOT_WIRED, id="tier-d"),
     ],
 )
@@ -954,7 +967,9 @@ def test_aretrieve_raises_the_typed_tier_error_before_transport(
     assert adapter.payloads == []
 
 
-@pytest.mark.parametrize("bogus", ["Z", "E", "a", "b", " c ", "", "summary"])
+@pytest.mark.parametrize(
+    "bogus", ["Z", "E", "a", "b", " c ", "", "summary", "local"]
+)
 def test_a_mode_outside_the_closed_set_raises_invalid_search_mode(
     bogus: str,
 ) -> None:
@@ -1007,9 +1022,9 @@ def test_transport_down_with_an_open_tier_is_still_retrieve_unavailable() -> Non
     """Boundary 'exception' × 档: the round trip of an ACCEPTED 档
     failing names ``retrieve_unavailable`` — the transport is the
     thing that broke, and neither the miss shape (a corpus with
-    nothing) nor a silent default-B answer may wear the 档's request."""
+    nothing) nor a silent default answer may wear the 档's request."""
     adapter = _ScriptedAdapter(scripted_exception=OSError("down"))
-    assert adapter.retrieve("foo", search_mode="B") == {
+    assert adapter.retrieve("foo", search_mode="graph") == {
         "error": "retrieve_unavailable"
     }
 
@@ -1017,7 +1032,7 @@ def test_transport_down_with_an_open_tier_is_still_retrieve_unavailable() -> Non
 @pytest.mark.parametrize(
     ("tier", "code"),
     [
-        pytest.param("C", TIER_NOT_OPEN, id="tier-c"),
+        pytest.param("global", TIER_NOT_OPEN, id="tier-global"),
         pytest.param("D", REAL_DB_NOT_WIRED, id="tier-d"),
     ],
 )
@@ -1073,16 +1088,16 @@ def test_concurrent_tiered_calls_answer_per_call() -> None:
     adapter = _ConcurrentTierAdapter()
 
     def _go(i: int) -> dict:
-        mode = ("A", "B", "C")[i % 3]
+        mode = ("A", "graph", "global")[i % 3]
         return adapter.retrieve("foo", search_mode=mode)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
         results = list(ex.map(_go, range(12)))
 
     expected_chunks = {"chunks": [_chunk("hit", "DOC-2023Q1", score=1.0)]}
-    modes = [("A", "B", "C")[i % 3] for i in range(12)]
+    modes = [("A", "graph", "global")[i % 3] for i in range(12)]
     for mode, result in zip(modes, results):
-        if mode == "C":
+        if mode == "global":
             assert result == {"error": TIER_NOT_OPEN}
         else:
             assert result == expected_chunks
@@ -1092,7 +1107,7 @@ def test_concurrent_tiered_calls_answer_per_call() -> None:
         for payload in adapter.payloads
     ]
     assert sorted(sent_modes) == sorted(
-        m for m in modes if m in ("A", "B")
+        m for m in modes if m in ("A", "graph")
     ), "a refused 档 reached the wire, or an accepted one did not"
 
 

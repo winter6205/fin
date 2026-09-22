@@ -374,7 +374,7 @@ def test_tool_wrapper_forwards_search_mode_to_the_port() -> None:
 @pytest.mark.parametrize(
     ("tier", "code"),
     [
-        pytest.param("C", "tier_not_open", id="tier-c"),
+        pytest.param("global", "tier_not_open", id="tier-global"),
         pytest.param("D", "real_db_not_wired", id="tier-d"),
     ],
 )
@@ -403,12 +403,53 @@ def test_fake_raises_invalid_search_mode_like_the_product_adapter() -> None:
     assert port.calls == []
 
 
+# ----- T3: the port's closed set, mirrored on the Fake -----
+
+
+@pytest.mark.parametrize("token", ["B", "C", "local", "", "hybrid", "b", "GRAPH"])
+def test_a_leftover_token_is_refused_by_the_fake_like_the_port(
+    token: str,
+) -> None:
+    """Negative class: the fake validates through the SAME seam as the
+    product adapter, so a retired letter or a look-alike word cannot get a
+    lexical answer out of the fake that the real port would refuse. No
+    silent ``graph``, no silent ``global``, no silent mapping."""
+    from fin.retrieve.port import InvalidSearchModeError
+
+    port = FakeRetrievePort(hits_by_query={"foo": [_chunk("hit")]})
+    with pytest.raises(InvalidSearchModeError) as excinfo:
+        port.retrieve("foo", search_mode=token)
+    assert excinfo.value.code == "invalid_search_mode"
+    assert port.calls == [], "a refused request must leave no call record"
+    assert port.input_validation_failures.count() == 0, (
+        "the 档 token is a port-level named exit, not one of §B2's four"
+    )
+
+
+def test_an_unopened_tier_never_degrades_into_an_empty_chunk_answer() -> None:
+    """Exception class: the three named 档 exits all RAISE, so none of
+    them can be misread as 「语料没东西」 — the ``{"chunks": []}`` success
+    shape is reserved for a request the 档 accepted and the corpus could
+    not answer."""
+    from fin.retrieve.port import (
+        InvalidSearchModeError,
+        TierUnavailableError,
+    )
+
+    port = FakeRetrievePort(hits_by_query={"foo": [_chunk("hit")]})
+    for token in ("global", "D", "B"):
+        with pytest.raises((TierUnavailableError, InvalidSearchModeError)):
+            port.retrieve("foo", search_mode=token)
+    assert port.calls == []
+
+
 # ----- T3: the five boundary classes under a 档 -----
 #
 # ``specs/search-mode-retrieve.md`` Boundaries: the five classes (empty /
 # negative / overflow / concurrent / exception) must hold on the port
 # contract once ``filters.search_mode`` rides it. Fake is not a 档 (SC8),
-# so these assert CONTRACT shapes — never an A/B/C/D ranking difference.
+# so these assert CONTRACT shapes — never a ranking difference between
+# the lasting tokens.
 
 
 def test_an_open_tier_never_turns_the_legal_empty_miss_into_an_error() -> None:
@@ -433,9 +474,27 @@ def test_an_empty_query_is_named_before_the_tier_is_consulted() -> None:
     (both are invalid input, but only the query is on the §B2 ledger)."""
     port = FakeRetrievePort()
     with pytest.raises(EmptyQueryError):
-        port.retrieve("   ", search_mode="C")
+        port.retrieve("   ", search_mode="global")
     assert port.input_validation_failures.count() == 1
     assert port.calls == []
+
+
+def test_an_omitted_mode_is_not_sent_and_stays_a_legal_miss() -> None:
+    """Empty class, the「omit → graph」half: leaving the 档 out is not an
+    error and not a letter. The fake records ``None`` (「do not send」) and
+    still answers the ordinary hit list, so the caller's omission resolves
+    to the ranking service's own default 知识问答 (``graph``) rather than
+    to a refusal or a miss dressed as one."""
+    port = FakeRetrievePort(hits_by_query={"foo": [_chunk("hit")]})
+
+    assert [c.text for c in port.retrieve("foo")["chunks"]] == ["hit"]
+    assert port.calls[-1]["search_mode"] is None, (
+        "an omitted mode must not be sent as any token, least of all a "
+        "retired letter"
+    )
+    # And the same call against a corpus with nothing for it stays the
+    # legal empty result — omission is not itself a failure.
+    assert FakeRetrievePort().retrieve("nothing") == {"chunks": []}
 
 
 def test_the_limit_cap_holds_under_an_open_tier() -> None:
@@ -444,8 +503,8 @@ def test_the_limit_cap_holds_under_an_open_tier() -> None:
     with the request."""
     chunks = [_chunk(f"hit {i}") for i in range(50)]
     port = FakeRetrievePort(hits_by_query={"foo": chunks})
-    over = port.retrieve("foo", limit=999, search_mode="B")
-    zero = port.retrieve("foo", limit=0, search_mode="B")
+    over = port.retrieve("foo", limit=999, search_mode="graph")
+    zero = port.retrieve("foo", limit=0, search_mode="graph")
     assert len(over["chunks"]) == 20
     assert len(zero["chunks"]) == 8
 
@@ -466,7 +525,7 @@ def test_concurrent_tiered_calls_answer_per_call() -> None:
     )
 
     def _go(i: int) -> tuple[str, object]:
-        mode = ("A", "B", "C", "Z")[i % 4]
+        mode = ("A", "graph", "global", "Z")[i % 4]
         try:
             out = port.retrieve("foo", limit=5, search_mode=mode)
             return mode, [c.text for c in out["chunks"]]
@@ -480,18 +539,21 @@ def test_concurrent_tiered_calls_answer_per_call() -> None:
 
     expected_texts = [c.text for c in chunks]
     for mode, payload in results:
-        if mode in ("A", "B"):
+        if mode in ("A", "graph"):
             assert payload == expected_texts, mode
-        elif mode == "C":
+        elif mode == "global":
             assert payload == ("tier", "tier_not_open")
         else:
+            # Exception class × 档: a refused token raises through the
+            # shared port instead of answering one thread with a hit and
+            # another with a silent empty list.
             assert payload == ("invalid",)
 
     recorded = [call["search_mode"] for call in port.calls]
     assert len(recorded) == 8
     assert recorded.count("A") == 4
-    assert recorded.count("B") == 4
-    assert "C" not in recorded and "Z" not in recorded
+    assert recorded.count("graph") == 4
+    assert "global" not in recorded and "Z" not in recorded
 
 
 # ----- recorded Fast 抽图 job fact (spec graph-index-standard-fast SC5) -----

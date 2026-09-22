@@ -68,8 +68,8 @@ class InvalidSearchModeError(InputValidationError):
     """``search_mode`` is not one of the closed 档 tokens.
 
     Invalid input (the T21 split), not a miss: it raises rather than
-    answering through some other 档 — "not silent C" and "not silent
-    B" are the same rule. The host tool's existing
+    answering through some other 档 — "not silent ``global``" and "not
+    silent ``graph``" are the same rule. The host tool's existing
     ``InputValidationError`` handling turns this into the named
     ``{"error": "invalid_search_mode"}`` envelope. Not counted on the
     input-validation ledger: the ledger's classes are the §B2 four,
@@ -110,6 +110,15 @@ def resolve_search_mode(search_mode: str | None) -> str | None:
     Matching is EXACT — the send door normalizes human input, so a
     port caller that sends ``"c"`` or ``" summary "`` made a wiring
     mistake this helper must name, not guess around.
+
+    That exactness is also why the retired letters ``B`` / ``C`` are
+    REFUSED here while the HTTP door still accepts them: the two surfaces
+    answer different questions. An operator may spell 知识问答 either way,
+    and the boundary resolves the spelling (``TIER_INPUT_TOKENS``); a
+    token reaching THIS seam is the value fin decided to send, so a letter
+    here means the boundary was skipped. Normalizing at the seam would
+    hide that bug and put a 档 choice behind a request that never made
+    it — the silent mapping the rename forbids.
 
     The 档 SSOT lives in the neutral leaf :mod:`fin.retrieve.tiers`,
     imported at module level: the port may not import ``fin.host``

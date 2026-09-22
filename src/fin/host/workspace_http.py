@@ -224,8 +224,8 @@ from fin.host.knowledge_mcp import (
 from fin.host.memory_dream import run_dream_after_turn
 from fin.host.memory_port import build_memory_port
 from fin.host.named_failures import (
-    RetrieveTier,
     TIER_UNAVAILABLE_CODE,
+    TierInputToken,
     normalize_tier_token,
     unavailable_tier,
 )
@@ -650,13 +650,18 @@ class SendMessageRequest(BaseModel):
     # from the question prose (the wayfinder doc forbids an open-ended
     # 业务意图桶). Typed as a closed enum so a bogus token is a 422
     # input error rather than a silently ignored field. The enum is
-    # derived from ``fin.host.named_failures.RETRIEVE_TIERS`` (via
-    # ``RetrieveTier``) rather than re-spelled here, so a 档 added to
+    # derived from ``fin.host.named_failures.TIER_INPUT_TOKENS`` (via
+    # ``TierInputToken``) rather than re-spelled here, so a 档 added to
     # the SSOT cannot leave this schema silently accepting the old set.
-    # A retired spelling still arrives here (old clients); it is resolved
-    # to its lasting token before anything reads the pin, never forwarded
-    # onward as a letter.
-    tiers: list[RetrieveTier] = Field(default_factory=list)
+    #
+    # The input tuple is deliberately WIDER than the port's closed set:
+    # it still carries the retired letters ``B`` / ``C`` because an old
+    # client's own token must not become a 422 on the rename day. This
+    # boundary is where those spellings resolve onto their lasting token
+    # (``normalize_tier_token``), and nothing past here can be a letter —
+    # the port refuses one by name, so the widening cannot leak a retired
+    # spelling toward the ranking service.
+    tiers: list[TierInputToken] = Field(default_factory=list)
     # search-mode host T4 (HTTP surface): an explicit Fast 抽图 PROPOSE
     # request. The send seeds the run's ``extract_method_proposal``
     # STATE field with ``{"proposed": "fast"}`` (the graph-side trigger
