@@ -7,4 +7,6 @@ Status: accepted
 
 Amended 2026-09-21 (ADR 0081): “structured classify” on the product path is Jev Choice over `A | graph | global | D`, not MiniMax JSON; pytest Fake Choice; no MiniMax fallback. _Stage (landed): the 档 gray-zone Jev tier is implemented — rules → Jev Choice → inherit → clarify / typed fail, with the default pytest Fake Choice and a required live `jev_live` round-trip; no MiniMax JSON classify remains on the product path._
 
+Amended 2026-09-22 (spelling only): the Jev closed set above is now spelled `lexical | graph | global | sql` — see the ADR 0081 amendment and `specs/search-mode-lexical-sql-tokens.md`; the decision recorded here does not move.
+
 Considered Options: every turn a mode picker; always-on classify LLM with silent default B; C only when the operator names it (CONTEXT 2026-09-17, withdrawn); clarify as free-text chat with no choice window.

@@ -833,9 +833,10 @@ class MCPRetrieveAdapter:
         ):
             if value is not None:
                 filters[key] = value
-        # The 档 rides the same record: iknow reads
-        # ``filters.search_mode`` ∈ A|graph|global|D and defaults to graph
-        # when the key is missing — so an unset mode is NOT sent as null.
+        # The 档 rides the same record: iknow reads ``filters.search_mode``
+        # over the closed set in :mod:`fin.retrieve.tiers` and defaults to
+        # graph when the key is missing — so an unset mode is NOT sent as
+        # null.
         if effective_search_mode is not None:
             filters[SEARCH_MODE_FILTER_KEY] = effective_search_mode
         if filters:

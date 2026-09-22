@@ -8,19 +8,24 @@ pick, the cascade's own output — resolves through
 ``fin.retrieve.tiers.normalize_tier_token`` BEFORE anything downstream can
 read the value.
 
+With the letters retired outright there is nothing left to resolve FROM, so
+this file pins both halves of that: the word forms still reach the port as
+themselves, and a retired letter no longer reaches it as anything — at the
+utterance, the pin and the seam alike.
+
 Opt-in (``uv run pytest -q -m soft_track``; deselected by default).
 Scripted model + :class:`~fin.retrieve.fake_port.FakeRetrievePort` only:
 what is asserted is the TOKEN a call carries, never how iknow ranks
 (Fake is not a 档).
 
-* ``test_an_assigned_knowledge_qa_records_graph_before_retrieve`` — the
+* ``test_an_assigned_tier_records_its_token_before_retrieve`` — the
   audit lands at the classify node, i.e. before the port sees a call,
   and every call the port records carries exactly that lasting token.
-* ``test_a_pinned_retired_letter_hands_the_port_its_lasting_token`` — the
-  same for a pin sent as the retired letter an old client still uses.
-* ``test_a_review_ask_names_global_on_the_audit_and_starts_no_letter`` —
-  综述 is named as ``global`` on every audit field, so the trail and the
-  seam agree.
+* ``test_a_pinned_letter_is_a_named_exit_and_routes_nothing`` — the same
+  seam an old client used to pin with a letter.
+* ``test_an_unopened_ask_names_its_token_and_starts_no_letter`` — a plan
+  slot is named as its lasting token on every audit field, so the trail and
+  the seam agree.
 * ``test_the_value_handed_to_the_port_is_never_a_letter`` — the port
   seam's own view of what normalization produces.
 """
@@ -30,14 +35,21 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import Field
 
 from fin.host.agent_instructions import SEARCH_MODE_INSTRUCTIONS_MARKER
 from fin.host.graph import compile_graph
-from fin.host.named_failures import LASTING_RETRIEVE_TIERS, TIER_NOT_OPEN
-from fin.host.search_mode_decision import normalize_search_mode
+from fin.host.named_failures import (
+    LASTING_RETRIEVE_TIERS,
+    REAL_DB_NOT_WIRED,
+    TIER_NOT_OPEN,
+)
+from fin.host.search_mode_decision import (
+    decide_search_mode,
+    normalize_search_mode,
+)
 from fin.host.scripted_model import ScriptedChatModel
 from fin.host.state import reset_input_state
 from fin.retrieve.fake_port import FakeRetrievePort
@@ -46,20 +58,26 @@ from fin.retrieve.port import (
     TierUnavailableError,
     resolve_search_mode,
 )
-from fin.retrieve.tiers import RETIRED_TIER_TOKENS
+from search_mode_pins import RETIRED_LETTERS
 
 pytestmark = [pytest.mark.soft_track]
 
 KNOWN_IDS = {"AAPL-2022Q3"}
 
-# Every spelling a request can arrive with for 知识问答 / 综述: the lasting
-# token, its retired letter, a case variant, and the CONTEXT label an
-# utterance names it with.
-KNOWLEDGE_QA_SPELLINGS = ("B", "b", "graph", "GRAPH", "知识问答")
-REVIEW_SPELLINGS = ("C", "c", "global", "Global", "综述")
+# Every spelling a request can arrive with for each OPENED 档: the lasting
+# token, a case variant, and the CONTEXT label an utterance names it with.
+OPENED_SPELLINGS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("graph", ("graph", "GRAPH", "知识问答")),
+    ("lexical", ("lexical", "LEXICAL", "查找")),
+)
+# The same for each plan slot, with the 具名失败 its name must yield.
+UNOPENED_SPELLINGS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("global", TIER_NOT_OPEN, ("global", "Global", "综述")),
+    ("sql", REAL_DB_NOT_WIRED, ("sql", "SQL", "真数据库")),
+)
 # A pin is a WIRE field, so only its token spellings can arrive; the
 # CONTEXT label is an utterance form the pin seam never sees.
-PIN_SPELLINGS = ("B", "b", "graph", "GRAPH")
+PIN_SPELLINGS: tuple[str, ...] = ("graph", "GRAPH")
 
 
 class _RecordingScriptedModel(ScriptedChatModel):
@@ -151,7 +169,7 @@ def _retired_letter_in(payload: Any) -> bool:
     """True if any string in the audit is EXACTLY a retired letter: the
     trail must read as the lasting tokens the port will carry."""
     if isinstance(payload, str):
-        return payload in RETIRED_TIER_TOKENS
+        return payload in RETIRED_LETTERS
     if isinstance(payload, dict):
         return any(_retired_letter_in(value) for value in payload.values())
     if isinstance(payload, (list, tuple)):
@@ -162,64 +180,76 @@ def _retired_letter_in(payload: Any) -> bool:
 # ----- the assigned-档 acceptance halves -----
 
 
-@pytest.mark.parametrize("spelling", KNOWLEDGE_QA_SPELLINGS)
-def test_an_assigned_knowledge_qa_records_graph_before_retrieve(
-    spelling: str,
+@pytest.mark.parametrize(
+    "lasting, spellings",
+    OPENED_SPELLINGS,
+    ids=[lasting for lasting, _ in OPENED_SPELLINGS],
+)
+def test_an_assigned_tier_records_its_token_before_retrieve(
+    lasting: str, spellings: tuple[str, ...]
 ) -> None:
-    """The 知识问答 档 is recorded as ``graph`` and the port is handed
-    ``graph``. Ordering is proven, not assumed: the model call that emitted
-    the retrieve tool call already carried 知识问答's usage copy, so the
+    """The 档 is recorded as its lasting token and the port is handed that
+    token. Ordering is proven, not assumed: the model call that emitted the
+    retrieve tool call already carried this 档's usage copy, so the
     assignment existed before the port call it describes."""
-    out, port, model = _run(_utterance(spelling))
+    for spelling in spellings:
+        out, port, model = _run(_utterance(spelling))
 
-    assert out["track"] == "grounded"
-    audit = out["search_mode_decision"]
-    assert audit["search_mode"] == "graph"
-    assert not _retired_letter_in(audit)
-    assert port.calls, "the grounded retrieve must have reached the port"
-    # POSITIVE: the assigned 档 IS the value the port was handed — not
-    # merely "not a letter", which an unassigned run would satisfy too.
-    assert [call["search_mode"] for call in port.calls] == [
-        "graph"
-    ] * len(port.calls), [call["search_mode"] for call in port.calls]
-    # The retrieve call is the SECOND model call of this run: the copy on
-    # the first one is the audit's own token, visible before the port ran.
-    blocks = _mode_copy_blocks(model)
-    assert blocks and all("检索档 graph" in block for block in blocks), blocks
+        assert out["track"] == "grounded"
+        audit = out["search_mode_decision"]
+        assert audit["search_mode"] == lasting, spelling
+        assert not _retired_letter_in(audit)
+        assert port.calls, "the grounded retrieve must have reached the port"
+        # POSITIVE: the assigned 档 IS the value the port was handed — not
+        # merely "not a letter", which an unassigned run would satisfy too.
+        assert [call["search_mode"] for call in port.calls] == [
+            lasting
+        ] * len(port.calls), [call["search_mode"] for call in port.calls]
+        # The retrieve call is the SECOND model call of this run: the copy on
+        # the first one is the audit's own token, visible before the port ran.
+        blocks = _mode_copy_blocks(model)
+        assert blocks and all(
+            f"检索档 {lasting}" in block for block in blocks
+        ), (spelling, blocks)
 
 
-@pytest.mark.parametrize("spelling", REVIEW_SPELLINGS)
-def test_a_review_ask_names_global_on_the_audit_and_starts_no_letter(
-    spelling: str,
+@pytest.mark.parametrize(
+    "lasting, code, spellings",
+    UNOPENED_SPELLINGS,
+    ids=[lasting for lasting, _, _ in UNOPENED_SPELLINGS],
+)
+def test_an_unopened_ask_names_its_token_and_starts_no_letter(
+    lasting: str, code: str, spellings: tuple[str, ...]
 ) -> None:
-    """综述 is a plan slot, so nothing is assigned — but the refusal the
-    operator can read names the LASTING token, and the retired letter
-    appears nowhere in the trail the port would have been handed."""
-    out, port, _model = _run(_utterance(spelling))
+    """A plan slot assigns nothing — but the refusal the operator can read
+    names the LASTING token, and no retired letter appears anywhere in the
+    trail the port would have been handed."""
+    for spelling in spellings:
+        out, port, _model = _run(_utterance(spelling))
 
-    audit = out["search_mode_decision"]
-    assert audit["decision_tier"] == "typed_fail"
-    assert audit["failure_code"] == TIER_NOT_OPEN
-    assert audit["search_mode"] is None
-    assert audit["signals"].get("requested_mode") == "global"
-    assert not _retired_letter_in(audit)
-    # POSITIVE: nothing was assigned, so the hop sends NO 档 — and it
-    # must not smuggle ``global`` (an unopened 档) onto the wire either.
-    assert port.calls, "the scripted retrieve still reached the port"
-    assert [call["search_mode"] for call in port.calls] == [None] * len(
-        port.calls
-    ), [call["search_mode"] for call in port.calls]
-    assert all(
-        call["search_mode"] not in RETIRED_TIER_TOKENS for call in port.calls
-    )
+        audit = out["search_mode_decision"]
+        assert audit["decision_tier"] == "typed_fail", spelling
+        assert audit["failure_code"] == code, spelling
+        assert audit["search_mode"] is None
+        assert audit["signals"].get("requested_mode") == lasting
+        assert not _retired_letter_in(audit)
+        # POSITIVE: nothing was assigned, so the hop sends NO 档 — and it
+        # must not smuggle the unopened 档 onto the wire either.
+        assert port.calls, "the scripted retrieve still reached the port"
+        assert [call["search_mode"] for call in port.calls] == [None] * len(
+            port.calls
+        ), [call["search_mode"] for call in port.calls]
+        assert all(
+            call["search_mode"] not in RETIRED_LETTERS for call in port.calls
+        )
 
 
 @pytest.mark.parametrize("spelling", PIN_SPELLINGS)
-def test_a_pinned_retired_letter_hands_the_port_its_lasting_token(
+def test_a_pinned_tier_hands_the_port_its_lasting_token(
     spelling: str,
 ) -> None:
-    """Whatever the client spelled, the run's audit and anything the port
-    is handed carry ``graph``."""
+    """Whatever the case the client spelled, the run's audit and anything
+    the port is handed carry the lasting token."""
     out, port, _model = _run(PLAIN_ASK, pinned=spelling)
 
     audit = out["search_mode_decision"]
@@ -227,14 +257,47 @@ def test_a_pinned_retired_letter_hands_the_port_its_lasting_token(
     assert audit["signals"].get("pinned") is True
     assert not _retired_letter_in(audit)
     # POSITIVE: a pin is an assignment, so the port is handed its lasting
-    # token — the letter the client spelled must not survive the hop.
+    # token — nothing may rewrite it on the way.
     assert port.calls, "the grounded retrieve must have reached the port"
     assert [call["search_mode"] for call in port.calls] == [
         "graph"
     ] * len(port.calls), [call["search_mode"] for call in port.calls]
     assert all(
-        call["search_mode"] not in RETIRED_TIER_TOKENS for call in port.calls
+        call["search_mode"] not in RETIRED_LETTERS for call in port.calls
     )
+
+
+@pytest.mark.parametrize("letter", RETIRED_LETTERS)
+def test_a_pinned_letter_is_a_named_exit_and_routes_nothing(
+    letter: str,
+) -> None:
+    """The pin seam keeps its old client honest by name, not by guess: a
+    retired letter is out of the closed set, so the cascade records the
+    ``invalid_search_mode`` EXIT and hands no 档 to the port."""
+    out, port, _model = _run(PLAIN_ASK, pinned=letter)
+
+    audit = out["search_mode_decision"]
+    assert audit["signals"].get("pin_exit") == "invalid_search_mode", letter
+    assert audit["signals"].get("pin") == letter
+    assert audit["search_mode"] is None
+    # The residual may still be a clarify (no judge injected here), which is
+    # the same "invent nothing" answer the closed set gives everywhere else.
+    assert [call["search_mode"] for call in port.calls] == [None] * len(
+        port.calls
+    ), [call["search_mode"] for call in port.calls]
+
+
+@pytest.mark.parametrize("letter", RETIRED_LETTERS)
+def test_an_utterance_naming_a_letter_resolves_no_tier(letter: str) -> None:
+    """Zero coexistence at the entry: ``A档`` / ``D档`` is ordinary prose the
+    judge and the rest of the cascade read, not a named 档 — the letter class
+    left the naming pattern together with the alias map, so the rules tier
+    cannot even see it as a candidate."""
+    decision = decide_search_mode(
+        [HumanMessage(content=f"{letter}档 {PLAIN_ASK}")]
+    )
+    assert decision.search_mode is None
+    assert "tier_naming" not in decision.signals
 
 
 # ----- the port seam's own view -----
@@ -245,27 +308,34 @@ def test_the_value_handed_to_the_port_is_never_a_letter() -> None:
     would send resolves on the port too. The seam's exactness is
     untouched — a letter sent WITHOUT normalization is still the wire's
     own mistake to name, which is why normalize cannot live behind the
-    port."""
-    for spelling in (*KNOWLEDGE_QA_SPELLINGS[:4], *REVIEW_SPELLINGS[:4]):
-        lasting = normalize_search_mode(spelling)
-        assert lasting in LASTING_RETRIEVE_TIERS, spelling
-        assert lasting not in RETIRED_TIER_TOKENS, spelling
+    port. Only TOKEN spellings reach this seam: the CONTEXT label is an
+    utterance form the normalizer never carries (the rules tier maps it
+    through ``TIER_LABELS``, the wire never sees it)."""
+    for lasting, spellings in (
+        ("graph", ("graph", "GRAPH", " graph ")),
+        ("lexical", ("lexical", "LEXICAL")),
+    ):
+        for spelling in spellings:
+            resolved = normalize_search_mode(spelling)
+            assert resolved == lasting, spelling
+            assert resolved in LASTING_RETRIEVE_TIERS, spelling
 
-    assert resolve_search_mode(normalize_search_mode("B")) == "graph"
-    try:
-        resolve_search_mode(normalize_search_mode("C"))
-    except TierUnavailableError as exc:
-        assert exc.code == TIER_NOT_OPEN
-    else:
-        raise AssertionError("global accepted as an open 档")
+    assert resolve_search_mode(normalize_search_mode("GRAPH")) == "graph"
+    for lasting, code, _spellings in UNOPENED_SPELLINGS:
+        try:
+            resolve_search_mode(normalize_search_mode(lasting))
+        except TierUnavailableError as exc:
+            assert exc.code == code, lasting
+        else:
+            raise AssertionError(f"{lasting} accepted as an open 档")
 
     # And the seam keeps its own name for a letter that arrives UN-normalized:
-    # the host's pin may be spelled either way, but the port forwards only the
-    # closed set, so a leftover letter is a wiring bug it refuses rather than a
-    # 档 it quietly reroutes.
-    try:
-        resolve_search_mode("B")
-    except InvalidSearchModeError as exc:
-        assert exc.code == "invalid_search_mode"
-    else:
-        raise AssertionError("a retired letter still crossed the port seam")
+    # the closed set is all the port forwards, so a leftover letter is a
+    # wiring bug it refuses rather than a 档 it quietly reroutes.
+    for letter in RETIRED_LETTERS:
+        try:
+            resolve_search_mode(letter)
+        except InvalidSearchModeError as exc:
+            assert exc.code == "invalid_search_mode", letter
+        else:
+            raise AssertionError(f"a retired letter {letter!r} crossed the seam")

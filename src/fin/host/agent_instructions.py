@@ -206,12 +206,12 @@ SEARCH_MODE_INSTRUCTIONS_MARKER: str = "[FIN_SEARCH_MODE]"
 # 查找 / 知识问答 / 综述 / 真数据库 — only the MCP token is named here.
 _USAGE_LEXICAL: str = (
     f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
-    "检索档 A 查找 (lexical-first): retrieve answers with "
-    "keyword-first matches over the corpus. Query retrieve "
-    "with the operator's own keywords, open a hit with "
-    "read_file before quoting it. If the exact keywords miss, "
-    "rephrase them once, then tell the operator plainly that "
-    "the 资料 has no lexical hit."
+    "检索档 lexical 查找 (send it as MCP filters.search_mode=lexical): "
+    "retrieve answers with keyword-first matches over "
+    "the corpus. Query retrieve with the operator's own keywords, "
+    "open a hit with read_file before quoting it. If the exact "
+    "keywords miss, rephrase them once, then tell the operator "
+    "plainly that the 资料 has no keyword hit."
 )
 
 _USAGE_KNOWLEDGE_QA: str = (
@@ -236,24 +236,23 @@ _USAGE_REVIEW: str = (
 
 _USAGE_REAL_DB: str = (
     f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
-    "检索档 D 真数据库: the ask targets business data, not the "
+    "检索档 sql 真数据库 (send it as MCP filters.search_mode=sql): "
+    "the ask targets business data, not the "
     "filings corpus. Route figures through the real-DB path; "
     "when it is not wired, report the 真库未接 named failure. "
     "Document tables in this corpus stay on the graph 档 "
     "(MCP filters.search_mode=graph), never on this one."
 )
 
-# Keyed by the lasting tokens alone. A retired letter is resolved onto its
-# lasting token by :func:`fin.retrieve.tiers.normalize_tier_token` BEFORE
-# this dict is read, which is the condition that lets a legacy spelling
-# carry no key here: the copy stays reachable for a pre-rename turn while
-# the retired spellings live in exactly one place (the SSOT map), so
-# retiring or adding one never touches this file.
+# Keyed by the lasting tokens alone. Every 档 is named by the word form of
+# the arm that answers under it, so there is no second spelling to resolve:
+# a retired letter is out of the closed set and normalizes to nothing, which
+# is why no legacy key ever had to be added here.
 SEARCH_MODE_USAGE_COPY: dict[str, str] = {
-    "A": _USAGE_LEXICAL,
+    "lexical": _USAGE_LEXICAL,
     "graph": _USAGE_KNOWLEDGE_QA,
     "global": _USAGE_REVIEW,
-    "D": _USAGE_REAL_DB,
+    "sql": _USAGE_REAL_DB,
 }
 
 
@@ -262,8 +261,8 @@ def _usage_copy_for(search_mode: object) -> str | None:
 
     Spelling→token resolution is delegated to the SSOT's
     :func:`normalize_tier_token` — one authority for casing and for the
-    retired letters, instead of a second case-folding rule beside this
-    dict. Anything outside the accepted spellings resolves to nothing,
+    closed set, instead of a second case-folding rule beside this dict.
+    Anything outside the accepted spellings resolves to nothing,
     never to the nearest 档; a lasting token with no copy (an unwired 档)
     likewise injects nothing rather than another 档's instructions.
     """
@@ -409,7 +408,8 @@ def messages_for_model(
     prefix stable.
 
     ``search_mode`` (search-mode host T3 / ADR 0061): the 检索档
-    this turn's cascade ASSIGNED (``"A"``–``"D"``). When set and
+    this turn's cascade ASSIGNED (one of ``LASTING_RETRIEVE_TIERS``).
+    When set and
     recognized, that 档's usage copy is appended to the head
     SystemMessage after the blocks above — call-scoped, exactly
     once, idempotent on re-entry. ``None`` / empty / an out-of-set

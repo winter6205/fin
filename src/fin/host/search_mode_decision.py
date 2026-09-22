@@ -8,14 +8,15 @@ non-grounded track never reaches this cascade and assigns no 档).
 Tier order (no silent default — the residual never names global):
 
 1. **rules** — a documented pin/override, or an utterance that EXPLICITLY
-   names a 档: the letter adjacent to 档 (``A档`` / ``档 B``) or a CONTEXT
-   label adjacent to 档 (查找 / 知识问答 / 综述 / 真数据库). Requiring the
-   档 marker keeps a single letter from firing on ordinary English ("A
-  apl"-shaped text cannot reach 档 adjacency) and mirrors the closed
-   selector shape ``fin.retrieve.tiers`` allows — question prose is never
-   scanned for bare 档 words (``fin.host.named_failures`` T6 note). A name
-   that cannot resolve uniquely (two different 档 named) stays ambiguous
-   and falls through.
+   names a 档: a lasting token adjacent to 档 (``lexical档`` / ``档 sql``)
+   or a CONTEXT label adjacent to 档 (查找 / 知识问答 / 综述 / 真数据库).
+   Requiring the 档 marker keeps a token from firing on ordinary English
+   ("a lexical item" shaped text cannot reach 档 adjacency) and mirrors the
+   closed selector shape ``fin.retrieve.tiers`` allows — question prose is
+   never scanned for bare 档 words (``fin.host.named_failures`` T6 note). A
+   retired bare letter next to 档 is ordinary prose now, which is the
+   cascade's own business, not a named tier; a name that cannot resolve
+   uniquely (two different 档 named) stays ambiguous and falls through.
 2. **jev** — one closed-set TypeSafe Choice over the lasting 档 tokens,
    only when rules miss **and** inherit would not already decide (the
    same peek shape as ``decide_track``, so a judge answer cannot steal an
@@ -47,7 +48,7 @@ a 档 and does not fall through to a different one.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -119,7 +120,7 @@ _INHERIT_MAX_LEN = 48
 
 # The judge is taught the operator labels AND what separates the 档. A bare
 # ``token + label`` pair is not a discriminator, and shipping one cost the
-# live judge its only opened 档 — ``D 真数据库`` reads like the natural home
+# live judge its only opened 档 — ``sql 真数据库`` reads like the natural home
 # for any question about a financial figure, while the spec keeps a figure
 # that lives only in a filing on 知识问答 (``graph``), so the label alone
 # pulled the grounded asks that this tier exists to decide onto an unopened
@@ -135,7 +136,7 @@ _INHERIT_MAX_LEN = 48
 # the row missing before anything is called — is
 # ``tests/host/test_search_mode_gray_zone_jev.py``.
 _JEV_MODE_TIER_GLOSSES: dict[str, str] = {
-    "A": "an exact-string or single-known-field lookup in the filed documents",
+    "lexical": "an exact-string or single-known-field lookup in the filed documents",
     "graph": (
         "a knowledge question answered from the filed documents, including "
         "any figure that only lives in a filing (revenue, net sales, gross "
@@ -146,7 +147,7 @@ _JEV_MODE_TIER_GLOSSES: dict[str, str] = {
         "or across many reporting periods — because no single document "
         "answers it (a summary of one document is a knowledge question)"
     ),
-    "D": (
+    "sql": (
         "a number that must come from a live business database or SQL table "
         "rather than from any document"
     ),
@@ -167,11 +168,27 @@ _JEV_MODE_INSTRUCTIONS: str = (
 )
 
 # A 档 is NAMED (high-confidence) only next to the 档 marker — a lasting
-# token, a retired letter, or a CONTEXT label adjacent to 档. Bare words
-# in question prose are NOT scanned (``fin.host.named_failures`` T6 note).
+# token, or a CONTEXT label adjacent to 档. Bare words in question prose are
+# NOT scanned (``fin.host.named_failures`` T6 note), and neither is a
+# retired single letter: with zero coexistence the letter is no longer a
+# spelling of anything, so 「A档」 is an ordinary utterance the judge reads
+# rather than a named tier. Both alternation groups are DERIVED from the 档
+# SSOT, longest name first, so this pattern cannot drift from the closed set
+# it recognizes and a shorter token can never shadow a longer one.
+def _naming_alternation(names: Iterable[str]) -> str:
+    return "|".join(
+        re.escape(name) for name in sorted(names, key=len, reverse=True)
+    )
+
+
+_TIER_TOKEN_ALTERNATION = _naming_alternation(LASTING_RETRIEVE_TIERS)
+_TIER_LABEL_ALTERNATION = _naming_alternation(MODE_LABELS.values())
+
 _TIER_NAMING_RE = re.compile(
-    r"(graph|global|[ABCD])\s*档|档\s*(graph|global|[ABCD])"
-    r"|(查找|知识问答|综述|真数据库)\s*档|档\s*(查找|知识问答|综述|真数据库)",
+    rf"({_TIER_TOKEN_ALTERNATION})\s*档"
+    rf"|档\s*({_TIER_TOKEN_ALTERNATION})"
+    rf"|({_TIER_LABEL_ALTERNATION})\s*档"
+    rf"|档\s*({_TIER_LABEL_ALTERNATION})",
     re.IGNORECASE,
 )
 
@@ -179,15 +196,16 @@ _TIER_NAMING_RE = re.compile(
 def normalize_search_mode(raw: object) -> SearchMode | None:
     """Map a wire/judge/pin/pick token onto the lasting 档 tokens.
 
-    The alias map is :mod:`fin.retrieve.tiers`' — this is the host-side
-    call of the same total function, kept as the name the cascade and the
-    pin seams already use.
+    The closed set and its case-folded spellings are
+    :mod:`fin.retrieve.tiers`' — this is the host-side call of the same
+    total function, kept as the name the cascade and the pin seams already
+    use.
 
     Deliberately NOT :func:`fin.retrieve.port.resolve_search_mode`:
     that raises at the port seam; the cascade must OBSERVE an
     out-of-set token (typed EXIT) and keep falling through, so it needs
     a total function here. Openness (``TIER_UNAVAILABLE_CODE``) is
-    checked by the caller so ``global``/``D`` can route to 具名失败.
+    checked by the caller so ``global``/``sql`` can route to 具名失败.
     """
     return normalize_tier_token(raw)  # type: ignore[return-value]
 
@@ -314,8 +332,9 @@ def _rules_decision(
         signals["tier_naming"] = named[0]
         return _assign_or_typed_fail(named[0], signals, confidence=0.9)
     if len(named) > 1:
-        # "A档还是B档?" cannot be resolved by confidence at all: ambiguous
-        # by construction, so rules abstain (the judge / clarify decide).
+        # "lexical档还是graph档?" cannot be resolved by confidence at all:
+        # ambiguous by construction, so rules abstain (the judge / clarify
+        # decide).
         signals["ambiguous_naming"] = named
     return None
 
@@ -409,12 +428,11 @@ def _try_jev_decide(
     signals["mode_jev_confidence"] = choice.confidence
     mode = normalize_search_mode(choice.label)
     if mode is None:
-        # ``normalize_search_mode`` is the SSOT total function, so a
-        # retired spelling (``B`` / ``C``) still resolves to its lasting
-        # 档 and is judged on availability like any other name; only a
-        # label it cannot map at all names nothing. The product client
-        # raises ``invalid_label`` before returning, so this arm covers a
-        # non-conforming injection too.
+        # ``normalize_search_mode`` is the SSOT total function over the
+        # closed set, so a label it cannot map names nothing — including a
+        # retired bare letter, which since the rename is not a spelling of
+        # any 档. The product client raises ``invalid_label`` before
+        # returning, so this arm covers a non-conforming injection too.
         signals["mode_jev_exit"] = JEV_CHOICE_EXIT_INVALID_SEARCH_MODE
         return None
     if choice.confidence < _MIN_JEV_CONFIDENCE:

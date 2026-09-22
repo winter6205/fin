@@ -11,7 +11,7 @@ the injected copy text and nothing else.
 What is pinned here, in order:
 
 * the POSITIVE hop — an assigned 知识问答 sends ``graph``, an assigned
-  查找 sends ``A`` (spec SC2);
+  查找 sends ``lexical`` (spec SC2);
 * the ABSENT assignment — a refused / unassigned turn sends no 档 at all
   (``None`` → the port omits the key → iknow's own default), and a
   refused 综述 never becomes a token through this hop (SC3 / SC6);
@@ -53,7 +53,7 @@ from fin.retrieve.port import (
     TierUnavailableError,
     resolve_search_mode,
 )
-from fin.retrieve.tiers import RETIRED_TIER_TOKENS
+from search_mode_pins import RETIRED_LETTERS
 
 pytestmark = [pytest.mark.soft_track]
 
@@ -138,7 +138,7 @@ def _modes(port: FakeRetrievePort, *, since: int = 0) -> list[Any]:
 
 @pytest.mark.parametrize(
     ("spelling", "lasting"),
-    [("B", "graph"), ("graph", "graph"), ("知识问答", "graph")],
+    [("graph", "graph"), ("GRAPH", "graph"), ("知识问答", "graph")],
 )
 def test_an_assigned_知识问答_sends_graph_on_the_port(
     spelling: str, lasting: str
@@ -153,14 +153,14 @@ def test_an_assigned_知识问答_sends_graph_on_the_port(
     assert modes == [lasting] * len(modes), modes
 
 
-def test_an_assigned_查找_sends_A_on_the_port() -> None:
-    """A stays a wire letter (spec SC2) and proves the hop is not a
+def test_an_assigned_查找_sends_lexical_on_the_port() -> None:
+    """lexical is a real open 档 and proves the hop is not a
     hardcoded 知识问答 default."""
     port = _port()
-    out = _run(_compile(port), _utterance("A"), "hop-a")
+    out = _run(_compile(port), _utterance("lexical"), "hop-lexical")
 
-    assert out["search_mode_decision"]["search_mode"] == "A"
-    assert _modes(port) == ["A"]
+    assert out["search_mode_decision"]["search_mode"] == "lexical"
+    assert _modes(port) == ["lexical"]
 
 
 # ----- the absent assignment (SC2 / SC6) -----
@@ -171,7 +171,7 @@ def test_a_refused_综述_sends_no_档_and_never_a_substitute() -> None:
     ``None`` must stay ``None`` (the port then omits the key) — the hop
     may not turn a refusal into a guessed 档."""
     port = _port()
-    out = _run(_compile(port), _utterance("C"), "hop-global")
+    out = _run(_compile(port), _utterance("global"), "hop-global")
 
     audit = out["search_mode_decision"]
     assert audit["failure_code"] == "tier_not_open"
@@ -195,7 +195,7 @@ def test_the_hop_forwards_the_audit_verbatim_and_the_port_names_it() -> None:
     assert assigned_retrieve_mode(
         {"search_mode_decision": {"search_mode": "local"}}
     ) == "local"
-    for raw in ("B", "C", "local"):
+    for raw in (*RETIRED_LETTERS, "local"):
         with pytest.raises(InvalidSearchModeError):
             resolve_search_mode(assigned_retrieve_mode(
                 {"search_mode_decision": {"search_mode": raw}}
@@ -204,7 +204,7 @@ def test_the_hop_forwards_the_audit_verbatim_and_the_port_names_it() -> None:
     with pytest.raises(TierUnavailableError):
         resolve_search_mode(
             assigned_retrieve_mode(
-                {"search_mode_decision": {"search_mode": "D"}}
+                {"search_mode_decision": {"search_mode": "sql"}}
             )
         )
 
@@ -282,7 +282,7 @@ def test_a_refused_turn_puts_no_档_key_on_the_wire() -> None:
     """The absent half AT THE WIRE: no assignment → no key, so iknow
     answers with its own default instead of a 档 fin invented."""
     adapter = _CapturingMcpAdapter()
-    _run(_compile(adapter), _utterance("C"), "wire-global")
+    _run(_compile(adapter), _utterance("global"), "wire-global")
 
     arguments = _arguments(adapter)
     assert arguments, "the scripted retrieve still ran"
@@ -333,7 +333,7 @@ def test_two_runs_on_one_cached_graph_carry_their_own_档() -> None:
         known_document_ids=KNOWN_IDS,
     ) is graph
 
-    expected = [("graph", "graph"), ("A", "A"), ("C", None)]
+    expected = [("graph", "graph"), ("lexical", "lexical"), ("global", None)]
     for spelling, lasting in expected:
         model._index = 0
         model.script = _script()
@@ -342,7 +342,7 @@ def test_two_runs_on_one_cached_graph_carry_their_own_档() -> None:
         modes = _modes(port, since=before)
         assert modes and modes == [lasting] * len(modes), (spelling, modes)
 
-    # No run's 档 rode another run's call, and the retired letters never
+    # No run's 档 rode another run's call, and a retired letter never
     # reached the wire at all.
-    assert [m for m in _modes(port) if m is not None] == ["graph", "A"]
-    assert not set(_modes(port)) & set(RETIRED_TIER_TOKENS)
+    assert [m for m in _modes(port) if m is not None] == ["graph", "lexical"]
+    assert not set(_modes(port)) & set(RETIRED_LETTERS)

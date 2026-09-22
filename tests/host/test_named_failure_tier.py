@@ -1,14 +1,14 @@
-"""global 综述 / D 真数据库 未开未接 是具名失败, 不是文档检索 (T6, spec SC9).
+"""global 综述 / sql 真数据库 未开未接 是具名失败, 不是文档检索 (T6, spec SC9).
 
-SC9: "``global`` (formerly C) and D remain unused: if invoked, named
+SC9: "``global`` and ``sql`` remain unused: if invoked, named
 未开/未接, no fake SQL retrieve." The wayfinder doc (闭环与分档 §1) fixes
 both halves of the contract:
 
-* "分类输出仅为 ``A|graph|global|D``（不确定则澄清）；每档一套问答模板。
-  **禁止开放业务意图桶**" — the unopened 档 are asked for by NAME, never
-  inferred from business intent.
-* "A/C/D 未开或未就绪：**具名失败**（查找未开 / 综述未开 / 真库未接），
-  不得一律 ``unknown_locator`` + 空 citations."
+* the classification output is a closed 档 set (不确定则澄清), one Q&A
+  template per 档 — **禁止开放业务意图桶** — the unopened 档 are asked
+  for by NAME, never inferred from business intent.
+* an unopened / not-wired 档 is a **具名失败** (综述未开 / 真库未接),
+  不得一律 ``unknown_locator`` + 空 citations.
 
 The refusal is a 400 (``attachment_not_found``'s door: the request
 names something this product cannot serve), NOT a 409 — the SPA's 409
@@ -24,8 +24,8 @@ No classifier is built — a request that merely TALKS about summaries
 or a real database is not evidence that the 档 was invoked, and guessing
 would be the 开放业务意图桶 the doc forbids.
 
-A is 查找, which the same doc leaves openable on the default stack; it
-is deliberately NOT refused here (see
+lexical 查找 is the lexical fallback the same doc leaves openable on the
+default stack; it is deliberately NOT refused here (see
 ``fin.host.named_failures.TIER_UNAVAILABLE_CODE``).
 """
 
@@ -42,9 +42,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.named_failures import (
     REAL_DB_NOT_WIRED,
-    RETIRED_TIER_TOKENS,
     RETRIEVE_TIERS,
-    TIER_INPUT_TOKENS,
     TIER_NOT_OPEN,
     TIER_UNAVAILABLE_CODE,
     unavailable_tier,
@@ -52,6 +50,7 @@ from fin.host.named_failures import (
 from fin.host.search_mode_decision import normalize_search_mode
 from fin.retrieve.fake_port import FakeRetrievePort
 from fin.retrieve.port import resolve_search_mode
+from search_mode_pins import RETIRED_LETTERS
 
 
 KNOWN_IDS = {"AAPL-2022Q3"}
@@ -108,54 +107,71 @@ def test_no_requested_tier_is_not_a_tier_refusal() -> None:
     assert unavailable_tier(()) is None
 
 
-@pytest.mark.parametrize("tier", ["C", "c", "global", "GLOBAL", " global "])
-def test_a_requested_review_tier_is_unavailable(tier: str) -> None:
-    """The refusal is looked up by the LASTING token, so the lowercase
-    ``global`` a client may now send names itself — an upper-cased
-    comparison against the table can never match it, and the send would
-    have fallen through to an ordinary run dressed as 综述."""
-    assert unavailable_tier([tier]) == "global"
+def test_a_requested_review_tier_is_unavailable() -> None:
+    """The refusal is looked up by the LASTING token, exactly: the door
+    hands this helper a value already typed over the closed set, so any
+    other spelling (case variant or padding) is refused there as a 422 —
+    see ``test_a_retired_letter_send_is_a_typed_refusal``."""
+    assert unavailable_tier(["global"]) == "global"
 
 
-@pytest.mark.parametrize("tier", ["D", "d"])
-def test_a_requested_real_db_tier_is_unavailable(tier: str) -> None:
-    assert unavailable_tier([tier]) == "D"
+def test_a_requested_real_db_tier_is_unavailable() -> None:
+    assert unavailable_tier(["sql"]) == "sql"
 
 
-@pytest.mark.parametrize("tier", ["A", "a", "B", "b", "graph", "GRAPH"])
+@pytest.mark.parametrize("tier", ["lexical", "graph"])
 def test_the_open_tiers_are_not_refused(tier: str) -> None:
-    """查找 and 知识问答 (retired letter or lasting token alike) are the
-    阶段一 path; naming them is not a failure."""
+    """查找 and 知识问答 are the 阶段一 path; naming them is not a
+    failure."""
+    assert unavailable_tier([tier]) is None
+
+
+@pytest.mark.parametrize("tier", RETIRED_LETTERS)
+def test_a_retired_letter_is_not_a_tier_at_this_seam(tier: str) -> None:
+    """Zero coexistence reaches the refusal helper too: a bare letter is
+    no longer a 档 spelling, so it is not read as 综述/真数据库 either —
+    this helper names nothing for it (the door refuses it by TYPE before
+    this lookup could matter)."""
     assert unavailable_tier([tier]) is None
 
 
 def test_an_unknown_token_is_not_guessed_at() -> None:
     """Only the closed tier list can request a 档 — an arbitrary
     string is never read as 综述 / 真数据库 (禁止开放业务意图桶)."""
-    assert unavailable_tier(["summary", "sql", "database"]) is None
+    assert unavailable_tier(["summary", "database"]) is None
 
 
 def test_the_closed_tier_list_is_the_lasting_set() -> None:
-    """The letters left the closed set when normalize took over their
-    input duty: ``graph`` / ``global`` ARE the list the port forwards from,
-    and nothing else can join it without being a lasting token."""
-    assert RETRIEVE_TIERS == ("A", "graph", "global", "D")
+    """The letters left the closed set with the rename: the four lasting
+    tokens ARE the list the port forwards from, and nothing else can join
+    it without being a lasting token."""
+    assert RETRIEVE_TIERS == ("lexical", "graph", "global", "sql")
 
 
-def test_the_door_still_reads_the_retired_letters_the_port_refuses() -> None:
-    """The two sets answer two different questions, and the rename needs
-    both. ``RETRIEVE_TIERS`` is what the port FORWARDS;
-    ``TIER_INPUT_TOKENS`` is what the send schema ACCEPTS. The letters live
-    only in the second — which is why retiring them from the wire set cannot
-    turn a live client's own token into a 422, and why a 档 added to the
-    closed set reaches the port without ever being an input spelling."""
-    assert TIER_INPUT_TOKENS == RETRIEVE_TIERS + tuple(RETIRED_TIER_TOKENS)
-    for letter in RETIRED_TIER_TOKENS:
-        assert letter not in RETRIEVE_TIERS
-        assert letter in TIER_INPUT_TOKENS
+def test_the_door_accepts_exactly_the_closed_set() -> None:
+    """Zero coexistence, proven on the door MODEL rather than on a tuple:
+    each retired letter is a typed validation error the schema raises before
+    any handler runs, and the lasting tokens validate. A letter that got
+    past this door is a wiring mistake, and the only honest answer to a
+    mistake is a named one.
+    """
+    from pydantic import ValidationError
+
+    from fin.host.workspace_http import SendMessageRequest
+
+    for letter in RETIRED_LETTERS:
+        with pytest.raises(ValidationError, match="tiers"):
+            SendMessageRequest(question="q", tiers=[letter])
+        # the door's own normalizing helper agrees: a letter resolves to
+        # nothing, it is never quietly read as a 档 on the way in.
+        assert normalize_search_mode(letter) is None
+    for token in RETRIEVE_TIERS:
+        assert SendMessageRequest(
+            question="q", tiers=[token]
+        ).tiers == [token]
 
 
-# ----- T1 (search-mode-retrieve): the public C-not-ready code -----
+# ----- T1 (search-mode-retrieve): the public 综述-not-ready code -----
 
 
 def test_community_summary_index_failure_is_public_with_its_wire_token() -> (
@@ -173,7 +189,7 @@ def test_community_summary_index_failure_is_public_with_its_wire_token() -> (
 
 def test_community_summary_index_failure_is_not_tier_not_open() -> None:
     """``tier_not_open`` stays「档未发/点了关闭的档」(routing-time 400);
-    the C not-ready code names the failed community-summary JOB.
+    the 综述 not-ready code names the failed community-summary JOB.
     Collapsing them would tell an operator to open a 档 that IS open."""
     from fin.host.named_failures import (
         COMMUNITY_SUMMARY_INDEX_FAILURE,
@@ -211,16 +227,14 @@ def test_community_summary_index_failure_does_not_collapse_into_unknown_locator(
 
 
 def test_the_send_schema_enum_is_derived_from_the_tier_ssot() -> None:
-    """Drift guard: the send door's enum must BE the SSOT's accepted-input
-    tuple, and the port's Literal must BE its closed set.
+    """Drift guard: the send door's enum must BE the SSOT's closed set, and
+    so must the port's Literal.
 
     Re-spelling the tokens in the Pydantic model would let a 档 added to
     ``RETRIEVE_TIERS`` keep validating against the old set — the drift this
-    asserts against. The field is deliberately the INPUT tuple, not the
-    forwarded one: that difference is the whole reason a retired letter can
-    still arrive over HTTP (see
-    :func:`test_a_retired_letter_pin_reaches_the_port_as_its_lasting_token`).
-    """
+    asserts against. The door's accepted set and the port's forwarded set are
+    one closed set, so the guard pins both halves at once: what the door
+    accepts IS what the port forwards."""
     from typing import get_args
 
     from fin.host.named_failures import RetrieveTier
@@ -231,23 +245,17 @@ def test_the_send_schema_enum_is_derived_from_the_tier_ssot() -> None:
 
     assert get_args(RetrieveTier) == RETRIEVE_TIERS
     assert any(
-        get_args(schema) == TIER_INPUT_TOKENS for schema in schemas
+        get_args(schema) == RETRIEVE_TIERS for schema in schemas
     ), schemas
 
 
-def test_a_retired_letter_pin_reaches_the_port_as_its_lasting_token(
+def test_a_pinned_tier_reaches_the_port_as_its_token(
     client: TestClient, store, http_app: FastAPI
 ) -> None:
-    """The trap the closed set shrinks into, pinned on the real HTTP path.
-
-    An operator pin spelled ``B档`` is a LIVE request, not a legacy curiosity:
-    if the send schema typed the forwarded set it would be a schema 422 and
-    the run would never start. So the boundary normalizes onto the lasting
-    token and the enum stays pure — proven by the facts that have to hold
-    together: the door answers 200, the run's audit reads ``graph``, that
-    value is one the port's own seam accepts, and no letter is recorded on
-    any call the port took.
-    """
+    """The lasting token end to end, on the real HTTP path: the door
+    answers 200, the run's audit reads the token, that value is one the
+    port's own seam accepts, and the wire call carries exactly it —
+    nothing rewrites the 档 on the way from the door to the port."""
     from fin.host.http import get_graph
 
     port = FakeRetrievePort(
@@ -282,7 +290,7 @@ def test_a_retired_letter_pin_reaches_the_port_as_its_lasting_token(
         f"/api/threads/{thread_id}/messages",
         json={
             "question": "What was AAPL net sales in 2023 Q3?",
-            "tiers": ["B"],
+            "tiers": ["graph"],
         },
     )
 
@@ -293,15 +301,8 @@ def test_a_retired_letter_pin_reaches_the_port_as_its_lasting_token(
     ).values["search_mode_decision"]
     assert audit["search_mode"] == "graph"
     assert audit["signals"].get("pinned") is True
-    # The seam's own verdict on the value this run assigned: exactly what
-    # shrinking ``RETRIEVE_TIERS`` to the lasting set must leave intact.
     assert resolve_search_mode(audit["search_mode"]) == "graph"
-    # The normalizer the send door itself calls is what turned the letter
-    # into that token; the seam never sees the letter.
-    assert normalize_search_mode("B") == "graph"
-    assert resolve_search_mode(normalize_search_mode("B")) == "graph"
-    # POSITIVE: the door's pin reaches the WIRE call as ``graph`` — the
-    # retired letter is refused at the boundary and never forwarded.
+    # POSITIVE: the door's pin reaches the WIRE call as exactly that token.
     assert [call["search_mode"] for call in port.calls] == [
         "graph"
     ] * len(port.calls), [call["search_mode"] for call in port.calls]
@@ -316,27 +317,11 @@ def test_every_tier_code_key_is_a_tier_the_door_accepts() -> None:
 # ----- the send door -----
 
 
-def test_naming_tier_c_refuses_tier_not_open(
+def test_naming_tier_global_refuses_tier_not_open(
     client: TestClient, store, graph
 ) -> None:
-    thread_id = _new_thread(client)
-
-    r = client.post(
-        f"/api/threads/{thread_id}/messages",
-        json={"question": "Summarize the filings", "tiers": ["C"]},
-    )
-
-    assert r.status_code == 400, r.text
-    assert r.headers["content-type"].startswith("application/json")
-    assert r.json() == {"error": TIER_NOT_OPEN}
-
-
-def test_naming_the_lasting_global_token_refuses_tier_not_open(
-    client: TestClient, store, graph
-) -> None:
-    """The send door takes the LASTING token: a lowercase ``global`` pin
-    is 档未开 too, and the run never starts (it is not silently served by
-    the default 档)."""
+    """The send door takes the LASTING token: a ``global`` pin is 档未开,
+    the run never starts (it is not silently served by the default 档)."""
     thread_id = _new_thread(client)
 
     r = client.post(
@@ -345,19 +330,20 @@ def test_naming_the_lasting_global_token_refuses_tier_not_open(
     )
 
     assert r.status_code == 400, r.text
+    assert r.headers["content-type"].startswith("application/json")
     assert r.json() == {"error": TIER_NOT_OPEN}
     detail = client.get(f"/api/threads/{thread_id}").json()
     assert detail["turns"] == []
 
 
-def test_naming_tier_d_refuses_real_db_not_wired(
+def test_naming_tier_sql_refuses_real_db_not_wired(
     client: TestClient, store, graph
 ) -> None:
     thread_id = _new_thread(client)
 
     r = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": "How many rows are in the sales table?", "tiers": ["D"]},
+        json={"question": "How many rows are in the sales table?", "tiers": ["sql"]},
     )
 
     assert r.status_code == 400, r.text
@@ -373,11 +359,11 @@ def test_the_two_tier_refusals_are_distinguishable(
 
     review = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": "q", "tiers": ["C"]},
+        json={"question": "q", "tiers": ["global"]},
     )
     real_db = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": "q", "tiers": ["D"]},
+        json={"question": "q", "tiers": ["sql"]},
     )
 
     assert review.json()["error"] != real_db.json()["error"]
@@ -396,20 +382,19 @@ def test_the_refusal_happens_before_any_run_starts(
 
     client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": "Summarize the filings", "tiers": ["C"]},
+        json={"question": "Summarize the filings", "tiers": ["global"]},
     )
 
     detail = client.get(f"/api/threads/{thread_id}").json()
     assert detail["turns"] == []
 
 
-@pytest.mark.parametrize("tier", ["B", "graph", "A"])
+@pytest.mark.parametrize("tier", ["lexical", "graph"])
 def test_naming_an_open_tier_does_not_refuse(
     tier: str, client: TestClient, store, graph
 ) -> None:
     """查找 and 知识问答 ride the ordinary send path (the run, not a
-    refusal), whether the 档 arrives as its lasting token or as the
-    retired letter an old client still sends."""
+    refusal): an open lasting token is never 档未开."""
     thread_id = _new_thread(client)
 
     r = client.post(
@@ -454,7 +439,7 @@ def test_an_unknown_tier_token_is_rejected_as_input(
     client: TestClient, store, graph
 ) -> None:
     """The selector is a closed enum: a bogus token is an INPUT error
-    (422), never silently read as C/D."""
+    (422), never silently read as global / sql."""
     thread_id = _new_thread(client)
 
     r = client.post(
@@ -463,3 +448,40 @@ def test_an_unknown_tier_token_is_rejected_as_input(
     )
 
     assert r.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        *RETIRED_LETTERS,
+        "GLOBAL",
+        "SQL",
+        " sql ",
+        "LEXICAL",
+        "GRAPH",
+    ],
+)
+def test_a_retired_letter_send_is_a_typed_refusal(
+    token: str, client: TestClient, store, graph
+) -> None:
+    """Zero coexistence at the door: ``tiers: ["A"]`` is no longer a
+    spelling that means something — it is the same kind of bad selector
+    as ``"Z"``, refused by the schema (422) before any run starts and
+    before the 400 refusal table is consulted. The enum is typed to the
+    closed set, so a non-exact spelling (case variant or padding included)
+    is refused by type, not normalized: this is the ONE seam that decides
+    what a selector may spell, and the refusal names the accepted set so
+    the operator can read it."""
+    thread_id = _new_thread(client)
+
+    r = client.post(
+        f"/api/threads/{thread_id}/messages",
+        json={"question": "q", "tiers": [token]},
+    )
+
+    assert r.status_code == 422, r.text
+    body = r.text
+    for lasting in RETRIEVE_TIERS:
+        assert lasting in body, body
+    detail = client.get(f"/api/threads/{thread_id}").json()
+    assert detail["turns"] == []

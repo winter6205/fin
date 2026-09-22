@@ -10,7 +10,7 @@ Ticket 4 落地了 graph 侧的 propose 窗（seed
 **state 字段** seed，工作台因此不可达。本文件锁 HTTP 契约：
 
 * ``SendMessageRequest.propose_extract_method="fast"`` → 该 run 的 input
-  state 携带 seed；pin 住开放档（``tiers:["B"]``）时 SSE 的唯一窗是
+  state 携带 seed；pin 住开放档（``tiers:["graph"]``）时 SSE 的唯一窗是
   方法窗（options standard/fast，title 区别于档窗）；
 * resume ``{"pick":"fast"}`` → 审计 ``applied is False`` +
   ``operator_confirmed True`` + ``picked "fast"``，run 走完
@@ -51,8 +51,8 @@ pytestmark = [pytest.mark.soft_track]
 
 KNOWN_IDS = {"AAPL-2022Q3", "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
-# Grounded by the track rules tier; ``tiers:["B"]`` (the retired letter,
-# which the pin normalizes to its lasting token) pins the 档 so the
+# Grounded by the track rules tier; ``tiers:["graph"]`` — the lasting
+# token, the only spelling the send door types — pins the 档 so the
 # ONLY possible window on these sends is the extract-method one.
 AMBIGUOUS = "What was AAPL net sales in 2023 Q3?"
 
@@ -154,7 +154,7 @@ def test_send_with_propose_fast_streams_method_window(
     thread_id = _new_thread(client)
     r = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": AMBIGUOUS, "tiers": ["B"], "propose_extract_method": "fast"},
+        json={"question": AMBIGUOUS, "tiers": ["graph"], "propose_extract_method": "fast"},
     )
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/event-stream")
@@ -184,7 +184,7 @@ def test_resume_fast_after_send_records_confirmed_proposal(
     thread_id = _new_thread(client)
     sent = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": AMBIGUOUS, "tiers": ["B"], "propose_extract_method": "fast"},
+        json={"question": AMBIGUOUS, "tiers": ["graph"], "propose_extract_method": "fast"},
     )
     assert _parse_sse_events(sent.text)[-1][0] == "choice_window"
 
@@ -222,7 +222,7 @@ def test_send_without_field_has_no_method_window(
     thread_id = _new_thread(client)
     r = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": AMBIGUOUS, "tiers": ["B"]},
+        json={"question": AMBIGUOUS, "tiers": ["graph"]},
     )
     assert r.status_code == 200
     names = [name for name, _ in _parse_sse_events(r.text)]
@@ -241,14 +241,14 @@ def test_seed_does_not_leak_to_next_send(
     thread_id = _new_thread(client)
     sent = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": AMBIGUOUS, "tiers": ["B"], "propose_extract_method": "fast"},
+        json={"question": AMBIGUOUS, "tiers": ["graph"], "propose_extract_method": "fast"},
     )
     assert _parse_sse_events(sent.text)[-1][0] == "choice_window"
     client.post(f"/api/threads/{thread_id}/resume", json={"pick": "standard"})
 
     second = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": AMBIGUOUS, "tiers": ["B"]},
+        json={"question": AMBIGUOUS, "tiers": ["graph"]},
     )
     assert second.status_code == 200
     names = [name for name, _ in _parse_sse_events(second.text)]
@@ -343,7 +343,7 @@ def test_send_with_version_context_resume_fast_applies_switch(
         f"/api/threads/{thread_id}/messages",
         json={
             "question": AMBIGUOUS,
-            "tiers": ["B"],
+            "tiers": ["graph"],
             "propose_extract_method": "fast",
             "propose_document_id": "AAPL-2022Q3",
             "propose_version": "a" * 64,
@@ -381,7 +381,7 @@ def test_send_with_half_version_context_never_applies(
         f"/api/threads/{thread_id}/messages",
         json={
             "question": AMBIGUOUS,
-            "tiers": ["B"],
+            "tiers": ["graph"],
             "propose_extract_method": "fast",
             "propose_document_id": "AAPL-2022Q3",
         },
@@ -407,7 +407,7 @@ def test_send_without_context_fields_keeps_wire_shape(
     thread_id = _new_thread(client)
     client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": AMBIGUOUS, "tiers": ["B"], "propose_extract_method": "fast"},
+        json={"question": AMBIGUOUS, "tiers": ["graph"], "propose_extract_method": "fast"},
     )
     seed = _state_values(installed, thread_id)["extract_method_proposal"]
     assert seed == {"proposed": "fast"}

@@ -124,7 +124,7 @@ def test_propose_seed_opens_extract_method_window() -> None:
     g = _compile(_ANSWER)
     out = g.invoke(
         _propose_input(AMBIGUOUS),
-        config=_cfg("fp-open", pinned_search_mode="B"),
+        config=_cfg("fp-open", pinned_search_mode="graph"),
     )
     payload = _interrupt_payload(out)
     assert payload is not None
@@ -150,7 +150,7 @@ def test_no_pick_keeps_extract_method_standard() -> None:
     g = _compile(_ANSWER)
     out = g.invoke(
         _propose_input(AMBIGUOUS),
-        config=_cfg("fp-nopick", pinned_search_mode="B"),
+        config=_cfg("fp-nopick", pinned_search_mode="graph"),
     )
     assert _interrupt_payload(out) is not None
     proposal = out["extract_method_proposal"]
@@ -168,8 +168,8 @@ def test_empty_pick_reopens_window_and_keeps_standard() -> None:
     window reopens (never a crash, never Fast) and stays standard."""
     g = _compile(_ANSWER)
     tid = "fp-empty-pick"
-    g.invoke(_propose_input(AMBIGUOUS), config=_cfg(tid, pinned_search_mode="B"))
-    again = g.invoke(Command(resume=""), config=_cfg(tid, pinned_search_mode="B"))
+    g.invoke(_propose_input(AMBIGUOUS), config=_cfg(tid, pinned_search_mode="graph"))
+    again = g.invoke(Command(resume=""), config=_cfg(tid, pinned_search_mode="graph"))
     payload = _interrupt_payload(again)
     assert payload is not None
     assert payload["kind"] == "choice_window"
@@ -189,8 +189,8 @@ def test_pick_fast_records_proposal_never_applies() -> None:
     fact. The 档 audit is untouched."""
     g = _compile(_ANSWER)
     tid = "fp-pick-fast"
-    g.invoke(_propose_input(AMBIGUOUS), config=_cfg(tid, pinned_search_mode="B"))
-    done = g.invoke(Command(resume="fast"), config=_cfg(tid, pinned_search_mode="B"))
+    g.invoke(_propose_input(AMBIGUOUS), config=_cfg(tid, pinned_search_mode="graph"))
+    done = g.invoke(Command(resume="fast"), config=_cfg(tid, pinned_search_mode="graph"))
     assert not done.get("__interrupt__")
     proposal = done["extract_method_proposal"]
     assert proposal["proposed"] == "fast"
@@ -212,9 +212,9 @@ def test_pick_fast_records_proposal_never_applies() -> None:
 def test_pick_standard_declines_proposal() -> None:
     g = _compile(_ANSWER)
     tid = "fp-pick-standard"
-    g.invoke(_propose_input(AMBIGUOUS), config=_cfg(tid, pinned_search_mode="B"))
+    g.invoke(_propose_input(AMBIGUOUS), config=_cfg(tid, pinned_search_mode="graph"))
     done = g.invoke(
-        Command(resume="standard"), config=_cfg(tid, pinned_search_mode="B")
+        Command(resume="standard"), config=_cfg(tid, pinned_search_mode="graph")
     )
     assert not done.get("__interrupt__")
     proposal = done["extract_method_proposal"]
@@ -230,13 +230,13 @@ def test_out_of_list_pick_reopens_then_resolves() -> None:
     resolves normally."""
     g = _compile(_ANSWER)
     tid = "fp-invalid"
-    g.invoke(_propose_input(AMBIGUOUS), config=_cfg(tid, pinned_search_mode="B"))
-    again = g.invoke(Command(resume="Z"), config=_cfg(tid, pinned_search_mode="B"))
+    g.invoke(_propose_input(AMBIGUOUS), config=_cfg(tid, pinned_search_mode="graph"))
+    again = g.invoke(Command(resume="Z"), config=_cfg(tid, pinned_search_mode="graph"))
     payload = _interrupt_payload(again)
     assert payload is not None
     assert "Z" in payload["rejected_picks"]
     assert again["extract_method_proposal"] == dict(_FAST_PROPOSAL_SEED)
-    done = g.invoke(Command(resume="fast"), config=_cfg(tid, pinned_search_mode="B"))
+    done = g.invoke(Command(resume="fast"), config=_cfg(tid, pinned_search_mode="graph"))
     assert not done.get("__interrupt__")
     assert done["extract_method_proposal"]["picked"] == "fast"
     assert done["extract_method_proposal"]["applied"] is False
@@ -259,10 +259,10 @@ def test_propose_then_mode_window_chain_never_yields_fast_mode() -> None:
     assert sorted(_option_ids(_interrupt_payload(out) or {})) == ["fast", "standard"]
 
     # A "档 pick" inside the method window is out-of-list: reopen.
-    again = g.invoke(Command(resume="A"), config=_cfg(tid))
+    again = g.invoke(Command(resume="graph"), config=_cfg(tid))
     payload = _interrupt_payload(again)
     assert payload is not None
-    assert "A" in payload["rejected_picks"]
+    assert "graph" in payload["rejected_picks"]
 
     resolved = g.invoke(Command(resume="fast"), config=_cfg(tid))
     # The method proposal is recorded...
@@ -284,7 +284,7 @@ def test_propose_then_mode_window_chain_never_yields_fast_mode() -> None:
     assert "fast" in mode_payload["rejected_picks"]
     assert reopened["search_mode_decision"]["search_mode"] not in ("Fast", "fast")
 
-    final = g.invoke(Command(resume="B"), config=_cfg(tid))
+    final = g.invoke(Command(resume="graph"), config=_cfg(tid))
     assert not final.get("__interrupt__")
     assert final["search_mode_decision"]["search_mode"] == "graph"
     assert final["search_mode_decision"]["search_mode"] not in ("Fast", "fast")
@@ -302,7 +302,7 @@ def test_default_grounded_flow_never_opens_the_window() -> None:
     interrupt and an EMPTY proposal audit (reset per run)."""
     g = _compile(_ANSWER)
     out = g.invoke(
-        _input(AMBIGUOUS), config=_cfg("fp-noop", pinned_search_mode="B")
+        _input(AMBIGUOUS), config=_cfg("fp-noop", pinned_search_mode="graph")
     )
     assert not out.get("__interrupt__")
     assert out["search_mode_decision"]["search_mode"] == "graph"
@@ -328,7 +328,7 @@ def test_lane_off_seed_never_opens_window() -> None:
     just runs through, applying nothing."""
     g = _compile(_ANSWER, choice_window=False)
     out = g.invoke(
-        _propose_input(AMBIGUOUS), config=_cfg("fp-lane-off", pinned_search_mode="B")
+        _propose_input(AMBIGUOUS), config=_cfg("fp-lane-off", pinned_search_mode="graph")
     )
     assert not out.get("__interrupt__")
     assert out["search_mode_decision"]["search_mode"] == "graph"
@@ -393,9 +393,9 @@ def test_fast_pick_with_version_context_applies_the_switch(
     tid = "fp-apply-fast"
     g.invoke(
         _propose_input_for_version(AMBIGUOUS, "AAPL-2022Q3", "a" * 64),
-        config=_cfg(tid, pinned_search_mode="B"),
+        config=_cfg(tid, pinned_search_mode="graph"),
     )
-    done = g.invoke(Command(resume="fast"), config=_cfg(tid, pinned_search_mode="B"))
+    done = g.invoke(Command(resume="fast"), config=_cfg(tid, pinned_search_mode="graph"))
     assert not done.get("__interrupt__")
     proposal = done["extract_method_proposal"]
     assert proposal["picked"] == "fast"
@@ -418,8 +418,8 @@ def test_fast_pick_without_version_context_never_touches_catalog(
     catalog_path = _seed_catalog(tmp_path)
     g = _compile(_ANSWER, catalog_path=catalog_path)
     tid = "fp-apply-nocontext"
-    g.invoke(_propose_input(AMBIGUOUS), config=_cfg(tid, pinned_search_mode="B"))
-    done = g.invoke(Command(resume="fast"), config=_cfg(tid, pinned_search_mode="B"))
+    g.invoke(_propose_input(AMBIGUOUS), config=_cfg(tid, pinned_search_mode="graph"))
+    done = g.invoke(Command(resume="fast"), config=_cfg(tid, pinned_search_mode="graph"))
     proposal = done["extract_method_proposal"]
     assert proposal["picked"] == "fast"
     assert proposal["applied"] is False
@@ -438,9 +438,9 @@ def test_fast_pick_for_unrecorded_version_is_typed_noop(tmp_path: Path) -> None:
     tid = "fp-apply-missing"
     g.invoke(
         _propose_input_for_version(AMBIGUOUS, "AAPL-2022Q3", "b" * 64),
-        config=_cfg(tid, pinned_search_mode="B"),
+        config=_cfg(tid, pinned_search_mode="graph"),
     )
-    done = g.invoke(Command(resume="fast"), config=_cfg(tid, pinned_search_mode="B"))
+    done = g.invoke(Command(resume="fast"), config=_cfg(tid, pinned_search_mode="graph"))
     assert not done.get("__interrupt__")
     proposal = done["extract_method_proposal"]
     assert proposal["applied"] is False
@@ -460,10 +460,10 @@ def test_standard_pick_with_context_declines_without_writing(
     tid = "fp-apply-decline"
     g.invoke(
         _propose_input_for_version(AMBIGUOUS, "AAPL-2022Q3", "a" * 64),
-        config=_cfg(tid, pinned_search_mode="B"),
+        config=_cfg(tid, pinned_search_mode="graph"),
     )
     done = g.invoke(
-        Command(resume="standard"), config=_cfg(tid, pinned_search_mode="B")
+        Command(resume="standard"), config=_cfg(tid, pinned_search_mode="graph")
     )
     proposal = done["extract_method_proposal"]
     assert proposal["picked"] == "standard"
@@ -485,10 +485,10 @@ def test_bad_picks_with_context_keep_version_standard_until_valid(
     tid = "fp-apply-bads"
     g.invoke(
         _propose_input_for_version(AMBIGUOUS, "AAPL-2022Q3", "a" * 64),
-        config=_cfg(tid, pinned_search_mode="B"),
+        config=_cfg(tid, pinned_search_mode="graph"),
     )
     for bad in ("turbo", ""):
-        again = g.invoke(Command(resume=bad), config=_cfg(tid, pinned_search_mode="B"))
+        again = g.invoke(Command(resume=bad), config=_cfg(tid, pinned_search_mode="graph"))
         assert _interrupt_payload(again) is not None
         assert again["extract_method_proposal"] == {
             "proposed": "fast",
@@ -496,7 +496,7 @@ def test_bad_picks_with_context_keep_version_standard_until_valid(
             "version": "a" * 64,
         }
         assert _stored_rows(catalog_path)[0]["extract_method"] == "standard"
-    done = g.invoke(Command(resume="fast"), config=_cfg(tid, pinned_search_mode="B"))
+    done = g.invoke(Command(resume="fast"), config=_cfg(tid, pinned_search_mode="graph"))
     assert done["extract_method_proposal"]["applied"] is True
     assert done["extract_method_proposal"]["rejected_picks"] == ["turbo", ""]
     assert _stored_rows(catalog_path)[0]["extract_method"] == "fast"
@@ -510,7 +510,7 @@ def test_lane_off_with_context_applies_nothing(tmp_path: Path) -> None:
     g = _compile(_ANSWER, choice_window=False, catalog_path=catalog_path)
     out = g.invoke(
         _propose_input_for_version(AMBIGUOUS, "AAPL-2022Q3", "a" * 64),
-        config=_cfg("fp-apply-laneoff", pinned_search_mode="B"),
+        config=_cfg("fp-apply-laneoff", pinned_search_mode="graph"),
     )
     assert not out.get("__interrupt__")
     assert out["extract_method_proposal"].get("applied") is not True

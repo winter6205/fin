@@ -64,7 +64,9 @@ def test_choice_request_names_the_closed_set_question_and_utterance() -> None:
     decision = decide_search_mode(_msgs(AMBIGUOUS), jev_client=fake)
 
     (call,) = fake.calls
-    assert call["options"] == ["A", "graph", "global", "D"]
+    # Derived, not re-spelled: which tokens (and in what order) the judge is
+    # asked over is the SSOT tuple's contract, pinned literally once in
+    # ``tests/host/test_soft_track_jev_route.py``.
     assert call["options"] == list(LASTING_RETRIEVE_TIERS)
     assert call["question_id"] == "search_mode"
     assert call["utterance"] == AMBIGUOUS
@@ -83,7 +85,7 @@ def test_choice_instructions_teach_each_operator_label() -> None:
     mean two copies of one rule that can drift apart. Both halves are
     pinned — every label present, no gloss body present.
     """
-    fake = FakeJevChoice([("A", 0.9)])
+    fake = FakeJevChoice([("lexical", 0.9)])
     decision = decide_search_mode(_msgs(AMBIGUOUS), jev_client=fake)
 
     call = fake.calls[0]
@@ -92,7 +94,7 @@ def test_choice_instructions_teach_each_operator_label() -> None:
         assert TIER_LABELS[mode] in call["instructions"]
     for gloss in smd._JEV_MODE_TIER_GLOSSES.values():
         assert gloss not in call["instructions"]
-    assert decision.search_mode == "A"
+    assert decision.search_mode == "lexical"
     assert decision.decision_tier == "jev"
     assert decision.failure_code is None
 
@@ -114,7 +116,7 @@ def test_rules_naming_skips_the_judge() -> None:
 def test_choice_criteria_carry_one_gloss_per_lasting_tier() -> None:
     """Anti-drift pin for the next 档 rename. A token that arrives without
     its discriminator is the failure mode this prompt already shipped once
-    (bare labels pulled ``D 真数据库`` on any figure question), so the gloss
+    (bare labels pulled ``sql 真数据库`` on any figure question), so the gloss
     table must be exactly the closed set and the cascade must hand that
     table over as its per-option criteria, value for value.
 
@@ -166,7 +168,7 @@ def test_missing_client_names_the_judge_as_the_reason() -> None:
 def test_judge_names_a_real_db_tier_as_its_own_named_failure() -> None:
     """「真库未接」 reached through the JUDGE (not only through a pin) is a
     DISTINCT exit from 「档未开」 and must never collapse into it."""
-    fake = FakeJevChoice([("D", 0.95)])
+    fake = FakeJevChoice([("sql", 0.95)])
     decision = decide_search_mode(_msgs(AMBIGUOUS), jev_client=fake)
 
     assert decision.search_mode is None
@@ -185,7 +187,7 @@ def test_judge_keys_carry_the_mode_prefix() -> None:
     separate audit rows and are never merged, so this is attribution, not
     collision-avoidance — the track judge's bare ``jev_*`` names simply do
     not belong on this row."""
-    fake = FakeJevChoice([("A", 0.9)])
+    fake = FakeJevChoice([("lexical", 0.9)])
     decision = decide_search_mode(_msgs(AMBIGUOUS), jev_client=fake)
 
     judge_keys = {
@@ -252,7 +254,7 @@ def test_mode_decision_is_recorded_before_retrieve() -> None:
 
     assert out["track"] == "grounded"
     assert [(call["question_id"], call["options"]) for call in fake.calls] == [
-        ("search_mode", ["A", "graph", "global", "D"])
+        ("search_mode", ["lexical", "graph", "global", "sql"])
     ]
     audit = out["search_mode_decision"]
     assert audit["search_mode"] == "graph"

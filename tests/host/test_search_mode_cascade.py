@@ -8,7 +8,7 @@ Five boundary classes (spec Boundaries "Test classes"), mapped to names:
 
 * empty      -> ``test_empty_utterance_residual_clarifies_without_inventing_c``
 * negative   -> ``test_jev_label_outside_the_closed_set_is_a_typed_exit`` /
-                ``test_pin_of_unopened_tier_is_typed_fail_not_silent_c``
+                ``test_pin_of_unopened_tier_is_typed_fail_not_silent_substitute``
 * overflow   -> ``test_cascade_has_no_step_cap_of_its_own`` /
                 ``test_snapshot_inherit_does_not_wipe_history``
 * concurrent -> ``test_mode_channel_does_not_leak_across_threads`` (the
@@ -92,13 +92,15 @@ def _compile(
 
 
 # ---------------------------------------------------------------------------
-# rules tier: a named 档 (lasting token, retired letter, or 检索档 label)
+# rules tier: a named 档 (lasting token or 检索档 label)
 # ---------------------------------------------------------------------------
 
 
-def test_rules_assign_mode_from_tier_letter() -> None:
-    decision = decide_search_mode(_msgs("A档：what was AAPL net sales in 2023 Q3?"))
-    assert decision.search_mode == "A"
+def test_rules_assign_mode_from_lasting_token() -> None:
+    decision = decide_search_mode(
+        _msgs("lexical档：what was AAPL net sales in 2023 Q3?")
+    )
+    assert decision.search_mode == "lexical"
     assert decision.decision_tier == "rules"
     assert decision.failure_code is None
     assert decision.options == []
@@ -112,12 +114,73 @@ def test_rules_assign_mode_from_context_label() -> None:
 
 def test_two_different_named_tiers_stay_ambiguous_not_first_match() -> None:
     """Boundary: a naming that cannot uniquely name one 档 is ambiguous —
-    rules must not pick one and silently call it high-confidence. The
-    retired letter in the naming still resolves to its lasting token."""
+    rules must not pick one and silently call it high-confidence."""
+    decision = decide_search_mode(_msgs("lexical档还是graph档？"))
+    assert decision.search_mode is None
+    assert decision.decision_tier == "clarify"
+    assert decision.signals.get("ambiguous_naming") == ["lexical", "graph"]
+
+
+def test_a_letter_next_to_the_marker_names_no_tier() -> None:
+    """Zero coexistence at the rules tier: a retired single letter next to
+    档 is ordinary prose — rules neither assign nor mark ambiguity, the ask
+    falls through like any unnamed one."""
     decision = decide_search_mode(_msgs("A档还是B档？"))
     assert decision.search_mode is None
     assert decision.decision_tier == "clarify"
-    assert decision.signals.get("ambiguous_naming") == ["A", "graph"]
+    assert "ambiguous_naming" not in decision.signals
+    assert "tier_naming" not in decision.signals
+
+
+# The 档 naming pattern is BUILT from the SSOT (token and label alternations
+# joined longest-first) instead of spelling the four names by hand. That is
+# only safe while the derived pattern recognises exactly what the
+# hand-written one did, so both directions are asserted here through the
+# PUBLIC cascade rather than against the compiled regex: every lasting token
+# and every operator label still names its 档 in either word order, and a
+# retired letter still names nothing at all.
+_NAMING_QUESTION = "what was AAPL net sales in 2023 Q3?"
+
+# The label an utterance names, read back off the public label map.
+_MODE_BY_LABEL = {label: mode for mode, label in MODE_LABELS.items()}
+
+
+def _named_mode(text: str) -> str | None:
+    """The 档 the rules tier resolved for this utterance, open or not.
+
+    An open 档 is assigned (``tier_naming``); a named-but-unopened one exits
+    as 具名失败 and records the token it refused (``requested_mode``). Both
+    are the rules tier having MATCHED the naming — which is what the
+    alternation is under test for.
+    """
+    decision = decide_search_mode(_msgs(text))
+    signals = decision.signals
+    return signals.get("tier_naming") or signals.get("requested_mode")
+
+
+@pytest.mark.parametrize("token", LASTING_RETRIEVE_TIERS)
+def test_every_lasting_token_names_its_tier_in_either_word_order(
+    token: str,
+) -> None:
+    assert _named_mode(f"{token}档 {_NAMING_QUESTION}") == token
+    assert _named_mode(f"档 {token} {_NAMING_QUESTION}") == token
+
+
+@pytest.mark.parametrize("label", list(MODE_LABELS.values()))
+def test_every_operator_label_names_its_tier_in_either_word_order(
+    label: str,
+) -> None:
+    expected = _MODE_BY_LABEL[label]
+    assert _named_mode(f"{label}档 {_NAMING_QUESTION}") == expected
+    assert _named_mode(f"档 {label} {_NAMING_QUESTION}") == expected
+
+
+@pytest.mark.parametrize("letter", ["A", "B", "C", "D"])
+def test_a_retired_letter_in_neither_word_order_names_a_tier(
+    letter: str,
+) -> None:
+    assert _named_mode(f"{letter}档 {_NAMING_QUESTION}") is None
+    assert _named_mode(f"档 {letter} {_NAMING_QUESTION}") is None
 
 
 # ---------------------------------------------------------------------------
@@ -127,22 +190,22 @@ def test_two_different_named_tiers_stay_ambiguous_not_first_match() -> None:
 
 def test_pin_assigns_mode_without_window() -> None:
     decision = decide_search_mode(
-        _msgs("what was AAPL net sales in 2023 Q3?"), pinned_mode="B"
+        _msgs("what was AAPL net sales in 2023 Q3?"), pinned_mode="graph"
     )
-    # The pin arrives as the retired letter an old client still sends
-    # and is recorded as the lasting token the port will carry.
+    # The pin arrives as the lasting token itself and is recorded as the
+    # value the port will carry.
     assert decision.search_mode == "graph"
     assert decision.decision_tier == "rules"
     assert decision.signals.get("pinned") is True
     assert decision.options == []  # no window opened by a pin
 
 
-def test_pin_of_unopened_tier_is_typed_fail_not_silent_c() -> None:
+def test_pin_of_unopened_tier_is_typed_fail_not_silent_substitute() -> None:
     """Boundary 'negative': pin 综述 (a plan-slot 档) → 具名失败 档未开;
     the residual must not invent ANY mode, and must not be a silent
     global assignment either. The refusal names the LASTING token."""
     decision = decide_search_mode(
-        _msgs("what was AAPL net sales in 2023 Q3?"), pinned_mode="C"
+        _msgs("what was AAPL net sales in 2023 Q3?"), pinned_mode="global"
     )
     assert decision.search_mode is None
     assert decision.decision_tier == "typed_fail"
@@ -152,10 +215,11 @@ def test_pin_of_unopened_tier_is_typed_fail_not_silent_c() -> None:
 
 def test_pin_of_real_db_tier_is_typed_fail_with_its_own_code() -> None:
     """「真库未接」 is a DISTINCT exit from 「档未开」 — never collapsed."""
-    decision = decide_search_mode(_msgs("what was revenue?"), pinned_mode="D")
+    decision = decide_search_mode(_msgs("what was revenue?"), pinned_mode="sql")
     assert decision.search_mode is None
     assert decision.decision_tier == "typed_fail"
     assert decision.failure_code == REAL_DB_NOT_WIRED
+    assert decision.signals.get("requested_mode") == "sql"
 
 
 def test_invalid_pin_is_typed_exit_and_falls_through() -> None:
@@ -192,10 +256,13 @@ def test_jev_valid_mode_assigns_the_jev_tier() -> None:
     assert decision.failure_code is None
 
 
-@pytest.mark.parametrize("label", ["E", "", "Z", "research"])
+@pytest.mark.parametrize("label", ["E", "", "Z", "research", "A", "b"])
 def test_jev_label_outside_the_closed_set_is_a_typed_exit(label: str) -> None:
     """Boundary 'negative': a judge label the 档 SSOT cannot map at all
-    names no 档 -- typed EXIT, residual clarify, never a silent global."""
+    names no 档 -- typed EXIT, residual clarify, never a silent global.
+    Retired single letters sit OUTSIDE the closed set now: zero
+    coexistence means an ``A`` answer from the judge is refused exactly
+    like ``E``, not quietly read as a spelling of some 档."""
     fake = FakeJevChoice([(label, 0.99)])
     decision = decide_search_mode(
         _msgs("what was AAPL net sales in 2023 Q3?"), jev_client=fake
@@ -207,18 +274,18 @@ def test_jev_label_outside_the_closed_set_is_a_typed_exit(label: str) -> None:
     assert decision.options  # the window data exists for Ticket 2 to render
 
 
-@pytest.mark.parametrize("label", ["B", " b "])
-def test_jev_retired_spelling_resolves_to_its_lasting_tier(label: str) -> None:
-    """A retired letter is NOT out of set: the answer goes through the
-    same SSOT total function, so ``B`` resolves to ``graph`` and is
-    judged open, while only an unmappable label above can exit. Pinning
-    this here is what keeps the alias rename from being re-litigated at
-    the judge seam."""
+@pytest.mark.parametrize("label", ["graph", "GRAPH", " lexical "])
+def test_jev_lasting_spelling_resolves_to_its_tier(label: str) -> None:
+    """The lasting tokens are the ONLY accepted spellings: every case or
+    padding variant of one goes through the same SSOT total function and
+    is judged open, while the retired letters above can only exit. Pinning
+    this here is what keeps the rename from being re-litigated at the
+    judge seam."""
     fake = FakeJevChoice([(label, 0.9)])
     decision = decide_search_mode(
         _msgs("what was AAPL net sales in 2023 Q3?"), jev_client=fake
     )
-    assert decision.search_mode == "graph"
+    assert decision.search_mode == label.strip().lower()
     assert decision.decision_tier == "jev"
     assert "mode_jev_exit" not in decision.signals
     assert decision.signals["mode_jev_label"] == label
@@ -336,21 +403,21 @@ def test_jev_skipped_when_inherit_would_decide() -> None:
     """Mirror of ``decide_track``'s peek: when inherit decides, the
     judge is NOT consulted (a judge answer cannot steal the
     inherited 档)."""
-    fake = FakeJevChoice([("A", 0.99)])
+    fake = FakeJevChoice([("lexical", 0.99)])
     snapshots = [
         {
             "company": "AAPL",
             "period": "2023 Q3",
             "document_ids": [],
-            "search_mode": "B",
+            "search_mode": "graph",
         }
     ]
     decision = decide_search_mode(
         _msgs("and 2022 Q3?"), snapshots=snapshots, jev_client=fake
     )
     assert fake.calls == []
-    # A 档 stored before the rename is still inheritable, and what the
-    # turn records is the lasting token.
+    # Inherit reads the durable history, so the stored lasting token is
+    # what the turn records.
     assert decision.search_mode == "graph"
     assert decision.decision_tier == "inherit"
     # Inherit won the turn, so the judge was not the reason anything was
@@ -378,20 +445,28 @@ def _snap_with_mode(company: str, period: str, mode: str) -> dict[str, Any]:
 
 
 def test_inherit_reuses_last_mode_on_short_follow_up() -> None:
-    # A 档 recorded before the rename still carries the job forward, and
-    # what this turn inherits is the lasting token.
-    snapshots = [_snap_with_mode("AAPL", "2023 Q3", "B")]
+    snapshots = [_snap_with_mode("AAPL", "2023 Q3", "graph")]
     decision = decide_search_mode(_msgs("and 2022 Q3?"), snapshots=snapshots)
     assert decision.search_mode == "graph"
     assert decision.decision_tier == "inherit"
     assert decision.signals.get("inherited_mode") == "graph"
 
 
+def test_inherit_ignores_a_retired_letter_in_history() -> None:
+    """Zero coexistence reaches the durable channel too: a stray retired
+    letter is not a 档 spelling, so it carries no job forward — the short
+    follow-up gets the residual clarify rather than an inherited mode."""
+    snapshots = [_snap_with_mode("AAPL", "2023 Q3", "B")]
+    decision = decide_search_mode(_msgs("and 2022 Q3?"), snapshots=snapshots)
+    assert decision.search_mode is None
+    assert decision.decision_tier == "clarify"
+
+
 def test_inherit_blocked_after_company_change_wipe() -> None:
     """Do not inherit across a NEW retrieve job: the company-change wipe
     snapshot clears the job the old 档 belonged to."""
     snapshots = [
-        _snap_with_mode("AAPL", "2023 Q3", "B"),
+        _snap_with_mode("AAPL", "2023 Q3", "graph"),
         {"company": "MSFT", "period": "", "document_ids": []},
     ]
     decision = decide_search_mode(
@@ -432,9 +507,9 @@ def test_clarify_options_are_structured_with_opened_flags() -> None:
     duplicated 档 enumeration here. The ids are the LASTING tokens, so a
     pick resumes with exactly the value the audit and the port carry."""
     options = clarify_options()
-    assert [o["id"] for o in options] == ["A", "graph", "global", "D"]
+    assert [o["id"] for o in options] == list(LASTING_RETRIEVE_TIERS)
     assert [o["label"] for o in options] == [
-        MODE_LABELS[t] for t in ("A", "graph", "global", "D")
+        MODE_LABELS[t] for t in LASTING_RETRIEVE_TIERS
     ]
     assert [o["opened"] for o in options] == [True, True, False, False]
 
@@ -446,28 +521,25 @@ def test_normalize_search_mode_closed_set_only() -> None:
 
 
 def test_normalize_lands_every_accepted_spelling_on_a_lasting_token() -> None:
-    """The rename is only real if BOTH halves resolve: a lowercase lasting
-    token arrives intact, and a retired letter normalizes to it. Case and
+    """The closed set alone: each lasting token arrives intact, case and
     padding stay tolerated (a selector is a closed token, not prose), and
-    the answer is always the token the port will carry."""
+    the answer is always the token the port will carry. Every retired
+    letter — whatever its case or padding — resolves to NOTHING: with zero
+    coexistence there is no alias left to land on."""
     for spelling, lasting in (
-        ("B", "graph"),
-        (" b ", "graph"),
-        ("C", "global"),
-        (" c ", "global"),
+        ("lexical", "lexical"),
+        ("LEXICAL", "lexical"),
+        (" lexical ", "lexical"),
         ("graph", "graph"),
         ("GRAPH", "graph"),
         ("global", "global"),
         ("Global", "global"),
-        ("A", "A"),
-        (" a ", "A"),
-        ("D", "D"),
+        ("sql", "sql"),
+        ("SQL", "sql"),
     ):
         assert normalize_search_mode(spelling) == lasting, spelling
-    assert set(LASTING_RETRIEVE_TIERS) == {
-        normalize_search_mode(spelling)
-        for spelling in ("a", "graph", "global", "D")
-    }
+    for letter in ("A", "B", "C", "D", " a ", "b", "C", "d"):
+        assert normalize_search_mode(letter) is None, letter
 
 
 # ---------------------------------------------------------------------------
@@ -487,13 +559,13 @@ def test_cascade_has_no_step_cap_of_its_own() -> None:
 def test_snapshot_inherit_does_not_wipe_history() -> None:
     """The mode patch is an APPEND carrying the working context — the
     prior snapshot entry is never rewritten or dropped."""
-    prior = _snap_with_mode("AAPL", "2023 Q3", "B")
-    patch = mode_snapshot_patch(prior, "A")
+    prior = _snap_with_mode("AAPL", "2023 Q3", "graph")
+    patch = mode_snapshot_patch(prior, "lexical")
     assert len(patch) == 1
-    assert patch[0]["search_mode"] == "A"
+    assert patch[0]["search_mode"] == "lexical"
     assert patch[0]["company"] == "AAPL"
     assert patch[0]["period"] == "2023 Q3"
-    assert prior == _snap_with_mode("AAPL", "2023 Q3", "B")  # no mutation
+    assert prior == _snap_with_mode("AAPL", "2023 Q3", "graph")  # no mutation
 
 
 def test_mode_patch_skipped_when_latest_already_carries_mode() -> None:
@@ -545,13 +617,13 @@ def test_grounded_rule_mode_assigned_before_retrieve() -> None:
     )
     out = g.invoke(
         {
-            **reset_input_state("A档 what was AAPL net sales in 2023 Q3?"),
+            **reset_input_state("lexical档 what was AAPL net sales in 2023 Q3?"),
             "evidence": [],
         },
         config=_cfg("smc-before-retrieve"),
     )
     assert out["track"] == "grounded"
-    assert out["search_mode_decision"]["search_mode"] == "A"
+    assert out["search_mode_decision"]["search_mode"] == "lexical"
     assert out["search_mode_decision"]["decision_tier"] == "rules"
     summaries = out.get("tool_summaries") or []
     assert any(entry.get("name") == "retrieve" for entry in summaries)
@@ -579,11 +651,11 @@ def test_graph_judge_assigns_mode_after_grounded_rules() -> None:
 
 
 def test_judge_instructions_teach_the_lasting_tokens() -> None:
-    """Nothing the judge is told may claim ``B`` / ``C`` are the
-    lasting MCP tokens. The Choice instruction seam is where that lesson
-    is taught, so the text it actually sends has to name ``graph`` /
-    ``global`` -- and a reply spelled with a lasting token must assign, or
-    the instruction would be offering a vocabulary the cascade rejects."""
+    """Nothing the judge is told may claim a retired letter is a lasting
+    MCP token. The Choice instruction seam is where that lesson is taught,
+    so the text it actually sends has to name the four lasting tokens --
+    and a reply spelled with one must assign, or the instruction would be
+    offering a vocabulary the cascade rejects."""
     fake = FakeJevChoice([("graph", 0.9)])
     g = _compile(
         [AIMessage(content="Net sales grew year over year.")], jev_client=fake
@@ -599,6 +671,7 @@ def test_judge_instructions_teach_the_lasting_tokens() -> None:
     instructions = fake.calls[0]["instructions"]
     assert '"graph"' not in instructions and "graph" in instructions
     assert "global" in instructions
+    assert all(token in instructions for token in LASTING_RETRIEVE_TIERS)
     assert '"A"|"B"|"C"|"D"' not in instructions
     assert out["search_mode_decision"]["search_mode"] == "graph"
 
@@ -643,12 +716,12 @@ def test_search_mode_decision_is_run_scoped() -> None:
     tid = "smc-run-scoped"
     out1 = g.invoke(
         {
-            **reset_input_state("A档 what was AAPL net sales in 2023 Q3?"),
+            **reset_input_state("graph档 what was AAPL net sales in 2023 Q3?"),
             "evidence": [],
         },
         config=_cfg(tid),
     )
-    assert out1["search_mode_decision"]["search_mode"] == "A"
+    assert out1["search_mode_decision"]["search_mode"] == "graph"
     out2 = g.invoke(
         {**reset_input_state("Hi!"), "evidence": []}, config=_cfg(tid)
     )

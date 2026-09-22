@@ -103,12 +103,15 @@ def test_sc_ambiguous_high_conf_grounded_binds_tools(
         config=_cfg("jev-sc2"),
     )
     # One judge client, two closed sets: the track Choice first, then the
-    # grounded turn's 检索档 Choice over ``A|graph|global|D``.
+    # grounded turn's 检索档 Choice over the four word forms.
     assert [call["question_id"] for call in fake.calls] == [
         "track",
         "search_mode",
     ]
-    assert fake.calls[1]["options"] == ["A", "graph", "global", "D"]
+    # Spelled literally, not compared to ``LASTING_RETRIEVE_TIERS``: what this
+    # seam owes the judge is the operator-facing ORDER of the 档 list, and an
+    # equality against the tuple's own production could not name a reordering.
+    assert fake.calls[1]["options"] == ["lexical", "graph", "global", "sql"]
     assert out["track"] == "grounded"
     assert out["track_decision"]["decision_tier"] == "jev"
     assert out["search_mode_decision"]["search_mode"] == "graph"

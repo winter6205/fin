@@ -2631,9 +2631,10 @@ def compile_graph(
                 window["rejected_picks"] = list(rejected)
             raw = str(interrupt(window) or "").strip()
             # The option ids are lasting tokens and the pick is resolved
-            # against them through the alias map — upper-casing a pick
-            # here would destroy the lowercase ones and reject a client
-            # that still sends a retired letter.
+            # through the SSOT total function over the closed set, so a
+            # retired letter names no option id and is rejected exactly like
+            # ``Z``. Upper-casing a pick here would destroy the lowercase
+            # tokens and refuse a client that sends one correctly.
             picked = normalize_search_mode(raw)
             if picked is not None and any(
                 str(option.get("id")) == picked for option in options

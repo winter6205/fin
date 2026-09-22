@@ -1,17 +1,17 @@
 """检索档 usage-copy keys and the retired-spelling invariant.
 
-The ``B``→``graph`` / ``C``→``global`` rename is complete on this surface:
+The ``A``→``lexical`` / ``D``→``sql`` rename left no alias behind, so on this
+surface:
 
 * :data:`SEARCH_MODE_USAGE_COPY` is keyed by exactly
-  :data:`fin.retrieve.tiers.LASTING_RETRIEVE_TIERS` — a retired spelling
-  is not a key and never needs to be added here.
-* a turn whose audit predates the rename still gets its copy, because
-  :func:`fin.retrieve.tiers.normalize_tier_token` is the single
-  spelling→token authority in front of the dict. Every assertion about a
-  retired letter below is DERIVED from
-  :data:`fin.retrieve.tiers.RETIRED_TIER_TOKENS`: adding a retired
-  spelling to that map is covered without touching this file, and a
-  lasting tier that arrives without copy fails
+  :data:`fin.retrieve.tiers.LASTING_RETRIEVE_TIERS` — a retired letter is
+  not a key and, with the letters out of the closed set, never can be.
+* :func:`fin.retrieve.tiers.normalize_tier_token` is the single
+  spelling→token authority in front of the dict, so an upper-cased or
+  padded lasting token reaches the SAME copy. Every assertion about a
+  retired letter below is a literal: the SSOT keeps no map to read, so a
+  letter must resolve to nothing here as everywhere else. A lasting tier
+  that arrives without copy fails
   :func:`test_copy_keys_are_exactly_the_lasting_tiers`.
 * the copy TEXT names the lasting MCP token and never tells the model its
   token is a retired letter — including the 真数据库 copy, whose document
@@ -31,17 +31,8 @@ from fin.host.agent_instructions import (
     SEARCH_MODE_USAGE_COPY,
     messages_for_model,
 )
-from fin.retrieve.tiers import (
-    LASTING_RETRIEVE_TIERS,
-    RETIRED_TIER_TOKENS,
-    TIER_LABELS,
-)
-
-# The lasting tokens a retired letter once named — read off the SSOT, so a
-# new retirement lands here automatically.
-LETTER_NAMED_TOKENS: tuple[str, ...] = tuple(
-    sorted(set(RETIRED_TIER_TOKENS.values()))
-)
+from fin.retrieve.tiers import LASTING_RETRIEVE_TIERS, TIER_LABELS
+from search_mode_pins import RETIRED_LETTERS
 
 
 def _payload(mode: object) -> list:
@@ -61,7 +52,7 @@ def _mode_blocks(payload: list) -> list[str]:
 def test_copy_keys_are_exactly_the_lasting_tiers() -> None:
     """No more, no less: the four lasting tokens, no retired spelling."""
     assert set(SEARCH_MODE_USAGE_COPY) == set(LASTING_RETRIEVE_TIERS)
-    assert not set(SEARCH_MODE_USAGE_COPY) & set(RETIRED_TIER_TOKENS)
+    assert not set(SEARCH_MODE_USAGE_COPY) & set(RETIRED_LETTERS)
 
 
 @pytest.mark.parametrize("mode", sorted(SEARCH_MODE_USAGE_COPY))
@@ -74,9 +65,11 @@ def test_every_copy_is_marked_once(mode: str) -> None:
     ) == 1
 
 
-@pytest.mark.parametrize("mode", LETTER_NAMED_TOKENS)
+@pytest.mark.parametrize("mode", LASTING_RETRIEVE_TIERS)
 def test_a_word_token_copy_names_its_own_token(mode: str) -> None:
-    """知识问答 / 综述 are the two 档 whose copy teaches the wire token."""
+    """Every 档 copy teaches the wire token the operator's request carries:
+    a label with no token taught beside it is how a model ends up sending a
+    档 nobody named."""
     copy = SEARCH_MODE_USAGE_COPY[mode]
     assert f"filters.search_mode={mode}" in copy
 
@@ -86,7 +79,7 @@ def test_no_copy_instructs_a_retired_letter(mode: str) -> None:
     """Nothing model-facing may teach a retired letter as the lasting MCP
     token."""
     copy = SEARCH_MODE_USAGE_COPY[mode]
-    for letter in RETIRED_TIER_TOKENS:
+    for letter in RETIRED_LETTERS:
         assert f"档 {letter}" not in copy, mode
         assert f"search_mode={letter}" not in copy, mode
 
@@ -98,8 +91,23 @@ def test_operator_label_sits_under_its_own_key(mode: str) -> None:
 
 
 def test_real_db_copy_keeps_document_tables_on_graph() -> None:
-    assert "graph" in SEARCH_MODE_USAGE_COPY["D"]
-    assert "filters.search_mode=graph" in SEARCH_MODE_USAGE_COPY["D"]
+    assert "graph" in SEARCH_MODE_USAGE_COPY["sql"]
+    assert "filters.search_mode=graph" in SEARCH_MODE_USAGE_COPY["sql"]
+
+
+def test_the_lookup_copy_names_the_token_once_and_the_wire_once() -> None:
+    """The 查找 copy is one mechanism descriptor plus the wire sentence — the
+    shape every other 档 copy uses. It used to say the word three times
+    (``检索档 lexical``, ``lexical-first``, the wire sentence), and a token
+    repeated in prose is a second spelling waiting to drift. The wire
+    teaching itself is what this pins hardest: without it the model has no
+    idea what to send.
+    """
+    copy = SEARCH_MODE_USAGE_COPY["lexical"]
+    assert copy.count("lexical") == 2
+    assert "filters.search_mode=lexical" in copy
+    assert "lexical-first" not in copy
+    assert "keyword-first" in copy
 
 
 @pytest.mark.parametrize("mode", LASTING_RETRIEVE_TIERS)
@@ -111,21 +119,26 @@ def test_copy_resolves_for_every_key_it_has(mode: str) -> None:
     assert SEARCH_MODE_USAGE_COPY[mode] in blocks[0]
 
 
-@pytest.mark.parametrize(
-    "retired, lasting", sorted(RETIRED_TIER_TOKENS.items())
-)
-def test_a_retired_spelling_reuses_its_lasting_copy_without_a_key(
-    retired: str, lasting: str
+@pytest.mark.parametrize("retired", RETIRED_LETTERS)
+def test_a_retired_letter_keys_no_copy_and_resolves_to_nothing(
+    retired: str,
 ) -> None:
-    """The SSOT map, not this file, owns the retired spelling: a pre-rename
-    audit resolves to the SAME text its lasting token gets."""
+    """Zero coexistence: with no alias map left in the SSOT, a letter is not
+    a spelling of anything — it must neither be a key nor borrow the copy of
+    the 档 it once named, or a stale writer would keep reaching a model."""
     assert retired not in SEARCH_MODE_USAGE_COPY
-    assert _mode_blocks(_payload(retired)) == _mode_blocks(_payload(lasting))
+    assert not _mode_blocks(_payload(retired))
+    assert not _mode_blocks(_payload(retired.lower()))
 
 
 @pytest.mark.parametrize(
     "mode, lasting",
-    [("GRAPH", "graph"), ("Global", "global"), ("  d  ", "D"), ("a", "A")],
+    [
+        ("GRAPH", "graph"),
+        ("Global", "global"),
+        ("  sql  ", "sql"),
+        ("LEXICAL", "lexical"),
+    ],
 )
 def test_case_and_padding_follow_the_ssot_normalizer(
     mode: str, lasting: str
@@ -136,7 +149,7 @@ def test_case_and_padding_follow_the_ssot_normalizer(
 
 
 @pytest.mark.parametrize(
-    "mode", ["E", "local", "fast", "B档", "", "   ", None, 3, True]
+    "mode", ["E", "local", "fast", "B档", "lexical档", "", "   ", None, 3, True]
 )
 def test_an_unresolvable_token_injects_nothing(mode: object) -> None:
     """Absent / empty / out-of-set (including a retired letter written as

@@ -27,10 +27,10 @@ const SEARCH_MODE_WINDOW = {
   title: "选择检索档",
   prompt: "为本次 grounded 提问选择检索档后继续。",
   options: [
-    { id: "A", label: "查找", opened: true },
-    { id: "B", label: "知识问答", opened: true },
-    { id: "C", label: "综述", opened: false },
-    { id: "D", label: "真数据库", opened: false },
+    { id: "lexical", label: "查找", opened: true },
+    { id: "graph", label: "知识问答", opened: true },
+    { id: "global", label: "综述", opened: false },
+    { id: "sql", label: "真数据库", opened: false },
   ],
 };
 
@@ -141,10 +141,10 @@ describe("parseChoiceWindow (wire boundary)", () => {
     expect(window?.title).toBe("选择检索档");
     expect(window?.prompt).toBe("为本次 grounded 提问选择检索档后继续。");
     expect(window?.options).toEqual([
-      { id: "A", label: "查找", opened: true },
-      { id: "B", label: "知识问答", opened: true },
-      { id: "C", label: "综述", opened: false },
-      { id: "D", label: "真数据库", opened: false },
+      { id: "lexical", label: "查找", opened: true },
+      { id: "graph", label: "知识问答", opened: true },
+      { id: "global", label: "综述", opened: false },
+      { id: "sql", label: "真数据库", opened: false },
     ]);
   });
 
@@ -167,9 +167,9 @@ describe("parseChoiceWindow (wire boundary)", () => {
   it("drops option entries without id or label; nulls the window when none survive", () => {
     const kept = parseChoiceWindow({
       kind: "choice_window",
-      options: [{ id: "A", label: "查找" }, { id: 2, label: "坏" }, { label: "无id" }],
+      options: [{ id: "lexical", label: "查找" }, { id: 2, label: "坏" }, { label: "无id" }],
     });
-    expect(kept?.options).toEqual([{ id: "A", label: "查找" }]);
+    expect(kept?.options).toEqual([{ id: "lexical", label: "查找" }]);
     expect(
       parseChoiceWindow({ kind: "choice_window", options: [{ label: "无id" }] }),
     ).toBeNull();
@@ -178,10 +178,10 @@ describe("parseChoiceWindow (wire boundary)", () => {
 
 describe("choice option gating (pure, DOM-free)", () => {
   it("marks opened:false options disabled, others enabled", () => {
-    expect(choiceOptionDisabled({ id: "C", label: "综述", opened: false })).toBe(true);
-    expect(choiceOptionDisabled({ id: "A", label: "查找", opened: true })).toBe(false);
+    expect(choiceOptionDisabled({ id: "global", label: "综述", opened: false })).toBe(true);
+    expect(choiceOptionDisabled({ id: "lexical", label: "查找", opened: true })).toBe(false);
     // An older peer that omits ``opened`` must not render dead buttons.
-    expect(choiceOptionDisabled({ id: "A", label: "查找" })).toBe(false);
+    expect(choiceOptionDisabled({ id: "lexical", label: "查找" })).toBe(false);
   });
 
   it("hasPendingChoiceWindow reads the turn table", () => {
@@ -206,7 +206,7 @@ describe("send stream ends on a choice_window frame", () => {
 
     const turn = activeTurn();
     expect((turn.choice_window?.options ?? []).length).toBeGreaterThan(0);
-    expect(turn.choice_window?.options[0]).toMatchObject({ id: "A", label: "查找" });
+    expect(turn.choice_window?.options[0]).toMatchObject({ id: "lexical", label: "查找" });
     // No terminal frames arrived: the row must not read as finished.
     expect(turn.in_flight).toBe(true);
   });
@@ -242,12 +242,12 @@ describe("pickChoice resumes with the pick and continues the turn", () => {
       ],
     ]);
 
-    await useWorkspaceStore.getState().pickChoice(THREAD_ID, RUN_ID, "B");
+    await useWorkspaceStore.getState().pickChoice(THREAD_ID, RUN_ID, "graph");
 
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe(`/api/threads/${THREAD_ID}/resume`);
     expect(calls[0].method).toBe("POST");
-    expect(calls[0].body).toEqual({ pick: "B" });
+    expect(calls[0].body).toEqual({ pick: "graph" });
 
     const turn = activeTurn();
     expect(turn.answer).toBe("391.0 亿美元");
@@ -258,13 +258,15 @@ describe("pickChoice resumes with the pick and continues the turn", () => {
 
   it("re-opens the window with rejected_picks on an invalid pick", async () => {
     seedThread([windowTurn(parsedWindow())]);
-    const rejected = { ...SEARCH_MODE_WINDOW, rejected_picks: ["B"] };
+    // The host records the RAW rejected value, so this names something
+    // that resolves to no 档 at all.
+    const rejected = { ...SEARCH_MODE_WINDOW, rejected_picks: ["Z"] };
     stubSseRuns([[["choice_window", rejected]]]);
 
     await useWorkspaceStore.getState().pickChoice(THREAD_ID, RUN_ID, "Q");
 
     const turn = activeTurn();
-    expect(turn.choice_window?.rejected_picks).toEqual(["B"]);
+    expect(turn.choice_window?.rejected_picks).toEqual(["Z"]);
     expect((turn.choice_window?.options ?? []).length).toBeGreaterThan(0);
     // Still suspended — no terminal frames, still not done.
     expect(turn.in_flight).toBe(true);
@@ -276,7 +278,7 @@ describe("pickChoice resumes with the pick and continues the turn", () => {
 
     const result = await useWorkspaceStore
       .getState()
-      .pickChoice(THREAD_ID, "99999999-9999-4999-8999-999999999999", "A");
+      .pickChoice(THREAD_ID, "99999999-9999-4999-8999-999999999999", "lexical");
 
     expect(result).toBeNull();
     expect(calls).toHaveLength(0);

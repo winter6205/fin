@@ -1059,7 +1059,7 @@ def test_bm25_mirrors_the_tier_named_exits_without_ranking() -> None:
 
     adapter = BM25Adapter({})
 
-    assert adapter.retrieve("revenue", search_mode="A") == {"chunks": []}
+    assert adapter.retrieve("revenue", search_mode="lexical") == {"chunks": []}
     assert adapter.retrieve("revenue", search_mode="graph") == {"chunks": []}
 
     with pytest.raises(InvalidSearchModeError) as excinfo:
@@ -1071,7 +1071,7 @@ def test_bm25_mirrors_the_tier_named_exits_without_ranking() -> None:
     assert excinfo.value.code == "tier_not_open"
 
     with pytest.raises(TierUnavailableError) as excinfo:
-        adapter.retrieve("revenue", search_mode="D")
+        adapter.retrieve("revenue", search_mode="sql")
     assert excinfo.value.code == "real_db_not_wired"
 
     with pytest.raises(InvalidSearchModeError) as excinfo:

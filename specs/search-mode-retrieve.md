@@ -1,6 +1,7 @@
 # Spec: search-mode retrieve (档 consumption)
 
 > **Status:** assumption gate = four-spec split confirmed 2026-09-17; this file is spec 3 of 4.
+> **Spelling superseded 2026-09-22:** the `filters.search_mode` set this file quotes is now `lexical | graph | global | sql` — `A` became `lexical` and `D` became `sql`, and no letter is read at any seam. The paths are unchanged: the 查找 arm still lexically hits a child and cites the parent **抽图窗** body (ADR 0060), 真数据库 still refuses `real_db_not_wired`. See [`specs/search-mode-lexical-sql-tokens.md`](search-mode-lexical-sql-tokens.md).
 > **Sibling (iknow-memory):** [`../../iknow-memory/specs/search-mode-retrieve.md`](../../iknow-memory/specs/search-mode-retrieve.md) (assembler). **Out (fin):** `specs/search-mode-host.md` (cascade / **choice window**); `specs/extract-window-tree.md` (window tree cut); `specs/graph-index-standard-fast.md` (extract / Fast / Leiden write).
 > **Prior closed loop:** [`specs/first-closed-loop.md`](first-closed-loop.md) (ingest + single-issuer retrieve + cite; C/D were plan slots).
 > **Plan:** not opened until `architecture-change-reviewer` on this spec.

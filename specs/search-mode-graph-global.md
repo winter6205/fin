@@ -1,6 +1,7 @@
 # Spec: search-mode graph / global (host wire tokens + copy)
 
 > **Status:** assumption gate locked 2026-09-20 (this file). Token rename is **in implementation scope**.
+> **Spelling superseded 2026-09-22:** the closed set below is now `lexical | graph | global | sql`, and the "host normalize reads the retired letters" provision was cancelled outright — `A`/`B`/`C`/`D` are refused at every seam, not mapped. See [`specs/search-mode-lexical-sql-tokens.md`](search-mode-lexical-sql-tokens.md). `graph`/`global` themselves did not move; what this increment decided stays the record.
 > **Sibling (iknow-memory, Out-link; may land in parallel):** [`../../iknow-memory/specs/search-mode-graph-global.md`](../../iknow-memory/specs/search-mode-graph-global.md)
 > **Do not rewrite in place:** [`specs/search-mode-retrieve.md`](search-mode-retrieve.md) (档 consumption / ranking-behind-port). This spec **Inherits** that contract and **Changes** the MCP `filters.search_mode` closed set plus host usage copy.
 > **档 assignment cookbook (out-link, not restated here):** [`specs/soft-track-judge-route.md`](soft-track-judge-route.md) then [`specs/search-mode-host.md`](search-mode-host.md) — Soft-Track `track=grounded`, then cascade names one of `A|graph|global|D`.

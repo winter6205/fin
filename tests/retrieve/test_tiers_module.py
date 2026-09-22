@@ -45,37 +45,37 @@ def test_tiers_module_exists_with_the_closed_set() -> None:
         TIER_UNAVAILABLE_CODE,
     )
 
-    assert RETRIEVE_TIERS == ("A", "graph", "global", "D")
+    assert RETRIEVE_TIERS == ("lexical", "graph", "global", "sql")
     assert TIER_NOT_OPEN == "tier_not_open"
     assert REAL_DB_NOT_WIRED == "real_db_not_wired"
     assert TIER_UNAVAILABLE_CODE == {
         "global": "tier_not_open",
-        "D": "real_db_not_wired",
+        "sql": "real_db_not_wired",
     }
 
 
-# ----- 1b. the retired letters are INPUT spellings, never wire tokens -----
+# ----- 1b. the retired letters are in NO set anymore -----
 
 
-def test_the_retired_letters_are_accepted_input_but_not_wire_tokens() -> None:
-    """The two halves of the rename live in different sets on purpose.
-
-    A request can still ARRIVE as ``B`` / ``C`` (an old client, a stored
-    pin), so those spellings stay in the accepted-input tuple the send
-    schema validates against. They are no longer in the closed set the
-    port forwards from: a letter that reaches the port is a wiring
-    mistake, and the only honest answer to a mistake is a named one.
+def test_the_refusal_message_names_the_word_form_set() -> None:
+    """Negative class, copy level: the refusal a caller sees IS the
+    documentation of the closed set, so it must spell the four word forms
+    and never a retired letter — a message still advertising ``A``/``D``
+    would teach the vocabulary the rename just retired.
     """
-    from fin.retrieve.tiers import (
-        RETIRED_TIER_TOKENS,
-        RETRIEVE_TIERS,
-        TIER_INPUT_TOKENS,
-    )
+    from fin.retrieve.port import InvalidSearchModeError, resolve_search_mode
+    from fin.retrieve.tiers import RETRIEVE_TIERS
 
-    for letter in ("B", "C"):
-        assert letter not in RETRIEVE_TIERS
-        assert letter in TIER_INPUT_TOKENS
-    assert TIER_INPUT_TOKENS == RETRIEVE_TIERS + tuple(RETIRED_TIER_TOKENS)
+    expected_set = "|".join(RETRIEVE_TIERS)
+    for letter in ("A", "B", "C", "D"):
+        try:
+            resolve_search_mode(letter)
+        except InvalidSearchModeError as exc:
+            assert str(exc) == (
+                f"search_mode {letter!r} is not one of {expected_set}"
+            ), letter
+        else:
+            raise AssertionError(f"{letter!r} crossed the port")
 
 
 def test_graph_is_an_open_tier_and_global_is_not() -> None:
@@ -96,12 +96,12 @@ def test_graph_is_an_open_tier_and_global_is_not() -> None:
         raise AssertionError("global accepted as an open 档")
 
 
-def test_a_retired_letter_at_the_port_is_invalid_not_routed() -> None:
+def test_a_letter_at_the_port_is_invalid_not_routed() -> None:
     """Negative class, and the whole point of the closed set shrinking.
 
-    ``B`` used to be an open 档 on the port and ``C`` an unopened one;
-    both now answer ``invalid_search_mode``. Normalizing them here would
-    be the silent mapping the spec forbids — the host already resolved
+    ``A`` used to be an open 档 on the port and ``D`` an unopened one; all
+    four letters now answer ``invalid_search_mode``. Normalizing them here
+    would be the silent mapping the spec forbids — the host already resolves
     its own spellings before the seam, so a letter that got this far is a
     wiring bug whose name must survive.
     """
@@ -111,11 +111,11 @@ def test_a_retired_letter_at_the_port_is_invalid_not_routed() -> None:
         resolve_search_mode,
     )
 
-    assert resolve_search_mode("A") == "A"
+    assert resolve_search_mode("lexical") == "lexical"
     assert resolve_search_mode("graph") == "graph"
     assert resolve_search_mode(None) is None
 
-    for token in ("B", "C"):
+    for token in ("A", "B", "C", "D"):
         try:
             resolve_search_mode(token)
         except InvalidSearchModeError as exc:
@@ -125,7 +125,7 @@ def test_a_retired_letter_at_the_port_is_invalid_not_routed() -> None:
 
     for token, code in (
         ("global", "tier_not_open"),
-        ("D", "real_db_not_wired"),
+        ("sql", "real_db_not_wired"),
     ):
         try:
             resolve_search_mode(token)
@@ -142,7 +142,7 @@ def test_an_unknown_token_stays_unknown_after_the_rename() -> None:
     silent map onto ``graph`` or ``global``."""
     from fin.retrieve.port import InvalidSearchModeError, resolve_search_mode
 
-    for token in ("local", "", "hybrid", "GRAPH", "Global", "b"):
+    for token in ("local", "", "hybrid", "GRAPH", "Global", "b", "LEXICAL"):
         try:
             resolve_search_mode(token)
         except InvalidSearchModeError as exc:
@@ -157,14 +157,11 @@ def test_tiers_module_is_public_via_dunder_all() -> None:
     assert set(tiers.__all__) == {
         "LASTING_RETRIEVE_TIERS",
         "REAL_DB_NOT_WIRED",
-        "RETIRED_TIER_TOKENS",
         "RETRIEVE_TIERS",
-        "TIER_INPUT_TOKENS",
         "TIER_LABELS",
         "TIER_NOT_OPEN",
         "TIER_UNAVAILABLE_CODE",
         "RetrieveTier",
-        "TierInputToken",
         "normalize_tier_token",
     }
 
@@ -178,37 +175,36 @@ def test_the_closed_set_is_one_definition_not_a_copy() -> None:
     assert RETRIEVE_TIERS is LASTING_RETRIEVE_TIERS
 
 
-def test_the_alias_map_is_the_one_authority_for_retired_spellings() -> None:
-    """The rename needs exactly one map, or a surface that forgets to read
-    it starts forwarding a token the wire no longer carries. Every lasting
-    token it points at must itself be a member of the closed set, and no
-    entry may point at another retired spelling (a chain would make the
-    normalize order-dependent)."""
+def test_the_normalizer_is_case_insensitive_and_names_no_letter() -> None:
+    """The word-form set needs exactly ONE resolver, or a surface that
+    forgets to read it starts forwarding a token the wire does not carry.
+
+    Case and padding survive for the lasting tokens (a selector is a closed
+    token, not prose); every retired letter resolves to nothing, in either
+    case — the rename left no map behind, so there is nowhere a letter can
+    still quietly become a 档.
+    """
     from fin.retrieve.tiers import (
         LASTING_RETRIEVE_TIERS,
-        RETIRED_TIER_TOKENS,
         RETRIEVE_TIERS,
         TIER_LABELS,
         normalize_tier_token,
     )
 
-    assert RETIRED_TIER_TOKENS == {"B": "graph", "C": "global"}
-    assert set(RETIRED_TIER_TOKENS.values()) <= set(RETRIEVE_TIERS)
-    assert LASTING_RETRIEVE_TIERS == tuple(
-        token for token in ("A", "graph", "global", "D")
-    )
+    assert LASTING_RETRIEVE_TIERS == ("lexical", "graph", "global", "sql")
     assert set(TIER_LABELS) == set(LASTING_RETRIEVE_TIERS)
-    # Nothing the map already resolves needs a second lookup.
-    for retired, lasting in RETIRED_TIER_TOKENS.items():
-        assert normalize_tier_token(retired) == lasting
-        assert normalize_tier_token(retired.lower()) == lasting
-        assert lasting not in RETIRED_TIER_TOKENS
-    # The retired letters are in NO set the port reads: they belong to the
-    # accepted-INPUT tuple only, so the map is the single place a letter can
-    # still be turned into a 档 — and the map, not the closed set, is what
-    # keeps an old client's request working.
+    assert TIER_LABELS == {
+        "lexical": "查找",
+        "graph": "知识问答",
+        "global": "综述",
+        "sql": "真数据库",
+    }
+    for token in LASTING_RETRIEVE_TIERS:
+        assert normalize_tier_token(token) == token
+        assert normalize_tier_token(f"  {token.upper()} ") == token
+    for letter in ("A", "a", "B", "b", "C", "c", "D", "d"):
+        assert normalize_tier_token(letter) is None, letter
     assert set(RETRIEVE_TIERS) == set(LASTING_RETRIEVE_TIERS)
-    assert not set(RETRIEVE_TIERS) & set(RETIRED_TIER_TOKENS)
 
 
 # ----- 2. named_failures re-exports the SAME objects -----
@@ -259,7 +255,7 @@ def test_resolve_search_mode_calls_without_host_import() -> None:
 import sys
 import fin.retrieve.port as p
 
-assert p.resolve_search_mode("A") == "A"
+assert p.resolve_search_mode("lexical") == "lexical"
 assert p.resolve_search_mode(None) is None
 try:
     p.resolve_search_mode("global")
@@ -268,7 +264,7 @@ except p.TierUnavailableError as e:
 else:
     raise AssertionError("global not refused")
 try:
-    p.resolve_search_mode("B")
+    p.resolve_search_mode("A")
 except p.InvalidSearchModeError as e:
     assert e.code == "invalid_search_mode"
 else:

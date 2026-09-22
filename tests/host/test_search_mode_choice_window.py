@@ -9,26 +9,28 @@ Contract covered here (ADR 0062 HITL, spec SC2 "clarify window" + SC4):
 * grounded + ``decision_tier == "clarify"`` pauses the run BEFORE any
   model / retrieve call on a LangGraph ``interrupt`` whose payload is
   the choice window (``kind`` + non-empty ``options`` of ``{id,label}``,
-  C/D present but marked unopened).
+  global/sql present but marked unopened).
 * ``Command(resume=pick)`` assigns the picked 档 (auditable
   ``decision_tier="operator_pick"`` + ``signals.resume_pick``) and the
   grounded leaf then proceeds (retrieve runs).
-* an unknown pick REOPENS the window (never a silent C); a pick of an
-  unopened 档 is the 具名失败 ``typed_fail`` recorded on the audit.
+* an unknown pick REOPENS the window (never a silent 档), and so does a
+  retired letter — with zero coexistence it names no option id and is
+  rejected exactly like ``Z``; a pick of an unopened 档 is the 具名失败
+  ``typed_fail`` recorded on the audit.
 * the workspace SSE wire emits a ``choice_window`` frame; ``POST
   /threads/{id}/resume`` accepts ``{"pick": ...}``; a send while a
   window is pending keeps the 409 ``concurrent_run`` semantics; the
   body-less crash resume is untouched.
-* optional pin (send ``tiers: ["B"]`` — a retired letter an old client
-  still sends, or a lasting token — / ``configurable`` pin) assigns
-  without opening the window (SC4).
+* optional pin (send ``tiers: ["graph"]`` — a lasting token, the only
+  spelling the door types — / ``configurable`` pin) assigns without
+  opening the window (SC4).
 * with the factory flag off (the default), the pre-T2 flow is intact —
   this is what keeps the default-collected suites green.
 
 Five boundary classes (spec Boundaries "Test classes") map to:
 empty -> ``test_ambiguous_grounded_ask_opens_choice_window`` (an ask
 the cascade cannot name IS the empty/residual input here);
-negative -> ``test_pick_of_unopened_tier_is_typed_fail_not_silent_c``;
+negative -> ``test_pick_of_unopened_tier_is_typed_fail_not_silent_substitute``;
 overflow -> ``test_invalid_pick_reopens_window_then_valid_pick_resolves``
 (repeated picks never accumulate a 档 — no silent default under any
 number of retries);
@@ -138,7 +140,7 @@ def test_choice_window_payload_contract_ids_and_labels() -> None:
         assert option["id"] and option["label"]
     # The ids are the LASTING tokens: the value a pick resumes with is
     # already the value the audit and the port carry.
-    assert [o["id"] for o in options] == ["A", "graph", "global", "D"]
+    assert [o["id"] for o in options] == ["lexical", "graph", "global", "sql"]
     # 综述/真数据库 may be present but marked unopened (spec Clarify bullet).
     assert [o["opened"] for o in options] == [True, True, False, False]
 
@@ -151,9 +153,10 @@ def test_resume_pick_assigns_mode_and_grounded_retrieves() -> None:
     out = g.invoke(_input(AMBIGUOUS), config=_cfg(tid))
     assert _interrupt_payload(out) is not None
 
-    # A stale client that still sends the retired letter is resolved to
-    # the lasting token before it is matched against the option ids.
-    done = g.invoke(Command(resume="B"), config=_cfg(tid))
+    # The pick rides the window's own option id and is matched against it
+    # as the lasting token — no translation step exists (or may exist)
+    # between what the operator sees and what the audit records.
+    done = g.invoke(Command(resume="graph"), config=_cfg(tid))
     assert not done.get("__interrupt__")
     audit = done["search_mode_decision"]
     assert audit["search_mode"] == "graph"
@@ -173,9 +176,11 @@ def test_resume_pick_assigns_mode_and_grounded_retrieves() -> None:
 
 
 def test_invalid_pick_reopens_window_then_valid_pick_resolves() -> None:
-    """An out-of-list pick never silent-Cs: the window REOPENS (with the
-    rejected value recorded for the operator), and a later valid pick
-    resolves normally."""
+    """An out-of-list pick never silently assigns: the window REOPENS
+    (with the rejected value recorded for the operator), and a later
+    valid pick resolves normally. A retired letter rides this same axis
+    now — zero coexistence means it names no option id, so an old
+    client's ``B`` is reopened, not quietly read as 知识问答."""
     g = _compile(_ANSWER)
     tid = "cw-invalid-pick"
     out = g.invoke(_input(AMBIGUOUS), config=_cfg(tid))
@@ -189,21 +194,27 @@ def test_invalid_pick_reopens_window_then_valid_pick_resolves() -> None:
     # No 档 was invented by the rejected attempt.
     assert again["search_mode_decision"]["search_mode"] is None
 
-    done = g.invoke(Command(resume="A"), config=_cfg(tid))
+    letter = g.invoke(Command(resume="B"), config=_cfg(tid))
+    payload = _interrupt_payload(letter)
+    assert payload is not None
+    assert "B" in payload["rejected_picks"]
+    assert letter["search_mode_decision"]["search_mode"] is None
+
+    done = g.invoke(Command(resume="lexical"), config=_cfg(tid))
     assert not done.get("__interrupt__")
     audit = done["search_mode_decision"]
-    assert audit["search_mode"] == "A"
+    assert audit["search_mode"] == "lexical"
     assert audit["decision_tier"] == "operator_pick"
-    assert audit["signals"].get("rejected_picks") == ["Z"]
+    assert audit["signals"].get("rejected_picks") == ["Z", "B"]
 
 
-def test_pick_of_unopened_tier_is_typed_fail_not_silent_c() -> None:
+def test_pick_of_unopened_tier_is_typed_fail_not_silent_substitute() -> None:
     """Boundary 'negative': the operator picking 综述 (unopened) gets the
     具名失败 on the audit — the cascade never substitutes another 档."""
     g = _compile(_ANSWER)
     tid = "cw-unopened-pick"
     g.invoke(_input(AMBIGUOUS), config=_cfg(tid))
-    done = g.invoke(Command(resume="C"), config=_cfg(tid))
+    done = g.invoke(Command(resume="global"), config=_cfg(tid))
     assert not done.get("__interrupt__")
     audit = done["search_mode_decision"]
     assert audit["decision_tier"] == "typed_fail"
@@ -245,7 +256,7 @@ def test_pin_assigns_mode_without_window() -> None:
     g = _compile(_ANSWER)
     out = g.invoke(
         _input(AMBIGUOUS),
-        config=_cfg("cw-pin", pinned_search_mode="B"),
+        config=_cfg("cw-pin", pinned_search_mode="graph"),
     )
     assert not out.get("__interrupt__")
     audit = out["search_mode_decision"]
@@ -400,7 +411,7 @@ def test_resume_with_pick_streams_the_completed_run(
     assert _parse_sse_events(r.text)[-1][0] == "choice_window"
 
     resumed = client.post(
-        f"/api/threads/{thread_id}/resume", json={"pick": "B"}
+        f"/api/threads/{thread_id}/resume", json={"pick": "graph"}
     )
     assert resumed.status_code == 200
     assert resumed.headers["content-type"].startswith("text/event-stream")
@@ -447,7 +458,7 @@ def test_resume_pick_without_pending_choice_is_400(
     silently ignored field, never a crash-resume hijack."""
     _install_window_graph(http_app, _ANSWER)
     thread_id = _new_thread(client)
-    r = client.post(f"/api/threads/{thread_id}/resume", json={"pick": "A"})
+    r = client.post(f"/api/threads/{thread_id}/resume", json={"pick": "lexical"})
     assert r.status_code == 400
     assert r.json() == {"error": "choice_not_pending"}
 
@@ -483,7 +494,7 @@ def test_send_with_pinned_tier_skips_the_window(
     thread_id = _new_thread(client)
     r = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": AMBIGUOUS, "tiers": ["B"]},
+        json={"question": AMBIGUOUS, "tiers": ["graph"]},
     )
     assert r.status_code == 200
     events = _parse_sse_events(r.text)

@@ -85,7 +85,7 @@ _TOKEN = "pterodactyl" + "".join(random.choices(string.ascii_lowercase, k=16))
 _GROUNDED_ASK = "what was AAPL net sales in 2023 Q3?"
 
 # The 档 a filing-figure ask may legally land on — the OPENED ones, derived
-# from the availability SSOT instead of spelled out: ``global`` and ``D`` are
+# from the availability SSOT instead of spelled out: ``global`` and ``sql`` are
 # the lasting tiers with a routing-time named failure, everything else is
 # open. The derivation is also the early warning — when ``global`` opens this
 # set widens here and in ``tests/host/test_live_jev_search_mode.py`` at once,

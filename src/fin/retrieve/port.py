@@ -42,14 +42,14 @@ from fin.retrieve.tiers import RETRIEVE_TIERS, TIER_UNAVAILABLE_CODE
 
 # The wire key the iknow-memory ``retrieve`` schema accepts inside its
 # ``filters`` record (sibling spec ``search-mode-retrieve.md``, tokens
-# renamed by ``search-mode-graph-global.md``:
-# ``filters.search_mode`` ∈ ``A|graph|global|D``; missing → iknow's
-# default 知识问答 = ``graph``).
-# The value set is the closed 档 SSOT (``fin.retrieve.tiers``): an
-# out-of-set value is the documented invalid-mode code
-# ``invalid_search_mode`` — the same token the iknow retrieve schema
-# answers with, mirrored port-side by ``InvalidSearchModeError``.
-# One place; the adapters and the tests import it.
+# renamed by ``search-mode-lexical-sql-tokens.md``): its value is one member
+# of the closed 档 set in :mod:`fin.retrieve.tiers`, re-spelled nowhere on
+# this side; a missing key means iknow's own default 知识问答 = ``graph``.
+# The letters those tokens once wore are retired everywhere, entry included,
+# so nothing downstream has to know them. An out-of-set value is the
+# documented invalid-mode code ``invalid_search_mode`` — the same token the
+# iknow retrieve schema answers with, mirrored port-side by
+# ``InvalidSearchModeError``. One place; the adapters and the tests import it.
 SEARCH_MODE_FILTER_KEY: Final[str] = "search_mode"
 
 # The outcome-record key by which a RECORDED Fast 抽图 job fact travels:
@@ -84,7 +84,7 @@ class TierUnavailableError(InputValidationError):
 
     Carries the SAME public code the send door uses for the request
     (``TIER_UNAVAILABLE_CODE``: ``global`` → ``tier_not_open``,
-    ``D`` → ``real_db_not_wired``) so a pin that reaches the port gets
+    ``sql`` → ``real_db_not_wired``) so a pin that reaches the port gets
     the identical named failure — never a retrieve dressed as another
     档. It subclasses the input-error family so every host seam that
     already converts a named input error converts this one too; the
@@ -106,19 +106,20 @@ def resolve_search_mode(search_mode: str | None) -> str | None:
     """Validate a 档 token against the closed set; return it for the wire.
 
     ``None`` passes through as "do not send" — iknow then answers with
-    its own default 知识问答 (``graph``), never with a letter the host chose.
-    Matching is EXACT — the send door normalizes human input, so a
-    port caller that sends ``"c"`` or ``" summary "`` made a wiring
-    mistake this helper must name, not guess around.
+    its own default 知识问答 (``graph``), never with a spelling the host chose.
+    Matching is EXACT, and that exactness is the point: every entry surface
+    types this value from the closed set already, so a port caller that
+    arrives with ``"sql "`` or ``" SQL "`` reached the wire past the boundary
+    that would have refused it — a wiring mistake this helper must name, not
+    guess around.
 
-    That exactness is also why the retired letters ``B`` / ``C`` are
-    REFUSED here while the HTTP door still accepts them: the two surfaces
-    answer different questions. An operator may spell 知识问答 either way,
-    and the boundary resolves the spelling (``TIER_INPUT_TOKENS``); a
-    token reaching THIS seam is the value fin decided to send, so a letter
-    here means the boundary was skipped. Normalizing at the seam would
-    hide that bug and put a 档 choice behind a request that never made
-    it — the silent mapping the rename forbids.
+    That exactness is also why a retired letter is REFUSED here and at
+    every entry seam alike: there is no second spelling of any 档 to
+    resolve, so the closed set IS the whole vocabulary from the operator's
+    keystroke to the wire. A letter reaching THIS seam means the boundary
+    was skipped. Normalizing at the seam would hide that bug and put a 档
+    choice behind a request that never made it — the silent mapping the
+    rename forbids.
 
     The 档 SSOT lives in the neutral leaf :mod:`fin.retrieve.tiers`,
     imported at module level: the port may not import ``fin.host``

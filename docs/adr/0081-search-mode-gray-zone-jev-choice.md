@@ -59,3 +59,13 @@ Labels unchanged on all five legs; the smallest remaining margin above the
 0.6 confidence floor narrowed to 0.72 (seam #2). Whether the floor should
 move is an **operator decision** — this ticket does NOT change
 `_MIN_JEV_CONFIDENCE`.
+
+## Amendment (2026-09-22): 档 spelling — the last two letters retire to word forms
+
+The closed set named above is now spelled `lexical | graph | global | sql` on
+both wires, with **zero coexistence** (operator ruling: pre-release, no live
+client): `A`/`B`/`C`/`D` left the vocabulary in the same stroke — this ADR's
+`A | graph | global | D` and its `B`/`C` note included, which stay as the
+record of what was decided then. Contract and live evidence:
+`specs/search-mode-lexical-sql-tokens.md` and
+`plans/search-mode-lexical-sql-tokens.md`.

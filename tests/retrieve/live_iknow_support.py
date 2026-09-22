@@ -35,7 +35,15 @@ from fin.retrieve.mcp_push_port import MCPPushPort
 from fin.retrieve.mcp_session import MCPStdioSession
 
 
-IKNOW_ROOT = Path("/home/winner/projects/iknow-memory")
+# WHY the override exists: the word-form 档 rename is a stacked cross-repo PR
+# pair, so fin's live legs have to be able to drive the iknow BRANCH build (the
+# one whose ``dist`` carries ``lexical``/``sql``) during the merge window. Unset,
+# every alias below still resolves to the single authoritative main checkout, so
+# the default harness is byte-for-byte what it was. Once both PRs merge the
+# variable is dropped and main's build is the only target again.
+IKNOW_ROOT = Path(
+    os.environ.get("FIN_LIVE_IKNOW_ROOT") or "/home/winner/projects/iknow-memory"
+)
 IKNOW_ENTRY = IKNOW_ROOT / "dist" / "index.js"
 # Both worktree roots have collapsed back to the main checkout: the surfaces
 # they once carried ahead of main are now merged and rebuilt there. The
@@ -43,7 +51,8 @@ IKNOW_ENTRY = IKNOW_ROOT / "dist" / "index.js"
 # and the search-mode retrieve stack (the tracked change/the tracked change/the tracked change/#245) all live in
 # main's ``dist`` now, so the live acceptance runs against the single
 # authoritative main build (issue fin the tracked change task 1: "对合并后的 iknow main
-# build"). The aliases are kept because the opt-in tests import them by name.
+# build"). The aliases are kept because the opt-in tests import them by name,
+# and they follow ``IKNOW_ROOT`` so one run never mixes two builds.
 IKNOW_WORKTREE_ROOT = IKNOW_ROOT
 IKNOW_CORPUS_READY_ROOT = IKNOW_ROOT
 EMBED_DIMENSIONS = 8
@@ -429,10 +438,10 @@ def live_iknow(
             # Vector-only on purpose. This harness runs STORAGE=memory with no
             # Elasticsearch; iknow ADR-0007 makes the BM25/precision layer
             # default-on-with-no-address an out-of-contract config (the in-process
-            # memory BM25 is a test seam, not a sanctioned fallback), so a B-tier
-            # retrieve escalates to retrieve_degraded_failure
+            # memory BM25 is a test seam, not a sanctioned fallback), so a
+            # graph-档 retrieve escalates to retrieve_degraded_failure
             # (keyword_bm25:attempted-and-failed). Disabling BM25 is the
-            # ADR-sanctioned vector-only escape hatch; A-tier lexical is still
+            # ADR-sanctioned vector-only escape hatch; the lexical 档 is still
             # exercised because mode-a-arm sources lexical from the memory backend
             # independent of this flag. Real-ES lexical is covered by the task-2
             # PG+ES driver, not this memory harness.
@@ -485,7 +494,7 @@ def live_iknow(
             # Unlike the memory branch, BM25 stays ON: with a real ES
             # precision layer configured, ADR-0007's default-on-with-address
             # contract is satisfied, and that layer is exactly what the
-            # task-2 A tier must lexically hit (and B fuses with vectors).
+            # task-2 lexical 档 must hit (and graph fuses it with vectors).
             # Rerank stays OFF so the fused order is observable end to end.
             "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED": "true",
             "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED": "true",
