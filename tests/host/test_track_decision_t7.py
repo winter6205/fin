@@ -4,6 +4,14 @@ Confidence clamping and label validation moved into the Jev client
 (T1): a compliant call returns a finite ``[0, 1]`` confidence and a
 closed-set label or raises a typed ``JevChoiceError``. The cascade
 contract left here is fail-closed routing.
+
+The criteria mis-wire containment pin for this lane is NOT here: it runs
+at the DEFAULT gate as
+``test_miswired_leaf_criteria_is_contained_as_an_exit`` in
+``tests/host/test_track_decision.py``, so a wiring break cannot hide
+behind this file's opt-in ``soft_track`` mark; the 档 lane's twin is
+``test_miswired_criteria_is_contained_as_an_exit`` in
+``tests/host/test_search_mode_cascade.py``.
 """
 
 from __future__ import annotations
@@ -18,7 +26,10 @@ from fin.host.jev_choice import (
     JEV_CHOICE_EXIT_TRANSPORT,
     JevChoiceError,
 )
-from fin.host.track_decision import decide_track
+from fin.host.track_decision import (
+    _JEV_TRACK_OPTIONS,
+    decide_track,
+)
 from jev_fake import FakeJevChoice
 
 
@@ -101,14 +112,25 @@ def test_unexpected_judge_raise_still_fail_closes() -> None:
     """A non-typed throw must not crash the cascade — clarify wins."""
 
     class _Broken:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
         def choose(self, **kwargs):  # noqa: ANN003, ANN201
+            self.calls.append(kwargs)
             raise RuntimeError("classifier unavailable")
 
+    judge = _Broken()
     decision = decide_track(
         [HumanMessage(content="maybe compare these?")],
-        jev_client=_Broken(),
+        jev_client=judge,
     )
 
     assert decision.track == "clarify"
     assert decision.signals["jev_exit"] == "unexpected_error"
     assert decision.signals["jev_error_type"] == "RuntimeError"
+    # The request it broke on carried a discriminator for every leaf the
+    # gray zone offered, not a copy of the leaf names.
+    (call,) = judge.calls
+    criteria = call["criteria"]
+    assert isinstance(criteria, dict)
+    assert set(criteria) == set(call["options"]) == set(_JEV_TRACK_OPTIONS)

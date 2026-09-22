@@ -31,10 +31,12 @@ Those four are authored by the cascades, both of which already import
 this module, so the names are exported here rather than re-spelled per
 lane.
 
-Invalid *inputs* (empty options, duplicate options, blank utterance) are
-programming errors at this boundary and raise ``ValueError``, not a
-typed exit: a typed exit describes a judge fact, and the judge was
-never asked anything when the call was malformed before send.
+Invalid *inputs* (empty options, duplicate options, blank utterance, a
+criteria mapping that does not describe exactly the offered options —
+empty, off-key, or blank-valued) are programming errors at this boundary
+and raise ``ValueError``, not a typed exit: a typed exit describes a judge
+fact, and the judge was never asked anything when the call was malformed
+before send.
 """
 
 from __future__ import annotations
@@ -77,6 +79,48 @@ class JevChoiceError(Exception):
         self.exit_code = exit_code
 
 
+def _validate_question(
+    utterance: str,
+    options: Sequence[str],
+    criteria: Mapping[str, str],
+) -> None:
+    """Refuse a malformed question BEFORE anything is sent.
+
+    Every check here runs before the send: a malformed question is a
+    programming error, so the judge is never asked a broken thing. The
+    criteria messages name option keys only and never echo a value, so
+    a mis-wired table cannot put its own text on an audit surface. A
+    ``ValueError`` raised here reaches the two cascades through their
+    wide ``except``, where it lands as ``*_jev_exit=unexpected_error``
+    plus ``*_jev_error_type`` — which keeps a wiring bug separable from
+    a judge fact on the audit while both fail closed.
+
+    The check ORDER (empty options, then duplicate options, then blank
+    utterance, then the criteria contract) is what lets a test pin each
+    malformed request to exactly one owning check.
+    """
+    if not options:
+        raise ValueError("options must be a non-empty closed set")
+    if len(set(options)) != len(options):
+        raise ValueError("options must be unique")
+    if not utterance.strip():
+        raise ValueError("utterance must not be blank")
+    if not criteria:
+        raise ValueError("criteria must describe every option")
+    missing = sorted(set(options) - set(criteria))
+    extra = sorted(set(criteria) - set(options))
+    if missing or extra:
+        raise ValueError(
+            "criteria keys must match options exactly: "
+            f"missing={missing} extra={extra}"
+        )
+    blank = sorted(
+        option for option, text in criteria.items() if not text.strip()
+    )
+    if blank:
+        raise ValueError(f"criteria description must not be blank: blank={blank}")
+
+
 class JevChoiceClient:
     """One closed-set Choice question per call against System One.
 
@@ -102,15 +146,14 @@ class JevChoiceClient:
         *,
         utterance: str,
         options: Sequence[str],
+        criteria: Mapping[str, str],
         question_id: str = "track",
         instructions: str | None = None,
     ) -> JevChoice:
-        if not options:
-            raise ValueError("options must be a non-empty closed set")
-        if len(set(options)) != len(options):
-            raise ValueError("options must be unique")
-        if not utterance.strip():
-            raise ValueError("utterance must not be blank")
+        # The whole input contract lives in ``_validate_question``: a
+        # malformed question raises there, before this method builds a
+        # payload or touches the transport.
+        _validate_question(utterance, options, criteria)
 
         payload: dict[str, Any] = {
             "model": self._config.model,
@@ -123,10 +166,9 @@ class JevChoiceClient:
                         if instructions is None
                         else instructions
                     ),
-                    # No per-option copy exists at this boundary; the
-                    # label is its own description until a caller has
-                    # richer criteria to pass.
-                    "criteria": {option: option for option in options},
+                    # Each option carries the description its caller wrote
+                    # for it; a label is never its own discriminator.
+                    "criteria": dict(criteria),
                 }
             },
         }

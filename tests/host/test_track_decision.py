@@ -4,18 +4,32 @@ The gray-zone tier is a Jev closed-set Choice (ADR 0080): the MiniMax
 JSON ``classify_model`` path is gone from the track cascade, so a
 langchain-shaped classifier is no longer accepted by ``decide_track``
 at all (signature-level proof).
+
+This file also carries the track lane's mis-wired-criteria containment
+pin at the DEFAULT gate (no ``soft_track`` mark), so a criteria wiring
+break fails a plain ``uv run pytest -q`` run rather than hiding behind
+the opt-in marks of ``test_track_decision_t7.py``.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 import pytest
 from langchain_core.messages import HumanMessage
 
 from fin.host.jev_choice import (
     JEV_CHOICE_EXIT_INVALID_LABEL,
+    JEV_CHOICE_EXIT_UNEXPECTED_ERROR,
+    JevChoiceClient,
     JevChoiceError,
 )
-from fin.host.track_decision import TrackDecision, decide_track
+from fin.host.track_decision import (
+    _JEV_TRACK_LEAF_CRITERIA,
+    _JEV_TRACK_OPTIONS,
+    TrackDecision,
+    decide_track,
+)
 from jev_fake import FakeJevChoice
 
 
@@ -132,6 +146,59 @@ def test_gray_zone_asks_the_closed_set_once() -> None:
     assert call["question_id"] == "track"
     assert decision.track == "off_topic"
     assert decision.decision_tier == "jev"
+
+
+@pytest.mark.soft_track
+def test_gray_zone_instructions_teach_every_leaf() -> None:
+    """The track mirror of ``test_choice_instructions_teach_each_operator_label``
+    in ``tests/host/test_search_mode_gray_zone_jev.py``: every leaf of the
+    closed set — read from ``_JEV_TRACK_OPTIONS``, not re-spelled here —
+    must appear in the instruction text the cascade ACTUALLY sends, and no
+    leaf body may: a body pasted into the prose would be a second copy of
+    the rule the criteria slot owns (the drift the ADR 0081 slot A/B
+    retired). Fake-recorded, so this pins the request, not a constant."""
+    fake = FakeJevChoice([("off_topic", 0.9)])
+    decide_track(
+        [HumanMessage(content="maybe compare these?")], jev_client=fake
+    )
+    call = fake.calls[0]
+    for leaf in _JEV_TRACK_OPTIONS:
+        assert leaf in call["instructions"]
+    for leaf, body in _JEV_TRACK_LEAF_CRITERIA.items():
+        assert call["criteria"][leaf] == body
+        assert body not in call["instructions"]
+
+
+def test_miswired_leaf_criteria_is_contained_as_an_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    jev_never_sent_client: tuple[JevChoiceClient, list[dict[str, Any]]],
+) -> None:
+    """The track cascade's own landing point for a criteria table that
+    stopped covering the closed set — what a leaf added to
+    ``_JEV_TRACK_OPTIONS`` without its body leaves behind. The real client
+    refuses to send a malformed question (``ValueError``), so the cascade
+    still fail-closes to clarify and the audit names the throw as a wiring
+    bug, never as a judge fact. The never-sent proof is the explicit
+    ``sent == []`` count on the shared fixture transport.
+
+    This pin sits at the DEFAULT gate on purpose (see this file's
+    docstring); the 档 lane's twin is
+    ``test_miswired_criteria_is_contained_as_an_exit`` in
+    ``tests/host/test_search_mode_cascade.py``.
+    """
+    client, sent = jev_never_sent_client
+    monkeypatch.delitem(_JEV_TRACK_LEAF_CRITERIA, "grounded")
+
+    decision = decide_track(
+        [HumanMessage(content="maybe compare these?")],
+        jev_client=client,
+    )
+
+    assert sent == []  # explicit count: nothing reached the transport
+    assert decision.track == "clarify"
+    assert decision.decision_tier == "clarify"
+    assert decision.signals["jev_exit"] == JEV_CHOICE_EXIT_UNEXPECTED_ERROR
+    assert decision.signals["jev_error_type"] == "ValueError"
 
 
 @pytest.mark.soft_track

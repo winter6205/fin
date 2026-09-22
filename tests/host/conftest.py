@@ -17,6 +17,12 @@ resolved by ``sys.path`` order, not by intent).
 The live-Jev gate does NOT live here: it moved to ``tests/conftest.py``,
 because ``jev_live`` suites now exist under ``tests/retrieve/`` too and a
 second copy of a credential gate is how skip-vs-fail semantics drift.
+
+It also owns the mis-wired-criteria containment client (see
+``jev_never_sent_client``): both cascade lanes pinned "a malformed
+question never reaches the wire" with their own private copy of the same
+sentinel transport and fake config — one fixture is how the two lanes'
+containment semantics cannot drift apart.
 """
 
 from __future__ import annotations
@@ -25,11 +31,14 @@ from fin.corpus._private_fixtures import load_private_fixture
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from fin.corpus.extracted import Locator
 from fin.corpus.facts import Fact, write_facts
+from fin.host.jev_choice import JevChoiceClient
+from fin.host.jev_config import JevConfig
 
 
 def pytest_collection_modifyitems(
@@ -118,6 +127,40 @@ def _memory_on_env_for_marked_tests(
     if request.node.get_closest_marker("memory_on") is None:
         return
     monkeypatch.setenv("FIN_MEMORY_ENABLED", "true")
+
+
+# ----- mis-wired-criteria containment: one shared never-sent client -----
+
+
+@pytest.fixture
+def jev_never_sent_client() -> tuple[JevChoiceClient, list[dict[str, Any]]]:
+    """A REAL client whose transport records everything that reaches it.
+
+    Shared by both cascade lanes' mis-wired-criteria containment pins
+    (``test_search_mode_cascade.py`` and, at the default gate,
+    ``test_track_decision.py``). The lane builds a criteria table that no
+    longer covers the closed set, and the real client must refuse to send
+    it; the never-sent proof is the EXPLICIT count ``sent == []`` — the
+    raise is only the belt so a payload that did reach the transport also
+    fails downstream asserts. The key is a fixed dummy: validation must
+    reject before anything could be sent, and nothing here touches a
+    network.
+    """
+    sent: list[dict[str, Any]] = []
+
+    def transport(payload: dict[str, Any]) -> dict[str, Any]:
+        sent.append(payload)
+        raise AssertionError("a malformed question must never reach the wire")
+
+    client = JevChoiceClient(
+        JevConfig(
+            api_key="ts-test-key-not-a-real-secret",
+            model="jev-latest",
+            base_url="https://api.typesafe.ai",
+        ),
+        transport=transport,
+    )
+    return client, sent
 
 
 # ----- T3 comparison fact seed (spec Focus 1) -----

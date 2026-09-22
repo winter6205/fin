@@ -25,7 +25,7 @@ dependents).
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -58,13 +58,26 @@ _MIN_JEV_CONFIDENCE = 0.6
 
 # Live smoke: the client's generic default instructions misjudge
 # off-domain asks as grounded; leaf semantics must come with the question.
+# The four leaf bodies are the closed set's per-option criteria (the wire
+# slot that describes ONE option), and the instruction text is only the
+# task — a prompt that pastes the leaves into prose is a second copy of
+# them, and only the criteria reaches the judge's per-option scoring.
+# The taught names are JOINED FROM THE CLOSED SET (mirroring
+# ``search_mode_decision._JEV_MODE_INSTRUCTIONS``): a leaf added to
+# ``_JEV_TRACK_OPTIONS`` without a prose re-spelling cannot silently stop
+# being taught, because this text cannot drift from the tuple.
 _JEV_TRACK_INSTRUCTIONS: str = (
     "Classify the operator utterance into exactly one Soft-Track track: "
-    "dialogue = conversational reply needing no filing data; "
-    "clarify = a filing-shaped ask missing company or period; "
-    "off_topic = outside US-filing financial research; "
-    "grounded = a research ask answerable from SEC filings."
+    + ", ".join(_JEV_TRACK_OPTIONS)
+    + ". Answer with the leaf name alone."
 )
+
+_JEV_TRACK_LEAF_CRITERIA: dict[str, str] = {
+    "dialogue": "conversational reply needing no filing data",
+    "clarify": "a filing-shaped ask missing company or period",
+    "off_topic": "outside US-filing financial research",
+    "grounded": "a research ask answerable from SEC filings",
+}
 
 # Canonical ticker spellings for snapshot storage.
 _COMPANY_CANON: dict[str, str] = {
@@ -101,6 +114,7 @@ class JevChoiceProvider(Protocol):
         *,
         utterance: str,
         options: Sequence[str],
+        criteria: Mapping[str, str],
         question_id: str = "track",
         instructions: str | None = None,
     ) -> JevChoice: ...
@@ -402,6 +416,7 @@ def _try_jev_classify(
         choice = jev_client.choose(
             utterance=text,
             options=_JEV_TRACK_OPTIONS,
+            criteria=_JEV_TRACK_LEAF_CRITERIA,
             question_id="track",
             instructions=_JEV_TRACK_INSTRUCTIONS,
         )

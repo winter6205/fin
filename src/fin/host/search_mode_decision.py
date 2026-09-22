@@ -117,16 +117,22 @@ _LABEL_TO_MODE: dict[str, str] = {label: mode for mode, label in MODE_LABELS.ite
 # own question, not a continuation).
 _INHERIT_MAX_LEN = 48
 
-# The judge is taught the operator labels AND what separates the 档: a bare
-# ``token + label`` pair is not a discriminator. Shipping one cost the live
-# judge its only opened 档 — ``D 真数据库`` reads like the natural home for
-# any question about a financial figure, while the spec keeps a figure that
-# lives only in a filing on 知识问答 (``graph``), so the label alone pulled
-# the grounded asks that this tier exists to decide onto an unopened 档.
-# Each gloss is therefore the boundary case it settles, not a restatement of
-# the label. Keyed by the lasting tokens and indexed (never ``.get``): a 档
-# added to ``LASTING_RETRIEVE_TIERS`` without its discriminator is a loud
-# KeyError at composition, named by the hermetic pin in
+# The judge is taught the operator labels AND what separates the 档. A bare
+# ``token + label`` pair is not a discriminator, and shipping one cost the
+# live judge its only opened 档 — ``D 真数据库`` reads like the natural home
+# for any question about a financial figure, while the spec keeps a figure
+# that lives only in a filing on 知识问答 (``graph``), so the label alone
+# pulled the grounded asks that this tier exists to decide onto an unopened
+# 档. Each gloss is therefore the boundary case it settles, not a
+# restatement of the label — and it is sent per option, in the wire's
+# ``criteria`` slot, not pasted into the instruction prose.
+#
+# The table is keyed by the lasting tokens and handed over whole, so a 档
+# added to ``LASTING_RETRIEVE_TIERS`` without its discriminator is a
+# mismatch the client names before it sends: a ``ValueError`` the cascade
+# records as ``mode_jev_exit=unexpected_error`` with ``mode_jev_error_type``,
+# never a silently undiscriminated option. The hermetic half of that pin —
+# the row missing before anything is called — is
 # ``tests/host/test_search_mode_gray_zone_jev.py``.
 _JEV_MODE_TIER_GLOSSES: dict[str, str] = {
     "A": "an exact-string or single-known-field lookup in the filed documents",
@@ -146,11 +152,14 @@ _JEV_MODE_TIER_GLOSSES: dict[str, str] = {
     ),
 }
 
+# Names only: which tokens exist and what the operator calls them. The
+# bodies that separate them ride ``_JEV_MODE_TIER_GLOSSES`` into the
+# criteria slot, so the two never have to be kept in prose sync here.
 _JEV_MODE_INSTRUCTIONS: str = (
     "Classify this grounded knowledge question into exactly one 检索档 "
-    "(retrieve tier), where "
-    + "; ".join(
-        f"{mode} {MODE_LABELS[mode]} = {_JEV_MODE_TIER_GLOSSES[mode]}"
+    "(retrieve tier): "
+    + ", ".join(
+        f"{mode} {MODE_LABELS[mode]}"
         for mode in LASTING_RETRIEVE_TIERS
         if mode in MODE_LABELS
     )
@@ -384,6 +393,7 @@ def _try_jev_decide(
         choice = jev_client.choose(
             utterance=text,
             options=LASTING_RETRIEVE_TIERS,
+            criteria=_JEV_MODE_TIER_GLOSSES,
             question_id="search_mode",
             instructions=_JEV_MODE_INSTRUCTIONS,
         )

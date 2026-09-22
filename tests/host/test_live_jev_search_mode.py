@@ -148,6 +148,7 @@ def test_live_lasting_tier_choice_round_trip(jev_live_client: JevChoiceClient) -
     choice = jev_live_client.choose(
         utterance=GROUNDING_UTTERANCE,
         options=LASTING_RETRIEVE_TIERS,
+        criteria=smd._JEV_MODE_TIER_GLOSSES,
         question_id="search_mode",
         instructions=smd._JEV_MODE_INSTRUCTIONS,
     )
@@ -271,6 +272,11 @@ def test_live_tier_decision_via_product_seam(jev_live_client: JevChoiceClient) -
     assert call["options"] == LASTING_RETRIEVE_TIERS
     assert call["question_id"] == "search_mode"
     assert call["instructions"] == smd._JEV_MODE_INSTRUCTIONS
+    # The live judge was discriminated by the per-option slot, not by prose
+    # pasted into the instruction text: the gloss table it sent is the
+    # product's, key for key, next to the options it offered.
+    assert call["criteria"] == smd._JEV_MODE_TIER_GLOSSES
+    assert set(call["criteria"]) == set(call["options"])
     assert call["utterance"] == GROUNDING_UTTERANCE
     _assert_judge_answered(decision, via="decide_search_mode")
 

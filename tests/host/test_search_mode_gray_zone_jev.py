@@ -76,14 +76,22 @@ def test_choice_instructions_teach_each_operator_label() -> None:
     every CONTEXT label has to be taught next to its own token, and the
     instruction text is built from the label SSOT, not re-spelled. The
     answer the instruction teaches has to be one the cascade accepts, so
-    the scripted reply here is the bare 查找 token it was shown."""
+    the scripted reply here is the bare 查找 token it was shown.
+
+    The instruction prose stops at the names: each 档's discriminator is a
+    per-option value on the wire, so a body pasted into the prompt would
+    mean two copies of one rule that can drift apart. Both halves are
+    pinned — every label present, no gloss body present.
+    """
     fake = FakeJevChoice([("A", 0.9)])
     decision = decide_search_mode(_msgs(AMBIGUOUS), jev_client=fake)
 
-    instructions = fake.calls[0]["instructions"]
+    call = fake.calls[0]
     for mode in LASTING_RETRIEVE_TIERS:
-        assert mode in instructions
-        assert TIER_LABELS[mode] in instructions
+        assert mode in call["instructions"]
+        assert TIER_LABELS[mode] in call["instructions"]
+    for gloss in smd._JEV_MODE_TIER_GLOSSES.values():
+        assert gloss not in call["instructions"]
     assert decision.search_mode == "A"
     assert decision.decision_tier == "jev"
     assert decision.failure_code is None
@@ -103,29 +111,37 @@ def test_rules_naming_skips_the_judge() -> None:
     assert decision.failure_code == TIER_NOT_OPEN
 
 
-def test_choice_instructions_carry_one_gloss_per_lasting_tier() -> None:
+def test_choice_criteria_carry_one_gloss_per_lasting_tier() -> None:
     """Anti-drift pin for the next 档 rename. A token that arrives without
     its discriminator is the failure mode this prompt already shipped once
     (bare labels pulled ``D 真数据库`` on any figure question), so the gloss
-    table and the rendered instruction text must both be complete: every
-    lasting 档 has exactly one gloss, and each rendered clause carries that
-    token, its operator label and that gloss. The composition indexes the
-    gloss, so this test is what names a missing row.
+    table must be exactly the closed set and the cascade must hand that
+    table over as its per-option criteria, value for value.
 
-    The label superset pin beside it is what makes that "indexes" claim true:
-    the composition emits a clause only ``if mode in MODE_LABELS``, so a
-    lasting 档 with a gloss but NO label would be dropped from the
-    instructions silently and never reach its gloss at all — a KeyError needs
-    the clause to be built, so coverage of the label map is the loud half.
+    A 档 added to ``LASTING_RETRIEVE_TIERS`` without its gloss stays LOUD
+    here rather than becoming a silently undiscriminated option: the key
+    set below is the closed set by equality, and the client validates the
+    same pairing against the options before it sends, so the mismatch is a
+    ``ValueError`` the cascade records as ``mode_jev_exit=unexpected_error``
+    (pinned in ``tests/host/test_search_mode_cascade.py``) — never a guess.
+
+    The label superset pin beside it is the other loud half: the instruction
+    text emits a name only ``if mode in MODE_LABELS``, so a lasting 档 with
+    a gloss but NO label would be dropped from what the judge is taught
+    silently and could still be answered.
     """
     assert set(smd._JEV_MODE_TIER_GLOSSES) == set(LASTING_RETRIEVE_TIERS)
     assert set(smd.MODE_LABELS) >= set(LASTING_RETRIEVE_TIERS)
-
-    instructions = smd._JEV_MODE_INSTRUCTIONS
     for mode in LASTING_RETRIEVE_TIERS:
-        gloss = smd._JEV_MODE_TIER_GLOSSES[mode]
-        assert f"{mode} {TIER_LABELS[mode]} = {gloss}" in instructions
-        assert gloss
+        assert smd._JEV_MODE_TIER_GLOSSES[mode].strip()
+
+    fake = FakeJevChoice([("graph", 0.9)])
+    decide_search_mode(_msgs(AMBIGUOUS), jev_client=fake)
+
+    criteria = fake.calls[0]["criteria"]
+    assert set(criteria) == set(LASTING_RETRIEVE_TIERS)
+    for mode in LASTING_RETRIEVE_TIERS:
+        assert criteria[mode] == smd._JEV_MODE_TIER_GLOSSES[mode]
 
 
 def test_missing_client_names_the_judge_as_the_reason() -> None:
