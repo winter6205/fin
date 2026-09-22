@@ -120,10 +120,12 @@ from fin.retrieve.mcp_session import (
     MCPStdioSession,
 )
 from fin.retrieve.port import (
+    RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY,
     SEARCH_MODE_FILTER_KEY,
     TierUnavailableError,
     resolve_search_mode,
 )
+from fin.retrieve.tiers import COMMUNITY_SUMMARY_INDEX_FAILURE
 
 
 _DEFAULT_LIMIT = 8
@@ -463,6 +465,36 @@ def _merge_degradation_signals(
     if not degraded:
         return NOT_DEGRADED
     return DegradationSignal(degraded=True, degraded_reasons=tuple(reasons))
+
+
+def _is_community_summary_not_ready(result: dict[str, Any]) -> bool:
+    """Whether an MCP ``tools/call`` result is the global 综述 report arm's
+    typed community-summary not-ready refusal.
+
+    The upstream surfaces it as an ``isError`` result whose first text
+    content block carries the ``community_summary_index_failure`` token.
+    Matching that token in the message is the whole name available here,
+    not a match on prose: iknow's tool boundary wraps every handler throw
+    as ``{content: [{type: "text", text: <Error.message>}], isError: true}``
+    (``registerOne`` → ``textResult``), so only the message string crosses
+    the wire — no structured ``code``/``error`` field is serialized for a
+    thrown retrieve error the way a ``read_source`` JSON body is. That is
+    a RECORDED job fact about the report index — distinct from a transport
+    fault (which has no such token and must stay ``retrieve_unavailable``)
+    and from a legal empty hit (which is not an error at all).
+    """
+    if result.get("isError") is not True:
+        return False
+    content = result.get("content")
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if not isinstance(block, Mapping) or block.get("type") != "text":
+            continue
+        text = block.get("text")
+        if isinstance(text, str):
+            return COMMUNITY_SUMMARY_INDEX_FAILURE in text
+    return False
 
 
 # ----- adapter -----
@@ -913,6 +945,16 @@ class MCPRetrieveAdapter:
                     f"MCP returned non-dict result: {result!r}",
                     envelope_signal,
                 )
+        # A global 综述 report-index not-ready refusal is a recorded job
+        # fact, not a transport fault: hand back the empty-plus-flag
+        # envelope so the host names the summary-index failure for the
+        # operator instead of letting the content-block unwrap below
+        # collapse it into ``retrieve_unavailable``.
+        if _is_community_summary_not_ready(result):
+            return {
+                "chunks": [],
+                RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY: True,
+            }
         # Variant 3: content-block envelope. Unwrap only when the
         # block carries neither the canonical ``chunks`` key nor the
         # legacy ``hits`` key — otherwise the block's ``content`` key

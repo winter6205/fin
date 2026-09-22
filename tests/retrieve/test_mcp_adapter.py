@@ -871,13 +871,14 @@ def test_retrieve_payload_filters_is_plural_record() -> None:
 
 from fin.host.named_failures import (  # noqa: E402  (section-local imports)
     REAL_DB_NOT_WIRED,
-    TIER_NOT_OPEN,
 )
 from fin.retrieve.port import (  # noqa: E402
     InvalidSearchModeError,
+    RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY,
     SEARCH_MODE_FILTER_KEY,
     TierUnavailableError,
 )
+from fin.retrieve.tiers import COMMUNITY_SUMMARY_INDEX_FAILURE  # noqa: E402
 
 
 def test_unset_search_mode_is_absent_from_the_wire() -> None:
@@ -930,7 +931,6 @@ def test_the_wire_never_carries_a_retired_letter() -> None:
 @pytest.mark.parametrize(
     ("tier", "code"),
     [
-        pytest.param("global", TIER_NOT_OPEN, id="tier-global"),
         pytest.param("sql", REAL_DB_NOT_WIRED, id="tier-sql"),
     ],
 )
@@ -941,7 +941,11 @@ def test_an_unopened_tier_is_a_named_exit_without_an_mcp_call(
     send door uses (``TIER_UNAVAILABLE_CODE`` mapping), not a silent
     default-``graph`` retrieve: the request never reaches the transport
     (payloads stays empty), and the exit is not the miss shape
-    ``{"chunks": []}`` (that would read as "the corpus has nothing")."""
+    ``{"chunks": []}`` (that would read as "the corpus has nothing").
+
+    Only ``sql`` is an unopened 档 now: opening ``global`` (fin task 4)
+    moved it onto the same forwarded path as lexical/graph (pinned by the
+    next test), so it can no longer wear this refusal."""
     adapter = _CapturingAdapter()
     result = adapter.retrieve("revenue", search_mode=tier)
     assert result == {"error": code}
@@ -949,10 +953,23 @@ def test_an_unopened_tier_is_a_named_exit_without_an_mcp_call(
     assert adapter.payloads == []
 
 
+def test_global_is_an_open_tier_forwarded_to_the_wire() -> None:
+    """The mirror of the refusal above, for the 档 this change opened:
+    ``global`` 综述 now runs a real report arm, so the adapter SENDS the
+    token to the server (it reaches the transport) rather than answering
+    「档未开」without a call."""
+    adapter = _CapturingAdapter()
+    assert adapter.retrieve("revenue", search_mode="global") == {"chunks": []}
+    assert len(adapter.payloads) == 1
+    assert (
+        adapter.payloads[0]["params"]["arguments"]["filters"]
+        == {SEARCH_MODE_FILTER_KEY: "global"}
+    )
+
+
 @pytest.mark.parametrize(
     ("tier", "code"),
     [
-        pytest.param("global", TIER_NOT_OPEN, id="tier-global"),
         pytest.param("sql", REAL_DB_NOT_WIRED, id="tier-sql"),
     ],
 )
@@ -961,7 +978,8 @@ def test_aretrieve_raises_the_typed_tier_error_before_transport(
 ) -> None:
     """The async seam carries the named failure as its typed error
     (the sync ``retrieve`` translates it to the product dict, the same
-    split as ``RetrieveUnavailableError``)."""
+    split as ``RetrieveUnavailableError``). Only ``sql`` remains a
+    routing-time refusal after global was opened."""
     adapter = _CapturingAdapter()
     with pytest.raises(TierUnavailableError) as excinfo:
         asyncio.run(adapter.aretrieve("revenue", search_mode=tier))
@@ -1034,7 +1052,6 @@ def test_transport_down_with_an_open_tier_is_still_retrieve_unavailable() -> Non
 @pytest.mark.parametrize(
     ("tier", "code"),
     [
-        pytest.param("global", TIER_NOT_OPEN, id="tier-global"),
         pytest.param("sql", REAL_DB_NOT_WIRED, id="tier-sql"),
     ],
 )
@@ -1046,9 +1063,123 @@ def test_a_closed_tier_keeps_its_name_even_when_the_transport_is_down(
     ``retrieve_unavailable``. The distinction is actionable: retrying
     the transport changes nothing for 「档未开」, while
     ``retrieve_unavailable`` means the 档 IS open and the call is
-    worth retrying."""
+    worth retrying. Only ``sql`` is a closed 档 after global was
+    opened; a global request over a down transport is the transport's
+    own failure, pinned in the next test."""
     adapter = _ScriptedAdapter(scripted_exception=OSError("down"))
     assert adapter.retrieve("foo", search_mode=tier) == {"error": code}
+
+
+def test_an_open_global_over_a_down_transport_is_retrieve_unavailable() -> None:
+    """The other side of that ordering now that global is open: a
+    综述 request is not refused at routing, so when the transport is
+    down it names ``retrieve_unavailable`` (retry-worthy), not
+    ``tier_not_open``."""
+    adapter = _ScriptedAdapter(scripted_exception=OSError("down"))
+    assert adapter.retrieve("foo", search_mode="global") == {
+        "error": "retrieve_unavailable"
+    }
+
+
+# ----- global 综述 runtime: community-summary index-not-ready (fin task 4) -
+#
+# The opened 综述 档's report arm reads the 社区 summary index. When that
+# index is not-ready, upstream surfaces a typed ``isError`` result whose
+# text carries the ``community_summary_index_failure`` token. fin must
+# record that job fact (the empty-plus-flag envelope the host decision
+# names), NOT collapse it into the generic ``retrieve_unavailable`` the
+# unwrapped content-block path would otherwise produce — and equally must
+# NOT mistake a transport error that lacks the token for the summary job.
+
+
+def _community_summary_error_result(*, text: str) -> dict:
+    """A ``tools/call`` result envelope for the upstream 综述 refusal.
+
+    This is the exact shape the adapter keys on: an ``isError`` result
+    whose first content block is a text carrying ``text``."""
+    return {
+        "result": {
+            "isError": True,
+            "content": [{"type": "text", "text": text}],
+        }
+    }
+
+
+def test_a_community_summary_refusal_is_recorded_as_the_job_fact() -> None:
+    """An isError whose text names community_summary_index_failure is a
+    RECORDED report-index fact: the adapter hands back the empty-plus-flag
+    envelope so the host names the summary-index job for the operator."""
+    adapter = _ScriptedAdapter(
+        scripted_response=_community_summary_error_result(
+            text=(
+                f"retrieve refused: {COMMUNITY_SUMMARY_INDEX_FAILURE} "
+                "(summary index not built)"
+            )
+        )
+    )
+    result = adapter.retrieve("综述这几份 10-Q", search_mode="global")
+    assert result == {
+        "chunks": [],
+        RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY: True,
+    }
+
+
+def test_a_community_summary_refusal_resolves_on_the_async_seam() -> None:
+    """Same fact on the async path: ``aretrieve`` returns the flagged
+    envelope rather than raising — the record is not a transport fault."""
+    adapter = _ScriptedAdapter(
+        scripted_response=_community_summary_error_result(
+            text=COMMUNITY_SUMMARY_INDEX_FAILURE
+        )
+    )
+    assert asyncio.run(adapter.aretrieve("综述", search_mode="global")) == {
+        "chunks": [],
+        RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY: True,
+    }
+
+
+def test_an_iserror_without_the_token_stays_retrieve_unavailable() -> None:
+    """The negative half of the discrimination: a real transport/tool
+    error whose text does NOT carry the summary token must keep the
+    generic ``retrieve_unavailable`` EXIT — fin never invents a
+    summary-index job fact out of an unrelated failure."""
+    adapter = _ScriptedAdapter(
+        scripted_response=_community_summary_error_result(
+            text="worker crashed unexpectedly"
+        )
+    )
+    assert adapter.retrieve("foo", search_mode="global") == {
+        "error": "retrieve_unavailable"
+    }
+
+
+def test_the_summary_token_only_counts_on_a_first_text_block() -> None:
+    """The matcher is narrow: a non-error result, or an isError whose
+    content is empty / not a leading text block, is not the recorded
+    job fact (it falls through to the ordinary unwrap / miss path)."""
+    from fin.retrieve.mcp_adapter import _is_community_summary_not_ready
+
+    token_text = COMMUNITY_SUMMARY_INDEX_FAILURE
+    # isError + leading text block carrying the token → True.
+    assert _is_community_summary_not_ready(
+        {"isError": True, "content": [{"type": "text", "text": token_text}]}
+    ) is True
+    # Not an error at all → False.
+    assert _is_community_summary_not_ready(
+        {"isError": False, "content": [{"type": "text", "text": token_text}]}
+    ) is False
+    # isError but empty content → False.
+    assert _is_community_summary_not_ready(
+        {"isError": True, "content": []}
+    ) is False
+    # isError, leading block is not a dict → False.
+    assert _is_community_summary_not_ready(
+        {"isError": True, "content": ["not-a-dict"]}
+    ) is False
+    # isError, leading text WITHOUT the token → False.
+    assert _is_community_summary_not_ready(
+        {"isError": True, "content": [{"type": "text", "text": "other err"}]}
+    ) is False
 
 
 def test_an_illegal_mode_is_named_before_a_broken_transport() -> None:
@@ -1063,9 +1194,9 @@ def test_an_illegal_mode_is_named_before_a_broken_transport() -> None:
 
 def test_concurrent_tiered_calls_answer_per_call() -> None:
     """Boundary 'concurrent' × 档: one shared adapter, parallel calls
-    mixing accepted and unopened 档 — each call gets its OWN named
-    answer (hit dict or ``{"error": tier_not_open}``), and only the
-    accepted modes ever reach the wire."""
+    mixing the three OPEN 档 — each accepted mode reaches the wire and
+    gets its OWN hit answer. ``global`` 综述 is open now (fin task 4), so
+    it is an accepted mode beside lexical/graph, not a per-call refusal."""
     chunks_wire = [
         {
             "id": "chunk-1",
@@ -1099,18 +1230,15 @@ def test_concurrent_tiered_calls_answer_per_call() -> None:
     expected_chunks = {"chunks": [_chunk("hit", "DOC-2023Q1", score=1.0)]}
     modes = [("lexical", "graph", "global")[i % 3] for i in range(12)]
     for mode, result in zip(modes, results):
-        if mode == "global":
-            assert result == {"error": TIER_NOT_OPEN}
-        else:
-            assert result == expected_chunks
+        assert result == expected_chunks, mode
 
     sent_modes = [
         payload["params"]["arguments"]["filters"][SEARCH_MODE_FILTER_KEY]
         for payload in adapter.payloads
     ]
-    assert sorted(sent_modes) == sorted(
-        m for m in modes if m in ("lexical", "graph")
-    ), "a refused 档 reached the wire, or an accepted one did not"
+    assert sorted(sent_modes) == sorted(modes), (
+        "an accepted 档 failed to reach the wire"
+    )
 
 
 # ----- locator_map injection -----

@@ -203,11 +203,15 @@ def test_an_open_tier_answers_with_the_same_script(port) -> None:
     plain = port.retrieve("营业收入同比")
     tiered = port.retrieve("营业收入同比", search_mode="lexical")
     assert tiered == plain
+    # 综述 opened: the capability fake answers it with the SAME all-on
+    # script exactly like the other open 档 — it is not a named refusal.
+    global_tiered = port.retrieve("营业收入同比", search_mode="global")
+    assert global_tiered == plain
 
 
 @pytest.mark.parametrize(
     ("mode", "code"),
-    [("global", "tier_not_open"), ("sql", "real_db_not_wired")],
+    [("sql", "real_db_not_wired")],
 )
 def test_the_capability_fake_refuses_an_unopened_tier_like_the_port(
     port, mode: str, code: str

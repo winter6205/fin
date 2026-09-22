@@ -75,9 +75,12 @@ from fin.corpus.push import envelope_of_unit
 from fin.host.named_failures import (
     COMMUNITY_SUMMARY_INDEX_FAILURE,
     REAL_DB_NOT_WIRED,
-    TIER_NOT_OPEN,
 )
-from fin.retrieve.port import InvalidSearchModeError, SEARCH_MODE_FILTER_KEY
+from fin.retrieve.port import (
+    InvalidSearchModeError,
+    RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY,
+    SEARCH_MODE_FILTER_KEY,
+)
 
 from live_iknow_support import (
     IKNOW_ROOT,
@@ -306,18 +309,20 @@ def test_graph_tier_sends_search_mode_on_the_wire_and_matches_the_default(
     )
 
 
-def test_the_global_token_is_one_the_server_accepts_even_though_fin_has_not_opened_it(
+def test_a_global_send_reaches_the_server_and_surfaces_the_runtime_index_failure(
     live: Any, parent_envelope: Any
 ) -> None:
-    """The two halves of the 综述 fact, on one real round trip.
+    """Both halves of the 综述 runtime fact, on one real round trip.
 
-    fin's port refuses ``global`` as 「档未开」 and never spends a wire
-    call on it. That is fin's own routing state, NOT evidence that the
-    token is unknown to iknow — so the raw transport is used here to
-    check the other half: the server takes ``global`` as a legal
-    ``filters.search_mode`` value and answers with its own not-ready
-    fact. A server-side enum refusal (``invalid_search_mode``) here would
-    mean fin renamed a token the sibling contract never carried.
+    ``global`` is now an OPEN 档: fin forwards it to the wire, and a
+    not-ready community summary index comes back as a RUNTIME fact, not a
+    routing-time ``tier_not_open``. The raw transport pins the server half
+    first — the server takes ``global`` as a legal ``filters.search_mode``
+    and answers with its own ``community_summary_index_failure`` (a server
+    ``invalid_search_mode`` here would mean fin renamed a token the sibling
+    never carried). The adapter half then proves fin translates that
+    refusal into the recorded outcome flag rather than collapsing it to
+    ``retrieve_unavailable``.
     """
 
     before = len(_retrieve_requests(live))
@@ -363,32 +368,35 @@ def test_the_global_token_is_one_the_server_accepts_even_though_fin_has_not_open
         f"server should answer with: {observed}"
     )
 
-    # And fin's own seam still keeps its routing-time name for the same
-    # token: the server accepting it is not an invitation to open it.
+    # fin's own seam: 综述 is open, so the adapter forwards global to the
+    # wire (a second request) and turns the server's typed refusal into the
+    # recorded outcome flag — the runtime emit — NOT ``tier_not_open`` and
+    # NOT ``retrieve_unavailable``.
     assert live.retrieve.retrieve(_GRAPH_TOKEN, search_mode="global") == {
-        "error": TIER_NOT_OPEN
+        "chunks": [],
+        RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY: True,
     }
-    assert len(_retrieve_requests(live)) == before + 1, (
-        "an unopened 档 must be refused before the wire, even though the "
-        "server would have answered"
+    assert len(_retrieve_requests(live)) == before + 2, (
+        "an open 档 must spend its wire call; the server's not-ready fact "
+        "reaches fin through the transport, not a pre-wire refusal"
     )
 
 
 @pytest.mark.parametrize(
     ("mode", "code"),
     [
-        pytest.param("global", TIER_NOT_OPEN, id="tier-global"),
         pytest.param("sql", REAL_DB_NOT_WIRED, id="tier-sql"),
     ],
 )
 def test_unopened_tier_keeps_its_named_exit_with_the_full_stack_live(
     live: Any, mode: str, code: str
 ) -> None:
-    """The unopened 档 exits are routing-time, not transport-time: even
-    with real ES/PG/Neo4j behind iknow (where a graph-shaped answer WOULD
-    succeed), the port still refuses 「档未开」/「真库未接」 by name and
-    the request never reaches the wire — no silent default answer dressed
-    as 综述 or 真数据库."""
+    """An unopened 档 exit is routing-time, not transport-time: even with
+    real ES/PG/Neo4j behind iknow (where a graph-shaped answer WOULD
+    succeed), the port still refuses 「真库未接」 by name and the request
+    never reaches the wire — no silent default answer dressed as 真数据库.
+    (``global`` no longer appears here: it is an open 档 now, so it spends
+    its wire call and surfaces the runtime index fact instead.)"""
 
     before = len(_retrieve_requests(live))
     assert live.retrieve.retrieve(_GRAPH_TOKEN, search_mode=mode) == {
