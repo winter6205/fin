@@ -41,8 +41,10 @@ from fin.retrieve.input_validation import InputValidationError
 from fin.retrieve.tiers import RETRIEVE_TIERS, TIER_UNAVAILABLE_CODE
 
 # The wire key the iknow-memory ``retrieve`` schema accepts inside its
-# ``filters`` record (sibling spec ``search-mode-retrieve.md``:
-# ``filters.search_mode`` ∈ ``A|B|C|D``; missing → iknow's default B).
+# ``filters`` record (sibling spec ``search-mode-retrieve.md``, tokens
+# renamed by ``search-mode-graph-global.md``:
+# ``filters.search_mode`` ∈ ``A|graph|global|D``; missing → iknow's
+# default 知识问答 = ``graph``).
 # The value set is the closed 档 SSOT (``fin.retrieve.tiers``): an
 # out-of-set value is the documented invalid-mode code
 # ``invalid_search_mode`` — the same token the iknow retrieve schema
@@ -81,8 +83,8 @@ class TierUnavailableError(InputValidationError):
     """A legal 档 token whose product side is not open yet.
 
     Carries the SAME public code the send door uses for the request
-    (``TIER_UNAVAILABLE_CODE``: C → ``tier_not_open``,
-    D → ``real_db_not_wired``) so a pin that reaches the port gets
+    (``TIER_UNAVAILABLE_CODE``: ``global`` → ``tier_not_open``,
+    ``D`` → ``real_db_not_wired``) so a pin that reaches the port gets
     the identical named failure — never a retrieve dressed as another
     档. It subclasses the input-error family so every host seam that
     already converts a named input error converts this one too; the
@@ -103,7 +105,8 @@ class TierUnavailableError(InputValidationError):
 def resolve_search_mode(search_mode: str | None) -> str | None:
     """Validate a 档 token against the closed set; return it for the wire.
 
-    ``None`` passes through as "do not send" (iknow's default B).
+    ``None`` passes through as "do not send" — iknow then answers with
+    its own default 知识问答 (``graph``), never with a letter the host chose.
     Matching is EXACT — the send door normalizes human input, so a
     port caller that sends ``"c"`` or ``" summary "`` made a wiring
     mistake this helper must name, not guess around.
@@ -195,10 +198,11 @@ class RetrievePort(Protocol):
             检索档 (spec ``search-mode-retrieve.md``): one of the
             closed ``RETRIEVE_TIERS`` tokens forwarded to the ranking
             service as ``filters.search_mode``. ``None`` (the default)
-            does NOT send the field — iknow's own default B answers,
-            backward compatible. An out-of-set token raises
-            ``InvalidSearchModeError``; a legal but unopened 档 raises
-            ``TierUnavailableError`` carrying the ``TIER_UNAVAILABLE_CODE``
+            does NOT send the field — iknow's own default 知识问答
+            (``graph``) answers, backward compatible. An out-of-set
+            token raises ``InvalidSearchModeError``; a legal but
+            unopened 档 raises ``TierUnavailableError`` carrying the
+            ``TIER_UNAVAILABLE_CODE``
             token. Never a silent downgrade to another 档 — call
             :func:`resolve_search_mode` to enforce this.
 

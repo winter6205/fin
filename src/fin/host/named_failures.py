@@ -21,10 +21,11 @@ never by matching prose::
                        zero chunks with zero mapping failures
     mapping_drop       retrieve returned hits, but every hit failed to
                        map to a fin locator (mapping ledger count > 0)
-    tier_not_open      检索档 C 综述 is a plan slot, not implemented
+    tier_not_open      检索档 global 综述 is a plan slot, not
+                       implemented (token formerly spelled ``C``)
     real_db_not_wired  检索档 D 真数据库 is a plan slot, not implemented
     community_summary_index_failure
-                       reserved for once C 综述 ships as an open 档:
+                       reserved for once global 综述 ships as an open 档:
                        its 社区 summary index is then not-ready (the
                        Leiden/community-summary job failed or summaries
                        are incomplete, ADR 0064 / 0078) — a runtime
@@ -96,12 +97,12 @@ CORPUS_NOT_READY: Final[str] = "corpus_not_ready"
 
 MAPPING_DROP: Final[str] = "mapping_drop"
 
-# Reserved for once C 综述 ships as an open 档: its 社区 summary index
-# can then be not-ready (the Leiden / community-summary job failed or
-# produced incomplete summaries — ADR 0064 / 0078). That would be a
-# runtime index fact, deliberately NOT ``tier_not_open``: today C is
-# still a plan slot (``TIER_UNAVAILABLE_CODE`` routes it there), and
-# once C is open, telling the operator to name a different 档 for an
+# Reserved for once global 综述 ships as an open 档: its 社区 summary
+# index can then be not-ready (the Leiden / community-summary job failed
+# or produced incomplete summaries — ADR 0064 / 0078). That would be a
+# runtime index fact, deliberately NOT ``tier_not_open``: today the 综述
+# token is still a plan slot (``TIER_UNAVAILABLE_CODE`` routes it there),
+# and once it is open, telling the operator to name a different 档 for an
 # index-job failure would be wrong advice. Public wire token pinned by
 # ``specs/search-mode-retrieve.md`` (Boundaries), shared with the
 # iknow-memory side.

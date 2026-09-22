@@ -135,7 +135,7 @@ ORDINARY_PERSON_COPY: Final[dict[str, str]] = {
         "citable source. The collection's locator map may be stale — "
         "re-run corpus ingest."
     ),
-    # search-mode-retrieve T1 / SC4 — the C 综述 档 is open but its
+    # search-mode-retrieve T1 / SC4 — the global 综述 档 is open but its
     # 社区 summary index is not-ready (the build failed or is
     # incomplete). Distinct from 「档未开」: re-naming the 档 is not the
     # fix; re-running the summary index job is.

@@ -228,7 +228,12 @@ def test_unassigned_or_unknown_mode_injects_nothing() -> None:
 def test_each_mode_copy_names_only_its_tier() -> None:
     """Every 档 carries its own usage copy naming exactly its label —
     A 查找 / B 知识问答 / C 综述 / D 真数据库 (CONTEXT 检索档)."""
-    assert set(SEARCH_MODE_USAGE_COPY) == set(MODE_LABELS)
+    # The copy is keyed one increment ahead of the labels: the lasting
+    # tokens ride beside the letters ``MODE_LABELS`` still produces.
+    assert set(SEARCH_MODE_USAGE_COPY) == set(MODE_LABELS) | {
+        "graph",
+        "global",
+    }
     for mode, label in MODE_LABELS.items():
         content = str(
             messages_for_model(
@@ -338,7 +343,9 @@ def test_second_turn_new_mode_leaves_first_history_unedited() -> None:
     assert not _mode_blocks(_checkpoint_messages(g, tid))
     last_call = model.captured[-1]
     block = str(_mode_blocks(last_call)[0].content)
-    assert "检索档 B" in block
+    # The copy names the lasting token even though THIS turn's
+    # decision still carries the letter (rename lands in two steps).
+    assert "检索档 graph" in block
     assert "检索档 A" not in block
 
 
@@ -413,6 +420,6 @@ def test_copy_reinjected_after_compaction() -> None:
     blocks = _mode_blocks(call)
     assert len(blocks) == 1
     assert blocks[0] is call[0]
-    assert "检索档 B" in str(blocks[0].content)
+    assert "检索档 graph" in str(blocks[0].content)
     # And the copy itself is still call-scoped after the rebuild.
     assert not _mode_blocks(_checkpoint_messages(g, tid))

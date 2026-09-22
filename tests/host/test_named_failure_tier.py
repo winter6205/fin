@@ -125,8 +125,11 @@ def test_an_unknown_token_is_not_guessed_at() -> None:
     assert unavailable_tier(["summary", "sql", "database"]) is None
 
 
-def test_the_closed_tier_list_is_a_b_c_d() -> None:
-    assert RETRIEVE_TIERS == ("A", "B", "C", "D")
+def test_the_closed_tier_list_is_the_migration_superset() -> None:
+    """``graph`` / ``global`` join the closed set while the letters are
+    still what the cascade and the pin produce; they leave when normalize
+    retires them, not before."""
+    assert RETRIEVE_TIERS == ("A", "B", "C", "D", "graph", "global")
 
 
 # ----- T1 (search-mode-retrieve): the public C-not-ready code -----
