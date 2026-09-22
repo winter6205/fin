@@ -28,21 +28,21 @@ empty
    - **Inherits:** spec 1 ACR PASS; ADR 0053 / 0060 / 0063.
    - **Surface:** `fin.corpus`
    - **Acceptance:** Child plan `extract-window-tree.md` bullets all checked; `uv run pytest -q` still Fake retrieve.
-   - Status: [ ] pending
+   - Status: [x] done — child plan `plans/extract-window-tree.md` all bullets [x]
 
 2. **Wave 2 graph index** — tag: `[implementation]`
    - **Inherits:** iknow spec + ADR-0011; fin 抽图窗/children as input.
    - **Surface:** iknow extract / graph / community CLI
    - **Acceptance:** Child plan `graph-index-standard-fast.md` (iknow) complete; `npm test` without live GDS.
    - `[blocks: T1]` for Fast co-occurrence on children
-   - Status: [ ] pending
+   - Status: [x] done — iknow `plans/graph-index-standard-fast.md` 6/6 [x]; commits 4682156 / 6a67bb2 / 7e081f5 / 9586d9a / f3ac774 / 3f08b60 all on iknow-memory main
 
 3. **Wave 3 retrieve 档** — tag: `[implementation]`
    - **Inherits:** `filters.search_mode`; named failure codes including `community_summary_index_failure`.
    - **Surface:** iknow retrieve assembler + fin retrieve port / `named_failures`
    - **Acceptance:** Both search-mode-retrieve child plans complete.
    - `[blocks: T2]` for C-ready path; 3a/3b `[parallel]` for B default + wire
-   - Status: [ ] pending
+   - Status: [~] mostly landed — 3a T1–T4 landed on iknow main (the tracked change wire parse + arms skeleton, the tracked change lexical parent-window arm, the tracked change global report-first arm, #245 sql typed refusal), retokenized to the word closed set by #269/the tracked change; 3b all three bullets satisfied on fin main by the #284–#293 stack (named code + port forward + five-class Fake). Remainder: (a) iknow `searchCommunitySummariesLexical` has interface + shape probe + call site only — no production implementation in `src/core/storage/elasticsearch-precision.ts`, so global's bm25 half has only run against unit doubles; (b) no live global (C-ready) integration case — `tests/integration/retrieve-search-mode-pg.test.ts` runs `communitySummaryEnabled: false`; the wave-2 dependency that blocked this (graph-index T5, `f3ac774`) is now landed, so the live proof is unblocked; (c) fin `community_summary_index_failure` runtime emit stays deliberately reserved while global maps to `tier_not_open` (no silent global) — live re-run of `tests/retrieve/test_live_search_modes_pg_es.py` after the iknow seam lands.
 
 4. **Wave 4 host cascade** — tag: `[implementation]`
    - **Inherits:** spec 4 ACR PASS; Soft-Track `decide_track` shape.
