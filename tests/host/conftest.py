@@ -13,6 +13,10 @@ in-thread / workspace tests assert against the SAME numbers, so the
 seed is a fixture rather than constants each file re-declares
 (``tests/host`` is not a package; a cross-module import would be
 resolved by ``sys.path`` order, not by intent).
+
+The live-Jev gate does NOT live here: it moved to ``tests/conftest.py``,
+because ``jev_live`` suites now exist under ``tests/retrieve/`` too and a
+second copy of a credential gate is how skip-vs-fail semantics drift.
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ def pytest_collection_modifyitems(
 ) -> None:
     """Deselect opt-in suites unless the matching ``-m`` is on the CLI.
 
-    Four marks live here:
+    Three marks live here:
 
     * ``soft_track``: Soft-Track ship suites (spec Soft-Track ship gate).
     * ``memory_on``: cases that exercise the ON memory path under
@@ -46,11 +50,12 @@ def pytest_collection_modifyitems(
       directory; the launcher's live acceptance lives under
       ``tests/host/``, so the same deselection has to exist here or it
       would run under the default hermetic suite.
-    * ``jev_live``: the ADR 0080 live Jev Choice round-trip against
-      ``api.typesafe.ai``. Default ``uv run pytest -q`` must make zero
-      calls there, so this mark is deselected the same way.
 
-    All four are register-style deselection: a CLI ``-m mcp`` (etc.)
+    ``jev_live`` is deliberately NOT handled here: the root
+    ``tests/conftest.py`` deselects it for every directory, because the
+    live Jev suites are not confined to this one.
+
+    All three are register-style deselection: a CLI ``-m mcp`` (etc.)
     re-runs them. The check is per-mark so a CLI ``-m memory_on`` keeps
     the ``soft_track`` items deselected and vice versa — they are
     independent opt-in switches.
@@ -64,7 +69,6 @@ def pytest_collection_modifyitems(
             "soft_track" if item.get_closest_marker("soft_track") is not None else None,
             "memory_on" if item.get_closest_marker("memory_on") is not None else None,
             "mcp" if item.get_closest_marker("mcp") is not None else None,
-            "jev_live" if item.get_closest_marker("jev_live") is not None else None,
         )
         # Drop only the opt-in marks that the CLI did NOT request. An
         # unmarked test stays kept.

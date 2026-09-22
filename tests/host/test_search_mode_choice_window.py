@@ -82,12 +82,10 @@ def _compile(
     script: list[AIMessage],
     *,
     choice_window: bool = True,
-    classify_model: Any | None = None,
 ) -> Any:
     return compile_graph(
         checkpointer=InMemorySaver(),
         model=ScriptedChatModel(script=script),
-        classify_model=classify_model,
         known_document_ids=KNOWN_IDS,
         enable_choice_window=choice_window,
     )

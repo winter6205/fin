@@ -15,8 +15,12 @@ import pytest
 
 from fin.host.jev_choice import (
     JEV_CHOICE_EXIT_INVALID_LABEL,
+    JEV_CHOICE_EXIT_INVALID_SEARCH_MODE,
+    JEV_CHOICE_EXIT_LOW_CONFIDENCE,
+    JEV_CHOICE_EXIT_NO_JEV_CLIENT,
     JEV_CHOICE_EXIT_SCHEMA,
     JEV_CHOICE_EXIT_TRANSPORT,
+    JEV_CHOICE_EXIT_UNEXPECTED_ERROR,
     JevChoice,
     JevChoiceClient,
     JevChoiceError,
@@ -154,6 +158,30 @@ def test_label_outside_closed_set_exit() -> None:
     with pytest.raises(JevChoiceError) as excinfo:
         client.choose(utterance="q", options=OPTIONS)
     assert excinfo.value.exit_code == JEV_CHOICE_EXIT_INVALID_LABEL
+
+
+def test_exit_family_keeps_its_public_spellings() -> None:
+    """The seven names are audit tokens. Every producer and consumer now
+    goes through the constants, so a changed VALUE would stay green on its
+    own: this asserts the whole family against its literal spellings in one
+    place, which makes a rename a wire change that has to fail here first."""
+    assert (
+        JEV_CHOICE_EXIT_TRANSPORT,
+        JEV_CHOICE_EXIT_SCHEMA,
+        JEV_CHOICE_EXIT_INVALID_LABEL,
+        JEV_CHOICE_EXIT_NO_JEV_CLIENT,
+        JEV_CHOICE_EXIT_LOW_CONFIDENCE,
+        JEV_CHOICE_EXIT_UNEXPECTED_ERROR,
+        JEV_CHOICE_EXIT_INVALID_SEARCH_MODE,
+    ) == (
+        "transport",
+        "schema",
+        "invalid_label",
+        "no_jev_client",
+        "low_confidence",
+        "unexpected_error",
+        "invalid_search_mode",
+    )
 
 
 def test_injected_transport_never_touches_urllib(monkeypatch: pytest.MonkeyPatch) -> None:

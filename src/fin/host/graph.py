@@ -2037,7 +2037,6 @@ def compile_graph(
     step_cap: int = STEP_CAP,
     issuer_cap: int = MAX_ISSUERS,
     recursion_limit: int = RECURSION_LIMIT,
-    classify_model: Any | None = None,
     jev_client: Any | None = None,
     retrieve_adapter: str = RETRIEVE_ADAPTER_FAKE,
     mcp_command: list[str] | None = None,
@@ -2127,16 +2126,15 @@ def compile_graph(
         canonical location. The factory wires the
         ``get_xbrl_fact`` host tool to read from this root.
         Tests inject a synthetic ``tmp_path``-rooted tree.
-    classify_model
-        Search-mode host: optional MiniMax model for the grounded
-        turn's 检索档 cascade (``search_mode_update_for_turn``).
-        Not used by the Soft-Track track decision any more (ADR 0080).
     jev_client
-        Soft-Track gray zone (ADR 0080): a Jev closed-set Choice
-        provider (``JevChoiceProvider``) for ambiguous utterances.
-        When ``None`` (missing ``FIN_JEV_API_KEY``) the gray zone
-        fail-closes to ``track="clarify"`` in ``decide_track`` —
-        never a silent default track.
+        Soft-Track gray zone: a Jev closed-set Choice provider
+        (``JevChoiceProvider``) for ambiguous utterances, used twice in
+        a turn — once for the four tracks in ``decide_track`` and again
+        for the 检索档 of a grounded turn in
+        ``search_mode_update_for_turn``. When ``None`` (missing
+        ``FIN_JEV_API_KEY``) each gray zone fail-closes to its own
+        residual — ``track="clarify"``, or the 档 choice window — and
+        never a silent default.
     retrieve_adapter
         T3 (#76): which adapter to auto-build when ``adapter`` is
         ``None`` — ``"fake"`` (the factory default: hermetic
@@ -2437,7 +2435,8 @@ def compile_graph(
         """Soft-Track: tiered track decision before leaves.
 
         Passes ``status_snapshots`` and the optional ``jev_client``
-        into ``decide_track`` (ADR 0080 gray-zone Choice). Appends
+        into ``decide_track`` (gray-zone Choice) and, for a grounded
+        turn, into the 档 cascade's own judge call below. Appends
         snapshots when the utterance
         sets or changes research context. When the track is
         ``grounded``, also runs the 检索档 cascade
@@ -2488,7 +2487,7 @@ def compile_graph(
             sm_update = search_mode_update_for_turn(
                 messages,
                 snapshots=merged,
-                classify_model=classify_model,
+                jev_client=jev_client,
                 pinned_mode=str(pinned) if pinned else None,
             )
             update["search_mode_decision"] = sm_update["audit"]
@@ -3437,7 +3436,6 @@ def compile_graph(
     return _make_locked_graph(
         checkpointer=checkpointer,
         model=model,
-        classify_model=classify_model,
         jev_client=jev_client,
         step_cap=step_cap,
         issuer_cap=issuer_cap,
@@ -3511,7 +3509,6 @@ def _make_locked_graph(
     checkpointer: Any,
     model: Any,
     step_cap: int,
-    classify_model: Any | None = None,
     jev_client: Any | None = None,
     issuer_cap: int = MAX_ISSUERS,
     summarizer: Any | None = None,
@@ -3524,9 +3521,9 @@ def _make_locked_graph(
     key = (
         id(checkpointer),
         id(model),
-        id(classify_model) if classify_model is not None else 0,
-        # ADR 0080: the gray-zone judge is part of the compiled graph's
-        # behavior — same-object threading as ``classify_model``.
+        # The gray-zone judge is part of the compiled graph's behavior:
+        # two graphs differing only in their judge are two different
+        # graphs, so the id belongs in the key.
         id(jev_client) if jev_client is not None else 0,
         int(step_cap),
         # T6: two graphs that differ ONLY in the issuer cap are two

@@ -398,7 +398,7 @@ def compile_for_scripted_e2e(
 
     ``InMemorySaver`` for state, ``FakeRetrievePort`` for retrieve (no
     MCP subprocess), :class:`PacedScriptedChatModel` for the model, and
-    no ``classify_model`` / ``jev_client`` — the rules tier already routes
+    no ``jev_client`` — the rules tier already routes
     the lane's fully-slotted question to ``grounded`` and a gray-zone
     judge call would consume transcript responses meant for the run
     itself.

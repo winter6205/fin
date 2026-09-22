@@ -85,7 +85,7 @@ def test_sc_ambiguous_high_conf_grounded_binds_tools(
             AIMessage(content=f"Per the filing: {span}"),
         ]
     )
-    fake = FakeJevChoice([("grounded", 0.9)])
+    fake = FakeJevChoice([("grounded", 0.9), ("graph", 0.9)])
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
@@ -102,9 +102,16 @@ def test_sc_ambiguous_high_conf_grounded_binds_tools(
         },
         config=_cfg("jev-sc2"),
     )
-    assert len(fake.calls) == 1
+    # One judge client, two closed sets: the track Choice first, then the
+    # grounded turn's 检索档 Choice over ``A|graph|global|D``.
+    assert [call["question_id"] for call in fake.calls] == [
+        "track",
+        "search_mode",
+    ]
+    assert fake.calls[1]["options"] == ["A", "graph", "global", "D"]
     assert out["track"] == "grounded"
     assert out["track_decision"]["decision_tier"] == "jev"
+    assert out["search_mode_decision"]["search_mode"] == "graph"
     # The research leaf ran with tools: the served read_file produced a
     # citation and no bounce marker entered the transcript.
     assert len(out["citations"]) >= 1

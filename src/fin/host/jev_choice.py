@@ -15,6 +15,22 @@ The exits are public wire tokens (same convention as
                     finite [0, 1]
     invalid_label   the returned label is not in the caller's closed set
 
+A gray-zone tier also records exits the client never raises, and they
+belong to the same family because they land in the same ``*_jev_exit``
+audit slot and mean the same thing (nothing was decided)::
+
+    no_jev_client           the tier was reached with no client to ask
+    low_confidence          the judge answered under the confidence floor
+    unexpected_error        a non-typed throw, contained at the boundary
+    invalid_search_mode     the 档 lane's judge named a label its 档 SSOT
+                            cannot map (the retrieve side spells the same
+                            token for its own invalid-selector failure —
+                            shared spelling, separate facts)
+
+Those four are authored by the cascades, both of which already import
+this module, so the names are exported here rather than re-spelled per
+lane.
+
 Invalid *inputs* (empty options, duplicate options, blank utterance) are
 programming errors at this boundary and raise ``ValueError``, not a
 typed exit: a typed exit describes a judge fact, and the judge was
@@ -36,6 +52,10 @@ from fin.host.jev_config import JevConfig, load_jev_config
 JEV_CHOICE_EXIT_TRANSPORT: Final[str] = "transport"
 JEV_CHOICE_EXIT_SCHEMA: Final[str] = "schema"
 JEV_CHOICE_EXIT_INVALID_LABEL: Final[str] = "invalid_label"
+JEV_CHOICE_EXIT_NO_JEV_CLIENT: Final[str] = "no_jev_client"
+JEV_CHOICE_EXIT_LOW_CONFIDENCE: Final[str] = "low_confidence"
+JEV_CHOICE_EXIT_UNEXPECTED_ERROR: Final[str] = "unexpected_error"
+JEV_CHOICE_EXIT_INVALID_SEARCH_MODE: Final[str] = "invalid_search_mode"
 
 DEFAULT_JEV_CHOICE_INSTRUCTIONS: Final[str] = (
     "Choose exactly one option that best fits the state."
@@ -228,8 +248,12 @@ def build_jev_client(
 __all__ = [
     "DEFAULT_JEV_CHOICE_INSTRUCTIONS",
     "JEV_CHOICE_EXIT_INVALID_LABEL",
+    "JEV_CHOICE_EXIT_INVALID_SEARCH_MODE",
+    "JEV_CHOICE_EXIT_LOW_CONFIDENCE",
+    "JEV_CHOICE_EXIT_NO_JEV_CLIENT",
     "JEV_CHOICE_EXIT_SCHEMA",
     "JEV_CHOICE_EXIT_TRANSPORT",
+    "JEV_CHOICE_EXIT_UNEXPECTED_ERROR",
     "JevChoice",
     "JevChoiceClient",
     "JevChoiceError",
