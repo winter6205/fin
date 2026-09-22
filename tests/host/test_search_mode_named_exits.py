@@ -159,18 +159,21 @@ def test_an_open_tier_send_still_meets_the_concurrent_run_409(
     assert r.json() == {"error": "concurrent_run"}
 
 
+@pytest.mark.parametrize("tier", ["C", "global"])
 def test_an_unopened_tier_is_named_before_the_concurrent_run_409(
-    client: TestClient, store, locked_graph
+    tier: str, client: TestClient, store, locked_graph
 ) -> None:
     """Exit ORDER on the concurrency seam: the routing-time 400 「档未开」
     fires BEFORE the lock probe — telling the operator to wait for the
     in-flight run would be wrong advice for a 档 this product has not
-    opened, and retrying after the run ends answers the same 400."""
+    opened, and retrying after the run ends answers the same 400. Both
+    spellings of 综述 (the retired letter and the lasting token) take
+    that exit; neither starts a run."""
     thread_id = store.create_thread(title="existing").id
 
     r = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": "q", "tiers": ["C"]},
+        json={"question": "q", "tiers": [tier]},
     )
 
     assert r.status_code == 400, r.text

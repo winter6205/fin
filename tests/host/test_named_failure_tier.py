@@ -1,4 +1,4 @@
-"""C 综述 / D 真数据库 未开未接 是具名失败, 不是文档检索 (T6, spec SC9).
+"""global 综述 / D 真数据库 未开未接 是具名失败, 不是文档检索 (T6, spec SC9).
 
 SC9: "C and D remain unused: if invoked, named 未开/未接, no fake SQL
 retrieve." The wayfinder doc (闭环与分档 §1) fixes both halves of the
@@ -17,10 +17,11 @@ new 409 token would be reported to the operator as 「还有一轮在运行」,
 a false claim (``web/src/api.ts`` sendConflictError).
 
 So this ticket implements the smallest honest surface: the send door
-accepts an explicit 档 selector and refuses a named C/D BEFORE the run
-starts, with the typed-JSON body every other workspace refusal uses.
+accepts an explicit 档 selector and refuses a named 综述/真数据库 BEFORE
+the run starts, with the typed-JSON body every other workspace refusal
+uses.
 No classifier is built — a request that merely TALKS about summaries
-or a real database is not evidence that C/D was invoked, and guessing
+or a real database is not evidence that the 档 was invoked, and guessing
 would be the 开放业务意图桶 the doc forbids.
 
 A is 查找, which the same doc leaves openable on the default stack; it
@@ -102,9 +103,13 @@ def test_no_requested_tier_is_not_a_tier_refusal() -> None:
     assert unavailable_tier(()) is None
 
 
-@pytest.mark.parametrize("tier", ["C", "c"])
+@pytest.mark.parametrize("tier", ["C", "c", "global", "GLOBAL", " global "])
 def test_a_requested_review_tier_is_unavailable(tier: str) -> None:
-    assert unavailable_tier([tier]) == "C"
+    """The refusal is looked up by the LASTING token, so the lowercase
+    ``global`` a client may now send names itself — an upper-cased
+    comparison against the table can never match it, and the send would
+    have fallen through to an ordinary run dressed as 综述."""
+    assert unavailable_tier([tier]) == "global"
 
 
 @pytest.mark.parametrize("tier", ["D", "d"])
@@ -112,10 +117,10 @@ def test_a_requested_real_db_tier_is_unavailable(tier: str) -> None:
     assert unavailable_tier([tier]) == "D"
 
 
-@pytest.mark.parametrize("tier", ["A", "B"])
+@pytest.mark.parametrize("tier", ["A", "a", "B", "b", "graph", "GRAPH"])
 def test_the_open_tiers_are_not_refused(tier: str) -> None:
-    """A 查找 and B 知识问答 are the 阶段一 path; naming them is not a
-    failure."""
+    """查找 and 知识问答 (retired letter or lasting token alike) are the
+    阶段一 path; naming them is not a failure."""
     assert unavailable_tier([tier]) is None
 
 
@@ -235,6 +240,25 @@ def test_naming_tier_c_refuses_tier_not_open(
     assert r.json() == {"error": TIER_NOT_OPEN}
 
 
+def test_naming_the_lasting_global_token_refuses_tier_not_open(
+    client: TestClient, store, graph
+) -> None:
+    """The send door takes the LASTING token: a lowercase ``global`` pin
+    is 档未开 too, and the run never starts (it is not silently served by
+    the default 档)."""
+    thread_id = _new_thread(client)
+
+    r = client.post(
+        f"/api/threads/{thread_id}/messages",
+        json={"question": "Summarize the filings", "tiers": ["global"]},
+    )
+
+    assert r.status_code == 400, r.text
+    assert r.json() == {"error": TIER_NOT_OPEN}
+    detail = client.get(f"/api/threads/{thread_id}").json()
+    assert detail["turns"] == []
+
+
 def test_naming_tier_d_refuses_real_db_not_wired(
     client: TestClient, store, graph
 ) -> None:
@@ -288,18 +312,21 @@ def test_the_refusal_happens_before_any_run_starts(
     assert detail["turns"] == []
 
 
+@pytest.mark.parametrize("tier", ["B", "graph", "A"])
 def test_naming_an_open_tier_does_not_refuse(
-    client: TestClient, store, graph
+    tier: str, client: TestClient, store, graph
 ) -> None:
-    """A/B ride the ordinary send path (the run, not a refusal)."""
+    """查找 and 知识问答 ride the ordinary send path (the run, not a
+    refusal), whether the 档 arrives as its lasting token or as the
+    retired letter an old client still sends."""
     thread_id = _new_thread(client)
 
     r = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": "What was AAPL net sales in 2023 Q3?", "tiers": ["B"]},
+        json={"question": "What was AAPL net sales in 2023 Q3?", "tiers": [tier]},
     )
 
-    assert r.status_code == 200
+    assert r.status_code == 200, r.text
 
 
 def test_a_send_without_a_tier_selector_is_unchanged(

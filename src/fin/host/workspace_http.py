@@ -226,6 +226,7 @@ from fin.host.memory_port import build_memory_port
 from fin.host.named_failures import (
     RetrieveTier,
     TIER_UNAVAILABLE_CODE,
+    normalize_tier_token,
     unavailable_tier,
 )
 from fin.host.observability import (
@@ -643,7 +644,7 @@ class SendMessageRequest(BaseModel):
     attachment_ids: list[str] = Field(default_factory=list)
     # T6 (spec SC9): the explicit 检索档 selector. Empty (the default)
     # is the ordinary send — the model resolves the track as it always
-    # has. A caller that NAMES an unimplemented 档 (C 综述 / D 真数据
+    # has. A caller that NAMES an unimplemented 档 (global 综述 / D 真数据
     # 库) gets the named 400 BEFORE any run starts; the product never
     # opens a document retrieve dressed as SQL, and never guesses a 档
     # from the question prose (the wayfinder doc forbids an open-ended
@@ -652,6 +653,9 @@ class SendMessageRequest(BaseModel):
     # derived from ``fin.host.named_failures.RETRIEVE_TIERS`` (via
     # ``RetrieveTier``) rather than re-spelled here, so a 档 added to
     # the SSOT cannot leave this schema silently accepting the old set.
+    # A retired spelling still arrives here (old clients); it is resolved
+    # to its lasting token before anything reads the pin, never forwarded
+    # onward as a letter.
     tiers: list[RetrieveTier] = Field(default_factory=list)
     # search-mode host T4 (HTTP surface): an explicit Fast 抽图 PROPOSE
     # request. The send seeds the run's ``extract_method_proposal``
@@ -2254,7 +2258,7 @@ def build_router(
         # probe, before any side effect, and long before a retrieve
         # could be dressed up as the tier the operator asked for. The
         # code is named per 档 (综述未开 / 真库未接), never collapsed
-        # into one token; A/B fall through to the ordinary run because
+        # into one token; A/graph fall through to the ordinary run because
         # 查找 is openable on the default stack today.
         requested_tier = unavailable_tier(body.tiers)
         if requested_tier is not None:
@@ -2415,9 +2419,14 @@ def build_router(
         # the named 400 above; a multi-select names nothing (the
         # ordinary cascade decides, same as an empty selector today).
         # The pin rides the run CONFIG, never the checkpointed state, so
-        # a follow-up send cannot inherit it.
+        # a follow-up send cannot inherit it. The value is normalized at
+        # this seam, not downstream: a request that pinned a retired
+        # letter must carry its lasting token into the cascade and on to
+        # the port, which validates wire tokens exactly.
         if len(body.tiers) == 1:
-            config["configurable"]["pinned_search_mode"] = body.tiers[0]
+            pinned = normalize_tier_token(body.tiers[0])
+            assert pinned is not None  # ``tiers`` is the closed enum
+            config["configurable"]["pinned_search_mode"] = pinned
         thinking_type = "adaptive" if body.thinking else "disabled"
         if not body.thinking:
             # T3 (#34): the operator's thinking preference rides the
