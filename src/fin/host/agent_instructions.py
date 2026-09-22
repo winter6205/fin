@@ -200,40 +200,79 @@ CLARIFY_SYSTEM_PROMPT: str = (
 # tell which mode a call ran under.
 SEARCH_MODE_INSTRUCTIONS_MARKER: str = "[FIN_SEARCH_MODE]"
 
+# One body per 档, bound by name: a former letter and its lasting token
+# must resolve the SAME text, because two bodies would teach the model two
+# different tokens for one 档 (and let them drift). Operator labels stay
+# 查找 / 知识问答 / 综述 / 真数据库 — only the MCP token is named here.
+_USAGE_LEXICAL: str = (
+    f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
+    "检索档 A 查找 (lexical-first): retrieve answers with "
+    "keyword-first matches over the corpus. Query retrieve "
+    "with the operator's own keywords, open a hit with "
+    "read_file before quoting it. If the exact keywords miss, "
+    "rephrase them once, then tell the operator plainly that "
+    "the 资料 has no lexical hit."
+)
+
+_USAGE_KNOWLEDGE_QA: str = (
+    f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
+    "检索档 graph 知识问答 (graph-priority; send it as MCP "
+    "filters.search_mode=graph): retrieve walks the "
+    "iknow graph neighborhoods first, then fills with vector "
+    "and BM25 passages. Ask retrieve the question as phrased; "
+    "quote only page text this run returned — graph relations "
+    "are not citable evidence."
+)
+
+_USAGE_REVIEW: str = (
+    f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
+    "检索档 global 综述 (report synthesis; send it as MCP "
+    "filters.search_mode=global): retrieve draws on "
+    "community summaries and report text prepared at index "
+    "time, then drops to windows for exact spans when needed. "
+    "Assemble the answer from report text this run returned "
+    "and keep quoted spans verbatim."
+)
+
+_USAGE_REAL_DB: str = (
+    f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
+    "检索档 D 真数据库: the ask targets business data, not the "
+    "filings corpus. Route figures through the real-DB path; "
+    "when it is not wired, report the 真库未接 named failure. "
+    "Document tables in this corpus stay on the graph 档 "
+    "(MCP filters.search_mode=graph), never on this one."
+)
+
+# ``B`` / ``C`` remain keys for one increment only: the cascade, the pin
+# and the choice-window ids still hand those letters to the lookup below,
+# and a turn that asks for its copy must get it (normalize retiring the
+# letters is the next step, and then these two keys go with them).
 SEARCH_MODE_USAGE_COPY: dict[str, str] = {
-    "A": (
-        f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
-        "检索档 A 查找 (lexical-first): retrieve answers with "
-        "keyword-first matches over the corpus. Query retrieve "
-        "with the operator's own keywords, open a hit with "
-        "read_file before quoting it. If the exact keywords miss, "
-        "rephrase them once, then tell the operator plainly that "
-        "the 资料 has no lexical hit."
-    ),
-    "B": (
-        f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
-        "检索档 B 知识问答 (graph-priority): retrieve walks the "
-        "iknow graph neighborhoods first, then fills with vector "
-        "and BM25 passages. Ask retrieve the question as phrased; "
-        "quote only page text this run returned — graph relations "
-        "are not citable evidence."
-    ),
-    "C": (
-        f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
-        "检索档 C 综述 (report synthesis): retrieve draws on "
-        "community summaries and report text prepared at index "
-        "time, then drops to windows for exact spans when needed. "
-        "Assemble the answer from report text this run returned "
-        "and keep quoted spans verbatim."
-    ),
-    "D": (
-        f"{SEARCH_MODE_INSTRUCTIONS_MARKER}\n"
-        "检索档 D 真数据库: the ask targets business data, not the "
-        "filings corpus. Route figures through the real-DB path; "
-        "when it is not wired, report the 真库未接 named failure. "
-        "Document tables in this corpus stay on 档 B."
-    ),
+    "A": _USAGE_LEXICAL,
+    "graph": _USAGE_KNOWLEDGE_QA,
+    "B": _USAGE_KNOWLEDGE_QA,
+    "global": _USAGE_REVIEW,
+    "C": _USAGE_REVIEW,
+    "D": _USAGE_REAL_DB,
 }
+
+
+def _usage_copy_for(search_mode: object) -> str | None:
+    """The 档 copy keyed by THIS turn's token, or ``None`` for no copy.
+
+    Exact match first: ``graph`` / ``global`` are lowercase words, so an
+    unconditional ``upper()`` would swallow every one of them. The
+    upper-cased retry stays behind it because the letters have always been
+    fed in mixed case (pin text, choice-window picks) and are still what
+    the cascade produces this increment.
+    """
+    if not isinstance(search_mode, str):
+        return None
+    token = search_mode.strip()
+    return SEARCH_MODE_USAGE_COPY.get(token) or SEARCH_MODE_USAGE_COPY.get(
+        token.upper()
+    )
+
 
 # Operator-facing ask per slot the clarify track can be missing.
 # A slot absent from this map is never named in the prompt: the
@@ -412,9 +451,7 @@ def messages_for_model(
     else:
         result = _append_memory_pointer(existing)
 
-    mode_block = SEARCH_MODE_USAGE_COPY.get(
-        search_mode.strip().upper() if isinstance(search_mode, str) else ""
-    )
+    mode_block = _usage_copy_for(search_mode)
     if mode_block is None:
         return result
     return _append_block_to_head(

@@ -45,10 +45,82 @@ def test_tiers_module_exists_with_the_closed_set() -> None:
         TIER_UNAVAILABLE_CODE,
     )
 
-    assert RETRIEVE_TIERS == ("A", "B", "C", "D")
+    assert RETRIEVE_TIERS == ("A", "B", "C", "D", "graph", "global")
     assert TIER_NOT_OPEN == "tier_not_open"
     assert REAL_DB_NOT_WIRED == "real_db_not_wired"
-    assert TIER_UNAVAILABLE_CODE == {"C": "tier_not_open", "D": "real_db_not_wired"}
+    assert TIER_UNAVAILABLE_CODE == {
+        "C": "tier_not_open",
+        "global": "tier_not_open",
+        "D": "real_db_not_wired",
+    }
+
+
+# ----- 1b. the lasting tokens sit BESIDE the letters this increment -----
+
+
+def test_the_former_letters_are_still_members() -> None:
+    """The rename ships in two increments: normalize (the next bullet)
+    has to retire ``B``/``C``, so removing them here would break the
+    surfaces that still produce them."""
+    from fin.retrieve.tiers import RETRIEVE_TIERS
+
+    for letter in ("B", "C"):
+        assert letter in RETRIEVE_TIERS
+
+
+def test_graph_is_an_open_tier_and_global_is_not() -> None:
+    """``graph`` 知识问答 is today's default 档, so it must carry no
+    「未开」code; ``global`` 综述 is still a plan slot, so naming it is
+    档未开 — never an empty success."""
+    from fin.retrieve.port import TierUnavailableError, resolve_search_mode
+    from fin.retrieve.tiers import TIER_UNAVAILABLE_CODE
+
+    assert "graph" not in TIER_UNAVAILABLE_CODE
+    assert resolve_search_mode("graph") == "graph"
+
+    try:
+        resolve_search_mode("global")
+    except TierUnavailableError as exc:
+        assert exc.code == "tier_not_open"
+    else:
+        raise AssertionError("global accepted as an open 档")
+
+
+def test_the_letters_route_exactly_as_before() -> None:
+    """A superset must not move an existing exit: ``B`` stays open and
+    ``C``/``D`` keep their own「未开」codes."""
+    from fin.retrieve.port import TierUnavailableError, resolve_search_mode
+
+    assert resolve_search_mode("A") == "A"
+    assert resolve_search_mode("B") == "B"
+    assert resolve_search_mode(None) is None
+
+    for token, code in (
+        ("C", "tier_not_open"),
+        ("D", "real_db_not_wired"),
+    ):
+        try:
+            resolve_search_mode(token)
+        except TierUnavailableError as exc:
+            assert exc.code == code, token
+        else:
+            raise AssertionError(f"{token} accepted as an open 档")
+
+
+def test_an_unknown_token_stays_unknown_after_the_rename() -> None:
+    """Negative class: adding ``graph``/``global`` must not turn every
+    non-token into a 档. An unknown token — including the upper-cased
+    spelling of a lasting token — is ``invalid_search_mode``, not a
+    silent map onto ``graph`` or ``global``."""
+    from fin.retrieve.port import InvalidSearchModeError, resolve_search_mode
+
+    for token in ("local", "", "hybrid", "GRAPH", "Global", "b"):
+        try:
+            resolve_search_mode(token)
+        except InvalidSearchModeError as exc:
+            assert exc.code == "invalid_search_mode"
+        else:
+            raise AssertionError(f"{token!r} accepted by the closed set")
 
 
 def test_tiers_module_is_public_via_dunder_all() -> None:

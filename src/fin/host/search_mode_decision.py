@@ -184,10 +184,15 @@ class SearchModeDecision:
 def clarify_options() -> list[dict[str, Any]]:
     """The structured option list for the choice window (Ticket 2).
 
-    All four 档 are listed (spec: C/D may be present but marked
-    unopened); ``opened`` reads the ``TIER_UNAVAILABLE_CODE`` SSOT so a
-    newly opened 档 flips here and nowhere else.
+    Every 档 the operator can READ is listed (spec: an unopened one may
+    appear, marked as such); ``opened`` reads the
+    ``TIER_UNAVAILABLE_CODE`` SSOT so a newly opened 档 flips here and
+    nowhere else.
     """
+    # The closed set can already carry a lasting token that the label map
+    # has not adopted yet (the rename lands in the labels one increment
+    # later). An option with no label is not a choice an operator can
+    # make, so the window follows the label map and nothing else.
     return [
         {
             "id": mode,
@@ -195,6 +200,7 @@ def clarify_options() -> list[dict[str, Any]]:
             "opened": mode not in TIER_UNAVAILABLE_CODE,
         }
         for mode in RETRIEVE_TIERS
+        if mode in MODE_LABELS
     ]
 
 
