@@ -20,17 +20,29 @@ builds an OFF memory port even when the operator ``.env`` has
 ``FIN_MEMORY_ENABLED=true``. Memory cases opt back in via the
 ``@pytest.mark.memory_on`` marker + ``memory_on_env`` fixture in
 ``tests/host/conftest.py``.
+
+The live-Jev gate lives here too (``jev_live_key_missing`` →
+:func:`build_jev_live_client` → the ``jev_live_client`` fixture → the
+``jev_live`` deselection hook): the ``jev_live`` suites are spread over
+``tests/host/`` and ``tests/retrieve/``, so a per-directory conftest could
+not serve both without a second copy of the skip-vs-fail semantics — and
+two copies of a gate drift.
 """
 
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Final
 
 import pytest
 
 from fin.corpus.catalog import record_filings
+from fin.host.jev_choice import JevChoiceClient, build_jev_client
 from fin.host.operator_env import apply_dotenv
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Load the operator ``.env`` (``FIN_CHECKPOINT_URL`` &c.) before any
 # fixture reads ``os.environ``, so Postgres-backed tests are not
@@ -143,3 +155,70 @@ def multi_form_corpus(tmp_path: Path) -> dict[str, Path]:
     record_filings(rows, catalog_path=catalog_path)
 
     return {"catalog_path": catalog_path}
+
+
+# ----- live Jev Choice gate (shared by every ``jev_live`` suite) -----
+
+JEV_LIVE_KEY_MISSING: Final[str] = "jev_live_key_missing"
+
+
+def build_jev_live_client(environ: Mapping[str, str]) -> JevChoiceClient:
+    """Build the real client or name the missing credential as a FAIL.
+
+    Single source for every live suite on purpose: skip-vs-fail is gate
+    semantics, and two copies of it drift. A missing key is a blocking
+    named failure (``jev_live_key_missing``, non-zero exit), never a green
+    skip — a Fake pass does not count as live evidence (ADR 0080 / test
+    rule 7), and neither does an absent credential.
+    """
+    client = build_jev_client(environ=environ)
+    if client is None:
+        pytest.fail(
+            f"{JEV_LIVE_KEY_MISSING}: set FIN_JEV_API_KEY in the repo .env",
+            pytrace=False,
+        )
+    assert client is not None  # for type checkers; pytest.fail raises
+    return client
+
+
+@pytest.fixture(scope="module")
+def jev_live_client() -> JevChoiceClient:
+    """The live client for one ``jev_live`` module.
+
+    This file strips the Jev env at session start, so this re-applies
+    ``apply_dotenv`` exactly like the product boot (``fin-serve``) does
+    before building the client — the same
+    :func:`fin.host.jev_choice.build_jev_client` the product cascade uses.
+    """
+    apply_dotenv(start=REPO_ROOT)
+    return build_jev_live_client(os.environ)
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Deselect ``jev_live`` items unless the CLI ``-m`` names that mark.
+
+    The ADR 0080 live Jev Choice round-trip talks to ``api.typesafe.ai``,
+    so the default hermetic run must not reach it — and the mark appears in
+    more than one test directory, which is why the switch is here rather
+    than in a per-directory hook. Register-style: a CLI ``-m jev_live`` (or
+    any expression naming the mark) re-selects them. Other opt-in marks are
+    owned by the directory that uses them.
+    """
+    markexpr = config.getoption("markexpr") or ""
+    if "jev_live" in markexpr:
+        return
+
+    kept: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        if item.get_closest_marker("jev_live") is not None:
+            deselected.append(item)
+        else:
+            kept.append(item)
+
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = kept
+

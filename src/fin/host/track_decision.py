@@ -31,7 +31,13 @@ from typing import Any, Literal, Protocol
 
 from langchain_core.messages import BaseMessage, HumanMessage
 
-from fin.host.jev_choice import JevChoice, JevChoiceError
+from fin.host.jev_choice import (
+    JEV_CHOICE_EXIT_LOW_CONFIDENCE,
+    JEV_CHOICE_EXIT_NO_JEV_CLIENT,
+    JEV_CHOICE_EXIT_UNEXPECTED_ERROR,
+    JevChoice,
+    JevChoiceError,
+)
 
 Track = Literal["dialogue", "clarify", "off_topic", "grounded"]
 
@@ -390,7 +396,7 @@ def _try_jev_classify(
     utterance the judge was supposed to decide.
     """
     if jev_client is None:
-        signals["jev_exit"] = "no_jev_client"
+        signals["jev_exit"] = JEV_CHOICE_EXIT_NO_JEV_CLIENT
         return _gray_zone_clarify(signals)
     try:
         choice = jev_client.choose(
@@ -403,7 +409,7 @@ def _try_jev_classify(
         signals["jev_exit"] = exc.exit_code
         return _gray_zone_clarify(signals)
     except Exception as exc:  # noqa: BLE001 — fail-closed at the cascade boundary
-        signals["jev_exit"] = "unexpected_error"
+        signals["jev_exit"] = JEV_CHOICE_EXIT_UNEXPECTED_ERROR
         signals["jev_error_type"] = type(exc).__name__
         return _gray_zone_clarify(signals)
 
@@ -412,7 +418,7 @@ def _try_jev_classify(
     signals["jev_label"] = choice.label
     signals["jev_confidence"] = choice.confidence
     if choice.confidence < _MIN_JEV_CONFIDENCE:
-        signals["jev_exit"] = "low_confidence"
+        signals["jev_exit"] = JEV_CHOICE_EXIT_LOW_CONFIDENCE
         return _gray_zone_clarify(signals, confidence=choice.confidence)
     return TrackDecision(
         track=choice.label,  # type: ignore[arg-type]

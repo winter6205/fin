@@ -16,13 +16,20 @@ Tier order (no silent default — the residual never names global):
    scanned for bare 档 words (``fin.host.named_failures`` T6 note). A name
    that cannot resolve uniquely (two different 档 named) stays ambiguous
    and falls through.
-2. **llm** — structured classify, only when rules miss **and** inherit
-   would not already decide (the same peek shape as ``decide_track``, so
-   a production classify model cannot steal an inherited 档). JSON names
-   exactly one of ``A|graph|global|D``. Typed EXITs
-   (``invalid_search_mode`` / ``schema_parse`` / ``model_error`` /
-   ``low_confidence``) record ``signals["classify_exit"]`` and fall
-   through: never a crash, never a silent-open global.
+2. **jev** — one closed-set TypeSafe Choice over the lasting 档 tokens,
+   only when rules miss **and** inherit would not already decide (the
+   same peek shape as ``decide_track``, so a judge answer cannot steal an
+   inherited 档). Fail-closed: a missing client, a typed
+   ``JevChoiceError``, an unexpected throw, an unmappable label or
+   sub-floor confidence all record ``signals["mode_jev_exit"]`` and fall
+   through — never a crash, never a silent-open global. A key-less boot is
+   named ``no_jev_client`` rather than left as a silent branch, exactly as
+   ``decide_track`` names its own gray zone; like every other EXIT it says
+   nothing was decided, and no label or confidence is written beside it.
+   The judge's keys carry the ``mode_`` prefix for human-readable
+   attribution in merged logs — the two ``signals`` dicts land in separate
+   audit rows (``track_decision`` / ``search_mode_decision``) and are never
+   merged.
 3. **inherit** — a short follow-up on the same thread that stays in the
    same retrieve job (latest status snapshot still has research context;
    no company-change wipe since the last assigned 档) reuses that 档.
@@ -39,15 +46,20 @@ a 档 and does not fall through to a different one.
 
 from __future__ import annotations
 
-import json
-import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import BaseMessage
 
+from fin.host.jev_choice import (
+    JEV_CHOICE_EXIT_INVALID_SEARCH_MODE,
+    JEV_CHOICE_EXIT_LOW_CONFIDENCE,
+    JEV_CHOICE_EXIT_NO_JEV_CLIENT,
+    JEV_CHOICE_EXIT_UNEXPECTED_ERROR,
+    JevChoiceError,
+)
 # The 档 SSOT (closed set + per-档 availability codes) is reused, not
 # re-enumerated; ``named_failures`` is the host-side import surface for
 # both (see its module docstring).
@@ -59,28 +71,21 @@ from fin.host.named_failures import (
     normalize_tier_token,
 )
 # Package-internal reuse of the Soft-Track cascade primitives (utterance
-# extraction, latest-snapshot context, company-change detection): SSOT
-# over duplication — these are the exact predicates ``decide_track``'s
-# inherit tier uses.
+# extraction, latest-snapshot context, company-change detection), of its
+# gray-zone seam type and of its confidence floor: SSOT over duplication
+# — these are the exact predicates ``decide_track``'s inherit tier uses,
+# the exact client shape its judge is injected with, and the one floor
+# below which a Choice is a typed EXIT rather than a decision (both
+# judges are the same gray-zone mechanism, so the bar cannot drift).
 from fin.host.track_decision import (
+    _MIN_JEV_CONFIDENCE,
+    JevChoiceProvider,
     _company_changed,
     _last_human_text,
     _latest_snapshot,
     _normalize_company,
     _snapshot_has_research_context,
 )
-
-
-def _message_text(message: Any) -> str:
-    if isinstance(message, AIMessage):
-        content = message.content
-        if isinstance(content, str):
-            return content
-        return str(content)
-    content = getattr(message, "content", None)
-    if isinstance(content, str):
-        return content
-    return str(message)
 
 
 # A 档 is NOT a fifth track: ``SearchMode`` is the retrieve-tier token
@@ -97,7 +102,7 @@ SearchMode = RetrieveTier
 # pick outranks the cascade, so it must be distinguishable from
 # ``rules`` on the audit.
 SearchModeDecisionTier = Literal[
-    "rules", "llm", "inherit", "clarify", "typed_fail", "operator_pick"
+    "rules", "jev", "inherit", "clarify", "typed_fail", "operator_pick"
 ]
 
 # Operator-visible labels (CONTEXT terms). Aliased, not re-spelled: the
@@ -107,19 +112,49 @@ MODE_LABELS: dict[str, str] = TIER_LABELS
 
 _LABEL_TO_MODE: dict[str, str] = {label: mode for mode, label in MODE_LABELS.items()}
 
-# Same floor as the track classifier: a below-floor classify is a typed
-# EXIT, not a decision.
-_MIN_CLASSIFY_CONFIDENCE = 0.6
-
 # Inherit follows up on SHORT text only (mirrors ``decide_track``'s
 # 48-char inherit heuristic — same shape, same reason: a long ask is its
 # own question, not a continuation).
 _INHERIT_MAX_LEN = 48
 
-_CLASSIFY_SYSTEM = (
-    "Classify this grounded knowledge question into exactly one 检索档. "
-    'Reply with JSON only: {"search_mode": "A"|"graph"|"global"|"D"} '
-    "where A 查找, graph 知识问答, global 综述, D 真数据库."
+# The judge is taught the operator labels AND what separates the 档: a bare
+# ``token + label`` pair is not a discriminator. Shipping one cost the live
+# judge its only opened 档 — ``D 真数据库`` reads like the natural home for
+# any question about a financial figure, while the spec keeps a figure that
+# lives only in a filing on 知识问答 (``graph``), so the label alone pulled
+# the grounded asks that this tier exists to decide onto an unopened 档.
+# Each gloss is therefore the boundary case it settles, not a restatement of
+# the label. Keyed by the lasting tokens and indexed (never ``.get``): a 档
+# added to ``LASTING_RETRIEVE_TIERS`` without its discriminator is a loud
+# KeyError at composition, named by the hermetic pin in
+# ``tests/host/test_search_mode_gray_zone_jev.py``.
+_JEV_MODE_TIER_GLOSSES: dict[str, str] = {
+    "A": "an exact-string or single-known-field lookup in the filed documents",
+    "graph": (
+        "a knowledge question answered from the filed documents, including "
+        "any figure that only lives in a filing (revenue, net sales, gross "
+        "margin, growth)"
+    ),
+    "global": (
+        "a synthesis that has to span many filings at once — across issuers, "
+        "or across many reporting periods — because no single document "
+        "answers it (a summary of one document is a knowledge question)"
+    ),
+    "D": (
+        "a number that must come from a live business database or SQL table "
+        "rather than from any document"
+    ),
+}
+
+_JEV_MODE_INSTRUCTIONS: str = (
+    "Classify this grounded knowledge question into exactly one 检索档 "
+    "(retrieve tier), where "
+    + "; ".join(
+        f"{mode} {MODE_LABELS[mode]} = {_JEV_MODE_TIER_GLOSSES[mode]}"
+        for mode in LASTING_RETRIEVE_TIERS
+        if mode in MODE_LABELS
+    )
+    + ". Answer with the token alone."
 )
 
 # A 档 is NAMED (high-confidence) only next to the 档 marker — a lasting
@@ -133,7 +168,7 @@ _TIER_NAMING_RE = re.compile(
 
 
 def normalize_search_mode(raw: object) -> SearchMode | None:
-    """Map a wire/classify/pin/pick token onto the lasting 档 tokens.
+    """Map a wire/judge/pin/pick token onto the lasting 档 tokens.
 
     The alias map is :mod:`fin.retrieve.tiers`' — this is the host-side
     call of the same total function, kept as the name the cascade and the
@@ -220,9 +255,12 @@ def _assign_or_typed_fail(
     signals: dict[str, Any],
     *,
     confidence: float,
+    tier: SearchModeDecisionTier = "rules",
 ) -> SearchModeDecision:
     """Name resolved: open 档 assigns, unopened 档 is 具名失败 — the
-    cascade never invents a substitute 档 for the request."""
+    cascade never invents a substitute 档 for the request. The ``tier``
+    records WHO named it (rules vs the judge) so the audit stays honest
+    about the decision's origin."""
     search_mode = normalize_search_mode(mode)
     assert search_mode is not None  # callers resolve before calling
     code = TIER_UNAVAILABLE_CODE.get(search_mode)
@@ -239,7 +277,7 @@ def _assign_or_typed_fail(
     return SearchModeDecision(
         search_mode=search_mode,
         confidence=confidence,
-        decision_tier="rules",
+        decision_tier=tier,
         signals=signals,
     )
 
@@ -268,7 +306,7 @@ def _rules_decision(
         return _assign_or_typed_fail(named[0], signals, confidence=0.9)
     if len(named) > 1:
         # "A档还是B档?" cannot be resolved by confidence at all: ambiguous
-        # by construction, so rules abstain (classify / clarify decide).
+        # by construction, so rules abstain (the judge / clarify decide).
         signals["ambiguous_naming"] = named
     return None
 
@@ -323,69 +361,66 @@ def _inherit_decision(
     )
 
 
-def _try_classify(
+def _try_jev_decide(
     text: str,
-    classify_model: Any,
+    jev_client: JevChoiceProvider | None,
     signals: dict[str, Any],
 ) -> SearchModeDecision | None:
-    """Attempt the structured search-mode classify. On any typed EXIT,
-    record ``classify_exit`` and return ``None`` so the cascade falls
-    through — a failed classify must neither crash nor open global."""
+    """Attempt the gray-zone 档 Choice. On any typed EXIT, record
+    ``mode_jev_exit`` and return ``None`` so the cascade falls through to
+    inherit / clarify — a failed judge must neither crash the run nor
+    open global.
+
+    An absent client is one of those EXITs (``no_jev_client``), mirroring
+    ``decide_track``'s gray-zone tier: a key-less boot still reaches this
+    tier, and a 具名失败 on the audit row beats a silent branch. The EXIT
+    is the only thing written — no label, no confidence, because nothing
+    was asked.
+    """
+    if jev_client is None:
+        signals["mode_jev_exit"] = JEV_CHOICE_EXIT_NO_JEV_CLIENT
+        return None
     try:
-        raw = classify_model.invoke(
-            [
-                SystemMessage(content=_CLASSIFY_SYSTEM),
-                HumanMessage(content=text),
-            ]
+        choice = jev_client.choose(
+            utterance=text,
+            options=LASTING_RETRIEVE_TIERS,
+            question_id="search_mode",
+            instructions=_JEV_MODE_INSTRUCTIONS,
         )
-    except Exception as exc:  # noqa: BLE001 — typed EXIT, must not crash
-        signals["classify_exit"] = "model_error"
-        signals["classify_error_type"] = type(exc).__name__
+    except JevChoiceError as exc:
+        signals["mode_jev_exit"] = exc.exit_code
+        return None
+    except Exception as exc:  # noqa: BLE001 — fail-closed at the cascade boundary
+        signals["mode_jev_exit"] = JEV_CHOICE_EXIT_UNEXPECTED_ERROR
+        signals["mode_jev_error_type"] = type(exc).__name__
         return None
 
-    payload_text = _message_text(raw).strip()
-    # Allow optional fenced JSON (same tolerance as the track classify).
-    if payload_text.startswith("```"):
-        payload_text = re.sub(r"^```(?:json)?\s*", "", payload_text)
-        payload_text = re.sub(r"\s*```$", "", payload_text)
-    try:
-        data = json.loads(payload_text)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        signals["classify_exit"] = "schema_parse"
-        return None
-
-    if not isinstance(data, dict):
-        signals["classify_exit"] = "schema_parse"
-        return None
-
-    mode = normalize_search_mode(data.get("search_mode"))
+    signals["mode_jev_label"] = choice.label
+    signals["mode_jev_confidence"] = choice.confidence
+    mode = normalize_search_mode(choice.label)
     if mode is None:
-        signals["classify_exit"] = "invalid_search_mode"
-        signals["invalid_search_mode"] = data.get("search_mode")
+        # ``normalize_search_mode`` is the SSOT total function, so a
+        # retired spelling (``B`` / ``C``) still resolves to its lasting
+        # 档 and is judged on availability like any other name; only a
+        # label it cannot map at all names nothing. The product client
+        # raises ``invalid_label`` before returning, so this arm covers a
+        # non-conforming injection too.
+        signals["mode_jev_exit"] = JEV_CHOICE_EXIT_INVALID_SEARCH_MODE
         return None
-
-    confidence = data.get("confidence", 0.7)
-    try:
-        confidence_f = float(confidence)
-    except (TypeError, ValueError):
-        confidence_f = 0.7
-    if not math.isfinite(confidence_f):
-        confidence_f = 0.0
-    confidence_f = min(max(confidence_f, 0.0), 1.0)
-
-    signals["llm_mode"] = mode
-    if confidence_f < _MIN_CLASSIFY_CONFIDENCE:
-        # An unsure name of global must not assign it either: the ban is
-        # on SILENT global, and low-confidence is precisely a silent answer.
-        signals["classify_exit"] = "low_confidence"
-        signals["low_confidence"] = True
+    if choice.confidence < _MIN_JEV_CONFIDENCE:
+        # An unsure name of an unopened 档 must not open it either: the ban
+        # is on SILENT global, and low confidence is precisely a silent
+        # answer.
+        signals["mode_jev_exit"] = JEV_CHOICE_EXIT_LOW_CONFIDENCE
         return None
     if mode in TIER_UNAVAILABLE_CODE:
-        return _assign_or_typed_fail(mode, signals, confidence=confidence_f)
+        return _assign_or_typed_fail(
+            mode, signals, confidence=choice.confidence, tier="jev"
+        )
     return SearchModeDecision(
         search_mode=mode,
-        confidence=confidence_f,
-        decision_tier="llm",
+        confidence=choice.confidence,
+        decision_tier="jev",
         signals=signals,
     )
 
@@ -394,7 +429,7 @@ def decide_search_mode(
     messages: list[BaseMessage],
     *,
     snapshots: list[Any] | None = None,
-    classify_model: Any | None = None,
+    jev_client: JevChoiceProvider | None = None,
     pinned_mode: str | None = None,
 ) -> SearchModeDecision:
     """Return the 档 decision for one grounded turn (tiered cascade).
@@ -410,18 +445,16 @@ def decide_search_mode(
     if rules_hit is not None:
         return rules_hit
 
-    # Peek inherit once before the classify call, exactly like
-    # ``decide_track``: if inherit would decide, a production
-    # classify_model must not steal the inherited 档.
+    # Peek inherit once before the judge call, exactly like
+    # ``decide_track``: if inherit would decide, a judge answer must not
+    # steal the inherited 档. The gray zone itself is entered with or
+    # without a client, again exactly like ``decide_track`` — a missing
+    # judge is named on the audit instead of falling through quietly.
     inherit_hit = _inherit_decision(text, snapshots, dict(signals))
-    if (
-        classify_model is not None
-        and text
-        and inherit_hit is None
-    ):
-        llm_hit = _try_classify(text, classify_model, signals)
-        if llm_hit is not None:
-            return llm_hit
+    if text and inherit_hit is None:
+        jev_hit = _try_jev_decide(text, jev_client, signals)
+        if jev_hit is not None:
+            return jev_hit
 
     if inherit_hit is not None:
         return inherit_hit
@@ -471,7 +504,7 @@ def search_mode_update_for_turn(
     messages: list[BaseMessage],
     *,
     snapshots: list[Any] | None = None,
-    classify_model: Any | None = None,
+    jev_client: JevChoiceProvider | None = None,
     pinned_mode: str | None = None,
 ) -> dict[str, Any]:
     """Single-call seam for the host ``classify_node`` (grounded turns).
@@ -485,7 +518,7 @@ def search_mode_update_for_turn(
     decision = decide_search_mode(
         messages,
         snapshots=snapshots,
-        classify_model=classify_model,
+        jev_client=jev_client,
         pinned_mode=pinned_mode,
     )
     return {
@@ -553,8 +586,8 @@ def apply_operator_pick(
     ``pick`` is a choice-window option id the CALLER (the graph node)
     already validated against the emitted options — an out-of-list pick
     never reaches here; the node reopens the window instead. A pick of
-    an UNOPENED 档 is the 具名失败 ``typed_fail`` (mirroring
-    :func:`_assign_or_typed_fail`): the audit names the failure and
+    an UNOPENED 档 is the 具名失败 ``typed_fail``, by way of
+    :func:`_assign_or_typed_fail` itself: the audit names the failure and
     invents no substitute mode.
 
     Returns ``{"audit": <state dict>, "snapshot_patch": [...]}`` — the
@@ -566,35 +599,21 @@ def apply_operator_pick(
     signals["resume_pick"] = pick
     if rejected:
         signals["rejected_picks"] = list(rejected)
-    mode = normalize_search_mode(pick)
-    assert mode is not None  # caller validated against the options list
-    code = TIER_UNAVAILABLE_CODE.get(mode)
-    if code is not None:
-        signals["requested_mode"] = mode
-        signals["named_failure"] = code
-        # NOT ``_assign_or_typed_fail``: that writes ``decision_tier=
-        # "rules"``, but a resume-audit typed fail must name its own
-        # origin tier (see SearchModeDecisionTier note).
-        audit = SearchModeDecision(
-            search_mode=None,
-            confidence=0.0,
-            decision_tier="typed_fail",
-            signals=signals,
-            failure_code=code,
-        ).to_state_dict()
-        return {"audit": audit, "snapshot_patch": []}
-    audit = SearchModeDecision(
-        search_mode=mode,
+    # One helper for both arms: ``_assign_or_typed_fail`` takes the
+    # ``tier`` it records, so the resume audit names its own origin
+    # (``operator_pick``) exactly as the cascade names ``rules`` / ``jev``.
+    resolved = _assign_or_typed_fail(
+        pick,
+        signals,
         confidence=1.0,  # an operator pick is certain by definition
-        decision_tier="operator_pick",
-        signals=signals,
-        options=[],  # the window data served its purpose
-        failure_code=None,
-    ).to_state_dict()
+        tier="operator_pick",
+    )
     return {
-        "audit": audit,
+        "audit": resolved.to_state_dict(),
+        # ``None`` on a typed fail, which is also the "nothing to append"
+        # answer of the patch seam — an unopened pick never rides history.
         "snapshot_patch": mode_snapshot_patch(
-            _latest_snapshot(snapshots), mode
+            _latest_snapshot(snapshots), resolved.search_mode
         ),
     }
 

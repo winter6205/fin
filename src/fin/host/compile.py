@@ -407,14 +407,14 @@ def compile_for_runtime(
     # ``PostgresSaver`` instance return the SAME proxy object.
     # That identity is what T9 will assert between the CLI
     # helper's graph and the HTTP handler's graph.
-    # Soft-Track gray zone (ADR 0080): the Jev Choice client is built
-    # here; a missing FIN_JEV_API_KEY yields ``None`` and the cascade
-    # fail-closes to clarify — no MiniMax JSON fallback. ``classify_model``
-    # stays threaded to the grounded turn's 检索档 cascade only.
+    # Soft-Track gray zone: the Jev Choice client is built here; a missing
+    # FIN_JEV_API_KEY yields ``None`` and each gray zone then fail-closes
+    # to its own residual (track ``clarify``, or the 检索档 choice
+    # window). One client serves both judges, so no second model seam is
+    # threaded.
     compiled = compile_graph(
         checkpointer=saver,
         model=model,
-        classify_model=model,
         jev_client=build_jev_client(environ=env),
         retrieve_adapter=_resolve_retrieve_adapter(env),
         # search-mode host T2 / ADR 0062: the durable PRODUCTION boot
@@ -487,14 +487,12 @@ def compile_for_runtime_dev(
         model_name=model_name, base_url=base_url, env=env
     )
     saver = InMemorySaver()
-    # Soft-Track gray zone (ADR 0080): mirror the durable path — the dev
-    # compile exercises the same Jev tier (or the same key-less
-    # fail-closed clarify). ``classify_model`` still mirrors production
-    # for the grounded turn's 检索档 cascade.
+    # Soft-Track gray zone: mirror the durable path — the dev compile
+    # exercises the same Jev tier (or the same key-less fail-closed
+    # residual).
     return compile_graph(
         checkpointer=saver,
         model=model,
-        classify_model=model,
         jev_client=build_jev_client(environ=env),
         retrieve_adapter=_resolve_retrieve_adapter(env),
     )

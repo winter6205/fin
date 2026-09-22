@@ -7,8 +7,8 @@ ADR 0080 splits the two seams:
   ``compile_for_runtime_dev`` build it via ``build_jev_client`` from the
   same env; a missing key means ``None`` and the cascade fail-closes to
   clarify (never a MiniMax JSON fallback).
-* ``classify_model`` — kept ONLY for the grounded turn's 检索档 cascade
-  (search-mode host), still reusing ``FIN_MODEL`` identity.
+* The grounded turn's 检索档 gray zone reuses that SAME client, so the
+  compile seam threads no second (MiniMax JSON) classify model at all.
 
 We mock ``compile_graph`` so the tests stay hermetic (no Postgres, no
 live LLM, no network).
@@ -105,17 +105,15 @@ def _install_fake_postgres_saver(
 
 
 @pytest.mark.soft_track
-def test_compile_for_runtime_injects_classify_model(
+def test_compile_for_runtime_threads_no_json_classify_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``compile_for_runtime`` MUST pass ``classify_model=model`` so the
-    Soft-Track LLM tier is reachable in production.
+    """``compile_for_runtime`` MUST NOT hand ``compile_graph`` a
+    ``classify_model``.
 
-    Identity (``is``), not equality — the spec rule is "reuse the
-    same model". ``compile_graph`` keys its idempotence cache on
-    ``id(classify_model)``; reusing the same object means two
-    runtime calls on the same ``FIN_MODEL`` resolve to the same
-    proxy.
+    The 检索档 gray zone is judged by the same Jev client the track
+    cascade uses; a separate MiniMax model seam would be a second,
+    silent classifier nobody asked for.
     """
     monkeypatch.delenv("FIN_MODEL", raising=False)
     monkeypatch.delenv("FIN_BASE_URL", raising=False)
@@ -142,29 +140,19 @@ def test_compile_for_runtime_injects_classify_model(
         "compile_for_runtime must call compile_graph exactly once"
     )
     call = graph_calls[0]
-    model = call["model"]
-    assert model is not None, "compile_graph must receive model="
-    # The whole point of this fix: the LLM classify model is the
-    # same object as the runtime model.
-    assert call.get("classify_model") is model, (
-        "compile_for_runtime must thread the SAME model object "
-        "through to compile_graph as classify_model= (spec "
-        "specs/soft-track.md — 'classify_model must reuse "
-        "FIN_MODEL'). Without it the LLM tier is silently "
-        "skipped in production."
+    assert call["model"] is not None, "compile_graph must receive model="
+    assert "classify_model" not in call, (
+        "the durable compile must not thread a MiniMax JSON classify "
+        "model into the 检索档 cascade."
     )
 
 
 @pytest.mark.soft_track
-def test_compile_for_runtime_dev_injects_classify_model(
+def test_compile_for_runtime_dev_threads_no_json_classify_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``compile_for_runtime_dev`` MUST also pass ``classify_model=model``.
-
-    Same contract as the durable path: the LLM tier must be
-    reachable in the in-memory dev path so dev runs exercise
-    production behavior.
-    """
+    """``compile_for_runtime_dev`` holds the same contract: the dev boot
+    exercises production's single-judge wiring, not a second model."""
     monkeypatch.delenv("FIN_MODEL", raising=False)
     monkeypatch.delenv("FIN_BASE_URL", raising=False)
     monkeypatch.delenv("FIN_API_KEY", raising=False)
@@ -183,8 +171,6 @@ def test_compile_for_runtime_dev_injects_classify_model(
         "fin.host.compile.compile_graph", _fake_compile_graph
     )
 
-    # The dev helper emits a ``warnings.warn`` on every call; the
-    # test suite is allowed to ignore that here.
     import warnings
 
     with warnings.catch_warnings():
@@ -195,12 +181,10 @@ def test_compile_for_runtime_dev_injects_classify_model(
         "compile_for_runtime_dev must call compile_graph exactly once"
     )
     call = graph_calls[0]
-    model = call["model"]
-    assert model is not None, "compile_graph must receive model="
-    assert call.get("classify_model") is model, (
-        "compile_for_runtime_dev must thread the SAME model "
-        "object through to compile_graph as classify_model= "
-        "(the search-mode 检索档 cascade uses it)."
+    assert call["model"] is not None, "compile_graph must receive model="
+    assert "classify_model" not in call, (
+        "the dev compile must not thread a MiniMax JSON classify model "
+        "into the 检索档 cascade."
     )
 
 

@@ -7,7 +7,7 @@ live LLM (mirrors ``test_soft_track_ship.py``).
 Five boundary classes (spec Boundaries "Test classes"), mapped to names:
 
 * empty      -> ``test_empty_utterance_residual_clarifies_without_inventing_c``
-* negative   -> ``test_classify_invalid_enum_is_typed_exit_not_silent_c`` /
+* negative   -> ``test_jev_label_outside_the_closed_set_is_a_typed_exit`` /
                 ``test_pin_of_unopened_tier_is_typed_fail_not_silent_c``
 * overflow   -> ``test_cascade_has_no_step_cap_of_its_own`` /
                 ``test_snapshot_inherit_does_not_wipe_history``
@@ -15,7 +15,7 @@ Five boundary classes (spec Boundaries "Test classes"), mapped to names:
                 same-thread 409 lane is HTTP-surface and already owned by
                 ``tests/host/test_search_mode_named_exits.py``; the T1
                 cascade itself is not an HTTP surface)
-* exception  -> ``test_classify_model_error_is_typed_exit_not_crash``
+* exception  -> ``test_jev_transport_error_is_a_typed_exit_not_crash``
 """
 
 from __future__ import annotations
@@ -27,6 +27,14 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.host import ScriptedChatModel, compile_graph
+from fin.host.jev_choice import (
+    JEV_CHOICE_EXIT_INVALID_SEARCH_MODE,
+    JEV_CHOICE_EXIT_LOW_CONFIDENCE,
+    JEV_CHOICE_EXIT_SCHEMA,
+    JEV_CHOICE_EXIT_TRANSPORT,
+    JEV_CHOICE_EXIT_UNEXPECTED_ERROR,
+    JevChoiceError,
+)
 from fin.host.named_failures import REAL_DB_NOT_WIRED, TIER_NOT_OPEN
 from fin.host.run_payload import _run_to_response_payload
 from fin.host.named_failures import LASTING_RETRIEVE_TIERS
@@ -38,6 +46,7 @@ from fin.host.search_mode_decision import (
     normalize_search_mode,
 )
 from fin.host.state import reset_input_state
+from jev_fake import FakeJevChoice
 
 pytestmark = [pytest.mark.soft_track]
 
@@ -52,33 +61,22 @@ def _msgs(text: str) -> list[HumanMessage]:
     return [HumanMessage(content=text)]
 
 
-class _ClassifyStub:
-    """Minimal ``classify_model`` seam: same ``.invoke`` shape the
-    Soft-Track injection tests use."""
+class _JudgeThatThrows:
+    """A judge client that fails outside the typed ``JevChoiceError`` set."""
 
-    def __init__(self, payload: str = "", raises: bool = False) -> None:
-        self.payload = payload
-        self.raises = raises
-        self.calls = 0
-        self.prompts: list[str] = []
-
-    def invoke(self, messages: Any, **kwargs: Any) -> AIMessage:
-        self.calls += 1
-        self.prompts.append(str(messages[0].content))
-        if self.raises:
-            raise RuntimeError("classify backend down")
-        return AIMessage(content=self.payload)
+    def choose(self, **kwargs: Any) -> Any:
+        raise RuntimeError("judge backend down")
 
 
 def _compile(
     script: list[AIMessage],
     *,
-    classify_model: Any | None = None,
+    jev_client: Any | None = None,
 ) -> Any:
     return compile_graph(
         checkpointer=InMemorySaver(),
         model=ScriptedChatModel(script=script),
-        classify_model=classify_model,
+        jev_client=jev_client,
         known_document_ids=KNOWN_IDS,
     )
 
@@ -163,84 +161,135 @@ def test_invalid_pin_is_typed_exit_and_falls_through() -> None:
 
 
 # ---------------------------------------------------------------------------
-# structured classify tier (only when rules miss and inherit would not decide)
+# Jev 档 tier (only when rules miss and inherit would not decide)
 # ---------------------------------------------------------------------------
 
 
-def test_classify_valid_mode_assigns_llm_tier() -> None:
-    stub = _ClassifyStub('```json\n{"search_mode": "B", "confidence": 0.9}\n```')
+def test_jev_valid_mode_assigns_the_jev_tier() -> None:
+    fake = FakeJevChoice([("graph", 0.9)])
     decision = decide_search_mode(
-        _msgs("what was AAPL net sales in 2023 Q3?"), classify_model=stub
+        _msgs("what was AAPL net sales in 2023 Q3?"), jev_client=fake
     )
-    assert stub.calls == 1
+    assert len(fake.calls) == 1
     assert decision.search_mode == "graph"
-    assert decision.decision_tier == "llm"
+    assert decision.decision_tier == "jev"
+    # The judge's own answer travels on the audit, not just its label:
+    # confidence and the ``mode_jev_*`` signal names are what make the
+    # tier attributable after the fact.
+    assert decision.confidence == 0.9
+    assert decision.signals["mode_jev_label"] == "graph"
+    assert decision.signals["mode_jev_confidence"] == 0.9
+    assert decision.failure_code is None
 
 
-def test_classify_invalid_enum_is_typed_exit_not_silent_c() -> None:
-    """Boundary 'negative': a classify enum outside the closed 档 set names
-    no 档 — typed EXIT, residual clarify, never a silent global."""
-    stub = _ClassifyStub('{"search_mode": "E"}')
+@pytest.mark.parametrize("label", ["E", "", "Z", "research"])
+def test_jev_label_outside_the_closed_set_is_a_typed_exit(label: str) -> None:
+    """Boundary 'negative': a judge label the 档 SSOT cannot map at all
+    names no 档 -- typed EXIT, residual clarify, never a silent global."""
+    fake = FakeJevChoice([(label, 0.99)])
     decision = decide_search_mode(
-        _msgs("what was AAPL net sales in 2023 Q3?"), classify_model=stub
+        _msgs("what was AAPL net sales in 2023 Q3?"), jev_client=fake
     )
-    assert stub.calls == 1
+    assert len(fake.calls) == 1
     assert decision.search_mode is None
-    assert decision.signals.get("classify_exit") == "invalid_search_mode"
+    assert decision.signals.get("mode_jev_exit") == JEV_CHOICE_EXIT_INVALID_SEARCH_MODE
     assert decision.decision_tier == "clarify"
     assert decision.options  # the window data exists for Ticket 2 to render
 
 
-def test_classify_unparseable_json_is_schema_parse_exit() -> None:
-    stub = _ClassifyStub("definitely not json")
+@pytest.mark.parametrize("label", ["B", " b "])
+def test_jev_retired_spelling_resolves_to_its_lasting_tier(label: str) -> None:
+    """A retired letter is NOT out of set: the answer goes through the
+    same SSOT total function, so ``B`` resolves to ``graph`` and is
+    judged open, while only an unmappable label above can exit. Pinning
+    this here is what keeps the alias rename from being re-litigated at
+    the judge seam."""
+    fake = FakeJevChoice([(label, 0.9)])
     decision = decide_search_mode(
-        _msgs("what was AAPL net sales in 2023 Q3?"), classify_model=stub
+        _msgs("what was AAPL net sales in 2023 Q3?"), jev_client=fake
     )
-    assert decision.signals.get("classify_exit") == "schema_parse"
+    assert decision.search_mode == "graph"
+    assert decision.decision_tier == "jev"
+    assert "mode_jev_exit" not in decision.signals
+    assert decision.signals["mode_jev_label"] == label
+
+
+def test_jev_schema_error_is_a_typed_exit() -> None:
+    """An unusable judge payload names nothing: the EXIT is recorded and
+    the residual stays clarify."""
+    fake = FakeJevChoice(
+        [JevChoiceError("not a choice object", exit_code=JEV_CHOICE_EXIT_SCHEMA)]
+    )
+    decision = decide_search_mode(
+        _msgs("what was AAPL net sales in 2023 Q3?"), jev_client=fake
+    )
+    assert decision.signals.get("mode_jev_exit") == JEV_CHOICE_EXIT_SCHEMA
     assert decision.search_mode is None
     assert decision.decision_tier == "clarify"
 
 
-def test_classify_model_error_is_typed_exit_not_crash() -> None:
-    """Boundary 'exception': a raising classify backend records
-    ``model_error`` and falls through the cascade — the run cannot crash
-    and C is not the silent default."""
-    stub = _ClassifyStub(raises=True)
-    decision = decide_search_mode(
-        _msgs("what was AAPL net sales in 2023 Q3?"), classify_model=stub
+def test_jev_transport_error_is_a_typed_exit_not_crash() -> None:
+    """Boundary 'exception': an unreachable judge records the transport
+    EXIT and falls through the cascade -- the run cannot crash and no 档
+    is the silent default."""
+    fake = FakeJevChoice(
+        [JevChoiceError("down", exit_code=JEV_CHOICE_EXIT_TRANSPORT)]
     )
-    assert decision.signals.get("classify_exit") == "model_error"
+    decision = decide_search_mode(
+        _msgs("what was AAPL net sales in 2023 Q3?"), jev_client=fake
+    )
+    assert len(fake.calls) == 1  # exactly one attempt; no retry storm
+    assert decision.signals.get("mode_jev_exit") == JEV_CHOICE_EXIT_TRANSPORT
     assert decision.search_mode is None
     assert decision.decision_tier == "clarify"
 
 
-def test_classify_low_confidence_falls_through_to_residual() -> None:
-    """Boundary 'low_confidence' EXIT: an unsure default-档 answer must not
-    assign it either (silent-open ban) — the EXIT falls through."""
-    stub = _ClassifyStub('{"search_mode": "B", "confidence": 0.1}')
+def test_jev_unexpected_throw_is_contained_as_an_exit() -> None:
     decision = decide_search_mode(
-        _msgs("what was AAPL net sales in 2023 Q3?"), classify_model=stub
+        _msgs("what was AAPL net sales in 2023 Q3?"),
+        jev_client=_JudgeThatThrows(),
     )
-    assert decision.signals.get("classify_exit") == "low_confidence"
+    assert decision.signals.get("mode_jev_exit") == JEV_CHOICE_EXIT_UNEXPECTED_ERROR
+    # The type name is the whole diagnostic: an un-typed failure must be
+    # attributable on the audit without leaking a message or a traceback.
+    assert decision.signals["mode_jev_error_type"] == "RuntimeError"
     assert decision.search_mode is None
     assert decision.decision_tier == "clarify"
 
 
-def test_classify_naming_unopened_tier_is_typed_fail() -> None:
-    stub = _ClassifyStub('{"search_mode": "C", "confidence": 0.95}')
+@pytest.mark.parametrize("label", ["global", "graph"])
+def test_jev_low_confidence_falls_through_to_residual(label: str) -> None:
+    """Boundary 'low_confidence' EXIT: an unsure name must not decide,
+    whether it names an unopened 档 or an OPEN one (silent-open ban) --
+    the EXIT falls through either way."""
+    fake = FakeJevChoice([(label, 0.1)])
     decision = decide_search_mode(
-        _msgs("what was AAPL net sales in 2023 Q3?"), classify_model=stub
+        _msgs("what was AAPL net sales in 2023 Q3?"), jev_client=fake
+    )
+    assert decision.signals.get("mode_jev_exit") == JEV_CHOICE_EXIT_LOW_CONFIDENCE
+    assert decision.search_mode is None
+    assert decision.decision_tier == "clarify"
+    assert decision.options  # the choice window still gets its data
+
+
+def test_jev_naming_unopened_tier_is_typed_fail() -> None:
+    fake = FakeJevChoice([("global", 0.95)])
+    decision = decide_search_mode(
+        _msgs("what was AAPL net sales in 2023 Q3?"), jev_client=fake
     )
     assert decision.search_mode is None
     assert decision.decision_tier == "typed_fail"
     assert decision.failure_code == TIER_NOT_OPEN
+    # The refusal names the LASTING token it wanted, so the operator can
+    # see which 档 the judge asked for.
+    assert decision.signals["requested_mode"] == "global"
 
 
-def test_classify_skipped_when_inherit_would_decide() -> None:
+def test_jev_skipped_when_inherit_would_decide() -> None:
     """Mirror of ``decide_track``'s peek: when inherit decides, the
-    classify model is NOT consulted (a production model cannot steal the
+    judge is NOT consulted (a judge answer cannot steal the
     inherited 档)."""
-    stub = _ClassifyStub('{"search_mode": "A", "confidence": 0.99}')
+    fake = FakeJevChoice([("A", 0.99)])
     snapshots = [
         {
             "company": "AAPL",
@@ -250,13 +299,21 @@ def test_classify_skipped_when_inherit_would_decide() -> None:
         }
     ]
     decision = decide_search_mode(
-        _msgs("and 2022 Q3?"), snapshots=snapshots, classify_model=stub
+        _msgs("and 2022 Q3?"), snapshots=snapshots, jev_client=fake
     )
-    assert stub.calls == 0
+    assert fake.calls == []
     # A 档 stored before the rename is still inheritable, and what the
     # turn records is the lasting token.
     assert decision.search_mode == "graph"
     assert decision.decision_tier == "inherit"
+    # Inherit won the turn, so the judge was not the reason anything was
+    # decided: a client-less run must not blame an absent judge on a turn
+    # inherit was going to answer anyway.
+    clientless = decide_search_mode(
+        _msgs("and 2022 Q3?"), snapshots=snapshots, jev_client=None
+    )
+    assert clientless.decision_tier == "inherit"
+    assert "mode_jev_exit" not in clientless.signals
 
 
 # ---------------------------------------------------------------------------
@@ -313,8 +370,10 @@ def test_inherit_requires_research_context_in_latest_snapshot() -> None:
 def test_empty_utterance_residual_clarifies_without_inventing_c() -> None:
     """Boundary 'empty': a blank post-grounded utterance with no inherit
     clarifies (window data emitted) — no 档 is invented, C is not the
-    silent default."""
-    decision = decide_search_mode(_msgs(""))
+    silent default, and the judge is never consulted for nothing."""
+    fake: FakeJevChoice = FakeJevChoice([])  # any call would raise
+    decision = decide_search_mode(_msgs(""), jev_client=fake)
+    assert fake.calls == []
     assert decision.search_mode is None
     assert decision.decision_tier == "clarify"
     assert decision.options == clarify_options()
@@ -451,47 +510,49 @@ def test_grounded_rule_mode_assigned_before_retrieve() -> None:
     assert any(entry.get("name") == "retrieve" for entry in summaries)
 
 
-def test_graph_classify_assigns_mode_after_grounded_rules() -> None:
-    """The injected classify model runs the search-mode classify exactly
-    once for a grounded, un-named, non-inheritable ask (track rules did
-    NOT call it)."""
-    stub = _ClassifyStub('{"search_mode": "B", "confidence": 0.9}')
-    g = _compile([AIMessage(content="Net sales grew year over year.")], classify_model=stub)
+def test_graph_judge_assigns_mode_after_grounded_rules() -> None:
+    """The injected judge runs the 档 Choice exactly once for a grounded,
+    un-named, non-inheritable ask (the track rules tier needed no
+    judge call at all)."""
+    fake = FakeJevChoice([("graph", 0.9)])
+    g = _compile(
+        [AIMessage(content="Net sales grew year over year.")], jev_client=fake
+    )
     out = g.invoke(
         {
             **reset_input_state("what was AAPL net sales in 2023 Q3?"),
             "evidence": [],
         },
-        config=_cfg("smc-classify-once"),
+        config=_cfg("smc-judge-once"),
     )
     assert out["track"] == "grounded"
-    assert stub.calls == 1
+    assert [call["question_id"] for call in fake.calls] == ["search_mode"]
     assert out["search_mode_decision"]["search_mode"] == "graph"
-    assert out["search_mode_decision"]["decision_tier"] == "llm"
+    assert out["search_mode_decision"]["decision_tier"] == "jev"
 
 
-def test_classify_prompt_teaches_the_lasting_tokens() -> None:
-    """SC4: nothing the model is told may claim ``B`` / ``C`` are the
-    lasting MCP tokens. The classify seam is where that lesson is taught,
-    so the system message it actually sends has to name ``graph`` /
-    ``global`` — and a reply spelled with a lasting token must assign, or
-    the prompt would be offering a vocabulary the cascade rejects."""
-    stub = _ClassifyStub('{"search_mode": "graph", "confidence": 0.9}')
+def test_judge_instructions_teach_the_lasting_tokens() -> None:
+    """Nothing the judge is told may claim ``B`` / ``C`` are the
+    lasting MCP tokens. The Choice instruction seam is where that lesson
+    is taught, so the text it actually sends has to name ``graph`` /
+    ``global`` -- and a reply spelled with a lasting token must assign, or
+    the instruction would be offering a vocabulary the cascade rejects."""
+    fake = FakeJevChoice([("graph", 0.9)])
     g = _compile(
-        [AIMessage(content="Net sales grew year over year.")],
-        classify_model=stub,
+        [AIMessage(content="Net sales grew year over year.")], jev_client=fake
     )
     out = g.invoke(
         {
             **reset_input_state("what was AAPL net sales in 2023 Q3?"),
             "evidence": [],
         },
-        config=_cfg("smc-classify-prompt"),
+        config=_cfg("smc-judge-instructions"),
     )
-    assert stub.calls == 1
-    prompt = stub.prompts[0]
-    assert '"graph"' in prompt and '"global"' in prompt, prompt
-    assert '"A"|"B"|"C"|"D"' not in prompt, prompt
+    assert len(fake.calls) == 1
+    instructions = fake.calls[0]["instructions"]
+    assert '"graph"' not in instructions and "graph" in instructions
+    assert "global" in instructions
+    assert '"A"|"B"|"C"|"D"' not in instructions
     assert out["search_mode_decision"]["search_mode"] == "graph"
 
 
