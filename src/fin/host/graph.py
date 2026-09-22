@@ -86,7 +86,7 @@ from langchain_core.messages import (
 from langchain_core.tools import InjectedToolArg, InjectedToolCallId, tool
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
-from langgraph.prebuilt import ToolNode
+from langgraph.prebuilt import InjectedState, ToolNode
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command, Send, interrupt
 
@@ -169,6 +169,7 @@ from fin.host.track_decision import (
 )
 from fin.host.search_mode_decision import (
     apply_operator_pick,
+    assigned_retrieve_mode,
     clarify_options,
     normalize_search_mode,
     search_mode_update_for_turn,
@@ -603,6 +604,7 @@ def _make_retrieve_tool(
         ticker: str | None = None,
         filing_date: str | None = None,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
+        state: Annotated[Any, InjectedState()] = None,
     ) -> Command:
         """Narrative retrieval over page-passage chunks.
 
@@ -614,7 +616,10 @@ def _make_retrieve_tool(
         cap = 20). On a hit, each chunk contributes one
         ``EvidenceItem``; misses contribute none. When retrieval
         is unavailable the tool returns
-        ``{"error": "retrieve_unavailable"}``.
+        ``{"error": "retrieve_unavailable"}``. The 检索档 is NOT an
+        argument: the host cascade assigns it and this call carries it
+        (spec search-mode SC2), so the model cannot pick or lie about a
+        档.
         """
         def _port_call(retry_query: str) -> dict[str, Any]:
             """One adapter-bound retrieve call for the retry helper.
@@ -633,6 +638,11 @@ def _make_retrieve_tool(
                     ticker=ticker,
                     filing_date=filing_date,
                     limit=limit,
+                    # SC2: the 档 this run's cascade assigned rides the
+                    # existing single port call. Resolved here (per
+                    # invocation), not at compile time — the graph is
+                    # cached and shared across runs.
+                    search_mode=assigned_retrieve_mode(state),
                     adapter=adapter,
                 )
             except InputValidationError as exc:
@@ -1325,6 +1335,10 @@ class IssuerTask(TypedDict, total=False):
 
     issuer: str
     query: str
+    # SC2: the 档 this run's cascade assigned, stamped by the router off
+    # the run's OWN state (never by the model, whose tool args only carry
+    # the roster + query). ``None`` means no assignment → no key sent.
+    search_mode: str | None
 
 
 def _make_research_issuers_tool(issuer_cap: int):
@@ -2743,7 +2757,6 @@ def compile_graph(
         # call-time only, the compaction gate's history rebuild needs no
         # extra seam: the next call re-adds it, and checkpointed
         # messages are never rewritten when the mode changes.
-        search_mode_audit = state.get("search_mode_decision") or {}
         model_messages = _with_turn_attachments(
             state,
             messages_for_model(
@@ -2751,7 +2764,10 @@ def compile_graph(
                 track="grounded",
                 memory_on=memory_enabled,
                 user_profile=_read_profile_text(),
-                search_mode=search_mode_audit.get("search_mode"),
+                # The same single owner of「本次跑的是哪个档」the retrieve
+                # hop reads, so the copy and the wire call can never
+                # disagree about the run's assignment.
+                search_mode=assigned_retrieve_mode(state),
             ),
         )
         stream = selected_model.stream(model_messages)
@@ -2946,6 +2962,10 @@ def compile_graph(
             result = retrieve(
                 query=issuer_query(issuer, query),
                 ticker=issuer,
+                # SC2: the branch answers under the 档 the cascade
+                # assigned for this run — carried on the payload the
+                # router stamped, not re-read from anywhere else.
+                search_mode=task.get("search_mode"),
                 adapter=adapter,
             )
         except InputValidationError as exc:
@@ -3309,8 +3329,17 @@ def compile_graph(
         query = str(plan.get("query") or "")
         if plan.get("error") or not issuers or not query:
             return "compaction_gate"
+        # Every branch of THIS run retrieves under THIS run's assigned
+        # 档 (SC2): read once off the state here, at dispatch time, so a
+        # cached graph cannot carry a previous run's token into a new
+        # fan-out. The model never supplies it — the payload's 档 key is
+        # written by the host from the cascade's audit.
+        mode = assigned_retrieve_mode(state)
         return [
-            Send("issuer_research", {"issuer": issuer, "query": query})
+            Send(
+                "issuer_research",
+                {"issuer": issuer, "query": query, "search_mode": mode},
+            )
             for issuer in issuers
         ]
 

@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -496,6 +497,49 @@ def search_mode_update_for_turn(
     }
 
 
+def assigned_retrieve_mode(state: Any) -> Any:
+    """The 档 the cascade assigned THIS run, read off its state (SC2).
+
+    This module owns the ``search_mode_decision`` channel, so it owns the
+    only read of it: ``AgentState.search_mode_decision`` is the single
+    source of truth for「本次跑的是哪个档」. Every entry point (utterance,
+    pin, choice-window pick, the cascade's own classify output) resolves
+    onto a lasting token there, and the audit deliberately holds ``None``
+    on clarify and on 具名失败 — so this reader has nothing to send for a
+    refused turn and iknow answers with its own default rather than with a
+    档 fin invented (SC3 / SC6: no silent ``global``, no silent ``graph``).
+
+    It forwards the audit VERBATIM — no ``normalize_search_mode`` here.
+    The audit is post-normalization by construction, so a retired letter
+    or a garbage token reaching this seam means a boundary was skipped,
+    which :func:`fin.retrieve.port.resolve_search_mode` names as
+    ``invalid_search_mode``. Guessing around it here would hide the wiring
+    bug and put a 档 behind a request that never chose one — and so would
+    swallowing a value that is not the audit mapping into「没送档」, which
+    hands the run to iknow's own default instead of naming the skipped
+    boundary.
+
+    The value is read PER CALL from the caller's state, never captured at
+    compile time: the compiled graph is idempotence-cached and shared by
+    every run of the process (see ``_IDEMPOTENCE_CACHE``), so a closed-
+    over 档 would leak one run's choice into the next run's wire call.
+
+    ``Any`` on purpose: an unclassified channel value is still forwarded to
+    the port, which is the seam that types it.
+    """
+    audit = (
+        state.get("search_mode_decision")
+        if isinstance(state, Mapping)
+        else None
+    )
+    if isinstance(audit, Mapping):
+        return audit.get("search_mode")
+    # An absent channel (the seeded ``{}``, or a state with no such key)
+    # genuinely means nothing was assigned; anything else is the value
+    # itself, so the port's typed refusal is the exit.
+    return audit
+
+
 def apply_operator_pick(
     decision: dict[str, Any],
     *,
@@ -561,6 +605,7 @@ __all__ = [
     "SearchModeDecision",
     "SearchModeDecisionTier",
     "apply_operator_pick",
+    "assigned_retrieve_mode",
     "clarify_options",
     "decide_search_mode",
     "mode_snapshot_patch",

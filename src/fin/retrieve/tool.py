@@ -60,7 +60,11 @@ def retrieve(
         检索档 token (spec ``search-mode-retrieve.md``): passed
         through untouched — the wrapper neither assigns a 档 (that is
         the host cascade's job) nor validates one (the port's named
-        failures stay single-sourced behind the port).
+        failures stay single-sourced behind the port). The host graph
+        resolves the value PER CALL off that run's cascade audit
+        (``fin.host.search_mode_decision.assigned_retrieve_mode``), so the
+        wrapper is the seam, not the source: an omitted value means "send
+        no 档" and iknow answers with its own default.
     adapter
         The shared ``RetrievePort`` implementation. The host graph
         (T6) constructs one adapter per run and threads it through

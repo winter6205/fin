@@ -9,10 +9,13 @@ service.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import threading
+import time
+import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -108,6 +111,70 @@ def _drop_pg_schema(schema: str) -> None:
         # best-effort cleanup; the run's unique name keeps a leftover schema
         # out of every later run's way, exactly as the unique ES indices do.
         pass
+
+
+# How long a driver waits for a pushed child to become searchable. Shared so
+# the two pg_es drivers cannot drift into polling for different lengths.
+ES_VISIBLE_TIMEOUT_SECONDS = 10.0
+
+
+def await_es_searchable(
+    chunk_ids: list[str],
+    *,
+    chunk_index: str,
+    timeout_seconds: float = ES_VISIBLE_TIMEOUT_SECONDS,
+) -> None:
+    """Bounded poll until every pushed child is visible in ``chunk_index``.
+    push's bulk write uses ``refresh: "wait_for"``, so the docs should
+    already be searchable when push returned — this checks that
+    deterministic hand-off against the live cluster rather than sleeping,
+    and a timeout names the real miss for the operator instead of letting
+    the tier assertion fail obscurely.
+
+    ``chunk_index`` is a parameter, not a module global: every pg_es driver
+    owns its own per-run index name, and this is the shared home.
+    """
+
+    deadline = time.monotonic() + timeout_seconds
+    missing = set(chunk_ids)
+    body = json.dumps(
+        {"size": len(chunk_ids), "query": {"ids": {"values": list(chunk_ids)}}}
+    ).encode("utf-8")
+    while missing:
+        request = urllib.request.Request(
+            f"{IKNOW_ES_URL}/{chunk_index}/_search",
+            data=body,
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            hits = json.load(response)["hits"]["hits"]
+        missing -= {hit["_id"] for hit in hits}
+        if not missing:
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"chunks {sorted(missing)} never became searchable in ES "
+                f"index {chunk_index} within {timeout_seconds}s"
+            )
+        time.sleep(0.25)
+
+
+def drop_es_indices(*index_names: str) -> None:
+    """Teardown of the per-run fin-owned indices given — never a name this
+    run does not own, so a driver that shares the cluster with iknow's own
+    suites cannot delete their indices by accident."""
+
+    for index in index_names:
+        request = urllib.request.Request(
+            f"{IKNOW_ES_URL}/{index}", method="DELETE"
+        )
+        try:
+            urllib.request.urlopen(request, timeout=5)
+        except OSError:
+            # best-effort cleanup; the run's unique names keep a leftover
+            # index out of every later run's way.
+            pass
 
 
 class _EmbeddingHandler(BaseHTTPRequestHandler):

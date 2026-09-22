@@ -113,9 +113,13 @@ class RecordingPort:
         )
         self._unavailable_for = unavailable_for
         self.queries: list[str] = []
+        # The 档 each branch call carried (search-mode SC2): ``None`` is
+        # "no assignment", which the port records as no key sent.
+        self.modes: list[Any] = []
 
     def retrieve(self, query: str, **kwargs: Any) -> dict[str, Any]:
         self.queries.append(query)
+        self.modes.append(kwargs.get("search_mode"))
         ticker = kwargs.get("ticker")
         if self._unavailable_for and ticker == self._unavailable_for:
             return {"error": "retrieve_unavailable"}
@@ -152,6 +156,7 @@ def _run(
     adapter: Any,
     thread_id: str,
     question: str = FANOUT_QUESTION,
+    config_extra: dict[str, Any] | None = None,
 ) -> dict:
     graph = compile_graph(
         checkpointer=InMemorySaver(),
@@ -159,9 +164,11 @@ def _run(
         adapter=adapter,
         known_document_ids=KNOWN_IDS,
     )
+    configurable: dict[str, Any] = {"thread_id": thread_id}
+    configurable.update(config_extra or {})
     return graph.invoke(
         reset_input_state(question),
-        config={"configurable": {"thread_id": thread_id}},
+        config={"configurable": configurable},
     )
 
 
@@ -216,6 +223,35 @@ def test_full_cap_fanout_synthesizes_with_a_citation_per_contributor() -> None:
     assert out["status_reason"] == "done"
     cited = {citation.document_id for citation in out["citations"]}
     assert cited == {_document_id(issuer) for issuer in CAP_ROSTER}
+
+
+def test_fanout_branches_retrieve_under_the_assigned_档() -> None:
+    """SC2 through the fan-out hop: the 档 the cascade assigned this run
+    rides EVERY branch call, stamped by the router off the run's state —
+    never by the model's tool args, which carry only roster + query."""
+    port = RecordingPort(issuers=["AAPL", "MSFT"])
+    out = _run(
+        _fanout_script(issuers=["AAPL", "MSFT"], answer=_synthesis(["AAPL", "MSFT"])),
+        adapter=port,
+        thread_id="t-fanout-mode",
+        config_extra={"pinned_search_mode": "graph"},
+    )
+    assert out["search_mode_decision"]["search_mode"] == "graph"
+    assert len(port.modes) == 2, port.queries
+    assert port.modes == ["graph", "graph"], port.modes
+
+
+def test_fanout_branches_send_no_档_when_nothing_is_assigned() -> None:
+    """The absent half of the same hop: an unassigned turn must not have
+    a 档 invented for its branches."""
+    port = RecordingPort(issuers=["AAPL", "MSFT"])
+    _run(
+        _fanout_script(issuers=["AAPL", "MSFT"], answer=_synthesis(["AAPL", "MSFT"])),
+        adapter=port,
+        thread_id="t-fanout-no-mode",
+    )
+    assert port.modes, "the branches still retrieved"
+    assert set(port.modes) == {None}, port.modes
 
 
 def test_fanout_runs_one_worker_per_issuer() -> None:
