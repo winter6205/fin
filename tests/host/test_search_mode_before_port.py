@@ -15,7 +15,7 @@ what is asserted is the TOKEN a call carries, never how iknow ranks
 
 * ``test_an_assigned_knowledge_qa_records_graph_before_retrieve`` — the
   audit lands at the classify node, i.e. before the port sees a call,
-  and the call itself carries no retired letter.
+  and every call the port records carries exactly that lasting token.
 * ``test_a_pinned_retired_letter_hands_the_port_its_lasting_token`` — the
   same for a pin sent as the retired letter an old client still uses.
 * ``test_a_review_ask_names_global_on_the_audit_and_starts_no_letter`` —
@@ -166,8 +166,8 @@ def _retired_letter_in(payload: Any) -> bool:
 def test_an_assigned_knowledge_qa_records_graph_before_retrieve(
     spelling: str,
 ) -> None:
-    """The 知识问答 档 is recorded as ``graph`` and no letter reaches the
-    port. Ordering is proven, not assumed: the model call that emitted
+    """The 知识问答 档 is recorded as ``graph`` and the port is handed
+    ``graph``. Ordering is proven, not assumed: the model call that emitted
     the retrieve tool call already carried 知识问答's usage copy, so the
     assignment existed before the port call it describes."""
     out, port, model = _run(_utterance(spelling))
@@ -177,9 +177,11 @@ def test_an_assigned_knowledge_qa_records_graph_before_retrieve(
     assert audit["search_mode"] == "graph"
     assert not _retired_letter_in(audit)
     assert port.calls, "the grounded retrieve must have reached the port"
-    assert all(
-        call["search_mode"] not in RETIRED_TIER_TOKENS for call in port.calls
-    ), [call["search_mode"] for call in port.calls]
+    # POSITIVE: the assigned 档 IS the value the port was handed — not
+    # merely "not a letter", which an unassigned run would satisfy too.
+    assert [call["search_mode"] for call in port.calls] == [
+        "graph"
+    ] * len(port.calls), [call["search_mode"] for call in port.calls]
     # The retrieve call is the SECOND model call of this run: the copy on
     # the first one is the audit's own token, visible before the port ran.
     blocks = _mode_copy_blocks(model)
@@ -201,6 +203,12 @@ def test_a_review_ask_names_global_on_the_audit_and_starts_no_letter(
     assert audit["search_mode"] is None
     assert audit["signals"].get("requested_mode") == "global"
     assert not _retired_letter_in(audit)
+    # POSITIVE: nothing was assigned, so the hop sends NO 档 — and it
+    # must not smuggle ``global`` (an unopened 档) onto the wire either.
+    assert port.calls, "the scripted retrieve still reached the port"
+    assert [call["search_mode"] for call in port.calls] == [None] * len(
+        port.calls
+    ), [call["search_mode"] for call in port.calls]
     assert all(
         call["search_mode"] not in RETIRED_TIER_TOKENS for call in port.calls
     )
@@ -218,6 +226,12 @@ def test_a_pinned_retired_letter_hands_the_port_its_lasting_token(
     assert audit["search_mode"] == "graph"
     assert audit["signals"].get("pinned") is True
     assert not _retired_letter_in(audit)
+    # POSITIVE: a pin is an assignment, so the port is handed its lasting
+    # token — the letter the client spelled must not survive the hop.
+    assert port.calls, "the grounded retrieve must have reached the port"
+    assert [call["search_mode"] for call in port.calls] == [
+        "graph"
+    ] * len(port.calls), [call["search_mode"] for call in port.calls]
     assert all(
         call["search_mode"] not in RETIRED_TIER_TOKENS for call in port.calls
     )

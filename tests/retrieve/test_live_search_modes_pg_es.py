@@ -64,8 +64,6 @@ import asyncio
 import json
 import random
 import string
-import time
-import urllib.request
 import uuid
 from typing import Any, Iterator
 
@@ -81,7 +79,12 @@ from fin.host.named_failures import (
 )
 from fin.retrieve.port import InvalidSearchModeError, SEARCH_MODE_FILTER_KEY
 
-from live_iknow_support import IKNOW_ES_URL, IKNOW_ROOT, live_iknow
+from live_iknow_support import (
+    IKNOW_ROOT,
+    await_es_searchable,
+    drop_es_indices,
+    live_iknow,
+)
 
 
 pytestmark = pytest.mark.mcp
@@ -107,8 +110,6 @@ def _rare_token(prefix: str) -> str:
 _A_TOKEN = _rare_token("pterodactyl")
 _B_TOKEN = _rare_token("quokka")
 
-_ES_VISIBLE_TIMEOUT_SECONDS = 10.0
-
 
 def _fixture_text() -> str:
     """One unit whose narrative 切分 yields ≥2 children, each carrying
@@ -132,55 +133,6 @@ def _retrieve_requests(live: Any) -> list[dict]:
         if request.get("method") == "tools/call"
         and request.get("params", {}).get("name") == "retrieve"
     ]
-
-
-def _await_es_searchable(chunk_ids: list[str]) -> None:
-    """Bounded poll until every pushed child is visible in the ES chunk
-    index. push's bulk write uses ``refresh: "wait_for"``, so the docs
-    should already be searchable when push returned — this checks that
-    deterministic hand-off against the live cluster rather than
-    sleeping, and a timeout names the real miss for the operator
-    instead of letting the tier assertion fail obscurely."""
-
-    deadline = time.monotonic() + _ES_VISIBLE_TIMEOUT_SECONDS
-    missing = set(chunk_ids)
-    body = json.dumps(
-        {"size": len(chunk_ids), "query": {"ids": {"values": list(chunk_ids)}}}
-    ).encode("utf-8")
-    while missing:
-        request = urllib.request.Request(
-            f"{IKNOW_ES_URL}/{_CHUNK_INDEX}/_search",
-            data=body,
-            headers={"content-type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=5) as response:
-            hits = json.load(response)["hits"]["hits"]
-        missing -= {hit["_id"] for hit in hits}
-        if not missing:
-            return
-        if time.monotonic() >= deadline:
-            raise AssertionError(
-                f"chunks {sorted(missing)} never became searchable in ES "
-                f"index {_CHUNK_INDEX} within "
-                f"{_ES_VISIBLE_TIMEOUT_SECONDS}s"
-            )
-        time.sleep(0.25)
-
-
-def _drop_fin_indices() -> None:
-    """Teardown only ever touches the two per-run fin-owned indices."""
-
-    for index in (_CHUNK_INDEX, _ENTITY_INDEX):
-        request = urllib.request.Request(
-            f"{IKNOW_ES_URL}/{index}", method="DELETE"
-        )
-        try:
-            urllib.request.urlopen(request, timeout=5)
-        except OSError:
-            # best-effort cleanup; the run's unique names keep a leftover
-            # index out of every later run's way.
-            pass
 
 
 @pytest.fixture(scope="module")
@@ -209,7 +161,7 @@ def live() -> Iterator[Any]:
             yield session
     finally:
         monkeypatch.undo()
-        _drop_fin_indices()
+        drop_es_indices(_CHUNK_INDEX, _ENTITY_INDEX)
 
 
 @pytest.fixture(scope="module")
@@ -242,7 +194,7 @@ def parent_envelope(live: Any) -> Any:
     assert pushed["written"] == len(envelope.chunks), pushed
     assert pushed["duplicates"] == 0, pushed
 
-    _await_es_searchable(list(pushed["block_ids"]))
+    await_es_searchable(list(pushed["block_ids"]), chunk_index=_CHUNK_INDEX)
     return envelope
 
 

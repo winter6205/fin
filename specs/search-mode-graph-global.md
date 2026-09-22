@@ -55,11 +55,11 @@ Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 ## Success Criteria
 
 1. `uv run pytest -q` exits 0 with default **Fake** retrieve. `web/` `tsc --noEmit` exits 0 when this task diffs `web/` (skip if no web diff).
-2. Port / MCP adapter: assigned 知识问答 sends `filters.search_mode=graph`; assigned 综述 sends `global`; **A** and **D** unchanged. Missing key / `search_mode=None` does not send `B` and is treated as **graph**.
+2. Port / MCP adapter: assigned 知识问答 sends `filters.search_mode=graph`; assigned 综述 sends `global` **only once 综述 opens** — while `TIER_UNAVAILABLE_CODE` maps `global → tier_not_open` (`fin.retrieve.tiers`), `resolve_search_mode` refuses before any filter write, so no fin caller can put `global` on the wire and that half is proven server-side only, by the raw JSON-RPC probe in the live driver. **A** and **D** unchanged. Missing key / `search_mode=None` does not send `B` and is treated as **graph**.
 3. Port negative: `search_mode` in `{B, C, local, ""}` or any non-set token raises / returns typed `invalid_search_mode` (not mapped at the port, not silent **global**).
 4. Host normalize + copy: cascade / pin / choice-window `id` / `SEARCH_MODE_USAGE_COPY` use `graph` and `global` as keys; usage copy for 知识问答 and 综述 does not instruct the model that lasting MCP tokens are `B` or `C`; D copy states document tables stay **graph**.
 5. Host does not contain a hybrid/RRF (or other) re-ranker for this task; still one `retrieve` tool on the compiled graph.
-6. **global** not-ready → `community_summary_index_failure` (same meaning as former C not-ready). **D** unwired → `real_db_not_wired`. Unopened 综述 档 → `tier_not_open` on **`global`**. None of these become empty `chunks[]` as success.
+6. **global** not-ready → `community_summary_index_failure` (same meaning as former C not-ready) — **deferred to the 综述-opening ticket**: fin has no producer for this code yet, only the constant (`fin.host.named_failures`) and its operator copy (`run_payload`); mapping the server's `degraded_reasons` onto it lands when the 档 opens. Until then it is observed server-side only, in the raw probe. **D** unwired → `real_db_not_wired`. Unopened 综述 档 → `tier_not_open` on **`global`**. None of these become empty `chunks[]` as success.
 7. Opt-in (or existing) host suite: after **grounded**, a high-confidence 知识问答 assign records audit `search_mode=graph` **before** retrieve; a 综述 assign records `global`. Residual cascade still must not silent-open **global**.
 8. Fake tests cover port contract + named-exit mapping only; they do not assert iknow ranking.
 9. Citation still uses this-run retrieve/`read_file` text; this spec does not replace the **citation verifier**.

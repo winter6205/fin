@@ -300,9 +300,11 @@ def test_a_retired_letter_pin_reaches_the_port_as_its_lasting_token(
     # into that token; the seam never sees the letter.
     assert normalize_search_mode("B") == "graph"
     assert resolve_search_mode(normalize_search_mode("B")) == "graph"
-    assert all(
-        call["search_mode"] not in RETIRED_TIER_TOKENS for call in port.calls
-    ), [call["search_mode"] for call in port.calls]
+    # POSITIVE: the door's pin reaches the WIRE call as ``graph`` — the
+    # retired letter is refused at the boundary and never forwarded.
+    assert [call["search_mode"] for call in port.calls] == [
+        "graph"
+    ] * len(port.calls), [call["search_mode"] for call in port.calls]
 
 
 def test_every_tier_code_key_is_a_tier_the_door_accepts() -> None:
