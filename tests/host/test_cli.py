@@ -530,9 +530,9 @@ def _paused_state() -> dict:
                     "title": "选择检索档",
                     "prompt": "为本次 grounded 提问选择检索档后继续。",
                     "options": [
-                        {"id": "A", "label": "单跳速答", "opened": True},
-                        {"id": "B", "label": "标准检索", "opened": True},
-                        {"id": "C", "label": "综述", "opened": False},
+                        {"id": "lexical", "label": "查找", "opened": True},
+                        {"id": "graph", "label": "知识问答", "opened": True},
+                        {"id": "global", "label": "综述", "opened": False},
                     ],
                 }
             ),
@@ -543,9 +543,9 @@ def _paused_state() -> dict:
 _PAUSED_TEXT = "\n".join(
     [
         "paused: choice_window —— 选择检索档",
-        "- A 单跳速答",
-        "- B 标准检索",
-        "- C 综述 (未开放)",
+        "- lexical 查找",
+        "- graph 知识问答",
+        "- global 综述 (未开放)",
         "在工作台该 thread 上选择后继续（HTTP resume），CLI 本增量不支持 pick",
     ]
 )

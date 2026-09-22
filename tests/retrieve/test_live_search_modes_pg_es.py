@@ -12,15 +12,15 @@ store; this one is the task-2 driver the memory harness deliberately
 could not cover (see the vector-only note in ``live_iknow_support``):
 the product :class:`~fin.retrieve.mcp_adapter.MCPRetrieveAdapter` and
 :class:`~fin.retrieve.mcp_push_port.MCPPushPort` over one real iknow
-subprocess whose A tier lexically hits **real Elasticsearch** and whose
-parent-window seam resolves through **real PG (pgvector)**.
+subprocess whose ``lexical`` 档 lexically hits **real Elasticsearch** and
+whose parent-window seam resolves through **real PG (pgvector)**.
 
 Focus assertions — what this fin-side driver PROVES (spec
 ``search-mode-retrieve.md`` SC2/SC3/SC7 and the named-exit contract of
 ``fin.retrieve.port``):
 
-* **A** — a real-ES lexical hit on a child resolves through the ledger
-  back-pointer and cites the PARENT body, never a child-only slice.
+* **lexical** — a real-ES lexical hit on a child resolves through the
+  ledger back-pointer and cites the PARENT body, never a child-only slice.
 * **graph on the wire** — an explicit ``graph`` carries
   ``filters.search_mode=graph`` while a missing mode does not send it.
 * **graph equivalence** — the missing mode and explicit ``graph`` answer
@@ -34,10 +34,10 @@ Focus assertions — what this fin-side driver PROVES (spec
   round trip still proves iknow accepts ``global`` and answers with its
   own not-ready fact (``community_summary_index_failure``), never with a
   refused enum value.
-* **D / leftover letters / invalid** — the named exits
-  (``real_db_not_wired``, ``invalid_search_mode`` for a leftover ``B`` /
-  ``C`` and for ``local``) are unchanged when the full stack is live: the
-  档 check still runs before the transport.
+* **sql / leftover letters / invalid** — the named exits
+  (``real_db_not_wired``, ``invalid_search_mode`` for every retired letter
+  ``A``/``B``/``C``/``D`` and for ``local``) are unchanged when the full
+  stack is live: the 档 check still runs before the transport.
 
 What this driver does NOT prove: graph-priority REORDERING is iknow's
 internal contract, validated against real Neo4j + GDS in iknow #242
@@ -107,21 +107,21 @@ def _rare_token(prefix: str) -> str:
     return f"{prefix}{suffix}"
 
 
-_A_TOKEN = _rare_token("pterodactyl")
-_B_TOKEN = _rare_token("quokka")
+_LEXICAL_TOKEN = _rare_token("pterodactyl")
+_GRAPH_TOKEN = _rare_token("quokka")
 
 
 def _fixture_text() -> str:
     """One unit whose narrative 切分 yields ≥2 children, each carrying
-    one 档's rare token so A and graph hit different children of the same
-    parent."""
+    one 档's rare token so ``lexical`` and graph hit different children of
+    the same parent."""
 
     filler_a = "Revenue discussion continues across the first child slice. " * 20
     filler_b = "Cost of revenue discussion continues across the second child slice. " * 20
     return (
-        f"{_A_TOKEN} opens the first child slice of this live parent "
-        "window fixture for the A tier lexical check. " + filler_a
-        + f"{_B_TOKEN} marks the second child slice reserved for the graph "
+        f"{_LEXICAL_TOKEN} opens the first child slice of this live parent "
+        "window fixture for the lexical 档 check. " + filler_a
+        + f"{_GRAPH_TOKEN} marks the second child slice reserved for the graph "
         "档 fused ranking check. " + filler_b
     )
 
@@ -183,9 +183,9 @@ def parent_envelope(live: Any) -> Any:
         valid_from="2020-01-01T00:00:00.000Z",
         valid_until="9999-12-31T23:59:59.999Z",
     )
-    # The A-tier claim is only meaningful over a real parent/child tree.
+    # The lexical-tier claim is only meaningful over a real parent/child tree.
     assert len(envelope.chunks) >= 2, (
-        "the fixture unit 切分 collapsed to a single child; the 档 A "
+        "the fixture unit 切分 collapsed to a single child; the lexical "
         f"child→parent assertion would be vacuous: {envelope!r}"
     )
     assert all(chunk.content != envelope.body for chunk in envelope.chunks)
@@ -198,28 +198,30 @@ def parent_envelope(live: Any) -> Any:
     return envelope
 
 
-def test_a_tier_real_es_lexical_hit_cites_the_parent_body(
+def test_lexical_tier_real_es_hit_cites_the_parent_body(
     live: Any, parent_envelope: Any
 ) -> None:
-    """Spec SC2: 档 A lexically hits an in-window child in REAL ES and
+    """Spec SC2: the ``lexical`` 档 hits an in-window child in REAL ES and
     answers the parent 抽图窗 body as the citable chunk text — a
     child-only slice wearing the answer is exactly what ADR-0060
     forbids."""
 
-    answer = live.retrieve.retrieve(_A_TOKEN, limit=5, search_mode="A")
+    answer = live.retrieve.retrieve(
+        _LEXICAL_TOKEN, limit=5, search_mode="lexical"
+    )
 
     assert "error" not in answer, answer
     chunks = answer["chunks"]
     assert chunks, (
-        f"档 A returned no chunk for the rare token {_A_TOKEN!r} that a "
-        "pushed child carries and the ES visibility poll confirmed: "
+        f"lexical 档 returned no chunk for the rare token {_LEXICAL_TOKEN!r} "
+        "that a pushed child carries and the ES visibility poll confirmed: "
         f"{answer!r}"
     )
     for chunk in chunks:
         assert chunk.text == parent_envelope.body, (
-            "档 A cited something other than the parent body (child→"
-            "parent collapse is the A-tier contract); the fixture "
-            "guarantees no child equals the body, so a child-only "
+            "the lexical 档 cited something other than the parent body "
+            "(child→parent collapse is the lexical-tier contract); the "
+            "fixture guarantees no child equals the body, so a child-only "
             "slice cannot pass this equality"
         )
         assert chunk.source_ref.document_id == _DOCUMENT_ID
@@ -241,9 +243,9 @@ def test_graph_tier_sends_search_mode_on_the_wire_and_matches_the_default(
     docstring for where the graph contract is actually validated)."""
 
     before = len(_retrieve_requests(live))
-    default_answer = live.retrieve.retrieve(_B_TOKEN, limit=8)
+    default_answer = live.retrieve.retrieve(_GRAPH_TOKEN, limit=8)
     explicit_answer = live.retrieve.retrieve(
-        _B_TOKEN, limit=8, search_mode="graph"
+        _GRAPH_TOKEN, limit=8, search_mode="graph"
     )
 
     assert "error" not in default_answer, default_answer
@@ -294,9 +296,9 @@ def test_graph_tier_sends_search_mode_on_the_wire_and_matches_the_default(
         "mode is graph, so both requests must answer identically"
     )
     texts = [chunk.text for chunk in explicit_answer["chunks"]]
-    assert any(_B_TOKEN in text for text in texts), (
+    assert any(_GRAPH_TOKEN in text for text in texts), (
         f"档 graph's fused ranking omitted the child carrying "
-        f"{_B_TOKEN!r}: {explicit_answer!r}"
+        f"{_GRAPH_TOKEN!r}: {explicit_answer!r}"
     )
     scores = [chunk.score for chunk in explicit_answer["chunks"]]
     assert scores == sorted(scores, reverse=True), (
@@ -331,7 +333,7 @@ def test_the_global_token_is_one_the_server_accepts_even_though_fin_has_not_open
                 "params": {
                     "name": "retrieve",
                     "arguments": {
-                        "query": _B_TOKEN,
+                        "query": _GRAPH_TOKEN,
                         "limit": 8,
                         "filters": {SEARCH_MODE_FILTER_KEY: "global"},
                     },
@@ -363,7 +365,7 @@ def test_the_global_token_is_one_the_server_accepts_even_though_fin_has_not_open
 
     # And fin's own seam still keeps its routing-time name for the same
     # token: the server accepting it is not an invitation to open it.
-    assert live.retrieve.retrieve(_B_TOKEN, search_mode="global") == {
+    assert live.retrieve.retrieve(_GRAPH_TOKEN, search_mode="global") == {
         "error": TIER_NOT_OPEN
     }
     assert len(_retrieve_requests(live)) == before + 1, (
@@ -376,7 +378,7 @@ def test_the_global_token_is_one_the_server_accepts_even_though_fin_has_not_open
     ("mode", "code"),
     [
         pytest.param("global", TIER_NOT_OPEN, id="tier-global"),
-        pytest.param("D", REAL_DB_NOT_WIRED, id="tier-d"),
+        pytest.param("sql", REAL_DB_NOT_WIRED, id="tier-sql"),
     ],
 )
 def test_unopened_tier_keeps_its_named_exit_with_the_full_stack_live(
@@ -386,16 +388,16 @@ def test_unopened_tier_keeps_its_named_exit_with_the_full_stack_live(
     with real ES/PG/Neo4j behind iknow (where a graph-shaped answer WOULD
     succeed), the port still refuses 「档未开」/「真库未接」 by name and
     the request never reaches the wire — no silent default answer dressed
-    as 综述 or D."""
+    as 综述 or 真数据库."""
 
     before = len(_retrieve_requests(live))
-    assert live.retrieve.retrieve(_B_TOKEN, search_mode=mode) == {
+    assert live.retrieve.retrieve(_GRAPH_TOKEN, search_mode=mode) == {
         "error": code
     }
     assert len(_retrieve_requests(live)) == before
 
 
-@pytest.mark.parametrize("leftover", ["B", "C", "b", "c", "local"])
+@pytest.mark.parametrize("leftover", ["A", "B", "C", "D", "b", "c", "local"])
 def test_invalid_mode_raises_before_the_wire_with_the_full_stack_live(
     live: Any,
     leftover: str,
@@ -410,6 +412,6 @@ def test_invalid_mode_raises_before_the_wire_with_the_full_stack_live(
 
     before = len(_retrieve_requests(live))
     with pytest.raises(InvalidSearchModeError) as excinfo:
-        live.retrieve.retrieve(_B_TOKEN, search_mode=leftover)
+        live.retrieve.retrieve(_GRAPH_TOKEN, search_mode=leftover)
     assert excinfo.value.code == "invalid_search_mode"
     assert len(_retrieve_requests(live)) == before

@@ -23,7 +23,8 @@ never by matching prose::
                        map to a fin locator (mapping ledger count > 0)
     tier_not_open      检索档 global 综述 is a plan slot, not
                        implemented (token formerly spelled ``C``)
-    real_db_not_wired  检索档 D 真数据库 is a plan slot, not implemented
+    real_db_not_wired  检索档 sql 真数据库 is a plan slot, not
+                       implemented (token formerly spelled ``D``)
     community_summary_index_failure
                        reserved for once global 综述 ships as an open 档:
                        its 社区 summary index is then not-ready (the
@@ -86,14 +87,11 @@ from fin.retrieve.port import RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY
 from fin.retrieve.tiers import (
     LASTING_RETRIEVE_TIERS,
     REAL_DB_NOT_WIRED,
-    RETIRED_TIER_TOKENS,
     RETRIEVE_TIERS,
     RetrieveTier,
-    TIER_INPUT_TOKENS,
     TIER_LABELS,
     TIER_NOT_OPEN,
     TIER_UNAVAILABLE_CODE,
-    TierInputToken,
     normalize_tier_token,
 )
 
@@ -125,8 +123,9 @@ COMMUNITY_SUMMARY_INDEX_FAILURE: Final[str] = "community_summary_index_failure"
 EMPTY_FAST_GRAPH_FAILURE: Final[str] = "empty_fast_graph_failure"
 
 # NOTE (T6 reach): a 档 is invoked ONLY through the explicit selector
-# (the send door's ``TierInputToken`` enum, whose accepted spellings
-# resolve onto :data:`RETRIEVE_TIERS`). Question prose is never scanned
+# (the send door's ``tiers`` enum, typed to the closed set
+# :data:`RETRIEVE_TIERS`, so a name outside it is a schema refusal rather
+# than a spelling to resolve). Question prose is never scanned
 # for 档 words —「综述这几份 10-Q」 is a perfectly ordinary 知识问答 ask
 # about a small set of filings, and reading it as a 综述 invocation would
 # be the 开放业务意图桶 the wayfinder doc forbids. See
@@ -259,21 +258,21 @@ def retrieve_outcomes_delta(
 def unavailable_tier(requested_tiers: Iterable[str] | None) -> str | None:
     """The first requested 档 that is a plan slot, or ``None``.
 
-    ``requested_tiers`` are the operator's explicit selectors; they are
-    resolved through :func:`fin.retrieve.tiers.normalize_tier_token`
-    (case-insensitive, retired spellings included) because a selector is
-    a small closed token, not prose — and because the refusal this feeds
-    is looked up in :data:`TIER_UNAVAILABLE_CODE` by its LASTING token:
-    matching a case-folded or upper-cased spelling against that table by
-    hand would silently miss ``global``. Only ``global`` / ``D`` are
-    refused here; an unknown token is ignored — this helper never guesses
-    that a string "meant" a 档 (the same closed-list rule as
+    ``requested_tiers`` are the operator's explicit selectors and they
+    arrive ALREADY TYPED over the closed set: the send door's
+    ``tiers: list[RetrieveTier]`` field (:mod:`fin.host.workspace_http`)
+    refuses every other spelling — case variant, padding, retired letter
+    — as a 422 input error before this helper is reached. So the lookup in
+    :data:`TIER_UNAVAILABLE_CODE` is exact and nothing is normalized here:
+    a normalize step would quietly accept a shape the door already refuses,
+    which is the second vocabulary the rename forbids. Only ``global`` /
+    ``sql`` are refused here; an unknown token is ignored — this helper
+    never guesses that a string "meant" a 档 (the same closed-list rule as
     :data:`TIER_UNAVAILABLE_CODE`).
     """
     for tier in requested_tiers or ():
-        lasting = normalize_tier_token(tier)
-        if lasting is not None and lasting in TIER_UNAVAILABLE_CODE:
-            return lasting
+        if tier in TIER_UNAVAILABLE_CODE:
+            return tier
     return None
 
 
@@ -284,15 +283,12 @@ __all__ = [
     "LASTING_RETRIEVE_TIERS",
     "MAPPING_DROP",
     "REAL_DB_NOT_WIRED",
-    "RETIRED_TIER_TOKENS",
     "RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY",
     "RETRIEVE_TIERS",
     "RetrieveTier",
-    "TIER_INPUT_TOKENS",
     "TIER_LABELS",
     "TIER_NOT_OPEN",
     "TIER_UNAVAILABLE_CODE",
-    "TierInputToken",
     "named_refusal_reason",
     "normalize_tier_token",
     "retrieve_blocking_failure",

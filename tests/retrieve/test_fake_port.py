@@ -344,8 +344,8 @@ def test_fake_records_the_search_mode_it_received() -> None:
     test can assert what the caller asked for without a live MCP."""
     port = FakeRetrievePort(hits_by_query={"foo": [_chunk("hit")]})
     port.retrieve("foo")
-    port.retrieve("foo", search_mode="A")
-    assert [call["search_mode"] for call in port.calls] == [None, "A"]
+    port.retrieve("foo", search_mode="lexical")
+    assert [call["search_mode"] for call in port.calls] == [None, "lexical"]
     assert port.calls[1]["query"] == "foo"
 
 
@@ -355,7 +355,7 @@ def test_tool_wrapper_forwards_search_mode_to_the_port() -> None:
     from fin.retrieve import retrieve as retrieve_tool
 
     port = FakeRetrievePort(hits_by_query={"foo": [_chunk("hit")]})
-    out = retrieve_tool("foo", search_mode="A", adapter=port)
+    out = retrieve_tool("foo", search_mode="lexical", adapter=port)
     assert out["chunks"], "the lexical answer is unchanged by the mode"
     assert port.calls == [
         {
@@ -366,7 +366,7 @@ def test_tool_wrapper_forwards_search_mode_to_the_port() -> None:
             "ticker": None,
             "filing_date": None,
             "limit": 8,
-            "search_mode": "A",
+            "search_mode": "lexical",
         }
     ]
 
@@ -375,7 +375,7 @@ def test_tool_wrapper_forwards_search_mode_to_the_port() -> None:
     ("tier", "code"),
     [
         pytest.param("global", "tier_not_open", id="tier-global"),
-        pytest.param("D", "real_db_not_wired", id="tier-d"),
+        pytest.param("sql", "real_db_not_wired", id="tier-sql"),
     ],
 )
 def test_fake_refuses_an_unopened_tier_like_the_product_adapter(
@@ -406,7 +406,9 @@ def test_fake_raises_invalid_search_mode_like_the_product_adapter() -> None:
 # ----- T3: the port's closed set, mirrored on the Fake -----
 
 
-@pytest.mark.parametrize("token", ["B", "C", "local", "", "hybrid", "b", "GRAPH"])
+@pytest.mark.parametrize(
+    "token", ["A", "B", "C", "D", "local", "", "hybrid", "b", "GRAPH"]
+)
 def test_a_leftover_token_is_refused_by_the_fake_like_the_port(
     token: str,
 ) -> None:
@@ -427,17 +429,19 @@ def test_a_leftover_token_is_refused_by_the_fake_like_the_port(
 
 
 def test_an_unopened_tier_never_degrades_into_an_empty_chunk_answer() -> None:
-    """Exception class: the three named 档 exits all RAISE, so none of
-    them can be misread as 「语料没东西」 — the ``{"chunks": []}`` success
-    shape is reserved for a request the 档 accepted and the corpus could
-    not answer."""
+    """Exception class: every named 档 exit RAISES, so none of them can be
+    misread as 「语料没东西」 — the ``{"chunks": []}`` success shape is
+    reserved for a request the 档 accepted and the corpus could not answer.
+    Both unopened word forms and retired letters are in that set: the word
+    forms answer ``TierUnavailableError``, the letters
+    ``InvalidSearchModeError``."""
     from fin.retrieve.port import (
         InvalidSearchModeError,
         TierUnavailableError,
     )
 
     port = FakeRetrievePort(hits_by_query={"foo": [_chunk("hit")]})
-    for token in ("global", "D", "B"):
+    for token in ("global", "sql", "A", "D"):
         with pytest.raises((TierUnavailableError, InvalidSearchModeError)):
             port.retrieve("foo", search_mode=token)
     assert port.calls == []
@@ -461,10 +465,10 @@ def test_an_open_tier_never_turns_the_legal_empty_miss_into_an_error() -> None:
         hits_by_query={"alpha": [_chunk("hit")]},
         known_document_ids={"DOC-2023Q1"},
     )
-    assert port.retrieve("nonexistent query", search_mode="A") == {
+    assert port.retrieve("nonexistent query", search_mode="lexical") == {
         "chunks": []
     }
-    assert port.calls[-1]["search_mode"] == "A"
+    assert port.calls[-1]["search_mode"] == "lexical"
 
 
 def test_an_empty_query_is_named_before_the_tier_is_consulted() -> None:
@@ -525,7 +529,7 @@ def test_concurrent_tiered_calls_answer_per_call() -> None:
     )
 
     def _go(i: int) -> tuple[str, object]:
-        mode = ("A", "graph", "global", "Z")[i % 4]
+        mode = ("lexical", "graph", "global", "Z")[i % 4]
         try:
             out = port.retrieve("foo", limit=5, search_mode=mode)
             return mode, [c.text for c in out["chunks"]]
@@ -539,7 +543,7 @@ def test_concurrent_tiered_calls_answer_per_call() -> None:
 
     expected_texts = [c.text for c in chunks]
     for mode, payload in results:
-        if mode in ("A", "graph"):
+        if mode in ("lexical", "graph"):
             assert payload == expected_texts, mode
         elif mode == "global":
             assert payload == ("tier", "tier_not_open")
@@ -551,7 +555,7 @@ def test_concurrent_tiered_calls_answer_per_call() -> None:
 
     recorded = [call["search_mode"] for call in port.calls]
     assert len(recorded) == 8
-    assert recorded.count("A") == 4
+    assert recorded.count("lexical") == 4
     assert recorded.count("graph") == 4
     assert "global" not in recorded and "Z" not in recorded
 

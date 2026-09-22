@@ -1,5 +1,5 @@
 """T3 five-class matrix, host side: 档 × the send door's named 409/400
-exits and the run-payload mapping of the C-not-ready token.
+exits and the run-payload mapping of the 综述-not-ready token.
 
 ``specs/search-mode-retrieve.md`` Boundaries name five test classes on
 the port (empty / negative / overflow / concurrent / exception). The
@@ -19,7 +19,7 @@ the **named-exit path** half:
   run payload with its OWN ordinary-person copy and is never invented
   by fin's retrieve-side decision from an empty or failed retrieve.
 
-Fake is not a 档 (SC8): nothing here asserts A/B/C/D ranking — only
+Fake is not a 档 (SC8): nothing here asserts any 档's ranking — only
 which named exit answers which request.
 """
 
@@ -145,13 +145,13 @@ def test_an_open_tier_send_still_meets_the_concurrent_run_409(
     client: TestClient, store, locked_graph
 ) -> None:
     """The 档 selector is routing metadata, not a lane: naming an OPEN
-    档 (B) while another run is in flight gets the same plain-JSON 409
+    档 (``graph``) while another run is in flight gets the same plain-JSON 409
     ``concurrent_run`` as a tier-less send."""
     thread_id = store.create_thread(title="existing").id
 
     r = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": "q", "tiers": ["B"]},
+        json={"question": "q", "tiers": ["graph"]},
     )
 
     assert r.status_code == 409, r.text
@@ -159,16 +159,16 @@ def test_an_open_tier_send_still_meets_the_concurrent_run_409(
     assert r.json() == {"error": "concurrent_run"}
 
 
-@pytest.mark.parametrize("tier", ["C", "global"])
+@pytest.mark.parametrize("tier", ["global"])
 def test_an_unopened_tier_is_named_before_the_concurrent_run_409(
     tier: str, client: TestClient, store, locked_graph
 ) -> None:
     """Exit ORDER on the concurrency seam: the routing-time 400 「档未开」
     fires BEFORE the lock probe — telling the operator to wait for the
     in-flight run would be wrong advice for a 档 this product has not
-    opened, and retrying after the run ends answers the same 400. Both
-    spellings of 综述 (the retired letter and the lasting token) take
-    that exit; neither starts a run."""
+    opened, and retrying after the run ends answers the same 400. The
+    lasting 综述 token takes that exit exactly as the retired letter
+    once did, and starts no run."""
     thread_id = store.create_thread(title="existing").id
 
     r = client.post(
@@ -196,7 +196,7 @@ def test_the_mcp_fault_gate_409_applies_to_an_open_tier_send(
 
     r = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": "q", "tiers": ["B"]},
+        json={"question": "q", "tiers": ["graph"]},
     )
 
     assert r.status_code == 409, r.text
@@ -210,21 +210,21 @@ def test_an_unopened_tier_is_named_before_the_mcp_fault_gate(
     client: TestClient, store, graph, mcp_env
 ) -> None:
     """「档未开」 is not a transport fact: the 400 wins over the closed
-    gate, so an operator with MCP down and a C pin gets the SAME
+    gate, so an operator with MCP down and a 综述 pin gets the SAME
     answer as with MCP up — never a retry-them advice token."""
     thread_id = store.create_thread(title="existing").id
     publish_knowledge_mcp_state(KNOWLEDGE_MCP_FAULT)
 
     r = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": "q", "tiers": ["C"]},
+        json={"question": "q", "tiers": ["global"]},
     )
 
     assert r.status_code == 400, r.text
     assert r.json() == {"error": TIER_NOT_OPEN}
 
 
-# ----- negative: the C-not-ready token on the run payload -----
+# ----- negative: the 综述-not-ready token on the run payload -----
 
 
 def test_community_summary_index_failure_rides_the_run_payload_intact() -> None:
@@ -259,9 +259,9 @@ def test_fin_never_invents_the_community_summary_index_failure() -> None:
     """Direction of the mapping: ``community_summary_index_failure``
     names the SERVICE's index fact. fin's own retrieve-side decision
     reads only chunk/mapping outcomes — an empty collection stays
-    ``corpus_not_ready`` and never gets upgraded to the C-index token
+    ``corpus_not_ready`` and never gets upgraded to the 综述-index token
     (that would blame the summary job for a collection that simply has
-    no hits; the C pin itself is covered by the adapter/fake T3
+    no hits; the global pin itself is covered by the adapter/fake T3
     sections)."""
     assert (
         retrieve_blocking_failure([{"chunks": 0, "mapping_failures": 0}])

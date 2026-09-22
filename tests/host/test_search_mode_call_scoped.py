@@ -246,7 +246,7 @@ def test_track_prompt_stays_first_with_mode_copy() -> None:
     """The copy rides INSIDE the head SystemMessage after the track
     prompt — near context, one message, old SystemMessages untouched."""
     out = messages_for_model(
-        [HumanMessage(content="q")], track="grounded", search_mode="A"
+        [HumanMessage(content="q")], track="grounded", search_mode="lexical"
     )
     head = str(out[0].content)
     assert head.startswith(HOST_INSTRUCTIONS_MARKER)
@@ -261,19 +261,21 @@ def test_track_prompt_stays_first_with_mode_copy() -> None:
 
 
 def test_assigned_mode_copy_absent_from_checkpointed_history() -> None:
-    """SC2 "call-scoped copy" half 1: after an A-assigned turn, the
+    """SC2 "call-scoped copy" half 1: after a lexical-assigned turn, the
     checkpoint's ``messages`` hold no search-mode usage SystemMessage."""
     model = _RecordingScriptedModel(
         script=[AIMessage(content="Net sales grew year over year.")]
     )
     g = _compile(model)
-    out = _invoke(g, "A档 what was AAPL net sales in 2023 Q3?", "smcp-checkpoint")
-    assert out["search_mode_decision"]["search_mode"] == "A"
+    out = _invoke(
+        g, "lexical档 what was AAPL net sales in 2023 Q3?", "smcp-checkpoint"
+    )
+    assert out["search_mode_decision"]["search_mode"] == "lexical"
     checkpoint = _checkpoint_messages(g, "smcp-checkpoint")
     assert checkpoint
     assert not _mode_blocks(checkpoint)
     for message in checkpoint:
-        assert SEARCH_MODE_USAGE_COPY["A"] not in str(message.content)
+        assert SEARCH_MODE_USAGE_COPY["lexical"] not in str(message.content)
     # The model itself DID see the copy, exactly once, in the head.
     assert model.captured
     call = model.captured[-1]
@@ -300,7 +302,7 @@ def test_model_payload_holds_copy_exactly_once_per_call() -> None:
         ]
     )
     g = _compile(model)
-    _invoke(g, "A档 what was AAPL net sales in 2023 Q3?", "smcp-tool-loop")
+    _invoke(g, "lexical档 what was AAPL net sales in 2023 Q3?", "smcp-tool-loop")
     assert len(model.captured) >= 2
     for call in model.captured:
         blocks = _mode_blocks(call)
@@ -309,10 +311,10 @@ def test_model_payload_holds_copy_exactly_once_per_call() -> None:
 
 
 def test_second_turn_new_mode_leaves_first_history_unedited() -> None:
-    """SC2 "call-scoped copy" half 2: turn 2 names 知识问答 (in the
-    retired letter) while turn 1 ran 查找; turn 1's checkpointed messages
-    stay byte-identical (history is NEVER rewritten on a mode change) and
-    the new call carries only the lasting token."""
+    """SC2 "call-scoped copy" half 2: turn 2 names 知识问答 while turn 1
+    ran 查找; turn 1's checkpointed messages stay byte-identical (history
+    is NEVER rewritten on a mode change) and the new call carries only
+    the lasting token."""
     model = _RecordingScriptedModel(
         script=[
             AIMessage(content="Answer one."),
@@ -321,15 +323,15 @@ def test_second_turn_new_mode_leaves_first_history_unedited() -> None:
     )
     g = _compile(model)
     tid = "smcp-two-modes"
-    out1 = _invoke(g, "A档 what was AAPL net sales in 2023 Q3?", tid)
-    assert out1["search_mode_decision"]["search_mode"] == "A"
+    out1 = _invoke(g, "lexical档 what was AAPL net sales in 2023 Q3?", tid)
+    assert out1["search_mode_decision"]["search_mode"] == "lexical"
     first_history = [
         (getattr(m, "id", None), str(m.content))
         for m in _checkpoint_messages(g, tid)
     ]
     assert first_history
 
-    out2 = _invoke(g, "B档 and 2022 Q3?", tid)
+    out2 = _invoke(g, "graph档 and 2022 Q3?", tid)
     assert out2["search_mode_decision"]["search_mode"] == "graph"
     second_history = [
         (getattr(m, "id", None), str(m.content))
@@ -340,10 +342,10 @@ def test_second_turn_new_mode_leaves_first_history_unedited() -> None:
     assert not _mode_blocks(_checkpoint_messages(g, tid))
     last_call = model.captured[-1]
     block = str(_mode_blocks(last_call)[0].content)
-    # An utterance that names the retired letter reaches both the audit
-    # and the copy as the lasting token.
+    # The second turn's copy names only its own 档 — the first turn's
+    # 查找 copy is gone from the fresh payload, not stacked onto it.
     assert "检索档 graph" in block
-    assert "检索档 A" not in block
+    assert "检索档 lexical" not in block
 
 
 def test_dialogue_turn_injects_no_copy() -> None:
@@ -391,7 +393,7 @@ def test_copy_reinjected_after_compaction() -> None:
                 "company": "AAPL",
                 "period": "2023 Q3",
                 "document_ids": [AAPL_2022Q3],
-                "search_mode": "B",
+                "search_mode": "graph",
             }
         ],
     )

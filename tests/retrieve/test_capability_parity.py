@@ -201,13 +201,13 @@ def test_a_hit_scripted_under_no_capability_is_rejected() -> None:
 
 def test_an_open_tier_answers_with_the_same_script(port) -> None:
     plain = port.retrieve("营业收入同比")
-    tiered = port.retrieve("营业收入同比", search_mode="A")
+    tiered = port.retrieve("营业收入同比", search_mode="lexical")
     assert tiered == plain
 
 
 @pytest.mark.parametrize(
     ("mode", "code"),
-    [("global", "tier_not_open"), ("D", "real_db_not_wired")],
+    [("global", "tier_not_open"), ("sql", "real_db_not_wired")],
 )
 def test_the_capability_fake_refuses_an_unopened_tier_like_the_port(
     port, mode: str, code: str

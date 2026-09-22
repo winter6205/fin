@@ -209,7 +209,7 @@ class FakeRetrievePort:
           → ``ConflictingFiltersError``
         * ``search_mode`` mirrors the port's 档 contract exactly
           (T2): out-of-set → ``InvalidSearchModeError``, unopened
-          global/D → ``TierUnavailableError`` (Fake is not a 档 and does
+          global/sql → ``TierUnavailableError`` (Fake is not a 档 and does
           not rank differently per 档 — spec SC8); an accepted token
           is recorded on ``self.calls`` so tests can assert what the
           caller asked for

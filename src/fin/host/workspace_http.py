@@ -225,8 +225,7 @@ from fin.host.memory_dream import run_dream_after_turn
 from fin.host.memory_port import build_memory_port
 from fin.host.named_failures import (
     TIER_UNAVAILABLE_CODE,
-    TierInputToken,
-    normalize_tier_token,
+    RetrieveTier,
     unavailable_tier,
 )
 from fin.host.observability import (
@@ -642,26 +641,23 @@ class SendMessageRequest(BaseModel):
     # text rides ``reset_input_state(attachments=...)`` as turn-scoped
     # context and never enters the corpus/ingest path.
     attachment_ids: list[str] = Field(default_factory=list)
-    # T6 (spec SC9): the explicit 检索档 selector. Empty (the default)
-    # is the ordinary send — the model resolves the track as it always
-    # has. A caller that NAMES an unimplemented 档 (global 综述 / D 真数据
-    # 库) gets the named 400 BEFORE any run starts; the product never
-    # opens a document retrieve dressed as SQL, and never guesses a 档
-    # from the question prose (the wayfinder doc forbids an open-ended
-    # 业务意图桶). Typed as a closed enum so a bogus token is a 422
-    # input error rather than a silently ignored field. The enum is
-    # derived from ``fin.host.named_failures.TIER_INPUT_TOKENS`` (via
-    # ``TierInputToken``) rather than re-spelled here, so a 档 added to
-    # the SSOT cannot leave this schema silently accepting the old set.
+    # The explicit 检索档 selector. Empty (the default) is the ordinary
+    # send — the model resolves the track as it always has. A caller that
+    # NAMES an unimplemented 档 (global 综述 / sql 真数据库) gets the named
+    # 400 BEFORE any run starts; the product never opens a document
+    # retrieve dressed as SQL, and never guesses a 档 from the question
+    # prose (the wayfinder doc forbids an open-ended 业务意图桶). The enum
+    # is derived from the SSOT closed set (:mod:`fin.retrieve.tiers`)
+    # rather than re-spelled here, so a 档 added there cannot leave this
+    # schema silently accepting the old set — and a bogus token is a 422
+    # input error rather than a silently ignored field.
     #
-    # The input tuple is deliberately WIDER than the port's closed set:
-    # it still carries the retired letters ``B`` / ``C`` because an old
-    # client's own token must not become a 422 on the rename day. This
-    # boundary is where those spellings resolve onto their lasting token
-    # (``normalize_tier_token``), and nothing past here can be a letter —
-    # the port refuses one by name, so the widening cannot leak a retired
-    # spelling toward the ranking service.
-    tiers: list[TierInputToken] = Field(default_factory=list)
+    # What the door accepts IS what the port forwards: the retired letters
+    # left the vocabulary on both wires in one stroke (pre-release, no live
+    # client), so a ``tiers: ["A"]`` send is a typed 422 that names the bad
+    # selector instead of a 200 whose 档 was guessed from a spelling
+    # nothing writes anymore.
+    tiers: list[RetrieveTier] = Field(default_factory=list)
     # search-mode host T4 (HTTP surface): an explicit Fast 抽图 PROPOSE
     # request. The send seeds the run's ``extract_method_proposal``
     # STATE field with ``{"proposed": "fast"}`` (the graph-side trigger
@@ -2263,8 +2259,8 @@ def build_router(
         # probe, before any side effect, and long before a retrieve
         # could be dressed up as the tier the operator asked for. The
         # code is named per 档 (综述未开 / 真库未接), never collapsed
-        # into one token; A/graph fall through to the ordinary run because
-        # 查找 is openable on the default stack today.
+        # into one token; lexical/graph fall through to the ordinary run
+        # because 查找 is openable on the default stack today.
         requested_tier = unavailable_tier(body.tiers)
         if requested_tier is not None:
             return JSONResponse(
@@ -2417,21 +2413,18 @@ def build_router(
                 "workspace_root": str(workspace_root),
             }
         }
-        # search-mode host T2 (SC4): the existing ``tiers`` selector is
-        # the documented pin field — naming EXACTLY ONE open 档 pins it
-        # for this run (the rules tier assigns without opening the
-        # window; the audit records the pin). An unopened 档 was already
-        # the named 400 above; a multi-select names nothing (the
-        # ordinary cascade decides, same as an empty selector today).
-        # The pin rides the run CONFIG, never the checkpointed state, so
-        # a follow-up send cannot inherit it. The value is normalized at
-        # this seam, not downstream: a request that pinned a retired
-        # letter must carry its lasting token into the cascade and on to
-        # the port, which validates wire tokens exactly.
+        # The existing ``tiers`` selector is the documented pin field —
+        # naming EXACTLY ONE open 档 pins it for this run (the rules tier
+        # assigns without opening the window; the audit records the pin). An
+        # unopened 档 was already the named 400 above; a multi-select names
+        # nothing (the ordinary cascade decides, same as an empty selector
+        # today). The pin rides the run CONFIG, never the checkpointed
+        # state, so a follow-up send cannot inherit it. The value is copied
+        # straight: the door's enum is the SSOT closed set, so what arrives
+        # here is already the exact token the port validates and there is no
+        # legacy spelling left to resolve on the way.
         if len(body.tiers) == 1:
-            pinned = normalize_tier_token(body.tiers[0])
-            assert pinned is not None  # ``tiers`` is the closed enum
-            config["configurable"]["pinned_search_mode"] = pinned
+            config["configurable"]["pinned_search_mode"] = body.tiers[0]
         thinking_type = "adaptive" if body.thinking else "disabled"
         if not body.thinking:
             # T3 (#34): the operator's thinking preference rides the

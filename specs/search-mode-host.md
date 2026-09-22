@@ -1,6 +1,7 @@
 # Spec: search-mode host (Soft-Track 检索档 + 工作台 choice window)
 
 > **Status:** assumption gate confirmed 2026-09-17 (four-spec split; this is spec 4 of 4).
+> **Spelling superseded 2026-09-22:** every 档 token this file names (`A` / `B` / `C` / `D`, and the `A | graph | global | D` set the ADR 0081 amendment quotes) is now `lexical | graph | global | sql`, with no retired letter read at any entry. The assignment cookbook — rules, Jev Choice, inherit, **choice window** — is unchanged; only the spellings moved. See [`specs/search-mode-lexical-sql-tokens.md`](search-mode-lexical-sql-tokens.md).
 > **Siblings:** `specs/extract-window-tree.md` (1/4), `specs/graph-index-standard-fast.md` (2/4), `specs/search-mode-retrieve.md` (3/4).
 > **This file:** fin **host graph** + **工作台** only.
 

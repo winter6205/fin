@@ -891,14 +891,15 @@ def test_unset_search_mode_is_absent_from_the_wire() -> None:
     assert "filters" not in arguments, arguments
 
 
-def test_search_mode_a_is_forwarded_as_filters_search_mode() -> None:
+def test_search_mode_lexical_is_forwarded_as_filters_search_mode() -> None:
     """The wire token is pinned exactly once per spec
-    (``filters.search_mode`` ∈ ``A|graph|global|D``, sibling iknow spec);
-    elsewhere the constant is used so a rename cannot drift silently."""
+    (``filters.search_mode`` ∈ ``lexical|graph|global|sql``, sibling iknow
+    spec); elsewhere the constant is used so a rename cannot drift
+    silently."""
     adapter = _CapturingAdapter()
-    adapter.retrieve("revenue", search_mode="A")
+    adapter.retrieve("revenue", search_mode="lexical")
     arguments = adapter.payloads[0]["params"]["arguments"]
-    assert arguments["filters"] == {"search_mode": "A"}
+    assert arguments["filters"] == {"search_mode": "lexical"}
     assert SEARCH_MODE_FILTER_KEY == "search_mode"
 
 
@@ -913,12 +914,13 @@ def test_graph_rides_alongside_the_edgar_filters() -> None:
 
 
 def test_the_wire_never_carries_a_retired_letter() -> None:
-    """The last honest separation: ``B``/``C`` are host-side spellings of
-    an input, never tokens of this protocol. The adapter hands the letter
+    """The last honest separation: a bare letter is no longer a token of
+    this protocol at all — not an input spelling either, since the entry
+    seams were retokenized in the same stroke. The adapter hands the letter
     to the SAME seam the fake uses, so a retired letter cannot be
     serialized to iknow as if the rename had never happened."""
     adapter = _CapturingAdapter()
-    for letter in ("B", "C"):
+    for letter in ("A", "B", "C", "D"):
         with pytest.raises(InvalidSearchModeError) as excinfo:
             adapter.retrieve("revenue", search_mode=letter)
         assert excinfo.value.code == "invalid_search_mode"
@@ -929,7 +931,7 @@ def test_the_wire_never_carries_a_retired_letter() -> None:
     ("tier", "code"),
     [
         pytest.param("global", TIER_NOT_OPEN, id="tier-global"),
-        pytest.param("D", REAL_DB_NOT_WIRED, id="tier-d"),
+        pytest.param("sql", REAL_DB_NOT_WIRED, id="tier-sql"),
     ],
 )
 def test_an_unopened_tier_is_a_named_exit_without_an_mcp_call(
@@ -951,7 +953,7 @@ def test_an_unopened_tier_is_a_named_exit_without_an_mcp_call(
     ("tier", "code"),
     [
         pytest.param("global", TIER_NOT_OPEN, id="tier-global"),
-        pytest.param("D", REAL_DB_NOT_WIRED, id="tier-d"),
+        pytest.param("sql", REAL_DB_NOT_WIRED, id="tier-sql"),
     ],
 )
 def test_aretrieve_raises_the_typed_tier_error_before_transport(
@@ -996,14 +998,14 @@ def test_an_open_tier_with_an_empty_wire_answer_is_the_legal_miss() -> None:
     """Boundary 'empty' × 档: an accepted 档 that reaches the server and
     finds nothing is the miss shape ``{"chunks": []}`` — and, unlike a
     refused 档, the request DID go out (one payload), so an operator
-    can tell "searched at A, nothing there" from "the port never
+    can tell "searched at lexical, nothing there" from "the port never
     opened that 档"."""
     adapter = _CapturingAdapter()
-    assert adapter.retrieve("foo", search_mode="A") == {"chunks": []}
+    assert adapter.retrieve("foo", search_mode="lexical") == {"chunks": []}
     assert len(adapter.payloads) == 1
     assert (
         adapter.payloads[0]["params"]["arguments"]["filters"]
-        == {SEARCH_MODE_FILTER_KEY: "A"}
+        == {SEARCH_MODE_FILTER_KEY: "lexical"}
     )
 
 
@@ -1012,10 +1014,10 @@ def test_a_tiered_request_sends_the_clamped_limit() -> None:
     wire, so a tiered over-cap request sends ``limit == 20`` beside
     its 档 — the cap is a port rule, not a 档 knob."""
     adapter = _CapturingAdapter()
-    adapter.retrieve("foo", limit=999, search_mode="A")
+    adapter.retrieve("foo", limit=999, search_mode="lexical")
     arguments = adapter.payloads[0]["params"]["arguments"]
     assert arguments["limit"] == 20
-    assert arguments["filters"] == {SEARCH_MODE_FILTER_KEY: "A"}
+    assert arguments["filters"] == {SEARCH_MODE_FILTER_KEY: "lexical"}
 
 
 def test_transport_down_with_an_open_tier_is_still_retrieve_unavailable() -> None:
@@ -1033,7 +1035,7 @@ def test_transport_down_with_an_open_tier_is_still_retrieve_unavailable() -> Non
     ("tier", "code"),
     [
         pytest.param("global", TIER_NOT_OPEN, id="tier-global"),
-        pytest.param("D", REAL_DB_NOT_WIRED, id="tier-d"),
+        pytest.param("sql", REAL_DB_NOT_WIRED, id="tier-sql"),
     ],
 )
 def test_a_closed_tier_keeps_its_name_even_when_the_transport_is_down(
@@ -1056,7 +1058,7 @@ def test_an_illegal_mode_is_named_before_a_broken_transport() -> None:
     ``retrieve_unavailable``."""
     adapter = _ScriptedAdapter(scripted_exception=OSError("down"))
     with pytest.raises(InvalidSearchModeError):
-        adapter.retrieve("foo", search_mode="c")
+        adapter.retrieve("foo", search_mode="sql ")
 
 
 def test_concurrent_tiered_calls_answer_per_call() -> None:
@@ -1088,14 +1090,14 @@ def test_concurrent_tiered_calls_answer_per_call() -> None:
     adapter = _ConcurrentTierAdapter()
 
     def _go(i: int) -> dict:
-        mode = ("A", "graph", "global")[i % 3]
+        mode = ("lexical", "graph", "global")[i % 3]
         return adapter.retrieve("foo", search_mode=mode)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
         results = list(ex.map(_go, range(12)))
 
     expected_chunks = {"chunks": [_chunk("hit", "DOC-2023Q1", score=1.0)]}
-    modes = [("A", "graph", "global")[i % 3] for i in range(12)]
+    modes = [("lexical", "graph", "global")[i % 3] for i in range(12)]
     for mode, result in zip(modes, results):
         if mode == "global":
             assert result == {"error": TIER_NOT_OPEN}
@@ -1107,7 +1109,7 @@ def test_concurrent_tiered_calls_answer_per_call() -> None:
         for payload in adapter.payloads
     ]
     assert sorted(sent_modes) == sorted(
-        m for m in modes if m in ("A", "graph")
+        m for m in modes if m in ("lexical", "graph")
     ), "a refused 档 reached the wire, or an accepted one did not"
 
 
