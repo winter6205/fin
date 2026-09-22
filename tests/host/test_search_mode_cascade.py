@@ -26,6 +26,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+import fin.host.search_mode_decision as smd
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.jev_choice import (
     JEV_CHOICE_EXIT_INVALID_SEARCH_MODE,
@@ -33,6 +34,7 @@ from fin.host.jev_choice import (
     JEV_CHOICE_EXIT_SCHEMA,
     JEV_CHOICE_EXIT_TRANSPORT,
     JEV_CHOICE_EXIT_UNEXPECTED_ERROR,
+    JevChoiceClient,
     JevChoiceError,
 )
 from fin.host.named_failures import REAL_DB_NOT_WIRED, TIER_NOT_OPEN
@@ -62,9 +64,17 @@ def _msgs(text: str) -> list[HumanMessage]:
 
 
 class _JudgeThatThrows:
-    """A judge client that fails outside the typed ``JevChoiceError`` set."""
+    """A judge client that fails outside the typed ``JevChoiceError`` set.
+
+    The kwargs it was handed are recorded, so a containment test can also
+    say what the cascade tried to send before it broke.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
 
     def choose(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
         raise RuntimeError("judge backend down")
 
 
@@ -245,14 +255,51 @@ def test_jev_transport_error_is_a_typed_exit_not_crash() -> None:
 
 
 def test_jev_unexpected_throw_is_contained_as_an_exit() -> None:
+    judge = _JudgeThatThrows()
     decision = decide_search_mode(
         _msgs("what was AAPL net sales in 2023 Q3?"),
-        jev_client=_JudgeThatThrows(),
+        jev_client=judge,
     )
     assert decision.signals.get("mode_jev_exit") == JEV_CHOICE_EXIT_UNEXPECTED_ERROR
     # The type name is the whole diagnostic: an un-typed failure must be
     # attributable on the audit without leaking a message or a traceback.
     assert decision.signals["mode_jev_error_type"] == "RuntimeError"
+    assert decision.search_mode is None
+    assert decision.decision_tier == "clarify"
+    # What it broke on was a request carrying the per-option discriminators,
+    # keyed by exactly the options the 档 cascade offered.
+    (call,) = judge.calls
+    assert set(call["criteria"]) == set(call["options"]) == set(
+        LASTING_RETRIEVE_TIERS
+    )
+
+
+def test_miswired_criteria_is_contained_as_an_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    jev_never_sent_client: tuple[JevChoiceClient, list[dict[str, Any]]],
+) -> None:
+    """The cascade's own landing point for a criteria table that stopped
+    covering the closed set — the residue of adding a 档 to
+    ``LASTING_RETRIEVE_TIERS`` without its gloss. The real client refuses
+    to send it (``ValueError``), and the cascade must still fall through to
+    clarify with no 档 carried, naming the throw as a wiring bug rather
+    than as a judge fact on the audit.
+
+    The 档 lane's twin at the default gate is
+    ``test_miswired_leaf_criteria_is_contained_as_an_exit`` in
+    ``tests/host/test_track_decision.py``: the same containment for the
+    track cascade, kept OUT of this opt-in file so a criteria wiring break
+    fails the plain ``uv run pytest -q`` gate too.
+    """
+    monkeypatch.delitem(smd._JEV_MODE_TIER_GLOSSES, "graph")
+
+    client, sent = jev_never_sent_client
+    decision = decide_search_mode(
+        _msgs("what was AAPL net sales in 2023 Q3?"), jev_client=client
+    )
+    assert sent == []  # the explicit never-sent count (the fixture's raise is the belt)
+    assert decision.signals["mode_jev_exit"] == JEV_CHOICE_EXIT_UNEXPECTED_ERROR
+    assert decision.signals["mode_jev_error_type"] == "ValueError"
     assert decision.search_mode is None
     assert decision.decision_tier == "clarify"
 
