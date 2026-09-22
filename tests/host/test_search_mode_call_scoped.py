@@ -44,6 +44,7 @@ from fin.host.agent_instructions import (
 )
 from fin.host.graph import compile_graph
 from fin.host.scripted_model import ScriptedChatModel
+from fin.host.named_failures import RETIRED_TIER_TOKENS
 from fin.host.search_mode_decision import MODE_LABELS
 from fin.host.session_compaction import session_token_budget
 from fin.host.state import reset_input_state
@@ -189,24 +190,24 @@ def test_messages_for_model_injects_mode_copy_once() -> None:
     out = messages_for_model(
         [HumanMessage(content="what was AAPL revenue?")],
         track="grounded",
-        search_mode="B",
+        search_mode="graph",
     )
     blocks = _mode_blocks(out)
     assert len(blocks) == 1
     assert blocks[0] is out[0]
     assert isinstance(out[0], SystemMessage)
     assert str(out[0].content).count(SEARCH_MODE_INSTRUCTIONS_MARKER) == 1
-    assert MODE_LABELS["B"] in str(out[0].content)
-    assert str(out[0].content).count(MODE_LABELS["B"]) == 1
+    assert MODE_LABELS["graph"] in str(out[0].content)
+    assert str(out[0].content).count(MODE_LABELS["graph"]) == 1
 
 
 def test_messages_for_model_injection_is_idempotent() -> None:
     """Re-feeding the output (re-entry / retry) must not stack a second
     copy — the marker check keeps exactly one block."""
     first = messages_for_model(
-        [HumanMessage(content="q")], track="grounded", search_mode="B"
+        [HumanMessage(content="q")], track="grounded", search_mode="graph"
     )
-    second = messages_for_model(first, track="grounded", search_mode="B")
+    second = messages_for_model(first, track="grounded", search_mode="graph")
     assert len(_mode_blocks(second)) == 1
     assert str(second[0].content).count(SEARCH_MODE_INSTRUCTIONS_MARKER) == 1
 
@@ -227,13 +228,14 @@ def test_unassigned_or_unknown_mode_injects_nothing() -> None:
 
 def test_each_mode_copy_names_only_its_tier() -> None:
     """Every 档 carries its own usage copy naming exactly its label —
-    A 查找 / B 知识问答 / C 综述 / D 真数据库 (CONTEXT 检索档)."""
-    # The copy is keyed one increment ahead of the labels: the lasting
-    # tokens ride beside the letters ``MODE_LABELS`` still produces.
-    assert set(SEARCH_MODE_USAGE_COPY) == set(MODE_LABELS) | {
-        "graph",
-        "global",
-    }
+    查找 / 知识问答 / 综述 / 真数据库 (CONTEXT 检索档)."""
+    # The copy still answers the retired letters (one more increment) and
+    # says the same thing for them as for their lasting tokens.
+    assert set(SEARCH_MODE_USAGE_COPY) == set(MODE_LABELS) | set(
+        RETIRED_TIER_TOKENS
+    )
+    for retired, lasting in RETIRED_TIER_TOKENS.items():
+        assert SEARCH_MODE_USAGE_COPY[retired] == SEARCH_MODE_USAGE_COPY[lasting]
     for mode, label in MODE_LABELS.items():
         content = str(
             messages_for_model(
@@ -313,9 +315,10 @@ def test_model_payload_holds_copy_exactly_once_per_call() -> None:
 
 
 def test_second_turn_new_mode_leaves_first_history_unedited() -> None:
-    """SC2 "call-scoped copy" half 2: turn 2 names B while turn 1 ran A;
-    turn 1's checkpointed messages stay byte-identical (history is
-    NEVER rewritten on a mode change) and the new call carries only B."""
+    """SC2 "call-scoped copy" half 2: turn 2 names 知识问答 (in the
+    retired letter) while turn 1 ran 查找; turn 1's checkpointed messages
+    stay byte-identical (history is NEVER rewritten on a mode change) and
+    the new call carries only the lasting token."""
     model = _RecordingScriptedModel(
         script=[
             AIMessage(content="Answer one."),
@@ -333,7 +336,7 @@ def test_second_turn_new_mode_leaves_first_history_unedited() -> None:
     assert first_history
 
     out2 = _invoke(g, "B档 and 2022 Q3?", tid)
-    assert out2["search_mode_decision"]["search_mode"] == "B"
+    assert out2["search_mode_decision"]["search_mode"] == "graph"
     second_history = [
         (getattr(m, "id", None), str(m.content))
         for m in _checkpoint_messages(g, tid)
@@ -343,8 +346,8 @@ def test_second_turn_new_mode_leaves_first_history_unedited() -> None:
     assert not _mode_blocks(_checkpoint_messages(g, tid))
     last_call = model.captured[-1]
     block = str(_mode_blocks(last_call)[0].content)
-    # The copy names the lasting token even though THIS turn's
-    # decision still carries the letter (rename lands in two steps).
+    # An utterance that names the retired letter reaches both the audit
+    # and the copy as the lasting token.
     assert "检索档 graph" in block
     assert "检索档 A" not in block
 
@@ -379,7 +382,7 @@ def test_typed_fail_grounded_turn_injects_no_copy() -> None:
 def test_copy_reinjected_after_compaction() -> None:
     """ADR 0061 re-inject: the compaction gate rebuilds history via
     ``RemoveMessage``; the NEXT model call of the same run still carries
-    the current turn's (inherited) B copy exactly once."""
+    the current turn's (inherited) 知识问答 copy exactly once."""
     model = _RecordingScriptedModel(
         script=[AIMessage(content="Net sales grew year over year.")]
     )
@@ -407,7 +410,7 @@ def test_copy_reinjected_after_compaction() -> None:
             config=_cfg(tid),
         )
     assert out["search_mode_decision"]["decision_tier"] == "inherit"
-    assert out["search_mode_decision"]["search_mode"] == "B"
+    assert out["search_mode_decision"]["search_mode"] == "graph"
     assert model.captured
     call = model.captured[-1]
     # The history the model sees was rebuilt by the gate: the summary

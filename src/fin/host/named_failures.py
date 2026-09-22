@@ -43,7 +43,8 @@ never by matching prose::
                        distinctness are settled and tested.
     invalid_search_mode
                        the documented invalid-mode code on the retrieve
-                       side: a filters.search_mode outside A|B|C|D
+                       side: a filters.search_mode outside the closed 档
+                       set named by ``fin.retrieve.tiers``
                        (spec search-mode-retrieve.md Boundaries allows
                        it next to tier_not_open; the iknow retrieve
                        schema answers with this token and
@@ -83,11 +84,15 @@ from typing import Final, Iterable, Mapping, Sequence
 # surface every host-side consumer already uses.
 from fin.retrieve.port import RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY
 from fin.retrieve.tiers import (
+    LASTING_RETRIEVE_TIERS,
     REAL_DB_NOT_WIRED,
+    RETIRED_TIER_TOKENS,
     RETRIEVE_TIERS,
     RetrieveTier,
+    TIER_LABELS,
     TIER_NOT_OPEN,
     TIER_UNAVAILABLE_CODE,
+    normalize_tier_token,
 )
 
 
@@ -251,15 +256,21 @@ def retrieve_outcomes_delta(
 def unavailable_tier(requested_tiers: Iterable[str] | None) -> str | None:
     """The first requested 档 that is a plan slot, or ``None``.
 
-    ``requested_tiers`` are the operator's explicit selectors; matching
-    is case-insensitive because a selector is a small closed token, not
-    prose. Only ``C`` / ``D`` are refused here; an unknown token is
-    ignored — this helper never guesses that a string "meant" a 档 (the
-    same closed-list rule as :data:`TIER_UNAVAILABLE_CODE`).
+    ``requested_tiers`` are the operator's explicit selectors; they are
+    resolved through :func:`fin.retrieve.tiers.normalize_tier_token`
+    (case-insensitive, retired spellings included) because a selector is
+    a small closed token, not prose — and because the refusal this feeds
+    is looked up in :data:`TIER_UNAVAILABLE_CODE` by its LASTING token:
+    matching a case-folded or upper-cased spelling against that table by
+    hand would silently miss ``global``. Only ``global`` / ``D`` are
+    refused here; an unknown token is ignored — this helper never guesses
+    that a string "meant" a 档 (the same closed-list rule as
+    :data:`TIER_UNAVAILABLE_CODE`).
     """
     for tier in requested_tiers or ():
-        if str(tier).strip().upper() in TIER_UNAVAILABLE_CODE:
-            return str(tier).strip().upper()
+        lasting = normalize_tier_token(tier)
+        if lasting is not None and lasting in TIER_UNAVAILABLE_CODE:
+            return lasting
     return None
 
 
@@ -267,14 +278,18 @@ __all__ = [
     "COMMUNITY_SUMMARY_INDEX_FAILURE",
     "CORPUS_NOT_READY",
     "EMPTY_FAST_GRAPH_FAILURE",
+    "LASTING_RETRIEVE_TIERS",
     "MAPPING_DROP",
     "REAL_DB_NOT_WIRED",
+    "RETIRED_TIER_TOKENS",
     "RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY",
     "RETRIEVE_TIERS",
     "RetrieveTier",
+    "TIER_LABELS",
     "TIER_NOT_OPEN",
     "TIER_UNAVAILABLE_CODE",
     "named_refusal_reason",
+    "normalize_tier_token",
     "retrieve_blocking_failure",
     "retrieve_outcomes_delta",
     "unavailable_tier",

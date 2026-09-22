@@ -29,6 +29,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.named_failures import REAL_DB_NOT_WIRED, TIER_NOT_OPEN
 from fin.host.run_payload import _run_to_response_payload
+from fin.host.named_failures import LASTING_RETRIEVE_TIERS
 from fin.host.search_mode_decision import (
     MODE_LABELS,
     clarify_options,
@@ -59,9 +60,11 @@ class _ClassifyStub:
         self.payload = payload
         self.raises = raises
         self.calls = 0
+        self.prompts: list[str] = []
 
     def invoke(self, messages: Any, **kwargs: Any) -> AIMessage:
         self.calls += 1
+        self.prompts.append(str(messages[0].content))
         if self.raises:
             raise RuntimeError("classify backend down")
         return AIMessage(content=self.payload)
@@ -81,7 +84,7 @@ def _compile(
 
 
 # ---------------------------------------------------------------------------
-# rules tier: explicit A/B/C/D or 检索档 label names the mode, no LLM
+# rules tier: a named 档 (lasting token, retired letter, or 检索档 label)
 # ---------------------------------------------------------------------------
 
 
@@ -95,17 +98,18 @@ def test_rules_assign_mode_from_tier_letter() -> None:
 
 def test_rules_assign_mode_from_context_label() -> None:
     decision = decide_search_mode(_msgs("知识问答档 what was AAPL 2023 Q3 revenue?"))
-    assert decision.search_mode == "B"
+    assert decision.search_mode == "graph"
     assert decision.decision_tier == "rules"
 
 
 def test_two_different_named_tiers_stay_ambiguous_not_first_match() -> None:
-    """Boundary: a naming that cannot uniquely name A/B/C/D is ambiguous —
-    rules must not pick one and silently call it high-confidence."""
+    """Boundary: a naming that cannot uniquely name one 档 is ambiguous —
+    rules must not pick one and silently call it high-confidence. The
+    retired letter in the naming still resolves to its lasting token."""
     decision = decide_search_mode(_msgs("A档还是B档？"))
     assert decision.search_mode is None
     assert decision.decision_tier == "clarify"
-    assert decision.signals.get("ambiguous_naming") == ["A", "B"]
+    assert decision.signals.get("ambiguous_naming") == ["A", "graph"]
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +121,9 @@ def test_pin_assigns_mode_without_window() -> None:
     decision = decide_search_mode(
         _msgs("what was AAPL net sales in 2023 Q3?"), pinned_mode="B"
     )
-    assert decision.search_mode == "B"
+    # The pin arrives as the retired letter an old client still sends
+    # and is recorded as the lasting token the port will carry.
+    assert decision.search_mode == "graph"
     assert decision.decision_tier == "rules"
     assert decision.signals.get("pinned") is True
     assert decision.options == []  # no window opened by a pin
@@ -125,15 +131,15 @@ def test_pin_assigns_mode_without_window() -> None:
 
 def test_pin_of_unopened_tier_is_typed_fail_not_silent_c() -> None:
     """Boundary 'negative': pin 综述 (a plan-slot 档) → 具名失败 档未开;
-    the residual must not invent ANY mode, and must not be a silent C
-    assignment either."""
+    the residual must not invent ANY mode, and must not be a silent
+    global assignment either. The refusal names the LASTING token."""
     decision = decide_search_mode(
         _msgs("what was AAPL net sales in 2023 Q3?"), pinned_mode="C"
     )
     assert decision.search_mode is None
     assert decision.decision_tier == "typed_fail"
     assert decision.failure_code == TIER_NOT_OPEN
-    assert decision.signals.get("requested_mode") == "C"
+    assert decision.signals.get("requested_mode") == "global"
 
 
 def test_pin_of_real_db_tier_is_typed_fail_with_its_own_code() -> None:
@@ -167,13 +173,13 @@ def test_classify_valid_mode_assigns_llm_tier() -> None:
         _msgs("what was AAPL net sales in 2023 Q3?"), classify_model=stub
     )
     assert stub.calls == 1
-    assert decision.search_mode == "B"
+    assert decision.search_mode == "graph"
     assert decision.decision_tier == "llm"
 
 
 def test_classify_invalid_enum_is_typed_exit_not_silent_c() -> None:
-    """Boundary 'negative': a classify enum outside A|B|C|D names no 档 —
-    typed EXIT, residual clarify, never a silent C."""
+    """Boundary 'negative': a classify enum outside the closed 档 set names
+    no 档 — typed EXIT, residual clarify, never a silent global."""
     stub = _ClassifyStub('{"search_mode": "E"}')
     decision = decide_search_mode(
         _msgs("what was AAPL net sales in 2023 Q3?"), classify_model=stub
@@ -209,8 +215,8 @@ def test_classify_model_error_is_typed_exit_not_crash() -> None:
 
 
 def test_classify_low_confidence_falls_through_to_residual() -> None:
-    """Boundary 'low_confidence' EXIT: an unsure C answer must not assign
-    C either (silent-open ban) — the EXIT falls through."""
+    """Boundary 'low_confidence' EXIT: an unsure default-档 answer must not
+    assign it either (silent-open ban) — the EXIT falls through."""
     stub = _ClassifyStub('{"search_mode": "B", "confidence": 0.1}')
     decision = decide_search_mode(
         _msgs("what was AAPL net sales in 2023 Q3?"), classify_model=stub
@@ -247,7 +253,9 @@ def test_classify_skipped_when_inherit_would_decide() -> None:
         _msgs("and 2022 Q3?"), snapshots=snapshots, classify_model=stub
     )
     assert stub.calls == 0
-    assert decision.search_mode == "B"
+    # A 档 stored before the rename is still inheritable, and what the
+    # turn records is the lasting token.
+    assert decision.search_mode == "graph"
     assert decision.decision_tier == "inherit"
 
 
@@ -266,11 +274,13 @@ def _snap_with_mode(company: str, period: str, mode: str) -> dict[str, Any]:
 
 
 def test_inherit_reuses_last_mode_on_short_follow_up() -> None:
+    # A 档 recorded before the rename still carries the job forward, and
+    # what this turn inherits is the lasting token.
     snapshots = [_snap_with_mode("AAPL", "2023 Q3", "B")]
     decision = decide_search_mode(_msgs("and 2022 Q3?"), snapshots=snapshots)
-    assert decision.search_mode == "B"
+    assert decision.search_mode == "graph"
     assert decision.decision_tier == "inherit"
-    assert decision.signals.get("inherited_mode") == "B"
+    assert decision.signals.get("inherited_mode") == "graph"
 
 
 def test_inherit_blocked_after_company_change_wipe() -> None:
@@ -312,22 +322,46 @@ def test_empty_utterance_residual_clarifies_without_inventing_c() -> None:
 
 def test_clarify_options_are_structured_with_opened_flags() -> None:
     """The Ticket-2 choice window consumes this: ids + operator labels;
-    the SSOT (``TIER_UNAVAILABLE_CODE``) marks C/D unopened — no
-    duplicated 档 enumeration here."""
+    the SSOT (``TIER_UNAVAILABLE_CODE``) marks 综述/真数据库 unopened — no
+    duplicated 档 enumeration here. The ids are the LASTING tokens, so a
+    pick resumes with exactly the value the audit and the port carry."""
     options = clarify_options()
-    assert [o["id"] for o in options] == ["A", "B", "C", "D"]
+    assert [o["id"] for o in options] == ["A", "graph", "global", "D"]
     assert [o["label"] for o in options] == [
-        MODE_LABELS[t] for t in ("A", "B", "C", "D")
+        MODE_LABELS[t] for t in ("A", "graph", "global", "D")
     ]
     assert [o["opened"] for o in options] == [True, True, False, False]
 
 
 def test_normalize_search_mode_closed_set_only() -> None:
-    assert normalize_search_mode(" c ") == "C"
-    assert normalize_search_mode("a") == "A"
     assert normalize_search_mode("E") is None
     assert normalize_search_mode(None) is None
     assert normalize_search_mode(3) is None
+
+
+def test_normalize_lands_every_accepted_spelling_on_a_lasting_token() -> None:
+    """The rename is only real if BOTH halves resolve: a lowercase lasting
+    token arrives intact, and a retired letter normalizes to it. Case and
+    padding stay tolerated (a selector is a closed token, not prose), and
+    the answer is always the token the port will carry."""
+    for spelling, lasting in (
+        ("B", "graph"),
+        (" b ", "graph"),
+        ("C", "global"),
+        (" c ", "global"),
+        ("graph", "graph"),
+        ("GRAPH", "graph"),
+        ("global", "global"),
+        ("Global", "global"),
+        ("A", "A"),
+        (" a ", "A"),
+        ("D", "D"),
+    ):
+        assert normalize_search_mode(spelling) == lasting, spelling
+    assert set(LASTING_RETRIEVE_TIERS) == {
+        normalize_search_mode(spelling)
+        for spelling in ("a", "graph", "global", "D")
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -357,11 +391,11 @@ def test_snapshot_inherit_does_not_wipe_history() -> None:
 
 
 def test_mode_patch_skipped_when_latest_already_carries_mode() -> None:
-    prior = _snap_with_mode("AAPL", "2023 Q3", "B")
-    assert mode_snapshot_patch(prior, "B") == []
+    prior = _snap_with_mode("AAPL", "2023 Q3", "graph")
+    assert mode_snapshot_patch(prior, "graph") == []
     assert mode_snapshot_patch(prior, None) == []
-    assert mode_snapshot_patch(None, "B") == [
-        {"company": "", "period": "", "document_ids": [], "search_mode": "B"}
+    assert mode_snapshot_patch(None, "graph") == [
+        {"company": "", "period": "", "document_ids": [], "search_mode": "graph"}
     ]
 
 
@@ -432,12 +466,37 @@ def test_graph_classify_assigns_mode_after_grounded_rules() -> None:
     )
     assert out["track"] == "grounded"
     assert stub.calls == 1
-    assert out["search_mode_decision"]["search_mode"] == "B"
+    assert out["search_mode_decision"]["search_mode"] == "graph"
     assert out["search_mode_decision"]["decision_tier"] == "llm"
 
 
+def test_classify_prompt_teaches_the_lasting_tokens() -> None:
+    """SC4: nothing the model is told may claim ``B`` / ``C`` are the
+    lasting MCP tokens. The classify seam is where that lesson is taught,
+    so the system message it actually sends has to name ``graph`` /
+    ``global`` — and a reply spelled with a lasting token must assign, or
+    the prompt would be offering a vocabulary the cascade rejects."""
+    stub = _ClassifyStub('{"search_mode": "graph", "confidence": 0.9}')
+    g = _compile(
+        [AIMessage(content="Net sales grew year over year.")],
+        classify_model=stub,
+    )
+    out = g.invoke(
+        {
+            **reset_input_state("what was AAPL net sales in 2023 Q3?"),
+            "evidence": [],
+        },
+        config=_cfg("smc-classify-prompt"),
+    )
+    assert stub.calls == 1
+    prompt = stub.prompts[0]
+    assert '"graph"' in prompt and '"global"' in prompt, prompt
+    assert '"A"|"B"|"C"|"D"' not in prompt, prompt
+    assert out["search_mode_decision"]["search_mode"] == "graph"
+
+
 def test_inherit_across_two_graph_turns_without_a_picker() -> None:
-    """SC2 bullet 2: turn 1 names B via the rules label; a short
+    """SC2 bullet 2: turn 1 names 知识问答 via the rules label; a short
     same-company follow-up inherits ``decision_tier=inherit`` — and the
     append-only snapshot history keeps every earlier entry (overflow:
     inherit never wipes)."""
@@ -450,10 +509,10 @@ def test_inherit_across_two_graph_turns_without_a_picker() -> None:
         },
         config=_cfg(tid),
     )
-    assert out1["search_mode_decision"]["search_mode"] == "B"
+    assert out1["search_mode_decision"]["search_mode"] == "graph"
     assert out1["search_mode_decision"]["decision_tier"] == "rules"
     snaps_after_one = list(out1.get("status_snapshots") or [])
-    assert any(s.get("search_mode") == "B" for s in snaps_after_one)
+    assert any(s.get("search_mode") == "graph" for s in snaps_after_one)
 
     out2 = g.invoke(
         {**reset_input_state("and 2022 Q3?"), "evidence": []},
@@ -461,7 +520,7 @@ def test_inherit_across_two_graph_turns_without_a_picker() -> None:
     )
     assert out2["track"] == "grounded"
     assert out2["search_mode_decision"]["decision_tier"] == "inherit"
-    assert out2["search_mode_decision"]["search_mode"] == "B"
+    assert out2["search_mode_decision"]["search_mode"] == "graph"
     snaps_after_two = list(out2.get("status_snapshots") or [])
     assert len(snaps_after_two) > len(snaps_after_one)
     assert snaps_after_two[: len(snaps_after_one)] == snaps_after_one
@@ -469,7 +528,7 @@ def test_inherit_across_two_graph_turns_without_a_picker() -> None:
 
 def test_search_mode_decision_is_run_scoped() -> None:
     """A new run clears the audit channel (mirror of ``track_decision``
-    reset): the greeting run after a B assignment carries no stale 档."""
+    reset): the greeting run after an assigned 档 carries no stale 档."""
     g = _compile(
         [AIMessage(content="Answer one."), AIMessage(content="Hi! How can I help?")]
     )
@@ -509,7 +568,7 @@ def test_mode_channel_does_not_leak_across_threads() -> None:
         },
         config=_cfg("smc-leak-a"),
     )
-    assert out_a["search_mode_decision"]["search_mode"] == "B"
+    assert out_a["search_mode_decision"]["search_mode"] == "graph"
     out_b = g.invoke(
         {**reset_input_state("and 2022 Q3?"), "evidence": []},
         config=_cfg("smc-leak-b"),
@@ -545,7 +604,7 @@ def test_typed_fail_in_utterance_names_failure_and_invents_no_mode() -> None:
 
 def test_run_payload_mirrors_search_mode_decision() -> None:
     smd = {
-        "search_mode": "B",
+        "search_mode": "graph",
         "confidence": 0.9,
         "decision_tier": "rules",
         "signals": {"pinned": True},

@@ -35,7 +35,7 @@ External blocker: iknow `plans/search-mode-graph-global.md` T1 (library accepts 
    - **Surface:** host search-mode decision / pin / choice window
    - **Acceptance:** assigned 知识问答 records audit `search_mode=graph` before retrieve; 综述 records `global`; utterance/pin `B档`/`C档` do not leave the port as `B`/`C`.
    - `[blocks: T1]`
-   - Status: [ ] pending
+   - Status: [x] done
 
 3. **Port closed set + five-class Fake** — tag: `[implementation]`
    - **Inherits:** spec: omit / `None` → iknow default graph (do not send `B`); port `B`/`C`/`local`/garbage → typed `invalid_search_mode`; global not-ready and D 未接 keep codes; no host re-rank; one retrieve tool.
@@ -47,3 +47,12 @@ External blocker: iknow `plans/search-mode-graph-global.md` T1 (library accepts 
 ## End of round
 
 After T1–T3 land: one code-review phase vs `specs/search-mode-graph-global.md`, then verification-before-completion. Unblocks iknow contract (`B`/`C` refuse).
+
+Host-side normalization is done (T2): `fin.retrieve.tiers.RETIRED_TIER_TOKENS` +
+`normalize_tier_token` are the one authority, and every host entry point (utterance
+rules, HTTP pin, choice-window ids, cascade output, audit `search_mode`) resolves
+through it. `RETRIEVE_TIERS` deliberately stays the superset
+(`A|B|C|D|graph|global`) until T3 lands on `src/fin/retrieve/port.py`; that is where
+it shrinks to `LASTING_RETRIEVE_TIERS` (`A|graph|global|D`) — the port seam still
+accepts `B`/`C` today (`resolve_search_mode("B") == "B"`), so enforcement remains
+T3's job and nothing about the wire changed here.

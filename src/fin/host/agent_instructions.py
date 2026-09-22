@@ -243,10 +243,11 @@ _USAGE_REAL_DB: str = (
     "(MCP filters.search_mode=graph), never on this one."
 )
 
-# ``B`` / ``C`` remain keys for one increment only: the cascade, the pin
-# and the choice-window ids still hand those letters to the lookup below,
-# and a turn that asks for its copy must get it (normalize retiring the
-# letters is the next step, and then these two keys go with them).
+# Every host entry point resolves a retired letter onto its lasting token
+# before it reaches this dict, so ``B`` / ``C`` are read only by a turn
+# whose audit predates the rename (an old checkpoint's ``search_mode``).
+# They go when a run no longer starts with such a thread; until then a
+# legacy turn that asks for its copy must get it.
 SEARCH_MODE_USAGE_COPY: dict[str, str] = {
     "A": _USAGE_LEXICAL,
     "graph": _USAGE_KNOWLEDGE_QA,
@@ -263,8 +264,8 @@ def _usage_copy_for(search_mode: object) -> str | None:
     Exact match first: ``graph`` / ``global`` are lowercase words, so an
     unconditional ``upper()`` would swallow every one of them. The
     upper-cased retry stays behind it because the letters have always been
-    fed in mixed case (pin text, choice-window picks) and are still what
-    the cascade produces this increment.
+    fed in mixed case (pin text, choice-window picks) and a pre-rename
+    audit can still carry one.
     """
     if not isinstance(search_mode, str):
         return None

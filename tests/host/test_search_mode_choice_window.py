@@ -19,7 +19,8 @@ Contract covered here (ADR 0062 HITL, spec SC2 "clarify window" + SC4):
   /threads/{id}/resume`` accepts ``{"pick": ...}``; a send while a
   window is pending keeps the 409 ``concurrent_run`` semantics; the
   body-less crash resume is untouched.
-* optional pin (send ``tiers: ["B"]`` / ``configurable`` pin) assigns
+* optional pin (send ``tiers: ["B"]`` — a retired letter an old client
+  still sends, or a lasting token — / ``configurable`` pin) assigns
   without opening the window (SC4).
 * with the factory flag off (the default), the pre-T2 flow is intact —
   this is what keeps the default-collected suites green.
@@ -137,8 +138,10 @@ def test_choice_window_payload_contract_ids_and_labels() -> None:
     for option in options:
         assert set(option) >= {"id", "label"}
         assert option["id"] and option["label"]
-    assert [o["id"] for o in options] == ["A", "B", "C", "D"]
-    # C/D may be present but marked unopened (spec Clarify bullet).
+    # The ids are the LASTING tokens: the value a pick resumes with is
+    # already the value the audit and the port carry.
+    assert [o["id"] for o in options] == ["A", "graph", "global", "D"]
+    # 综述/真数据库 may be present but marked unopened (spec Clarify bullet).
     assert [o["opened"] for o in options] == [True, True, False, False]
 
 
@@ -150,18 +153,21 @@ def test_resume_pick_assigns_mode_and_grounded_retrieves() -> None:
     out = g.invoke(_input(AMBIGUOUS), config=_cfg(tid))
     assert _interrupt_payload(out) is not None
 
+    # A stale client that still sends the retired letter is resolved to
+    # the lasting token before it is matched against the option ids.
     done = g.invoke(Command(resume="B"), config=_cfg(tid))
     assert not done.get("__interrupt__")
     audit = done["search_mode_decision"]
-    assert audit["search_mode"] == "B"
+    assert audit["search_mode"] == "graph"
     assert audit["decision_tier"] == "operator_pick"
-    assert audit["signals"].get("resume_pick") == "B"
+    assert audit["signals"].get("resume_pick") == "graph"
     assert audit["options"] == []  # the window is consumed once resolved
     assert audit["failure_code"] is None
     # The pick rides the durable snapshot history (inherit source, SC4-
     # adjacent): the CURRENT job now carries the picked 档.
     assert any(
-        s.get("search_mode") == "B" for s in done.get("status_snapshots") or []
+        s.get("search_mode") == "graph"
+        for s in done.get("status_snapshots") or []
     )
     # ...and grounded proceeded: the ONE retrieve tool ran after the pick.
     summaries = done.get("tool_summaries") or []
@@ -205,7 +211,24 @@ def test_pick_of_unopened_tier_is_typed_fail_not_silent_c() -> None:
     assert audit["decision_tier"] == "typed_fail"
     assert audit["failure_code"] == TIER_NOT_OPEN
     assert audit["search_mode"] is None
-    assert audit["signals"].get("requested_mode") == "C"
+    assert audit["signals"].get("requested_mode") == "global"
+
+
+def test_lowercase_lasting_token_pick_resolves() -> None:
+    """The window's own tokens must survive the pick: a lowercase
+    ``graph`` (an option id spelled exactly as emitted) resolves to the
+    知识问答 档 instead of being upper-cased into something that matches no
+    option — and its upper-cased lookalike resolves to the same 档."""
+    for spelling in ("graph", "GRAPH", " Graph "):
+        g = _compile(_ANSWER)
+        tid = f"cw-lowercase-pick-{spelling.strip()}"
+        g.invoke(_input(AMBIGUOUS), config=_cfg(tid))
+        done = g.invoke(Command(resume=spelling), config=_cfg(tid))
+        assert not done.get("__interrupt__"), spelling
+        audit = done["search_mode_decision"]
+        assert audit["search_mode"] == "graph", spelling
+        assert audit["decision_tier"] == "operator_pick", spelling
+        assert audit["signals"].get("resume_pick") == "graph", spelling
 
 
 def test_greeting_dialogue_never_opens_the_window() -> None:
@@ -228,7 +251,7 @@ def test_pin_assigns_mode_without_window() -> None:
     )
     assert not out.get("__interrupt__")
     audit = out["search_mode_decision"]
-    assert audit["search_mode"] == "B"
+    assert audit["search_mode"] == "graph"
     assert audit["decision_tier"] == "rules"
     assert audit["signals"].get("pinned") is True
 
@@ -393,7 +416,7 @@ def test_resume_with_pick_streams_the_completed_run(
     audit = installed._graph.get_state(
         _cfg(thread_id)
     ).values["search_mode_decision"]
-    assert audit["search_mode"] == "B"
+    assert audit["search_mode"] == "graph"
     assert audit["decision_tier"] == "operator_pick"
 
 
@@ -475,6 +498,6 @@ def test_send_with_pinned_tier_skips_the_window(
     audit = installed._graph.get_state(
         _cfg(thread_id)
     ).values["search_mode_decision"]
-    assert audit["search_mode"] == "B"
+    assert audit["search_mode"] == "graph"
     assert audit["decision_tier"] == "rules"
     assert audit["signals"].get("pinned") is True

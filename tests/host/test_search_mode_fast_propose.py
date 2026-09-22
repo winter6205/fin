@@ -203,7 +203,7 @@ def test_pick_fast_records_proposal_never_applies() -> None:
     for snapshot in done.get("status_snapshots") or []:
         assert "extract_method" not in snapshot
     # The 档 (pinned before the window) is unaffected by the pick.
-    assert done["search_mode_decision"]["search_mode"] == "B"
+    assert done["search_mode_decision"]["search_mode"] == "graph"
     assert done["search_mode_decision"]["search_mode"] not in ("Fast", "fast")
 
 
@@ -270,7 +270,7 @@ def test_propose_then_mode_window_chain_never_yields_fast_mode() -> None:
     # window, with the A/B/C/D option list (Fast is not among them).
     mode_payload = _interrupt_payload(resolved)
     assert mode_payload is not None
-    assert _option_ids(mode_payload) == ["A", "B", "C", "D"]
+    assert _option_ids(mode_payload) == ["A", "graph", "global", "D"]
     assert resolved["search_mode_decision"]["search_mode"] not in ("Fast", "fast")
 
     # "fast" is NOT a 档 id: the mode window reopens, never crash.
@@ -282,7 +282,7 @@ def test_propose_then_mode_window_chain_never_yields_fast_mode() -> None:
 
     final = g.invoke(Command(resume="B"), config=_cfg(tid))
     assert not final.get("__interrupt__")
-    assert final["search_mode_decision"]["search_mode"] == "B"
+    assert final["search_mode_decision"]["search_mode"] == "graph"
     assert final["search_mode_decision"]["search_mode"] not in ("Fast", "fast")
     assert final["extract_method_proposal"]["picked"] == "fast"
     assert final["extract_method_proposal"]["applied"] is False
@@ -301,7 +301,7 @@ def test_default_grounded_flow_never_opens_the_window() -> None:
         _input(AMBIGUOUS), config=_cfg("fp-noop", pinned_search_mode="B")
     )
     assert not out.get("__interrupt__")
-    assert out["search_mode_decision"]["search_mode"] == "B"
+    assert out["search_mode_decision"]["search_mode"] == "graph"
     assert out["extract_method_proposal"] == {}
 
 
@@ -327,7 +327,7 @@ def test_lane_off_seed_never_opens_window() -> None:
         _propose_input(AMBIGUOUS), config=_cfg("fp-lane-off", pinned_search_mode="B")
     )
     assert not out.get("__interrupt__")
-    assert out["search_mode_decision"]["search_mode"] == "B"
+    assert out["search_mode_decision"]["search_mode"] == "graph"
     assert out["extract_method_proposal"].get("applied") is not True
     assert out["extract_method_proposal"].get("picked") is None
 
@@ -400,7 +400,7 @@ def test_fast_pick_with_version_context_applies_the_switch(
     stored = _stored_rows(catalog_path)[0]
     assert stored["extract_method"] == "fast"
     assert stored["rebuild_pending"] is True
-    assert done["search_mode_decision"]["search_mode"] == "B"
+    assert done["search_mode_decision"]["search_mode"] == "graph"
     assert done["search_mode_decision"]["search_mode"] not in ("fast", "Fast")
 
 

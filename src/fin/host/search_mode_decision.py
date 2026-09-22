@@ -5,7 +5,7 @@ Mirror of :func:`fin.host.track_decision.decide_track`'s tiered cascade
 ``grounded`` (spec search-mode-host confirmed assumption 2: a
 non-grounded track never reaches this cascade and assigns no 档).
 
-Tier order (no silent default — the residual never names C):
+Tier order (no silent default — the residual never names global):
 
 1. **rules** — a documented pin/override, or an utterance that EXPLICITLY
    names a 档: the letter adjacent to 档 (``A档`` / ``档 B``) or a CONTEXT
@@ -19,17 +19,17 @@ Tier order (no silent default — the residual never names C):
 2. **llm** — structured classify, only when rules miss **and** inherit
    would not already decide (the same peek shape as ``decide_track``, so
    a production classify model cannot steal an inherited 档). JSON names
-   exactly one of ``A|B|C|D``. Typed EXITs
+   exactly one of ``A|graph|global|D``. Typed EXITs
    (``invalid_search_mode`` / ``schema_parse`` / ``model_error`` /
    ``low_confidence``) record ``signals["classify_exit"]`` and fall
-   through: never a crash, never a silent-open C.
+   through: never a crash, never a silent-open global.
 3. **inherit** — a short follow-up on the same thread that stays in the
    same retrieve job (latest status snapshot still has research context;
    no company-change wipe since the last assigned 档) reuses that 档.
 4. **clarify** — the residual: emits the structured option list for the
    operator (the choice-window ``interrupt`` wiring is Ticket 2; this
    ticket only persists the payload data). An unnamed ask keeps
-   ``search_mode=None`` — the residual policy must not default to C.
+   ``search_mode=None`` — the residual policy must not default to global.
 
 A 档 named but not open (per the ``TIER_UNAVAILABLE_CODE`` SSOT — never
 a duplicated enumeration) is a **typed fail** carrying the CONTEXT 具名
@@ -51,9 +51,11 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 # re-enumerated; ``named_failures`` is the host-side import surface for
 # both (see its module docstring).
 from fin.host.named_failures import (
-    RETRIEVE_TIERS,
+    LASTING_RETRIEVE_TIERS,
+    TIER_LABELS,
     TIER_UNAVAILABLE_CODE,
     RetrieveTier,
+    normalize_tier_token,
 )
 # Package-internal reuse of the Soft-Track cascade primitives (utterance
 # extraction, latest-snapshot context, company-change detection): SSOT
@@ -97,14 +99,10 @@ SearchModeDecisionTier = Literal[
     "rules", "llm", "inherit", "clarify", "typed_fail", "operator_pick"
 ]
 
-# Operator-visible labels (CONTEXT terms). SSOT-adjacent: these are the
-# same four names the retrieve tiers document.
-MODE_LABELS: dict[str, str] = {
-    "A": "查找",
-    "B": "知识问答",
-    "C": "综述",
-    "D": "真数据库",
-}
+# Operator-visible labels (CONTEXT terms). Aliased, not re-spelled: the
+# retrieve 档 SSOT owns the four names so the choice window, an utterance
+# and the copy cannot drift from each other.
+MODE_LABELS: dict[str, str] = TIER_LABELS
 
 _LABEL_TO_MODE: dict[str, str] = {label: mode for mode, label in MODE_LABELS.items()}
 
@@ -119,35 +117,34 @@ _INHERIT_MAX_LEN = 48
 
 _CLASSIFY_SYSTEM = (
     "Classify this grounded knowledge question into exactly one 检索档. "
-    'Reply with JSON only: {"search_mode": "A"|"B"|"C"|"D"} where '
-    "A 查找, B 知识问答, C 综述, D 真数据库."
+    'Reply with JSON only: {"search_mode": "A"|"graph"|"global"|"D"} '
+    "where A 查找, graph 知识问答, global 综述, D 真数据库."
 )
 
-# A 档 is NAMED (high-confidence) only next to the 档 marker — a letter
-# or CONTEXT label adjacent to 档. Bare words in question prose are NOT
-# scanned (``fin.host.named_failures`` T6 note).
+# A 档 is NAMED (high-confidence) only next to the 档 marker — a lasting
+# token, a retired letter, or a CONTEXT label adjacent to 档. Bare words
+# in question prose are NOT scanned (``fin.host.named_failures`` T6 note).
 _TIER_NAMING_RE = re.compile(
-    r"([ABCD])\s*档|档\s*([ABCD])"
+    r"(graph|global|[ABCD])\s*档|档\s*(graph|global|[ABCD])"
     r"|(查找|知识问答|综述|真数据库)\s*档|档\s*(查找|知识问答|综述|真数据库)",
     re.IGNORECASE,
 )
 
 
 def normalize_search_mode(raw: object) -> SearchMode | None:
-    """Map a wire/classify/pin token onto the closed 档 set.
+    """Map a wire/classify/pin/pick token onto the lasting 档 tokens.
+
+    The alias map is :mod:`fin.retrieve.tiers`' — this is the host-side
+    call of the same total function, kept as the name the cascade and the
+    pin seams already use.
 
     Deliberately NOT :func:`fin.retrieve.port.resolve_search_mode`:
     that raises at the port seam; the cascade must OBSERVE an
     out-of-set token (typed EXIT) and keep falling through, so it needs
     a total function here. Openness (``TIER_UNAVAILABLE_CODE``) is
-    checked by the caller so ``C``/``D`` can route to 具名失败.
+    checked by the caller so ``global``/``D`` can route to 具名失败.
     """
-    if not isinstance(raw, str):
-        return None
-    mapped = raw.strip().upper()
-    if mapped in RETRIEVE_TIERS:
-        return mapped  # type: ignore[return-value]
-    return None
+    return normalize_tier_token(raw)  # type: ignore[return-value]
 
 
 @dataclass(frozen=True)
@@ -187,19 +184,21 @@ def clarify_options() -> list[dict[str, Any]]:
     Every 档 the operator can READ is listed (spec: an unopened one may
     appear, marked as such); ``opened`` reads the
     ``TIER_UNAVAILABLE_CODE`` SSOT so a newly opened 档 flips here and
-    nowhere else.
+    nowhere else. The option ``id`` is the LASTING token, so the pick an
+    operator resumes with is already the value the audit and the port
+    carry — nothing has to translate it on the way.
     """
-    # The closed set can already carry a lasting token that the label map
-    # has not adopted yet (the rename lands in the labels one increment
-    # later). An option with no label is not a choice an operator can
-    # make, so the window follows the label map and nothing else.
+    # The label map is what makes a token a choice an operator can read,
+    # so the window follows it and nothing else; a lasting 档 added to
+    # the closed set without a label stays out of the window until it is
+    # named for the operator too.
     return [
         {
             "id": mode,
             "label": MODE_LABELS[mode],
             "opened": mode not in TIER_UNAVAILABLE_CODE,
         }
-        for mode in RETRIEVE_TIERS
+        for mode in LASTING_RETRIEVE_TIERS
         if mode in MODE_LABELS
     ]
 
@@ -330,7 +329,7 @@ def _try_classify(
 ) -> SearchModeDecision | None:
     """Attempt the structured search-mode classify. On any typed EXIT,
     record ``classify_exit`` and return ``None`` so the cascade falls
-    through — a failed classify must neither crash nor open C."""
+    through — a failed classify must neither crash nor open global."""
     try:
         raw = classify_model.invoke(
             [
@@ -375,8 +374,8 @@ def _try_classify(
 
     signals["llm_mode"] = mode
     if confidence_f < _MIN_CLASSIFY_CONFIDENCE:
-        # An unsure name of C must not assign C either: the ban is on
-        # SILENT C, and low-confidence is precisely a silent answer.
+        # An unsure name of global must not assign it either: the ban is
+        # on SILENT global, and low-confidence is precisely a silent answer.
         signals["classify_exit"] = "low_confidence"
         signals["low_confidence"] = True
         return None
@@ -427,7 +426,7 @@ def decide_search_mode(
         return inherit_hit
 
     # Residual: no single default 档 (spec: the residual must not open
-    # C). Clarify emits the structured option list; Ticket 2 turns it
+    # global). Clarify emits the structured option list; Ticket 2 turns it
     # into the choice-window interrupt.
     signals["clarify"] = True
     return SearchModeDecision(

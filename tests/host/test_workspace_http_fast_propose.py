@@ -51,7 +51,8 @@ pytestmark = [pytest.mark.soft_track]
 
 KNOWN_IDS = {"AAPL-2022Q3", "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
-# Grounded by the track rules tier; ``tiers:["B"]`` pins the 档 so the
+# Grounded by the track rules tier; ``tiers:["B"]`` (the retired letter,
+# which the pin normalizes to its lasting token) pins the 档 so the
 # ONLY possible window on these sends is the extract-method one.
 AMBIGUOUS = "What was AAPL net sales in 2023 Q3?"
 
@@ -204,7 +205,7 @@ def test_resume_fast_after_send_records_confirmed_proposal(
     # The 档 pin is untouched by the method pick (Fast is never a 档).
     assert _state_values(installed, thread_id)["search_mode_decision"][
         "search_mode"
-    ] == "B"
+    ] == "graph"
 
 
 # ---------------------------------------------------------------------------

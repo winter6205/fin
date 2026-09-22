@@ -170,6 +170,7 @@ from fin.host.track_decision import (
 from fin.host.search_mode_decision import (
     apply_operator_pick,
     clarify_options,
+    normalize_search_mode,
     search_mode_update_for_turn,
 )
 from fin.host.extract_method_proposal import (
@@ -2616,13 +2617,20 @@ def compile_graph(
             if rejected:
                 window["rejected_picks"] = list(rejected)
             raw = str(interrupt(window) or "").strip()
-            key = raw.upper()
-            if any(str(option.get("id")) == key for option in options):
+            # The option ids are lasting tokens and the pick is resolved
+            # against them through the alias map — upper-casing a pick
+            # here would destroy the lowercase ones and reject a client
+            # that still sends a retired letter.
+            picked = normalize_search_mode(raw)
+            if picked is not None and any(
+                str(option.get("id")) == picked for option in options
+            ):
                 break
             rejected.append(raw)
+        assert picked is not None  # reached only through the match above
         merged = apply_operator_pick(
             decision,
-            pick=key,
+            pick=picked,
             snapshots=state.get("status_snapshots"),
             rejected=rejected,
         )

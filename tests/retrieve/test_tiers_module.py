@@ -127,12 +127,49 @@ def test_tiers_module_is_public_via_dunder_all() -> None:
     import fin.retrieve.tiers as tiers
 
     assert set(tiers.__all__) == {
+        "LASTING_RETRIEVE_TIERS",
         "REAL_DB_NOT_WIRED",
+        "RETIRED_TIER_TOKENS",
         "RETRIEVE_TIERS",
         "RetrieveTier",
+        "TIER_LABELS",
         "TIER_NOT_OPEN",
         "TIER_UNAVAILABLE_CODE",
+        "normalize_tier_token",
     }
+
+
+def test_the_alias_map_is_the_one_authority_for_retired_spellings() -> None:
+    """The rename needs exactly one map, or a surface that forgets to read
+    it starts forwarding a token the wire no longer carries. Every lasting
+    token it points at must itself be a member of the closed set, and no
+    entry may point at another retired spelling (a chain would make the
+    normalize order-dependent)."""
+    from fin.retrieve.tiers import (
+        LASTING_RETRIEVE_TIERS,
+        RETIRED_TIER_TOKENS,
+        RETRIEVE_TIERS,
+        TIER_LABELS,
+        normalize_tier_token,
+    )
+
+    assert RETIRED_TIER_TOKENS == {"B": "graph", "C": "global"}
+    assert set(RETIRED_TIER_TOKENS.values()) <= set(RETRIEVE_TIERS)
+    assert LASTING_RETRIEVE_TIERS == tuple(
+        token for token in ("A", "graph", "global", "D")
+    )
+    assert set(TIER_LABELS) == set(LASTING_RETRIEVE_TIERS)
+    # Nothing the map already resolves needs a second lookup.
+    for retired, lasting in RETIRED_TIER_TOKENS.items():
+        assert normalize_tier_token(retired) == lasting
+        assert normalize_tier_token(retired.lower()) == lasting
+        assert lasting not in RETIRED_TIER_TOKENS
+    # The letters are still accepted as wire tokens by the closed set
+    # until the port retires them; the map is what keeps them OUT of the
+    # host's own output.
+    assert set(RETRIEVE_TIERS) == set(LASTING_RETRIEVE_TIERS) | set(
+        RETIRED_TIER_TOKENS
+    )
 
 
 # ----- 2. named_failures re-exports the SAME objects -----
