@@ -9,7 +9,8 @@ Contract covered here (ADR 0062 HITL, spec SC2 "clarify window" + SC4):
 * grounded + ``decision_tier == "clarify"`` pauses the run BEFORE any
   model / retrieve call on a LangGraph ``interrupt`` whose payload is
   the choice window (``kind`` + non-empty ``options`` of ``{id,label}``,
-  global/sql present but marked unopened).
+  综述 opened so global/graph/lexical are marked opened and only sql is
+  marked unopened).
 * ``Command(resume=pick)`` assigns the picked 档 (auditable
   ``decision_tier="operator_pick"`` + ``signals.resume_pick``) and the
   grounded leaf then proceeds (retrieve runs).
@@ -52,7 +53,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.named_failures import TIER_NOT_OPEN
+from fin.host.named_failures import REAL_DB_NOT_WIRED
 from fin.host.state import reset_input_state
 
 pytestmark = [pytest.mark.soft_track]
@@ -141,8 +142,9 @@ def test_choice_window_payload_contract_ids_and_labels() -> None:
     # The ids are the LASTING tokens: the value a pick resumes with is
     # already the value the audit and the port carry.
     assert [o["id"] for o in options] == ["lexical", "graph", "global", "sql"]
-    # 综述/真数据库 may be present but marked unopened (spec Clarify bullet).
-    assert [o["opened"] for o in options] == [True, True, False, False]
+    # 综述 opened: lexical/graph/global are all marked opened; only
+    # 真数据库 (``sql``) remains the unopened plan slot in the window.
+    assert [o["opened"] for o in options] == [True, True, True, False]
 
 
 def test_resume_pick_assigns_mode_and_grounded_retrieves() -> None:
@@ -209,18 +211,36 @@ def test_invalid_pick_reopens_window_then_valid_pick_resolves() -> None:
 
 
 def test_pick_of_unopened_tier_is_typed_fail_not_silent_substitute() -> None:
-    """Boundary 'negative': the operator picking 综述 (unopened) gets the
-    具名失败 on the audit — the cascade never substitutes another 档."""
+    """Boundary 'negative': the operator picking 真数据库 (``sql``, the one
+    plan slot still unopened) gets the 具名失败 on the audit — the cascade
+    never substitutes another 档. This negative case moved off 综述 once
+    综述 opened."""
     g = _compile(_ANSWER)
     tid = "cw-unopened-pick"
+    g.invoke(_input(AMBIGUOUS), config=_cfg(tid))
+    done = g.invoke(Command(resume="sql"), config=_cfg(tid))
+    assert not done.get("__interrupt__")
+    audit = done["search_mode_decision"]
+    assert audit["decision_tier"] == "typed_fail"
+    assert audit["failure_code"] == REAL_DB_NOT_WIRED
+    assert audit["search_mode"] is None
+    assert audit["signals"].get("requested_mode") == "sql"
+
+
+def test_pick_of_the_opened_综述_assigns_global() -> None:
+    """综述 opened: a ``global`` pick from the window is now a clean
+    operator assignment (never a typed_fail) — the window's marked-open
+    option and the assigned 档 agree."""
+    g = _compile(_ANSWER)
+    tid = "cw-global-pick"
     g.invoke(_input(AMBIGUOUS), config=_cfg(tid))
     done = g.invoke(Command(resume="global"), config=_cfg(tid))
     assert not done.get("__interrupt__")
     audit = done["search_mode_decision"]
-    assert audit["decision_tier"] == "typed_fail"
-    assert audit["failure_code"] == TIER_NOT_OPEN
-    assert audit["search_mode"] is None
-    assert audit["signals"].get("requested_mode") == "global"
+    assert audit["decision_tier"] == "operator_pick"
+    assert audit["failure_code"] is None
+    assert audit["search_mode"] == "global"
+    assert audit["signals"].get("resume_pick") == "global"
 
 
 def test_lowercase_lasting_token_pick_resolves() -> None:

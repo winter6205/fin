@@ -104,6 +104,7 @@ from fin.host.evidence_admission import (
 )
 from fin.host.memory_port import MemoryPort
 from fin.host.named_failures import (
+    copy_recorded_job_facts,
     named_refusal_reason,
     retrieve_outcomes_delta,
 )
@@ -188,7 +189,7 @@ from fin.retrieve.degradation import (
 )
 from fin.retrieve.hit_mapping import MappingFailureLedger, ledger_from_env
 from fin.retrieve.input_validation import InputValidationError
-from fin.retrieve.port import RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY, RetrievePort
+from fin.retrieve.port import RetrievePort
 from fin.retrieve.read_port import MissReadPort, ReadPort
 from fin.retrieve.tool import retrieve
 
@@ -814,10 +815,11 @@ def _make_retrieve_tool(
             "chunks": len(serialized_chunks),
             "mapping_failures": ledger.count_on_this_thread(),
         }
-        if result.get(RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY) is True:
-            # A RECORDED Fast job fact rides the run record so the
-            # citation gate can name the method, not just the empty set.
-            call_outcome[RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY] = True
+        # A RECORDED job fact (Fast empty-graph, or the global 综述
+        # index-not-ready refusal) rides the run record so the citation gate
+        # can name the job, not just the empty set. One shared copy helper,
+        # keyed by the named_failures job-fact table — no per-flag branch here.
+        copy_recorded_job_facts(result, call_outcome)
         return Command(
             update={
                 "messages": [tool_message],

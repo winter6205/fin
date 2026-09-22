@@ -21,16 +21,22 @@ never by matching prose::
                        zero chunks with zero mapping failures
     mapping_drop       retrieve returned hits, but every hit failed to
                        map to a fin locator (mapping ledger count > 0)
-    tier_not_open      检索档 global 综述 is a plan slot, not
-                       implemented (token formerly spelled ``C``)
+    tier_not_open      a 检索档 that is a routing-time plan slot, not a
+                       real arm (token formerly spelled ``C`` for global
+                       综述). The global 档 is now open, so this code has
+                       no live producer; it stays in the public vocabulary
+                       as a distinct, reserved exit, and 「档未开」 is not
+                       what a runtime summary-index failure is (that is
+                       ``community_summary_index_failure`` below)
     real_db_not_wired  检索档 sql 真数据库 is a plan slot, not
                        implemented (token formerly spelled ``D``)
     community_summary_index_failure
-                       reserved for once global 综述 ships as an open 档:
-                       its 社区 summary index is then not-ready (the
+                       the open global 综述 档's runtime not-ready exit:
+                       its 社区 summary index is not-ready (the
                        Leiden/community-summary job failed or summaries
                        are incomplete, ADR 0064 / 0078) — a runtime
-                       fact, distinct from 「档未开」
+                       fact, distinct from 「档未开」, and never invented
+                       from a bare empty
     empty_fast_graph_failure
                        the Fast 抽图 job built an EMPTY entity-relation
                        graph over the 资料 set (spec
@@ -83,8 +89,12 @@ from typing import Final, Iterable, Mapping, Sequence
 # it and may not import ``fin.host`` (``fin.host.graph`` imports the
 # port; review F3). Re-exported here unchanged: this stays the import
 # surface every host-side consumer already uses.
-from fin.retrieve.port import RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY
+from fin.retrieve.port import (
+    RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY,
+    RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY,
+)
 from fin.retrieve.tiers import (
+    COMMUNITY_SUMMARY_INDEX_FAILURE,
     LASTING_RETRIEVE_TIERS,
     REAL_DB_NOT_WIRED,
     RETRIEVE_TIERS,
@@ -102,16 +112,18 @@ CORPUS_NOT_READY: Final[str] = "corpus_not_ready"
 
 MAPPING_DROP: Final[str] = "mapping_drop"
 
-# Reserved for once global 综述 ships as an open 档: its 社区 summary
-# index can then be not-ready (the Leiden / community-summary job failed
-# or produced incomplete summaries — ADR 0064 / 0078). That would be a
-# runtime index fact, deliberately NOT ``tier_not_open``: today the 综述
-# token is still a plan slot (``TIER_UNAVAILABLE_CODE`` routes it there),
-# and once it is open, telling the operator to name a different 档 for an
-# index-job failure would be wrong advice. Public wire token pinned by
-# ``specs/search-mode-retrieve.md`` (Boundaries), shared with the
-# iknow-memory side.
-COMMUNITY_SUMMARY_INDEX_FAILURE: Final[str] = "community_summary_index_failure"
+# The global 综述 档 is open, and this is its runtime not-ready exit: the
+# 社区 summary index the report arm reads is absent or unpopulated (the
+# Leiden / community-summary job failed or produced incomplete summaries —
+# ADR 0064 / 0078). It is deliberately NOT ``tier_not_open`` (the 档 runs a
+# real arm now) and never invented from a bare empty (that stays
+# ``corpus_not_ready``). The value is DEFINED in the neutral leaf
+# :mod:`fin.retrieve.tiers` so the retrieve adapter can match it without a
+# host import; re-exported here so every host-side surface keeps working.
+# Public wire token pinned by ``specs/search-mode-retrieve.md`` (Boundaries),
+# shared with the iknow-memory side.
+# ``COMMUNITY_SUMMARY_INDEX_FAILURE`` is imported from ``fin.retrieve.tiers``
+# above and re-exported via ``__all__`` below.
 
 # The Fast 抽图 job's empty-graph exit (spec graph-index-standard-fast
 # SC5): a typed 具名失败, deliberately NOT ``corpus_not_ready`` (the
@@ -135,6 +147,70 @@ EMPTY_FAST_GRAPH_FAILURE: Final[str] = "empty_fast_graph_failure"
 # ----- the retrieve-side decision -----
 
 
+# The RECORDED job facts, in the priority order that resolves a blocking
+# failure ahead of the mapping / empty-collection readings: a recorded job
+# fact EXPLAINS the empty, so it outranks the inference. One row is the
+# whole contract — adding a 档's job fact appends here and nowhere else,
+# never a new boolean in the decision or a new copy branch at a call site.
+# The order between these two is immaterial (a send is never
+# simultaneously a 综述 and a Fast-graph send); the tuple spelling keeps
+# the resolution data-driven rather than an if-ladder.
+_RETRIEVE_JOB_FACTS: Final[tuple[tuple[str, str], ...]] = (
+    (RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY, EMPTY_FAST_GRAPH_FAILURE),
+    (
+        RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY,
+        COMMUNITY_SUMMARY_INDEX_FAILURE,
+    ),
+)
+
+_JOB_FACT_KEYS: Final[frozenset[str]] = frozenset(
+    key for key, _ in _RETRIEVE_JOB_FACTS
+)
+
+
+def _valid_counts(record: object) -> tuple[int, int] | None:
+    """The ``(chunks, mapping_failures)`` of a contract-conforming record.
+
+    ``None`` when the record contributes nothing — a non-Mapping, or a
+    non-int count. An invented failure is worse than skipping an
+    unreadable record, so both the decision and the delta rebuild treat a
+    malformed entry this one way.
+    """
+    if not isinstance(record, Mapping):
+        return None
+    chunks = record.get("chunks")
+    failures = record.get("mapping_failures")
+    if not isinstance(chunks, int) or not isinstance(failures, int):
+        return None
+    return chunks, failures
+
+
+def _recorded_job_fact_keys(record: Mapping[str, object]) -> set[str]:
+    """The job-fact keys this record explicitly marks ``True``.
+
+    Only an explicit ``True`` is the fact: fin never upgrades a plain
+    empty collection into a job failure, so a lookalike or absent flag is
+    left out here exactly as it is by the copy helper below.
+    """
+    return {key for key in _JOB_FACT_KEYS if record.get(key) is True}
+
+
+def copy_recorded_job_facts(
+    source: Mapping[str, object],
+    target: dict[str, object],
+) -> dict[str, object]:
+    """Copy every RECORDED job fact from ``source`` onto ``target``.
+
+    Shared by the tool seam (``fin.host.graph._make_retrieve_tool``) and
+    the :func:`retrieve_outcomes_delta` rebuild so one more job fact is one
+    row in :data:`_RETRIEVE_JOB_FACTS`, not a second copy site. Returns
+    ``target`` for chaining.
+    """
+    for key in _recorded_job_fact_keys(source):
+        target[key] = True
+    return target
+
+
 def retrieve_blocking_failure(
     outcomes: Iterable[Mapping[str, object]] | None,
 ) -> str | None:
@@ -151,37 +227,37 @@ def retrieve_blocking_failure(
     guessing a cause: an invented failure is worse than the verifier's
     reason.
 
-    A record may additionally carry the RECORDED Fast job fact under
-    :data:`RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY`, and only an explicit
-    ``True`` is that fact: fin never upgrades a plain empty collection
-    into the Fast failure (that would blame a job which never reported
-    one). When the run ends with no chunk anywhere, the job fact wins
-    over the mapping / empty-collection readings — an empty Fast graph
-    EXPLAINS why nothing mapped or matched, and the operator's fix is
-    the extract method, not ingest.
+    A record may additionally carry a RECORDED job fact — the Fast 抽图
+    empty-graph fact under :data:`RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY` or the
+    global 综述 index-not-ready fact under
+    :data:`RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY` — and only an
+    explicit ``True`` is that fact: fin never upgrades a plain empty
+    collection into a job failure (that would blame a job which never
+    reported one). When the run ends with no chunk anywhere, a recorded
+    job fact wins over the mapping / empty-collection readings, because it
+    EXPLAINS why nothing mapped or matched; :data:`_RETRIEVE_JOB_FACTS`
+    carries that priority.
     """
     saw_call = False
-    saw_fast_graph_empty = False
+    recorded_job_facts: set[str] = set()
     mapping_failures = 0
     for record in outcomes or ():
-        if not isinstance(record, Mapping):
+        counts = _valid_counts(record)
+        if counts is None:
             continue
-        chunks = record.get("chunks")
-        failures = record.get("mapping_failures")
-        if not isinstance(chunks, int) or not isinstance(failures, int):
-            continue
+        chunks, failures = counts
         saw_call = True
         if chunks > 0:
             # Retrieval worked at least once this run: a later refusal
             # is the verifier's to make, not retrieve's to pre-empt.
             return None
-        if record.get(RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY) is True:
-            saw_fast_graph_empty = True
+        recorded_job_facts |= _recorded_job_fact_keys(record)
         mapping_failures = max(mapping_failures, failures)
     if not saw_call:
         return None
-    if saw_fast_graph_empty:
-        return EMPTY_FAST_GRAPH_FAILURE
+    for key, code in _RETRIEVE_JOB_FACTS:
+        if key in recorded_job_facts:
+            return code
     if mapping_failures > 0:
         return MAPPING_DROP
     return CORPUS_NOT_READY
@@ -212,7 +288,7 @@ def retrieve_outcomes_delta(
     records: Sequence[Mapping[str, object]] | None,
     *,
     baseline: int,
-) -> list[dict[str, int]]:
+) -> list[dict[str, object]]:
     """The ``retrieve_outcomes`` entries recorded since ``baseline``.
 
     The counts are clamped to ``>= 0``. The live caller reads its
@@ -229,29 +305,25 @@ def retrieve_outcomes_delta(
     unreadable measurement take down a tool call that is otherwise
     fine.
 
-    A RECORDED Fast job fact (an explicit ``True`` under
-    :data:`RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY`) rides the rebuild — the
-    tool seam reconstructs records through this helper, and dropping
-    the fact here would erase the only path the decision has to see
-    it. Any other flag value (absent, False, a lookalike) is left off
-    the rebuilt record: the output shape stays the plain two-count
-    contract for every ordinary call.
+    A RECORDED job fact (an explicit ``True`` under a
+    :data:`_RETRIEVE_JOB_FACTS` key) rides the rebuild — the tool seam
+    reconstructs records through this helper, and dropping the fact here
+    would erase the only path the decision has to see it. Any other flag
+    value (absent, False, a lookalike) is left off the rebuilt record: the
+    output shape stays the plain two-count contract for every ordinary
+    call.
     """
-    out: list[dict[str, int]] = []
+    out: list[dict[str, object]] = []
     for record in records or ():
-        if not isinstance(record, Mapping):
+        counts = _valid_counts(record)
+        if counts is None:
             continue
-        chunks = record.get("chunks")
-        failures = record.get("mapping_failures")
-        if not isinstance(chunks, int) or not isinstance(failures, int):
-            continue
-        entry: dict[str, int] = {
+        chunks, failures = counts
+        entry: dict[str, object] = {
             "chunks": chunks,
             "mapping_failures": max(failures - baseline, 0),
         }
-        if record.get(RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY) is True:
-            entry[RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY] = True
-        out.append(entry)
+        out.append(copy_recorded_job_facts(record, entry))
     return out
 
 
@@ -265,10 +337,10 @@ def unavailable_tier(requested_tiers: Iterable[str] | None) -> str | None:
     — as a 422 input error before this helper is reached. So the lookup in
     :data:`TIER_UNAVAILABLE_CODE` is exact and nothing is normalized here:
     a normalize step would quietly accept a shape the door already refuses,
-    which is the second vocabulary the rename forbids. Only ``global`` /
-    ``sql`` are refused here; an unknown token is ignored — this helper
-    never guesses that a string "meant" a 档 (the same closed-list rule as
-    :data:`TIER_UNAVAILABLE_CODE`).
+    which is the second vocabulary the rename forbids. Only ``sql`` is
+    refused here (``global`` 综述 is now an open 档); an unknown token is
+    ignored — this helper never guesses that a string "meant" a 档 (the same
+    closed-list rule as :data:`TIER_UNAVAILABLE_CODE`).
     """
     for tier in requested_tiers or ():
         if tier in TIER_UNAVAILABLE_CODE:
@@ -283,12 +355,14 @@ __all__ = [
     "LASTING_RETRIEVE_TIERS",
     "MAPPING_DROP",
     "REAL_DB_NOT_WIRED",
+    "RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY",
     "RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY",
     "RETRIEVE_TIERS",
     "RetrieveTier",
     "TIER_LABELS",
     "TIER_NOT_OPEN",
     "TIER_UNAVAILABLE_CODE",
+    "copy_recorded_job_facts",
     "named_refusal_reason",
     "normalize_tier_token",
     "retrieve_blocking_failure",

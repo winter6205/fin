@@ -362,13 +362,16 @@ def test_dialogue_turn_injects_no_copy() -> None:
 
 
 def test_typed_fail_grounded_turn_injects_no_copy() -> None:
-    """An unopened 档 (综述) is a typed fail with ``search_mode=None``:
-    the grounded model call runs with NO copy — nothing was assigned."""
+    """An unopened 档 (sql 真数据库) is a typed fail with
+    ``search_mode=None``: the grounded model call runs with NO copy —
+    nothing was assigned. (``global`` 综述 used to be the unopened 档 here;
+    it is now an open report arm, so ``sql`` carries the same typed-fail
+    contract.)"""
     model = _RecordingScriptedModel(
         script=[AIMessage(content="Net sales grew.")]
     )
     g = _compile(model)
-    out = _invoke(g, "综述档 what was AAPL net sales in 2023 Q3?", "smcp-typed-fail")
+    out = _invoke(g, "sql档 what was AAPL net sales in 2023 Q3?", "smcp-typed-fail")
     assert out["search_mode_decision"]["decision_tier"] == "typed_fail"
     assert out["search_mode_decision"]["search_mode"] is None
     for call in model.captured:
