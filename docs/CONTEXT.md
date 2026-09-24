@@ -144,7 +144,7 @@ The tagged-numbers format inside official 10-Q/10-K iXBRL. Not a website; SEC.go
 _Avoid_: using XBRL as a product or hostname, conflating it with iknow-memory retrieve
 
 **read_source**:
-The selected model-facing name for a known-locator source read, currently exposed in code as `read_file`: it resolves one authorized source unit from the company corpus or active-thread attachment without requiring a `retrieve` hit in the same run. A bounded read starts at position zero or at the returned Unicode-code-point `next_position`; only text returned in this run may become citation evidence (ADRs 0046 and 0088).
+The selected model-facing name for a known-locator source read, currently exposed in code as `read_file`: it resolves one authorized source unit from the company corpus or active-thread attachment without requiring a `retrieve` hit in the same run. Each read returns at most 8,000 Unicode code points and a complete serialized response of at most 32 KiB, including on the backend wire; continuation uses a zero-based code-point `next_position`, and only text returned in this run may become citation evidence (ADRs 0046 and 0088).
 _Avoid_: read_file as the future tool name, read_locator, read_page, read_chunk, treating read as retrieve, reading embeddings
 
 **ingest endpoint**:
@@ -152,7 +152,7 @@ The product job that parses, applies **切分** from the format parameter table,
 _Avoid_: chunk-any-string tool, model-chosen split points, EDGAR form name as the root document type
 
 **thread attach**:
-An operator-submitted file held by fin under a logical `attachment_id` for the **research thread** lifetime. Fin owns its parsed text and thread-private searchable index, which remains reusable across turns; the host binds reads to the trusted active thread, and deleting the thread removes its attachments and index. Attaching alone never pushes it into the permanent company corpus (ADRs 0083, 0085, and 0088).
+An operator-submitted file under a logical `attachment_id` for the **research thread** lifetime; fin owns its durable bytes, parsed units, thread-private searchable index, and `parsing`/`ready`/`failed` state. `ready` requires a usable index, including after restart; the host binds access to the active thread, deletion removes its attachment data, and attaching never pushes it into the permanent company corpus (ADRs 0083, 0085, 0086, and 0088).
 _Avoid_: treating drag-into-chat as corpus ingest, model-visible filesystem paths, injecting the attachment body into the prompt, page-only attachment browsing
 
 **corpus ingest**:
