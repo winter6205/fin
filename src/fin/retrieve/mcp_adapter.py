@@ -120,10 +120,12 @@ from fin.retrieve.mcp_session import (
     MCPStdioSession,
 )
 from fin.retrieve.port import (
+    RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY,
     SEARCH_MODE_FILTER_KEY,
     TierUnavailableError,
     resolve_search_mode,
 )
+from fin.retrieve.tiers import COMMUNITY_SUMMARY_INDEX_FAILURE
 
 
 _DEFAULT_LIMIT = 8
@@ -463,6 +465,64 @@ def _merge_degradation_signals(
     if not degraded:
         return NOT_DEGRADED
     return DegradationSignal(degraded=True, degraded_reasons=tuple(reasons))
+
+
+def _named_error_code_of_body(body: object) -> str | None:
+    """The named error code a decoded ``tools/call`` body carries, if any.
+
+    Every named refusal this adapter reads projects its code the same way
+    — a JSON body with a string ``error`` field (``read_source_not_found``
+    and friends, the global 综述 refusal) — so the field is read here
+    once and no caller has to match a code against prose.
+    """
+    if not isinstance(body, Mapping):
+        return None
+    code = body.get("error")
+    return code if isinstance(code, str) else None
+
+
+def _is_community_summary_not_ready(result: dict[str, Any]) -> bool:
+    """Whether an MCP ``tools/call`` result is the global 综述 report arm's
+    typed community-summary not-ready refusal.
+
+    The upstream surfaces it as an ``isError`` result whose first text
+    content block carries the JSON body ``{error:
+    "community_summary_index_failure", message: <prose>}``, and the
+    structured field is the whole name: the code is read off the decoded
+    body with the same field read the ``read_source`` miss body uses, never
+    searched for in the message, because a transport fault is free to
+    quote the token in its own prose. A refusal so named is a RECORDED job
+    fact about the report index — distinct from a transport fault (which
+    carries no such field and must stay ``retrieve_unavailable``) and from
+    a legal empty hit (which is not an error at all).
+
+    Only the FIRST text block is judged: a body that will not decode is a
+    decisive miss for this result, so the scan stops there instead of
+    treating later blocks as candidate envelopes.
+    """
+    if result.get("isError") is not True:
+        return False
+    content = result.get("content")
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if not isinstance(block, Mapping) or block.get("type") != "text":
+            continue
+        text = block.get("text")
+        if not isinstance(text, str):
+            continue
+        try:
+            body = json.loads(text)
+        except ValueError as exc:
+            logger.debug(
+                "community-summary error text is not JSON: %s",
+                exc,
+            )
+            return False
+        return (
+            _named_error_code_of_body(body) == COMMUNITY_SUMMARY_INDEX_FAILURE
+        )
+    return False
 
 
 # ----- adapter -----
@@ -913,6 +973,16 @@ class MCPRetrieveAdapter:
                     f"MCP returned non-dict result: {result!r}",
                     envelope_signal,
                 )
+        # A global 综述 report-index not-ready refusal is a recorded job
+        # fact, not a transport fault: hand back the empty-plus-flag
+        # envelope so the host names the summary-index failure for the
+        # operator instead of letting the content-block unwrap below
+        # collapse it into ``retrieve_unavailable``.
+        if _is_community_summary_not_ready(result):
+            return {
+                "chunks": [],
+                RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY: True,
+            }
         # Variant 3: content-block envelope. Unwrap only when the
         # block carries neither the canonical ``chunks`` key nor the
         # legacy ``hits`` key — otherwise the block's ``content`` key
@@ -1101,10 +1171,8 @@ def _read_body_of_content(result: Mapping[str, Any]) -> Any:
         except ValueError:
             return _READ_MISS_SENTINEL
         if isinstance(inner, Mapping):
-            error_code = inner.get("error")
-            if isinstance(error_code, str) and error_code.startswith(
-                "read_source_"
-            ):
+            code = _named_error_code_of_body(inner)
+            if code is not None and code.startswith("read_source_"):
                 return _READ_MISS_SENTINEL
             body = inner.get("content")
             if isinstance(body, str):

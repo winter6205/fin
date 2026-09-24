@@ -1061,14 +1061,13 @@ def test_bm25_mirrors_the_tier_named_exits_without_ranking() -> None:
 
     assert adapter.retrieve("revenue", search_mode="lexical") == {"chunks": []}
     assert adapter.retrieve("revenue", search_mode="graph") == {"chunks": []}
+    # 综述 opened: it is now an accepted 档 on EVERY RetrievePort shape,
+    # answered with the ordinary (empty) result rather than a named refusal.
+    assert adapter.retrieve("revenue", search_mode="global") == {"chunks": []}
 
     with pytest.raises(InvalidSearchModeError) as excinfo:
         adapter.retrieve("revenue", search_mode="B")
     assert excinfo.value.code == "invalid_search_mode"
-
-    with pytest.raises(TierUnavailableError) as excinfo:
-        adapter.retrieve("revenue", search_mode="global")
-    assert excinfo.value.code == "tier_not_open"
 
     with pytest.raises(TierUnavailableError) as excinfo:
         adapter.retrieve("revenue", search_mode="sql")

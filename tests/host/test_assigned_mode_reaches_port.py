@@ -11,10 +11,12 @@ the injected copy text and nothing else.
 What is pinned here, in order:
 
 * the POSITIVE hop — an assigned 知识问答 sends ``graph``, an assigned
-  查找 sends ``lexical`` (spec SC2);
+  查找 sends ``lexical``, and (since 综述 opened) an assigned 综述 sends
+  ``global`` — all three lasting open tokens ride the same hop (spec SC2);
 * the ABSENT assignment — a refused / unassigned turn sends no 档 at all
-  (``None`` → the port omits the key → iknow's own default), and a
-  refused 综述 never becomes a token through this hop (SC3 / SC6);
+  (``None`` → the port omits the key → iknow's own default), and the one
+  plan slot still refused at routing, 真数据库 (``sql``), never becomes a
+  token through this hop (SC3 / SC6);
 * the INVALID assignment — the hop forwards the audit VERBATIM, so a
   retired letter that somehow survives in state is named by the port as
   ``invalid_search_mode`` instead of being guessed into a 档;
@@ -163,20 +165,37 @@ def test_an_assigned_查找_sends_lexical_on_the_port() -> None:
     assert _modes(port) == ["lexical"]
 
 
-# ----- the absent assignment (SC2 / SC6) -----
-
-
-def test_a_refused_综述_sends_no_档_and_never_a_substitute() -> None:
-    """综述 refuses earlier as 具名失败, so the hop has nothing to send.
-    ``None`` must stay ``None`` (the port then omits the key) — the hop
-    may not turn a refusal into a guessed 档."""
+def test_an_assigned_综述_sends_global_on_the_port() -> None:
+    """综述 opened into a real report arm: naming it is now the POSITIVE
+    hop, not a refusal — the port is handed exactly ``global``, never
+    ``None``, never a substitute 档."""
     port = _port()
     out = _run(_compile(port), _utterance("global"), "hop-global")
 
+    assert out["track"] == "grounded"
     audit = out["search_mode_decision"]
-    assert audit["failure_code"] == "tier_not_open"
+    assert audit["search_mode"] == "global"
+    assert audit["failure_code"] is None
+    modes = _modes(port)
+    assert modes, "the grounded retrieve must have reached the port"
+    assert modes == ["global"] * len(modes), modes
+
+
+# ----- the absent assignment (SC2 / SC6) -----
+
+
+def test_a_refused_真数据库_sends_no_档_and_never_a_substitute() -> None:
+    """真数据库 refuses earlier as 具名失败, so the hop has nothing to
+    send. ``None`` must stay ``None`` (the port then omits the key) — the
+    hop may not turn a refusal into a guessed 档. This invariant moved off
+    综述 when 综述 opened: ``sql`` is now the surviving plan slot."""
+    port = _port()
+    out = _run(_compile(port), _utterance("sql"), "hop-sql")
+
+    audit = out["search_mode_decision"]
+    assert audit["failure_code"] == "real_db_not_wired"
     assert audit["search_mode"] is None
-    assert audit["signals"].get("requested_mode") == "global"
+    assert audit["signals"].get("requested_mode") == "sql"
     modes = _modes(port)
     assert modes, "the scripted retrieve still runs its ordinary query"
     assert modes == [None] * len(modes), modes
@@ -280,9 +299,10 @@ def test_a_grounded_run_puts_the_档_on_the_wire_filters() -> None:
 
 def test_a_refused_turn_puts_no_档_key_on_the_wire() -> None:
     """The absent half AT THE WIRE: no assignment → no key, so iknow
-    answers with its own default instead of a 档 fin invented."""
+    answers with its own default instead of a 档 fin invented. 真数据库
+    (``sql``) is the refused turn now that 综述 routes a real token."""
     adapter = _CapturingMcpAdapter()
-    _run(_compile(adapter), _utterance("global"), "wire-global")
+    _run(_compile(adapter), _utterance("sql"), "wire-sql")
 
     arguments = _arguments(adapter)
     assert arguments, "the scripted retrieve still ran"
@@ -333,7 +353,11 @@ def test_two_runs_on_one_cached_graph_carry_their_own_档() -> None:
         known_document_ids=KNOWN_IDS,
     ) is graph
 
-    expected = [("graph", "graph"), ("lexical", "lexical"), ("global", None)]
+    expected = [
+        ("graph", "graph"),
+        ("lexical", "lexical"),
+        ("global", "global"),
+    ]
     for spelling, lasting in expected:
         model._index = 0
         model.script = _script()
@@ -342,7 +366,12 @@ def test_two_runs_on_one_cached_graph_carry_their_own_档() -> None:
         modes = _modes(port, since=before)
         assert modes and modes == [lasting] * len(modes), (spelling, modes)
 
-    # No run's 档 rode another run's call, and a retired letter never
-    # reached the wire at all.
-    assert [m for m in _modes(port) if m is not None] == ["graph", "lexical"]
+    # All three opened 档 rode their OWN run's call — three distinct
+    # lasting tokens on one cached graph, no leakage between runs, and a
+    # retired letter never reached the wire at all.
+    assert [m for m in _modes(port) if m is not None] == [
+        "graph",
+        "lexical",
+        "global",
+    ]
     assert not set(_modes(port)) & set(RETIRED_LETTERS)

@@ -374,7 +374,6 @@ def test_tool_wrapper_forwards_search_mode_to_the_port() -> None:
 @pytest.mark.parametrize(
     ("tier", "code"),
     [
-        pytest.param("global", "tier_not_open", id="tier-global"),
         pytest.param("sql", "real_db_not_wired", id="tier-sql"),
     ],
 )
@@ -383,7 +382,9 @@ def test_fake_refuses_an_unopened_tier_like_the_product_adapter(
 ) -> None:
     """Fake is not a 档: it mirrors the named exit rather than quietly
     answering with its dictionary lookup (spec SC8 — Fake covers the
-    contract, not the ranking)."""
+    contract, not the ranking). Only ``sql`` remains an unopened 档 after
+    global was opened; the next test pins that global now mirrors the
+    product adapter by ACCEPTING the token."""
     from fin.retrieve.port import TierUnavailableError
 
     port = FakeRetrievePort(hits_by_query={"foo": [_chunk("hit")]})
@@ -391,6 +392,16 @@ def test_fake_refuses_an_unopened_tier_like_the_product_adapter(
         port.retrieve("foo", search_mode=tier)
     assert excinfo.value.code == code
     assert port.calls == []
+
+
+def test_fake_accepts_global_like_the_product_adapter() -> None:
+    """Opening global (fin task 4) means the Fake mirrors the port the
+    same way it mirrors lexical/graph: the token resolves, is recorded on
+    ``calls``, and answers the ordinary hit list — no 「档未开」raise."""
+    port = FakeRetrievePort(hits_by_query={"foo": [_chunk("hit")]})
+    result = port.retrieve("foo", search_mode="global")
+    assert [c.text for c in result["chunks"]] == ["hit"]
+    assert port.calls[-1]["search_mode"] == "global"
 
 
 def test_fake_raises_invalid_search_mode_like_the_product_adapter() -> None:
@@ -441,7 +452,7 @@ def test_an_unopened_tier_never_degrades_into_an_empty_chunk_answer() -> None:
     )
 
     port = FakeRetrievePort(hits_by_query={"foo": [_chunk("hit")]})
-    for token in ("global", "sql", "A", "D"):
+    for token in ("sql", "A", "D"):
         with pytest.raises((TierUnavailableError, InvalidSearchModeError)):
             port.retrieve("foo", search_mode=token)
     assert port.calls == []
@@ -515,11 +526,11 @@ def test_the_limit_cap_holds_under_an_open_tier() -> None:
 
 def test_concurrent_tiered_calls_answer_per_call() -> None:
     """Boundary 'concurrent' × 档: parallel calls on one shared fake —
-    an accepted 档 answers with the same hit list, an unopened one
-    raises its own named error, an illegal one raises
-    ``InvalidSearchModeError``, and ``calls`` records ONLY the accepted
-    requests each carrying its OWN mode (a refused 档 must not leak a
-    record, another thread's or its own)."""
+    each accepted 档 answers with the same hit list, an illegal one
+    raises ``InvalidSearchModeError``, and ``calls`` records ONLY the
+    accepted requests each carrying its OWN mode (a refused token must
+    not leak a record, another thread's or its own). After global was
+    opened it is an accepted mode beside lexical/graph."""
     from fin.retrieve.port import InvalidSearchModeError, TierUnavailableError
 
     chunks = [_chunk(f"hit {i}") for i in range(5)]
@@ -543,10 +554,8 @@ def test_concurrent_tiered_calls_answer_per_call() -> None:
 
     expected_texts = [c.text for c in chunks]
     for mode, payload in results:
-        if mode in ("lexical", "graph"):
+        if mode in ("lexical", "graph", "global"):
             assert payload == expected_texts, mode
-        elif mode == "global":
-            assert payload == ("tier", "tier_not_open")
         else:
             # Exception class × 档: a refused token raises through the
             # shared port instead of answering one thread with a hit and
@@ -554,10 +563,11 @@ def test_concurrent_tiered_calls_answer_per_call() -> None:
             assert payload == ("invalid",)
 
     recorded = [call["search_mode"] for call in port.calls]
-    assert len(recorded) == 8
+    assert len(recorded) == 12
     assert recorded.count("lexical") == 4
     assert recorded.count("graph") == 4
-    assert "global" not in recorded and "Z" not in recorded
+    assert recorded.count("global") == 4
+    assert "Z" not in recorded
 
 
 # ----- recorded Fast 抽图 job fact (spec graph-index-standard-fast SC5) -----

@@ -656,8 +656,8 @@ class SendMessageRequest(BaseModel):
     attachment_ids: list[str] = Field(default_factory=list)
     # The explicit 检索档 selector. Empty (the default) is the ordinary
     # send — the model resolves the track as it always has. A caller that
-    # NAMES an unimplemented 档 (global 综述 / sql 真数据库) gets the named
-    # 400 BEFORE any run starts; the product never opens a document
+    # NAMES a still-unimplemented 档 (sql 真数据库) gets the named 400
+    # BEFORE any run starts; the product never opens a document
     # retrieve dressed as SQL, and never guesses a 档 from the question
     # prose (the wayfinder doc forbids an open-ended 业务意图桶). The enum
     # is derived from the SSOT closed set (:mod:`fin.retrieve.tiers`)
