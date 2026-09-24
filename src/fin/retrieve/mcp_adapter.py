@@ -495,6 +495,10 @@ def _is_community_summary_not_ready(result: dict[str, Any]) -> bool:
     fact about the report index — distinct from a transport fault (which
     carries no such field and must stay ``retrieve_unavailable``) and from
     a legal empty hit (which is not an error at all).
+
+    Only the FIRST text block is judged: a body that will not decode is a
+    decisive miss for this result, so the scan stops there instead of
+    treating later blocks as candidate envelopes.
     """
     if result.get("isError") is not True:
         return False
@@ -509,7 +513,11 @@ def _is_community_summary_not_ready(result: dict[str, Any]) -> bool:
             continue
         try:
             body = json.loads(text)
-        except ValueError:
+        except ValueError as exc:
+            logger.debug(
+                "community-summary error text is not JSON: %s",
+                exc,
+            )
             return False
         return (
             _named_error_code_of_body(body) == COMMUNITY_SUMMARY_INDEX_FAILURE
