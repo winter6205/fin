@@ -363,9 +363,33 @@ def test_a_global_send_reaches_the_server_and_surfaces_the_runtime_index_failure
         "the server refused the ``global`` token itself, so fin's closed "
         f"set does not match what iknow accepts: {observed}"
     )
-    assert COMMUNITY_SUMMARY_INDEX_FAILURE in observed, (
+    # Pin the wire shape the way the adapter actually reads it: decode
+    # the first text block and match its structured ``error`` FIELD.
+    # Substring containment over the serialized response would pass on a
+    # prose mention too, so it could not detect producer drift.
+    result = response.get("result")
+    assert isinstance(result, dict) and result.get("isError") is True, (
+        f"expected an isError result envelope: {observed}"
+    )
+    first_text = next(
+        (
+            block["text"]
+            for block in result.get("content", [])
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ),
+        None,
+    )
+    assert first_text is not None, (
+        f"the refusal carried no text block: {observed}"
+    )
+    body = json.loads(first_text)
+    assert isinstance(body, dict) and body.get("error") == (
+        COMMUNITY_SUMMARY_INDEX_FAILURE
+    ), (
         "the 综述 arm is not ready on this stack, and that is the fact the "
-        f"server should answer with: {observed}"
+        f"server should name in the error field: {observed}"
     )
 
     # fin's own seam: 综述 is open, so the adapter forwards global to the

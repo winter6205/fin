@@ -1095,7 +1095,7 @@ def test_an_open_global_over_a_down_transport_is_retrieve_unavailable() -> None:
 # merely happens to contain the token for the summary job.
 
 
-def _is_error_result(*, text: str) -> dict:
+def _an_error_result(*, text: str) -> dict:
     """A ``tools/call`` result envelope whose first content block is a
     text carrying ``text`` — the shape the transport boundary wraps every
     failure in, structured body or bare prose alike."""
@@ -1110,7 +1110,7 @@ def _is_error_result(*, text: str) -> dict:
 def _community_summary_error_result(*, message: str) -> dict:
     """The upstream 综述 refusal on the wire: an ``isError`` result whose
     first text block carries the named error body, ``message`` as prose."""
-    return _is_error_result(
+    return _an_error_result(
         text=json.dumps(
             {
                 "error": COMMUNITY_SUMMARY_INDEX_FAILURE,
@@ -1157,7 +1157,7 @@ def test_an_iserror_without_the_token_stays_retrieve_unavailable() -> None:
     generic ``retrieve_unavailable`` EXIT — fin never invents a
     summary-index job fact out of an unrelated failure."""
     adapter = _ScriptedAdapter(
-        scripted_response=_is_error_result(text="worker crashed unexpectedly")
+        scripted_response=_an_error_result(text="worker crashed unexpectedly")
     )
     assert adapter.retrieve("foo", search_mode="global") == {
         "error": "retrieve_unavailable"
@@ -1170,7 +1170,7 @@ def test_the_token_in_transport_prose_alone_is_not_the_job_fact() -> None:
     token (a retry log line, a stack trace, an echo of the request) has
     no structured error field, so it is still ``retrieve_unavailable``."""
     adapter = _ScriptedAdapter(
-        scripted_response=_is_error_result(
+        scripted_response=_an_error_result(
             text=(
                 "worker exited while replaying: "
                 f"{COMMUNITY_SUMMARY_INDEX_FAILURE} "
@@ -1188,7 +1188,7 @@ def test_a_named_error_field_with_another_code_is_not_the_job_fact() -> None:
     code — even one spelling the summary token as a fragment — is not
     the 综述 job fact and stays ``retrieve_unavailable``."""
     adapter = _ScriptedAdapter(
-        scripted_response=_is_error_result(
+        scripted_response=_an_error_result(
             text=json.dumps(
                 {
                     "error": (
@@ -1270,6 +1270,19 @@ def test_the_summary_token_only_counts_on_a_first_text_block() -> None:
                 {
                     "type": "text",
                     "text": json.dumps([COMMUNITY_SUMMARY_INDEX_FAILURE]),
+                }
+            ],
+        }
+    ) is False
+    # isError, a JSON object that parses cleanly but carries no ``error``
+    # field at all — an unrelated failure names no code → False.
+    assert _is_community_summary_not_ready(
+        {
+            "isError": True,
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps({"message": "transport detail"}),
                 }
             ],
         }
