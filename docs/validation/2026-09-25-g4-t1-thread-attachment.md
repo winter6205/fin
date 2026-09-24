@@ -115,7 +115,8 @@ obligation.
 Closed by runs 17–23, so they are no longer open questions:
 
 - **B1 closed** — `test_live_host_graph_hop.py` passes (run 19) against real
-  stdio + real Elasticsearch.
+  stdio + real Elasticsearch, with the qualification recorded under
+  *Correction to runs 19 and 23*.
 - **B3 closed** — `jq` and the Compose plugin were installed; `test_fin_launcher`
   29 passed, `tests/host/test_compile.py` 21 passed (run 17, 18). This also
   corrected a wrong path in an earlier draft of this record: the compose
@@ -139,20 +140,22 @@ Closed by runs 17–23, so they are no longer open questions:
 
 Still open, with the reason:
 
-- **B2b** `tests/host/test_live_fin_launcher_acceptance.py` — still not run, and
-  the reason is now precise rather than "missing prerequisites". The toolchain
-  gate is cleared (run 22) and `web/dist` builds clean, but two hard stops
-  remain: (i) the suite's own teardown runs a bare `fin down`, and
-  `scripts/dev-down.sh` issues `docker compose down` against **both** compose
-  projects, which would delete this machine's dev Postgres, Elasticsearch and
-  Neo4j; (ii) `fin up` cannot come up cleanly anyway, because the iknow-memory
-  compose file wants to *create* `iknow-memory-postgres`, while the container on
-  `:5432` is a hand-run one with no compose labels and a different volume, so a
-  real attempt collides on the name and would land on an empty volume with
-  `bound_collection_name=unbound`. Clearing it needs the operator's iknow
-  Postgres brought under that compose project (or `FIN_IKNOW_ROOT` pointed at a
-  self-consistent checkout) plus authorization for that teardown. What *is*
-  proven about the launcher is its hermetic layer, 29 cases in run 17.
+- **B2b attempted (run 24), still blocked on one named cause.** The two
+  candidate stops listed here before the run were resolved differently than
+  expected. (i) The teardown hazard is real — the suite's `fin down` did delete
+  three Compose containers — and it is survivable, so it is not a blocker; see
+  *What run 24 cost the machine*. (ii) The name collision is the blocker, and
+  `docker stop` does **not** clear it: `Error response from daemon: Conflict.
+  The container name "/iknow-memory-postgres" is already in use by container
+  "9824bfa07bc2…". You have to remove (or rename) that container`. The operator
+  must either bring that hand-run Postgres under the sibling's Compose project
+  or point `FIN_IKNOW_ROOT` at a self-consistent checkout; renaming or removing
+  someone else's container is outside this ticket's authority, so the worker
+  stopped and reported instead of forcing it. What is now proven about the
+  launcher: its hermetic layer (29 cases, run 17) plus preflight, build,
+  fin-owned Postgres health, `fin check`, and MCP reachability on the real box.
+  What remains unproven: full-stack `fin up`, `fin status` consistency, the
+  `.fin/ready` verdict, `fin logs`, and the 409-then-admit path.
 - **B4** Not run: browser-level check of the Composer attachment chips. The
   web suite runs in a node environment with no DOM, so chip rendering,
   the withheld-attachment line, and the retry control are covered at the
@@ -248,7 +251,10 @@ Compose-managed dev Postgres brought up on `5433` (healthcheck `healthy`);
 Elasticsearch (`9200`) and Neo4j (`7687`) built and started from the sibling
 `/home/winner/projects/iknow-memory/docker-compose.yml`; a pgvector Postgres on
 host `5434` so that the pre-existing **non-Compose** `iknow-memory-postgres` on
-`5432` was never touched.
+`5432` would never need touching. That last clause held for runs 17–23 and then
+**stopped holding** at run 24, whose attempt did stop and restart that container
+(without renaming, removing, or recreating it) — the full accounting is under
+*What run 24 cost the machine*.
 
 | # | Command | Exit | Result |
 | --- | --- | --- | --- |
@@ -259,6 +265,44 @@ host `5434` so that the pre-existing **non-Compose** `iknow-memory-postgres` on
 | 21 | `uv run --no-sync pytest -q tests/host/test_thread_attachment_durable.py tests/host/test_thread_attach.py` | 0 | 44 passed — the toolchain and service changes did not disturb the attachment slice |
 | 22 | `bash scripts/dev-up.sh --check` | 0 | `dev-up: check ok` — the launcher's toolchain gate is no longer a blocker |
 | 23 | `npm run build` (that repo's own `"build": "tsc -p tsconfig.json"`) in the sibling, then `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_search_modes_pg_es.py` and the four neighbor groups | 0 | the build was a **byte-level no-op** (identical sha256 before/after on the three inspected files, mtime only); `test_live_search_modes_pg_es.py` is now **11 passed, 0 failed**, and the neighbors show no regression: graph hop 1, read_source + corpus_ingest + research_cite 6, mcp t2–t5 5 |
+| 24 | `uv run --no-sync pytest -q -m mcp tests/host/test_live_fin_launcher_acceptance.py` | 1 | **5 errors, 0 failures**, all from one fixture cause (21s): `fin up` exits 1 before serving, at the iknow-memory compose step. Everything of the launcher that does not depend on that step proved to work on the real box — preflight gates, build, fin's own Postgres `:5433` reported `Healthy`, `fin check`, and a direct `probe_knowledge_mcp()` call answering `reachable` over real stdio + ES + Neo4j. Classified as un-wired environment, not a product defect |
+
+### What run 24 cost the machine, and how it was proven restored
+
+The teardown risk this section previously warned about **materialized and was
+recovered**, so it is recorded as an event rather than a hypothesis. The suite's
+own `fin down` deleted the three Compose-managed containers
+(`fin-wt-g4-t1-postgres-1`, `iknow-memory-es`, `iknow-memory-neo4j`); all three
+were brought back with identical names, ports, project labels and health, on
+**their original named volumes** (`…_postgres-data`,
+`iknow-memory-infra_iknow-memory-es`, `-neo4j` — each created before this
+session, and ES still holds the `iknow-memory-chunks` index). Container ids
+changed; data did not.
+
+Two residues were left deliberately, because removing storage is not this
+ticket's call: the empty volume `iknow-memory-infra_iknow-memory-pg` created by
+the failed `up` at 01:56, and an anonymous Neo4j `/logs` volume. Verified after
+the fact: `docker inspect iknow-memory-postgres` still reports id
+`9824bfa07bc2…` and creation `2026-09-24T14:32:03Z` with volume
+`iknow-memory-pg-test` — the operator's own container was **stopped and started,
+never renamed or removed**.
+
+Restore was proven by execution, not by `docker ps`:
+`tests/host/test_thread_attach.py` → 19 passed, and
+`tests/retrieve/test_live_host_graph_hop.py` → 1 passed.
+
+### Correction to runs 19 and 23: the graph-hop pass needed an explicit DB URL
+
+Run 19 was recorded as "passes against real stdio + real Elasticsearch", which
+is true, but incomplete in a way that matters. With **no** env override that
+case targets `:5432`, where the hand-run `iknow-memory-postgres` has only the
+superuser `postgres` role — no `iknow_memory` role or database — and it fails
+`FATAL: role "iknow_memory" does not exist`. That fact predates every operation
+in this ticket. Runs 19 and 23 passed because they set
+`FIN_LIVE_IKNOW_DB_URL=…@localhost:5434/iknow_memory`, i.e. against the separate
+pgvector instance this ticket started. B1's closure therefore stands as
+*live-stdio-plus-live-Elasticsearch coverage on a box configured for it*, not as
+"a default-configuration pass".
 
 ### The two workers disagreed about `dist/`, and that is the real F1a evidence
 
