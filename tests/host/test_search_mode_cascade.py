@@ -8,7 +8,7 @@ Five boundary classes (spec Boundaries "Test classes"), mapped to names:
 
 * empty      -> ``test_empty_utterance_residual_clarifies_without_inventing_c``
 * negative   -> ``test_jev_label_outside_the_closed_set_is_a_typed_exit`` /
-                ``test_pin_of_unopened_tier_is_typed_fail_not_silent_substitute``
+                ``test_pin_of_real_db_tier_is_typed_fail_with_its_own_code``
 * overflow   -> ``test_cascade_has_no_step_cap_of_its_own`` /
                 ``test_snapshot_inherit_does_not_wipe_history``
 * concurrent -> ``test_mode_channel_does_not_leak_across_threads`` (the
@@ -37,7 +37,7 @@ from fin.host.jev_choice import (
     JevChoiceClient,
     JevChoiceError,
 )
-from fin.host.named_failures import REAL_DB_NOT_WIRED, TIER_NOT_OPEN
+from fin.host.named_failures import REAL_DB_NOT_WIRED
 from fin.host.run_payload import _run_to_response_payload
 from fin.host.named_failures import LASTING_RETRIEVE_TIERS
 from fin.host.search_mode_decision import (
@@ -200,17 +200,18 @@ def test_pin_assigns_mode_without_window() -> None:
     assert decision.options == []  # no window opened by a pin
 
 
-def test_pin_of_unopened_tier_is_typed_fail_not_silent_substitute() -> None:
-    """Boundary 'negative': pin 综述 (a plan-slot 档) → 具名失败 档未开;
-    the residual must not invent ANY mode, and must not be a silent
-    global assignment either. The refusal names the LASTING token."""
+def test_pin_of_the_global_tier_is_now_assigned_not_a_typed_fail() -> None:
+    """Boundary flipped by opening global (fin task 4): pin 综述 no longer
+    exits 具名失败 档未开 — the cascade assigns the LASTING token at the
+    rules tier, exactly as it assigns graph/lexical. This is the opposite
+    of the old 「不 invent 档」 failure; sql still owns that path (next test)."""
     decision = decide_search_mode(
         _msgs("what was AAPL net sales in 2023 Q3?"), pinned_mode="global"
     )
-    assert decision.search_mode is None
-    assert decision.decision_tier == "typed_fail"
-    assert decision.failure_code == TIER_NOT_OPEN
-    assert decision.signals.get("requested_mode") == "global"
+    assert decision.search_mode == "global"
+    assert decision.decision_tier == "rules"
+    assert decision.failure_code is None
+    assert decision.signals.get("pinned") is True
 
 
 def test_pin_of_real_db_tier_is_typed_fail_with_its_own_code() -> None:
@@ -374,8 +375,9 @@ def test_miswired_criteria_is_contained_as_an_exit(
 @pytest.mark.parametrize("label", ["global", "graph"])
 def test_jev_low_confidence_falls_through_to_residual(label: str) -> None:
     """Boundary 'low_confidence' EXIT: an unsure name must not decide,
-    whether it names an unopened 档 or an OPEN one (silent-open ban) --
-    the EXIT falls through either way."""
+    whichever 档 it names -- the ban is on a SILENT assignment, and now
+    that ``global`` is open a low-confidence 综述 is refused exactly like a
+    low-confidence ``graph``. The EXIT falls through either way."""
     fake = FakeJevChoice([(label, 0.1)])
     decision = decide_search_mode(
         _msgs("what was AAPL net sales in 2023 Q3?"), jev_client=fake
@@ -386,17 +388,19 @@ def test_jev_low_confidence_falls_through_to_residual(label: str) -> None:
     assert decision.options  # the choice window still gets its data
 
 
-def test_jev_naming_unopened_tier_is_typed_fail() -> None:
+def test_jev_naming_the_global_tier_is_assigned_at_the_jev_tier() -> None:
+    """Opened global flipped this exit: a judge naming 综述 now assigns
+    the 档 at the ``jev`` tier instead of a typed 「档未开」failure. The
+    judge's own label still rides the audit, and the refusal code is gone
+    (fin never invents a failure for a 档 it now runs)."""
     fake = FakeJevChoice([("global", 0.95)])
     decision = decide_search_mode(
         _msgs("what was AAPL net sales in 2023 Q3?"), jev_client=fake
     )
-    assert decision.search_mode is None
-    assert decision.decision_tier == "typed_fail"
-    assert decision.failure_code == TIER_NOT_OPEN
-    # The refusal names the LASTING token it wanted, so the operator can
-    # see which 档 the judge asked for.
-    assert decision.signals["requested_mode"] == "global"
+    assert decision.search_mode == "global"
+    assert decision.decision_tier == "jev"
+    assert decision.failure_code is None
+    assert decision.signals["mode_jev_label"] == "global"
 
 
 def test_jev_skipped_when_inherit_would_decide() -> None:
@@ -503,15 +507,16 @@ def test_empty_utterance_residual_clarifies_without_inventing_c() -> None:
 
 def test_clarify_options_are_structured_with_opened_flags() -> None:
     """The Ticket-2 choice window consumes this: ids + operator labels;
-    the SSOT (``TIER_UNAVAILABLE_CODE``) marks 综述/真数据库 unopened — no
-    duplicated 档 enumeration here. The ids are the LASTING tokens, so a
-    pick resumes with exactly the value the audit and the port carry."""
+    the SSOT (``TIER_UNAVAILABLE_CODE``) marks 真数据库 unopened and — since
+    fin task 4 — 综述 opened — no duplicated 档 enumeration here. The ids
+    are the LASTING tokens, so a pick resumes with exactly the value the
+    audit and the port carry."""
     options = clarify_options()
     assert [o["id"] for o in options] == list(LASTING_RETRIEVE_TIERS)
     assert [o["label"] for o in options] == [
         MODE_LABELS[t] for t in LASTING_RETRIEVE_TIERS
     ]
-    assert [o["opened"] for o in options] == [True, True, False, False]
+    assert [o["opened"] for o in options] == [True, True, True, False]
 
 
 def test_normalize_search_mode_closed_set_only() -> None:
@@ -758,23 +763,24 @@ def test_mode_channel_does_not_leak_across_threads() -> None:
     assert out_b["search_mode_decision"]["search_mode"] is None
 
 
-def test_typed_fail_in_utterance_names_failure_and_invents_no_mode() -> None:
-    """「综述」 named in the utterance is an unopened 档: the run records
-    the 具名失败 (``tier_not_open``) with ``search_mode=None`` — the
-    cascade does not invent a 档, and the graph does not crash."""
+def test_naming_the_global_tier_in_the_utterance_assigns_it() -> None:
+    """Flipped by opening global (fin task 4): 「综述」 named in the
+    utterance is now an OPEN 档 — the cascade assigns ``search_mode=global``
+    at the rules tier instead of recording a ``tier_not_open`` failure. The
+    graph still runs cleanly either way."""
     g = _compile([AIMessage(content="Net sales grew.")])
     out = g.invoke(
         {
             **reset_input_state("综述档 what was AAPL net sales in 2023 Q3?"),
             "evidence": [],
         },
-        config=_cfg("smc-typed-fail"),
+        config=_cfg("smc-global-assigned"),
     )
     assert out["track"] == "grounded"
-    smd = out["search_mode_decision"]
-    assert smd["search_mode"] is None
-    assert smd["decision_tier"] == "typed_fail"
-    assert smd["failure_code"] == TIER_NOT_OPEN
+    mode_decision = out["search_mode_decision"]
+    assert mode_decision["search_mode"] == "global"
+    assert mode_decision["decision_tier"] == "rules"
+    assert mode_decision["failure_code"] is None
     assert out["status"] in ("done", "refuse")  # no crash either way
 
 

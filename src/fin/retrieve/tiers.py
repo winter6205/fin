@@ -1,4 +1,9 @@
-"""The 档 SSOT: the closed tier set and its routing-time codes.
+"""The 档 SSOT: the closed tier set and its named-failure tokens.
+
+The routing-time codes for an unopened 档 live here, plus the global
+综述 档's one runtime code (:data:`COMMUNITY_SUMMARY_INDEX_FAILURE`) — it
+belongs with the 档 vocabulary it qualifies even though it is emitted off
+the upstream retrieve error rather than at routing time.
 
 A neutral leaf (stdlib imports only) so BOTH sides can depend on it
 without a cycle: :func:`fin.retrieve.port.resolve_search_mode`
@@ -22,6 +27,15 @@ from typing import Final, Literal
 TIER_NOT_OPEN: Final[str] = "tier_not_open"
 
 REAL_DB_NOT_WIRED: Final[str] = "real_db_not_wired"
+
+# The global 综述 档 is OPEN, so its only remaining refusal is a runtime
+# index fact: the 社区 summary index the report arm reads is not-ready (the
+# Leiden / community-summary job failed or is incomplete). This is NOT a
+# routing-time ``tier_not_open`` — the 档 runs a real arm, the arm simply has
+# nothing indexed yet — so the code lives with the 档 vocabulary but is
+# emitted at runtime, off the upstream retrieve error. Shared token with the
+# iknow-memory side; re-exported by ``fin.host.named_failures``.
+COMMUNITY_SUMMARY_INDEX_FAILURE: Final[str] = "community_summary_index_failure"
 
 # The 档 tokens in operator-facing order (查找 / 知识问答 / 综述 / 真数据库,
 # CONTEXT 检索档). Everything the host PRODUCES — the cascade, a pin, an
@@ -52,7 +66,10 @@ RetrieveTier = Literal[*RETRIEVE_TIERS]
 # The named failure each unimplemented 档 yields. ``lexical`` 查找 is the
 # lexical fallback the same doc leaves openable, so it is NOT in this
 # table: an 查找 send runs a real arm. Neither is ``graph``: it IS the
-# default 知识问答 档.
+# default 知识问答 档. Nor is ``global``: opening it moved it from a plan
+# slot to a real report arm, so a 综述 send runs and only a runtime
+# index-not-ready fact refuses it (via
+# :data:`COMMUNITY_SUMMARY_INDEX_FAILURE`), never this routing table.
 #
 # No retired letter has a row here either. With the word forms the whole
 # closed set, a bare ``A`` / ``B`` / ``C`` / ``D`` is not a 档 spelling at
@@ -61,7 +78,6 @@ RetrieveTier = Literal[*RETRIEVE_TIERS]
 # one would suggest a letter can still be routed, which is the silent
 # mapping the rename forbids.
 TIER_UNAVAILABLE_CODE: Final[dict[str, str]] = {
-    "global": TIER_NOT_OPEN,
     "sql": REAL_DB_NOT_WIRED,
 }
 
@@ -103,6 +119,7 @@ def normalize_tier_token(raw: object) -> str | None:
 
 
 __all__ = [
+    "COMMUNITY_SUMMARY_INDEX_FAILURE",
     "LASTING_RETRIEVE_TIERS",
     "REAL_DB_NOT_WIRED",
     "RETRIEVE_TIERS",

@@ -39,6 +39,7 @@ def _run_python(statement: str) -> subprocess.CompletedProcess[str]:
 
 def test_tiers_module_exists_with_the_closed_set() -> None:
     from fin.retrieve.tiers import (
+        COMMUNITY_SUMMARY_INDEX_FAILURE,
         REAL_DB_NOT_WIRED,
         RETRIEVE_TIERS,
         TIER_NOT_OPEN,
@@ -48,8 +49,13 @@ def test_tiers_module_exists_with_the_closed_set() -> None:
     assert RETRIEVE_TIERS == ("lexical", "graph", "global", "sql")
     assert TIER_NOT_OPEN == "tier_not_open"
     assert REAL_DB_NOT_WIRED == "real_db_not_wired"
+    assert COMMUNITY_SUMMARY_INDEX_FAILURE == "community_summary_index_failure"
+    # Opening the global 综述 档 (fin task 4) moved it from a routing-time
+    # plan slot to a real report arm, so it drops out of the「未开」table:
+    # only ``sql`` is refused at routing time now. A global send's one
+    # remaining refusal is the RUNTIME summary-index fact below, never this
+    # table — so the table keeps exactly one row.
     assert TIER_UNAVAILABLE_CODE == {
-        "global": "tier_not_open",
         "sql": "real_db_not_wired",
     }
 
@@ -78,22 +84,25 @@ def test_the_refusal_message_names_the_word_form_set() -> None:
             raise AssertionError(f"{letter!r} crossed the port")
 
 
-def test_graph_is_an_open_tier_and_global_is_not() -> None:
-    """``graph`` 知识问答 is today's default 档, so it must carry no
-    「未开」code; ``global`` 综述 is still a plan slot, so naming it is
-    档未开 — never an empty success."""
+def test_graph_and_global_are_both_open_tiers() -> None:
+    """``graph`` 知识问答 is today's default 档, and opening ``global`` 综述
+    (fin task 4) made it a real report arm too: neither carries a
+    「未开」code, so naming either resolves to the token rather than raising.
+    ``sql`` alone is still a plan slot."""
     from fin.retrieve.port import TierUnavailableError, resolve_search_mode
     from fin.retrieve.tiers import TIER_UNAVAILABLE_CODE
 
     assert "graph" not in TIER_UNAVAILABLE_CODE
+    assert "global" not in TIER_UNAVAILABLE_CODE
     assert resolve_search_mode("graph") == "graph"
+    assert resolve_search_mode("global") == "global"
 
     try:
-        resolve_search_mode("global")
+        resolve_search_mode("sql")
     except TierUnavailableError as exc:
-        assert exc.code == "tier_not_open"
+        assert exc.code == "real_db_not_wired"
     else:
-        raise AssertionError("global accepted as an open 档")
+        raise AssertionError("sql accepted as an open 档")
 
 
 def test_a_letter_at_the_port_is_invalid_not_routed() -> None:
@@ -113,6 +122,7 @@ def test_a_letter_at_the_port_is_invalid_not_routed() -> None:
 
     assert resolve_search_mode("lexical") == "lexical"
     assert resolve_search_mode("graph") == "graph"
+    assert resolve_search_mode("global") == "global"
     assert resolve_search_mode(None) is None
 
     for token in ("A", "B", "C", "D"):
@@ -123,16 +133,14 @@ def test_a_letter_at_the_port_is_invalid_not_routed() -> None:
         else:
             raise AssertionError(f"{token} still crosses the port")
 
-    for token, code in (
-        ("global", "tier_not_open"),
-        ("sql", "real_db_not_wired"),
-    ):
-        try:
-            resolve_search_mode(token)
-        except TierUnavailableError as exc:
-            assert exc.code == code, token
-        else:
-            raise AssertionError(f"{token} accepted as an open 档")
+    # Only ``sql`` is a routing-time plan slot now: global was opened, so it
+    # resolves to its token above and cannot be refused here.
+    try:
+        resolve_search_mode("sql")
+    except TierUnavailableError as exc:
+        assert exc.code == "real_db_not_wired"
+    else:
+        raise AssertionError("sql accepted as an open 档")
 
 
 def test_an_unknown_token_stays_unknown_after_the_rename() -> None:
@@ -155,6 +163,7 @@ def test_tiers_module_is_public_via_dunder_all() -> None:
     import fin.retrieve.tiers as tiers
 
     assert set(tiers.__all__) == {
+        "COMMUNITY_SUMMARY_INDEX_FAILURE",
         "LASTING_RETRIEVE_TIERS",
         "REAL_DB_NOT_WIRED",
         "RETRIEVE_TIERS",
@@ -257,12 +266,13 @@ import fin.retrieve.port as p
 
 assert p.resolve_search_mode("lexical") == "lexical"
 assert p.resolve_search_mode(None) is None
+assert p.resolve_search_mode("global") == "global"
 try:
-    p.resolve_search_mode("global")
+    p.resolve_search_mode("sql")
 except p.TierUnavailableError as e:
-    assert e.code == "tier_not_open"
+    assert e.code == "real_db_not_wired"
 else:
-    raise AssertionError("global not refused")
+    raise AssertionError("sql not refused")
 try:
     p.resolve_search_mode("A")
 except p.InvalidSearchModeError as e:
