@@ -194,6 +194,18 @@ from fin.corpus.ingest_endpoint import (
     IngestInvalidDocTypeError,
     IngestUploadTooLargeError,
 )
+from fin.host.attachment_prepare import (
+    AttachmentCleanupError,
+    AttachmentNotFoundError,
+    AttachmentNotReadyError,
+    AttachmentPreparationService,
+    text_rejection_reason,
+)
+from fin.host.attachment_store import (
+    AttachmentRecord,
+    AttachmentStoreError,
+    InMemoryAttachmentStore,
+)
 from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER, strip_hidden_bounce_marker
 from fin.host.collection_bind import resolve_bound_collection_name
 from fin.host.export import (
@@ -581,31 +593,25 @@ _DEFAULT_TITLE: str = "New thread"
 
 
 # corpus-serve-ingest T4 (ADR 0047 thread attach): hard cap on one
-# attachment upload, in bytes. Attach is a THIS-TURN read affordance
-# (model context), not storage — the cap keeps a drag-and-drop from
-# ballooning the process heap and the model context. Oversize is a
-# named 413, never a silent truncate. Module-level so operators can
-# tune it and tests can shrink it.
+# attachment upload, in bytes. The cap keeps a drag-and-drop from
+# ballooning the byte store and the model context. Oversize is a named
+# 413, never a silent truncate. Module-level so operators can tune it
+# and tests can shrink it.
 ATTACHMENT_MAX_BYTES: Final[int] = 2 * 1024 * 1024
 
 
-@dataclass(frozen=True)
-class AttachmentBlob:
-    """One turn-scoped attachment (ADR 0047 **thread attach**).
-
-    Storage is the turn blob: an in-memory dict on the mounted router
-    (same lifecycle as :class:`RunControl`), keyed by attachment id.
-    Deliberately NOT a file, NOT the corpus object store, NOT an
-    extracted tree — the attach door stores nothing durable and never
-    pushes; when the process ends the blobs end. The send that
-    references the id consumes it (single use).
-    """
-
-    attachment_id: str
-    thread_id: str
-    filename: str
-    text: str
-    size_bytes: int
+def _attachment_wire_record(record: AttachmentRecord) -> dict[str, Any]:
+    """Serialize one attachment row for the workspace surface."""
+    return {
+        "attachment_id": record.attachment_id,
+        "filename": record.filename,
+        "size_bytes": record.size_bytes,
+        "status": record.status,
+        "version": record.version,
+        "unit_count": record.unit_count,
+        "searchable": record.searchable,
+        "failure_reason": record.failure_reason,
+    }
 
 
 # ----- request / response schemas -----
@@ -632,14 +638,14 @@ class SendMessageRequest(BaseModel):
     # The proxy keeps ``reasoning_split=True`` regardless — only the
     # thinking TYPE toggles; reasoning_details round-trip remains on.
     thinking: bool = True
-    # corpus-serve-ingest T4 (ADR 0047 **thread attach**): ids returned
-    # by ``POST /threads/{id}/attachments`` to expose on THIS run.
-    # Referencing an unknown id (or another thread's id) is a named
-    # 400 ``attachment_not_found`` BEFORE any graph invoke; the send
-    # that runs consumes the blobs (single use), and a send rejected
-    # 409 does NOT consume them. Attach never pushes: the resolved
-    # text rides ``reset_input_state(attachments=...)`` as turn-scoped
-    # context and never enters the corpus/ingest path.
+    # ADR 0047 **thread attach**: ids returned by
+    # ``POST /threads/{id}/attachments``. An id stays referenceable for the
+    # whole thread lifetime, so a later turn reuses it; an unknown id or
+    # another thread's id is the named 400 ``attachment_not_found`` BEFORE
+    # any graph invoke, and a named id still ``parsing`` is
+    # ``attachment_not_ready``. Attach never pushes: the resolved text rides
+    # ``reset_input_state(attachments=...)`` as turn-scoped context and
+    # never enters the corpus/ingest path.
     attachment_ids: list[str] = Field(default_factory=list)
     # The explicit 检索档 selector. Empty (the default) is the ordinary
     # send — the model resolves the track as it always has. A caller that
@@ -2004,10 +2010,81 @@ def get_ingest_service() -> IngestEndpoint:
         return _ingest_service_singleton
 
 
+# One attachment service per process, over the env-selected thread store
+# and object store: attachment rows are durable product state, so they
+# follow the same singletons the thread sidebar and corpus ingest use.
+_attachment_service_singleton: AttachmentPreparationService | None = None
+_attachment_service_lock = threading.Lock()
+
+
+def _build_default_attachment_service() -> AttachmentPreparationService:
+    """Build the default attachment service and resume interrupted work.
+
+    Recovery runs here rather than on a request path: a restart must
+    restore the derived index before any ``ready`` is reported, and
+    construction is the one point certain to precede the first read.
+
+    The byte store follows the corpus object-store configuration. With no
+    MinIO/S3 configured the service degrades to process-local bytes and
+    says so — the same logged degradation the unconfigured checkpointer
+    uses — because attachment rows outlive the blobs then, and recovery
+    reports them as ``source_unavailable`` rather than as empty text.
+    """
+    import os
+
+    from fin.corpus.object_store import (
+        InMemoryObjectStore,
+        object_store_from_env,
+    )
+    from fin.corpus.object_store_errors import ObjectStoreNotConfiguredError
+    from fin.host.attachment_store import (
+        InMemoryAttachmentStore,
+        PostgresAttachmentStore,
+    )
+    from fin.host.thread_store import default_thread_store
+
+    try:
+        objects: Any = object_store_from_env()
+    except ObjectStoreNotConfiguredError:
+        logger.warning(
+            "FIN_OBJECT_STORE_URL/FIN_OBJECT_STORE_BUCKET are not set; "
+            "thread attachments keep their raw bytes in process memory and "
+            "will report source_unavailable after a restart"
+        )
+        objects = InMemoryObjectStore()
+
+    url = (os.environ.get("FIN_CHECKPOINT_URL") or "").strip()
+    if url:
+        # WHY the thread store first: every attachment row references the
+        # thread row, so the thread schema has to exist before the
+        # attachment tables are created.
+        threads = default_thread_store()
+        store: Any = PostgresAttachmentStore(url)
+    else:
+        store = InMemoryAttachmentStore(default_thread_store())
+    service = AttachmentPreparationService(store=store, objects=objects)
+    service.recover()
+    return service
+
+
+def default_attachment_service() -> AttachmentPreparationService:
+    """Process singleton for the thread attachment service.
+
+    ``fin.host.http`` wraps this as its ``get_attachment_service``
+    dependency so tests can override the seam in one place.
+    """
+    global _attachment_service_singleton
+    with _attachment_service_lock:
+        if _attachment_service_singleton is None:
+            _attachment_service_singleton = _build_default_attachment_service()
+        return _attachment_service_singleton
+
+
 def build_router(
     *,
     get_graph,
     get_thread_store,
+    get_attachment_service=None,
     get_watchlist_store=None,
     get_memory_port=None,
     get_filing_monitor=None,
@@ -2038,17 +2115,8 @@ def build_router(
     """
     router = APIRouter(prefix="/api")
     run_control = RunControl()
-    # corpus-serve-ingest T4 (ADR 0047): the turn-blob attachment
-    # registry, created HERE (per mounted router) for the same reason
-    # as ``run_control`` — two apps in one test session must not share
-    # attachments. Nothing in this dict is ever written to disk or to
-    # the corpus store; the attach door never pushes.
-    #
-    # Known limitation (deliberate): no total-size cap and NO
-    # eviction — blobs are in-process memory held until the send that
-    # references them consumes them (single-use pop) or the process
-    # exits. This is a turn-blob registry, not a durable store.
-    attachment_store: dict[str, AttachmentBlob] = {}
+    if get_attachment_service is None:
+        get_attachment_service = default_attachment_service
     if get_watchlist_store is None:
         get_watchlist_store = default_watchlist_store
     if get_memory_port is None:
@@ -2168,13 +2236,32 @@ def build_router(
         thread_id: str,
         graph: Any = Depends(get_graph),
         store: ThreadStore = Depends(get_thread_store),
+        attachments: AttachmentPreparationService = Depends(
+            get_attachment_service
+        ),
     ) -> dict:
         existing = store.get_thread(thread_id)
         if existing is None:
             return JSONResponse(
                 status_code=404, content={"error": "thread_not_found"}
             )
-        # Metadata first, then checkpointer. If the checkpointer
+        # Attachment data goes first. An attachment that outlives its
+        # thread would keep searchable text a deleted research thread owned,
+        # so a cleanup failure stops the delete here — named, logged, and
+        # retryable — instead of acknowledging a thread whose bytes remain.
+        try:
+            attachments.delete_thread(thread_id)
+        except AttachmentCleanupError:
+            logger.exception(
+                "delete_thread: attachment cleanup failed for thread_id=%s",
+                thread_id,
+            )
+            return JSONResponse(
+                status_code=500,
+                content={"error": "attachment_cleanup_failed"},
+            )
+
+        # Metadata next, then checkpointer. If the checkpointer
         # delete raises we keep the metadata gone - that's the
         # user-visible intent, and the next ``GET`` will not
         # resurrect the turn table.
@@ -2216,6 +2303,9 @@ def build_router(
         background: BackgroundTasks,
         graph: Any = Depends(get_graph),
         store: ThreadStore = Depends(get_thread_store),
+        attachments: AttachmentPreparationService = Depends(
+            get_attachment_service
+        ),
         memory_port: Any = Depends(get_memory_port),
         collector: ObservabilityCollector = Depends(
             get_observability_collector
@@ -2292,31 +2382,38 @@ def build_router(
                 thread_id=thread_id,
             )
 
-        # corpus-serve-ingest T4 (ADR 0047 thread attach): resolve the
-        # referenced attachments BEFORE the lock probe and BEFORE the
-        # title rewrite, so a bad reference is a named 400 with zero
-        # side effects. Resolution is read-only — consumption happens
-        # only after the 409 probe passes, so a send rejected with
-        # ``concurrent_run`` keeps its attachments for the retry.
-        # Unknown OR other-thread ids are the same named error (no
-        # existence leak across threads).
+        # ADR 0083/0088: referenced attachments are resolved from this
+        # thread's durable store BEFORE the lock probe and BEFORE the title
+        # rewrite, so a bad reference is a named 400 with zero side effects.
+        # Unknown OR other-thread ids share one error (no existence leak
+        # across threads); a named attachment that is still ``parsing`` is
+        # ``attachment_not_ready`` rather than an empty context block.
+        # Resolution is read-only — an attachment stays referenceable for the
+        # rest of the thread's life.
         referenced_ids = list(dict.fromkeys(body.attachment_ids or []))
         resolved_attachments: list[dict[str, str]] = []
-        if referenced_ids:
-            for attachment_id in referenced_ids:
-                blob = attachment_store.get(attachment_id)
-                if blob is None or blob.thread_id != thread_id:
-                    return JSONResponse(
-                        status_code=400,
-                        content={"error": "attachment_not_found"},
-                    )
-                resolved_attachments.append(
-                    {
-                        "attachment_id": blob.attachment_id,
-                        "filename": blob.filename,
-                        "text": blob.text,
-                    }
+        for attachment_id in referenced_ids:
+            try:
+                resolved = attachments.resolve_for_turn(
+                    thread_id=thread_id, attachment_id=attachment_id
                 )
+            except AttachmentNotFoundError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "attachment_not_found"},
+                )
+            except AttachmentNotReadyError:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "attachment_not_ready"},
+                )
+            resolved_attachments.append(
+                {
+                    "attachment_id": resolved.attachment_id,
+                    "filename": resolved.filename,
+                    "text": resolved.text,
+                }
+            )
 
         # T2: title update on the first real send. The T1 path
         # set the title from ``first_message`` at create time;
@@ -2380,17 +2477,6 @@ def build_router(
             raise ConcurrentRunError(
                 f"a choice window is pending on thread_id={thread_id!r}"
             )
-
-        # corpus-serve-ingest T4: the run is definitely starting, so
-        # NOW the referenced blobs are consumed (turn-blob single-use
-        # semantics). A later send replaying the same id is the named
-        # 400, not a silently stale re-read; a send rejected 409 above
-        # did NOT reach this point, so the retry keeps the attachment.
-        # If the stream itself fails mid-flight the blobs stay
-        # consumed — the operator re-attaches, the same contract as
-        # any dropped turn.
-        for attachment_id in referenced_ids:
-            attachment_store.pop(attachment_id, None)
 
         # T2: the input state ALWAYS resets the run-scoped fields
         # (``reset_input_state`` clears ``evidence`` — impossible
@@ -2674,29 +2760,28 @@ def build_router(
     async def attach_to_thread(
         thread_id: str,
         request: Request,
+        background: BackgroundTasks,
         store: ThreadStore = Depends(get_thread_store),
+        attachments: AttachmentPreparationService = Depends(
+            get_attachment_service
+        ),
     ) -> dict:
-        """corpus-serve-ingest T4 (ADR 0047 **thread attach**).
+        """ADR 0083/0086 **thread attach**: the durable attach door.
 
-        The FIRST door of the two upload doors: a file dropped into
-        the open research thread. The bytes are decoded as UTF-8 text,
-        held as a turn blob in this router's memory, and returned as
-        an ``attachment_id`` the next ``POST .../messages`` may
-        reference via ``attachment_ids``. The model reads the text on
-        THAT turn only; nothing is pushed, nothing is ingested,
-        nothing lands in the corpus store or any extracted tree.
-
+        A file dropped into the open research thread is stored as bytes
+        under this thread's ownership and answered with a logical
+        ``attachment_id`` plus ``parsing``. Parsing and indexing then run
+        off the request path; the attachment is ``ready`` for every later
+        turn of this thread once its frozen units and derived index exist.
+        Nothing is pushed and nothing enters the permanent company corpus
+        (ADR 0047 keeps those doors separate).
         Wire shape: raw bytes body with the filename as the
         ``filename`` query parameter. Deliberately NOT multipart
-        ``UploadFile``: this door ships ONE undecorated turn blob —
-        no form fields, nothing to parse — so the web client's plain
-        ``fetch`` body is the entire contract and neither side pays
-        for multipart handling (the ingest route is the only
-        multipart surface). Binary handling stays OUT of this
-        door by contract — PDF/DOCX/... belong to the corpus-ingest
-        endpoint, where 切分 runs deterministically (ADR 0047) — so
-        undecodable bytes are a named rejection, not a best-effort
-        parse.
+        ``UploadFile``: this door takes one file and no form fields, so
+        the web client's plain ``fetch`` body is the entire contract and
+        neither side pays for multipart handling (the ingest route is the
+        only multipart surface). The model gets the logical id, never a
+        path.
 
         Named boundaries (no silent success, and every failure key is
         attach-namespaced, never ingest vocabulary):
@@ -2704,11 +2789,10 @@ def build_router(
         * unknown thread            -> 404 ``thread_not_found``
         * empty body                -> 400 ``empty_attachment``
         * body over the byte cap    -> 413 ``attachment_too_large``
-        * non-UTF-8 bytes           -> 400 ``attachment_not_text``
-        * blob-store write fails    -> 500 ``attachment_store_failed``
-          (exception boundary; the send-side read has no failure mode
-          beyond a missing/consumed id, which is the named 400
-          ``attachment_not_found``)
+        * bytes that are not text   -> 400 ``attachment_not_text``
+        * durable write fails       -> 500 ``attachment_store_failed``
+          (the exception boundary: never a half-stored 200 whose id the
+          next send could reference, and never ingest vocabulary here)
 
         The 413 is decided at the ROUTE layer before the body is
         buffered: a declared oversize Content-Length is refused
@@ -2733,46 +2817,109 @@ def build_router(
             return JSONResponse(
                 status_code=400, content={"error": "empty_attachment"}
             )
+        rejected = text_rejection_reason(body)
+        if rejected:
+            return JSONResponse(status_code=400, content={"error": rejected})
         try:
-            text = body.decode("utf-8")
-        except UnicodeDecodeError:
-            # Text-only is the CONTRACT, not a missing feature: the
-            # attach door must never parse binaries (切分 belongs to
-            # the ingest endpoint, ADR 0047).
-            return JSONResponse(
-                status_code=400, content={"error": "attachment_not_text"}
-            )
-        attachment_id = str(uuid.uuid4())
-        filename = (request.query_params.get("filename") or "").strip()
-        if not filename:
-            filename = "attachment.txt"
-        try:
-            attachment_store[attachment_id] = AttachmentBlob(
-                attachment_id=attachment_id,
+            record = attachments.accept(
                 thread_id=thread_id,
-                filename=filename,
-                text=text,
-                size_bytes=len(body),
+                filename=request.query_params.get("filename") or "",
+                payload=body,
             )
-        except Exception:
-            # Exception boundary: a blob-store write failure (e.g. a
-            # MemoryError on the turn blob) is a TYPED named error —
-            # never a half-stored 200 the caller could reference, and
-            # never ingest vocabulary on the attach door.
+        except AttachmentStoreError:
             logger.exception(
-                "attach_to_thread: blob store write failed for thread_id=%s",
+                "attach_to_thread: durable write failed for thread_id=%s",
                 thread_id,
             )
             return JSONResponse(
                 status_code=500,
                 content={"error": "attachment_store_failed"},
             )
+        background.add_task(attachments.prepare_async, record.attachment_id)
         return {
-            "attachment_id": attachment_id,
-            "filename": filename,
-            "size_bytes": len(body),
+            "attachment_id": record.attachment_id,
+            "filename": record.filename,
+            "size_bytes": record.size_bytes,
             "scope": "thread_attach",
+            "status": record.status,
+            "version": record.version,
         }
+
+    @router.get("/threads/{thread_id}/attachments")
+    def list_thread_attachments(
+        thread_id: str,
+        store: ThreadStore = Depends(get_thread_store),
+        attachments: AttachmentPreparationService = Depends(
+            get_attachment_service
+        ),
+    ) -> dict:
+        """Every attachment this thread owns, with its preparation state."""
+        if store.get_thread(thread_id) is None:
+            return JSONResponse(
+                status_code=404, content={"error": "thread_not_found"}
+            )
+        records = attachments.store.list_for_thread(thread_id)
+        return {
+            "attachments": [
+                _attachment_wire_record(attachments.status(record.attachment_id) or record)
+                for record in records
+            ]
+        }
+
+    @router.get("/threads/{thread_id}/attachments/{attachment_id}")
+    def read_thread_attachment(
+        thread_id: str,
+        attachment_id: str,
+        store: ThreadStore = Depends(get_thread_store),
+        attachments: AttachmentPreparationService = Depends(
+            get_attachment_service
+        ),
+    ) -> dict:
+        """Status of one attachment on a later turn.
+
+        An unknown id and another thread's id share ``attachment_not_found``
+        so this read cannot probe what a different thread holds.
+        """
+        if store.get_thread(thread_id) is None:
+            return JSONResponse(
+                status_code=404, content={"error": "thread_not_found"}
+            )
+        record = attachments.status(attachment_id)
+        if record is None or record.thread_id != thread_id:
+            return JSONResponse(
+                status_code=400, content={"error": "attachment_not_found"}
+            )
+        return _attachment_wire_record(record)
+
+    @router.post("/threads/{thread_id}/attachments/{attachment_id}/retry")
+    def retry_thread_attachment(
+        thread_id: str,
+        attachment_id: str,
+        store: ThreadStore = Depends(get_thread_store),
+        attachments: AttachmentPreparationService = Depends(
+            get_attachment_service
+        ),
+    ) -> dict:
+        """Re-drive a failed attachment; success makes it ``ready``."""
+        if store.get_thread(thread_id) is None:
+            return JSONResponse(
+                status_code=404, content={"error": "thread_not_found"}
+            )
+        record = attachments.status(attachment_id)
+        if record is None or record.thread_id != thread_id:
+            return JSONResponse(
+                status_code=400, content={"error": "attachment_not_found"}
+            )
+        try:
+            return _attachment_wire_record(attachments.retry(attachment_id))
+        except AttachmentStoreError:
+            logger.exception(
+                "retry_thread_attachment: state write failed for attachment_id=%s",
+                attachment_id,
+            )
+            return JSONResponse(
+                status_code=500, content={"error": "attachment_store_failed"}
+            )
 
     @router.post("/threads/{thread_id}/resume")
     def resume_thread(
@@ -3445,6 +3592,7 @@ def mount(
     *,
     get_graph,
     get_thread_store,
+    get_attachment_service=None,
     get_watchlist_store=None,
     get_memory_port=None,
     get_filing_monitor=None,
@@ -3457,6 +3605,7 @@ def mount(
         build_router(
             get_graph=get_graph,
             get_thread_store=get_thread_store,
+            get_attachment_service=get_attachment_service,
             get_watchlist_store=get_watchlist_store,
             get_memory_port=get_memory_port,
             get_filing_monitor=get_filing_monitor,
@@ -3469,6 +3618,7 @@ def mount(
 
 __all__ = [
     "build_router",
+    "default_attachment_service",
     "default_workspace_root_for_process",
     "get_ingest_service",
     "get_workspace_root",

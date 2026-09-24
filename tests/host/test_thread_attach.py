@@ -1,29 +1,29 @@
-"""Thread attach: this-turn read-only, never a push (corpus-serve-ingest T4).
+"""Thread attach: durable to the thread, searchable, never a push.
 
-Covers spec Focus 3 / SC4, SC8 (no research-graph 切分) and ADR 0047's
-**thread attach** door: a file dragged into the open research thread is
-readable by the model on THAT turn only and never enters the corpus
-push/ingest path. The corpus-ingest door is a separate control (T3);
-an attach failure must be named and must never look like ingest
-success (error-handling ACR line).
+Covers the attach door's named boundaries plus the two product invariants
+that survive G4: the text a turn references reaches that run's prompt
+call-scoped (ADR 0047), and attaching NEVER pushes into the permanent
+company corpus (ADR 0083). The corpus-ingest door is a separate control;
+an attach failure must be named and must never look like ingest success.
 
 Boundary classes exercised (defensive-contract-validator):
 
 * empty      — empty upload body -> named 400 ``empty_attachment``.
 * negative   — non-UTF-8 bytes -> named 400 ``attachment_not_text``
-               (attach is text-only BY CONTRACT: binary formats belong
-               to the ingest door, where 切分 runs — ADR 0047);
-               unknown attachment id on send -> named 400.
+               (the door admits text only until document-type
+               classification lands; binaries that need 切分 belong to
+               the ingest door, ADR 0047); unknown attachment id on
+               send -> named 400.
 * overflow   — oversize upload -> named 413 ``attachment_too_large``.
 * concurrent — 409 concurrent_run is unchanged; a 409'd send does NOT
-               consume the referenced attachments (retry keeps them).
-* exception  — failures are typed JSON errors, never silent 200s;
-               a blob-store write failure is the named 500
+               lose the referenced attachments (retry keeps them).
+* exception  — failures are typed JSON errors, never silent 200s; a
+               durable write failure is the named 500
                ``attachment_store_failed`` (and nothing half-stores).
 
-Citation discipline (ADR 0046 / SC9): the attachment text is injected
-call-scoped at model time and NEVER into the ``evidence`` channel, so
-an attachment-only span cannot pass the citation gate.
+Citation discipline (ADR 0046): the attachment text is injected
+call-scoped at model time and NEVER into the ``evidence`` channel, so an
+attachment-only span cannot pass the citation gate.
 """
 
 from __future__ import annotations
@@ -95,15 +95,22 @@ def client(http_app: FastAPI) -> TestClient:
 
 @pytest.fixture
 def fresh_store(http_app: FastAPI):
-    from fin.host.http import get_graph, get_thread_store
+    from fin.corpus.object_store import InMemoryObjectStore
+    from fin.host.attachment_prepare import AttachmentPreparationService
+    from fin.host.attachment_store import InMemoryAttachmentStore
+    from fin.host.http import get_attachment_service, get_graph, get_thread_store
     from fin.host.thread_store import InMemoryThreadStore
 
     store = InMemoryThreadStore()
+    service = AttachmentPreparationService(
+        store=InMemoryAttachmentStore(store), objects=InMemoryObjectStore()
+    )
     http_app.dependency_overrides[get_thread_store] = lambda: store
+    http_app.dependency_overrides[get_attachment_service] = lambda: service
     model = RecordingScriptedModel(script=[AIMessage(content="ok")])
     g = _compile_with(model)
     http_app.dependency_overrides[get_graph] = lambda: g
-    return {"store": store, "model": model}
+    return {"store": store, "model": model, "attachments": service}
 
 
 def _compile_with(model: ScriptedChatModel) -> Any:
@@ -320,25 +327,27 @@ def test_attach_unknown_thread_404(client: TestClient, fresh_store) -> None:
 def test_attach_store_write_failure_named_500(
     client: TestClient, fresh_store, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Exception boundary: a blob-store write failure is a TYPED named
-    500 ``attachment_store_failed`` — never a silent 200 and never a
+    """Exception boundary: a durable write failure is a TYPED named 500
+    ``attachment_store_failed`` — never a silent 200 and never a
     half-stored attachment (the send side cannot reference a phantom
-    id). The store is the turn-blob dict, so the only realistic write
-    failure is allocation/construction; the test injects it by
-    replacing the blob constructor at module scope (the route resolves
-    ``AttachmentBlob`` through module globals at call time)."""
-    from fin.host import workspace_http
+    id). The byte store is the first durable layer the door writes, so
+    its refusal is the failure injected here, and nothing may be left
+    behind by it."""
+    from fin.corpus.object_store import InMemoryObjectStore
 
-    def _boom(*args: Any, **kwargs: Any) -> Any:
-        raise MemoryError("simulated blob allocation failure")
+    class RefusingObjectStore(InMemoryObjectStore):
+        def put(self, key, payload, *, content_type=None):  # type: ignore[no-untyped-def]
+            raise MemoryError("simulated blob allocation failure")
 
-    monkeypatch.setattr(workspace_http, "AttachmentBlob", _boom)
+    service = fresh_store["attachments"]
+    monkeypatch.setattr(service, "objects", RefusingObjectStore())
     thread_id = _new_thread(client)
     r = _attach(client, thread_id, ATTACH_SENTINEL.encode(), filename="x.md")
     assert r.status_code == 500
     assert r.json() == {"error": "attachment_store_failed"}
-    # Nothing half-stored: a later send cannot reference an id that
-    # was never durably held (named 400, not a stale re-read).
+    # Nothing half-stored: the thread owns no attachment record, and a
+    # later send cannot reference an id that was never durably held.
+    assert service.store.list_for_thread(thread_id) == []
     send = _send(client, thread_id, attachment_ids=["whatever"])
     assert send.status_code == 400
     assert send.json() == {"error": "attachment_not_found"}
@@ -430,12 +439,12 @@ def test_attachment_text_visible_on_dialogue_turn(
     assert _model_saw_sentinel(model), "attachment text never reached the dialogue leaf"
 
 
-def test_attachment_is_single_use_consumed_by_send(
+def test_attachment_remains_referenceable_for_the_thread_lifetime(
     client: TestClient, fresh_store
 ) -> None:
-    """Turn-blob semantics: the send that references the attachment
-    consumes it; replaying the same id on a later send is a named 400
-    rather than a silently stale re-read."""
+    """Thread-lifetime contract (ADR 0088): a send that references an
+    attachment does not consume it, so a later turn re-reads the same id
+    instead of forcing the operator to re-attach."""
     thread_id = _new_thread(client)
     attached = _attach(client, thread_id, ATTACH_SENTINEL.encode()).json()
     assert _send(
@@ -444,8 +453,9 @@ def test_attachment_is_single_use_consumed_by_send(
     replay = _send(
         client, thread_id, attachment_ids=[attached["attachment_id"]]
     )
-    assert replay.status_code == 400
-    assert replay.json() == {"error": "attachment_not_found"}
+    assert replay.status_code == 200
+    model: RecordingScriptedModel = fresh_store["model"]
+    assert _model_saw_sentinel(model), "replay turn lost the attachment text"
 
 
 def test_concurrent_send_409_does_not_consume_attachments(
