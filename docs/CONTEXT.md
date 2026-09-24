@@ -144,7 +144,7 @@ The tagged-numbers format inside official 10-Q/10-K iXBRL. Not a website; SEC.go
 _Avoid_: using XBRL as a product or hostname, conflating it with iknow-memory retrieve
 
 **read_source**:
-The selected model-facing name for a known-locator source read, currently exposed in code as `read_file`: it resolves an authorized corpus or current-thread attachment locator without requiring a `retrieve` hit in the same run. Returned text may be this-run citation evidence (ADR 0046); the return unit remains a G4 decision.
+The selected model-facing name for a known-locator source read, currently exposed in code as `read_file`: it resolves one authorized source unit from the company corpus or active-thread attachment without requiring a `retrieve` hit in the same run. Returned text may be this-run citation evidence (ADR 0046); overflow behavior remains a G4 decision.
 _Avoid_: read_file as the future tool name, read_locator, read_page, read_chunk, treating read as retrieve, reading embeddings
 
 **ingest endpoint**:
@@ -308,7 +308,7 @@ _Avoid_: gpt-researcher, open_deep_research, blank-file StateGraph as the requir
 ### Corpus and eval
 
 **product corpus**:
-The operator-selected filings after ingest: freeze and **切分** in fin, then push to the retrieve backend. Serve-time `retrieve` / `read_source` / the citation verifier use this-run tool payloads (ADR 0046), not a second on-disk tree as company-corpus SSOT.
+The operator-selected filings after ingest: fin parses source text into **冻结单元**, then deterministically **切分**s and pushes its chunks to the retrieve backend. Serve-time `retrieve` / `read_source` / the citation verifier use this-run tool payloads (ADR 0046), not a second on-disk tree as company-corpus SSOT.
 _Avoid_: private fixture source 12 as product SSOT, unofficial PDF as live identity, S&P 500 backfill as the ingest default, a second PDF-page product path
 
 **eval fixture**:
@@ -348,8 +348,8 @@ Historical nine hand-authored cases against the private fixture source 12 (ADR 0
 _Avoid_: 40-question matrix as a v1 commitment, treating nine cases as the current ceiling
 
 **冻结单元**:
-fin 解析产出的最小可引用文本单位；一经产出即冻结。切出的块是其连续子串并 push；**citation verifier** 在运行时对的是本轮 retrieve/`read_source` 正文（ADR 0046）。
-_Avoid_: chunk, 原始文件, 任意段落, 未冻结的中间解析产物
+A versioned, locator-addressed unit of parsed source text that fin determines before retrieval chunking; "frozen" means its text is fixed for that parsed version, not that fin creates a cache or separate persistence tier. Search chunks are contiguous substrings of the unit, while citation evidence comes only from text returned by `retrieve` or `read_source` in the current run (ADR 0046).
+_Avoid_: chunk, raw file, arbitrary paragraph, session cache, second citation SSOT, query-time result
 
 **切分**:
 fin 把冻结单元文本切成块的过程与规则，是 fin 的职责；切分必须确定性可复现，同一（字节输入 + 规则版本 + 参数表版本）两次切分产物逐字节相同。检索服务对推送文本不做二次切分、截断、重组或归一化改写。
