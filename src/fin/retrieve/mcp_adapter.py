@@ -467,21 +467,34 @@ def _merge_degradation_signals(
     return DegradationSignal(degraded=True, degraded_reasons=tuple(reasons))
 
 
+def _named_error_code_of_body(body: object) -> str | None:
+    """The named error code a decoded ``tools/call`` body carries, if any.
+
+    Every named refusal this adapter reads projects its code the same way
+    — a JSON body with a string ``error`` field (``read_source_not_found``
+    and friends, the global 综述 refusal) — so the field is read here
+    once and no caller has to match a code against prose.
+    """
+    if not isinstance(body, Mapping):
+        return None
+    code = body.get("error")
+    return code if isinstance(code, str) else None
+
+
 def _is_community_summary_not_ready(result: dict[str, Any]) -> bool:
     """Whether an MCP ``tools/call`` result is the global 综述 report arm's
     typed community-summary not-ready refusal.
 
     The upstream surfaces it as an ``isError`` result whose first text
-    content block carries the ``community_summary_index_failure`` token.
-    Matching that token in the message is the whole name available here,
-    not a match on prose: iknow's tool boundary wraps every handler throw
-    as ``{content: [{type: "text", text: <Error.message>}], isError: true}``
-    (``registerOne`` → ``textResult``), so only the message string crosses
-    the wire — no structured ``code``/``error`` field is serialized for a
-    thrown retrieve error the way a ``read_source`` JSON body is. That is
-    a RECORDED job fact about the report index — distinct from a transport
-    fault (which has no such token and must stay ``retrieve_unavailable``)
-    and from a legal empty hit (which is not an error at all).
+    content block carries the JSON body ``{error:
+    "community_summary_index_failure", message: <prose>}``, and the
+    structured field is the whole name: the code is read off the decoded
+    body with the same field read the ``read_source`` miss body uses, never
+    searched for in the message, because a transport fault is free to
+    quote the token in its own prose. A refusal so named is a RECORDED job
+    fact about the report index — distinct from a transport fault (which
+    carries no such field and must stay ``retrieve_unavailable``) and from
+    a legal empty hit (which is not an error at all).
     """
     if result.get("isError") is not True:
         return False
@@ -492,8 +505,15 @@ def _is_community_summary_not_ready(result: dict[str, Any]) -> bool:
         if not isinstance(block, Mapping) or block.get("type") != "text":
             continue
         text = block.get("text")
-        if isinstance(text, str):
-            return COMMUNITY_SUMMARY_INDEX_FAILURE in text
+        if not isinstance(text, str):
+            continue
+        try:
+            body = json.loads(text)
+        except ValueError:
+            return False
+        return (
+            _named_error_code_of_body(body) == COMMUNITY_SUMMARY_INDEX_FAILURE
+        )
     return False
 
 
@@ -1143,10 +1163,8 @@ def _read_body_of_content(result: Mapping[str, Any]) -> Any:
         except ValueError:
             return _READ_MISS_SENTINEL
         if isinstance(inner, Mapping):
-            error_code = inner.get("error")
-            if isinstance(error_code, str) and error_code.startswith(
-                "read_source_"
-            ):
+            code = _named_error_code_of_body(inner)
+            if code is not None and code.startswith("read_source_"):
                 return _READ_MISS_SENTINEL
             body = inner.get("content")
             if isinstance(body, str):

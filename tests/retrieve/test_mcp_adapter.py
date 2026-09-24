@@ -1085,18 +1085,20 @@ def test_an_open_global_over_a_down_transport_is_retrieve_unavailable() -> None:
 #
 # The opened 综述 档's report arm reads the 社区 summary index. When that
 # index is not-ready, upstream surfaces a typed ``isError`` result whose
-# text carries the ``community_summary_index_failure`` token. fin must
-# record that job fact (the empty-plus-flag envelope the host decision
-# names), NOT collapse it into the generic ``retrieve_unavailable`` the
-# unwrapped content-block path would otherwise produce — and equally must
-# NOT mistake a transport error that lacks the token for the summary job.
+# first text block carries the JSON body
+# ``{"error": "community_summary_index_failure", "message": <prose>}``.
+# fin classifies on that exact structured field — never on a prose
+# substring — and records the job fact (the empty-plus-flag envelope the
+# host decision names), NOT collapsing it into the generic
+# ``retrieve_unavailable`` the unwrapped content-block path would
+# otherwise produce. Equally it must not mistake a transport message that
+# merely happens to contain the token for the summary job.
 
 
-def _community_summary_error_result(*, text: str) -> dict:
-    """A ``tools/call`` result envelope for the upstream 综述 refusal.
-
-    This is the exact shape the adapter keys on: an ``isError`` result
-    whose first content block is a text carrying ``text``."""
+def _is_error_result(*, text: str) -> dict:
+    """A ``tools/call`` result envelope whose first content block is a
+    text carrying ``text`` — the shape the transport boundary wraps every
+    failure in, structured body or bare prose alike."""
     return {
         "result": {
             "isError": True,
@@ -1105,16 +1107,27 @@ def _community_summary_error_result(*, text: str) -> dict:
     }
 
 
+def _community_summary_error_result(*, message: str) -> dict:
+    """The upstream 综述 refusal on the wire: an ``isError`` result whose
+    first text block carries the named error body, ``message`` as prose."""
+    return _is_error_result(
+        text=json.dumps(
+            {
+                "error": COMMUNITY_SUMMARY_INDEX_FAILURE,
+                "message": message,
+            }
+        )
+    )
+
+
 def test_a_community_summary_refusal_is_recorded_as_the_job_fact() -> None:
-    """An isError whose text names community_summary_index_failure is a
-    RECORDED report-index fact: the adapter hands back the empty-plus-flag
-    envelope so the host names the summary-index job for the operator."""
+    """An isError carrying the structured error field naming
+    community_summary_index_failure is a RECORDED report-index fact: the
+    adapter hands back the empty-plus-flag envelope so the host names the
+    summary-index job for the operator."""
     adapter = _ScriptedAdapter(
         scripted_response=_community_summary_error_result(
-            text=(
-                f"retrieve refused: {COMMUNITY_SUMMARY_INDEX_FAILURE} "
-                "(summary index not built)"
-            )
+            message="summary index not built"
         )
     )
     result = adapter.retrieve("综述这几份 10-Q", search_mode="global")
@@ -1129,7 +1142,7 @@ def test_a_community_summary_refusal_resolves_on_the_async_seam() -> None:
     envelope rather than raising — the record is not a transport fault."""
     adapter = _ScriptedAdapter(
         scripted_response=_community_summary_error_result(
-            text=COMMUNITY_SUMMARY_INDEX_FAILURE
+            message="community summaries incomplete"
         )
     )
     assert asyncio.run(adapter.aretrieve("综述", search_mode="global")) == {
@@ -1144,8 +1157,46 @@ def test_an_iserror_without_the_token_stays_retrieve_unavailable() -> None:
     generic ``retrieve_unavailable`` EXIT — fin never invents a
     summary-index job fact out of an unrelated failure."""
     adapter = _ScriptedAdapter(
-        scripted_response=_community_summary_error_result(
-            text="worker crashed unexpectedly"
+        scripted_response=_is_error_result(text="worker crashed unexpectedly")
+    )
+    assert adapter.retrieve("foo", search_mode="global") == {
+        "error": "retrieve_unavailable"
+    }
+
+
+def test_the_token_in_transport_prose_alone_is_not_the_job_fact() -> None:
+    """The false classification prose matching would allow: an
+    unstructured transport failure whose message happens to quote the
+    token (a retry log line, a stack trace, an echo of the request) has
+    no structured error field, so it is still ``retrieve_unavailable``."""
+    adapter = _ScriptedAdapter(
+        scripted_response=_is_error_result(
+            text=(
+                "worker exited while replaying: "
+                f"{COMMUNITY_SUMMARY_INDEX_FAILURE} "
+                "appears in this unrelated transport message"
+            )
+        )
+    )
+    assert adapter.retrieve("foo", search_mode="global") == {
+        "error": "retrieve_unavailable"
+    }
+
+
+def test_a_named_error_field_with_another_code_is_not_the_job_fact() -> None:
+    """The field is matched EXACTLY: a JSON error body naming another
+    code — even one spelling the summary token as a fragment — is not
+    the 综述 job fact and stays ``retrieve_unavailable``."""
+    adapter = _ScriptedAdapter(
+        scripted_response=_is_error_result(
+            text=json.dumps(
+                {
+                    "error": (
+                        f"{COMMUNITY_SUMMARY_INDEX_FAILURE}_retry_queued"
+                    ),
+                    "message": "not the refusal",
+                }
+            )
         )
     )
     assert adapter.retrieve("foo", search_mode="global") == {
@@ -1154,19 +1205,38 @@ def test_an_iserror_without_the_token_stays_retrieve_unavailable() -> None:
 
 
 def test_the_summary_token_only_counts_on_a_first_text_block() -> None:
-    """The matcher is narrow: a non-error result, or an isError whose
-    content is empty / not a leading text block, is not the recorded
-    job fact (it falls through to the ordinary unwrap / miss path)."""
+    """The matcher is narrow: a non-error result, an isError whose
+    content is empty / not a leading text block, or a leading text that is
+    not the named error body is not the recorded job fact (it falls
+    through to the ordinary unwrap / miss path)."""
     from fin.retrieve.mcp_adapter import _is_community_summary_not_ready
 
-    token_text = COMMUNITY_SUMMARY_INDEX_FAILURE
-    # isError + leading text block carrying the token → True.
+    def error_body(code: str) -> str:
+        return json.dumps({"error": code, "message": "summary index absent"})
+
+    # isError + leading text block carrying the named error field → True.
     assert _is_community_summary_not_ready(
-        {"isError": True, "content": [{"type": "text", "text": token_text}]}
+        {
+            "isError": True,
+            "content": [
+                {
+                    "type": "text",
+                    "text": error_body(COMMUNITY_SUMMARY_INDEX_FAILURE),
+                }
+            ],
+        }
     ) is True
     # Not an error at all → False.
     assert _is_community_summary_not_ready(
-        {"isError": False, "content": [{"type": "text", "text": token_text}]}
+        {
+            "isError": False,
+            "content": [
+                {
+                    "type": "text",
+                    "text": error_body(COMMUNITY_SUMMARY_INDEX_FAILURE),
+                }
+            ],
+        }
     ) is False
     # isError but empty content → False.
     assert _is_community_summary_not_ready(
@@ -1179,6 +1249,49 @@ def test_the_summary_token_only_counts_on_a_first_text_block() -> None:
     # isError, leading text WITHOUT the token → False.
     assert _is_community_summary_not_ready(
         {"isError": True, "content": [{"type": "text", "text": "other err"}]}
+    ) is False
+    # isError, token only in prose (no structured field) → False.
+    assert _is_community_summary_not_ready(
+        {
+            "isError": True,
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"retry log: {COMMUNITY_SUMMARY_INDEX_FAILURE}",
+                }
+            ],
+        }
+    ) is False
+    # isError, body JSON that is not an object → False.
+    assert _is_community_summary_not_ready(
+        {
+            "isError": True,
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps([COMMUNITY_SUMMARY_INDEX_FAILURE]),
+                }
+            ],
+        }
+    ) is False
+    # isError, named error field carrying another code → False.
+    assert _is_community_summary_not_ready(
+        {
+            "isError": True,
+            "content": [
+                {
+                    "type": "text",
+                    "text": error_body("read_source_not_found"),
+                }
+            ],
+        }
+    ) is False
+    # isError, non-string error field → False.
+    assert _is_community_summary_not_ready(
+        {
+            "isError": True,
+            "content": [{"type": "text", "text": '{"error": 7}'}],
+        }
     ) is False
 
 

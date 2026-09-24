@@ -69,8 +69,9 @@ RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY: Final[str] = "fast_graph_empty"
 # report arm reads is absent or unpopulated). Only that named upstream
 # refusal sets it — a silent empty is still ``corpus_not_ready``, and fin
 # must never upgrade a bare empty into this code. The adapter records it
-# off the MCP error text; ``fin.host.named_failures`` re-exports it onto
-# the codes surface and the public CODE is :data:`COMMUNITY_SUMMARY_INDEX_FAILURE`.
+# off the named ``error`` code on the MCP error body;
+# ``fin.host.named_failures`` re-exports it onto the codes surface and the
+# public CODE is :data:`COMMUNITY_SUMMARY_INDEX_FAILURE`.
 RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY: Final[str] = "community_summary_unready"
 
 
