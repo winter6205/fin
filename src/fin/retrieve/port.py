@@ -63,6 +63,17 @@ SEARCH_MODE_FILTER_KEY: Final[str] = "search_mode"
 # that module's reserved token and awaits the spec's Open Question 1.
 RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY: Final[str] = "fast_graph_empty"
 
+# The outcome-record key by which a RECORDED global 综述 index-not-ready
+# fact travels: the upstream retrieve answered its typed
+# ``community_summary_index_failure`` refusal (the 社区 summary index the
+# report arm reads is absent or unpopulated). Only that named upstream
+# refusal sets it — a silent empty is still ``corpus_not_ready``, and fin
+# must never upgrade a bare empty into this code. The adapter records it
+# off the named ``error`` code on the MCP error body;
+# ``fin.host.named_failures`` re-exports it onto the codes surface and the
+# public CODE is :data:`COMMUNITY_SUMMARY_INDEX_FAILURE`.
+RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY: Final[str] = "community_summary_unready"
+
 
 class InvalidSearchModeError(InputValidationError):
     """``search_mode`` is not one of the closed 档 tokens.
@@ -83,14 +94,14 @@ class TierUnavailableError(InputValidationError):
     """A legal 档 token whose product side is not open yet.
 
     Carries the SAME public code the send door uses for the request
-    (``TIER_UNAVAILABLE_CODE``: ``global`` → ``tier_not_open``,
-    ``sql`` → ``real_db_not_wired``) so a pin that reaches the port gets
-    the identical named failure — never a retrieve dressed as another
-    档. It subclasses the input-error family so every host seam that
-    already converts a named input error converts this one too; the
-    empty :attr:`input_class` marks that it is deliberately NOT a §B2
-    ledger class (the 档 token itself is well-formed; the product just
-    has not opened it).
+    (``TIER_UNAVAILABLE_CODE``: ``sql`` → ``real_db_not_wired``;
+    ``global`` is now open, so it is never raised for that 档) so a pin
+    that reaches the port gets the identical named failure — never a
+    retrieve dressed as another 档. It subclasses the input-error family so
+    every host seam that already converts a named input error converts
+    this one too; the empty :attr:`input_class` marks that it is
+    deliberately NOT a §B2 ledger class (the 档 token itself is
+    well-formed; the product just has not opened it).
     """
 
     input_class = ""

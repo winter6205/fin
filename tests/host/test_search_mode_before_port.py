@@ -44,7 +44,6 @@ from fin.host.graph import compile_graph
 from fin.host.named_failures import (
     LASTING_RETRIEVE_TIERS,
     REAL_DB_NOT_WIRED,
-    TIER_NOT_OPEN,
 )
 from fin.host.search_mode_decision import (
     decide_search_mode,
@@ -66,13 +65,16 @@ KNOWN_IDS = {"AAPL-2022Q3"}
 
 # Every spelling a request can arrive with for each OPENED 档: the lasting
 # token, a case variant, and the CONTEXT label an utterance names it with.
+# ``global`` joined this set when fin task 4 opened 综述 into a real report
+# arm, so it now routes its token to the port exactly like graph/lexical.
 OPENED_SPELLINGS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("graph", ("graph", "GRAPH", "知识问答")),
     ("lexical", ("lexical", "LEXICAL", "查找")),
+    ("global", ("global", "Global", "综述")),
 )
-# The same for each plan slot, with the 具名失败 its name must yield.
+# The same for each plan slot, with the 具名失败 its name must yield. Only
+# ``sql`` (真数据库) is still a plan slot after global was opened.
 UNOPENED_SPELLINGS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("global", TIER_NOT_OPEN, ("global", "Global", "综述")),
     ("sql", REAL_DB_NOT_WIRED, ("sql", "SQL", "真数据库")),
 )
 # A pin is a WIRE field, so only its token spellings can arrive; the
@@ -314,6 +316,7 @@ def test_the_value_handed_to_the_port_is_never_a_letter() -> None:
     for lasting, spellings in (
         ("graph", ("graph", "GRAPH", " graph ")),
         ("lexical", ("lexical", "LEXICAL")),
+        ("global", ("global", "Global", " global ")),
     ):
         for spelling in spellings:
             resolved = normalize_search_mode(spelling)
@@ -321,6 +324,7 @@ def test_the_value_handed_to_the_port_is_never_a_letter() -> None:
             assert resolved in LASTING_RETRIEVE_TIERS, spelling
 
     assert resolve_search_mode(normalize_search_mode("GRAPH")) == "graph"
+    assert resolve_search_mode(normalize_search_mode("GLOBAL")) == "global"
     for lasting, code, _spellings in UNOPENED_SPELLINGS:
         try:
             resolve_search_mode(normalize_search_mode(lasting))

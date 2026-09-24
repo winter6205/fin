@@ -28,7 +28,6 @@ from fin.host.named_failures import (
     LASTING_RETRIEVE_TIERS,
     REAL_DB_NOT_WIRED,
     TIER_LABELS,
-    TIER_NOT_OPEN,
 )
 from fin.host.search_mode_decision import clarify_options, decide_search_mode
 from fin.host.state import reset_input_state
@@ -105,12 +104,24 @@ def test_choice_instructions_teach_each_operator_label() -> None:
 
 
 def test_rules_naming_skips_the_judge() -> None:
+    """When the rules tier can name the 档, the judge never runs — that
+    short-circuit holds for either rules outcome. 综述 is now OPEN: naming
+    it assigns at the rules tier; a still-unopened 档 (真数据库) is a rules
+    typed_fail; BOTH paths skip the judge because the rules already read
+    the utterance and returned a decided value."""
     fake: FakeJevChoice = FakeJevChoice([])  # any call would raise
-    decision = decide_search_mode(_msgs("综述档 说明一下"), jev_client=fake)
-
+    assigned = decide_search_mode(_msgs("综述档 说明一下"), jev_client=fake)
     assert fake.calls == []
-    assert decision.decision_tier == "typed_fail"
-    assert decision.failure_code == TIER_NOT_OPEN
+    assert assigned.decision_tier == "rules"
+    assert assigned.search_mode == "global"
+    assert assigned.failure_code is None
+
+    fake2: FakeJevChoice = FakeJevChoice([])
+    refused = decide_search_mode(_msgs("sql档 查一下"), jev_client=fake2)
+    assert fake2.calls == []
+    assert refused.decision_tier == "typed_fail"
+    assert refused.failure_code == REAL_DB_NOT_WIRED
+    assert refused.search_mode is None
 
 
 def test_choice_criteria_carry_one_gloss_per_lasting_tier() -> None:
