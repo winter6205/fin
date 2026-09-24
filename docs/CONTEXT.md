@@ -152,8 +152,8 @@ The product job that parses, applies **切分** from the format parameter table,
 _Avoid_: chunk-any-string tool, model-chosen split points, EDGAR form name as the root document type
 
 **thread attach**:
-The operator places a file on the open **research thread** so the model can read it this turn. Default is no **入库推送**.
-_Avoid_: treating drag-into-chat as corpus ingest
+An operator-submitted file held by fin under a logical `attachment_id` for the **research thread** lifetime. Its parsed text enters a thread-scoped temporary index for `retrieve` and `read_file` and can become this-run citation evidence; attaching alone never pushes it into the permanent company corpus (ADRs 0083 and 0085).
+_Avoid_: treating drag-into-chat as corpus ingest, model-visible filesystem paths, injecting the attachment body into the prompt, page-only attachment browsing
 
 **corpus ingest**:
 The separate workspace control that sends a file through the **ingest endpoint** into the retrieve backend.
