@@ -103,14 +103,16 @@ the company-source boundary. What it does not prove: attachment semantics over
 the real store. T1's thread-attach door resolves no body through MCP by
 contract, and that is pinned by `test_attach_does_not_trigger_mcp_read_source`
 (run 15), which installs a spy on `MCPRetrieveAdapter.read`, wires the MCP
-adapter as the graph's real `read_port`, and asserts zero calls. Nor does any
-of it cover the `pg_es` retrieval tiers — those stay blocked at B1/B2. No G4
-attachment gold case over the real fin object store plus live iknow-memory
-store exists yet; that is SC12's end-of-round obligation.
+adapter as the graph's real `read_port`, and asserts zero calls. The `pg_es`
+retrieval tiers were blocked when this section was first written and now run
+green (runs 20, 23), so they are no longer a gap in the live evidence — they are
+just not what T1 changes. No G4 attachment gold case over the real fin object
+store plus live iknow-memory store exists yet; that is SC12's end-of-round
+obligation.
 
 ## Blocked items — status after the environment unblock
 
-Closed by runs 17–22, so they are no longer open questions:
+Closed by runs 17–23, so they are no longer open questions:
 
 - **B1 closed** — `test_live_host_graph_hop.py` passes (run 19) against real
   stdio + real Elasticsearch.
@@ -118,6 +120,12 @@ Closed by runs 17–22, so they are no longer open questions:
   29 passed, `tests/host/test_compile.py` 21 passed (run 17, 18). This also
   corrected a wrong path in an earlier draft of this record: the compose
   contract case lives at `tests/host/test_compile.py`.
+- **B2a closed** — `tests/retrieve/test_live_search_modes_pg_es.py` is at
+  **11 passed, 0 failed** (run 23), with its four neighbor live groups re-run
+  green in the same session. One correction to the earlier draft: that file
+  *collects* 11 cases, not 12; the "12" in runs 9 and 20 was this file's 11 plus
+  `test_live_host_graph_hop.py`'s 1. The repair was a rebuild of the read-only
+  sibling's `dist/`, which the operator authorized for this ticket.
 - **B6 closed on a side branch** — the default suite's `$HOME` leak is fixed at
   the shared boundary: an autouse `tests/conftest.py` fixture points `HOME` at an
   empty per-run directory, following the file's existing
@@ -131,10 +139,6 @@ Closed by runs 17–22, so they are no longer open questions:
 
 Still open, with the reason:
 
-- **B2a** `tests/retrieve/test_live_search_modes_pg_es.py` — 11 of 12 pass; the
-  twelfth fails on the stale sibling build described in F1. Closing it needs
-  `npm run build` inside `/home/winner/projects/iknow-memory`, which is a
-  read-only dependency of this ticket, so it was reported instead of performed.
 - **B2b** `tests/host/test_live_fin_launcher_acceptance.py` — still not run, and
   the reason is now precise rather than "missing prerequisites". The toolchain
   gate is cleared (run 22) and `web/dist` builds clean, but two hard stops
@@ -158,8 +162,13 @@ Still open, with the reason:
   image, 8,000-code-point continuation, cross-thread denial at retrieve,
   attachment/company comparison) — belongs to T2–T5 and the end-of-round run.
 - **F1a** New, and the only finding worth filing from the whole unblock: the
-  live-iknow harness trusts a stale `dist/` (see F1), which is what manufactured
-  the false cross-repo defect. Owner: `tests/retrieve/live_iknow_support.py`.
+  live-iknow harness launches the sibling server on an `is_file()` check alone,
+  so a gitignored artifact whose state cannot be reliably *observed* — two of my
+  own workers measured the same `dist/` paths minutes apart and reported
+  contradictory contracts — is indistinguishable from a violated wire contract.
+  Fix is recorded build provenance asserted before launch, not a freshness
+  comparison. Owner: `tests/retrieve/live_iknow_support.py`. Out of scope for a
+  retrieve-adjacent attachment ticket; filed as its own harness ticket.
 
 ## PR base state
 
@@ -243,11 +252,49 @@ host `5434` so that the pre-existing **non-Compose** `iknow-memory-postgres` on
 | 17 | `uv run --no-sync pytest -q tests/host/test_fin_launcher.py` | 0 | 29 passed — all 12 cases that had failed on `fin: jq is required` now run |
 | 18 | `uv run --no-sync pytest -q tests/host/test_compile.py` | 0 | 21 passed, including the `docker compose config` contract case (correction: this file lives at `tests/host/test_compile.py`, not `tests/test_compile.py` as an earlier draft of this record said) |
 | 19 | `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_host_graph_hop.py` | 0 | 1 passed against real stdio + real Elasticsearch — closes B1 |
-| 20 | `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_host_graph_hop.py tests/retrieve/test_live_search_modes_pg_es.py` | 1 | 11 passed, 1 failed — the `pg_es` tier is reachable for the first time; the single failure is a stale sibling build, not a product defect, item F1 below |
+| 20 | `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_host_graph_hop.py tests/retrieve/test_live_search_modes_pg_es.py` | 1 | 11 passed, 1 failed — the `pg_es` tier is reachable for the first time; the single failure was attributed to a stale sibling build (item F1) and superseded by run 23 |
 | 21 | `uv run --no-sync pytest -q tests/host/test_thread_attachment_durable.py tests/host/test_thread_attach.py` | 0 | 44 passed — the toolchain and service changes did not disturb the attachment slice |
 | 22 | `bash scripts/dev-up.sh --check` | 0 | `dev-up: check ok` — the launcher's toolchain gate is no longer a blocker |
+| 23 | `npm run build` (that repo's own `"build": "tsc -p tsconfig.json"`) in the sibling, then `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_search_modes_pg_es.py` and the four neighbor groups | 0 | the build was a **byte-level no-op** (identical sha256 before/after on the three inspected files, mtime only); `test_live_search_modes_pg_es.py` is now **11 passed, 0 failed**, and the neighbors show no regression: graph hop 1, read_source + corpus_ingest + research_cite 6, mcp t2–t5 5 |
 
-### F1 — the `global` refusal was a stale sibling build, not a contract defect
+### The two workers disagreed about `dist/`, and that is the real F1a evidence
+
+One unresolved contradiction, recorded rather than smoothed over. The
+diagnosing worker observed `dist/core/errors.js` containing **zero**
+occurrences of `failureToken`, a **two**-argument `GraphragError` throw at
+`mode-c-arm.js:152`, and `dist/index.js` dated 2026-09-24 09:22. The rebuilding
+worker, a few minutes later, inspected the **same paths** and found **six**
+occurrences of `failureToken`, a **three**-argument throw matching
+`mode-c-arm.ts:243-255`, and an mtime of 2026-09-25 01:26 — a *different* mtime
+for a file neither worker changed in between, and one already on the far side of
+`068da4e`. Its rebuild then changed no bytes.
+
+So one of those two measurements does not describe the file it claims to, and
+this record cannot say which. What is not in doubt: the suite is green now,
+`failureToken` and the three-argument form are present in the artifact now, and
+the sibling checkout's `HEAD` (`2553e7d`) has contained `068da4e` throughout.
+The earlier "stale build produced a false cross-repo contract violation"
+conclusion was sound against the evidence available when it was drawn, but it is
+**not** confirmed by a controlled before/after, because the two observations
+that would have formed it came from different workers with no shared snapshot.
+
+That is a stronger case for **F1a** than a clean before/after would have been:
+an unlabelled, gitignored build product with only an `is_file()` guard is not
+just able to *be* stale — it is not reliably *observable*, so two workers on the
+same machine can report different contracts and neither can be refuted from the
+artifact alone. The guard the harness needs is not a freshness check against
+`HEAD` but a recorded identity: build provenance written into `dist/` (source sha
+plus timestamp) and asserted by `tests/retrieve/live_iknow_support.py` before it
+launches a server from it.
+
+### F1 — the `global` refusal was not a contract defect; the stale-build cause is narrowed, not proven
+
+*Status after run 23:* this case is green and B2a is closed. What follows is kept
+as the diagnosis of the run-20 failure, with one narrowing: the rebuild changed
+no bytes, so the section below documents a real observed divergence between the
+artifact and `src/`, but this record has **no controlled before/after** proving
+the rebuild is what turned it green (see the two subsections above). The
+conclusion that *does* hold is F1a.
 
 `test_a_global_send_reaches_the_server_and_surfaces_the_runtime_index_failure`
 fails deterministically (reproduced three times, byte-identical). The server
@@ -274,23 +321,27 @@ sides already honor it:
 
 The prose came from the *artifact under test*, not from anyone's source: the
 harness runs `/home/winner/projects/iknow-memory/dist/index.js`, built
-2026-09-24 09:22, while `068da4e` landed 2026-09-24 19:00. Three independent
-proofs: `dist/core/errors.js` contains zero occurrences of `failureToken`;
+2026-09-24 09:22, while `068da4e` landed 2026-09-24 19:00. Three observations
+taken at the time — two of them contradicted minutes later, as recorded above:
+`dist/core/errors.js` contains zero occurrences of `failureToken`;
 `dist/core/retrieval/mode-c-arm.js:152` throws `GraphragError` with two
 arguments (token-less); and the sibling's own TS test
 `npx vitest run tests/index.test.ts -t "named failure on the wire"` passes 2
-cases from current source. Minimal remedy is `npm run build` in that checkout —
-a rebuild, not a code change — which this ticket did not perform because
-`/home/winner/projects/iknow-memory` is a read-only dependency and the operator's
-other live suites run against that same `dist/`.
+cases from current source. The remedy was `npm run build` in that checkout — a
+rebuild, not a code change — which the operator then authorized for this ticket
+(run 23), after this record first declined to touch a read-only dependency that
+other live suites share. That the rebuild changed no bytes is the open part of
+this story, recorded above.
 
 **The finding that is real (F1a, harness hygiene, not product):**
 `tests/retrieve/live_iknow_support.py` selects the sibling server after only an
 `is_file()` check (`tests/retrieve/test_live_search_modes_pg_es.py:149`), so a
 stale build is indistinguishable from a violated wire contract, and a machine
-that never ran the suite before will report a false cross-repo defect. The
-guard belongs there — e.g. compare the build's freshness against the sibling's
-`HEAD`, or fail loudly when the artifact predates the source.
+that never ran the suite before will report a false cross-repo defect. The guard
+belongs there, and not as a freshness comparison against `HEAD`: a gitignored
+artifact has no reliable clock, as the contradictory measurements above show. It
+needs recorded provenance — the source sha and build time stamped into `dist/` by
+the build itself, asserted before the harness launches a server from it.
 
 No relationship to the attachment slice: the failing test imports only
 `fin.corpus.chunking` / `_common` / `push`, `fin.host.named_failures` and
