@@ -5,7 +5,7 @@ Status: accepted
 
 The host classifies each attachment once while preparing it, records the result on the attachment, and selects from the closed set `text`, `pdf-text`, `pdf-scanned`, `image`, and `unsupported`. Format bytes and PDF text-layer characteristics provide the classification facts; `unsupported` fails with `attachment_type_unsupported` rather than guessing a parser. Jev does not gain a document-type Choice lane because document format is an inspectable input property, unlike the intent choices in ADRs 0080 and 0081.
 
-ADR 0085 places this classification in the thread-scoped temporary-ingest path. Whether parsing runs asynchronously, and its timing and failure states, remain a separate G3 decision.
+ADR 0085 places this classification in the thread-scoped temporary-ingest path. ADR 0086 records when asynchronous parsing starts and how its availability and failures are exposed.
 
 Considered Options: an additional Jev classification lane and asking the operator to classify every attachment. Both add an avoidable decision step for formats the host can inspect.
 
