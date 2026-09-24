@@ -8,13 +8,14 @@ port-level half lives in ``tests/retrieve/test_fake_port.py`` and
 the **named-exit path** half:
 
 * concurrent: the 409 ``concurrent_run`` guard is orthogonal to the 档
-  selector — an open 档 does not bypass it, and an unopened 档 is named
-  BEFORE the probe (a retry of the in-flight run would not answer a
-  「档未开」 request).
+  selector — an open 档 (``graph`` or the newly opened ``global``) does
+  not bypass it, and the one plan slot still refused at routing (``sql``)
+  is named BEFORE the probe (a retry of the in-flight run would not
+  answer a 「真库未接」 request).
 * exception: the knowledge-MCP gate's 409 ``knowledge_mcp_fault``
   applies to an open-tier send exactly as to a tier-less one, and the
-  routing-time 400 still wins over it —「档未开」 is not a transport
-  fact, so it reads the same whether MCP is up or down.
+  routing-time 400 still wins over it — the unopened 档's named refusal
+  is not a transport fact, so it reads the same whether MCP is up or down.
 * negative: ``community_summary_index_failure`` (T1's token) rides the
   run payload with its OWN ordinary-person copy and is never invented
   by fin's retrieve-side decision from an empty or failed retrieve.
@@ -45,9 +46,11 @@ from fin.host.named_failures import (
     CORPUS_NOT_READY,
     MAPPING_DROP,
     REAL_DB_NOT_WIRED,
+    RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY,
     TIER_NOT_OPEN,
     named_refusal_reason,
     retrieve_blocking_failure,
+    retrieve_outcomes_delta,
 )
 from fin.host.run_payload import ORDINARY_PERSON_COPY, _run_to_response_payload
 
@@ -141,17 +144,20 @@ def mcp_env(monkeypatch: pytest.MonkeyPatch) -> None:
 # ----- concurrent: 409 ``concurrent_run`` × 档 selector -----
 
 
+@pytest.mark.parametrize("tier", ["graph", "global"])
 def test_an_open_tier_send_still_meets_the_concurrent_run_409(
-    client: TestClient, store, locked_graph
+    tier: str, client: TestClient, store, locked_graph
 ) -> None:
     """The 档 selector is routing metadata, not a lane: naming an OPEN
-    档 (``graph``) while another run is in flight gets the same plain-JSON 409
-    ``concurrent_run`` as a tier-less send."""
+    档 (``graph``, or ``global`` since 综述 was opened into a real report
+    arm) while another run is in flight gets the same plain-JSON 409
+    ``concurrent_run`` as a tier-less send — the opened 档 clears the
+    routing gate and meets the lock, it is not a 「档未开」 400."""
     thread_id = store.create_thread(title="existing").id
 
     r = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": "q", "tiers": ["graph"]},
+        json={"question": "q", "tiers": [tier]},
     )
 
     assert r.status_code == 409, r.text
@@ -159,16 +165,17 @@ def test_an_open_tier_send_still_meets_the_concurrent_run_409(
     assert r.json() == {"error": "concurrent_run"}
 
 
-@pytest.mark.parametrize("tier", ["global"])
+@pytest.mark.parametrize("tier", ["sql"])
 def test_an_unopened_tier_is_named_before_the_concurrent_run_409(
     tier: str, client: TestClient, store, locked_graph
 ) -> None:
-    """Exit ORDER on the concurrency seam: the routing-time 400 「档未开」
-    fires BEFORE the lock probe — telling the operator to wait for the
-    in-flight run would be wrong advice for a 档 this product has not
-    opened, and retrying after the run ends answers the same 400. The
-    lasting 综述 token takes that exit exactly as the retired letter
-    once did, and starts no run."""
+    """Exit ORDER on the concurrency seam: the routing-time 400 naming the
+    plan slot fires BEFORE the lock probe — telling the operator to wait
+    for the in-flight run would be wrong advice for a 档 this product has
+    not opened, and retrying after the run ends answers the same 400.
+    ``sql`` (真数据库) is the plan slot left standing once 综述 was opened;
+    it takes that named exit exactly as the retired letter once did, and
+    starts no run."""
     thread_id = store.create_thread(title="existing").id
 
     r = client.post(
@@ -177,26 +184,29 @@ def test_an_unopened_tier_is_named_before_the_concurrent_run_409(
     )
 
     assert r.status_code == 400, r.text
-    assert r.json() == {"error": TIER_NOT_OPEN}
+    assert r.json() == {"error": REAL_DB_NOT_WIRED}
 
 
 # ----- exception: 409 ``knowledge_mcp_fault`` × 档 selector -----
 
 
+@pytest.mark.parametrize("tier", ["graph", "global"])
 def test_the_mcp_fault_gate_409_applies_to_an_open_tier_send(
-    client: TestClient, store, graph, mcp_env
+    tier: str, client: TestClient, store, graph, mcp_env
 ) -> None:
     """Boundary 'exception' on the named-409 surface: with the product
     MCP adapter published 坏, an OPEN-档 send is refused by the gate
     exactly like a tier-less send — the 档 never reaches the (down)
     retrieve, and the two 409 tokens stay distinguishable
-    (``knowledge_mcp_fault`` here vs ``concurrent_run`` above)."""
+    (``knowledge_mcp_fault`` here vs ``concurrent_run`` above). ``global``
+    clears the routing gate now that 综述 is open, so it meets this
+    transport fault rather than a 「档未开」 400."""
     thread_id = store.create_thread(title="existing").id
     publish_knowledge_mcp_state(KNOWLEDGE_MCP_FAULT)
 
     r = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": "q", "tiers": ["graph"]},
+        json={"question": "q", "tiers": [tier]},
     )
 
     assert r.status_code == 409, r.text
@@ -209,19 +219,20 @@ def test_the_mcp_fault_gate_409_applies_to_an_open_tier_send(
 def test_an_unopened_tier_is_named_before_the_mcp_fault_gate(
     client: TestClient, store, graph, mcp_env
 ) -> None:
-    """「档未开」 is not a transport fact: the 400 wins over the closed
-    gate, so an operator with MCP down and a 综述 pin gets the SAME
-    answer as with MCP up — never a retry-them advice token."""
+    """The unopened 档's named refusal is not a transport fact: the 400
+    wins over the closed gate, so an operator with MCP down and a
+    ``sql`` (真数据库) pin gets the SAME answer as with MCP up — never a
+    retry-them advice token."""
     thread_id = store.create_thread(title="existing").id
     publish_knowledge_mcp_state(KNOWLEDGE_MCP_FAULT)
 
     r = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": "q", "tiers": ["global"]},
+        json={"question": "q", "tiers": ["sql"]},
     )
 
     assert r.status_code == 400, r.text
-    assert r.json() == {"error": TIER_NOT_OPEN}
+    assert r.json() == {"error": REAL_DB_NOT_WIRED}
 
 
 # ----- negative: the 综述-not-ready token on the run payload -----
@@ -274,6 +285,73 @@ def test_fin_never_invents_the_community_summary_index_failure() -> None:
             verifier_reason="unknown_locator",
         )
         != COMMUNITY_SUMMARY_INDEX_FAILURE
+    )
+
+
+def test_a_recorded_community_summary_refusal_emits_the_runtime_code() -> None:
+    """The positive chain (mirror of the Fast-fact decision tests): when a
+    retrieve call answered the global 综述 index's typed refusal, the tool
+    records :data:`RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY` and the
+    no-chunk run resolves to ``community_summary_index_failure`` — the same
+    token the operator copy carries — not ``corpus_not_ready``. The flag is
+    the ONLY source (see the never-invents test above), and any chunk>0
+    pre-empts it for the verifier's own verdict."""
+    record = {
+        "chunks": 0,
+        "mapping_failures": 0,
+        RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY: True,
+    }
+    assert retrieve_blocking_failure([record]) == COMMUNITY_SUMMARY_INDEX_FAILURE
+    # A later call that produced a usable chunk wins: the refusal is not
+    # pre-empted onto a run retrieval actually answered.
+    assert (
+        retrieve_blocking_failure(
+            [record, {"chunks": 2, "mapping_failures": 0}]
+        )
+        is None
+    )
+    # The tool seam rebuilds records through ``retrieve_outcomes_delta``;
+    # dropping the flag there would erase the decision's only path to it.
+    assert retrieve_outcomes_delta([record], baseline=0) == [record]
+
+
+def test_the_retrieve_tool_forwards_the_community_fact_into_the_run_record() -> (
+    None
+):
+    """The tool seam itself — not a hand-built record — must carry a
+    recorded global 综述 report-index refusal onto ``retrieve_outcomes``:
+    the end-to-end mirror of the Fast 抽图 tool-seam test and the
+    decision-layer test above. A run over ``FakeRetrievePort
+    (community_summary_unready=True)`` flows port flag →
+    ``copy_recorded_job_facts`` → run record → the no-chunk run resolving
+    to ``community_summary_index_failure``, all hermetically (the live
+    cross-repo case proves the real server's wire frame)."""
+    from fin.host.graph import _make_retrieve_tool
+    from fin.retrieve.fake_port import FakeRetrievePort
+    from fin.retrieve.hit_mapping import MappingFailureLedger
+
+    tool = _make_retrieve_tool(
+        FakeRetrievePort(community_summary_unready=True),
+        mapping_ledger=MappingFailureLedger(),
+    )
+    command = tool.invoke(
+        {
+            "name": "retrieve",
+            "args": {"query": "跨多份材料的综述问题"},
+            "id": "c-community-unready",
+            "type": "tool_call",
+        }
+    )
+    assert command.update["retrieve_outcomes"] == [
+        {
+            "chunks": 0,
+            "mapping_failures": 0,
+            RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY: True,
+        }
+    ]
+    assert (
+        retrieve_blocking_failure(command.update["retrieve_outcomes"])
+        == COMMUNITY_SUMMARY_INDEX_FAILURE
     )
 
 

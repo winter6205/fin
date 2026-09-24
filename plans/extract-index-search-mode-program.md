@@ -28,21 +28,21 @@ empty
    - **Inherits:** spec 1 ACR PASS; ADR 0053 / 0060 / 0063.
    - **Surface:** `fin.corpus`
    - **Acceptance:** Child plan `extract-window-tree.md` bullets all checked; `uv run pytest -q` still Fake retrieve.
-   - Status: [ ] pending
+   - Status: [x] done — child plan `plans/extract-window-tree.md` all bullets [x]
 
 2. **Wave 2 graph index** — tag: `[implementation]`
    - **Inherits:** iknow spec + ADR-0011; fin 抽图窗/children as input.
    - **Surface:** iknow extract / graph / community CLI
    - **Acceptance:** Child plan `graph-index-standard-fast.md` (iknow) complete; `npm test` without live GDS.
    - `[blocks: T1]` for Fast co-occurrence on children
-   - Status: [ ] pending
+   - Status: [x] done — iknow `plans/graph-index-standard-fast.md` 6/6 [x]; commits 4682156 / 6a67bb2 / 7e081f5 / 9586d9a / f3ac774 / 3f08b60 all on iknow-memory main
 
 3. **Wave 3 retrieve 档** — tag: `[implementation]`
    - **Inherits:** `filters.search_mode`; named failure codes including `community_summary_index_failure`.
    - **Surface:** iknow retrieve assembler + fin retrieve port / `named_failures`
    - **Acceptance:** Both search-mode-retrieve child plans complete.
    - `[blocks: T2]` for C-ready path; 3a/3b `[parallel]` for B default + wire
-   - Status: [ ] pending
+   - Status: [x] done — 3a T1–T4 landed on iknow main (#238 wire parse + arms skeleton, #243 lexical parent-window arm, #244 global report-first arm, #245 sql typed refusal), retokenized to the word closed set by #269/#270; 3b all three bullets satisfied on fin main by the #284–#293 stack. The remainder chain fully landed: iknow T5a ES community-summary write side (b91ab36) → iknow T5b global report-TEXT ES read seam + live global proof, fail-closed no-healthy-empty (26684c9), both on `feat/es-community-summary` → fin task 4 opened the global 档 and wired the `community_summary_index_failure` runtime emit end-to-end (fin 2701923, `feat/open-global-tier`); cross-repo live proof `-m mcp tests/retrieve/test_live_search_modes_pg_es.py` 11 passed against the real iknow T5b server.
 
 4. **Wave 4 host cascade** — tag: `[implementation]`
    - **Inherits:** spec 4 ACR PASS; Soft-Track `decide_track` shape.
