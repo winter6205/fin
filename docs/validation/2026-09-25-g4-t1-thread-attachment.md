@@ -23,7 +23,10 @@ committed G4 gold set are not closed by this record.
 
 ## Commands and results
 
-Default-suite runs are hermetic. The Postgres-backed runs at 1 and 16 used a
+Default-suite runs on this branch are hermetic except for the `$HOME` leak
+tracked as B6 — three `test_clarify_prompt.py` cases read the operator's real
+`~/.fin/user.md`, and the fix for that lives on its own PR #299, not here. The
+Postgres-backed runs at 1 and 16 used a
 throwaway container started for this ticket (`fin-g4-t1-pg`, `postgres:16`,
 host port 5433 → container 5432, DEV-only credentials taken from the committed
 `docker-compose.yml`). That container has since been **removed** — it held host
@@ -127,16 +130,22 @@ Closed by runs 17–23, so they are no longer open questions:
   *collects* 11 cases, not 12; the "12" in runs 9 and 20 was this file's 11 plus
   `test_live_host_graph_hop.py`'s 1. The repair was a rebuild of the read-only
   sibling's `dist/`, which the operator authorized for this ticket.
-- **B6 closed on a side branch** — the default suite's `$HOME` leak is fixed at
-  the shared boundary: an autouse `tests/conftest.py` fixture points `HOME` at an
-  empty per-run directory, following the file's existing
-  `_strip_operator_llm_and_mcp_cwd_env` convention rather than special-casing the
-  three tests. Proven RED first (`3 failed` with a planted `~/.fin/user.md`, and
-  `3 failed` with the operator's real 508-byte one), then GREEN with that real
-  home still present (`11 passed`), then `uv run --no-sync pytest -q` →
-  **2962 passed, 47 skipped, 299 deselected, exit 0** — the first full default
-  run on this box. It is deliberately **not** in this PR: one file, `+38`, test
-  infrastructure only, commit `61741d7`, unpushed, awaiting the operator.
+- **B6 closed on its own PR, [#299](https://github.com/winter6205/fin/pull/299)**
+  — the default suite's `$HOME` leak is fixed at the shared boundary: an autouse
+  `tests/conftest.py` fixture points `HOME` at an empty per-run directory,
+  following the file's existing `_strip_operator_llm_and_mcp_cwd_env` convention
+  rather than special-casing the three tests. Proven RED first (`3 failed` with a
+  planted `~/.fin/user.md`, and `3 failed` with the operator's real 508-byte one),
+  then GREEN with that real home still present (`11 passed`), then
+  `uv run --no-sync pytest -q` → **2962 passed, 47 skipped, 299 deselected, exit
+  0**. Deliberately **not** folded into this PR: one file, `+38/-0`, test
+  infrastructure only. It was re-proven from scratch on the current `main`
+  (`7907453`, commit `edc1a2f`, zero-conflict cherry-pick) rather than reusing the
+  numbers above: baseline without the fix `3 failed, 8 passed` → with it
+  `11 passed`, `pytest -q tests/host` 1651 passed, full default suite identical at
+  2962/47/299. Independently re-checked in this session: `~/.fin/user.md` is still
+  that 508-byte file, and `test_clarify_prompt.py` passes 11 on the branch — the
+  fix removes the dependency, it does not hide the file.
 
 Still open, with the reason:
 
@@ -230,7 +239,7 @@ Each was traced to this machine, not to `9bbcae2`:
   `HOME=$(mktemp -d) uv run --no-sync pytest -q tests/host/test_clarify_prompt.py`
   → 11 passed. The code path predates this merge (commits `273dbaf` and
   `b6d01b5` are ancestors of *both* merge parents), so the branch neither
-  caused nor can silently absorb it; it is filed as item B6.
+  caused nor can silently absorb it; it is item B6, fixed on PR #299.
 
 `tests/retrieve` — the directory whose `port.py` / `mcp_adapter.py` /
 `tiers.py` this merge actually changed — reported zero failures, and the eight
@@ -395,3 +404,13 @@ No relationship to the attachment slice: the failing test imports only
 `fin.retrieve.port`, and `grep -i attachment` over `src/fin/retrieve/*` and
 `live_iknow_support.py` is empty.
 
+
+## Delivery state
+
+- **PR #298** (this ticket, T1 only): `OPEN / MERGEABLE / CLEAN` against
+  `origin/main` = `7907453`, branch 0 behind — i.e. **awaiting merge**.
+- **PR [#299](https://github.com/winter6205/fin/pull/299)** (B6, split out on the
+  operator's request): `OPEN / MERGEABLE`, `main` ← `fix/test-suite-hermetic-home`,
+  1 file, `+38/−0`. Independent of #298; neither blocks the other.
+- Not delivered by either: T2–T5, and with them spec Success Criteria 5–12 plus
+  SC12's committed G4 gold set.
