@@ -144,7 +144,7 @@ The tagged-numbers format inside official 10-Q/10-K iXBRL. Not a website; SEC.go
 _Avoid_: using XBRL as a product or hostname, conflating it with iknow-memory retrieve
 
 **read_source**:
-The selected model-facing name for a known-locator source read, currently exposed in code as `read_file`: it resolves one authorized source unit from the company corpus or active-thread attachment without requiring a `retrieve` hit in the same run. Returned text may be this-run citation evidence (ADR 0046); overflow behavior remains a G4 decision.
+The selected model-facing name for a known-locator source read, currently exposed in code as `read_file`: it resolves one authorized source unit from the company corpus or active-thread attachment without requiring a `retrieve` hit in the same run. A bounded read starts at position zero or at the returned Unicode-code-point `next_position`; only text returned in this run may become citation evidence (ADRs 0046 and 0088).
 _Avoid_: read_file as the future tool name, read_locator, read_page, read_chunk, treating read as retrieve, reading embeddings
 
 **ingest endpoint**:
@@ -152,7 +152,7 @@ The product job that parses, applies **切分** from the format parameter table,
 _Avoid_: chunk-any-string tool, model-chosen split points, EDGAR form name as the root document type
 
 **thread attach**:
-An operator-submitted file held by fin under a logical `attachment_id` for the **research thread** lifetime. Its parsed text enters a thread-scoped temporary index for `retrieve` and `read_source` and can become this-run citation evidence; attaching alone never pushes it into the permanent company corpus (ADRs 0083 and 0085).
+An operator-submitted file held by fin under a logical `attachment_id` for the **research thread** lifetime. Fin owns its parsed text and thread-private searchable index, which remains reusable across turns; the host binds reads to the trusted active thread, and deleting the thread removes its attachments and index. Attaching alone never pushes it into the permanent company corpus (ADRs 0083, 0085, and 0088).
 _Avoid_: treating drag-into-chat as corpus ingest, model-visible filesystem paths, injecting the attachment body into the prompt, page-only attachment browsing
 
 **corpus ingest**:
@@ -160,19 +160,19 @@ The separate workspace control that sends a file through the **ingest endpoint**
 _Avoid_: one control that both attaches and stores without an explicit ingest choice
 
 **locator**:
-A typed source identity for citation and `read_source`: the company-corpus form remains `{document_id, version, unit}`, while a distinct attachment kind is validated against the active thread and parsed-content version (G4; exact fields pending). The claimed quote is separate from the locator; retrieved chunks carry a locator as `source_ref` and are not citation identities (ADR 0046).
-_Avoid_: chunk_id, char offset, bbox, page-less citation, unofficial PDF page as live EDGAR identity, verifying an HTML quote against a PDF page
+A typed source identity for citation and `read_source`: company sources use `{document_id, version, unit}` and thread attachments use `{kind: "attachment", attachment_id, version, unit}`. The host validates the attachment against the trusted active thread and parsed-content version; a read continuation position is separate from the locator. Retrieved chunks carry a locator as `source_ref`, while the claimed quote remains separate (ADRs 0046 and 0088).
+_Avoid_: chunk_id, char offset as citation identity, bbox, page as the generic unit field, unofficial PDF page as live EDGAR identity, verifying an HTML quote against a PDF page
 
 **citation verifier**:
-A code gate on the **grounded** track path to END: a supporting span is a contiguous substring of the answer (v1 minimum 32 characters) that appears in text this run received from **retrieve** / **read_source** (ADR 0046). Passed spans become the user-visible citations; unknown locators refuse immediately; missing or unmatched spans bounce with a hidden template until the citation-repair cap, then refuse. Other tracks skip this gate. _Stage: substring gate on main; Jev support pick out of this host Jev program (ADR 0082)._
+A code gate on the **grounded** track path to END: a supporting span is a contiguous substring of the answer (v1 minimum 32 characters) that appears in text this run received from **retrieve** / **read_source** (ADR 0046). Passed spans become unit-located user-visible citations; unknown locators refuse immediately; missing or unmatched spans bounce with a hidden template until the citation-repair cap, then refuse. Other tracks skip this gate. _Stage: substring gate on main; Jev support pick out of this host Jev program (ADR 0082)._
 _Avoid_: faithfulness prompt, LLM-as-judge as the citation gate, model-authored citation block, `verify` as a tool, running the gate on greetings or soft off-topic replies, web-search text as gate evidence, a second serve-time extracted tree as citation SSOT
 
 **citation span**:
-One user-visible citation row from the verifier: a ≥32-character contiguous substring of the answer that matched on a retrieved or read page. The workspace sources list may show many spans per page (sliding-window overlap); that granularity is expected, not a send failure.
-_Avoid_: treating each span as a full sentence, hiding overlap as a bug, conflating span count with page count
+One user-visible citation row from the verifier: a ≥32-character contiguous substring of the answer that matched on a retrieved or read source unit. The workspace sources list may show many spans per unit (sliding-window overlap); that granularity is expected, not a send failure.
+_Avoid_: treating each span as a full sentence, hiding overlap as a bug, conflating span count with unit count
 
 **citation-repair cap**:
-v1 limit of 3 recoverable citation-verifier failures (span not on the page, or a non-refuse final answer with no cites) before the run must refuse.
+v1 limit of 3 recoverable citation-verifier failures (span not in returned source text, or a non-refuse final answer with no cites) before the run must refuse.
 _Avoid_: retry budget, max repairs, using step cap as the cite-fail rule
 
 **step cap**:
