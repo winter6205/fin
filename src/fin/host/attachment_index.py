@@ -8,9 +8,11 @@ address the same text, so the index may not carry a variant of it.
 This module is the whole computation as pure functions: no file, no
 database, no lock, no clock, standard library only. ``attachment_store``
 persists what :func:`build_postings` returns (its ``put_index`` postings
-shape is ``dict[str, Sequence[int]]``) and refuses ``ready`` unless
-:func:`is_usable` accepts it, so the durability layer and the ranking
-rule stay independent and each is testable alone.
+shape is ``dict[str, Sequence[int]]``) and refuses ``ready`` for a version
+that has no unit or posting rows of its own; :func:`is_usable` is the
+stronger rule the preparation service applies before it reports a stored
+``ready`` at all. Keeping the two apart means the durability layer and the
+ranking rule stay independent and each is testable alone.
 
 Determinism is a product requirement, not a nicety: a restart rebuilds
 the index for the *same* parsed version, and any difference in term set
@@ -223,8 +225,8 @@ def search(
 def is_usable(postings: Mapping[str, Sequence[int]]) -> bool:
     """Whether a derived index may back a ``ready`` claim.
 
-    The store's ``mark_ready`` asks this before it flips the status, and
-    the two rules are the spec's own:
+    The preparation service asks this before it reports a stored ``ready``,
+    and the two rules are the spec's own:
 
     * a derived index with no rows, or with a term that reaches no unit,
       cannot serve a hit — publishing ``ready`` over it would present a

@@ -317,12 +317,14 @@ def attachment_context_message(
     """Return the call-scoped attachment block, or ``None`` for none.
 
     corpus-serve-ingest T4 (ADR 0047 **thread attach**): the operator
-    may drag a file into the open research thread; the model may read
-    it on THIS turn only. Like the track prompts, the returned
-    ``SystemMessage`` is prepended at model call time and must never
-    be written back to the checkpoint — the caller drops it after the
-    call, and ``reset_input_state`` clears the ``attachments`` state
-    channel on the next run, so the text disappears next turn.
+    may drag a file into the open research thread, and the thread keeps
+    it for its whole life (ADR 0086). The block itself is still
+    call-scoped: like the track prompts, the returned ``SystemMessage``
+    is prepended at model call time and must never be written back to
+    the checkpoint, because the text is re-stuffed from the thread's
+    stored copy on every run that names the attachment. A later run
+    that does NOT name it gets no block, so the text is absent for that
+    run — the attachment persists, its in-context text does not.
 
     Citation discipline (ADR 0046): the block says explicitly that
     attachments are NOT citable corpus. The gate's real protection is
@@ -340,9 +342,10 @@ def attachment_context_message(
     return SystemMessage(
         content=(
             f"{THREAD_ATTACHMENTS_MARKER}\n"
-            "The operator attached the following file(s) to THIS turn. "
-            "They are readable context for this turn only and vanish "
-            "on the next turn. They are NOT part of the citable "
+            "The operator named the following file(s) attached to this "
+            "thread for this run. They belong to the thread and can be "
+            "named again on later turns; this copy of their text is for "
+            "this run only. They are NOT part of the citable "
             "corpus: the citation gate only accepts spans copied from "
             "this run's retrieve / read_file tool text, so never "
             "present attachment content as retrieved evidence.\n\n"

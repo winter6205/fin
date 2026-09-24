@@ -31,7 +31,9 @@ function attachment(
     size_bytes: 6,
     scope: "thread_attach",
     status: "ready",
-    version: "v1",
+    version: 1,
+    unit_count: 2,
+    searchable: true,
     ...overrides,
   };
 }

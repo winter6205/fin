@@ -161,7 +161,12 @@ class AttachmentPreparationService:
         return record
 
     def prepare(self, attachment_id: str) -> AttachmentRecord:
-        """Freeze parsed units and the derived index, then publish ready."""
+        """Freeze parsed units and the derived index, then publish ready.
+
+        This is also the retry path: a record that never reached ``ready`` is
+        driven again from its retained bytes, while a published version is
+        left alone because earlier answers cite its locators.
+        """
         record = self._require(attachment_id)
         if record.searchable:
             # EXIT: already published and usable — re-preparing would mint a
@@ -169,24 +174,21 @@ class AttachmentPreparationService:
             return record
         return self._prepare(record, version=record.version + 1)
 
-    def retry(self, attachment_id: str) -> AttachmentRecord:
-        """Re-drive a failed attachment; success moves it to ``ready``."""
-        record = self._require(attachment_id)
-        self.store.clear_units(attachment_id)
-        self.store.clear_index(attachment_id)
-        return self._prepare(record, version=record.version + 1)
-
     def prepare_async(self, attachment_id: str) -> None:
         """Drive preparation off the request path; failures are recorded."""
         try:
             self.prepare(attachment_id)
         except (AttachmentNotFoundError, AttachmentThreadGoneError):
+            # EXIT: the thread is gone, so there is no reader left to serve
+            # and no row left to leave half-published.
             logger.info(
                 "attachment preparation lost the race with its thread delete: "
                 "attachment_id=%s",
                 attachment_id,
             )
         except AttachmentStoreError:
+            # EXIT: the store itself refused the status write, so the row
+            # stays ``parsing`` and the next restart re-drives it here.
             logger.exception(
                 "attachment preparation could not be recorded: attachment_id=%s",
                 attachment_id,
@@ -285,6 +287,20 @@ class AttachmentPreparationService:
         )
         return replace(record, status="parsing", indexed=False)
 
+    def list_for_thread(self, thread_id: str) -> tuple[AttachmentRecord, ...]:
+        """Every attachment of a thread, with the same verification as a read.
+
+        The stored status is not trusted here either: a row that claims
+        ``ready`` without its derived data reads as ``parsing``, so the list
+        and the single-status door can never disagree about one row.
+        """
+        verified: list[AttachmentRecord] = []
+        for record in self.store.list_for_thread(thread_id):
+            current = self.status(record.attachment_id)
+            if current is not None:
+                verified.append(current)
+        return tuple(verified)
+
     def units(self, attachment_id: str) -> tuple[ParsedAttachmentUnit, ...]:
         record = self.store.get(attachment_id)
         if record is None or not record.version:
@@ -303,6 +319,11 @@ class AttachmentPreparationService:
         if not record.searchable:
             raise AttachmentNotReadyError(attachment_id)
         text = "\n\n".join(unit.text for unit in self.units(attachment_id))
+        if not text.strip():
+            # EXIT: a ready record whose frozen text is gone is not an empty
+            # document; the turn gets the typed exit instead of a content
+            # block that names nothing.
+            raise AttachmentNotReadyError(attachment_id)
         return ResolvedAttachment(
             attachment_id=record.attachment_id,
             filename=record.filename,
@@ -322,12 +343,14 @@ class AttachmentPreparationService:
         for record in self.store.incomplete():
             repaired += 1
             try:
-                self._prepare(
-                    record, version=record.version or 1
-                )
+                self._prepare(record, version=record.version or 1)
             except AttachmentThreadGoneError:
+                # EXIT: its thread is gone; nothing this row could write
+                # would be readable, and the cascade already took the rest.
                 continue
             except AttachmentStoreError:
+                # EXIT: this row could not be rebuilt, so it keeps reading
+                # as ``parsing`` and the next restart tries it again.
                 logger.exception(
                     "attachment recovery could not rebuild attachment_id=%s",
                     record.attachment_id,
@@ -357,6 +380,7 @@ class AttachmentPreparationService:
         200 over orphaned data.
         """
         failures: list[str] = []
+        removed: set[str] = set()
         for record in self.store.list_for_thread(thread_id):
             try:
                 self.objects.delete(record.object_key)
@@ -367,16 +391,32 @@ class AttachmentPreparationService:
                     exc,
                 )
                 failures.append(record.object_key)
+            else:
+                removed.add(record.object_key)
         if failures:
             raise AttachmentCleanupError(thread_id, failures)
-        self._discard_bytes(thread_id, self.store.delete_for_thread(thread_id))
+        # WHY the sweep is restricted: the row delete also reports every key it
+        # knew about, including one an upload added after the list above. Those
+        # bytes have not been touched yet, so only they are swept here, and no
+        # key is deleted twice.
+        pending = self.store.delete_for_thread(thread_id)
+        self._discard_bytes(
+            thread_id, [key for key in pending if key not in removed]
+        )
 
     def _discard_bytes(self, thread_id: str, keys: Sequence[str]) -> None:
-        """Best-effort byte sweep; a failure here is logged, never hidden."""
+        """Best-effort byte sweep; a failure here is logged, never hidden.
+
+        The durable rows are already gone when this runs, so the door cannot
+        retry the leftover and the named key in the log is the operator's
+        handle for it.
+        """
         for key in keys:
             try:
                 self.objects.delete(key)
             except Exception:
+                # EXIT: no record left owns this key to fail on, so the
+                # delete still reports success and the key is logged.
                 logger.exception(
                     "orphaned attachment bytes left behind for thread_id=%s key=%s",
                     thread_id,

@@ -25,7 +25,7 @@ import {
   IngestFailedError,
   type SendRequest,
 } from "./api";
-import { useWorkspaceStore } from "./store";
+import { attachmentsForSend, useWorkspaceStore } from "./store";
 import type { ThreadAttachment, ThreadDetail } from "./types";
 
 const THREAD_ID = "11111111-1111-4111-8111-111111111111";
@@ -44,22 +44,26 @@ const INGEST_OK = {
   invalidation: null,
 };
 
-// The POST 200 of the attach door: stored, not yet parsed.
+// The POST 200 of the attach door: stored, not yet parsed. Every
+// attachment door answers with this same shape.
 const ATTACH_PARSED_LATER: ThreadAttachment = {
   attachment_id: "att-1",
   filename: "notes.md",
   size_bytes: 6,
   scope: "thread_attach",
   status: "parsing",
-  version: "v1",
+  version: 0,
+  unit_count: 0,
+  searchable: false,
+  failure_reason: null,
 };
 
 const ATTACH_READY: ThreadAttachment = {
   ...ATTACH_PARSED_LATER,
   status: "ready",
+  version: 1,
   unit_count: 2,
   searchable: true,
-  failure_reason: null,
 };
 
 const ATTACH_FAILED: ThreadAttachment = {
@@ -309,6 +313,55 @@ describe("two doors never cross (acceptance)", () => {
   });
 });
 
+describe("send gate: what a send may reference", () => {
+  it("references only READY records, so an unrelated question is never refused", () => {
+    const selection = attachmentsForSend([
+      { ...ATTACH_READY, attachment_id: "ready-1" },
+      { ...ATTACH_PARSED_LATER, attachment_id: "parsing-1" },
+      { ...ATTACH_FAILED, attachment_id: "failed-1" },
+    ]);
+    expect(selection.ids).toEqual(["ready-1"]);
+    // What was left out stays visible with its reason — the rule may never
+    // drop a record silently.
+    expect(selection.withheld.map((a) => a.attachment_id)).toEqual([
+      "parsing-1",
+      "failed-1",
+    ]);
+  });
+
+  it("names nothing for a thread that holds no attachment", () => {
+    expect(attachmentsForSend([])).toEqual({ ids: [], withheld: [] });
+  });
+
+  it("the ids the gate selects are the ids that reach the wire", async () => {
+    seedThread();
+    useWorkspaceStore.setState({
+      attachments: [
+        ATTACH_READY,
+        { ...ATTACH_PARSED_LATER, attachment_id: "att-2" },
+        ATTACH_FAILED,
+      ],
+    });
+    const { calls } = stubFetch((url) =>
+      url.endsWith("/messages") ? sseRunResponse() : jsonResponse("[]"),
+    );
+
+    await useWorkspaceStore
+      .getState()
+      .sendQuestion(
+        THREAD_ID,
+        "读这份",
+        true,
+        attachmentsForSend(useWorkspaceStore.getState().attachments).ids,
+      );
+
+    const request = JSON.parse(
+      calls.find((c) => c.url.endsWith("/messages"))?.body as string,
+    ) as SendRequest;
+    expect(request.attachment_ids).toEqual(["att-1"]);
+  });
+});
+
 describe("attachment lifecycle (ADR 0086)", () => {
   it("loadAttachments lists the thread's records", async () => {
     seedThread();
@@ -390,11 +443,11 @@ describe("attachment lifecycle (ADR 0086)", () => {
     const retryUrl = `${LIST_URL}/att-1/retry`;
     const { calls } = stubFetch((url) => {
       if (url === retryUrl) {
-        return jsonResponse({ ...ATTACH_PARSED_LATER, version: "v2" });
+        return jsonResponse({ ...ATTACH_PARSED_LATER, version: 2 });
       }
       if (url === LIST_URL) {
         return jsonResponse({
-          attachments: [{ ...ATTACH_READY, version: "v2" }],
+          attachments: [{ ...ATTACH_READY, version: 2 }],
         });
       }
       return jsonResponse({ error: "attachment_not_found" }, 400);
@@ -408,7 +461,7 @@ describe("attachment lifecycle (ADR 0086)", () => {
     await vi.advanceTimersByTimeAsync(2000);
     expect(useWorkspaceStore.getState().attachments[0]).toEqual({
       ...ATTACH_READY,
-      version: "v2",
+      version: 2,
     });
 
     // A deleted / foreign attachment id answers the named 400.
