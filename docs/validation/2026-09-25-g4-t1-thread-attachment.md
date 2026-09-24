@@ -9,7 +9,10 @@ Identity of what was measured:
 - Base (spec/ADR/docs only): `7a30e84`.
 - Implementation commits under review: `b1a97bf` (host persistence), `19f9b27` (web status surface).
 - This record is written after the dual-axis code review and its repair round;
-  the repair is the commit that adds this file.
+  the repair is `ead5e26`.
+- The tree the closing runs (8–15) measured is the post-merge tip `9bbcae2`,
+  not the pre-merge tip; see *PR base state* for why the merge was re-verified
+  instead of trusted.
 - Worktree: `/home/winner/projects/fin-wt-g4-t1`.
 
 Scope honesty: T1 owns the durable text-attachment slice only. Classified
@@ -69,43 +72,59 @@ Static sweep: no bare `except` without a named outcome in
 `EXIT:` comment naming the condition), no `attachments.store` reach-through
 left in the HTTP routes, and no test-only helper added to a public barrel.
 
-## Real-boundary run 6 — iknow-memory MCP
+## Real-boundary evidence — iknow-memory MCP
+
+Run 6 was taken pre-merge; runs 13–15 repeat the same boundary on the merged
+tree, where `src/fin/retrieve/mcp_adapter.py` (+76/−13) and
+`src/fin/retrieve/port.py` (+27) actually changed, so the live evidence below
+is about the tree this PR ships.
 
 Dependency configuration: real `node` process over
 `/home/winner/projects/iknow-memory/dist/index.js`, `storage: "memory"`,
 MCP stdio transport, scripted model. Dataset: committed
 `data/corpus/manifest.json` fixtures.
 
-| Case | Observed |
+| Case group | Observed |
 | --- | --- |
 | `research_done_cites_this_runs_retrieved_text` | PASS |
 | `ungrounded_answer_over_the_same_live_evidence_is_not_done` | PASS |
 | `test_live_mcp_read_source` (3 cases) | PASS |
 | `test_live_corpus_ingest` (1 case) | PASS |
+| `test_live_mcp_t2..t5` (5 cases: push, retrieve, idempotency, continuation, invalidation, degradation) | PASS |
+| `test_mcp_smoke` (20 cases) | PASS — fixture server, protocol level only |
 
 What this proves for T1: the live MCP push/retrieve/`read_source` path still
-behaves after the attachment slice landed, i.e. the new thread-attachment
-layer did not disturb the company-source boundary. What it does not prove:
-attachment semantics. T1's thread-attach door resolves no body through MCP by
-contract, and that is pinned hermetically by
-`test_attach_does_not_trigger_mcp_read_source` (a spy on
-`MCPRetrieveAdapter.read` asserts zero calls). No G4 attachment gold case over
-the real fin object store plus live iknow-memory store exists yet; that is
-SC12's end-of-round obligation.
+behaves after the attachment slice landed *and* after main's adapter/port
+refactor merged into it, i.e. the new thread-attachment layer did not disturb
+the company-source boundary. What it does not prove: attachment semantics over
+the real store. T1's thread-attach door resolves no body through MCP by
+contract, and that is pinned by `test_attach_does_not_trigger_mcp_read_source`
+(run 15), which installs a spy on `MCPRetrieveAdapter.read`, wires the MCP
+adapter as the graph's real `read_port`, and asserts zero calls. Nor does any
+of it cover the `pg_es` retrieval tiers — those stay blocked at B1/B2. No G4
+attachment gold case over the real fin object store plus live iknow-memory
+store exists yet; that is SC12's end-of-round obligation.
 
 ## Blocked items (recorded, not substituted)
 
-- **B1** `tests/retrieve/test_live_host_graph_hop.py` — error, not failure:
-  it requires the iknow-memory `pg_es` cluster (`FATAL: role "iknow_memory"
-  does not exist` on localhost:5432). Verified to fail identically in the
-  untouched main checkout, so it is a missing local prerequisite, not a T1
-  regression. Expected command: bring up the project docker-compose stack,
-  then `uv run pytest -q -m mcp tests/retrieve/test_live_host_graph_hop.py`.
-- **B2** `tests/retrieve/test_live_search_modes_pg_es.py` — not run: no
-  Elasticsearch on `127.0.0.1:9200`. Same prerequisite family as B1.
-- **B3** Not run: the 12 `tests/host/test_fin_launcher` cases (host lacks
-  `jq`) and `tests/test_compile.py`'s compose case (no docker compose plugin).
-  Both fail identically on the untouched main checkout; unrelated to T1.
+- **B1** `tests/retrieve/test_live_host_graph_hop.py` — not run on the merged
+  tree: it needs the iknow-memory `pg_es` cluster. Probed rather than assumed:
+  `127.0.0.1:9200` and `127.0.0.1:7687` both refuse the connection while
+  `127.0.0.1:5432` answers (only a postgres container runs here), and an
+  earlier attempt failed as `FATAL: role "iknow_memory" does not exist`.
+  Bringing that stack up means deploying shared services, which is outside this
+  ticket's authority. Expected command:
+  `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_host_graph_hop.py`
+  after the project docker-compose stack is up.
+- **B2** `tests/retrieve/test_live_search_modes_pg_es.py` — not run, same
+  prerequisite family as B1 (no Elasticsearch, no Neo4j). Also not run:
+  `tests/host/test_live_fin_launcher_acceptance.py`, which would
+  `docker compose up` the whole stack and bind `:8000`; that is deploying or
+  restarting a shared service, so it was left blocked instead of attempted.
+- **B3** Not runnable here: the 12 `tests/host/test_fin_launcher` cases (host
+  lacks `jq`) and `tests/test_compile.py`'s compose case (this docker CLI has no
+  compose subcommand). Both fail identically on the untouched main checkout;
+  unrelated to T1. Observed in run 9.
 - **B4** Not run: browser-level check of the Composer attachment chips. The
   web suite runs in a node environment with no DOM, so chip rendering,
   the withheld-attachment line, and the retry control are covered at the
@@ -114,13 +133,75 @@ SC12's end-of-round obligation.
 - **B5** Not closed: SC12's committed G4 gold set (PDF-text, scanned PDF,
   image, 8,000-code-point continuation, cross-thread denial at retrieve,
   attachment/company comparison) — belongs to T2–T5 and the end-of-round run.
+- **B6** New finding, not caused by this ticket: the default hermetic suite is
+  not fully hermetic. Three `tests/host/test_clarify_prompt.py` cases read the
+  operator's real `$HOME/.fin/user.md` because they build the graph without a
+  `user_profile_store`, so the suite's result depends on a developer's home
+  directory. Fixing it means isolating `HOME` in `tests/conftest.py`, which is
+  shared test infrastructure outside T1's scope and outside this diff's
+  boundary, so it is reported here instead of folded into this change.
 
 ## PR base state
 
-`origin/main` has moved ahead of the merge-base `2307e6b`: 10 commits on
-`main`, 11 on this branch, and exactly two files collide —
-`.claude/rules/test.md` and `.codex/rules/test.md`. The branch therefore has
-to be rebased onto `origin/main` with those two resolved before the merge
-request can open clean; the actual rebase result is reported in the PR
-description rather than claimed here.
+`origin/main` had moved ahead of the merge-base `2307e6b` (10 commits on
+`main`, 11 on this branch), and exactly two files collided:
+`.claude/rules/test.md` and `.codex/rules/test.md`. Both sides had
+independently translated that Chinese file to English, so the merge is a
+content collision, not a semantic one: our version is a strict superset (it
+adds the *Golden-set acceptance for every change* section), and
+`origin/main` contributed no line that our version lacked — checked by
+diffing each side's file against the other and finding no main-only line.
+The conflict was therefore resolved by keeping ours.
+
+A merge commit (`9bbcae2`) was chosen over an 11-commit rebase deliberately:
+rebase would re-apply each commit against new main code without any evidence
+that the combined tree still passes, whereas a merge puts the two changesets
+together under one test run — the run recorded in the next section. After it,
+the branch is 12 ahead / 0 behind `origin/main`, so the request opens clean.
+
+## Post-merge re-verification
+
+`main` landed a search-mode job-fact refactor that touched the same two files
+this ticket modified (`src/fin/host/graph.py`,
+`src/fin/host/workspace_http.py`) plus `src/fin/retrieve/*`; git auto-merged
+them without a conflict, which is exactly the case where a merge can be
+textually clean and semantically wrong. Every run below is on the merged tree.
+
+| # | Command | Exit | Result |
+| --- | --- | --- | --- |
+| 8 | `uv run --no-sync pytest tests/host/test_thread_attachment_durable.py tests/host/test_attachment_store.py tests/host/test_thread_attach.py tests/host/test_agent_instructions.py -q` | 0 | 98 passed, 0 failed, 6 skipped (all 6 are `FIN_CHECKPOINT_URL` gates on `PostgresAttachmentStore`) |
+| 9 | `uv run --no-sync pytest tests/host tests/retrieve -q` | 1 | 2380 passed, 16 failed, 58 skipped, 271 deselected (7m31s, run to completion). **Zero failures in `tests/retrieve`**; the 16 are box prerequisites, itemized below |
+| 10 | `cd web && npm run typecheck` (`tsc --noEmit`) | 0 | no diagnostics |
+| 11 | `cd web && npm test` (`vitest run`) | 0 | 24 files, 326 tests passed; the `send gate: what a send may reference` cases were re-confirmed as collected and passing under `--reporter=verbose`, and file collection was checked against `find src -name "*test*"` so nothing was silently dropped |
+| 12 | `uv run --no-sync pytest -q -m mcp tests/retrieve/test_mcp_smoke.py` | 0 | 20 passed — MCP 2.0 protocol against the local fixture server only |
+| 13 | `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_mcp_t2.py test_live_mcp_t3.py test_live_mcp_t4.py test_live_mcp_t5.py` | 0 | 5 passed against a real `iknow-memory` node process (push / retrieve / idempotency / continuation / invalidation / degradation), `storage: "memory"`, with BM25, graph and rerank explicitly off in the harness |
+| 14 | `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_mcp_read_source.py tests/retrieve/test_live_corpus_ingest.py tests/retrieve/test_live_research_cite_on_ingest.py` | 0 | 6 passed — live `read_source` contract plus ingest→research→cite round trip |
+| 15 | `uv run --no-sync pytest -q tests/host/test_thread_attach.py::test_attach_does_not_trigger_mcp_read_source` | 0 | 1 passed — the thread-attach door installs a spy on `MCPRetrieveAdapter.read`, wires the MCP adapter as the graph's real `read_port`, and asserts zero calls |
+
+### Why run 9's 16 failures are not merge damage
+
+Each was traced to this machine, not to `9bbcae2`:
+
+- 12 × `tests/host/test_fin_launcher.py` — `stderr='fin: jq is required'`;
+  `command -v jq` reports nothing installed.
+- 1 × `tests/host/test_compile.py::test_compose_config_exits_zero_when_docker_available`
+  — `docker compose version` answers `docker: unknown command: docker compose`.
+- 3 × `tests/host/test_clarify_prompt.py` — a **suite hermeticity leak** rather
+  than a product bug: those cases call `compile_graph()` without injecting a
+  `user_profile_store`, so `_read_profile_text()` reads the operator's real
+  `$HOME/.fin/user.md` (present here, 508 bytes) and the expected prompt gains
+  a trailing `[FIN_USER_PROFILE]` block. Reproduced and isolated in one step:
+  `HOME=$(mktemp -d) uv run --no-sync pytest -q tests/host/test_clarify_prompt.py`
+  → 11 passed. The code path predates this merge (commits `273dbaf` and
+  `b6d01b5` are ancestors of *both* merge parents), so the branch neither
+  caused nor can silently absorb it; it is filed as item B6.
+
+`tests/retrieve` — the directory whose `port.py` / `mcp_adapter.py` /
+`tiers.py` this merge actually changed — reported zero failures, and the eight
+merge-touched search-mode and named-failure files were re-run standalone green
+(48 passed). The one hand-check worth recording: our
+`RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY` branch in `graph.py` was correctly replaced
+by main's `copy_recorded_job_facts` helper rather than left duplicated.
+
+These runs supersede runs 1–7 above, which were taken on the pre-merge tip.
 
