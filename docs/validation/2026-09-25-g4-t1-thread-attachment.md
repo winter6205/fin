@@ -24,13 +24,18 @@ committed G4 gold set are not closed by this record.
 ## Commands and results
 
 Default-suite runs are hermetic. Postgres-backed runs use a throwaway
-container the operator started for this ticket
-(`fin-g4-t1-pg`, `postgres:16`, host port 5433 → container 5432, DEV-only
-credentials from the committed dockerfile); it is not
-the project's `FIN_CHECKPOINT_URL` service. It was still up when this round
-closed and is deliberately left running for the T2 follow-up rather than
-removed here — it holds only this ticket's test rows, and deleting a service
-someone else started is not this ticket's call.
+container started for this ticket (`fin-g4-t1-pg`, `postgres:16`, host port
+5433 → container 5432, DEV-only credentials taken from the committed
+`docker-compose.yml`); it is not the project's `FIN_CHECKPOINT_URL` service.
+
+**Cost of leaving it up.** `docker-compose.yml` publishes the project's own dev
+Postgres on host `5433` as well (deliberately `5433:5433`, so `5432` stays free
+for the iknow-memory server). `docker port fin-g4-t1-pg` confirms this
+container holds host `5433`, so `scripts/dev-up.sh` cannot bind its Postgres
+until `fin-g4-t1-pg` is removed. That is a side effect of this ticket on the
+operator's machine, recorded rather than quietly cleaned: the container is
+still up because the T2 follow-up needs real SQL again, and removing a
+container someone else may be relying on is not this ticket's call.
 
 | # | Command | Exit | Result |
 | --- | --- | --- | --- |
@@ -113,21 +118,33 @@ store exists yet; that is SC12's end-of-round obligation.
 - **B1** `tests/retrieve/test_live_host_graph_hop.py` — not run on the merged
   tree: it needs the iknow-memory `pg_es` cluster. Probed rather than assumed:
   `127.0.0.1:9200` and `127.0.0.1:7687` both refuse the connection while
-  `127.0.0.1:5432` answers (only a postgres container runs here), and an
-  earlier attempt failed as `FATAL: role "iknow_memory" does not exist`.
-  Bringing that stack up means deploying shared services, which is outside this
-  ticket's authority. Expected command:
-  `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_host_graph_hop.py`
-  after the project docker-compose stack is up.
+  `127.0.0.1:5432` answers (an `iknow-memory-postgres` container runs, but no
+  Elasticsearch or Neo4j alongside it), and an earlier attempt failed as
+  `FATAL: role "iknow_memory" does not exist`.
+  **Correction to the first draft of this record**: that cluster is *not*
+  reachable by starting this repo's stack. fin's `docker-compose.yml` declares
+  exactly one service, Postgres; `elasticsearch` and `neo4j` are declared in the
+  read-only sibling `/home/winner/projects/iknow-memory/docker-compose.yml`.
+  The real blocker is one level down and explains most of this section: **this
+  box has no Compose at all** — `docker compose version` answers
+  `docker: unknown command: docker compose` and no `docker-compose` binary
+  exists — so neither `scripts/dev-up.sh` nor the sibling stack can be brought
+  up here as written. Starting it also means deploying shared services, which
+  is outside this ticket's authority regardless. Expected command once the
+  iknow-memory stack is up:
+  `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_host_graph_hop.py`.
 - **B2** `tests/retrieve/test_live_search_modes_pg_es.py` — not run, same
   prerequisite family as B1 (no Elasticsearch, no Neo4j). Also not run:
   `tests/host/test_live_fin_launcher_acceptance.py`, which would
   `docker compose up` the whole stack and bind `:8000`; that is deploying or
-  restarting a shared service, so it was left blocked instead of attempted.
+  restarting a shared service, and on this box it could not even be attempted,
+  since the launcher path it exercises depends on the same absent Compose.
 - **B3** Not runnable here: the 12 `tests/host/test_fin_launcher` cases (host
   lacks `jq`) and `tests/test_compile.py`'s compose case (this docker CLI has no
   compose subcommand). Both fail identically on the untouched main checkout;
-  unrelated to T1. Observed in run 9.
+  unrelated to T1. Observed in run 9. Both are one package away from clear —
+  `jq` plus the Docker Compose plugin — which is an operator decision about
+  this machine, not a code change, so nothing was installed here.
 - **B4** Not run: browser-level check of the Composer attachment chips. The
   web suite runs in a node environment with no DOM, so chip rendering,
   the withheld-attachment line, and the retry control are covered at the
