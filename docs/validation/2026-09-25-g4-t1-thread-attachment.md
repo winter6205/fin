@@ -167,8 +167,11 @@ Still open, with the reason:
   own workers measured the same `dist/` paths minutes apart and reported
   contradictory contracts — is indistinguishable from a violated wire contract.
   Fix is recorded build provenance asserted before launch, not a freshness
-  comparison. Owner: `tests/retrieve/live_iknow_support.py`. Out of scope for a
-  retrieve-adjacent attachment ticket; filed as its own harness ticket.
+  comparison. Owner: `tests/retrieve/live_iknow_support.py`, and it belongs on
+  the already-open [#276](https://github.com/winter6205/fin/issues/276), whose
+  prerequisites section currently asks a human to "先确认主 checkout 已 pull +
+  rebuild" — the mechanical assertion is exactly what that issue lacks. This
+  attachment ticket does not own it and has not opened a new issue for it.
 
 ## PR base state
 
