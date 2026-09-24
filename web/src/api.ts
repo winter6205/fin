@@ -327,10 +327,12 @@ async function threadConflictError(res: Response): Promise<Error> {
 export interface SendRequest {
   question: string;
   thinking?: boolean;
-  // corpus-serve-ingest T5 (ADR 0047 **thread attach**): ids minted
-  // by POST /threads/{id}/attachments, referenced ONCE by this send.
-  // This is the attach door's only downstream — the attach path must
-  // never touch /api/corpus/ingest.
+  // ADR 0086: ids minted by the thread-attach
+  // door. They are referenceable for the whole thread lifetime, so a
+  // later send reuses the same ids; referencing one whose status is
+  // still "parsing" is refused pre-SSE with 400
+  // ``attachment_not_ready``. This is the attach door's only
+  // downstream — the attach path must never touch /api/corpus/ingest.
   attachment_ids?: string[];
 }
 
@@ -360,6 +362,15 @@ export async function sendMessage(
   // different refusal from a held run and must not read as one.
   if (res.status === 409) throw await sendConflictError(res);
   if (res.status === 503) throw new IngestMissingError("ingest_missing");
+  // Attach door: a run that requires a still-parsing attachment
+  // is this one named pre-SSE refusal; every other 400 keeps the
+  // generic transport error below.
+  if (
+    res.status === 400 &&
+    (await namedErrorCode(res.clone())) === "attachment_not_ready"
+  ) {
+    throw new AttachmentNotReadyError();
+  }
   if (res.status === 204) {
     // Empty submit no-op; caller should not have called this.
     // No SSE frames arrive on a 204, so there is no server-minted
@@ -681,6 +692,18 @@ export class AttachFailedError extends Error {
   }
 }
 
+/** The send door refusing a run that requires a still-parsing
+ * attachment (400 ``attachment_not_ready``, decided before any SSE
+ * frame). Subclasses ``AttachFailedError`` so the composer renders it
+ * through the attach door's own copy — the failure is about an
+ * ATTACHMENT, not about the question. */
+export class AttachmentNotReadyError extends AttachFailedError {
+  constructor() {
+    super("attachment_not_ready", 400);
+    this.name = "AttachmentNotReadyError";
+  }
+}
+
 /** Read the named ``error`` code off a failed response body; an
  * unparseable body still yields a non-empty code (statusText is
  * often empty on fetch errors, so the status itself is the code). */
@@ -735,11 +758,13 @@ export async function ingestCorpus(
 /**
  * The thread-attach door (ADR 0047): raw-bytes POST with the filename
  * as a query parameter — deliberately NOT multipart: this door ships
- * ONE undecorated turn blob (no form fields), so a plain ``fetch``
- * body is the whole contract and neither side needs multipart
- * parsing. The returned ``attachment_id`` is referenced ONCE on the
- * next send via ``SendRequest.attachment_ids``; nothing is pushed to
- * the corpus.
+ * one undecorated blob (no form fields), so a plain ``fetch`` body is
+ * the whole contract and neither side needs multipart parsing. The
+ * minted ``attachment_id`` is referenceable for the WHOLE thread
+ * lifetime (ADR 0086): the door answers while the host still parses
+ * and indexes, so the 200 carries ``status: "parsing"`` and the
+ * caller follows the lifecycle through the GET doors below. Nothing
+ * is pushed to the corpus.
  */
 export async function attachToThread(
   threadId: string,
@@ -752,6 +777,46 @@ export async function attachToThread(
     `/api/threads/${encodeURIComponent(threadId)}/attachments` +
     `?filename=${encodeURIComponent(file.name)}`;
   const res = await fetch(url, { method: "POST", body: bytes });
+  if (!res.ok) {
+    throw new AttachFailedError(await namedErrorCode(res), res.status);
+  }
+  return (await res.json()) as ThreadAttachment;
+}
+
+/**
+ * The thread's attachment list — the authoritative readiness view
+ * (statuses, versions, failure reasons) the SPA polls while anything
+ * is still ``parsing``. An unknown thread answers a named failure,
+ * not an empty list pretending the thread was clean.
+ */
+export async function listThreadAttachments(
+  threadId: string,
+): Promise<ThreadAttachment[]> {
+  const res = await fetch(
+    `/api/threads/${encodeURIComponent(threadId)}/attachments`,
+  );
+  if (!res.ok) {
+    throw new AttachFailedError(await namedErrorCode(res), res.status);
+  }
+  const body = (await res.json()) as { attachments: ThreadAttachment[] };
+  return body.attachments;
+}
+
+/**
+ * Re-run preparation for one failed attachment (ADR 0086 retry).
+ * The 200 is the fresh single record — typically back to
+ * ``"parsing"``. Unknown or foreign attachment ids answer the named
+ * 400 ``attachment_not_found``.
+ */
+export async function retryThreadAttachment(
+  threadId: string,
+  attachmentId: string,
+): Promise<ThreadAttachment> {
+  const res = await fetch(
+    `/api/threads/${encodeURIComponent(threadId)}/attachments` +
+      `/${encodeURIComponent(attachmentId)}/retry`,
+    { method: "POST" },
+  );
   if (!res.ok) {
     throw new AttachFailedError(await namedErrorCode(res), res.status);
   }
