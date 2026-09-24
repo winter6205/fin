@@ -1,4 +1,7 @@
-// corpus-serve-ingest T5: the two upload doors on the workspace.
+// The two upload doors on the workspace: the corpus-ingest door and
+// the thread-attach door (ADR 0047), plus the thread-attachment
+// lifecycle (ADR 0086: parsing / ready / failed, retry, persistence
+// across sends).
 //
 // Acceptance core: the ingest door (store.ingestFile) is the ONLY
 // path that calls POST /api/corpus/ingest; the attach door
@@ -6,18 +9,24 @@
 // POST /api/threads/{id}/attachments + /messages and NEVER the
 // ingest endpoint (ADR 0047: the doors must not cross).
 //
-// These tests live at the store/api seam because the web suite runs
-// in a node environment (no DOM) — the components are thin wrappers
-// over exactly these actions.
+// The attach door's promise changed's promise: the POST answers while the
+// host still parses (status "parsing"), the id stays referenceable
+// for the WHOLE thread (no single-use consumption), and a failed
+// preparation is retryable. These tests live at the store/api seam
+// because the web suite runs in a node environment (no DOM) — the
+// components are thin wrappers over exactly these actions. Timers
+// are faked for the whole file: the readiness poll is driven by
+// advancing a schedule, never by really waiting.
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AttachFailedError,
+  AttachmentNotReadyError,
   IngestFailedError,
   type SendRequest,
 } from "./api";
 import { useWorkspaceStore } from "./store";
-import type { ThreadDetail } from "./types";
+import type { ThreadAttachment, ThreadDetail } from "./types";
 
 const THREAD_ID = "11111111-1111-4111-8111-111111111111";
 
@@ -35,11 +44,30 @@ const INGEST_OK = {
   invalidation: null,
 };
 
-const ATTACH_OK = {
+// The POST 200 of the attach door: stored, not yet parsed.
+const ATTACH_PARSED_LATER: ThreadAttachment = {
   attachment_id: "att-1",
   filename: "notes.md",
   size_bytes: 6,
   scope: "thread_attach",
+  status: "parsing",
+  version: "v1",
+};
+
+const ATTACH_READY: ThreadAttachment = {
+  ...ATTACH_PARSED_LATER,
+  status: "ready",
+  unit_count: 2,
+  searchable: true,
+  failure_reason: null,
+};
+
+const ATTACH_FAILED: ThreadAttachment = {
+  ...ATTACH_PARSED_LATER,
+  status: "failed",
+  unit_count: 0,
+  searchable: false,
+  failure_reason: "attachment_empty_text",
 };
 
 interface RecordedCall {
@@ -113,10 +141,18 @@ function seedThread(): void {
     corpusLoaded: false,
     sendingQuestion: false,
     resumingThreadId: null,
+    attachments: [],
   });
 }
 
+const LIST_URL = `/api/threads/${encodeURIComponent(THREAD_ID)}/attachments`;
+
+beforeEach(() => {
+  vi.useFakeTimers();
+});
+
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -181,7 +217,9 @@ describe("attach door (store.attachFile)", () => {
   it("POSTs raw bytes with the filename query param (never multipart)", async () => {
     seedThread();
     const { calls } = stubFetch((url) =>
-      url.includes("/attachments") ? jsonResponse(ATTACH_OK) : jsonResponse({}, 404),
+      url === LIST_URL
+        ? jsonResponse({ attachments: [ATTACH_READY] })
+        : jsonResponse(ATTACH_PARSED_LATER),
     );
 
     const file = new File(["hello!"], "notes.md", { type: "text/markdown" });
@@ -191,10 +229,14 @@ describe("attach door (store.attachFile)", () => {
 
     expect(attachment.attachment_id).toBe("att-1");
     expect(attachment.scope).toBe("thread_attach");
+    // The door answers BEFORE preparation finished, and the
+    // record lands in the thread slice as ``parsing``.
+    expect(attachment.status).toBe("parsing");
+    expect(useWorkspaceStore.getState().attachments).toEqual([
+      ATTACH_PARSED_LATER,
+    ]);
     const call = calls[0];
-    expect(call.url).toBe(
-      `/api/threads/${encodeURIComponent(THREAD_ID)}/attachments?filename=notes.md`,
-    );
+    expect(call.url).toBe(`${LIST_URL}?filename=notes.md`);
     expect(call.method).toBe("POST");
     expect(call.body).not.toBeInstanceOf(FormData);
     expect(new TextDecoder().decode(call.body as Uint8Array)).toBe("hello!");
@@ -203,7 +245,7 @@ describe("attach door (store.attachFile)", () => {
   it("throws the typed error carrying the named failure code", async () => {
     seedThread();
     stubFetch((url) =>
-      url.includes("/attachments")
+      url.startsWith(LIST_URL) && url !== LIST_URL
         ? jsonResponse({ error: "attachment_not_text" }, 400)
         : jsonResponse({}, 404),
     );
@@ -223,7 +265,10 @@ describe("two doors never cross (acceptance)", () => {
   it("attach-then-send calls the attach endpoint and NEVER the ingest endpoint", async () => {
     seedThread();
     const { calls } = stubFetch((url) => {
-      if (url.includes("/attachments")) return jsonResponse(ATTACH_OK);
+      if (url === LIST_URL) return jsonResponse({ attachments: [] });
+      if (url.includes("/attachments")) {
+        return jsonResponse(ATTACH_PARSED_LATER);
+      }
       if (url.endsWith("/messages")) return sseRunResponse();
       return jsonResponse("[]"); // refreshThreads tail
     });
@@ -261,5 +306,220 @@ describe("two doors never cross (acceptance)", () => {
     const sendCall = calls.find((c) => c.url.endsWith("/messages"));
     const request = JSON.parse(sendCall?.body as string) as SendRequest;
     expect(request.attachment_ids).toBeUndefined();
+  });
+});
+
+describe("attachment lifecycle (ADR 0086)", () => {
+  it("loadAttachments lists the thread's records", async () => {
+    seedThread();
+    stubFetch((url) =>
+      url === LIST_URL
+        ? jsonResponse({ attachments: [ATTACH_READY, ATTACH_FAILED] })
+        : jsonResponse({}, 404),
+    );
+
+    await useWorkspaceStore.getState().loadAttachments(THREAD_ID);
+
+    expect(useWorkspaceStore.getState().attachments).toEqual([
+      ATTACH_READY,
+      ATTACH_FAILED,
+    ]);
+  });
+
+  it("polls the list while a record is parsing and stops once ready", async () => {
+    seedThread();
+    let reads = 0;
+    stubFetch((url) => {
+      if (url === LIST_URL) {
+        reads += 1;
+        // First read still parsing, second read ready.
+        return jsonResponse({
+          attachments: [reads >= 2 ? ATTACH_READY : ATTACH_PARSED_LATER],
+        });
+      }
+      return jsonResponse(ATTACH_PARSED_LATER);
+    });
+
+    await useWorkspaceStore
+      .getState()
+      .loadAttachments(THREAD_ID, 1000);
+    expect(useWorkspaceStore.getState().attachments[0].status).toBe("parsing");
+    expect(reads).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(reads).toBe(2);
+    expect(useWorkspaceStore.getState().attachments[0].status).toBe("ready");
+
+    // Nothing is parsing anymore: the chain stopped on its own.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(reads).toBe(2);
+  });
+
+  it("a stale list read cannot erase the just-attached parsing chip", async () => {
+    seedThread();
+    let reads = 0;
+    stubFetch((url) => {
+      if (url === LIST_URL) {
+        reads += 1;
+        // Read 1 answers WITHOUT the fresh record (issued before the
+        // POST committed); read 2 catches up.
+        return jsonResponse({
+          attachments: reads >= 2 ? [ATTACH_READY] : [],
+        });
+      }
+      return jsonResponse(ATTACH_PARSED_LATER);
+    });
+
+    await useWorkspaceStore
+      .getState()
+      .attachFile(THREAD_ID, new File(["hello!"], "notes.md"));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(useWorkspaceStore.getState().attachments).toEqual([
+      ATTACH_PARSED_LATER,
+    ]);
+
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(useWorkspaceStore.getState().attachments).toEqual([ATTACH_READY]);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(reads).toBe(2);
+  });
+
+  it("retry re-runs preparation, follows the record to ready, and names an unknown id", async () => {
+    seedThread();
+    useWorkspaceStore.setState({ attachments: [ATTACH_FAILED] });
+    const retryUrl = `${LIST_URL}/att-1/retry`;
+    const { calls } = stubFetch((url) => {
+      if (url === retryUrl) {
+        return jsonResponse({ ...ATTACH_PARSED_LATER, version: "v2" });
+      }
+      if (url === LIST_URL) {
+        return jsonResponse({
+          attachments: [{ ...ATTACH_READY, version: "v2" }],
+        });
+      }
+      return jsonResponse({ error: "attachment_not_found" }, 400);
+    });
+
+    await useWorkspaceStore.getState().retryAttachment(THREAD_ID, "att-1");
+    const retried = calls.find((c) => c.url === retryUrl);
+    expect(retried?.method).toBe("POST");
+    expect(useWorkspaceStore.getState().attachments[0].status).toBe("parsing");
+
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(useWorkspaceStore.getState().attachments[0]).toEqual({
+      ...ATTACH_READY,
+      version: "v2",
+    });
+
+    // A deleted / foreign attachment id answers the named 400.
+    const rejection = await useWorkspaceStore
+      .getState()
+      .retryAttachment(THREAD_ID, "gone")
+      .then(() => null)
+      .catch((error: unknown) => error);
+    expect(rejection).toBeInstanceOf(AttachFailedError);
+    expect((rejection as AttachFailedError).code).toBe("attachment_not_found");
+  });
+
+  it("a send that requires a still-parsing attachment surfaces the named refusal", async () => {
+    seedThread();
+    stubFetch((url) =>
+      url.endsWith("/messages")
+        ? jsonResponse({ error: "attachment_not_ready" }, 400)
+        : jsonResponse("[]"),
+    );
+
+    const rejection = await useWorkspaceStore
+      .getState()
+      .sendQuestion(THREAD_ID, "读附件", true, ["att-1"])
+      .then(() => null)
+      .catch((error: unknown) => error);
+
+    expect(rejection).toBeInstanceOf(AttachmentNotReadyError);
+    expect((rejection as AttachFailedError).code).toBe("attachment_not_ready");
+  });
+
+  it("attachments stay referenceable on every later send (no consumption)", async () => {
+    seedThread();
+    const { calls } = stubFetch((url) => {
+      if (url === LIST_URL) return jsonResponse({ attachments: [ATTACH_READY] });
+      if (url.endsWith("/messages")) return sseRunResponse();
+      return jsonResponse("[]"); // refreshThreads tail
+    });
+
+    await useWorkspaceStore
+      .getState()
+      .loadAttachments(THREAD_ID, 600_000);
+    await useWorkspaceStore
+      .getState()
+      .sendQuestion(THREAD_ID, "第一轮", true, ["att-1"]);
+    await useWorkspaceStore
+      .getState()
+      .sendQuestion(THREAD_ID, "第二轮", true, ["att-1"]);
+
+    const sends = calls
+      .filter((c) => c.url.endsWith("/messages"))
+      .map((c) => JSON.parse(c.body as string) as SendRequest);
+    expect(sends).toHaveLength(2);
+    // The same id rides BOTH turns — the before this contract single-use promise
+    // is gone.
+    expect(sends[0].attachment_ids).toEqual(["att-1"]);
+    expect(sends[1].attachment_ids).toEqual(["att-1"]);
+    expect(useWorkspaceStore.getState().attachments).toEqual([ATTACH_READY]);
+  });
+
+  it("a failed list read leaves navigation working and the chain stopped", async () => {
+    seedThread();
+    useWorkspaceStore.setState({ attachments: [ATTACH_READY] });
+    let reads = 0;
+    stubFetch((url) => {
+      if (url === LIST_URL) {
+        reads += 1;
+        return jsonResponse({ error: "thread_not_found" }, 404);
+      }
+      return jsonResponse({}, 404);
+    });
+
+    await expect(
+      useWorkspaceStore.getState().loadAttachments(THREAD_ID, 1000),
+    ).resolves.toBeUndefined();
+    await vi.advanceTimersByTimeAsync(10_000);
+    // One read only: the failed door ended the chain, it does not
+    // spin on a dead endpoint.
+    expect(reads).toBe(1);
+    expect(useWorkspaceStore.getState().attachments).toEqual([ATTACH_READY]);
+  });
+
+  it("opening another thread clears the slice and stops its poll", async () => {
+    seedThread();
+    const OTHER_ID = "22222222-2222-4222-8222-222222222222";
+    let reads = 0;
+    stubFetch((url) => {
+      if (url === LIST_URL) {
+        reads += 1;
+        return jsonResponse({ attachments: [ATTACH_PARSED_LATER] });
+      }
+      if (url === `/api/threads/${OTHER_ID}`) {
+        return jsonResponse({
+          id: OTHER_ID,
+          title: "other",
+          created_at: "2026-01-01T00:00:00.000Z",
+          turns: [],
+        });
+      }
+      return jsonResponse({}, 404);
+    });
+
+    await useWorkspaceStore.getState().loadAttachments(THREAD_ID, 1000);
+    expect(useWorkspaceStore.getState().attachments).toEqual([
+      ATTACH_PARSED_LATER,
+    ]);
+    await useWorkspaceStore.getState().openThread(OTHER_ID);
+    expect(useWorkspaceStore.getState().attachments).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    // The old thread's chain stopped with the switch: no further
+    // list reads for it.
+    expect(reads).toBe(1);
   });
 });
