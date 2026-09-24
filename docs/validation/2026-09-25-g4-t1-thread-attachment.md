@@ -177,6 +177,7 @@ textually clean and semantically wrong. Every run below is on the merged tree.
 | 13 | `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_mcp_t2.py test_live_mcp_t3.py test_live_mcp_t4.py test_live_mcp_t5.py` | 0 | 5 passed against a real `iknow-memory` node process (push / retrieve / idempotency / continuation / invalidation / degradation), `storage: "memory"`, with BM25, graph and rerank explicitly off in the harness |
 | 14 | `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_mcp_read_source.py tests/retrieve/test_live_corpus_ingest.py tests/retrieve/test_live_research_cite_on_ingest.py` | 0 | 6 passed — live `read_source` contract plus ingest→research→cite round trip |
 | 15 | `uv run --no-sync pytest -q tests/host/test_thread_attach.py::test_attach_does_not_trigger_mcp_read_source` | 0 | 1 passed — the thread-attach door installs a spy on `MCPRetrieveAdapter.read`, wires the MCP adapter as the graph's real `read_port`, and asserts zero calls |
+| 16 | `FIN_CHECKPOINT_URL=<throwaway pg> uv run --no-sync pytest -q tests/host/test_thread_attachment_durable.py tests/host/test_thread_attachment_durable_postgres.py tests/host/test_attachment_store.py` | 0 | 77 passed, 0 skipped — the same real-SQL scope as pre-merge run 1, re-run here so the restart-rebuild, FK-cascade and `incomplete()` evidence belongs to the shipped tree rather than to the pre-merge tip |
 
 ### Why run 9's 16 failures are not merge damage
 
