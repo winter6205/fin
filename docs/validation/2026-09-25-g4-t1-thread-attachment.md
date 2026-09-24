@@ -212,6 +212,15 @@ Still open, with the reason:
   rebuild" — the mechanical assertion is exactly what that issue lacks. This
   attachment ticket does not own it and has not opened a new issue for it.
 
+- **F2** Found while running the context-loop checks, and worth more attention than
+  the ADR items: the archived `pre-context-write-guard.cjs` fails *open*. Its
+  `require('./lib/read-stdin-with-timeout.cjs')` target does not exist under
+  `archive/`, the outer `catch` swallows it, and the script **exits 0** — a guard
+  that reports success while doing nothing. Anyone trusting that path gets a
+  false-green CONTEXT/ADR gate. Owner: the arthurpower plugin's archived hook, not
+  this repository. Not fixed here: it is plugin-external and a validation hook is a
+  high-risk area under `.claude/rules/security-boundaries.md`.
+
 ## PR base state
 
 `origin/main` had moved ahead of the merge-base `2307e6b` (10 commits on
@@ -432,6 +441,29 @@ No relationship to the attachment slice: the failing test imports only
 `fin.retrieve.port`, and `grep -i attachment` over `src/fin/retrieve/*` and
 `live_iknow_support.py` is empty.
 
+
+## Context-loop hooks — because this PR's diff touches `docs/adr/`
+
+The PR diff is 38 files including 9 under `docs/adr/` (2 modified, 6 added), so the
+four context-loop checks fire. A worker ran them against
+`hooks/pre-context-write-guard.ts` and the ADR tree. **Provenance first, because it
+decides what this run owns:** every ADR/CONTEXT edit here was authored
+2026-09-24 **15:23–21:05 +0800** (commits `52343f4`, `57ffdea`, `4f4ad7e`, author
+`winter6205`/`Codex`), while this session's transcript starts 22:01 +0800. This run
+wrote no ADR; it inherited these files into its PR.
+
+| # | Hook | Result | Evidence |
+| --- | --- | --- | --- |
+| 1 | CONTEXT/ADR schema | **FAIL on one file, from a hook-vs-format conflict** | `docs/adr/0009:4` `Status: accepted; superseded-by ADR-0087 §…` exits 2; the other 7 changed ADRs and `docs/CONTEXT.md` exit 0. `ADR-FORMAT.md:42` says that combination *is legal*, and `main` already carries the same exit-2 shape at 0053 and 0066 — so the conflict predates this PR and fixing 0009 alone would deviate from the documented format. Also: the archived `pre-context-write-guard.cjs` is unrunnable (`require('./lib/read-stdin-with-timeout.cjs')` missing → outer catch → **exit 0 false green**); the `.ts` version was used instead |
+| 2 | Write authority (`domain-modeling` routing) | **N/A for this run; unverifiable for the authoring session** | Zero `Write`/`Edit` events hit `docs/adr` or `docs/CONTEXT.md` in this session's transcript; the 9 `docs/adr`-touching shell calls are read-only. The guard's identity check is a hardcoded constant (`pre-context-write-guard.ts:710-718`) and no `hooks` key exists in `~/.qoder-cn/settings.json`, so the hook never ran this session and cannot be asserted from a session log either |
+| 3 | Read-side freshness | **FAIL, base-authored** | Annotated by amendment: 0009, 0047. Unannotated contradictions: `0006` (`{document_id, version, page}` + "do not put … character offsets … in the locator") is overturned by 0088's typed `unit` and code-point `next_position`; `0005`/`0021`/`0046`/`0082` still name the tool `read_file`, which 0087 renames to `read_source`. None of those five files is in this diff. The repo's own convention is `Amendment (date)`; the blockquote form the hook demands appears **0** times in `docs/adr/`, and `post-conflict-annotation.ts` only scans `## Decision` sections, which fin ADRs do not have — so that detector is structurally always-empty here. The spec's own claim (*"0083/0085/0086 point forward without rewriting historical decisions"*) **is** true in the diff |
+| 4 | ADR three-condition gate | **PARTIAL, repo-wide convention** | All 6 added ADRs record `Considered Options` (real trade-off), and 0083–0086 add recovery/decision-source; hard-to-reverse and surprising-without-context are recorded **nowhere**, in any of the 88 ADRs — so these 6 are consistent with the collection, not worse than it |
+
+None of the four is closed by this ticket, and none is a behavior defect: 1 and 3
+are ADR-governance conflicts that predate the run, 2 is out of its own reach, and 4
+is a convention question for the whole ADR set. They are named rather than silently
+carried into the merge, and resolving 1 or 3 means editing someone else's ADR text
+or a validation hook — both outside an attachment ticket's authority.
 
 ## Delivery state
 
