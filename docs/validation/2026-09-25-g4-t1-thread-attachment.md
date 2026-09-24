@@ -26,8 +26,11 @@ committed G4 gold set are not closed by this record.
 Default-suite runs are hermetic. Postgres-backed runs use a throwaway
 container the operator started for this ticket
 (`fin-g4-t1-pg`, `postgres:16`, host port 5433 → container 5432, DEV-only
-credentials from the committed dockerfile, dropped after the run); it is not
-the project's `FIN_CHECKPOINT_URL` service.
+credentials from the committed dockerfile); it is not
+the project's `FIN_CHECKPOINT_URL` service. It was still up when this round
+closed and is deliberately left running for the T2 follow-up rather than
+removed here — it holds only this ticket's test rows, and deleting a service
+someone else started is not this ticket's call.
 
 | # | Command | Exit | Result |
 | --- | --- | --- | --- |
