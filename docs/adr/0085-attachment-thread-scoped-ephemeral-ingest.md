@@ -7,6 +7,8 @@ For the grounded knowledge assistant, attachment processing parses file content 
 
 This revises ADR 0083's original page-only attachment reading path while retaining its binary upload, logical `attachment_id`, and thread lifetime. ADR 0084's type selection now feeds attachment preparation. ADR 0086 records parsing start time, availability states, and failure behavior.
 
+ADRs 0087 and 0088 supersede this record's historical `read_file` name and generic page locator with bounded `read_source` and typed `unit` locators; thread-scoped search and attachment lifetime remain in force.
+
 Considered Options: direct page browsing without an attachment index and adding attachments to the permanent corpus. Direct browsing leaves long documents difficult to locate within; permanent ingest changes the attachment's intended lifetime and corpus boundary.
 
 Recovery source: `docs/会话备份.txt`, lines 1793–1834 and 1902–1929. Restored to this checkout on 2026-09-24.
