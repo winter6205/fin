@@ -65,7 +65,11 @@ def stack(postgres_url: str) -> Iterator[dict[str, Any]]:
 
 
 def _boot(stack: dict[str, Any]) -> AttachmentPreparationService:
-    """A fresh service over fresh store instances — a restarted process."""
+    """A restarted process: fresh SQL store instances over the same rows.
+
+    The byte layer stays shared because this suite has no second object-store
+    endpoint; the S3 adapter's own contract is covered in ``tests/corpus``.
+    """
     return AttachmentPreparationService(
         store=PostgresAttachmentStore(stack["url"]), objects=stack["objects"]
     )
@@ -149,6 +153,23 @@ def test_a_lost_index_is_rebuilt_at_the_same_version(
     assert search(
         restarted.store.index_postings(attachment_id, restored.version), "cash"
     )
+
+
+def test_rebuilding_without_its_bytes_names_the_exit(
+    stack: dict[str, Any]
+) -> None:
+    attachment_id = _attach(stack)
+    record = stack["service"].prepare(attachment_id)
+    stack["service"].store.clear_index(attachment_id)
+    stack["objects"].delete(record.object_key)
+
+    restarted = _boot(stack)
+    assert restarted.recover() == 1
+    failed = restarted.status(attachment_id)
+    assert failed.status == "failed"
+    assert failed.failure_reason == "source_unavailable"
+    # A rebuild that cannot read the bytes never publishes an empty index.
+    assert restarted.store.index_postings(attachment_id, failed.version) == {}
 
 
 # ----- deletion -----

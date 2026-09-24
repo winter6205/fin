@@ -143,8 +143,9 @@ interface WorkspaceState {
   // Seed the slice for the thread the Composer opens and keep it
   // fresh while anything is "parsing". ``intervalMs`` is the poll
   // cadence, injectable so tests advance the schedule without real
-  // waiting. A failed door read leaves the slice empty — attachments
-  // are auxiliary to the thread view and must not fail navigation.
+  // waiting. A failed door read ends the chain and leaves the slice as
+  // it is — attachments are auxiliary to the thread view and must not
+  // fail navigation. The next open / attach / retry restarts it.
   loadAttachments: (threadId: string, intervalMs?: number) => Promise<void>;
   // Re-run preparation for one failed attachment (ADR 0086 retry).
   // Rejects with the named ``AttachFailedError`` so the control can
@@ -958,12 +959,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // or spinning on a dead endpoint — the next open / attach / retry
     // restarts it.
     stopAttachmentPolling();
-    let attachments: ThreadAttachment[];
-    try {
-      attachments = await api.listThreadAttachments(threadId);
-    } catch {
-      return;
-    }
+    const attachments = await readAttachmentList(threadId);
+    if (attachments === null) return;
     if (get().activeThread?.id !== threadId) return;
     set({ attachments });
     if (attachments.some((a) => a.status === "parsing")) {
@@ -1107,6 +1104,24 @@ function patchTurnByRunIdOn(
 
 const ATTACHMENT_POLL_INTERVAL_MS = 2000;
 
+/**
+ * The thread's attachment list, or ``null`` when the door refused.
+ *
+ * Both entry points that re-read the list (an open, a poll tick) treat a
+ * refusal the same way: stop, keep what is on screen, let the next action
+ * restart the chain. One place catches so the named door error is never
+ * dropped twice.
+ */
+async function readAttachmentList(
+  threadId: string,
+): Promise<ThreadAttachment[] | null> {
+  try {
+    return await api.listThreadAttachments(threadId);
+  } catch {
+    return null;
+  }
+}
+
 let attachmentPollTimer: ReturnType<typeof setTimeout> | null = null;
 
 function stopAttachmentPolling(): void {
@@ -1147,10 +1162,8 @@ async function attachmentPollTick(
     stopAttachmentPolling();
     return;
   }
-  let attachments: ThreadAttachment[];
-  try {
-    attachments = await api.listThreadAttachments(threadId);
-  } catch {
+  const attachments = await readAttachmentList(threadId);
+  if (attachments === null) {
     // A failed read ENDS the chain: the next open / attach / retry
     // restarts it, and a dead or deleted door must not leave a
     // background loop spinning on timers.
@@ -1179,4 +1192,31 @@ async function attachmentPollTick(
     return;
   }
   stopAttachmentPolling();
+}
+
+/**
+ * The one rule for what a send may reference, and what it deliberately
+ * did not.
+ *
+ * Only a ``ready`` attachment is named: the thread keeps every attachment
+ * for its whole life, so a question that never mentioned the still-parsing
+ * one must not be refused on its account (spec: an unrelated question can
+ * still use ready sources). ``withheld`` is the other half of the contract —
+ * the control renders it, so a record left out of a run is always said out
+ * loud rather than silently dropped.
+ */
+export function attachmentsForSend(attachments: readonly ThreadAttachment[]): {
+  ids: string[];
+  withheld: ThreadAttachment[];
+} {
+  const ids: string[] = [];
+  const withheld: ThreadAttachment[] = [];
+  for (const attachment of attachments) {
+    if (attachment.status === "ready" && attachment.searchable) {
+      ids.push(attachment.attachment_id);
+    } else {
+      withheld.push(attachment);
+    }
+  }
+  return { ids, withheld };
 }

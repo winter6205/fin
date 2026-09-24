@@ -399,6 +399,8 @@ export type AttachmentStatus = "parsing" | "ready" | "failed";
 // than break.
 export type AttachmentFailureReason =
   | "attachment_empty_text"
+  | "attachment_index_unavailable"
+  | "attachment_not_text"
   | "source_unavailable";
 
 // One attachment of a thread (the thread-attach door). ``scope`` is
@@ -406,19 +408,17 @@ export type AttachmentFailureReason =
 // pushed to the permanent corpus (SC4). Unlike the old door the
 // id is NOT single-use: it stays referenceable for the whole thread
 // lifetime while ``status`` tells whether a run may cite it yet.
-// Mirrors the GET/POST payloads of
-// src/fin/host/workspace_http.py attachment routes.
+// Every attachment door — upload, list, status, retry — answers with
+// exactly this shape, so one record never has two field sets.
 export interface ThreadAttachment {
   attachment_id: string;
   filename: string;
   size_bytes: number;
   scope: "thread_attach";
   status: AttachmentStatus;
-  // Parsed-content version; a retry that re-parses mints a new one.
-  version: string;
-  // Ready-view fields from the GET doors; the POST 200 (status
-  // "parsing") omits them, so they are optional here.
-  unit_count?: number;
-  searchable?: boolean;
+  // Parsed-content version; 0 until the first preparation publishes one.
+  version: number;
+  unit_count: number;
+  searchable: boolean;
   failure_reason?: AttachmentFailureReason | string | null;
 }

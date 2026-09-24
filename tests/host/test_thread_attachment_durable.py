@@ -23,8 +23,13 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.object_store import InMemoryObjectStore
 from fin.corpus.object_store_errors import UnknownObjectKeyError
-from fin.host.attachment_prepare import AttachmentPreparationService
+from fin.host.attachment_index import search
+from fin.host.attachment_prepare import (
+    AttachmentNotReadyError,
+    AttachmentPreparationService,
+)
 from fin.host.attachment_store import (
+    AttachmentRecord,
     AttachmentThreadGoneError,
     InMemoryAttachmentStore,
     ParsedAttachmentUnit,
@@ -516,31 +521,147 @@ def test_failed_preparation_retries_to_ready(
     )
 
 
-def test_concurrent_retry_keeps_one_active_index_version(
+def test_redriving_a_lost_index_keeps_the_published_version_addressable(
+    wired: dict[str, Any], gate: GateObjectStore, client: TestClient
+) -> None:
+    # Re-preparation writes a NEW version, so the version earlier answers
+    # already cited has to survive an attempt that then fails.
+    body = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
+    attachment_id = body["attachment_id"]
+    published = wired["service"].status(attachment_id)
+    assert published.status == "ready"
+
+    wired["service"].store.clear_index(attachment_id)
+    gate.get_fails = True
+    response = client.post(
+        f"/api/threads/{wired['thread_id']}/attachments/{attachment_id}/retry"
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "failed"
+
+    assert wired["service"].store.units(
+        attachment_id, published.version
+    ) == (ParsedAttachmentUnit(unit=1, text=REVENUE_TEXT),)
+
+
+def test_a_ready_attachment_with_lost_text_is_not_injected_as_content(
     wired: dict[str, Any]
 ) -> None:
+    # EXIT: a unit row whose text is gone is not an empty document — the turn
+    # gets the typed not-ready exit instead of a content block naming nothing.
+    thread_id = wired["thread_id"]
+    record = wired["service"].accept(
+        thread_id=thread_id,
+        filename="notes.txt",
+        payload=REVENUE_TEXT.encode("utf-8"),
+    )
+    attachment_id = record.attachment_id
+    wired["service"].store.record_units(
+        attachment_id=attachment_id,
+        version=1,
+        units=(ParsedAttachmentUnit(unit=1, text=""),),
+    )
+    wired["service"].store.put_index(
+        attachment_id=attachment_id, version=1, postings={"revenue": [1]}
+    )
+    wired["service"].store.mark_ready(
+        attachment_id=attachment_id, version=1, unit_count=1
+    )
+
+    with pytest.raises(AttachmentNotReadyError):
+        wired["service"].resolve_for_turn(
+            thread_id=thread_id, attachment_id=attachment_id
+        )
+
+
+def test_the_list_door_reports_a_row_that_lost_its_index_as_parsing(
+    client: TestClient, wired: dict[str, Any]
+) -> None:
+    published = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
+    lost = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
+    wired["service"].store.clear_index(lost["attachment_id"])
+
+    listed = client.get(f"/api/threads/{wired['thread_id']}/attachments")
+    assert listed.status_code == 200, listed.text
+    rows = listed.json()["attachments"]
+    assert [(row["status"], row["searchable"]) for row in rows] == [
+        ("ready", True),
+        ("parsing", False),
+    ]
+    assert rows[0]["scope"] == "thread_attach"
+
+
+def test_every_attachment_door_answers_with_one_shape(
+    client: TestClient, wired: dict[str, Any]
+) -> None:
+    body = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
+    attachment_id = body["attachment_id"]
+    thread_path = f"/api/threads/{wired['thread_id']}/attachments"
+    doors = [
+        body,
+        _status(client, wired["thread_id"], attachment_id).json(),
+        client.get(thread_path).json()["attachments"][0],
+        client.post(f"{thread_path}/{attachment_id}/retry").json(),
+    ]
+    shape = {
+        "attachment_id",
+        "failure_reason",
+        "filename",
+        "scope",
+        "searchable",
+        "size_bytes",
+        "status",
+        "unit_count",
+        "version",
+    }
+    for record in doors:
+        assert set(record) == shape
+        assert isinstance(record["version"], int)
+        assert record["attachment_id"] == attachment_id
+
+
+def test_concurrent_repreparation_publishes_one_index_version(
+    wired: dict[str, Any], gate: GateObjectStore
+) -> None:
+    attempts = 4
     record = wired["service"].accept(
         thread_id=wired["thread_id"],
         filename="notes.txt",
         payload=REVENUE_TEXT.encode("utf-8"),
     )
-    results = [_attempt(wired["service"].prepare, record.attachment_id)]
-    threads = [
-        threading.Thread(
-            target=lambda: results.append(
-                _attempt(wired["service"].prepare, record.attachment_id)
-            )
-        )
-        for _ in range(3)
-    ]
-    for worker in threads:
+    gate.get_fails = True
+    assert wired["service"].prepare(record.attachment_id).status == "failed"
+    gate.get_fails = False
+
+    gate_open = threading.Barrier(attempts)
+    results: list[Any] = []
+
+    def race() -> None:
+        gate_open.wait(timeout=10)
+        results.append(_attempt(wired["service"].prepare, record.attachment_id))
+
+    workers = [threading.Thread(target=race) for _ in range(attempts)]
+    for worker in workers:
         worker.start()
-    for worker in threads:
+    for worker in workers:
         worker.join(timeout=10)
 
-    assert len(results) == 4
+    assert len(results) == attempts
+    assert all(
+        isinstance(result, AttachmentRecord) and result.status == "ready"
+        for result in results
+    ), results
     final = wired["service"].status(record.attachment_id)
     assert final.status == "ready"
     assert wired["service"].store.indexed_versions(record.attachment_id) == (
         final.version,
     )
+    assert [
+        hit.unit
+        for hit in search(
+            wired["service"].store.index_postings(
+                record.attachment_id, final.version
+            ),
+            "revenue",
+        )
+    ] == [1]

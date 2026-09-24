@@ -204,7 +204,7 @@ from fin.host.attachment_prepare import (
 from fin.host.attachment_store import (
     AttachmentRecord,
     AttachmentStoreError,
-    InMemoryAttachmentStore,
+    AttachmentThreadGoneError,
 )
 from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER, strip_hidden_bounce_marker
 from fin.host.collection_bind import resolve_bound_collection_name
@@ -598,14 +598,21 @@ _DEFAULT_TITLE: str = "New thread"
 # 413, never a silent truncate. Module-level so operators can tune it
 # and tests can shrink it.
 ATTACHMENT_MAX_BYTES: Final[int] = 2 * 1024 * 1024
+ATTACHMENT_SCOPE: Final[str] = "thread_attach"
 
 
 def _attachment_wire_record(record: AttachmentRecord) -> dict[str, Any]:
-    """Serialize one attachment row for the workspace surface."""
+    """Serialize one attachment row for the workspace surface.
+
+    Every attachment door answers with this shape, so a client that polled
+    the upload response and then read the status cannot see two different
+    field sets for the same row.
+    """
     return {
         "attachment_id": record.attachment_id,
         "filename": record.filename,
         "size_bytes": record.size_bytes,
+        "scope": ATTACHMENT_SCOPE,
         "status": record.status,
         "version": record.version,
         "unit_count": record.unit_count,
@@ -2058,7 +2065,7 @@ def _build_default_attachment_service() -> AttachmentPreparationService:
         # WHY the thread store first: every attachment row references the
         # thread row, so the thread schema has to exist before the
         # attachment tables are created.
-        threads = default_thread_store()
+        default_thread_store()
         store: Any = PostgresAttachmentStore(url)
     else:
         store = InMemoryAttachmentStore(default_thread_store())
@@ -2836,14 +2843,7 @@ def build_router(
                 content={"error": "attachment_store_failed"},
             )
         background.add_task(attachments.prepare_async, record.attachment_id)
-        return {
-            "attachment_id": record.attachment_id,
-            "filename": record.filename,
-            "size_bytes": record.size_bytes,
-            "scope": "thread_attach",
-            "status": record.status,
-            "version": record.version,
-        }
+        return _attachment_wire_record(record)
 
     @router.get("/threads/{thread_id}/attachments")
     def list_thread_attachments(
@@ -2858,11 +2858,10 @@ def build_router(
             return JSONResponse(
                 status_code=404, content={"error": "thread_not_found"}
             )
-        records = attachments.store.list_for_thread(thread_id)
         return {
             "attachments": [
-                _attachment_wire_record(attachments.status(record.attachment_id) or record)
-                for record in records
+                _attachment_wire_record(record)
+                for record in attachments.list_for_thread(thread_id)
             ]
         }
 
@@ -2911,7 +2910,13 @@ def build_router(
                 status_code=400, content={"error": "attachment_not_found"}
             )
         try:
-            return _attachment_wire_record(attachments.retry(attachment_id))
+            return _attachment_wire_record(attachments.prepare(attachment_id))
+        except AttachmentThreadGoneError:
+            # EXIT: the thread was deleted between the check above and the
+            # write; the attachment is gone, not the store broken.
+            return JSONResponse(
+                status_code=400, content={"error": "attachment_not_found"}
+            )
         except AttachmentStoreError:
             logger.exception(
                 "retry_thread_attachment: state write failed for attachment_id=%s",

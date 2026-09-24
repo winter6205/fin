@@ -2507,21 +2507,22 @@ def compile_graph(
     def _with_turn_attachments(
         state: AgentState, model_messages: list[BaseMessage]
     ) -> list[BaseMessage]:
-        """Prepend the turn-scoped attachment block, or return as-is.
+        """Prepend the run's attachment block, or return as-is.
 
-        corpus-serve-ingest T4 (ADR 0047 thread attach): attachment
-        context is injected CALL-SCOPED like the track prompt —
-        prepended at model time and never written back to the
-        checkpoint. ``reset_input_state`` clears the ``attachments``
-        channel on the next send, so the text is visible on this
-        run's model calls only. The block goes right after the track
+        ADR 0047 thread attach, as extended by ADR 0086: the attachment
+        lives on the thread, while the text the model sees is injected
+        CALL-SCOPED like the track prompt — prepended at model time and
+        never written back to the checkpoint. ``reset_input_state``
+        clears the ``attachments`` channel, so a run that does not name
+        the attachment carries no copy of it; a later run that does name
+        it is re-stuffed from the thread's stored text. The block goes
+        right after the track
         prompt (position 1) so the model reads the instructions
         before the attachment body.
 
-        ADR 0047's visibility contract is unconditional for the turn
-        ("gives the model that file for this turn only"), so EVERY
-        leaf's model call gets it — the research ``model_node`` and
-        the ``_non_research_leaf`` tracks alike; an attach turn that
+        Every leaf's model call of a run that names the attachment gets
+        the block — the research ``model_node`` and the
+        ``_non_research_leaf`` tracks alike; an attach turn that
         Soft-Track routes to dialogue must still expose the file.
 
         The attachment text never enters the ``evidence`` channel

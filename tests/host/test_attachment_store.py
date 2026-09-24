@@ -502,8 +502,7 @@ def test_incomplete_excludes_failed_rows_and_ready_rows_from_other_versions() ->
     # Derived data for an older version does not make a newer version complete.
     store.put_index(attachment_id=ready.attachment_id, version=3, postings=POSTINGS)
 
-    assert store.incomplete() == [failed] or store.incomplete() == []
-    assert all(row.status != "failed" for row in store.incomplete())
+    assert store.incomplete() == []
 
 
 # ----- thread deletion -----

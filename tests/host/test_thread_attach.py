@@ -418,11 +418,11 @@ def test_attachment_text_visible_this_turn_gone_next_turn(
 def test_attachment_text_visible_on_dialogue_turn(
     client: TestClient, fresh_store
 ) -> None:
-    """ADR 0047 visibility is UNCONDITIONAL for the turn: "gives the
-    model that file for this turn only". Soft-Track may route the
-    attach turn to the dialogue leaf (a greeting carries no research
+    """ADR 0047 visibility is UNCONDITIONAL for the run that names the
+    attachment. Soft-Track may route the attach turn to the dialogue leaf (a
+    greeting carries no research
     cues), and that leaf's model call must still see the text —
-    otherwise the this-turn contract silently breaks on non-research
+    otherwise the attach contract silently breaks on non-research
     turns."""
     thread_id = _new_thread(client)
     model: RecordingScriptedModel = fresh_store["model"]
@@ -556,10 +556,11 @@ def test_attach_and_send_never_ingest_or_push(
 def test_attach_does_not_trigger_mcp_read_source(
     client: TestClient, fresh_store, http_app: FastAPI, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """T2: thread attach never resolves a body through MCP ``read_source``.
+    """Thread attach never resolves a body through MCP ``read_source``.
 
-    The attach door is "give the model that file for this turn only"
-    (ADR 0047). Re-routing attachment text through MCP would silently
+    The attach door hands the model the thread's own stored text (ADRs
+    0047/0086); it is not a corpus locator. Re-routing attachment text
+    through MCP would silently
     expand the read_file tool's surface, so the seam must short-circuit
     in the host graph before any MCP call. A spy on
     ``MCPRetrieveAdapter.read`` is installed and the graph is rebuilt

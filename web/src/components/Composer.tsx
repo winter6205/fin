@@ -5,9 +5,9 @@
 // ADRs 0047/0086: the thread-attach door lives
 // here — a file picker button AND a drop on the composer both upload
 // the file to POST /threads/{id}/attachments. Attachments persist for
-// the WHOLE thread (no longer one-use): every send references the
-// READY ones while parsing / failed records stay on the chip list
-// with their state and retry. This door never touches
+// the WHOLE thread (no longer one-use): each send names the READY ones
+// through ``attachmentsForSend``, and whatever that rule leaves out is
+// named on screen instead of vanishing. This door never touches
 // /api/corpus/ingest.
 
 import { useEffect, useRef, useState } from "react";
@@ -18,7 +18,7 @@ import {
 } from "../attachFailure";
 import { AttachFailedError } from "../api";
 import { describeSendFailure, type SendFailureNotice } from "../sendFailure";
-import { useWorkspaceStore } from "../store";
+import { attachmentsForSend, useWorkspaceStore } from "../store";
 
 interface ComposerProps {
   threadId: string;
@@ -69,6 +69,9 @@ export default function Composer({ threadId }: ComposerProps) {
   const loadAttachments = useWorkspaceStore((s) => s.loadAttachments);
   const retryAttachment = useWorkspaceStore((s) => s.retryAttachment);
   const attachments = useWorkspaceStore((s) => s.attachments);
+  // Derived, never stored: the chips the reference rule leaves out are on
+  // screen the same moment they stop being left out.
+  const { withheld } = attachmentsForSend(attachments);
   const [attachBusy, setAttachBusy] = useState(false);
   const [attachFailure, setAttachFailure] =
     useState<AttachFailureNotice | null>(null);
@@ -117,15 +120,12 @@ export default function Composer({ threadId }: ComposerProps) {
     if (!q) return; // Empty submit no-op.
     setDraft("");
     setFailure(null);
-    // Only READY attachments may be referenced — the host
-    // refuses a run that needs a still-parsing one (400
-    // attachment_not_ready). The send does NOT consume the ids: the
-    // same records ride every later turn.
-    const attachmentIds = attachments
-      .filter((a) => a.status === "ready")
-      .map((a) => a.attachment_id);
+    // The store owns the one reference rule. Only a READY attachment is
+    // named, so a question unrelated to a still-parsing one is never
+    // refused on its account; what was left out is rendered below.
+    const { ids } = attachmentsForSend(attachments);
     try {
-      await sendQuestion(threadId, q, thinkingOn, attachmentIds);
+      await sendQuestion(threadId, q, thinkingOn, ids);
     } catch (error) {
       // The draft was cleared optimistically and the textarea held
       // the only copy of the question — put it back so the operator
@@ -228,6 +228,16 @@ export default function Composer({ threadId }: ComposerProps) {
             </li>
           ))}
         </ul>
+      ) : null}
+      {withheld.length > 0 ? (
+        <p
+          data-testid="attachment-withheld"
+          className="mb-2 text-xs text-gray-600"
+        >
+          {`本轮不会引用：${withheld
+            .map((a) => `${a.filename}（${describeAttachmentStatus(a)}）`)
+            .join("、")}。就绪后它会自动随后续问题带上。`}
+        </p>
       ) : null}
       {dragOver ? (
         <p

@@ -134,3 +134,19 @@ def test_attachment_context_message_states_not_citable_discipline() -> None:
     content = str(msg.content)
     assert "NOT part of the citable corpus" in content
     assert "retrieve" in content
+
+
+def test_attachment_context_message_states_the_thread_lifetime() -> None:
+    """ADR 0086: the file stays on the thread and may be named again on later
+    turns; only this run's copy of its text is call-scoped. Copy promising
+    that the text vanishes next turn tells the model the opposite of what the
+    door does."""
+    from fin.host.agent_instructions import attachment_context_message
+
+    msg = attachment_context_message(
+        [{"attachment_id": "a1", "filename": "n.md", "text": "t"}]
+    )
+    assert msg is not None
+    content = str(msg.content)
+    assert "belong to the thread" in content
+    assert "vanish" not in content
