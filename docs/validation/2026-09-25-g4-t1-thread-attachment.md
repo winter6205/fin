@@ -23,19 +23,14 @@ committed G4 gold set are not closed by this record.
 
 ## Commands and results
 
-Default-suite runs are hermetic. Postgres-backed runs use a throwaway
-container started for this ticket (`fin-g4-t1-pg`, `postgres:16`, host port
-5433 → container 5432, DEV-only credentials taken from the committed
-`docker-compose.yml`); it is not the project's `FIN_CHECKPOINT_URL` service.
-
-**Cost of leaving it up.** `docker-compose.yml` publishes the project's own dev
-Postgres on host `5433` as well (deliberately `5433:5433`, so `5432` stays free
-for the iknow-memory server). `docker port fin-g4-t1-pg` confirms this
-container holds host `5433`, so `scripts/dev-up.sh` cannot bind its Postgres
-until `fin-g4-t1-pg` is removed. That is a side effect of this ticket on the
-operator's machine, recorded rather than quietly cleaned: the container is
-still up because the T2 follow-up needs real SQL again, and removing a
-container someone else may be relying on is not this ticket's call.
+Default-suite runs are hermetic. The Postgres-backed runs at 1 and 16 used a
+throwaway container started for this ticket (`fin-g4-t1-pg`, `postgres:16`,
+host port 5433 → container 5432, DEV-only credentials taken from the committed
+`docker-compose.yml`). That container has since been **removed** — it held host
+`5433`, which is exactly the port `docker-compose.yml` publishes the project's
+own dev Postgres on (deliberately `5433:5433`, so `5432` stays free for the
+iknow-memory server), so it was blocking `scripts/dev-up.sh`. Runs 17+ use the
+project's own Compose-managed Postgres instead. See *Environment unblock*.
 
 | # | Command | Exit | Result |
 | --- | --- | --- | --- |
@@ -113,38 +108,47 @@ of it cover the `pg_es` retrieval tiers — those stay blocked at B1/B2. No G4
 attachment gold case over the real fin object store plus live iknow-memory
 store exists yet; that is SC12's end-of-round obligation.
 
-## Blocked items (recorded, not substituted)
+## Blocked items — status after the environment unblock
 
-- **B1** `tests/retrieve/test_live_host_graph_hop.py` — not run on the merged
-  tree: it needs the iknow-memory `pg_es` cluster. Probed rather than assumed:
-  `127.0.0.1:9200` and `127.0.0.1:7687` both refuse the connection while
-  `127.0.0.1:5432` answers (an `iknow-memory-postgres` container runs, but no
-  Elasticsearch or Neo4j alongside it), and an earlier attempt failed as
-  `FATAL: role "iknow_memory" does not exist`.
-  **Correction to the first draft of this record**: that cluster is *not*
-  reachable by starting this repo's stack. fin's `docker-compose.yml` declares
-  exactly one service, Postgres; `elasticsearch` and `neo4j` are declared in the
-  read-only sibling `/home/winner/projects/iknow-memory/docker-compose.yml`.
-  The real blocker is one level down and explains most of this section: **this
-  box has no Compose at all** — `docker compose version` answers
-  `docker: unknown command: docker compose` and no `docker-compose` binary
-  exists — so neither `scripts/dev-up.sh` nor the sibling stack can be brought
-  up here as written. Starting it also means deploying shared services, which
-  is outside this ticket's authority regardless. Expected command once the
-  iknow-memory stack is up:
-  `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_host_graph_hop.py`.
-- **B2** `tests/retrieve/test_live_search_modes_pg_es.py` — not run, same
-  prerequisite family as B1 (no Elasticsearch, no Neo4j). Also not run:
-  `tests/host/test_live_fin_launcher_acceptance.py`, which would
-  `docker compose up` the whole stack and bind `:8000`; that is deploying or
-  restarting a shared service, and on this box it could not even be attempted,
-  since the launcher path it exercises depends on the same absent Compose.
-- **B3** Not runnable here: the 12 `tests/host/test_fin_launcher` cases (host
-  lacks `jq`) and `tests/test_compile.py`'s compose case (this docker CLI has no
-  compose subcommand). Both fail identically on the untouched main checkout;
-  unrelated to T1. Observed in run 9. Both are one package away from clear —
-  `jq` plus the Docker Compose plugin — which is an operator decision about
-  this machine, not a code change, so nothing was installed here.
+Closed by runs 17–22, so they are no longer open questions:
+
+- **B1 closed** — `test_live_host_graph_hop.py` passes (run 19) against real
+  stdio + real Elasticsearch.
+- **B3 closed** — `jq` and the Compose plugin were installed; `test_fin_launcher`
+  29 passed, `tests/host/test_compile.py` 21 passed (run 17, 18). This also
+  corrected a wrong path in an earlier draft of this record: the compose
+  contract case lives at `tests/host/test_compile.py`.
+- **B6 closed on a side branch** — the default suite's `$HOME` leak is fixed at
+  the shared boundary: an autouse `tests/conftest.py` fixture points `HOME` at an
+  empty per-run directory, following the file's existing
+  `_strip_operator_llm_and_mcp_cwd_env` convention rather than special-casing the
+  three tests. Proven RED first (`3 failed` with a planted `~/.fin/user.md`, and
+  `3 failed` with the operator's real 508-byte one), then GREEN with that real
+  home still present (`11 passed`), then `uv run --no-sync pytest -q` →
+  **2962 passed, 47 skipped, 299 deselected, exit 0** — the first full default
+  run on this box. It is deliberately **not** in this PR: one file, `+38`, test
+  infrastructure only, commit `61741d7`, unpushed, awaiting the operator.
+
+Still open, with the reason:
+
+- **B2a** `tests/retrieve/test_live_search_modes_pg_es.py` — 11 of 12 pass; the
+  twelfth fails on the stale sibling build described in F1. Closing it needs
+  `npm run build` inside `/home/winner/projects/iknow-memory`, which is a
+  read-only dependency of this ticket, so it was reported instead of performed.
+- **B2b** `tests/host/test_live_fin_launcher_acceptance.py` — still not run, and
+  the reason is now precise rather than "missing prerequisites". The toolchain
+  gate is cleared (run 22) and `web/dist` builds clean, but two hard stops
+  remain: (i) the suite's own teardown runs a bare `fin down`, and
+  `scripts/dev-down.sh` issues `docker compose down` against **both** compose
+  projects, which would delete this machine's dev Postgres, Elasticsearch and
+  Neo4j; (ii) `fin up` cannot come up cleanly anyway, because the iknow-memory
+  compose file wants to *create* `iknow-memory-postgres`, while the container on
+  `:5432` is a hand-run one with no compose labels and a different volume, so a
+  real attempt collides on the name and would land on an empty volume with
+  `bound_collection_name=unbound`. Clearing it needs the operator's iknow
+  Postgres brought under that compose project (or `FIN_IKNOW_ROOT` pointed at a
+  self-consistent checkout) plus authorization for that teardown. What *is*
+  proven about the launcher is its hermetic layer, 29 cases in run 17.
 - **B4** Not run: browser-level check of the Composer attachment chips. The
   web suite runs in a node environment with no DOM, so chip rendering,
   the withheld-attachment line, and the retry control are covered at the
@@ -153,13 +157,9 @@ store exists yet; that is SC12's end-of-round obligation.
 - **B5** Not closed: SC12's committed G4 gold set (PDF-text, scanned PDF,
   image, 8,000-code-point continuation, cross-thread denial at retrieve,
   attachment/company comparison) — belongs to T2–T5 and the end-of-round run.
-- **B6** New finding, not caused by this ticket: the default hermetic suite is
-  not fully hermetic. Three `tests/host/test_clarify_prompt.py` cases read the
-  operator's real `$HOME/.fin/user.md` because they build the graph without a
-  `user_profile_store`, so the suite's result depends on a developer's home
-  directory. Fixing it means isolating `HOME` in `tests/conftest.py`, which is
-  shared test infrastructure outside T1's scope and outside this diff's
-  boundary, so it is reported here instead of folded into this change.
+- **F1a** New, and the only finding worth filing from the whole unblock: the
+  live-iknow harness trusts a stale `dist/` (see F1), which is what manufactured
+  the false cross-repo defect. Owner: `tests/retrieve/live_iknow_support.py`.
 
 ## PR base state
 
@@ -225,4 +225,75 @@ merge-touched search-mode and named-failure files were re-run standalone green
 by main's `copy_recorded_job_facts` helper rather than left duplicated.
 
 These runs supersede runs 1–7 above, which were taken on the pre-merge tip.
+
+## Environment unblock, and what it then proved
+
+The 16 failures and the blocked items were traced to missing packages and
+services, so the box was repaired and the previously-unrunnable suites were run
+for the first time. Toolchain added: Docker Compose v2 `2.40.3` and `jq`
+`1.8.1`. Services: `fin-g4-t1-pg` removed and the project's own
+Compose-managed dev Postgres brought up on `5433` (healthcheck `healthy`);
+Elasticsearch (`9200`) and Neo4j (`7687`) built and started from the sibling
+`/home/winner/projects/iknow-memory/docker-compose.yml`; a pgvector Postgres on
+host `5434` so that the pre-existing **non-Compose** `iknow-memory-postgres` on
+`5432` was never touched.
+
+| # | Command | Exit | Result |
+| --- | --- | --- | --- |
+| 17 | `uv run --no-sync pytest -q tests/host/test_fin_launcher.py` | 0 | 29 passed — all 12 cases that had failed on `fin: jq is required` now run |
+| 18 | `uv run --no-sync pytest -q tests/host/test_compile.py` | 0 | 21 passed, including the `docker compose config` contract case (correction: this file lives at `tests/host/test_compile.py`, not `tests/test_compile.py` as an earlier draft of this record said) |
+| 19 | `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_host_graph_hop.py` | 0 | 1 passed against real stdio + real Elasticsearch — closes B1 |
+| 20 | `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_host_graph_hop.py tests/retrieve/test_live_search_modes_pg_es.py` | 1 | 11 passed, 1 failed — the `pg_es` tier is reachable for the first time; the single failure is a stale sibling build, not a product defect, item F1 below |
+| 21 | `uv run --no-sync pytest -q tests/host/test_thread_attachment_durable.py tests/host/test_thread_attach.py` | 0 | 44 passed — the toolchain and service changes did not disturb the attachment slice |
+| 22 | `bash scripts/dev-up.sh --check` | 0 | `dev-up: check ok` — the launcher's toolchain gate is no longer a blocker |
+
+### F1 — the `global` refusal was a stale sibling build, not a contract defect
+
+`test_a_global_send_reaches_the_server_and_surfaces_the_runtime_index_failure`
+fails deterministically (reproduced three times, byte-identical). The server
+answers a `global` send with a **prose** text block,
+`retrieve search_mode=global is not ready: community_summary_index_failure
+(no community_index_state row yet)`, while
+`tests/retrieve/test_live_search_modes_pg_es.py:387` parses that block as JSON
+and reads `{"error": ...}`, giving
+`json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)`.
+
+**An earlier draft of this record blamed `main`'s commit `2701923` for this. That
+accusation was wrong and is retracted.** The contract is settled and *both*
+sides already honor it:
+
+- `specs/search-mode-graph-global.md:63` pins the reader to "the `error` field
+  of the `isError` JSON body … **never a prose match**", and says the producer
+  lands in iknow-memory #273.
+- `iknow-memory/src/index.ts:535-545` emits exactly
+  `textResult(JSON.stringify({ error: failureToken, message }), true)`, shipped
+  by `068da4e` ("publish community-summary not-ready as a structured wire
+  field").
+- `src/fin/retrieve/mcp_adapter.py:480` (`_named_error_code_of_body`) reads
+  `body.get("error")` structurally — the same expectation from the other side.
+
+The prose came from the *artifact under test*, not from anyone's source: the
+harness runs `/home/winner/projects/iknow-memory/dist/index.js`, built
+2026-09-24 09:22, while `068da4e` landed 2026-09-24 19:00. Three independent
+proofs: `dist/core/errors.js` contains zero occurrences of `failureToken`;
+`dist/core/retrieval/mode-c-arm.js:152` throws `GraphragError` with two
+arguments (token-less); and the sibling's own TS test
+`npx vitest run tests/index.test.ts -t "named failure on the wire"` passes 2
+cases from current source. Minimal remedy is `npm run build` in that checkout —
+a rebuild, not a code change — which this ticket did not perform because
+`/home/winner/projects/iknow-memory` is a read-only dependency and the operator's
+other live suites run against that same `dist/`.
+
+**The finding that is real (F1a, harness hygiene, not product):**
+`tests/retrieve/live_iknow_support.py` selects the sibling server after only an
+`is_file()` check (`tests/retrieve/test_live_search_modes_pg_es.py:149`), so a
+stale build is indistinguishable from a violated wire contract, and a machine
+that never ran the suite before will report a false cross-repo defect. The
+guard belongs there — e.g. compare the build's freshness against the sibling's
+`HEAD`, or fail loudly when the artifact predates the source.
+
+No relationship to the attachment slice: the failing test imports only
+`fin.corpus.chunking` / `_common` / `push`, `fin.host.named_failures` and
+`fin.retrieve.port`, and `grep -i attachment` over `src/fin/retrieve/*` and
+`live_iknow_support.py` is empty.
 
