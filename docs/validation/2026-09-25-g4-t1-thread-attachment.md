@@ -78,6 +78,33 @@ Static sweep: no bare `except` without a named outcome in
 `EXIT:` comment naming the condition), no `attachments.store` reach-through
 left in the HTTP routes, and no test-only helper added to a public barrel.
 
+## Review gate and how its findings were closed
+
+The plan's per-bullet loop requires one code-review phase after the bullets, with
+BLOCKED findings repaired rather than patched at the symptom. Pinned refs: base
+`7a30e84`, HEAD `19f9b27`, dual-axis (Standards + Spec) sub-agents.
+
+| Round | Aggregate | Gate |
+| --- | --- | --- |
+| 1, on `7a30e84..19f9b27` | 6 High across both axes: S-1 `mark_ready` cross-process publish race; S-2/S-3 `delete_thread` double byte-delete and late-upload orphan; P1-1 cross-thread lookup answered 400 vs 404 inconsistently; P1-2 run history still held a resolvable `attachment_id` after thread deletion; P2-1 dependency note | `GATE: BLOCKED` → `review-report-repair` |
+| 2, same refs after repair work | Standards 1 High / Spec 0 High (the web send door silently dropping `parsing` attachments, which also made the host's typed `attachment_not_ready` unreachable) | `GATE: BLOCKED: 1 High unresolved` |
+
+Both rounds' High findings close in one commit, `ead5e26`, whose body maps each fix
+to its root-cause cluster rather than to a line: `retry()` deleted outright so a
+published version can no longer be destroyed by a retry (its race and the 400/404
+split go with it), empty derived text raises `AttachmentNotReadyError` instead of
+being injected as content, the four attachment doors share one wire shape and the
+list door goes through `list_for_thread` instead of reaching into the store,
+`delete_thread` no longer deletes every key twice, the model-facing copy stops
+claiming the text vanishes next turn, and the web send rule collapses to one
+authority, `attachmentsForSend`, so a withheld attachment is named rather than
+dropped and an unrelated question is never blocked by a `parsing` chip.
+
+**Stated plainly: there was no third dual-axis pass on the `ead5e26` diff.** The
+second round's High is closed by the same change, and what backs it is execution,
+not another opinion — the 142-case attachment run and the web gate cases below. A
+re-review of a repair diff is the operator's call, not this ticket's default.
+
 ## Real-boundary evidence — iknow-memory MCP
 
 Run 6 was taken pre-merge; runs 13–15 repeat the same boundary on the merged
@@ -275,6 +302,7 @@ host `5434` so that the pre-existing **non-Compose** `iknow-memory-postgres` on
 | 22 | `bash scripts/dev-up.sh --check` | 0 | `dev-up: check ok` — the launcher's toolchain gate is no longer a blocker |
 | 23 | `npm run build` (that repo's own `"build": "tsc -p tsconfig.json"`) in the sibling, then `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_search_modes_pg_es.py` and the four neighbor groups | 0 | the build was a **byte-level no-op** (identical sha256 before/after on the three inspected files, mtime only); `test_live_search_modes_pg_es.py` is now **11 passed, 0 failed**, and the neighbors show no regression: graph hop 1, read_source + corpus_ingest + research_cite 6, mcp t2–t5 5 |
 | 24 | `uv run --no-sync pytest -q -m mcp tests/host/test_live_fin_launcher_acceptance.py` | 1 | **5 errors, 0 failures**, all from one fixture cause (21s): `fin up` exits 1 before serving, at the iknow-memory compose step. Everything of the launcher that does not depend on that step proved to work on the real box — preflight gates, build, fin's own Postgres `:5433` reported `Healthy`, `fin check`, and a direct `probe_knowledge_mcp()` call answering `reachable` over real stdio + ES + Neo4j. Classified as un-wired environment, not a product defect |
+| 25 | Closing-turn re-verification on the shipped tip `5c926cb`: `FIN_CHECKPOINT_URL=<project compose pg :5433> uv run --no-sync pytest -q` over the six attachment files, then `cd web && npx tsc --noEmit` and `npx vitest run -t "send gate"` | 0 | **142 passed** on real Postgres (the durable, Postgres, store, thread-attach, agent-instructions and index suites together); `tsc` exit 0; the 3 web send-gate cases pass. All 27 test ids cited in *T1 acceptance, per case* were also checked to exist in `tests/` by name — `id_check_missing=0` |
 
 ### What run 24 cost the machine, and how it was proven restored
 
