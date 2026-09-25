@@ -682,8 +682,35 @@ def test_malformed_requested_crop_count_fails_typed_not_type_error(
         preflight_run(budgets, [1], bad_crop)
 
 
-# ----- the deployed bounds, bound to their measurement evidence -----
+@pytest.mark.parametrize(
+    ("pages", "crops"),
+    [
+        ([1], MAX_CROP_CALLS + 1),
+        ([1], MAX_VISION_CALLS - 1),
+        ([MAX_PAGES - 1], MAX_CROP_CALLS + 1),
+    ],
+    ids=["one_over", "almost_twice_the_headroom", "spends_the_whole_run_budget"],
+)
+def test_crop_request_over_the_configured_headroom_fails_even_inside_the_run_budget(
+    pages: list[int],
+    crops: int,
+) -> None:
+    """The fourth bound is a deployment price, so a run total with room left
+    still cannot buy more crops than were priced.
+    """
+    budgets = _load()
+    assert sum(pages) + crops <= MAX_VISION_CALLS  # the run total is not what fails
+    with pytest.raises(AttachmentVisionBudgetExceeded):
+        preflight_run(budgets, pages, crops)
 
+
+def test_crop_request_at_exactly_the_configured_headroom_is_admitted() -> None:
+    """The bound is inclusive, like the page cap."""
+    budgets = _load()
+    preflight_run(budgets, [1], MAX_CROP_CALLS)
+
+
+# ----- the deployed bounds, bound to their measurement evidence -----
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_EXAMPLE_PATH = PROJECT_ROOT / ".env.example"
 CORPUS_DISTRIBUTION_PATH = (
