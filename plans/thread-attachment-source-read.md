@@ -8,8 +8,6 @@
 **Per-ticket loop (implementation bullets):** tdd → targeted typecheck and tests. After implementation bullets land, run one code-review phase, repair BLOCKED findings, then verification-before-completion and the project commit rule. T2a is measurement/decision work, not a code ticket.
 **Golden-set gate (all bullets):** add or update committed cases for changed behavior, run the relevant gold set with the real boundaries that behavior crosses, and record actual per-case results. A missing live prerequisite blocks completion under `.claude/rules/test.md`; scripted/Fake tests are supplemental.
 
-Independent review: 2026-09-25.
-
 bounded-context-guardian: yes — fin owns attachment bytes, parsing, visual derivatives, and thread-private indexing; iknow-memory remains the company-source boundary.
 input-contract-tests: yes — upload/send gating, lifecycle states, page and vision budgets, deletion races, locator bounds, and backend failures have explicit acceptance cases.
 error-handling-enforcer: yes — parser, vision, index, budget, upload, and deletion-cleanup failures have typed exits; tombstones continue blocking access during cleanup retry.

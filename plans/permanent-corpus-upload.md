@@ -14,7 +14,7 @@ error-handling-enforcer: yes — each failed stage has a typed status/EXIT, expl
 complexity-anti-drift: yes — the sequence separates API/state decisions, durable submission, parser/chunk/push, and graph-index orchestration; it adds no graph node or second splitter.
 minimal-change-verifier: yes — reuses the workspace home, corpus object-store/parser/chunk/push seams, and bounded source-read contract; does not add a second library, ranking implementation, or automatic thread-to-corpus conversion.
 
-**OVERALL: PASS**
+**OVERALL: PASS — provisional pending T1's spec amendment**
 
 ## Settled contract and open seams
 
@@ -22,7 +22,7 @@ minimal-change-verifier: yes — reuses the workspace home, corpus object-store/
 - **Inherits:** the company source locator remains `{document_id, version, unit}`; pushed chunks carry the canonical `source_ref`; exact company-unit reads use iknow-memory's bounded `read_source` contract. iknow distinguishes per-source text-search readiness from corpus-wide graph/C readiness. No model-supplied path or thread id widens access.
 - **Inherits:** iknow-memory `plans/bounded-source-read.md` T1 is merged and remains complete; this plan consumes its bounded exact-`source_ref` read contract without reopening it.
 - **Open for T1:** accepted-response/job identity, fin's durable submission states, retry/replacement semantics, whether to retain the existing 50 MiB upload cap or set a different finite cap, whether unsupported format is rejected before acceptance or fails as a job, how `document_id` is derived from filename/company/period and how `format`/`doc_type` are validated before a stable job identity exists, how the operator sees per-source text result alongside corpus-wide graph/C readiness, and the status polling contract. The current `corpus-serve-ingest` spec describes a synchronous endpoint and must be amended before implementation.
-- **Current runtime gap:** the historical `plans/corpus-serve-ingest.md` T5 says the upload control landed, but current `App.tsx` has no mounted corpus control and `HomePage` has no file input; `ingestFile` has no non-test UI caller. The new plan restores the standalone home entry. The current `POST /api/corpus/ingest` parses, chunks, and pushes synchronously and does not persist the uploaded raw bytes. `IngestStateStore` is currently in-memory.
+- **Current runtime gap (pre-T2 state):** the historical `plans/corpus-serve-ingest.md` T5 says the upload control landed, but current `App.tsx` has no mounted corpus control and `HomePage` has no file input; `ingestFile` has no non-test UI caller. The new plan restores the standalone home entry. The current `POST /api/corpus/ingest` parses, chunks, and pushes synchronously and does not persist the uploaded raw bytes. `IngestStateStore` is currently in-memory.
 - **To persist after T1:** record the decided permanent-upload job and readiness vocabulary in the fin glossary/spec; coordinate the iknow job's public states through the sibling plan. Do not mark these terms settled before the decision ticket.
 - **Scope cut:** no automatic promotion of an attachment into the company corpus, no upload action on the thread composer, no corpus delete UI in this increment, and no change to retrieve ranking. Failed-submission object cleanup and version-replacement invalidation remain in scope.
 
