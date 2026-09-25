@@ -27,7 +27,8 @@ minimal-change-verifier: yes — one G4 outcome excludes accounts, permanent ing
    - **Inherits:** spec: "Fin owns each thread's attachment source and index" and "`ready` means both text and index are usable"; ADR 0083 keeps the existing binary attachment door and separate corpus ingest.
    - **Surface:** fin thread attachment capability, object store, thread store, workspace HTTP and web attachment state.
    - **Acceptance:** upload a UTF-8 text file as bytes; the API returns a logical attachment ID and `parsing`, then `ready` only after searchable index data exists; the same thread can inspect status on another turn; process restart retains bytes and parsed version and restores index availability before `ready`; deleting the thread removes metadata, bytes, parsed units, and index entries. A concurrent delete and preparation cannot resurrect the index; cleanup failure is typed, observable, and retriable rather than acknowledged as complete. The existing one-use attachment assertion is replaced by the thread-lifetime contract.
-   - Status: [ ] pending
+   - Status: [x] delivered — merged to `main` as `5de7120` (PR #298); per-clause evidence in
+     [`docs/validation/2026-09-25-g4-t1-thread-attachment.md`](../docs/validation/2026-09-25-g4-t1-thread-attachment.md)
 
 2. **Classified async preparation and retry** — tag: `[implementation]`
    - **Inherits:** ADR 0084 closed type set `text`, `pdf-text`, `pdf-scanned`, `image`, `unsupported`; ADR 0086 asynchronous parse/index, `attachment_not_ready`, named render/vision failures and retry.
