@@ -29,13 +29,14 @@ docker build \
 
 # Post-build verification of the OCR language contract (ADR 0054: fin's
 # TesseractEngine default is `chi_sim+eng`, the OS must ship both tessdata).
+# The Dockerfile already fails the build on a missing language, so this is the
+# out-of-build confirmation on the image that actually got tagged: one boot,
+# recorded once, asserted from the record rather than re-queried.
 echo "[build] verifying tessdata inside the built image"
 docker run --rm --entrypoint /usr/bin/tesseract "${IMAGE}" --list-langs \
     | tee "${HERE}/results/image_tesseract_langs.txt"
-docker run --rm --entrypoint /usr/bin/tesseract "${IMAGE}" --list-langs \
-    | grep -qx 'eng'
-docker run --rm --entrypoint /usr/bin/tesseract "${IMAGE}" --list-langs \
-    | grep -qx 'chi_sim'
+grep -qx 'eng' "${HERE}/results/image_tesseract_langs.txt"
+grep -qx 'chi_sim' "${HERE}/results/image_tesseract_langs.txt"
 
 # Record the baked resolved-version manifest and the image identity so
 # PIN_MANIFEST.md can cite the artifact rather than a guess.

@@ -35,12 +35,14 @@ download metadata that the image wrote itself.
 | tag | `fin-g4-pipeline:t2a` |
 | image id | `sha256:8e10185fa27ea5adcfca94732adc27a2720ed9a31b67698d0a2c9e7a1a62c800` |
 | created | `2026-09-26T00:41:58.341799675+08:00` |
-| content size | `681909257` bytes (docker `Size`: 2.93 GB uncompressed) |
+| content size (`size_bytes`) | `681909257` bytes = 650.3 MiB |
 | arch | `amd64` |
 | base image | `python:3.12-slim` |
 | Python | `3.12.14 (main, Sep 19 2026, 01:04:57) [GCC 14.2.0]` |
 
-Source of these values: `docker image inspect` snapshot in `results/image_identity.txt`.
+Source of these values: `docker image inspect` snapshot in `results/image_identity.txt`;
+`size_bytes` is that snapshot's only size field, so no larger unpacked figure is recorded
+anywhere in `results/`.
 
 ## 2. System packages (apt, `python:3.12-slim` bookworm)
 
@@ -225,13 +227,25 @@ WARNING: Your kernel does not support swap limit capabilities or the cgroup is n
          Memory limited without swap.
 ```
 
-The WSL2 kernel in use does not enable `CONFIG_MEMCG_SWAP` accounting, so `--memory-swap=4g`
-is accepted but **not enforced**: `memory.swap.max` reads `max` (the driver records that as
-`cgroup_memory_swap_max_bytes: -1`). The practical consequence for T2a's budget decision is
-mitigated by observation rather than assumption: every measured run reports
-`VmSwap = 0` bytes and `memory.swap.current = 0`, i.e. the workload never swapped, so
-`memory.peak` *is* the true 4 GiB-relevant footprint. A host that does support swap
-accounting should re-run this harness before the caps are frozen.
+The WSL2 kernel in use does not enforce a container swap limit, so `--memory-swap=4g` is
+accepted but **not applied**: `memory.swap.max` reads `max` (the driver records that as
+`cgroup_memory_swap_max_bytes: -1`). Swap *usage* is still accounted, and it is nonzero where
+it matters. `memory.peak` counts memory charged to the cgroup, not the bytes the kernel moved
+out, so on this host the 4 GiB-relevant footprint of a run is its `memory.peak` plus its swap,
+and `VmSwap` has to be read rather than assumed away. Eight of the ten metas tracked under
+`results/` do report `proc_vmswap_bytes = 0` and `cgroup_memory_swap_current_bytes = 0` — the
+six `2023_FY_GOOG.pdf` runs (`…T164419Z`, `…T170133Z`, `…T170956Z`, `…T184410Z`, `…T195408Z`,
+`…T204930Z`) and both `g4-mixed-chart-001` runs (`…T174114Z`, `…T204952Z`), all of them one to
+three pages — while the non-PDF rejection
+meta (`g4-image-chart-001.png…T195253Z`) records `null` for both because it measured nothing.
+The load-bearing run is the exception:
+`2023_Q1_MSFT_20260925T171056Z.meta.json`, the 72-page conversion, reports
+`proc_vmswap_bytes = 182738944` with `cgroup_memory_swap_current_bytes = 275591168`. Both are
+end-of-run readings rather than peaks — the driver has no swap counter to peak on here — so the
+byte total that conversion put under the ceiling is at least resident `VmHWM` 3,324,112,896 plus
+182,738,944 swapped. That is why the validation record computes its margin from
+resident-plus-swap and why no cap here may be read off `memory.peak` alone. A host that enforces
+the swap half of the ceiling should re-run this harness before the caps are frozen.
 
 ## 7. Environment findings that constrain reproducibility
 
@@ -258,7 +272,7 @@ accounting should re-run this harness before the caps are frozen.
 | `Dockerfile` | pinned runtime (docling + CPU torch + tesseract eng/chi_sim), with build-time guards |
 | `build.sh` | ceiling-constrained build + `tesseract --list-langs` verification + freeze snapshot |
 | `driver.py` | in-container measurement driver; emits exactly one JSON line, logs to stderr |
-| `run_measured.sh` | ceiling-constrained `docker run` wrapper; merges `docker inspect` OOMKilled + host-side cgroup peaks into the result |
+| `run_measured.sh` | ceiling-constrained `docker run` wrapper; merges `docker inspect` OOMKilled with its own out-of-band read of the container scope's `memory.peak` / `memory.swap.peak`. That host-side cross-check read nothing on this host — `host_side_cgroup_memory_peak_bytes` and `host_side_cgroup_memory_swap_peak_bytes` are `null` in every committed meta — so every peak here comes from the driver's in-container reads |
 | `PIN_MANIFEST.md` | this file |
 | `results/` | build snapshots (`image_*.txt`) + one dir and one `<name>.measured.jsonl` per measured run |
 
