@@ -140,9 +140,68 @@ just not what T1 changes. No G4 attachment gold case over the real fin object
 store plus live iknow-memory store exists yet; that is SC12's end-of-round
 obligation.
 
+### Browser-level pass — the DOM gap closed (B4)
+
+The web suite runs in a node environment with no DOM, so until this pass nothing
+about chip rendering, the withheld line, or the retry control had been *seen*.
+Stack: real `fin-serve` on `:8000` against the project's Compose Postgres on
+`:5433`, real `vite` dev on `:5173`, driven by playwright-cli. Uploaded file is
+committed representative data (`data/corpus/extracted/0000320193-24-000006/passages-001.json`,
+76 KB of real filing passages), not invented toy text.
+
+| Case | Observed |
+| --- | --- |
+| upload → `parsing` → `ready` unaided | chip painted `解析中…` at **172 ms**, `可引用` at **2316 ms** with no click between; reproduced at 116 ms → 2207 ms. So the readiness transition is **polled, not user-triggered** — the store's 2 s list poll, one `GET /attachments` per tick. Door reported `unit_count: 1, searchable: true, version: 1` |
+| same-thread reuse across turns | two sends on one thread, both `POST /messages` **200** carrying the identical id pair; both chips still `ready` after — the id is not consumed |
+| unrelated question while a file is `parsing` — the behavior round 2 of the review flagged High | send button enabled; withheld line read `本轮不会引用：page-001.json（解析中…）。就绪后它会自动随后续问题带上。`; the send went out with only the 4 ready ids, parsing id excluded, withheld line still visible, no refusal notice — browser agrees with `uploadDoors.test.ts` send-gate |
+| failed path + retry control | whitespace-only file → `failed`, chip `解析失败（没有解析出文本内容）`, door `failure_reason: "attachment_empty_text"`; retry present, visible, not disabled, aria-labelled; clicking it returns **200** with `status: failed, version: 0, unit_count: 0` and the same reason — correct, since retry re-runs preparation over still-empty bytes. **`retry → ready` was not observed**: no transient-failure fixture exists, so that edge stays store-level |
+| cross-thread | only the current thread's chips in `body.innerText`; **no select/listbox/combobox affordance exists at all**, only the hidden file input, so a foreign reference cannot be constructed; navigating away and back re-scoped the list (5 chips → 1) |
+| console / network hygiene | 108 requests, zero app-originated 4xx/5xx, zero console errors, zero unhandled rejections; no `object_key`, bucket, `s3://`, `local://`, `file://`, `/home/`, `/tmp/`, `/var/` in any client payload — the doors expose exactly the 9 pinned fields |
+
+**Narrowed, not glossed:** two halves of a browser send were *not* observable on
+this box, and the pass reports them rather than claiming them. (a) The worktree has
+no `.env`, so every model call answers 401 and each turn ends
+`status: refuse / status_classified: auth` — the attachment door still admits the
+send (200), which is what B4 is about, but the **answer** half is unproven here.
+(b) The backend logged `FIN_OBJECT_STORE_URL/BUCKET are not set; thread attachments
+keep their raw bytes in process memory`, so **restart durability is not
+exercisable in this configuration**; it remains SQL-seam evidence (runs 1/16/25),
+not a browser-proven property.
+
+Four by-products, none a T1 product defect:
+
+- **F3, then F-B4-1 (Low, pre-existing, not attachment code)** — `GET /api/threads/{id}`
+  serializes the raw upstream provider error into each turn's `status_reason`
+  (`… OpenAIAuthenticationError: Error code: 401 - … Please carry the API secret
+  key in the 'Author…`). No credential value and no path leaks, and the UI's own
+  copy is sanitized, but third-party internals are reaching a client surface,
+  which cuts against the project's 错误信息不泄露敏感细节 rule. Owner: turn
+  serialization in `src/fin/host/workspace_http.py`. Reported, not fixed here.
+- **F-B4-2 / F-B4-3** — the two limits just described.
+- **F-B4-4 (coverage note)** — because `attachmentsForSend` strips non-ready ids
+  client-side (`web/src/Composer.tsx:126`), the host's typed `attachment_not_ready`
+  is unreachable from the browser; the on-screen withheld line is the only signal,
+  and `uploadDoors.test.ts:477` is the sole cover for that refusal. Consistent with
+  spec, but worth knowing the host code path has no UI traffic behind it.
+
+Residue from the pass, left deliberately: 5 threads and 9 attachment rows in the
+**dev** Postgres. The operator may want them cleaned; deleting data was not this
+worker's call. The 11 per-case screenshots are session-ephemeral under
+`/tmp/b4-browser/` and are deliberately **not** committed — this record's standing
+claim is the observed text above, and a PNG that cannot be re-derived from the
+commands would only pretend to be evidence.
+
 ## Blocked items — status after the environment unblock
 
-Closed by runs 17–23, so they are no longer open questions:
+Closed by runs 17–26, so they are no longer open questions:
+
+- **B4 closed with two named limits** — the Composer attachment surface was driven
+  in a real browser (run 26); all six cases in *Browser-level pass* observed,
+  including the polled `parsing`→`ready` transition and the withheld-attachment
+  line that round 2 of the review turned into a High fix. Not proven there, and
+  recorded as such: the answer half of a send (no `.env` on this box → every model
+  call 401s) and restart durability (object store unset → bytes live in process
+  memory).
 
 - **B1 closed** — `test_live_host_graph_hop.py` passes (run 19) against real
   stdio + real Elasticsearch, with the qualification recorded under
@@ -192,14 +251,17 @@ Still open, with the reason:
   fin-owned Postgres health, `fin check`, and MCP reachability on the real box.
   What remains unproven: full-stack `fin up`, `fin status` consistency, the
   `.fin/ready` verdict, `fin logs`, and the 409-then-admit path.
-- **B4** Not run: browser-level check of the Composer attachment chips. The
-  web suite runs in a node environment with no DOM, so chip rendering,
-  the withheld-attachment line, and the retry control are covered at the
-  store/api seam only. Expected command: `cd web && npm run dev` plus a manual
-  upload→parse→send pass.
 - **B5** Not closed: SC12's committed G4 gold set (PDF-text, scanned PDF,
   image, 8,000-code-point continuation, cross-thread denial at retrieve,
   attachment/company comparison) — belongs to T2–T5 and the end-of-round run.
+- **F3** (was F-B4-1) Pre-existing hygiene leak found by the browser pass, not
+  repaired here: `GET /api/threads/{id}` puts the raw upstream provider error into
+  each turn's `status_reason`, so third-party internals reach the client surface.
+  No secret value and no path is included, and the UI copy is sanitized, but the
+  project rule *错误信息不泄露敏感细节* argues for mapping it to a named reason at
+  the serialization boundary. Owner: `src/fin/host/workspace_http.py`. Needs the
+  operator's call, since it is outside the attachment slice and touches the error
+  vocabulary the review rounds just aligned.
 - **F1a** New, and the only finding worth filing from the whole unblock: the
   live-iknow harness launches the sibling server on an `is_file()` check alone,
   so a gitignored artifact whose state cannot be reliably *observed* — two of my
@@ -312,6 +374,7 @@ host `5434` so that the pre-existing **non-Compose** `iknow-memory-postgres` on
 | 23 | `npm run build` (that repo's own `"build": "tsc -p tsconfig.json"`) in the sibling, then `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_search_modes_pg_es.py` and the four neighbor groups | 0 | the build was a **byte-level no-op** (identical sha256 before/after on the three inspected files, mtime only); `test_live_search_modes_pg_es.py` is now **11 passed, 0 failed**, and the neighbors show no regression: graph hop 1, read_source + corpus_ingest + research_cite 6, mcp t2–t5 5 |
 | 24 | `uv run --no-sync pytest -q -m mcp tests/host/test_live_fin_launcher_acceptance.py` | 1 | **5 errors, 0 failures**, all from one fixture cause (21s): `fin up` exits 1 before serving, at the iknow-memory compose step. Everything of the launcher that does not depend on that step proved to work on the real box — preflight gates, build, fin's own Postgres `:5433` reported `Healthy`, `fin check`, and a direct `probe_knowledge_mcp()` call answering `reachable` over real stdio + ES + Neo4j. Classified as un-wired environment, not a product defect |
 | 25 | Closing-turn re-verification on the shipped tip `5c926cb`: `FIN_CHECKPOINT_URL=<project compose pg :5433> uv run --no-sync pytest -q` over the six attachment files, then `cd web && npx tsc --noEmit` and `npx vitest run -t "send gate"` | 0 | **142 passed** on real Postgres (the durable, Postgres, store, thread-attach, agent-instructions and index suites together); `tsc` exit 0; the 3 web send-gate cases pass. All 27 test ids cited in *T1 acceptance, per case* were also checked to exist in `tests/` by name — `id_check_missing=0` |
+| 26 | Real browser: `FIN_CHECKPOINT_URL=<compose pg :5433> uv run --no-sync fin-serve` on `:8000` + `cd web && npm run dev` on `:5173`, driven by playwright-cli over committed corpus data | 0 | 6/6 cases observed — see *Browser-level pass* below. 108 requests, zero app-originated 4xx/5xx, zero console errors, no storage locator in any client payload. Both servers stopped and ports verified closed |
 
 ### What run 24 cost the machine, and how it was proven restored
 
