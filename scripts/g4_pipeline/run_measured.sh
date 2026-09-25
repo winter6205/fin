@@ -56,6 +56,93 @@ RUN_DIR="${RESULTS}/${BASE}_${STAMP}"
 CTR="fin-g4-t2a-${BASE}-$$"
 mkdir -p "${RUN_DIR}/pages" "${MODEL_CACHE}/hf" "${MODEL_CACHE}/torch" "${RESULTS}"
 
+# Single schema for both the measured and the failed record: values the harness
+# never read are emitted as JSON null by the serializer, never as "" or "false",
+# and every string (paths, docker state errors) is escaped there rather than by
+# printf. Usage: emit_meta <mode> <raw-jsonl-path-or-empty> <meta-path>.
+emit_meta() {
+    G4_MODE="$1" G4_RAW="$2" G4_META="$3" \
+    G4_PDF="${PDF_HOST}" G4_OOM="${OOMKILLED:-}" G4_CEXIT="${STATE_EXIT:-}" \
+    G4_REXIT="${RUN_EXIT:-}" G4_PEAK="${HOST_PEAK:-}" G4_SWAP_PEAK="${HOST_SWAP_PEAK:-}" \
+    G4_STATE_ERR="${STATE_ERR:-}" G4_JSON_LINES="${JSON_LINES:-}" \
+    G4_CEIL_MEM="${CEIL_MEM}" G4_CEIL_SWAP="${CEIL_SWAP}" G4_CEIL_CPUS="${CEIL_CPUS}" \
+    G4_MEASURED="${RUN_DIR}/${BASE}.measured.jsonl" \
+    G4_JSONL_COPY="${RESULTS}/${BASE}_${STAMP}.jsonl" \
+        python3 - <<'PY'
+import json, os, time
+
+env = os.environ
+
+
+def as_int(value):
+    value = (value or "").strip()
+    return int(value) if value.lstrip("-").isdigit() else None
+
+
+def as_bool(value):
+    return {"true": True, "false": False}.get((value or "").strip().lower())
+
+
+# An empty State.Error and the pre-inspect placeholder both mean "no error was
+# captured", which serializes as null rather than as a distinguishable string.
+state_error = (env.get("G4_STATE_ERR") or "").strip() or None
+if state_error == "none":
+    state_error = None
+
+oom = as_bool(env.get("G4_OOM"))
+cexit = as_int(env.get("G4_CEXIT"))
+rexit = as_int(env.get("G4_REXIT"))
+hpeak = as_int(env.get("G4_PEAK"))
+hswap = as_int(env.get("G4_SWAP_PEAK"))
+raw = env.get("G4_RAW") or ""
+rec = json.loads(open(raw, encoding="utf-8").read().strip()) if raw else None
+# Patching rec's own totals dict keeps the harness observations inside the
+# measured JSONL artifact as well as the meta summary.
+totals = rec.setdefault("totals", {}) if rec else {}
+
+totals["oom_killed_docker_inspect"] = oom
+if oom is not None:
+    totals["oom_killed"] = oom
+    totals["oom_killed_source"] = "docker inspect .State.OOMKilled (cgroup counter kept alongside)"
+totals["container_exit_code"] = cexit
+totals["docker_run_exit_code"] = rexit
+totals["host_side_cgroup_memory_peak_bytes"] = hpeak
+totals["host_side_cgroup_memory_swap_peak_bytes"] = hswap
+totals["ceiling"] = {"memory": env["G4_CEIL_MEM"], "memory_swap": env["G4_CEIL_SWAP"],
+                     "cpus": env["G4_CEIL_CPUS"]}
+
+if env["G4_MODE"] == "measured":
+    line = json.dumps(rec, separators=(",", ":")) + "\n"
+    open(env["G4_MEASURED"], "w", encoding="utf-8").write(line)
+    open(env["G4_JSONL_COPY"], "w", encoding="utf-8").write(line)
+
+driver_keys = (
+    "peak_rss_vmhwm_bytes", "cgroup_peak_bytes", "cgroup_memory_max_bytes",
+    "cgroup_memory_swap_max_bytes", "cgroup_memory_swap_current_bytes",
+    "proc_vmswap_bytes", "oom_kill_events_in_cgroup", "oom_killed",
+    "oom_killed_docker_inspect", "container_exit_code", "docker_run_exit_code",
+    "host_side_cgroup_memory_peak_bytes", "host_side_cgroup_memory_swap_peak_bytes",
+    "total_latency_ms", "render_and_ocr_latency_ms", "docling_whole_doc_latency_ms",
+    "page_latency_ms_stats", "regions_total", "pages_needing_ocr",
+    "pages_with_ocr_applied", "pages_with_native_text", "native_text_chars_total",
+    "ocr_text_chars_total", "docling_error", "docling_status", "docling_page_count",
+    "slice_pass_error", "ceiling")
+file_info = rec.get("file", {}) if rec else {}
+meta = {"pdf": file_info.get("name") or env["G4_PDF"],
+        "pdf_bytes": file_info.get("bytes"),
+        "pdf_sha256": file_info.get("sha256"),
+        "page_count": rec.get("page_count") if rec else None,
+        "measured_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+meta.update({k: totals.get(k) for k in driver_keys})
+# state_error and json_lines describe the harness rather than the container, so
+# they exist only here; every other key is named once, in driver_keys.
+meta.update({"state_error": state_error,
+             "json_lines": as_int(env.get("G4_JSON_LINES"))})
+open(env["G4_META"], "w", encoding="utf-8").write(json.dumps(meta, indent=2) + "\n")
+print("[run] summary: " + json.dumps(meta, separators=(",", ":")))
+PY
+}
+
 # One-time, cached model fetch (constraint: the Heron weights download once into
 # the mounted host cache and are reused). Docling 2.130 will NOT auto-download
 # into an explicit artifacts_path - it raises FileNotFoundError pointing at this
@@ -70,6 +157,7 @@ mkdir -p "${RUN_DIR}/pages" "${MODEL_CACHE}/hf" "${MODEL_CACHE}/torch" "${RESULT
 if [[ ! -f "${MODEL_CACHE}/docling-project--docling-layout-heron/model.safetensors" ||
       ! -f "${MODEL_CACHE}/docling-project--docling-models/model_artifacts/tableformer/accurate/tableformer_accurate.safetensors" ]]; then
     echo "[run] artifacts cache incomplete -> fetching layout + tableformer into ${MODEL_CACHE}"
+    FETCH_EXIT=0
     docker run --rm \
         --memory="${CEIL_MEM}" --memory-swap="${CEIL_SWAP}" --cpus="${CEIL_CPUS}" \
         --user "$(id -u):$(id -g)" \
@@ -78,8 +166,13 @@ if [[ ! -f "${MODEL_CACHE}/docling-project--docling-layout-heron/model.safetenso
         --volume "${MODEL_CACHE}:/models" \
         --entrypoint /usr/local/bin/docling-tools \
         "${IMAGE}" models download --output-dir /models layout tableformer \
-        > "${RESULTS}/model_fetch.log" 2>&1
-    echo "[run] model fetch exit=$? log=${RESULTS}/model_fetch.log"
+        > "${RESULTS}/model_fetch.log" 2>&1 || FETCH_EXIT=$?
+    if [[ "${FETCH_EXIT}" != "0" ]]; then
+        echo "[run] FATAL: model fetch exit=${FETCH_EXIT}, no measurement taken; log=${RESULTS}/model_fetch.log" >&2
+        tail -20 "${RESULTS}/model_fetch.log" >&2 || true
+        exit 1
+    fi
+    echo "[run] model fetch ok, log=${RESULTS}/model_fetch.log"
     ls -1 "${MODEL_CACHE}" | sed 's/^/[run] artifacts: /'
 fi
 
@@ -131,68 +224,36 @@ if [[ -n "${CID}" ]]; then
         --format '{{if .State.OOMKilled}}true{{else}}false{{end}} {{.State.ExitCode}} {{.State.Error}}' "${CTR}")
     # Out-of-band cgroup peak from the host: survives even if the driver died
     # before it could print its line. Requires read permission on the cgroup.
-    for f in "/sys/fs/cgroup/docker/${CID}/memory.peak" \
-             "/sys/fs/cgroup/system.slice/docker-${CID}.scope/memory.peak"; do
-        [[ -r ${f} ]] && HOST_PEAK="$(cat "${f}")" && break
-    done
-    for f in "/sys/fs/cgroup/docker/${CID}/memory.swap.peak" \
-             "/sys/fs/cgroup/system.slice/docker-${CID}.scope/memory.swap.peak"; do
-        [[ -r ${f} ]] && HOST_SWAP_PEAK="$(cat "${f}")" && break
+    # Both leaves live in the same scope directory, so one probe walk covers
+    # memory and swap and an unreadable scope leaves both null.
+    for scope in "/sys/fs/cgroup/docker/${CID}" \
+                 "/sys/fs/cgroup/system.slice/docker-${CID}.scope"; do
+        if [[ -z "${HOST_PEAK}" && -r "${scope}/memory.peak" ]]; then
+            HOST_PEAK="$(cat "${scope}/memory.peak")"
+        fi
+        if [[ -z "${HOST_SWAP_PEAK}" && -r "${scope}/memory.swap.peak" ]]; then
+            HOST_SWAP_PEAK="$(cat "${scope}/memory.swap.peak")"
+        fi
+        if [[ -n "${HOST_PEAK}" && -n "${HOST_SWAP_PEAK}" ]]; then
+            break
+        fi
     done
 fi
 docker rm -f "${CTR}" >/dev/null 2>&1 || true
 
 grep -E '^\{"schema":"fin\.g4' "${RUN_DIR}/stdout.jsonl" >"${RUN_DIR}/${BASE}.raw.jsonl" || true
 N="$(wc -l <"${RUN_DIR}/${BASE}.raw.jsonl")"
+JSON_LINES="${N}"
 if [[ "${N}" != "1" ]]; then
     echo "[run] FAIL: expected exactly 1 JSON line on stdout, got ${N}" >&2
     echo "[run] docker_run_exit=${RUN_EXIT} container_exit=${STATE_EXIT} OOMKilled=${OOMKILLED} state_error=${STATE_ERR}" >&2
     echo "[run] last 40 stderr lines:" >&2
     tail -40 "${RUN_DIR}/stderr.log" >&2 || true
-    printf '{"pdf":"%s","docker_run_exit":%s,"container_exit":"%s","oom_killed":"%s","state_error":"%s","json_lines":%s,"host_cgroup_memory_peak_bytes":"%s"}\n' \
-        "${PDF_HOST}" "${RUN_EXIT}" "${STATE_EXIT}" "${OOMKILLED}" "${STATE_ERR}" "${N}" "${HOST_PEAK}" \
-        >"${RESULTS}/${BASE}_${STAMP}.meta.json"
+    emit_meta failed "" "${RESULTS}/${BASE}_${STAMP}.meta.json"
     exit 1
 fi
 
-python3 - "${RUN_DIR}/${BASE}.raw.jsonl" "${RUN_DIR}/${BASE}.measured.jsonl" \
-    "${RESULTS}/${BASE}_${STAMP}.jsonl" "${RESULTS}/${BASE}_${STAMP}.meta.json" \
-    "${OOMKILLED}" "${STATE_EXIT}" "${RUN_EXIT}" "${HOST_PEAK}" "${HOST_SWAP_PEAK}" \
-    "${CEIL_MEM}" "${CEIL_SWAP}" "${CEIL_CPUS}" <<'PY'
-import json, sys
-(raw, measured, jsonl_copy, meta, oom, cexit, rexit, hpeak, hswap, cmem, cswap, ccpus) = sys.argv[1:13]
-rec = json.loads(open(raw, encoding="utf-8").read().strip())
-oom_b = {"true": True, "false": False}.get(oom.lower())
-t = rec.setdefault("totals", {})
-t["oom_killed_docker_inspect"] = oom_b
-if oom_b is not None:
-    t["oom_killed"] = oom_b
-    t["oom_killed_source"] = "docker inspect .State.OOMKilled (cgroup counter kept alongside)"
-t["container_exit_code"] = int(cexit) if cexit.isdigit() else cexit
-t["docker_run_exit_code"] = int(rexit)
-t["host_side_cgroup_memory_peak_bytes"] = int(hpeak) if hpeak.isdigit() else None
-t["host_side_cgroup_memory_swap_peak_bytes"] = int(hswap) if hswap.isdigit() else None
-t["ceiling"] = {"memory": cmem, "memory_swap": cswap, "cpus": ccpus}
-line = json.dumps(rec, separators=(",", ":")) + "\n"
-open(measured, "w", encoding="utf-8").write(line)
-open(jsonl_copy, "w", encoding="utf-8").write(line)
-summary = {k: t.get(k) for k in (
-    "peak_rss_vmhwm_bytes", "cgroup_peak_bytes", "cgroup_memory_max_bytes",
-    "cgroup_memory_swap_max_bytes", "cgroup_memory_swap_current_bytes",
-    "proc_vmswap_bytes", "oom_kill_events_in_cgroup", "oom_killed",
-    "oom_killed_docker_inspect", "container_exit_code", "docker_run_exit_code",
-    "host_side_cgroup_memory_peak_bytes", "host_side_cgroup_memory_swap_peak_bytes",
-    "total_latency_ms", "render_and_ocr_latency_ms", "docling_whole_doc_latency_ms",
-    "page_latency_ms_stats", "regions_total", "pages_needing_ocr",
-    "pages_with_ocr_applied", "pages_with_native_text", "native_text_chars_total",
-    "ocr_text_chars_total", "docling_error", "docling_status", "docling_page_count", "slice_pass_error", "ceiling")}
-summary = {"pdf": rec["file"]["name"], "pdf_bytes": rec["file"]["bytes"],
-           "pdf_sha256": rec["file"]["sha256"], "page_count": rec["page_count"],
-           "measured_at_utc": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
-           **summary}
-open(meta, "w", encoding="utf-8").write(json.dumps(summary, indent=2) + "\n")
-print("[run] summary: " + json.dumps(summary, separators=(",", ":")))
-PY
+emit_meta measured "${RUN_DIR}/${BASE}.raw.jsonl" "${RESULTS}/${BASE}_${STAMP}.meta.json"
 
 echo "[run] measured JSON   : ${RUN_DIR}/${BASE}.measured.jsonl"
 echo "[run] page bitmaps    : ${RUN_DIR}/pages"

@@ -316,6 +316,8 @@ the numbers cannot drift from their evidence unnoticed:
 | 12 | `uv run --no-sync python scripts/g4_vision_probe.py --dotenv-start /home/winner/projects/fin --image scripts/g4_pipeline/results/g4-mixed-chart-001_20260925T174114Z/pages/page_0003.png --series "Total net sales" --mean 94186.5 --out data/corpus/g4_vision_probe_page.json` | 0 | 3 real calls on a pipeline-rendered filing page; `supports_image_input=true structured_output_ok=true usage_reported=true mean_answered=true` |
 | 13 | `uv run --no-sync python scripts/g4_vision_probe.py --dotenv-start /home/winner/projects/fin --image data/corpus/g4_attachment_gold/g4-image-chart-001.png --series "Total net sales" --mean 94186.5 --out data/corpus/g4_vision_probe_gold.json` | 0 | 3 real calls on the committed crop-shaped gold image; same three verdicts true |
 | 14 | `uv run --no-sync python scripts/g4_vision_probe.py --dotenv-start /home/winner/projects/fin` | 0 | 3 real calls on the drawn page, re-recorded under the current artifact contract; `supports_image_input=true structured_output_ok=true usage_reported=true mean_answered=true`, `image.bytes=37482` |
+| 15 | `scripts/g4_pipeline/run_measured.sh data/corpus/pdf/2023_FY_GOOG.pdf` | 0 | after the decomposition; `results/2023_FY_GOOG_20260925T195408Z*`, 186-key tree identical to `…T184410Z` (see *Splitting the harness without moving a field*) |
+| 16 | `scripts/g4_pipeline/run_measured.sh data/corpus/g4_attachment_gold/g4-image-chart-001.png` | 1 | the non-PDF rejection re-recorded under the unified meta schema; `results/g4-image-chart-001.png_20260925T195253Z.meta.json`, `json_lines=0`, unread fields `null` |
 
 Run 6 is the real-boundary check: it spawns the compiled iknow-memory stdio
 server (`/home/winner/projects/iknow-memory/dist/index.js`, built 2026-09-25)
@@ -443,6 +445,35 @@ arithmetic in the extrapolation section keeps using the larger reading available
 for a run, which for the 72-page file is `VmHWM + VmSwap`. Per-page latency is
 not comparable (6,074.1 ms against 3,571.1 ms) with the host at load 8.5 on four
 cores.
+
+### Splitting the harness without moving a field
+
+`driver.py` and `run_measured.sh` were then decomposed for complexity only —
+`main()` from 393 lines / CC 57 to 55 lines / CC 4, the three measurement passes
+into frozen dataclasses — with the emitted field names frozen as the contract.
+`run_measured.sh` folded its two `.meta.json` paths (measured and failed) into
+one `emit_meta` serializer, which made three duplicate names on one quantity
+visible: `docker_run_exit`, `container_exit`, and `host_cgroup_memory_peak_bytes`
+said the same thing as `docker_run_exit_code`, `container_exit_code`, and
+`host_side_cgroup_memory_peak_bytes`. The bare three are dropped, so
+`driver_keys` is the single source of meta field names.
+
+Two runs prove the split changed no measurement:
+
+* measured — `results/2023_FY_GOOG_20260925T195408Z*` (exit 0) against the
+  recorded `…T184410Z`: 186 keys, 0 missing, 0 extra, identical order, and every
+  contract field intact (`page_image_png_bytes = 31,454`, `regions_total`
+  `1 / 0 / 0`, `native_text_chars_total = 49`, `docling_status = SUCCESS`,
+  `rendered_dpi = null` with its named error). Only timings and peaks moved, and
+  this time the driver's `cgroup_peak_bytes` (1,125,564,416) fell back *below*
+  `VmHWM` (1,296,621,568) — the reversal of the single field that differed
+  before, which confirms the ordering caveat above rather than settling it.
+* failed — `results/g4-image-chart-001.png_20260925T195253Z.meta.json` (exit 1,
+  `json_lines = 0`) reproduces the non-PDF rejection under the unified schema,
+  with `null` where values were never read and typed `1` / `false` where the
+  harness did read them. It supersedes
+  `…g4-image-chart-001.png_20260925T174210Z.meta.json`, which predates the
+  unification and recorded `""` and `"false"` for the same failure.
 
 ## Not covered by this record
 

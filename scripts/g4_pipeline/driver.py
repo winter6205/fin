@@ -85,10 +85,36 @@ FPDF_PAGEOBJ_IMAGE: Final[int] = 3
 
 _PROC_STATUS_FIELDS: Final[tuple[str, ...]] = ("VmHWM", "VmRSS", "VmSwap", "VmPeak")
 
+# The three region kinds Docling's layout output is bucketed into; the record
+# names them in this order.
+REGION_KINDS: Final[tuple[str, ...]] = ("text", "table", "figure")
+
 
 def log(msg: str) -> None:
     """Diagnostics on stderr only - stdout carries exactly one JSON line."""
     print(msg, file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------
+# failure recording: a measurement that did not happen is never a zero
+# --------------------------------------------------------------------------
+def error_text(exc: BaseException, *, prefix: str = "") -> str:
+    """The one spelling of a failed reading: ``<Type>: <message>``."""
+    return f"{prefix}{type(exc).__name__}: {exc}"
+
+
+def record_unmeasured(
+    entry: dict[str, object], key: str, exc: BaseException, *, prefix: str = ""
+) -> str:
+    """Write ``{key: None, f"{key}_error": <Type>: <msg>}`` for one failed value.
+
+    The reason is returned so a sink outside ``entry`` - a log line, the totals
+    block - carries exactly the same text as the field.
+    """
+    reason = error_text(exc, prefix=prefix)
+    entry[key] = None
+    entry[f"{key}_error"] = reason
+    return reason
 
 
 # --------------------------------------------------------------------------
@@ -122,7 +148,7 @@ def _read_proc_status_fields(
                     )  # EXIT: text that is not a number is a failed read, not a zero
     except OSError as exc:
         errors.append(
-            f"/proc/self/status: {type(exc).__name__}: {exc}"
+            error_text(exc, prefix="/proc/self/status: ")
         )  # EXIT: no /proc means no process peak, named rather than guessed
         log(f"[mem] cannot read /proc/self/status: {exc}")
     return values, errors
@@ -142,7 +168,7 @@ def _read_cgroup_int(
     except OSError as exc:
         return (
             None,
-            f"{name}: {type(exc).__name__}: {exc}",
+            error_text(exc, prefix=f"{name}: "),
         )  # EXIT: an absent cgroup file is a gap, never a zero
     if raw == CGROUP_NO_LIMIT_TEXT:
         if allow_unlimited:
@@ -239,7 +265,7 @@ def memory_snapshot(tag: str) -> MemorySnapshot:
             body = (CGROUP_DIR / ev).read_text(encoding="utf-8")
         except OSError as exc:
             errors.append(
-                f"{ev}: {type(exc).__name__}: {exc}"
+                error_text(exc, prefix=f"{ev}: ")
             )  # EXIT: an absent events file is a gap in the OOM evidence
             continue
         for line in body.splitlines():
@@ -287,6 +313,8 @@ def resolved_versions() -> dict[str, object]:
         try:
             out[pkg] = metadata.version(pkg)
         except metadata.PackageNotFoundError:
+            # EXIT: a distribution the image cannot introspect is no version, so
+            # the pin record says null rather than a guessed or echoed one
             out[pkg] = None
     import torch
 
@@ -355,8 +383,13 @@ def _image_object_type() -> tuple[int, str | None]:
     except Exception as exc:
         return (
             FPDF_PAGEOBJ_IMAGE,
-            f"pypdfium2.raw unreadable, image kind assumed to be "
-            f"{FPDF_PAGEOBJ_IMAGE}: {type(exc).__name__}: {exc}",
+            error_text(
+                exc,
+                prefix=(
+                    "pypdfium2.raw unreadable, image kind assumed to be "
+                    f"{FPDF_PAGEOBJ_IMAGE}: "
+                ),
+            ),
         )  # EXIT: a pinned constant, but the record must say it was not measured
 
 
@@ -399,8 +432,7 @@ def _page_image_objects(page: Any, img_type: int) -> tuple[int | None, str | Non
         except Exception as retry_exc:
             return (
                 None,
-                f"type scan after {type(exc).__name__}: {exc}; "
-                f"{type(retry_exc).__name__}: {retry_exc}",
+                error_text(exc, prefix="type scan after ") + "; " + error_text(retry_exc),
             )  # EXIT: no count at all, so nothing is recorded as zero images
         if unreadable:
             return (
@@ -411,8 +443,15 @@ def _page_image_objects(page: Any, img_type: int) -> tuple[int | None, str | Non
     except Exception as exc:
         return (
             None,
-            f"{type(exc).__name__}: {exc}",
+            error_text(exc),
         )  # EXIT: an unreadable object list is a gap, not a zero
+
+
+def _png_path(page_no: int, image_dir: Path | None) -> Path:
+    """Kept page bitmap path, or a per-process temp path when nothing is kept."""
+    if image_dir is not None:
+        return image_dir / f"page_{page_no:04d}.png"
+    return Path(f"/tmp/g4_page_{os.getpid()}_{page_no:04d}.png")
 
 
 def _apply_page_ocr(
@@ -429,11 +468,7 @@ def _apply_page_ocr(
     ``image_dir`` persists the PNG so the vision payload is measured; ``None``
     means a temp file removed after the call.
     """
-    png_path = (
-        image_dir / f"page_{page_no:04d}.png"
-        if image_dir is not None
-        else Path(f"/tmp/g4_page_{os.getpid()}_{page_no:04d}.png")
-    )
+    png_path = _png_path(page_no, image_dir)
     entry["ocr_trigger"] = ocr_trigger
     pil.save(png_path, format="PNG")
     try:
@@ -441,7 +476,7 @@ def _apply_page_ocr(
     except Exception as exc:  # fin.corpus.ocr's typed OcrRequiredUnavailableError
         entry["ocr_error_code"] = getattr(exc, "code", type(exc).__name__)
         entry["ocr_error"] = (
-            f"{type(exc).__name__}: {exc}"  # EXIT: a code alone would hide why the page has no text
+            error_text(exc)  # EXIT: a code alone would hide why the page has no text
         )
         entry["ocr_used"] = False
     else:
@@ -457,12 +492,144 @@ def _apply_page_ocr(
                 png_path.unlink(missing_ok=True)
             except OSError as exc:
                 failures.append(
-                    f"page {page_no}: temp PNG {png_path.name} not removed: "
-                    f"{type(exc).__name__}: {exc}"
+                    error_text(
+                        exc,
+                        prefix=f"page {page_no}: temp PNG {png_path.name} not removed: ",
+                    )
                 )  # EXIT: a leaked bitmap is not a gap in a number, but not invisible either
     if image_dir is not None:
         entry["page_image_png_bytes"] = png_path.stat().st_size
         entry["page_image_png_sha256"] = sha256_bytes(png_path)[1]
+
+
+@dataclass(frozen=True, slots=True)
+class RenderPass:
+    """One entry per physical page, plus the render window that produced them."""
+
+    pages: list[dict[str, object]]
+    latency_ms: float
+
+
+def _page_structure_entry(
+    page: Any, page_no: int, img_type: int, detect_ocr_required: Any
+) -> dict[str, object]:
+    """What the page itself says, before any bitmap is produced."""
+    width_pt, height_pt = page.get_size()
+    textpage = page.get_textpage()
+    native_text = textpage.get_text_range() or ""
+    n_images, images_error = _page_image_objects(page, img_type)
+    if images_error is not None:
+        log(f"[driver] page {page_no} object scan failed: {images_error}")
+    return {
+        "page_no": page_no,
+        "size_pt": [round(float(width_pt), 2), round(float(height_pt), 2)],
+        "native_text_char_count": len(native_text),
+        "native_text_codepoints": len(native_text),
+        "pdf_image_objects": n_images,
+        "pdf_image_objects_error": images_error,
+        # The rule's own "no image reference" input is 0, so a failed scan
+        # is readable only through pdf_image_objects_error.
+        "ocr_required_by_repo_rule": bool(
+            detect_ocr_required(
+                text=native_text,
+                image_count=n_images if n_images is not None else 0,
+                min_text_chars=1,
+            )
+        ),
+        "ocr_used": False,
+        "ocr_trigger": None,
+        "ocr_lang": None,
+        "ocr_text_char_count": 0,
+        "ocr_text_sample": None,
+        "ocr_error_code": None,
+        "ocr_error": None,
+    }
+
+
+def _apply_render_geometry(
+    page: Any, entry: dict[str, object], dpi: int
+) -> tuple[Any, Any]:
+    """Full-page bitmap at the requested scale; the caller drops it after OCR."""
+    bitmap = page.render(scale=dpi / 72.0)
+    pil = bitmap.to_pil()
+    entry["rendered_width_px"] = int(pil.width)
+    entry["rendered_height_px"] = int(pil.height)
+    try:
+        dpi_x, dpi_y = bitmap.get_dpi()
+        entry["rendered_dpi"] = [round(float(dpi_x), 1), round(float(dpi_y), 1)]
+    except Exception as exc:
+        record_unmeasured(
+            entry, "rendered_dpi", exc
+        )  # EXIT: the requested DPI is not a measured one
+    return bitmap, pil
+
+
+def _ocr_trigger(entry: dict[str, object], force_ocr: bool) -> str | None:
+    """Which rule asked for CPU Tesseract on this page, if any.
+
+    ``forced_selftest`` exercises the OCR boundary on a page the repo rule would
+    not select, so "the OCR path is live" is observed rather than assumed. It is
+    never used to decide coverage in a measured run.
+    """
+    if entry["ocr_required_by_repo_rule"]:
+        return "repo_rule"  # EXIT: the frozen rule selected OCR for this page
+    if force_ocr:
+        return "forced_selftest"
+    return None  # EXIT: no rule asked, so no OCR cost is charged to this page
+
+
+def _save_page_png(entry: dict[str, object], pil: Any, png_path: Path) -> None:
+    """Persist a bitmap no OCR call consumed, so its size is measured, not assumed."""
+    pil.save(png_path, format="PNG")
+    entry["page_image_png_bytes"] = png_path.stat().st_size
+
+
+def prepare_image_dir(image_dir: Path | None, failures: list[str]) -> Path | None:
+    """Create the bitmap directory, or switch the PNG measurement off by name."""
+    if image_dir is None:
+        return None  # EXIT: no --write-images, so no page carries PNG bytes at all
+    try:
+        image_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log(f"[driver] cannot write images to {image_dir}: {exc}")
+        failures.append(
+            error_text(exc, prefix=f"--write-images off: cannot create {image_dir}: ")
+        )  # EXIT: page bitmaps then carry no byte measurement at all
+        return None
+    return image_dir
+
+
+def render_pages(
+    *, started_at: float, pdf_doc: Any, page_count: int, dpi: int, force_ocr: bool,
+    image_dir: Path | None, ocr_engine: Any, detect_ocr_required: Any, failures: list[str],
+) -> RenderPass:
+    """Render every physical page and run the repo-gated OCR step on those it selects.
+
+    ``started_at`` is when the document was opened, not when this was called: the
+    render window the record reports includes the file's own parse.
+    """
+    img_type, img_type_error = _image_object_type()
+    if img_type_error is not None:
+        failures.append(img_type_error)
+    image_dir = prepare_image_dir(image_dir, failures)
+
+    pages: list[dict[str, object]] = []
+    for idx in range(page_count):
+        page_no = idx + 1
+        pt0 = time.monotonic()
+        page = pdf_doc[idx]
+        entry = _page_structure_entry(page, page_no, img_type, detect_ocr_required)
+        bitmap, pil = _apply_render_geometry(page, entry, dpi)
+        trigger = _ocr_trigger(entry, force_ocr)
+        if trigger is not None:
+            _apply_page_ocr(entry, pil, page_no, ocr_engine, trigger, image_dir, failures)
+        elif image_dir is not None:
+            _save_page_png(entry, pil, _png_path(page_no, image_dir))
+        del pil, bitmap
+        entry["render_latency_ms"] = round((time.monotonic() - pt0) * 1000.0, 1)
+        pages.append(entry)
+
+    return RenderPass(pages=pages, latency_ms=(time.monotonic() - started_at) * 1000.0)
 
 
 # --------------------------------------------------------------------------
@@ -485,7 +652,7 @@ def build_converter(artifacts_path: Path, layout_preset: str, threads: int):
     except Exception as exc:
         # The default LayoutObjectDetectionOptions is already the Heron spec;
         # fall back to it but record that the explicit preset call failed.
-        layout_note = f"from_preset failed ({type(exc).__name__}: {exc}); default"
+        layout_note = f"from_preset failed ({error_text(exc)}); default"
         layout_options = LayoutObjectDetectionOptions()
         # EXIT: the built pipeline is still Heron, but the record says the
         # preset was not what selected it
@@ -594,8 +761,361 @@ def region_counts_from_document(doc) -> dict[int, dict[str, object]]:
     return per_page
 
 
+@dataclass(frozen=True, slots=True)
+class DoclingPass:
+    """The whole-document pass, the record's only source of regions.
+
+    ``error`` set means nothing here was measured: ``status`` / ``page_count``
+    are null and the region fields go null, never zero.
+    """
+
+    latency_ms: float
+    status: str | None
+    page_count: int | None
+    error: str | None
+    regions: dict[int, dict[str, object]]
+    page_sizes_pt: dict[int, list[float]]
+
+    @property
+    def regions_measured(self) -> bool:
+        """Docling's export is the region authority, so its failure is load-bearing."""
+        return self.error is None
+
+    def to_totals(self) -> dict[str, object]:
+        """The totals fields this pass owns, named as the committed lines name them."""
+        return {
+            "docling_whole_doc_latency_ms": round(self.latency_ms, 1),
+            "docling_status": self.status,
+            "docling_page_count": self.page_count,
+            "docling_error": self.error,
+        }
+
+
+def docling_page_sizes(doc: Any) -> dict[int, list[float]]:
+    """Docling's own per-page size in points, keyed by physical page number."""
+    sizes: dict[int, list[float]] = {}
+    for p in getattr(doc, "pages", []) or []:
+        no = getattr(p, "number", None)
+        size = getattr(p, "size", None)
+        if no is not None and size is not None:
+            sizes[int(no)] = [round(float(size.width), 2), round(float(size.height), 2)]
+    return sizes
+
+
+def run_docling_pass(
+    conv: Any, pdf_path: Path, checkpoints: list[MemorySnapshot]
+) -> DoclingPass:
+    """Convert the whole document once with the pinned pipeline and take its regions."""
+    t_full = time.monotonic()
+    status: str | None = None
+    doc_page_count: int | None = None
+    error: str | None = None
+    regions: dict[int, dict[str, object]] = {}
+    sizes: dict[int, list[float]] = {}
+    try:
+        res = conv.convert(str(pdf_path))
+        status = str(getattr(res, "status", None))
+        doc = res.document
+        doc_page_count = len(getattr(doc, "pages", []) or [])
+        regions = region_counts_from_document(doc)
+        sizes = docling_page_sizes(doc)
+    except Exception as exc:
+        error = error_text(exc)
+        log(f"[driver] Docling whole-document pass failed: {error}")
+        # EXIT: this pass is the only region source, so regions go null below
+    latency_ms = (time.monotonic() - t_full) * 1000.0
+    checkpoints.append(memory_snapshot("after_docling_whole_doc"))
+    return DoclingPass(
+        latency_ms=latency_ms,
+        status=status,
+        page_count=doc_page_count,
+        error=error,
+        regions=regions,
+        page_sizes_pt=sizes,
+    )
+
+
+def attach_regions(pages: list[dict[str, object]], docling: DoclingPass) -> None:
+    """Give every physical page its Docling regions, or name why there are none."""
+    measured = docling.regions_measured
+    for entry in pages:
+        page_no = int(entry["page_no"])
+        reg = docling.regions.get(page_no, {})
+        entry["region_counts"] = {
+            kind: (int(reg.get(kind, 0)) if measured else None) for kind in REGION_KINDS
+        }  # EXIT: on a measured page an absent bucket really is zero
+        entry["table_boxes"] = reg.get("table_boxes", []) if measured else None
+        entry["figure_boxes"] = reg.get("figure_boxes", []) if measured else None
+        entry["docling_page_size_pt"] = docling.page_sizes_pt.get(page_no)
+
+
 # --------------------------------------------------------------------------
-def main() -> int:
+# per-page latency pass (single-page conversions on the warm pipeline)
+# --------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class SlicePass:
+    """Warm steady-state per-page cost, plus the reason the pass stopped early."""
+
+    enabled: bool
+    error: str | None
+    latencies_ms: list[float]
+
+    def to_totals(self) -> dict[str, object]:
+        return {"slice_pass_enabled": self.enabled, "slice_pass_error": self.error}
+
+
+def _discard_slice_doc(one: Any, page_no: int, failures: list[str]) -> None:
+    """Close a slice document now; gc would hold one handle per page under the ceiling."""
+    try:
+        one.close()
+    except Exception as exc:
+        failures.append(
+            error_text(exc, prefix=f"slice page {page_no}: document close failed: ")
+        )  # EXIT: a handle left open would inflate the next peak
+
+
+def _discard_slice_pdf(tmp_pdf: Path, page_no: int, failures: list[str]) -> None:
+    """Remove one slice file; a slice left on disk is a cost, not a measurement."""
+    try:
+        tmp_pdf.unlink(missing_ok=True)
+    except OSError as exc:
+        failures.append(
+            error_text(exc, prefix=f"slice page {page_no}: temp PDF not removed: ")
+        )  # EXIT: a slice left on disk is a cost, not a measurement
+
+
+def _slice_one_page(
+    pdfium_mod: Any, pdf_doc: Any, conv: Any, idx: int, page_no: int, failures: list[str],
+) -> float:
+    """Convert one physical page alone and return the measured milliseconds."""
+    tmp_pdf = Path(f"/tmp/g4_slice_{os.getpid()}_{page_no:04d}.pdf")
+    one = None
+    t_pg = time.monotonic()
+    try:
+        one = pdfium_mod.PdfDocument.new()
+        one.import_pages(pdf_doc, pages=[idx])
+        one.save(str(tmp_pdf))
+        conv.convert(str(tmp_pdf))
+        return (time.monotonic() - t_pg) * 1000.0
+    finally:
+        if one is not None:
+            _discard_slice_doc(one, page_no, failures)
+            # Dropped here rather than left to the next rebinding: a document
+            # that outlives its own iteration holds pages inside the 4 GiB ceiling.
+            del one
+        _discard_slice_pdf(tmp_pdf, page_no, failures)
+
+
+def _stop_slice_pass(
+    pages: list[dict[str, object]], idx: int, page_no: int, exc: BaseException,
+) -> str:
+    """Null the page that failed and name every later page as unmeasured."""
+    pages[idx]["page_latency_ms"] = None
+    pages[idx]["page_latency_mode"] = "single_page_slice_failed"
+    for rest in pages[idx + 1 :]:
+        rest["page_latency_ms"] = None
+        rest["page_latency_mode"] = "not_measured_after_slice_failure"
+    # EXIT: pages after the stop are named as unmeasured instead of leaving their
+    # keys out, so a short n in the stats is not a silent shrink of the document
+    return error_text(exc, prefix=f"page {page_no}: ")
+
+
+def run_slice_pass(
+    *, pdfium_mod: Any, pdf_doc: Any, conv: Any, pages: list[dict[str, object]],
+    page_count: int, checkpoints: list[MemorySnapshot], failures: list[str],
+    enabled: bool,
+) -> SlicePass:
+    """Time every page through a single-page conversion, until one of them fails."""
+    if not enabled:
+        # No per-page number available without measurement: stay explicit.
+        for entry in pages:
+            entry["page_latency_ms"] = None
+            entry["page_latency_mode"] = "not_measured"
+        return SlicePass(enabled=False, error=None, latencies_ms=[])
+
+    latencies: list[float] = []
+    error: str | None = None
+    for idx in range(page_count):
+        page_no = idx + 1
+        try:
+            ms = _slice_one_page(pdfium_mod, pdf_doc, conv, idx, page_no, failures)
+        except Exception as exc:
+            error = _stop_slice_pass(pages, idx, page_no, exc)
+            log(f"[driver] slice pass page {page_no} failed: {error}")
+            break
+        pages[idx]["page_latency_ms"] = round(ms, 1)
+        pages[idx]["page_latency_mode"] = "single_page_slice"
+        latencies.append(ms)
+        if idx % 10 == 9:
+            checkpoints.append(memory_snapshot(f"slice_pass_page_{page_no}"))
+    return SlicePass(enabled=True, error=error, latencies_ms=latencies)
+
+
+# --------------------------------------------------------------------------
+# the record: one JSON line, keyed as the committed measurements are
+# --------------------------------------------------------------------------
+def page_limit_exceeded(max_pages: int | None, page_count: int) -> bool:
+    """``--max-pages`` is a harness valve: over-limit is reported, never cut.
+
+    Mirrors fin's ``attachment_page_limit_exceeded`` shape rather than truncating.
+    """
+    return max_pages is not None and page_count > max_pages
+
+
+def _p95(values: list[float]) -> float | None:
+    """Quantiles need 20 samples; below that the observed maximum is reported."""
+    if not values:
+        return None  # EXIT: no measured page means no percentile, not a zero
+    if len(values) >= 20:
+        return round(statistics.quantiles(values, n=20)[-1], 1)
+    return round(max(values), 1)
+
+
+def page_latency_stats(pages: list[dict[str, object]]) -> dict[str, object]:
+    """Distribution over the pages that measured a per-page latency at all."""
+    values = [
+        x for x in (p.get("page_latency_ms") for p in pages) if isinstance(x, (int, float))
+    ]
+    return {
+        "n": len(values),
+        "note": "single-page conversions on an already-initialised "
+        "pipeline (DocumentConverter caches the initialised "
+        "StandardPdfPipeline), i.e. warm steady-state per-page cost",
+        "mean": round(statistics.fmean(values), 1) if values else None,
+        "median": round(statistics.median(values), 1) if values else None,
+        "p95": _p95(values),
+        "max": round(max(values), 1) if values else None,
+    }
+
+
+def regions_total(pages: list[dict[str, object]], measured: bool) -> dict[str, object]:
+    """Region totals per kind, or all-null when the only region source failed."""
+    if not measured:
+        # EXIT: no sum over an unmeasured pass, so a null is never a zero
+        return {kind: None for kind in REGION_KINDS}
+    return {
+        kind: sum(int(p["region_counts"][kind]) for p in pages) for kind in REGION_KINDS
+    }
+
+
+def page_rule_counts(pages: list[dict[str, object]]) -> dict[str, object]:
+    """How many pages the rule selected, and how much text the passes produced."""
+    return {
+        "pages_needing_ocr": sum(1 for p in pages if p["ocr_required_by_repo_rule"]),
+        "pages_with_ocr_applied": sum(1 for p in pages if p["ocr_used"]),
+        "pages_with_native_text": sum(1 for p in pages if p["native_text_char_count"] > 0),
+        "native_text_chars_total": sum(p["native_text_char_count"] for p in pages),
+        "ocr_text_chars_total": sum(p["ocr_text_char_count"] for p in pages),
+    }
+
+
+def peak_fields(samples: list[MemorySnapshot]) -> dict[str, object]:
+    """Peaks over every snapshot taken during the run.
+
+    A failed read is None and drops out of the max; a limit file's "no limit"
+    reading is CGROUP_NO_LIMIT_BYTES and must never enter this max at all.
+    """
+    vmhwm = [c.proc_vmhwm_bytes for c in samples if c.proc_vmhwm_bytes]
+    cgroup = [
+        c.cgroup_memory_peak_bytes for c in samples if (c.cgroup_memory_peak_bytes or 0) > 0
+    ]
+    return {
+        "peak_rss_vmhwm_bytes": max(vmhwm, default=0),
+        "cgroup_peak_bytes": max(cgroup, default=0),
+    }
+
+
+def oom_fields(samples: list[MemorySnapshot]) -> dict[str, object]:
+    """The OOM signal, taken from the cgroup counter alone."""
+    events = [
+        int(v)
+        for c in samples
+        for k, v in c.events.items()
+        if k.startswith("memory.events") and k.endswith("oom_kill")
+    ]
+    peak = max(events, default=0)
+    return {"oom_kill_events_in_cgroup": peak, "oom_killed": bool(peak > 0)}
+
+
+def build_totals(
+    *, render: RenderPass, docling: DoclingPass, slice_pass: SlicePass,
+    checkpoints: list[MemorySnapshot], final: MemorySnapshot,
+    harness_failures: list[str],
+) -> dict[str, object]:
+    """The record's totals block: what was measured, plus what failed to be."""
+    pages = render.pages
+    samples = checkpoints + [final]
+    return {
+        "render_and_ocr_latency_ms": round(render.latency_ms, 1),
+        **docling.to_totals(),
+        **slice_pass.to_totals(),
+        "total_latency_ms": round(
+            render.latency_ms + docling.latency_ms + sum(slice_pass.latencies_ms), 1
+        ),
+        "page_latency_ms_stats": page_latency_stats(pages),
+        "regions_total": regions_total(pages, docling.regions_measured),
+        **page_rule_counts(pages),
+        **peak_fields(samples),
+        "cgroup_memory_max_bytes": final.cgroup_memory_max_bytes,
+        "cgroup_memory_swap_max_bytes": final.cgroup_memory_swap_max_bytes,
+        "cgroup_memory_swap_current_bytes": final.cgroup_memory_swap_current_bytes,
+        "proc_vmswap_bytes": final.proc_vmswap_bytes,
+        **oom_fields(samples),
+        "oom_killed_source": "cgroup memory.events oom_kill counter",
+        "harness_failures": harness_failures,
+        "memory_checkpoints": [c.to_record() for c in samples],
+    }
+
+
+def build_record(
+    *, pdf_path: Path, artifacts_path: Path, requested_dpi: int, max_pages: int | None,
+    file_bytes: int, file_sha256: str, page_count: int, render: RenderPass,
+    docling: DoclingPass, slice_pass: SlicePass, checkpoints: list[MemorySnapshot],
+    final: MemorySnapshot, harness_failures: list[str],
+    pipeline_identity: dict[str, object], tesseract_lang: str,
+) -> dict[str, object]:
+    """Assemble the whole measurement line the harness contract emits."""
+    return {
+        "schema": "fin.g4.t2a.pipeline_measurement/1",
+        "file": {
+            "path": str(pdf_path),
+            "name": pdf_path.name,
+            "bytes": file_bytes,
+            "sha256": file_sha256,
+        },
+        "page_count": page_count,
+        "requested_dpi": requested_dpi,
+        "max_pages": max_pages,
+        "page_limit_exceeded": page_limit_exceeded(max_pages, page_count),
+        "pages": render.pages,
+        "totals": build_totals(
+            render=render, docling=docling, slice_pass=slice_pass,
+            checkpoints=checkpoints, final=final, harness_failures=harness_failures,
+        ),
+        "pin_manifest": resolved_versions(),
+        "pipeline_identity": pipeline_identity,
+        "docling_builtin_limits": docling_builtin_limits(),
+        "heron_artifact": {**artifact_identity(artifacts_path), **pipeline_identity},
+        "repo_rule_provenance": {
+            "ocr_decision": "fin.corpus.ocr.detect_ocr_required(min_text_chars=1)",
+            "ocr_engine": "fin.corpus.ocr.TesseractEngine",
+            "tesseract_lang_default": tesseract_lang,
+            "page_unit_rule": "one frozen unit per physical page (fin.corpus.parsers._pdf)",
+        },
+    }
+
+
+def emit(record: dict[str, object]) -> None:
+    """Exactly one machine-readable JSON line on stdout; diagnostics stay on stderr."""
+    sys.stdout.write(json.dumps(record, separators=(",", ":"), ensure_ascii=True) + "\n")
+    sys.stdout.flush()
+
+
+# --------------------------------------------------------------------------
+# CLI / phase wiring
+# --------------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    """The driver's CLI: the PDF under test plus the harness safety valves."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--pdf", required=True, type=Path)
     ap.add_argument("--dpi", type=int, default=200)
@@ -641,352 +1161,83 @@ def main() -> int:
         help="per-page latency from single-page conversions (Docling's own "
         "whole-document latency is always measured too)",
     )
-    args = ap.parse_args()
+    return ap.parse_args()
 
-    pdf_path: Path = args.pdf
-    if not pdf_path.is_file():
-        log(f"[driver] no such PDF: {pdf_path}")
-        return 2  # EXIT: nothing was measured, so no line is printed at all
 
-    # The repo's OCR rule and language string, imported from the read-only
-    # mount. Hard failure if absent: a locally re-implemented rule would stop
-    # being a measurement of fin.
-    sys.path.insert(0, str(args.fin_src))
+def load_repo_ocr(fin_src: Path) -> tuple[Any, Any, str]:
+    """fin.corpus.ocr's rule, engine and language string, read off the mount.
+
+    Hard failure if absent: a locally re-implemented rule would stop being a
+    measurement of fin.
+    """
+    sys.path.insert(0, str(fin_src))
     from fin.corpus.ocr import (  # noqa: E402
         DEFAULT_TESSERACT_LANG,
         TesseractEngine,
         detect_ocr_required,
     )
+
+    return (
+        detect_ocr_required,
+        TesseractEngine(lang=DEFAULT_TESSERACT_LANG),
+        DEFAULT_TESSERACT_LANG,
+    )
+
+
+def main() -> int:
+    args = parse_args()
+    pdf_path: Path = args.pdf
+    if not pdf_path.is_file():
+        log(f"[driver] no such PDF: {pdf_path}")
+        return 2  # EXIT: nothing was measured, so no line is printed at all
+
+    detect_ocr_required, ocr_engine, tesseract_lang = load_repo_ocr(args.fin_src)
     import pypdfium2 as pdfium  # noqa: E402
 
     checkpoints: list[MemorySnapshot] = [memory_snapshot("start")]
     harness_failures: list[str] = []
     file_bytes, file_sha256 = sha256_bytes(pdf_path)
 
-    # ---------------------------------------------------------------- render
-    t0 = time.monotonic()
+    started_at = time.monotonic()
     pdf_doc = pdfium.PdfDocument(str(pdf_path))
     page_count = len(pdf_doc)
-    img_type, img_type_error = _image_object_type()
-    if img_type_error is not None:
-        harness_failures.append(img_type_error)
-    pages: list[dict[str, object]] = []
-    ocr_engine = TesseractEngine(lang=DEFAULT_TESSERACT_LANG)
-    image_dir: Path | None = args.image_dir if args.write_images else None
-    if image_dir is not None:
-        try:
-            image_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            log(f"[driver] cannot write images to {image_dir}: {exc}")
-            harness_failures.append(
-                f"--write-images off: cannot create {image_dir}: "
-                f"{type(exc).__name__}: {exc}"
-            )  # EXIT: page bitmaps then carry no byte measurement at all
-            image_dir = None
-
-    for idx in range(page_count):
-        page_no = idx + 1
-        pt0 = time.monotonic()
-        page = pdf_doc[idx]
-        width_pt, height_pt = page.get_size()
-        textpage = page.get_textpage()
-        native_text = textpage.get_text_range() or ""
-        n_images, images_error = _page_image_objects(page, img_type)
-        if images_error is not None:
-            log(f"[driver] page {page_no} object scan failed: {images_error}")
-
-        entry: dict[str, object] = {
-            "page_no": page_no,
-            "size_pt": [round(float(width_pt), 2), round(float(height_pt), 2)],
-            "native_text_char_count": len(native_text),
-            "native_text_codepoints": len(native_text),
-            "pdf_image_objects": n_images,
-            "pdf_image_objects_error": images_error,
-            # The rule's own "no image reference" input is 0, so a failed scan
-            # is readable only through pdf_image_objects_error.
-            "ocr_required_by_repo_rule": bool(
-                detect_ocr_required(
-                    text=native_text,
-                    image_count=n_images if n_images is not None else 0,
-                    min_text_chars=1,
-                )
-            ),
-            "ocr_used": False,
-            "ocr_trigger": None,
-            "ocr_lang": None,
-            "ocr_text_char_count": 0,
-            "ocr_text_sample": None,
-            "ocr_error_code": None,
-            "ocr_error": None,
-        }
-
-        bitmap = page.render(scale=args.dpi / 72.0)
-        pil = bitmap.to_pil()
-        entry["rendered_width_px"] = int(pil.width)
-        entry["rendered_height_px"] = int(pil.height)
-        try:
-            dpi_x, dpi_y = bitmap.get_dpi()
-            entry["rendered_dpi"] = [round(float(dpi_x), 1), round(float(dpi_y), 1)]
-        except Exception as exc:
-            entry["rendered_dpi"] = None
-            entry["rendered_dpi_error"] = (
-                f"{type(exc).__name__}: {exc}"  # EXIT: the requested DPI is not a measured one
-            )
-
-        ocr_trigger = "repo_rule" if entry["ocr_required_by_repo_rule"] else None
-        if args.force_ocr and ocr_trigger is None:
-            # Harness self-check only: exercises the CPU Tesseract boundary on a
-            # page the repo rule would not select, so "OCR path is live" is
-            # observed rather than assumed even when every committed PDF has a
-            # text layer. Never used to decide coverage in a measured run.
-            ocr_trigger = "forced_selftest"
-        if ocr_trigger is not None:
-            _apply_page_ocr(
-                entry,
-                pil,
-                page_no,
-                ocr_engine,
-                ocr_trigger,
-                image_dir,
-                harness_failures,
-            )
-        elif image_dir is not None:
-            png_path = image_dir / f"page_{page_no:04d}.png"
-            pil.save(png_path, format="PNG")
-            entry["page_image_png_bytes"] = png_path.stat().st_size
-
-        del pil, bitmap
-        entry["render_latency_ms"] = round((time.monotonic() - pt0) * 1000.0, 1)
-        pages.append(entry)
-
-    render_ms = (time.monotonic() - t0) * 1000.0
+    render = render_pages(
+        started_at=started_at, pdf_doc=pdf_doc, page_count=page_count, dpi=args.dpi,
+        force_ocr=args.force_ocr, image_dir=args.image_dir if args.write_images else None,
+        ocr_engine=ocr_engine, detect_ocr_required=detect_ocr_required,
+        failures=harness_failures,
+    )
     checkpoints.append(memory_snapshot("after_render_and_ocr"))
 
-    if args.max_pages is not None and page_count > args.max_pages:
-        # attachment_page_limit_exceeded shape: reported, never silently cut.
+    if page_limit_exceeded(args.max_pages, page_count):
         log(f"[driver] page limit exceeded: {page_count} > {args.max_pages}")
 
-    # ------------------------------------------------------- Docling + Heron
     conv, pipeline_identity = build_converter(
         args.artifacts, args.layout_preset, args.threads
     )
     checkpoints.append(memory_snapshot("after_converter_init"))
 
-    t_full = time.monotonic()
-    full_error = None
-    docling_status = None
-    docling_page_count = None
-    regions: dict[int, dict[str, object]] = {}
-    doc_page_sizes: dict[int, list[float]] = {}
-    res = None
-    try:
-        res = conv.convert(str(pdf_path))
-        docling_status = str(getattr(res, "status", None))
-        doc = res.document
-        docling_page_count = len(getattr(doc, "pages", []) or [])
-        regions = region_counts_from_document(doc)
-        for p in getattr(doc, "pages", []) or []:
-            no = getattr(p, "number", None)
-            size = getattr(p, "size", None)
-            if no is not None and size is not None:
-                doc_page_sizes[int(no)] = [
-                    round(float(size.width), 2),
-                    round(float(size.height), 2),
-                ]
-    except Exception as exc:
-        full_error = f"{type(exc).__name__}: {exc}"
-        log(f"[driver] Docling whole-document pass failed: {full_error}")
-        # EXIT: this pass is the only region source, so regions go None below
-    full_doc_ms = (time.monotonic() - t_full) * 1000.0
-    checkpoints.append(memory_snapshot("after_docling_whole_doc"))
+    docling = run_docling_pass(conv, pdf_path, checkpoints)
+    attach_regions(render.pages, docling)
 
-    # Docling's export is the authority for region boxes, and a pass that blew
-    # up measured no regions at all, which is not the same fact as zero regions.
-    regions_measured = full_error is None
-    for entry in pages:
-        reg = regions.get(int(entry["page_no"]), {})
-        entry["region_counts"] = {
-            kind: (int(reg.get(kind, 0)) if regions_measured else None)
-            for kind in ("text", "table", "figure")
-        }  # EXIT: on a measured page an absent bucket really is zero
-        entry["table_boxes"] = reg.get("table_boxes", []) if regions_measured else None
-        entry["figure_boxes"] = (
-            reg.get("figure_boxes", []) if regions_measured else None
-        )
-        entry["docling_page_size_pt"] = doc_page_sizes.get(int(entry["page_no"]))
-
-    # ------------------------------------------------- per-page latency pass
-    slice_mode = False
-    slice_error = None
-    per_page_ms: list[float] = []
-    if args.slice_pass:
-        slice_mode = True
-        for idx in range(page_count):
-            page_no = idx + 1
-            one = None
-            tmp_pdf = Path(f"/tmp/g4_slice_{os.getpid()}_{page_no:04d}.pdf")
-            t_pg = time.monotonic()
-            try:
-                one = pdfium.PdfDocument.new()
-                one.import_pages(pdf_doc, pages=[idx])
-                one.save(str(tmp_pdf))
-                conv.convert(str(tmp_pdf))
-                ms = (time.monotonic() - t_pg) * 1000.0
-                per_page_ms.append(ms)
-                pages[idx]["page_latency_ms"] = round(ms, 1)
-                pages[idx]["page_latency_mode"] = "single_page_slice"
-            except Exception as exc:
-                slice_error = f"page {page_no}: {type(exc).__name__}: {exc}"
-                log(f"[driver] slice pass page {page_no} failed: {slice_error}")
-                pages[idx]["page_latency_ms"] = None
-                pages[idx]["page_latency_mode"] = "single_page_slice_failed"
-                for rest in pages[idx + 1 :]:
-                    rest["page_latency_ms"] = None
-                    rest["page_latency_mode"] = "not_measured_after_slice_failure"
-                # EXIT: pages after the stop are named as unmeasured instead of
-                # leaving their keys out, so a short n in the stats is not a
-                # silent shrink of the document
-                break
-            finally:
-                if one is not None:
-                    # Explicit close: gc-based cleanup would pile up one PDF
-                    # handle per page inside the 4 GiB ceiling.
-                    try:
-                        one.close()
-                    except Exception as exc:
-                        harness_failures.append(
-                            f"slice page {page_no}: document close failed: "
-                            f"{type(exc).__name__}: {exc}"
-                        )  # EXIT: a handle left open would inflate the next peak
-                        del one
-                try:
-                    tmp_pdf.unlink(missing_ok=True)
-                except OSError as exc:
-                    harness_failures.append(
-                        f"slice page {page_no}: temp PDF not removed: "
-                        f"{type(exc).__name__}: {exc}"
-                    )  # EXIT: a slice left on disk is a cost, not a measurement
-            if idx % 10 == 9:
-                checkpoints.append(memory_snapshot(f"slice_pass_page_{page_no}"))
-    else:
-        # No per-page number available without measurement: stay explicit.
-        for entry in pages:
-            entry["page_latency_ms"] = None
-            entry["page_latency_mode"] = "not_measured"
+    slice_pass = run_slice_pass(
+        pdfium_mod=pdfium, pdf_doc=pdf_doc, conv=conv, pages=render.pages,
+        page_count=page_count, checkpoints=checkpoints, failures=harness_failures,
+        enabled=args.slice_pass,
+    )
     checkpoints.append(memory_snapshot("end"))
-
     final = memory_snapshot("final")
-    # A failed read is None and drops out of the peak; a limit file's "no limit"
-    # reading is CGROUP_NO_LIMIT_BYTES and must never enter this max at all.
-    vmhwm = max(
-        [c.proc_vmhwm_bytes for c in checkpoints if c.proc_vmhwm_bytes]
-        + [final.proc_vmhwm_bytes or 0]
-    )
-    cgroup_peak = max(
-        [
-            c.cgroup_memory_peak_bytes or 0
-            for c in checkpoints
-            if (c.cgroup_memory_peak_bytes or 0) > 0
-        ]
-        + [final.cgroup_memory_peak_bytes or 0]
-    )
-    oom_kill_events = max(
-        [
-            int(v)
-            for c in checkpoints + [final]
-            for k, v in c.events.items()
-            if k.startswith("memory.events") and k.endswith("oom_kill")
-        ]
-        or [0]
-    )
 
-    latencies = [p.get("page_latency_ms") for p in pages]
-    latencies = [x for x in latencies if isinstance(x, (int, float))]
-
-    record = {
-        "schema": "fin.g4.t2a.pipeline_measurement/1",
-        "file": {
-            "path": str(pdf_path),
-            "name": pdf_path.name,
-            "bytes": file_bytes,
-            "sha256": file_sha256,
-        },
-        "page_count": page_count,
-        "requested_dpi": args.dpi,
-        "max_pages": args.max_pages,
-        "page_limit_exceeded": bool(
-            args.max_pages is not None and page_count > args.max_pages
-        ),
-        "pages": pages,
-        "totals": {
-            "render_and_ocr_latency_ms": round(render_ms, 1),
-            "docling_whole_doc_latency_ms": round(full_doc_ms, 1),
-            "docling_status": docling_status,
-            "docling_page_count": docling_page_count,
-            "docling_error": full_error,
-            "slice_pass_enabled": slice_mode,
-            "slice_pass_error": slice_error,
-            "total_latency_ms": round(
-                render_ms + full_doc_ms + sum(per_page_ms), 1
-            ),
-            "page_latency_ms_stats": {
-                "n": len(latencies),
-                "note": "single-page conversions on an already-initialised "
-                "pipeline (DocumentConverter caches the initialised "
-                "StandardPdfPipeline), i.e. warm steady-state per-page cost",
-                "mean": round(statistics.fmean(latencies), 1) if latencies else None,
-                "median": round(statistics.median(latencies), 1) if latencies else None,
-                "p95": (
-                    round(statistics.quantiles(latencies, n=20)[-1], 1)
-                    if len(latencies) >= 20
-                    else (round(max(latencies), 1) if latencies else None)
-                ),
-                "max": round(max(latencies), 1) if latencies else None,
-            },
-            "regions_total": {
-                kind: (
-                    sum(int(p["region_counts"][kind]) for p in pages)
-                    if regions_measured
-                    else None
-                )
-                for kind in ("text", "table", "figure")
-            },  # EXIT: no sum over an unmeasured pass, so a null is never a zero
-            "pages_needing_ocr": sum(
-                1 for p in pages if p["ocr_required_by_repo_rule"]
-            ),
-            "pages_with_ocr_applied": sum(1 for p in pages if p["ocr_used"]),
-            "pages_with_native_text": sum(
-                1 for p in pages if p["native_text_char_count"] > 0
-            ),
-            "native_text_chars_total": sum(
-                p["native_text_char_count"] for p in pages
-            ),
-            "ocr_text_chars_total": sum(p["ocr_text_char_count"] for p in pages),
-            "peak_rss_vmhwm_bytes": vmhwm,
-            "cgroup_peak_bytes": cgroup_peak,
-            "cgroup_memory_max_bytes": final.cgroup_memory_max_bytes,
-            "cgroup_memory_swap_max_bytes": final.cgroup_memory_swap_max_bytes,
-            "cgroup_memory_swap_current_bytes": final.cgroup_memory_swap_current_bytes,
-            "proc_vmswap_bytes": final.proc_vmswap_bytes,
-            "oom_kill_events_in_cgroup": oom_kill_events,
-            "oom_killed": bool(oom_kill_events > 0),
-            "oom_killed_source": "cgroup memory.events oom_kill counter",
-            "harness_failures": harness_failures,
-            "memory_checkpoints": [c.to_record() for c in checkpoints + [final]],
-        },
-        "pin_manifest": resolved_versions(),
-        "pipeline_identity": pipeline_identity,
-        "docling_builtin_limits": docling_builtin_limits(),
-        "heron_artifact": {**artifact_identity(args.artifacts), **pipeline_identity},
-        "repo_rule_provenance": {
-            "ocr_decision": "fin.corpus.ocr.detect_ocr_required(min_text_chars=1)",
-            "ocr_engine": "fin.corpus.ocr.TesseractEngine",
-            "tesseract_lang_default": DEFAULT_TESSERACT_LANG,
-            "page_unit_rule": "one frozen unit per physical page (fin.corpus.parsers._pdf)",
-        },
-    }
-    sys.stdout.write(json.dumps(record, separators=(",", ":"), ensure_ascii=True) + "\n")
-    sys.stdout.flush()
+    emit(
+        build_record(
+            pdf_path=pdf_path, artifacts_path=args.artifacts, requested_dpi=args.dpi,
+            max_pages=args.max_pages, file_bytes=file_bytes, file_sha256=file_sha256,
+            page_count=page_count, render=render, docling=docling,
+            slice_pass=slice_pass, checkpoints=checkpoints, final=final,
+            harness_failures=harness_failures, pipeline_identity=pipeline_identity,
+            tesseract_lang=tesseract_lang,
+        )
+    )
     return 0
 
 
