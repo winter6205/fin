@@ -41,19 +41,27 @@ OVERALL: PASS
      `FIN_ATTACHMENT_MAX_PDF_PAGES=80`, `FIN_ATTACHMENT_VISION_CALLS_PER_RUN=88`,
      `FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN=8`, persisted as deployment settings
      in `.env.example` (no code default). All three gold cases are committed and fit
-     one run; only `g4-mixed-chart-001` was carried through the pinned pipeline — the
-     scanned case did not finish and the bare image is outside the harness's PDF-only
-     input path. Per-case numbers, the extrapolation to 80 pages, the rejected
-     40-page option, and the 4 GB device limitation are in
+     one run; only `g4-mixed-chart-001` has a committed run under the pinned
+     pipeline — the scanned case left no committed measurement and the bare image
+     is outside the harness's PDF-only input path. Per-case numbers, the
+     extrapolation to 80 pages, the rejected 40-page option, and the 4 GB device
+     limitation are in
      [`docs/validation/2026-09-26-g4-t2a-page-vision-budgets.md`](../docs/validation/2026-09-26-g4-t2a-page-vision-budgets.md).
-     Three of its *Leftovers* are the spec's own acceptance clause rather than
-     follow-up polish: the 80-page point was never run at the 4 GiB ceiling (1),
-     scanned-page OCR — the one cost that could make the cap unusable — is
-     unquantified (4), and the "4 GB device" is a cgroup ceiling on a swapping
-     WSL2 VM, so every figure there is bounded rather than fast (5). T2b–T2f build
-     against these four keys as the values under test; none of them may present
-     the numbers as the approved shipped default until those three close. The
-     enforcement seam is `fin.host.attachment_budgets` (109 cases).
+     Five of its *Leftovers* bound this decision rather than polish it, and each
+     one has an owning ticket there: the 80-page point was never run at the 4 GiB
+     ceiling (1, T2f), scanned-page OCR — the one cost that could make the cap
+     unusable — is unquantified (4, T2d), no millisecond figure is a device
+     specification because the four cores were shared with other work (6, T2d), a
+     bare image has no measured preparation cost (7, T2d), and `88 = 80 + 8` sits
+     on `validate()`'s exact floor, so a run that admits the page cap has no
+     headroom for a retried full-page scan and T2e must price that retry against
+     the run budget (9, T2e). The record's other items are owned there too: the
+     per-turn monetary ceiling and the observed crop demand by T2e (2, 8), the
+     one-filing-per-turn guidance by T2b (3), the dedicated-device reading by T2f
+     (5). T2b–T2f build against these four keys as the values under test; none of
+     them may present the numbers as the approved shipped default until 1, 4, 6,
+     7, and 9 close. The enforcement seam is `fin.host.attachment_budgets` (109
+     cases).
 
 3. **T2b — Store uploads raw and gate sends** — tag: `[implementation]`
    - **Inherits:** spec: upload stores durable raw bytes only and returns `uploaded`; preparation starts only from an eligible grounded graph turn; no conversation starts or sends while any composer upload is in flight. T1's 2 MiB route constant is historical and is replaced by the finite, measured deployment setting from T2a.

@@ -23,11 +23,12 @@ runtime-dependency decision stays with T2d.
 | `FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN` | `max_vision_crop_calls_per_run` | `8` |
 
 **These values are provisional, not a shipped default.** Two of the three gold
-cases never reached the pipeline (*Gold cases under the pinned pipeline*), and
-the scanned-page OCR quantity that could invalidate `max_pdf_pages = 80` is
-unmeasured here. What this ticket delivers is a validated, enforced, measured-where-measurable
-starting configuration plus the list of what must be measured before an operator
-authorises it as the product default (*Leftovers* 1, 4, 6, 7).
+cases have no committed pipeline measurement here (*Gold cases under the pinned
+pipeline*), and the scanned-page OCR quantity that could invalidate
+`max_pdf_pages = 80` is unmeasured here. What this ticket delivers is a
+validated, enforced, measured-where-measurable starting configuration plus the
+list of what must be measured before an operator authorises it as the product
+default (*Leftovers* 1, 4, 6, 7, 9).
 
 The values are persisted **only** in `.env.example`. `attachment_budgets.py`
 carries no numeric default: the spec requires a missing limit to fail
@@ -98,10 +99,28 @@ Measured runs (`scripts/g4_pipeline/results/*.meta.json`):
 
 | file | pages | bytes | `VmHWM` | cgroup peak | `VmSwap` | OOM | exit | total ms |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `2023_FY_GOOG.pdf` | 1 | 624 | 489,889,792 | 384,000,000 | 0 | 0 | 0 | 3,489.8 |
-| `2023_FY_GOOG.pdf` | 1 | 624 | 885,321,728 | 937,984,000 | 0 | 0 | 0 | 5,830.8 |
+| `2023_FY_GOOG.pdf` | 1 | 624 | 489,889,792 | 384,000,000 | 0 | 0 | 0 † | 3,489.8 |
+| `2023_FY_GOOG.pdf` | 1 | 624 | 885,321,728 | 937,984,000 | 0 | 0 | 0 † | 5,830.8 |
 | `2023_FY_GOOG.pdf` | 1 | 624 | 1,301,147,648 | 1,065,414,656 | 0 | 0 | 0 | 15,013.3 |
 | `2023_Q1_MSFT.pdf` | 72 | 2,223,272 | 3,324,112,896 | 3,102,502,912 | 182,738,944 | 0 | 0 | 1,528,374.9 |
+
+† `…T164419Z` and `…T170133Z` are not measurements of the pipeline. Each
+carried a named `slice_pass_error` — `FileNotFoundError: Model
+'docling-project/docling-layout-heron' not found in artifacts_path` and
+`ValueError: Not able to find a model file for TableModel04_rs`, the two
+incomplete-cache states the fetch preamble in `run_measured.sh` exists to
+prevent — so `regions_total` is `0 / 0 / 0` and `docling_status` is `null` in
+both, and the exit is 0 because the driver writes a slice-pass failure into the
+record rather than failing on it. Their `VmHWM` is torch plus the weights each pass
+reached before the named model was missed — 489,889,792 B when Heron itself was
+absent from the cache, 885,321,728 B when only TableFormer was — and their
+timings are an aborted conversion, not a completed one. The rows stay because
+that ramp is a real measurement and because a run can exit 0 having done almost
+none of the work. The three later 1-page runs, `…T184410Z`, `…T195408Z`, and
+`…T204930Z`, are the harness reproducing this input after each of its own
+repairs and are recorded with their fields under *Two field-provenance
+corrections*, *Splitting the harness without moving a field*, and *Repairing the
+gap semantics without moving a measurement*.
 
 The 72-page conversion is the load-bearing one: Docling whole-document
 `829,935.8 ms`, i.e. `11,526.9 ms/page`; warm steady-state single-page
@@ -110,8 +129,10 @@ render-plus-OCR pass `17,369.3 ms` (`241 ms/page`, with 0 pages needing OCR in
 this native-text file); Heron regions over 72 pages: 790 text, 55 table,
 **1 figure**; 222,233 native text characters.
 
-Model load, not page count, dominates the floor: a 1-page run already peaked
-between 0.49 and 1.30 GiB.
+Model load, not page count, dominates the floor: the four 1-page runs that
+completed both passes peaked between 1,234,628,608 and 1,301,147,648 B, i.e.
+within 5.4% of each other and 1.15–1.21 GiB before the per-page term is worth
+anything.
 
 ### Measurement conditions (they bound every latency figure here)
 
@@ -134,9 +155,13 @@ pgmajfault 817456
 Four unrelated agent processes (`qodercn`, 0.5 GiB each) and the iknow-memory
 Elasticsearch/Neo4j containers share those four cores, and each pipeline
 container was given `--cpus=4`, i.e. one whole host, so two concurrent runs
-contend 1:1. The same 1-page input measured 3,489.8 ms, 5,830.8 ms, and
-15,013.3 ms across three runs — a ~4× spread that is contention, not variance
-in the input.
+contend 1:1. The same 1-page input measured 15,013.3 ms, 29,171.3 ms,
+16,407.2 ms, and 10,402.8 ms across the four runs that completed both model
+passes (`…T170956Z`, `…T184410Z`, `…T195408Z`, `…T204930Z`) — a 2.8× spread on
+identical input, and the same 1.8× spread on the warm per-page conversion
+inside those runs (3,571.1 / 6,074.1 / 5,942.4 / 3,374.5 ms). Contention, not
+variance in the input; `driver.py` records no load figure for any of them,
+which is *Leftovers* 6.
 
 What this does and does not invalidate:
 
@@ -144,9 +169,11 @@ What this does and does not invalidate:
   is real, so every resident-peak figure and the byte/page counts stand.
 * Global major-fault traffic is not attributable to one container, so **no
   millisecond figure here is a device specification**. They are upper bounds
-  measured under load, used only to order the two page-cap options (which
-  differ ~2×, outside the spread) and to show that per-page cost is the
-  binding constraint, not total bytes.
+  measured under load, used only to order the two page-cap options, and that
+  ordering is arithmetic rather than a comparison of two measurements: the
+  `40` row is the same per-page rate over half the pages, so contention moves
+  both options together. What the figures do establish is that per-page cost is
+  the binding constraint, not total bytes.
 * `driver.py` records no load or major-fault figure per run, so the runs that
   mattered cannot be corrected after the fact. A serial re-measure with load
   captured before and after is the only clean evidence available and **it has
@@ -181,7 +208,7 @@ and is listed under *Leftovers*.
 | one max attachment end-to-end | ≈ 19.9 min | ≈ 10.1 min |
 | input tokens at the cap | 88 × 4,275 = 376,200 | 48 × 4,275 = 205,200 |
 | 4 GiB margin, plus-swap reading | 13.1% | 39.3% |
-| corpus files rejected | 0 of 13 | 4 of 13 (31%: 67, 72, 74, 80 pages) |
+| corpus files rejected | 0 of 13 | 9 of 13 (69%: 46, 50, 51, 51, 52, 67, 72, 74, 80 pages) |
 
 The vision rows use the mean of the three calls on the pipeline-rendered
 `g4-mixed-chart-001.pdf` page 3 (`3,496 / 3,094 / 2,585` ms,
@@ -194,11 +221,16 @@ bound is kept deliberately, since a run budget is spent in worst case. Both
 margin columns use the strict plus-swap reading of the extrapolation above
 (`1,301,147,648 + pages × 28,096,739 + 182,738,944` against the 4 GiB ceiling).
 
-`80` was chosen because the excluded set is exactly the SEC 10-Q filings that
-this product exists to read, the ticket's own acceptance clause is that the
-caps admit the observed corpus, and every bound is a deployment setting with
-no code default — an operator on a 2 GiB device lowers all four without a code
-change, which is the mitigation `40` would otherwise have provided by fiat.
+`80` was chosen because `40` does not cut a fringe. It rejects 9 of the 13
+measured filings — the four MSFT 10-Qs (67, 72, 74, 80 pages), the four AMZN
+10-Qs (50, 51, 51, 52 pages), and `2023_Q1_AAPL.pdf` (46 pages) — and keeps
+only the three shortest AAPL 10-Qs and the 624-byte GOOG fixture, so the
+excluded set is most of the quarterly-filing population this product exists to
+read rather than one issuer's long tail. The ticket's own acceptance clause is
+that the caps admit the observed corpus, and every bound is a deployment
+setting with no code default — an operator on a 2 GiB device lowers all four
+without a code change, which is the mitigation `40` would otherwise have
+provided by fiat.
 
 Two rows of that table need a caveat rather than a number. Both latency columns
 exclude OCR, because the file that reached 72 pages needed none; and the
@@ -222,6 +254,15 @@ provider or model identifier is written into `attachment_budgets.py`):
 | `data/corpus/g4_vision_probe.json` | drawn page in `/tmp` | 816 × 1056 | 37,482 | the script's own capability probe |
 | `data/corpus/g4_vision_probe_page.json` | `g4-mixed-chart-001.pdf` page 3, rendered by the pinned pipeline at 200 dpi | 1700 × 2200 | 205,088 | a real full-page scan |
 | `data/corpus/g4_vision_probe_gold.json` | `g4-image-chart-001.png` (committed gold) | 1200 × 746 | 40,419 | the crop / figure-only shape |
+
+The middle row's subject is a page bitmap under `pages/`, which is gitignored, so
+it is pinned by records rather than by the file: the probe artifact carries
+`1700 × 2200` over `205,088` bytes, the committed `…T174114Z` page-3 record
+carries the same dimensions and byte count, and the re-render under the repaired
+harness (`…T204952Z`) produced `205,088` bytes again with
+`page_image_png_sha256 = 72b000ce49688014…`. The probe's subject and that hash
+name the same bytes because two renderings of the same fixture at the same DPI
+agreed, not because one file was hashed twice.
 
 Each artifact is three calls — chart presence, chart meaning, structured JSON —
 and every one of the nine calls succeeded. Per-call latency and provider-reported
@@ -267,10 +308,22 @@ charts carries 4 labelled numeric values that a question could need a
 higher-resolution look at after the full-page scan, so `2 × 4 = 8`. What is now
 measured rather than assumed is the *shape and cost* of such a call, on the
 committed chart PNG; what is still a plan is *how many* crops a run will want,
-because no production caller asks yet (*Not covered*). A retried crop is another
-call and draws from the same 8, so `max_vision_calls_per_run = 88` — `80 + 8`,
-exactly the minimum the self-consistency rule allows — buys crop **and** retry
-headroom out of one pool of 8, and nothing more.
+because no production caller asks yet (*Not covered*).
+
+`88 = 80 + 8` is `validate()`'s exact floor, not a cushion: the rule allows
+equality, so a run that admits the page cap has spent 80 calls before anyone
+asks for a crop and holds exactly the declared 8. Those 8 are crop headroom, and
+a retried crop draws from them, which is what keeps the pair self-consistent at
+the minimum. A retried **full-page** scan has no line item of its own —
+`preflight_run` prices one scan per admitted page plus `requested_crop_calls` —
+so on a page-cap run that also wants its 8 crops it is the 89th call and the run
+fails `attachment_vision_budget_exceeded`. Crops therefore have headroom and
+page-scan retries have none: the spec's page-at-a-time rule ("pages submitted
+singly so resource use is bounded and failures can be retried by page") is
+honoured only while `88 − pages` is spare, i.e. below the page cap. Whether a
+retry borrows the crop bound or the run budget rises above the floor is
+undecided, and it is T2e's to price: T2e is the first ticket that issues a retry
+at all (*Leftovers* 9).
 
 ## Validation seam
 
@@ -318,6 +371,11 @@ the numbers cannot drift from their evidence unnoticed:
 | 14 | `uv run --no-sync python scripts/g4_vision_probe.py --dotenv-start /home/winner/projects/fin` | 0 | 3 real calls on the drawn page, re-recorded under the current artifact contract; `supports_image_input=true structured_output_ok=true usage_reported=true mean_answered=true`, `image.bytes=37482` |
 | 15 | `scripts/g4_pipeline/run_measured.sh data/corpus/pdf/2023_FY_GOOG.pdf` | 0 | after the decomposition; `results/2023_FY_GOOG_20260925T195408Z*`, 186-key tree identical to `…T184410Z` (see *Splitting the harness without moving a field*) |
 | 16 | `scripts/g4_pipeline/run_measured.sh data/corpus/g4_attachment_gold/g4-image-chart-001.png` | 1 | the non-PDF rejection re-recorded under the unified meta schema; `results/g4-image-chart-001.png_20260925T195253Z.meta.json`, `json_lines=0`, unread fields `null` |
+| 17 | `docker run --rm --entrypoint python fin-g4-pipeline:t2a -c "import inspect, pypdfium2, pypdfium2.raw as raw; print(inspect.signature(pypdfium2.PdfPage.get_objects)); print(int(raw.FPDF_PAGEOBJ_IMAGE))"` | 0 | `(self, filter=None, max_depth=15, form=None, level=0, textpage=None)` and `3` — the pinned signature and kind the image-object scan now calls, and the reason `image_only=` was removed |
+| 18 | `uv run --no-sync python -m py_compile scripts/g4_pipeline/driver.py scripts/g4_vision_probe.py scripts/g4_upload_distribution.py && bash -n scripts/g4_pipeline/run_measured.sh scripts/g4_pipeline/build.sh` | 0 | after this round's harness edits |
+| 19 | `uv run --no-sync pytest -q tests/host/test_attachment_budgets.py` | 0 | 109 passed, after the harness edits (the module under test is untouched by them) |
+| 20 | `scripts/g4_pipeline/run_measured.sh data/corpus/pdf/2023_FY_GOOG.pdf` | 0 | after the gap-semantics repair; `results/2023_FY_GOOG_20260925T204930Z*`, 186 field paths against `…T195408Z` with exactly one out and one in |
+| 21 | `scripts/g4_pipeline/run_measured.sh data/corpus/g4_attachment_gold/g4-mixed-chart-001.pdf` | 0 | `results/g4-mixed-chart-001_20260925T204952Z*`; `pdf_image_objects 1 / 0 / 1`, page PNG bytes and `regions_total 24 / 0 / 2` identical to `…T174114Z` |
 
 Run 6 is the real-boundary check: it spawns the compiled iknow-memory stdio
 server (`/home/winner/projects/iknow-memory/dist/index.js`, built 2026-09-25)
@@ -348,14 +406,14 @@ requires.
 
 `scripts/g4_pipeline/run_measured.sh data/corpus/g4_attachment_gold/<case>` for
 each of the three committed gold cases, in the same ceiling as the corpus runs
-above. The numbers below are read out of the committed
-`scripts/g4_pipeline/results/*.meta.json`; there is no summary file, and the
-metas are the record.
+above. The numbers below are read out of the tracked
+`scripts/g4_pipeline/results/*.meta.json`, and nothing untracked — a run
+directory, an aggregate file — is evidence for a figure in this document.
 
 | case | pages | bytes | cgroup peak | `VmHWM` | OOM / exit | total ms | text / table / figure | state |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `g4-mixed-chart-001.pdf` | 3 | 35,324 | 1,671,122,944 | 1,402,855,424 | 0 / 0 | 31,823.1 | 24 / 0 / 2 | measured |
-| `g4-scanned-001.pdf` | 3 | 677,716 | — | — | — | — | — | **not measured** |
+| `g4-scanned-001.pdf` | 3 | 677,716 | — | — | — | — | — | **no committed measurement** |
 | `g4-image-chart-001.png` | 1 | 40,419 | — | — | 1 (not OOM) | — | — | **rejected by the harness** |
 
 * `g4-mixed-chart-001.pdf` is the load-bearing gold case for the crop bound:
@@ -390,16 +448,16 @@ silently absorbed here:
   figure in 72 pages of `2023_Q1_MSFT.pdf`, and now 0 tables on a statement page
   that is one. This is further reason the spec's full-page scan rule is not
   optional.
-* `g4-scanned-001.pdf` did not finish. Both attempts rendered page bitmaps and
-  stopped before the driver wrote a measurement: the first left a meta with
-  `json_lines: 0` and no memory peak, the second left no meta at all. So **no
-  pipeline-measured cost of any kind — wall time, CPU time, or resident peak —
-  is claimed for a scanned page in this record.** The two scanned-page time
-  figures that *do* appear, in *Not covered*, are stopwatch observations of a
-  killed attempt with no committed artifact behind them, and are labelled there
-  as such. Those two aborted run directories are deliberately not committed —
-  they carry no measurement, and the bitmaps under `pages/` are gitignored
-  derivatives reproducible from the committed fixture.
+* `g4-scanned-001.pdf` has no committed measurement. Attempts on this host got
+  as far as rendering page bitmaps, and what they left under `results/` is
+  untracked — one meta with `json_lines: 0` and no peak, plus a later directory
+  whose meta and JSONL do carry figures — so **no pipeline-measured cost of any
+  kind — wall time, CPU time, or resident peak — is claimed for a scanned
+  page.** The two scanned-page time figures that *do* appear, in *Not covered*,
+  are stopwatch observations of a killed attempt with no artifact behind them,
+  and are labelled there as such. The bitmaps under `pages/` are gitignored
+  derivatives reproducible from the committed fixture; *Leftovers* 4 stays open
+  until a scanned-page run's meta and timer artifact are committed together.
 * `g4-image-chart-001.png` failed in the harness, not in the ceiling:
   `run_measured.sh` hands its argument to `pypdfium2.PdfDocument`, which raises
   `PdfiumError: Failed to load document (PDFium: Data format error)` on a bare
@@ -471,9 +529,70 @@ Two runs prove the split changed no measurement:
 * failed — `results/g4-image-chart-001.png_20260925T195253Z.meta.json` (exit 1,
   `json_lines = 0`) reproduces the non-PDF rejection under the unified schema,
   with `null` where values were never read and typed `1` / `false` where the
-  harness did read them. It supersedes
-  `…g4-image-chart-001.png_20260925T174210Z.meta.json`, which predates the
-  unification and recorded `""` and `"false"` for the same failure.
+  harness did read them. The pre-unification meta for the same rejection wrote
+  `""` for the unread peak and `"false"` as a string for `oom_killed`; it is
+  deleted at this branch's head and is evidence only as of `d6b222a`, the commit
+  that removed it, so the schema it demonstrated is quoted here rather than
+  pointed at.
+
+### Repairing the gap semantics without moving a measurement
+
+The next finding was in the harness again, and this one made two artifacts of
+one run disagree: `run_measured.sh` wrote its own `oom_killed` and
+`oom_killed_source` over the driver's, while `peak_fields` and `oom_fields`
+reported `max(…, default=0)` for a counter no snapshot had managed to read. One
+rule covers both: a reading that never happened is a gap, never a value.
+
+* The driver owns the OOM verdict; docker's opinion is recorded beside it as
+  `oom_killed_docker_inspect` and no longer overwrites it.
+  `oom_killed_source` names the counter only when a snapshot read it, and says
+  `"not read; see oom_killed_error"` when none did.
+* An unread peak is `null` plus a `<key>_error` naming its source and pointing at
+  `memory_checkpoints[].read_errors`. The error sibling appears exactly when the
+  value is `null`, so the key tree of a run that did read its snapshots is
+  unchanged.
+* `driver_keys` in `run_measured.sh` is now asserted against the record it
+  projects: a totals key renamed in `driver.py` fails the run with
+  `FATAL: driver totals lack …` rather than quietly summarising a real
+  measurement as `null`.
+
+Two duplications went with it. `native_text_codepoints` was a second name for
+`native_text_char_count` and is deleted. The page-bitmap writer is one function
+that records bytes *and* sha256 for every kept page: until this round the hash
+was written only on pages that went through OCR, so a text page's payload was
+identified by size alone.
+
+The image-object scan also lost its two-level fallback ladder, and the first
+run after the deletion is the reason the ladder's *shape* mattered. What the
+scan assumed was the pinned library's signature — `get_objects(image_only=True)`
+— and `pypdfium2 5.13.0` answers
+`TypeError: PdfPage.get_objects() got an unexpected keyword argument
+'image_only'`; its parameter is `filter`. Every page of that run recorded
+`pdf_image_objects_error` and a `null` count instead of a spurious `0`, so the
+rule that selects OCR could see "no images" on a page where the scan had simply
+failed — and that is the only thing the run is quoted for: it is a working-tree
+state between two edits, and its artifacts are not committed. The scan is now
+one call that takes its kind constant from the same library version the record
+pins:
+
+```python
+objects = page.get_objects(filter=[int(raw.FPDF_PAGEOBJ_IMAGE)])
+```
+
+Two runs prove this round moved no measurement:
+
+* measured — `results/2023_FY_GOOG_20260925T204930Z*` (exit 0) against the
+  recorded `…T195408Z`: 186 field paths in each, one leaving and one arriving
+  (`pages[].native_text_codepoints` out, `pages[].page_image_png_sha256` in),
+  with every contract field intact — `page_image_png_bytes = 31,454`,
+  `pdf_image_objects = 0`, `regions_total 1 / 0 / 0`,
+  `native_text_chars_total = 49`, `oom_killed false` on a counter that read `0`.
+* measured — `results/g4-mixed-chart-001_20260925T204952Z*` (exit 0) against the
+  recorded `…T174114Z`: `pdf_image_objects 1 / 0 / 1`,
+  `page_image_png_bytes 148,581 / 244,555 / 205,088` and
+  `regions_total 24 / 0 / 2` all identical, i.e. the single filtered call counts
+  exactly what the ladder counted. Its total (19,082.5 ms against 31,823.1 ms)
+  is the same host-load spread as the 1-page runs above, not a speed-up.
 
 ## Not covered by this record
 
@@ -497,9 +616,9 @@ Two runs prove the split changed no measurement:
   question of a page yet.
 * OCR cost on a genuinely scanned file at scale: the 72-page measurement had
   `pages_needing_ocr = 0`, so the per-page parse figure above never included
-  OCR. The one scanned case this ticket attempted did not complete in a bounded
-  time on this host, and **scanned-page OCR cost is therefore unmeasured here** —
-  the largest open quantity in this ticket (*Leftovers* 4).
+  OCR. No scanned-case run on this host left a committed meta, and
+  **scanned-page OCR cost is therefore unmeasured here** — the largest open
+  quantity in this ticket (*Leftovers* 4).
 
   Two time figures were observed while those attempts were running, and neither
   has a committed timer artifact behind it, so they are stated here as
@@ -531,7 +650,9 @@ Two runs prove the split changed no measurement:
 2. One vision scan per admissible page, serial, costs ≈ 4.5 min and ≈ 376K
    input tokens for a max-size attachment. Nobody has decided a per-turn
    monetary ceiling; that is an operator/product call this ticket can only
-   price, not make.
+   price, not make. T2e is the first ticket whose run record carries provider
+   usage per call against a total, so it is where the price becomes readable
+   and where the operator's ceiling has to be applied.
 3. A turn with two max-size attachments cannot fit `88` calls (2 × 80 pages),
    so it fails `attachment_vision_budget_exceeded` by design. There is no
    per-message attachment-count limit in the product, so the guidance to send
@@ -548,7 +669,9 @@ Two runs prove the split changed no measurement:
    itself swapping. The peaks and OOM counts are valid; the wall-clock figures
    are not comparable to a dedicated 4 GB machine, and the operator who
    authorises these four values as the shipped default should read them as
-   *bounded and consistent*, not as *fast*.
+   *bounded and consistent*, not as *fast*. T2f's gold round is the run that
+   owes the dedicated-device reading, because the End-of-round record claims
+   measured peaks and latency for a device, not for a cgroup.
 6. **The latency re-measure under a quiet host has not been run.** The pinned
    runs above share four cores with other work, so no millisecond figure here is
    a device specification.
@@ -556,13 +679,18 @@ Two runs prove the split changed no measurement:
    ```text
    Validation:
    - Not run: host load at 8.5 on 4 cores at record time; a serial re-run would
-     be contaminated by the same contention that produced the 4x spread.
+     be contaminated by the same contention that produced the 1.9× spread on
+     identical input.
    - Expected command: scripts/g4_pipeline/run_measured.sh \
        data/corpus/g4_attachment_gold/g4-mixed-chart-001.pdf
      with `cat /proc/loadavg` and `grep -E "^pswpout|^pgmajfault" /proc/vmstat`
      captured immediately before and after, on an otherwise idle machine.
    - Blocking issue: no idle 4-core host available to this ticket.
    ```
+
+   T2d owns it: `--psm`, render DPI, and the skip-OCR decision are picked from
+   these figures, and picking them from contended numbers is the guess this
+   ticket refuses.
 
 7. A bare image has no measured preparation cost, because the harness only
    drives PDF inputs (see the `g4-image-chart-001.png` row above). T2d owns the
@@ -574,3 +702,17 @@ Two runs prove the split changed no measurement:
    code asks a question of a page yet, so nothing has ever wanted a crop. T2e
    should re-read this number against the first production run that records
    crops actually issued, and lower it if the observed demand is smaller.
+9. **Page-scan retry headroom is undecided.** `88 = 80 + 8` is the exact
+   `validate()` floor, so a run at the page cap has nothing spare: its 80 scans
+   plus the 8 crops the deployment declares fill 88, and a second scan of one
+   page is then the 89th call, failing the whole run with
+   `attachment_vision_budget_exceeded`. That is precisely the call the spec's
+   page-at-a-time rule exists to make possible — "pages submitted singly so
+   resource use is bounded and failures can be retried by page" — and it is the
+   one a failed first scan needs. Either `preflight_run` prices a retry term and
+   `validate()`'s floor moves with it, or `max_vision_calls_per_run` stops being
+   the minimum and rises above `pages + crops`; both touch the enforcement seam
+   and at least one deployed bound, so neither is a free edit. T2e owns the
+   decision: it is the first ticket that issues a retry call, and it must price
+   retries against the run budget before any of the four values is authorised as
+   the shipped default.

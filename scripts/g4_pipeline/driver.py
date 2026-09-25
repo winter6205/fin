@@ -79,15 +79,19 @@ CGROUP_DIR = Path("/sys/fs/cgroup")
 CGROUP_NO_LIMIT_TEXT: Final[str] = "max"
 CGROUP_NO_LIMIT_BYTES: Final[int] = -1
 
-# pypdfium2's FPDF_PAGEOBJ_IMAGE enum value, used only when the raw module
-# cannot be imported; no other object kind counts as an image.
-FPDF_PAGEOBJ_IMAGE: Final[int] = 3
-
 _PROC_STATUS_FIELDS: Final[tuple[str, ...]] = ("VmHWM", "VmRSS", "VmSwap", "VmPeak")
 
 # The three region kinds Docling's layout output is bucketed into; the record
 # names them in this order.
 REGION_KINDS: Final[tuple[str, ...]] = ("text", "table", "figure")
+
+# Where a failed reading already explained itself: every snapshot carries its
+# own causes, so a totals-level gap points there rather than repeating them.
+_READ_ERRORS_HINT: Final[str] = "see memory_checkpoints[].read_errors"
+
+# The single counter this harness trusts for an OOM kill. Its name goes into
+# both the provenance field and the gap reason, so the two cannot drift apart.
+OOM_KILL_COUNTER_SOURCE: Final[str] = "cgroup memory.events oom_kill counter"
 
 
 def log(msg: str) -> None:
@@ -105,16 +109,10 @@ def error_text(exc: BaseException, *, prefix: str = "") -> str:
 
 def record_unmeasured(
     entry: dict[str, object], key: str, exc: BaseException, *, prefix: str = ""
-) -> str:
-    """Write ``{key: None, f"{key}_error": <Type>: <msg>}`` for one failed value.
-
-    The reason is returned so a sink outside ``entry`` - a log line, the totals
-    block - carries exactly the same text as the field.
-    """
-    reason = error_text(exc, prefix=prefix)
+) -> None:
+    """Write ``{key: None, f"{key}_error": <Type>: <msg>}`` for one failed value."""
     entry[key] = None
-    entry[f"{key}_error"] = reason
-    return reason
+    entry[f"{key}_error"] = error_text(exc, prefix=prefix)
 
 
 # --------------------------------------------------------------------------
@@ -374,72 +372,20 @@ def artifact_identity(artifacts_path: Path) -> dict[str, object]:
 # the render and text-layer numbers below come from the same library the
 # pinned pipeline uses internally)
 # --------------------------------------------------------------------------
-def _image_object_type() -> tuple[int, str | None]:
-    """The image page-object kind, plus why it was not read from the library."""
+def _page_image_objects(page: Any) -> tuple[int | None, str | None]:
+    """Count a page's image objects without decoding any bitmap.
+
+    The kind constant is read from the pinned library and handed to the
+    library's own ``filter``, so the count is the library's answer rather than a
+    comparison against a copied-out number. ``(None, reason)`` when it declines
+    to answer: an unavailable count is not "no images" and must not select the
+    OCR rule.
+    """
     try:
         from pypdfium2 import raw
 
-        return int(raw.FPDF_PAGEOBJ_IMAGE), None
-    except Exception as exc:
-        return (
-            FPDF_PAGEOBJ_IMAGE,
-            error_text(
-                exc,
-                prefix=(
-                    "pypdfium2.raw unreadable, image kind assumed to be "
-                    f"{FPDF_PAGEOBJ_IMAGE}: "
-                ),
-            ),
-        )  # EXIT: a pinned constant, but the record must say it was not measured
-
-
-def _object_kind(obj: object) -> int | None:
-    """A page object's kind, or None when neither accessor answers."""
-    for attr in ("get_type", "type"):
-        val = getattr(obj, attr, None)
-        if callable(val):
-            try:
-                return int(val())
-            except Exception:
-                continue  # EXIT: this accessor refused; the other may still answer
-        elif val is not None:
-            try:
-                return int(val)
-            except Exception:
-                continue  # EXIT: an uncoercible kind is no knowledge of the kind
-    return None  # EXIT: unknown kind, so the object is neither image nor not-image
-
-
-def _page_image_objects(page: Any, img_type: int) -> tuple[int | None, str | None]:
-    """Count a page's image objects without decoding any bitmap.
-
-    ``image_only=True`` filters on the object type, which is what fin's rule
-    needs (a count, not a pixel). ``(None, reason)`` when no API shape answers:
-    an unavailable count is not "no images" and must not select the OCR rule.
-    """
-    try:
-        return len(page.get_objects(image_only=True)), None
-    except TypeError as exc:  # older pypdfium2 has no image_only shortcut
-        try:
-            count = 0
-            unreadable = 0
-            for obj in page.get_objects():
-                kind = _object_kind(obj)
-                if kind is None:
-                    unreadable += 1
-                elif kind == img_type:
-                    count += 1
-        except Exception as retry_exc:
-            return (
-                None,
-                error_text(exc, prefix="type scan after ") + "; " + error_text(retry_exc),
-            )  # EXIT: no count at all, so nothing is recorded as zero images
-        if unreadable:
-            return (
-                count,
-                f"{unreadable} objects with unreadable kind were not counted",
-            )  # EXIT: a partial count is labelled as one
-        return count, None
+        objects = page.get_objects(filter=[int(raw.FPDF_PAGEOBJ_IMAGE)])
+        return len(list(objects)), None
     except Exception as exc:
         return (
             None,
@@ -454,6 +400,21 @@ def _png_path(page_no: int, image_dir: Path | None) -> Path:
     return Path(f"/tmp/g4_page_{os.getpid()}_{page_no:04d}.png")
 
 
+def _save_page_png(
+    entry: dict[str, object], pil: Any, png_path: Path, *, keep: bool
+) -> None:
+    """Persist a page bitmap and record the payload a vision call would send.
+
+    ``keep`` is False only for the temp file an OCR call consumes: a bitmap that
+    is removed again has no payload size to measure.
+    """
+    pil.save(png_path, format="PNG")
+    if not keep:
+        return  # EXIT: a discarded temp bitmap carries no byte measurement
+    entry["page_image_png_bytes"] = png_path.stat().st_size
+    entry["page_image_png_sha256"] = sha256_bytes(png_path)[1]
+
+
 def _apply_page_ocr(
     entry: dict[str, object],
     pil: Any,
@@ -463,14 +424,10 @@ def _apply_page_ocr(
     image_dir: Path | None,
     failures: list[str],
 ) -> None:
-    """One rendered page through PNG -> the repo's Tesseract engine, recorded.
-
-    ``image_dir`` persists the PNG so the vision payload is measured; ``None``
-    means a temp file removed after the call.
-    """
+    """One rendered page through PNG -> the repo's Tesseract engine, recorded."""
     png_path = _png_path(page_no, image_dir)
     entry["ocr_trigger"] = ocr_trigger
-    pil.save(png_path, format="PNG")
+    _save_page_png(entry, pil, png_path, keep=image_dir is not None)
     try:
         ocr_text = ocr_engine.recognize(source=png_path, page=page_no)
     except Exception as exc:  # fin.corpus.ocr's typed OcrRequiredUnavailableError
@@ -497,9 +454,6 @@ def _apply_page_ocr(
                         prefix=f"page {page_no}: temp PNG {png_path.name} not removed: ",
                     )
                 )  # EXIT: a leaked bitmap is not a gap in a number, but not invisible either
-    if image_dir is not None:
-        entry["page_image_png_bytes"] = png_path.stat().st_size
-        entry["page_image_png_sha256"] = sha256_bytes(png_path)[1]
 
 
 @dataclass(frozen=True, slots=True)
@@ -511,20 +465,19 @@ class RenderPass:
 
 
 def _page_structure_entry(
-    page: Any, page_no: int, img_type: int, detect_ocr_required: Any
+    page: Any, page_no: int, detect_ocr_required: Any
 ) -> dict[str, object]:
     """What the page itself says, before any bitmap is produced."""
     width_pt, height_pt = page.get_size()
     textpage = page.get_textpage()
     native_text = textpage.get_text_range() or ""
-    n_images, images_error = _page_image_objects(page, img_type)
+    n_images, images_error = _page_image_objects(page)
     if images_error is not None:
         log(f"[driver] page {page_no} object scan failed: {images_error}")
     return {
         "page_no": page_no,
         "size_pt": [round(float(width_pt), 2), round(float(height_pt), 2)],
         "native_text_char_count": len(native_text),
-        "native_text_codepoints": len(native_text),
         "pdf_image_objects": n_images,
         "pdf_image_objects_error": images_error,
         # The rule's own "no image reference" input is 0, so a failed scan
@@ -578,12 +531,6 @@ def _ocr_trigger(entry: dict[str, object], force_ocr: bool) -> str | None:
     return None  # EXIT: no rule asked, so no OCR cost is charged to this page
 
 
-def _save_page_png(entry: dict[str, object], pil: Any, png_path: Path) -> None:
-    """Persist a bitmap no OCR call consumed, so its size is measured, not assumed."""
-    pil.save(png_path, format="PNG")
-    entry["page_image_png_bytes"] = png_path.stat().st_size
-
-
 def prepare_image_dir(image_dir: Path | None, failures: list[str]) -> Path | None:
     """Create the bitmap directory, or switch the PNG measurement off by name."""
     if image_dir is None:
@@ -608,9 +555,6 @@ def render_pages(
     ``started_at`` is when the document was opened, not when this was called: the
     render window the record reports includes the file's own parse.
     """
-    img_type, img_type_error = _image_object_type()
-    if img_type_error is not None:
-        failures.append(img_type_error)
     image_dir = prepare_image_dir(image_dir, failures)
 
     pages: list[dict[str, object]] = []
@@ -618,13 +562,13 @@ def render_pages(
         page_no = idx + 1
         pt0 = time.monotonic()
         page = pdf_doc[idx]
-        entry = _page_structure_entry(page, page_no, img_type, detect_ocr_required)
+        entry = _page_structure_entry(page, page_no, detect_ocr_required)
         bitmap, pil = _apply_render_geometry(page, entry, dpi)
         trigger = _ocr_trigger(entry, force_ocr)
         if trigger is not None:
             _apply_page_ocr(entry, pil, page_no, ocr_engine, trigger, image_dir, failures)
         elif image_dir is not None:
-            _save_page_png(entry, pil, _png_path(page_no, image_dir))
+            _save_page_png(entry, pil, _png_path(page_no, image_dir), keep=True)
         del pil, bitmap
         entry["render_latency_ms"] = round((time.monotonic() - pt0) * 1000.0, 1)
         pages.append(entry)
@@ -1009,6 +953,28 @@ def page_rule_counts(pages: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
+def _gap_reason(source: str) -> str:
+    """Why a whole measurement is missing: no snapshot ever read ``source``.
+
+    The per-snapshot cause is already carried by every snapshot that failed, so
+    the reason points there instead of repeating it once per peak.
+    """
+    return f"no snapshot read {source}; {_READ_ERRORS_HINT}"
+
+
+def _peak_or_gap(key: str, readings: list[int], source: str) -> dict[str, object]:
+    """One peak as ``{key: max(readings)}``, or as ``None`` plus its reason.
+
+    The ``<key>_error`` sibling exists only together with the ``None``, so a run
+    that did read its snapshots keeps the key tree the committed measurements
+    carry.
+    """
+    if readings:
+        return {key: max(readings)}
+    # EXIT: nothing read is a gap in the evidence, never a reading of zero
+    return {key: None, f"{key}_error": _gap_reason(source)}
+
+
 def peak_fields(samples: list[MemorySnapshot]) -> dict[str, object]:
     """Peaks over every snapshot taken during the run.
 
@@ -1020,20 +986,35 @@ def peak_fields(samples: list[MemorySnapshot]) -> dict[str, object]:
         c.cgroup_memory_peak_bytes for c in samples if (c.cgroup_memory_peak_bytes or 0) > 0
     ]
     return {
-        "peak_rss_vmhwm_bytes": max(vmhwm, default=0),
-        "cgroup_peak_bytes": max(cgroup, default=0),
+        **_peak_or_gap("peak_rss_vmhwm_bytes", vmhwm, "/proc/self/status VmHWM"),
+        **_peak_or_gap("cgroup_peak_bytes", cgroup, "cgroup memory.peak"),
     }
 
 
 def oom_fields(samples: list[MemorySnapshot]) -> dict[str, object]:
-    """The OOM signal, taken from the cgroup counter alone."""
+    """The OOM signal, taken from the cgroup counter alone.
+
+    A counter that answered 0 is evidence that nothing was killed. A counter no
+    snapshot managed to read is evidence of nothing at all, so both the count
+    and the bool derived from it go ``None`` with the reason, rather than the
+    "no OOM happened" a pair of zeros would assert.
+    """
     events = [
         int(v)
         for c in samples
         for k, v in c.events.items()
         if k.startswith("memory.events") and k.endswith("oom_kill")
     ]
-    peak = max(events, default=0)
+    if not events:
+        # EXIT: an unread counter cannot answer in either direction
+        reason = _gap_reason(OOM_KILL_COUNTER_SOURCE)
+        return {
+            "oom_kill_events_in_cgroup": None,
+            "oom_kill_events_in_cgroup_error": reason,
+            "oom_killed": None,
+            "oom_killed_error": reason,
+        }
+    peak = max(events)
     return {"oom_kill_events_in_cgroup": peak, "oom_killed": bool(peak > 0)}
 
 
@@ -1045,6 +1026,11 @@ def build_totals(
     """The record's totals block: what was measured, plus what failed to be."""
     pages = render.pages
     samples = checkpoints + [final]
+    oom = oom_fields(samples)
+    counter_read = oom["oom_kill_events_in_cgroup"] is not None
+    # Naming the counter as the source is only truthful when a snapshot actually
+    # read it; an unread one points at the reason the gap carries instead.
+    oom_source = OOM_KILL_COUNTER_SOURCE if counter_read else "not read; see oom_killed_error"
     return {
         "render_and_ocr_latency_ms": round(render.latency_ms, 1),
         **docling.to_totals(),
@@ -1060,8 +1046,8 @@ def build_totals(
         "cgroup_memory_swap_max_bytes": final.cgroup_memory_swap_max_bytes,
         "cgroup_memory_swap_current_bytes": final.cgroup_memory_swap_current_bytes,
         "proc_vmswap_bytes": final.proc_vmswap_bytes,
-        **oom_fields(samples),
-        "oom_killed_source": "cgroup memory.events oom_kill counter",
+        **oom,
+        "oom_killed_source": oom_source,
         "harness_failures": harness_failures,
         "memory_checkpoints": [c.to_record() for c in samples],
     }

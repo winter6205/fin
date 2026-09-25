@@ -69,25 +69,27 @@ emit_meta() {
     G4_MEASURED="${RUN_DIR}/${BASE}.measured.jsonl" \
     G4_JSONL_COPY="${RESULTS}/${BASE}_${STAMP}.jsonl" \
         python3 - <<'PY'
-import json, os, time
+import json, os, sys, time
 
 env = os.environ
 
 
 def as_int(value):
-    value = (value or "").strip()
-    return int(value) if value.lstrip("-").isdigit() else None
+    # Only ASCII digits are a number. The module this harness measures
+    # (fin.host.attachment_budgets) rejects a full-width digit as a confusable,
+    # and text handed over by the shell is the same kind of input.
+    text = (value or "").strip()
+    digits = text[1:] if text.startswith("-") else text
+    return int(text) if digits.isascii() and digits.isdigit() else None
 
 
 def as_bool(value):
     return {"true": True, "false": False}.get((value or "").strip().lower())
 
 
-# An empty State.Error and the pre-inspect placeholder both mean "no error was
-# captured", which serializes as null rather than as a distinguishable string.
+# An empty State.Error means no error was captured, which serializes as null
+# rather than as a placeholder string that would need decoding a second time.
 state_error = (env.get("G4_STATE_ERR") or "").strip() or None
-if state_error == "none":
-    state_error = None
 
 oom = as_bool(env.get("G4_OOM"))
 cexit = as_int(env.get("G4_CEXIT"))
@@ -100,10 +102,10 @@ rec = json.loads(open(raw, encoding="utf-8").read().strip()) if raw else None
 # measured JSONL artifact as well as the meta summary.
 totals = rec.setdefault("totals", {}) if rec else {}
 
+# The driver's reading of the cgroup counter owns oom_killed and
+# oom_killed_source: overwriting them left two artifacts of one run disagreeing
+# about the same verdict. Docker's opinion is recorded under its own name.
 totals["oom_killed_docker_inspect"] = oom
-if oom is not None:
-    totals["oom_killed"] = oom
-    totals["oom_killed_source"] = "docker inspect .State.OOMKilled (cgroup counter kept alongside)"
 totals["container_exit_code"] = cexit
 totals["docker_run_exit_code"] = rexit
 totals["host_side_cgroup_memory_peak_bytes"] = hpeak
@@ -127,6 +129,14 @@ driver_keys = (
     "pages_with_ocr_applied", "pages_with_native_text", "native_text_chars_total",
     "ocr_text_chars_total", "docling_error", "docling_status", "docling_page_count",
     "slice_pass_error", "ceiling")
+# These names also live in driver.py's build_totals, so the mirror is only
+# honest while it is checked: a rename there must fail loudly here rather than
+# summarise a real measurement as null. A failed run has no driver totals at all
+# and is therefore exempt.
+if rec:
+    lost = [k for k in driver_keys if k not in totals]
+    if lost:
+        sys.exit("[run] FATAL: driver totals lack " + ", ".join(sorted(lost)))
 file_info = rec.get("file", {}) if rec else {}
 meta = {"pdf": file_info.get("name") or env["G4_PDF"],
         "pdf_bytes": file_info.get("bytes"),
@@ -135,7 +145,8 @@ meta = {"pdf": file_info.get("name") or env["G4_PDF"],
         "measured_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 meta.update({k: totals.get(k) for k in driver_keys})
 # state_error and json_lines describe the harness rather than the container, so
-# they exist only here; every other key is named once, in driver_keys.
+# they exist only here; the rest are the driver's own totals names, projected
+# onto the summary by the checked list above.
 meta.update({"state_error": state_error,
              "json_lines": as_int(env.get("G4_JSON_LINES"))})
 open(env["G4_META"], "w", encoding="utf-8").write(json.dumps(meta, indent=2) + "\n")
@@ -214,14 +225,22 @@ RUN_EXIT=0
 cat "${RUN_DIR}/stderr.log"
 
 CID="$(docker inspect --format '{{.Id}}' "${CTR}" 2>/dev/null || true)"
-OOMKILLED=unknown
-STATE_EXIT=unknown
-STATE_ERR=none
+# Empty means "inspect answered nothing" and serialises as JSON null, so no
+# placeholder string has to be decoded again on the other side of the boundary.
+OOMKILLED=
+STATE_EXIT=
+STATE_ERR=
 HOST_PEAK=
 HOST_SWAP_PEAK=
 if [[ -n "${CID}" ]]; then
-    read -r OOMKILLED STATE_EXIT STATE_ERR < <(docker inspect \
-        --format '{{if .State.OOMKilled}}true{{else}}false{{end}} {{.State.ExitCode}} {{.State.Error}}' "${CTR}")
+    # An already-removed or never-created container makes inspect print nothing.
+    # That answer must degrade to empty fields rather than abort the script here,
+    # which would skip docker rm and the record: under this harness the failure
+    # is the result.
+    STATE_LINE="$(docker inspect \
+        --format '{{if .State.OOMKilled}}true{{else}}false{{end}} {{.State.ExitCode}} {{.State.Error}}' \
+        "${CTR}" 2>/dev/null || true)"
+    read -r OOMKILLED STATE_EXIT STATE_ERR <<<"${STATE_LINE}" || true
     # Out-of-band cgroup peak from the host: survives even if the driver died
     # before it could print its line. Requires read permission on the cgroup.
     # Both leaves live in the same scope directory, so one probe walk covers
@@ -246,7 +265,9 @@ N="$(wc -l <"${RUN_DIR}/${BASE}.raw.jsonl")"
 JSON_LINES="${N}"
 if [[ "${N}" != "1" ]]; then
     echo "[run] FAIL: expected exactly 1 JSON line on stdout, got ${N}" >&2
-    echo "[run] docker_run_exit=${RUN_EXIT} container_exit=${STATE_EXIT} OOMKilled=${OOMKILLED} state_error=${STATE_ERR}" >&2
+    # The wording a human reads stays explicit here; the record itself carries
+    # these fields as null when inspect answered nothing.
+    echo "[run] docker_run_exit=${RUN_EXIT} container_exit=${STATE_EXIT:-unknown} OOMKilled=${OOMKILLED:-unknown} state_error=${STATE_ERR:-none}" >&2
     echo "[run] last 40 stderr lines:" >&2
     tail -40 "${RUN_DIR}/stderr.log" >&2 || true
     emit_meta failed "" "${RESULTS}/${BASE}_${STAMP}.meta.json"
