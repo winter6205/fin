@@ -52,6 +52,7 @@ never reads the environment and never imports FastAPI.
 from __future__ import annotations
 
 import hashlib
+import threading
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,7 +89,7 @@ from fin.retrieve.push_port import PushPort
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from fin.corpus.ingest_state import IngestStateStore
     from fin.corpus.metadata_store import MetadataStore
-    from fin.corpus.object_store import ObjectStore
+    from fin.corpus.object_store import ObjectPointer, ObjectStore
 
 # Overflow class (§B2 第 5 条 / test allocation): the largest upload the
 # endpoint accepts. Oversize is a named 413-class failure, never a
@@ -505,6 +506,12 @@ class IngestEndpoint:
         self._object_store = object_store
         self._metadata_store = metadata_store
         self._state_store = state_store
+        # A per-document submit lock serializes the check-write-read of
+        # submit_durable so two identical uploads cannot both pass the
+        # "no prior job" read and race on the durable write. The guard
+        # protects the registry itself, not any single document.
+        self._submit_locks: dict[str, threading.Lock] = {}
+        self._submit_locks_guard = threading.Lock()
 
     @property
     def push_port(self) -> PushPort:
@@ -742,6 +749,51 @@ class IngestEndpoint:
             period=period,
             doc_type=doc_type,
         )
+        objects, pointers, states = self._durable_stores()
+        version = hashlib.sha256(data).hexdigest()
+        # The key is identity-derived, so re-submitting the same bytes can
+        # never land a second object and a different filename cannot name a
+        # second copy of one version.
+        key = f"filings/{doc_id}/{version}"
+        # Resolved before the lock: a missing media type is a code bug in the
+        # format table, not a storage outage, so it must not be misclassified
+        # as a 503 by the write's except handler.
+        content_type = _FORMAT_CONTENT_TYPES[fmt]
+
+        with self._lock_for(doc_id):
+            prior_pointer = self._known_pointer(doc_id)
+            prior_job = self._known_job(doc_id)
+
+            joined = self._resolve_join(
+                prior_pointer, prior_job, doc_id, version
+            )
+            if joined is not None:
+                return joined
+            self._raise_if_conflict(prior_job, doc_id)
+
+            job = self._persist_accept(
+                objects,
+                pointers,
+                states,
+                key=key,
+                data=data,
+                content_type=content_type,
+                doc_id=doc_id,
+                version=version,
+                prior_pointer=prior_pointer,
+            )
+            return IngestSubmission(
+                document_id=doc_id, version=version, state=job.state
+            )
+
+    def _durable_stores(
+        self,
+    ) -> tuple[ObjectStore, MetadataStore, IngestStateStore]:
+        """The three durable ports, or a typed unconfigured failure.
+
+        The accept writes to all three; a missing one cannot be compensated,
+        so the boundary check happens before any write.
+        """
         objects = self._object_store
         pointers = self._metadata_store
         states = self._state_store
@@ -752,42 +804,88 @@ class IngestEndpoint:
                 "them is not wired",
                 stage="unconfigured",
             )
+        return objects, pointers, states
 
-        version = hashlib.sha256(data).hexdigest()
-        # The key is identity-derived, so re-submitting the same bytes can
-        # never land a second object and a different filename cannot name a
-        # second copy of one version.
-        key = f"filings/{doc_id}/{version}"
-        prior_pointer = self._known_pointer(doc_id)
-        prior_job = self._known_job(doc_id)
+    def _lock_for(self, document_id: str) -> threading.Lock:
+        """The one submit lock for a document, created on first use."""
+        with self._submit_locks_guard:
+            lock = self._submit_locks.get(document_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._submit_locks[document_id] = lock
+            return lock
 
-        if prior_pointer is not None and prior_pointer.sha256 == version:
-            # Duplicate: join the job that owns this version instead of
-            # writing a second object, job row or logical version.
-            if prior_job is not None:
-                return IngestSubmission(
-                    document_id=doc_id,
-                    version=version,
-                    state=prior_job.state,
-                )
+    def _resolve_join(
+        self,
+        prior_pointer: ObjectPointer | None,
+        prior_job: IngestJob | None,
+        document_id: str,
+        version: str,
+    ) -> IngestSubmission | None:
+        """The submission that owns these bytes already, if there is one.
 
-        if prior_job is not None and prior_job.state is not IngestState.FAILED:
-            if prior_job.state is IngestState.READY:
-                raise IngestReplacementUnsupportedError(
-                    f"{doc_id!r} is ready on another version and the upload "
-                    "is not those bytes: the state machine has no edge out of "
-                    "'ready', so the replacement cannot be accepted yet"
-                )
-            raise IngestConcurrentRunError(
-                f"a job for {doc_id!r} is already in state "
-                f"{prior_job.state.value!r}; a different version is not "
-                "accepted while it is in flight"
+        A re-upload of the version the document already points at is an
+        idempotent join onto the existing job — no second object, pointer or
+        job row is written.
+        """
+        if (
+            prior_pointer is not None
+            and prior_pointer.sha256 == version
+            and prior_job is not None
+        ):
+            return IngestSubmission(
+                document_id=document_id,
+                version=version,
+                state=prior_job.state,
             )
+        return None
 
+    def _raise_if_conflict(
+        self, prior_job: IngestJob | None, document_id: str
+    ) -> None:
+        """Reject a version swap the state machine has no edge for.
+
+        A ``failed`` job is not a conflict: the retry edge re-enters it at
+        ``fetching``. A ``ready`` job has no outgoing edge, so replacing it is
+        the typed unsupported error; any other live state is the typed
+        concurrent-run error. Both raise before a write, so nothing lands.
+        """
+        if prior_job is None or prior_job.state is IngestState.FAILED:
+            return
+        if prior_job.state is IngestState.READY:
+            raise IngestReplacementUnsupportedError(
+                f"{document_id!r} is ready on another version and the upload "
+                "is not those bytes: the state machine has no edge out of "
+                "'ready', so the replacement cannot be accepted yet"
+            )
+        raise IngestConcurrentRunError(
+            f"a job for {document_id!r} is already in state "
+            f"{prior_job.state.value!r}; a different version is not "
+            "accepted while it is in flight"
+        )
+
+    def _persist_accept(
+        self,
+        objects: ObjectStore,
+        pointers: MetadataStore,
+        states: IngestStateStore,
+        *,
+        key: str,
+        data: bytes,
+        content_type: str,
+        doc_id: str,
+        version: str,
+        prior_pointer: ObjectPointer | None,
+    ) -> IngestJob:
+        """Write the object, pointer and job in order, compensating on failure.
+
+        Nothing is reported accepted until all three are durable. A failure at
+        any step deletes the object written this attempt (and restores the
+        overwritten pointer), so a rejected upload leaves the document exactly
+        as it was; a compensation that itself fails is the typed cleanup error.
+        """
         try:
-            pointer = objects.put(
-                key, data, content_type=_FORMAT_CONTENT_TYPES[fmt]
-            )
+            pointer = objects.put(key, data, content_type=content_type)
         except Exception as exc:
             raise IngestDurableCommitError(
                 f"the raw object for {doc_id!r} could not be written "
@@ -824,7 +922,9 @@ class IngestEndpoint:
             ) from exc
 
         try:
-            job = self._record_job(states, doc_id, version=version)
+            return self._record_job(states, doc_id, version=version)
+        except IngestDurableCommitError:
+            raise
         except Exception as exc:
             self._discard_rejected_upload(
                 objects=objects,
@@ -839,10 +939,6 @@ class IngestEndpoint:
                 f"({type(exc).__name__})",
                 stage="job_record",
             ) from exc
-
-        return IngestSubmission(
-            document_id=doc_id, version=version, state=job.state
-        )
 
     def job_status(self, job_id: str) -> IngestJobStatus:
         """Report the persisted state of one ingest job.
@@ -883,19 +979,26 @@ class IngestEndpoint:
         A job already in ``failed`` re-enters at ``fetching`` — the retry
         edge the state machine defines — instead of claiming a second
         ``pending`` job for the same document.
+
+        A :class:`DuplicateJobError` here means another submission committed
+        the job between the caller's read and this create. The submit lock
+        makes that impossible within one process, so it can only be a
+        cross-process competitor that already accepted these same bytes; the
+        safe recovery is to join the committed job, never to raise — raising
+        would make the caller delete the shared object the winner depends on.
         """
         try:
             return states.create_job(doc_id)
         except DuplicateJobError:
             job = states.get_job(doc_id)
-            if job.state is not IngestState.FAILED:
-                raise
-            states.transition(
-                doc_id,
-                IngestState.FETCHING,
-                metadata={"replaced_version": version},
-            )
-            return states.get_job(doc_id)
+            if job.state is IngestState.FAILED:
+                states.transition(
+                    doc_id,
+                    IngestState.FETCHING,
+                    metadata={"replaced_version": version},
+                )
+                return states.get_job(doc_id)
+            return job
 
     def _discard_rejected_upload(
         self,
@@ -915,15 +1018,25 @@ class IngestEndpoint:
         """
         try:
             objects.delete(key)
-        except Exception:
-            # ``from cause`` keeps the persistence failure that triggered
-            # the rollback as the cause; the delete's own failure stays as
-            # the implicit context, so both are auditable.
+        except Exception as del_exc:
+            # Both failures must stay recoverable: the persistence failure
+            # that triggered the rollback (``cause``) is the reason this
+            # object is being discarded at all, so it owns the exception
+            # chain; the delete's own failure (``del_exc``) is named in the
+            # message instead. When there is no triggering cause the delete
+            # failure is the whole story and chains itself.
+            chained = cause if cause is not None else del_exc
             raise IngestObjectCleanupError(
                 f"the raw object {key!r} of a rejected upload is orphaned: "
-                "the compensating delete failed after a persistence failure",
+                f"the compensating delete failed "
+                f"({type(del_exc).__name__})"
+                + (
+                    f" after a persistence failure ({type(cause).__name__})"
+                    if cause is not None
+                    else ""
+                ),
                 key=key,
-            ) from cause
+            ) from chained
         if restore is not None:
             try:
                 pointers.put_pointer(document_id, restore)

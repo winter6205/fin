@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -869,6 +870,43 @@ def test_duplicate_submission_joins_the_job_without_a_second_write() -> None:
     assert joined.state is IngestState.READY
     assert len(stack.objects.puts) == 1
     assert stack.states.get_job("DOC-1").state is IngestState.READY
+
+
+def test_concurrent_identical_submissions_join_without_deleting() -> None:
+    # Two uploads of the same bytes racing on one document must both resolve
+    # to the accepted job and never compensate the shared object away: a
+    # loser that deleted the key the winner just committed would fail a
+    # durable accept that already succeeded. The per-document submit lock
+    # serializes the check-write-read, and a lost race joins rather than
+    # raising, so exactly one object lands and none is deleted.
+    stack = _durable_stack()
+    version = hashlib.sha256(_V1_TEXT).hexdigest()
+    key = f"filings/DOC-1/{version}"
+    start = threading.Barrier(2)
+    outcomes: list[object] = []
+    failures: list[BaseException] = []
+
+    def submit() -> None:
+        start.wait()
+        try:
+            outcomes.append(_submit(stack, _V1_TEXT))
+        except BaseException as exc:  # noqa: BLE001 - re-raised in main
+            failures.append(exc)
+
+    threads = [threading.Thread(target=submit) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert failures == [], failures
+    assert len(outcomes) == 2
+    assert {submission.version for submission in outcomes} == {version}
+    assert {submission.job_id for submission in outcomes} == {"DOC-1"}
+    # one object, one job, and no compensating delete of the shared key
+    assert stack.objects.puts == [key]
+    assert stack.objects.deletes == []
+    assert stack.states.get_job("DOC-1").state is IngestState.PENDING
 
 
 def test_different_version_while_in_flight_is_a_typed_conflict() -> None:
