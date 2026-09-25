@@ -25,7 +25,8 @@ committed G4 gold set are not closed by this record.
 
 Default-suite runs on this branch are hermetic except for the `$HOME` leak
 tracked as B6 — three `test_clarify_prompt.py` cases read the operator's real
-`~/.fin/user.md`, and the fix for that lives on its own that pull request, not here. The
+`~/.fin/user.md`. That fix shipped as that pull request and is now on `main` (`eeafbe1`);
+it was re-confirmed live on 2026-09-25 as run 27 below. The
 Postgres-backed runs at 1 and 16 used a
 throwaway container started for this ticket (`fin-g4-t1-pg`, `postgres:16`,
 host port 5433 → container 5432, DEV-only credentials taken from the committed
@@ -540,12 +541,53 @@ is a convention question for the whole ADR set. They are named rather than silen
 carried into the merge, and resolving 1 or 3 means editing someone else's ADR text
 or a validation hook — both outside an attachment ticket's authority.
 
+## Closeout after the merge (runs 27–29, 2026-09-25)
+
+Merging the tracked change was decided on a fresh controlled comparison, not on the numbers
+carried above.
+
+- **Run 27 — the tracked change is still needed on today's `main`, and it works.** Two trees,
+  one command (`uv run --no-sync pytest -q tests/host/test_thread_attach.py
+  tests/host/test_clarify_prompt.py`): main tip `5de7120` without the fixture →
+  **3 failed, 27 passed**, all three in `test_clarify_prompt.py`; the same tip
+  with `edc1a2f` stacked on it (`git merge --no-commit`, and `diff -rq` against
+  the tip shows the tree differs by exactly `tests/conftest.py`, plus
+  `web/dist`/`node_modules`) → **30 passed**. The leak is on the *read* side:
+  `~/.fin/user.md` kept its 508 bytes and its 2026-09-24 02:17 mtime across both
+  runs.
+- **Run 28 — a false alarm about the tracked change, retracted in the same turn.** In the
+  merged tree, `test_ready_attachment_is_read_back_by_a_new_process` failed at
+  `tests/host/test_thread_attachment_durable_postgres.py:108`
+  (`assert _counts(stack)[0] == 1`), and the first comparison seemed to blame the
+  `$HOME` fixture. It does not. Seeding one leftover `fin_thread_attachment` row
+  on a tree **without** the tracked change reproduced the failure at the same line; seeding only
+  a `fin_thread` row did not. The real cause is this suite's own cleanup: `stack`
+  emptied the database at teardown only, so the first case's global row count
+  depended on whatever an earlier interrupted run had left. The comparison had not
+  controlled for that, so "the tracked change broke a T1 test" was wrong and is not carried.
+- **Run 29 — the cause fixed as its own change, RED first.** Added
+  `test_an_interrupted_run_leaves_attachment_rows` (plants the rows a killed
+  process would leave, taking `postgres_url` only so no fixture cleans behind it)
+  and `test_a_fresh_run_clears_rows_left_behind` (asserts a new `stack` starts at
+  `(0, 0, 0)`): **RED** at line 224 with the leftover present, then **GREEN** after
+  `_drop_all_threads()` runs on both sides of the fixture — **7 passed**, run twice
+  in a row, and 7 passed again from a deliberately dirty start. Neighbours
+  `test_thread_attachment_durable.py` + `test_thread_attach.py` → 44 passed. No
+  assertion was removed or weakened; `ruff` is not installed in this venv, so no
+  lint gate ran and the new code matches the file's existing shape by hand.
+
 ## Delivery state
 
-- **that pull request** (this ticket, T1 only): `OPEN / MERGEABLE / CLEAN` against
-  `origin/main` = `7907453`, branch 0 behind — i.e. **awaiting merge**.
-- **PR the tracked pull request** (B6, split out on the
-  operator's request): `OPEN / MERGEABLE`, `main` ← `fix/test-suite-hermetic-home`,
-  1 file, `+38/−0`. Independent of the tracked change; neither blocks the other.
-- Not delivered by either: T2–T5, and with them spec Success Criteria 5–12 plus
-  SC12's committed G4 gold set.
+- **that pull request** (T1): **merged** into `main` as `5de7120`.
+- **that pull request** (B6, split out on the operator's request): **merged** into `main` as
+  `eeafbe1`, after run 27 showed it fixes three red cases on that tip. 1 file,
+  `+38/−0`.
+- The start-state defect found in run 28 is delivered as that pull request (branch
+  `fix/g4-t1-suite-restartable`): test-only, and it marks T1 delivered in
+  `plans/thread-attachment-source-read.md`.
+- Both merged branches were deleted locally and on the remote on the operator's
+  2026-09-25 "做完完整合并就行" instruction.
+- Not delivered by any of them: T2–T5, and with them spec Success Criteria 5–12
+  plus SC12's committed G4 gold set. Still open: B2b's five launcher-acceptance
+  cases (one operator container action away), F1a on the tracked change, and F2's fail-open
+  archived guard.
