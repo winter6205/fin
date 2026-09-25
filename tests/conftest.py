@@ -126,6 +126,44 @@ def _strip_operator_llm_and_mcp_cwd_env(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.delenv("TYPESAFE_BASE_URL", raising=False)
 
 
+@pytest.fixture(scope="session")
+def _hermetic_home(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """One empty HOME reused for the whole default run.
+
+    Several product seams resolve a default path from ``$HOME`` at CALL
+    time and MUST be off the operator's real home in the hermetic run:
+    :func:`fin.host.graph.compile_graph` builds its default
+    ``user_profile_store`` from ``$HOME/.fin/user.md``, and the CLI /
+    HTTP / :meth:`fin.host.user_profile.UserProfileStore.from_env` seams
+    resolve ``$HOME/.fin/default`` the same way (all read
+    ``os.environ["HOME"]`` or ``Path.home()``). A real ``~/.fin/user.md``
+    on a developer box leaked a ``[FIN_USER_PROFILE]`` block into the
+    compiled system prompt and broke
+    ``tests/host/test_clarify_prompt.py``, making the default suite
+    depend on the home directory. An empty per-run home removes that
+    dependency at the single source; it also covers the ``$HOME``-derived
+    workspace defaults, which are the identical root cause.
+    """
+    return tmp_path_factory.mktemp("fin-hermetic-home")
+
+
+@pytest.fixture(autouse=True)
+def _redirect_home_off_operator(
+    _hermetic_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Point ``HOME`` at the empty per-run home for every test.
+
+    Applied per-test rather than once at session start so a sibling that
+    mutates ``HOME`` cannot leak it into the next test — the same
+    reasoning as :func:`_strip_operator_llm_and_mcp_cwd_env`. On POSIX
+    ``Path.home()`` and ``~`` resolve via ``HOME``, so overriding it also
+    neutralises ``Path.home()`` callers. Tests that genuinely need a home
+    set ``HOME`` themselves (via ``monkeypatch``); as a non-autouse
+    fixture/body that runs after this one, their value wins for that test.
+    """
+    monkeypatch.setenv("HOME", str(_hermetic_home))
+
+
 # One row per form the operator should be able to see in the library.
 _MULTI_FORM_ROWS: tuple[tuple[str, str, str], ...] = (
     ("ZEUS-2023-10K", "10-K", "2023 FY"),
