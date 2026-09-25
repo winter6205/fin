@@ -19,7 +19,8 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKTREE="${G4_WORKTREE:-/home/winner/projects/fin-wt-g4-attachment}"
+# Derived from this script's own location so any checkout works.
+WORKTREE="${G4_WORKTREE:-$(cd "${HERE}/../.." && pwd)}"
 IMAGE="${G4_IMAGE:-fin-g4-pipeline:t2a}"
 MODEL_CACHE="${G4_MODEL_CACHE:-$HOME/.cache/fin-g4-docling-models}"
 CEIL_MEM="${G4_CEILING_MEMORY:-4g}"
