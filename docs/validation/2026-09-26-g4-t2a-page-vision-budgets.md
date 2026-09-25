@@ -22,6 +22,13 @@ runtime-dependency decision stays with T2d.
 | `FIN_ATTACHMENT_VISION_CALLS_PER_RUN` | `max_vision_calls_per_run` | `88` |
 | `FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN` | `max_vision_crop_calls_per_run` | `8` |
 
+**These values are provisional, not a shipped default.** Two of the three gold
+cases never reached the pipeline (*Gold cases under the pinned pipeline*), and
+the scanned-page OCR quantity that could invalidate `max_pdf_pages = 80` is
+unmeasured here. What this ticket delivers is a validated, enforced, measured-where-measurable
+starting configuration plus the list of what must be measured before an operator
+authorises it as the product default (*Leftovers* 1, 4, 6, 7).
+
 The values are persisted **only** in `.env.example`. `attachment_budgets.py`
 carries no numeric default: the spec requires a missing limit to fail
 validation, so a default baked into code would be the guessed number the
@@ -140,9 +147,10 @@ What this does and does not invalidate:
   measured under load, used only to order the two page-cap options (which
   differ ~2×, outside the spread) and to show that per-page cost is the
   binding constraint, not total bytes.
-* `driver.py` did not record load or major faults per run, so the runs that
-  mattered were re-measured serially with load captured before and after; see
-  the *Re-runs* rows in the command table.
+* `driver.py` records no load or major-fault figure per run, so the runs that
+  mattered cannot be corrected after the fact. A serial re-measure with load
+  captured before and after is the only clean evidence available and **it has
+  not been run** — *Leftovers* 6 carries it.
 
 ### Extrapolation to the 80-page cap (labelled as extrapolation)
 
@@ -206,26 +214,38 @@ environment; no provider or model identifier is written into
 | 3 | structured JSON | 3,303 ms | 1,413 | 254 | schema-valid |
 
 So the provider takes image input, returns parseable structure, and reports
-usage. `max_vision_crop_calls_per_run = 8` is the observed crop demand of the
-committed gold set: 2 chart-present pages × 4 numeric anchors, i.e. the number
-of question-specific inspections that could each need a higher-resolution look
-after the full-page scan. `max_vision_calls_per_run = 88` is `80 + 8`, exactly
-the minimum the self-consistency rule allows — one full-page scan for every
-admissible page plus that crop headroom.
+usage. That input is a drawn chart image, not a rendered filing page: these
+three calls establish that the configured endpoint accepts an image and reports
+usage, and the per-call latency and token figures are a floor, not a filing-page
+measurement (*Not covered*).
+
+`max_vision_crop_calls_per_run = 8` is **a planning figure, not an observed
+count**. The committed gold set has 2 chart-present pages
+(`g4-mixed-chart-001` page 3, `g4-image-chart-001` page 1) and each of those
+charts carries 4 labelled numeric values that a question could need a
+higher-resolution look at after the full-page scan, so `2 × 4 = 8`. No crop call
+has been made against the provider at all, so this prices an intended behaviour
+rather than a measured demand (*Not covered*). A retried crop is another call
+and draws from the same 8, so `max_vision_calls_per_run = 88` — `80 + 8`, exactly
+the minimum the self-consistency rule allows — buys crop **and** retry headroom
+out of one pool of 8, and nothing more.
 
 ## Validation seam
 
-`src/fin/host/attachment_budgets.py` (new, 222 lines): a frozen four-field
+`src/fin/host/attachment_budgets.py` (new, 226 lines): a frozen four-field
 `AttachmentBudgets`, `from_environ` requiring all four keys, `validate`
 enforcing positivity, an upper bound at `sys.maxsize`, and
 `calls >= pages + crop`, and `preflight_run(budgets, admitted_pages,
-requested_crop_calls)` which refuses a run **before** any page is skipped and
-maps the two violations onto the only outward codes the module owns:
+requested_crop_calls)` which checks the page cap per attachment, then the crop
+headroom on its own, then the run total — all **before** any page is skipped —
+and maps the two violations onto the only outward codes the module owns:
 `attachment_page_limit_exceeded` and `attachment_vision_budget_exceeded`. A
-config failure has no outward code (spec's closed list), so
+run asking for more crops than the headroom is refused even when `pages +
+crops` still fits the run budget, because the fourth bound is a deployed price,
+not a suggestion. A config failure has no outward code (spec's closed list), so
 `AttachmentBudgetConfigError` is internal by contract.
 
-Tests: `tests/host/test_attachment_budgets.py`, 105 cases. The three
+Tests: `tests/host/test_attachment_budgets.py`, 109 cases. The three
 deployed-bound cases bind `.env.example` to the two measured data files, so
 the numbers cannot drift from their evidence unnoticed:
 
@@ -243,6 +263,9 @@ the numbers cannot drift from their evidence unnoticed:
 | 4 | same, after `.env.example` | 0 | 105 passed |
 | 5 | `python -m py_compile src/fin/host/attachment_budgets.py tests/host/test_attachment_budgets.py scripts/g4_upload_distribution.py scripts/g4_vision_probe.py` | 0 | the repo has no ruff/mypy gate; compile is the typecheck seam |
 | 6 | `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_mcp_t2.py tests/retrieve/test_live_mcp_t3.py tests/retrieve/test_live_mcp_t4.py tests/retrieve/test_live_mcp_t5.py tests/retrieve/test_live_mcp_read_source.py tests/retrieve/test_live_research_cite_on_ingest.py tests/retrieve/test_live_host_graph_hop.py` | 0 | 11 passed in 36.65 s |
+| 7 | `uv run --no-sync pytest -q tests/host/test_attachment_budgets.py -k crop` (RED: the fourth bound was documented but not enforced) | 1 | 3 failed `DID NOT RAISE AttachmentVisionBudgetExceeded`, 1 passed |
+| 8 | `uv run --no-sync pytest -q tests/host/test_attachment_budgets.py` | 0 | 109 passed |
+| 9 | `uv run --no-sync pytest -q tests/host` | 0 | 1860 passed, 60 skipped, 227 deselected in 124.08 s; the skips are the pre-existing `FIN_CHECKPOINT_URL` and `web/dist` gates |
 
 Run 6 is the real-boundary check: it spawns the compiled iknow-memory stdio
 server (`/home/winner/projects/iknow-memory/dist/index.js`, built 2026-09-25)
@@ -269,10 +292,65 @@ nothing in T2a regressed it. A budget-specific live case is deliberately not
 invented here, and this is not the G4 gold run the plan's *End of round*
 requires.
 
-Pipeline and provider commands and their per-case results are recorded by
-`scripts/g4_pipeline/` (§Basis above for the recorded metas).
+### Gold cases under the pinned pipeline
 
-<!-- GOLD-ROWS: filled from scripts/g4_pipeline/results/g4_t2a_gold_summary.json -->
+`scripts/g4_pipeline/run_measured.sh data/corpus/g4_attachment_gold/<case>` for
+each of the three committed gold cases, in the same ceiling as the corpus runs
+above. The numbers below are read out of the committed
+`scripts/g4_pipeline/results/*.meta.json`; there is no summary file, and the
+metas are the record.
+
+| case | pages | bytes | cgroup peak | `VmHWM` | OOM / exit | total ms | text / table / figure | state |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `g4-mixed-chart-001.pdf` | 3 | 35,324 | 1,671,122,944 | 1,402,855,424 | 0 / 0 | 31,823.1 | 24 / 0 / 2 | measured |
+| `g4-scanned-001.pdf` | 3 | 677,716 | — | — | — | — | — | **not measured** |
+| `g4-image-chart-001.png` | 1 | 40,419 | — | — | 1 (not OOM) | — | — | **rejected by the harness** |
+
+* `g4-mixed-chart-001.pdf` is the load-bearing gold case for the crop bound:
+  Heron returned `figure = 2` over its 3 pages, and `pages_needing_ocr = 0`. Its
+  chart-page count is what `max_vision_crop_calls_per_run = 8` is priced against.
+
+#### Expected versus actual on the one measured case
+
+Expectations are the committed `per_page` entries of
+`data/corpus/g4_attachment_gold/manifest.json`; actuals are the page records of
+`scripts/g4_pipeline/results/g4-mixed-chart-001_20260925T174114Z/g4-mixed-chart-001.measured.jsonl`.
+
+| page | expected | actual | verdict |
+| --- | --- | --- | --- |
+| 1 | text + figure, no OCR, 449 native chars | text 14 / figure 1, `ocr_used` false, 460 native chars | as expected |
+| 2 | text + **table**, no OCR, 1,181 native chars | text 5 / **table 0**, `ocr_used` false, 1,111 native chars | **miss** — Heron found no table region on a condensed statement page |
+| 3 | text + figure, **OCR expected** for the figure only (chart title, 4 period labels, 4 value labels and the source line are pixels), 334 native chars | text 5 / figure 1, **`ocr_required_by_repo_rule` false, `ocr_used` false**, 337 native chars | **miss** — the chart's pixel text was never read |
+
+Neither miss is a budget problem, and both belong to T2d rather than being
+silently absorbed here:
+
+* Page 3 is a rule conflict, not a model failure.
+  `detect_ocr_required` (`src/fin/corpus/ocr.py:141-152`) fires only when the
+  text layer is under `min_text_chars = 100` **and** the page has an image, so a
+  page carrying 337 native characters can never be OCR'd even when its figure
+  region is pure pixels. The measured run proves the rule as written does not
+  meet the gold expectation, and the manifest's `ocr_scope` ("the figure region
+  only") requires region-scoped OCR that the page-level trigger cannot express.
+* Page 2 is the same recall problem already recorded as `known_gaps[0]`: one
+  figure in 72 pages of `2023_Q1_MSFT.pdf`, and now 0 tables on a statement page
+  that is one. This is further reason the spec's full-page scan rule is not
+  optional.
+* `g4-scanned-001.pdf` did not finish. The harness rendered page bitmaps and
+  wrote no meta, so no CPU-time or resident-peak figure for a scanned page is
+  claimed anywhere in this record (*Not covered*, *Leftovers* 4).
+* `g4-image-chart-001.png` failed in the harness, not in the ceiling:
+  `run_measured.sh` hands its argument to `pypdfium2.PdfDocument`, which raises
+  `PdfiumError: Failed to load document (PDFium: Data format error)` on a bare
+  PNG. The pinned pipeline as driven here takes PDF input only, so a
+  non-PDF attachment has no measured preparation cost. That is T2d's input-path
+  decision, recorded as *Leftovers* 7; it does not move any of the four bounds,
+  because an image is one page and its upload size is covered by the byte
+  distribution.
+
+All three cases together are 7 pages, so
+`test_deployed_bounds_prepare_every_gold_case_in_one_run` prices
+`7 + 8 = 15` calls against the `88` run budget and passes.
 
 ## Not covered by this record
 
@@ -336,3 +414,23 @@ Pipeline and provider commands and their per-case results are recorded by
    are not comparable to a dedicated 4 GB machine, and the operator who
    authorises these four values as the shipped default should read them as
    *bounded and consistent*, not as *fast*.
+6. **The latency re-measure under a quiet host has not been run.** The pinned
+   runs above share four cores with other work, so no millisecond figure here is
+   a device specification.
+
+   ```text
+   Validation:
+   - Not run: host load at 8.5 on 4 cores at record time; a serial re-run would
+     be contaminated by the same contention that produced the 4x spread.
+   - Expected command: scripts/g4_pipeline/run_measured.sh \
+       data/corpus/g4_attachment_gold/g4-mixed-chart-001.pdf
+     with `cat /proc/loadavg` and `grep -E "^pswpout|^pgmajfault" /proc/vmstat`
+     captured immediately before and after, on an otherwise idle machine.
+   - Blocking issue: no idle 4-core host available to this ticket.
+   ```
+
+7. A bare image has no measured preparation cost, because the harness only
+   drives PDF inputs (see the `g4-image-chart-001.png` row above). T2d owns the
+   non-PDF input path — whether an image is wrapped into a one-page document
+   before Docling or sent straight to the OCR/vision step — and must measure it
+   rather than reuse these PDF figures.
