@@ -232,12 +232,16 @@ accepted but **not applied**: `memory.swap.max` reads `max` (the driver records 
 `cgroup_memory_swap_max_bytes: -1`). Swap *usage* is still accounted, and it is nonzero where
 it matters. `memory.peak` counts memory charged to the cgroup, not the bytes the kernel moved
 out, so on this host the 4 GiB-relevant footprint of a run is its `memory.peak` plus its swap,
-and `VmSwap` has to be read rather than assumed away. Eight of the ten metas tracked under
+and `VmSwap` has to be read rather than assumed away. Twelve of the fourteen metas tracked under
 `results/` do report `proc_vmswap_bytes = 0` and `cgroup_memory_swap_current_bytes = 0` — the
-six `2023_FY_GOOG.pdf` runs (`…T164419Z`, `…T170133Z`, `…T170956Z`, `…T184410Z`, `…T195408Z`,
-`…T204930Z`) and both `g4-mixed-chart-001` runs (`…T174114Z`, `…T204952Z`), all of them one to
-three pages — while the non-PDF rejection
-meta (`g4-image-chart-001.png…T195253Z`) records `null` for both because it measured nothing.
+seven `2023_FY_GOOG.pdf` runs (`…T164419Z`, `…T170133Z`, `…T170956Z`, `…T184410Z`, `…T195408Z`,
+`…T204930Z`, `…T220516Z`), the three `g4-mixed-chart-001` runs (`…T174114Z`, `…T204952Z`,
+`…T220537Z`) and both `g4-scanned-001` runs (`…T185551Z`, `…T205348Z`), all of them one to three
+pages. The scanned pair is the whole-tree case worth naming: its 63 to 68 minutes of
+render-plus-OCR work runs mostly in a Tesseract child process, and
+`memory.swap.current` still read 0 at the end of each run. The non-PDF
+rejection meta (`g4-image-chart-001.png…T195253Z`) records `null` for both because it measured
+nothing.
 The load-bearing run is the exception:
 `2023_Q1_MSFT_20260925T171056Z.meta.json`, the 72-page conversion, reports
 `proc_vmswap_bytes = 182738944` with `cgroup_memory_swap_current_bytes = 275591168`. Both are

@@ -22,13 +22,18 @@ runtime-dependency decision stays with T2d.
 | `FIN_ATTACHMENT_VISION_CALLS_PER_RUN` | `max_vision_calls_per_run` | `88` |
 | `FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN` | `max_vision_crop_calls_per_run` | `8` |
 
-**These values are provisional, not a shipped default.** Two of the three gold
-cases have no committed pipeline measurement here (*Gold cases under the pinned
-pipeline*), and the scanned-page OCR quantity that could invalidate
-`max_pdf_pages = 80` is unmeasured here. What this ticket delivers is a
-validated, enforced, measured-where-measurable starting configuration plus the
-list of what must be measured before an operator authorises it as the product
-default (*Leftovers* 1, 4, 6, 7, 9).
+**These values are provisional, not a shipped default.** One of the three gold
+cases has no committed pipeline measurement here — the bare PNG, which the
+harness's PDF-only input path refuses (*Gold cases under the pinned
+pipeline*) — and the scanned-page OCR quantity that could invalidate
+`max_pdf_pages = 80` is now measured: ~22 min of CPU OCR per page on this host.
+That figure does not move the cap. It binds every corpus-covering cap the same
+way, because no page limit that still admits this corpus makes a scanned filing
+fast, so the lever is T2d's OCR configuration rather than a number in this
+table. What this ticket delivers is a validated, enforced,
+measured-where-measurable starting configuration plus the list of what must be
+measured before an operator authorises it as the product default
+(*Leftovers* 1, 4, 6, 7, 9).
 
 The values are persisted **only** in `.env.example`. `attachment_budgets.py`
 carries no numeric default: the spec requires a missing limit to fail
@@ -129,9 +134,9 @@ render-plus-OCR pass `17,369.3 ms` (`241 ms/page`, with 0 pages needing OCR in
 this native-text file); Heron regions over 72 pages: 790 text, 55 table,
 **1 figure**; 222,233 native text characters.
 
-Model load, not page count, dominates the floor: the four 1-page runs that
-completed both passes peaked between 1,234,628,608 and 1,301,147,648 B, i.e.
-within 5.4% of each other and 1.15–1.21 GiB before the per-page term is worth
+Model load, not page count, dominates the floor: the five 1-page runs that
+completed both passes peaked between 1,234,628,608 and 1,304,858,624 B, i.e.
+within 5.7% of each other and 1.15–1.22 GiB before the per-page term is worth
 anything.
 
 ### Measurement conditions (they bound every latency figure here)
@@ -152,16 +157,49 @@ pswpout 4408871          # ≈ 16.8 GiB written out since boot
 pgmajfault 817456
 ```
 
-Four unrelated agent processes (`qodercn`, 0.5 GiB each) and the iknow-memory
-Elasticsearch/Neo4j containers share those four cores, and each pipeline
-container was given `--cpus=4`, i.e. one whole host, so two concurrent runs
-contend 1:1. The same 1-page input measured 15,013.3 ms, 29,171.3 ms,
+Four unrelated agent processes (`qoderclicn`, 0.4–1.0 GiB each) and the
+iknow-memory Elasticsearch/Neo4j containers share those four cores, and each
+pipeline container was given `--cpus=4`, i.e. one whole host, so two concurrent
+runs contend 1:1. The same 1-page input measured 15,013.3 ms, 29,171.3 ms,
 16,407.2 ms, and 10,402.8 ms across the four runs that completed both model
 passes (`…T170956Z`, `…T184410Z`, `…T195408Z`, `…T204930Z`) — a 2.8× spread on
 identical input, and a 1.8× spread on the warm per-page conversion
 inside those runs (3,571.1 / 6,074.1 / 5,942.4 / 3,374.5 ms). Contention, not
-variance in the input; `driver.py` records no load figure for any of them,
-which is *Leftovers* 6.
+variance in the input; `driver.py` records no load figure for any of them.
+
+### The quiet-host re-measure, and how quiet this host gets
+
+*Leftovers* 6's owed evidence was run after the scanned case finished, serially
+and with the load captured around it
+(`scripts/g4_pipeline/results/serial_remeasure_20260925T220516Z.txt`, one
+`[run] summary:` line per run, so the latencies below are the tracked metas' own):
+
+| run | 1-min load before / after | total ms | Docling whole doc | warm per-page ms | `VmHWM` |
+| --- | --- | --- | --- | --- | --- |
+| `2023_FY_GOOG.pdf` `…T220516Z` | 2.78 / 3.01 | 9,891.4 | 8,077.2 | 1,679.9 | 1,304,858,624 |
+| `g4-mixed-chart-001.pdf` `…T220537Z` | 3.01 / 3.25 | 20,099.9 | 12,005.2 | 2,568.1 | 1,450,414,080 |
+
+What it buys and what it does not:
+
+* The 1-page total, 9,891.4 ms, is the fastest of the five runs of that input and
+  sits just under the quietest contended one (10,402.8 ms), so the contended set
+  was not inflated much at the *whole-run* level — model load is not what the
+  cores were fighting over.
+* The **warm per-page** term is where contention showed: 1,679.9 ms at load 2.78
+  against a 3,374.5 ms best and 6,074.1 ms worst under load 15.9, i.e. the
+  contended runs overstated the steady-state page by roughly 2–3.6×. Every
+  per-page millisecond figure in this record is therefore an **upper bound**,
+  including the `11,526.9 ms/page` that produces the `≈ 19.9 min` end-to-end
+  estimate, and the estimate is conservative by a factor of about two rather
+  than optimistic.
+* Content metrics did not move: the mixed re-run again returned `24 / 0 / 2`
+  regions and `1,908` native characters, identical to both earlier runs of that
+  file.
+* This is **not** the dedicated 4 GB device reading. The captured window shows a
+  1-minute load of 2.78 to 3.25 on 4 cores with **4,096 MiB of swap already in
+  use** and 936,751 major faults since boot on the backing VM — the quietest this
+  machine gets while a session is open, not an idle machine and not a 4 GB
+  device. *Leftovers* 5 and 6 keep that distinction.
 
 What this does and does not invalidate:
 
@@ -174,10 +212,13 @@ What this does and does not invalidate:
   `40` row is the same per-page rate over half the pages, so contention moves
   both options together. What the figures do establish is that per-page cost is
   the binding constraint, not total bytes.
-* `driver.py` records no load or major-fault figure per run, so the runs that
-  mattered cannot be corrected after the fact. A serial re-measure with load
-  captured before and after is the only clean evidence available and **it has
-  not been run** — *Leftovers* 6 carries it.
+* `driver.py` records no load or major-fault figure per run, so the runs above
+  cannot be corrected after the fact. The serial re-measure with load captured
+  around it **has now been run** (*The quiet-host re-measure, and how quiet this
+  host gets*): it puts the contended per-page figures at roughly 2–3.6× the
+  quiet-host rate, which is why they are used only to order the two page-cap
+  options and never as a device specification. What remains open is the part a
+  shared host cannot settle — *Leftovers* 6.
 
 ### Extrapolation to the 80-page cap (labelled as extrapolation)
 
@@ -193,8 +234,13 @@ ceiling                                                = 4,294,967,296 B  = 4.00
 margin                                                 =   563,341,584 B  = 13.1%
 ```
 
-So `max_pdf_pages = 80` fits a 4 GiB device with ~13% margin on the strict
-(plus-swap) reading, **but the 80-page point itself was never run** — it is
+The baseline is the largest peak among the four runs made under load
+(`…T170956Z`). Substituting the quiet-host run's marginally larger
+`1,304,858,624` moves the plus-swap total by ~412 KB against a 563 MB margin —
+0.01% of the ceiling — so which 1-page run is subtracted is not what the decision
+rests on.
+
+So `max_pdf_pages = 80` fits a 4 GiB device with ~13% margin on the strict(plus-swap) reading, **but the 80-page point itself was never run** — it is
 11% beyond the largest measurement. That is the residual risk of this ticket
 and is listed under *Leftovers*.
 
@@ -233,15 +279,16 @@ without a code change, which is the mitigation `40` would otherwise have
 provided by fiat.
 
 Two rows of that table need a caveat rather than a number. Both latency columns
-exclude OCR, because the file that reached 72 pages needed none; and the
-scanned-page OCR cost is unmeasured on this host (*Not covered*). A page cap is
-not the lever for OCR: if a scanned page really costs minutes of CPU, no value
-in the corpus-covering range makes an 80-page — or a 10-page — scanned filing
-feasible, and the fix belongs to T2d's render DPI, `--psm`, and
-skip-OCR-when-native-text choices. Setting `max_pdf_pages` from an unmeasured
-quantity would be exactly the guessed limit this ticket forbids, so the cap
-rests on the two things that were measured: the enforced 4 GiB resident ceiling
-and the real page/byte distribution.
+exclude OCR, because the file that reached 72 pages needed none; the scanned
+case, which does, cost `≈ 21.9 min` of render-plus-OCR per page at the mean of
+its two runs (*Gold cases under the pinned pipeline*), so an 80-page scanned
+filing is `80 × 21.9 min ≈ 29 h` and a 10-page one is already `≈ 3.6 h`. A page
+cap is therefore not the lever for OCR: no value in the corpus-covering range
+makes a scanned filing feasible, and the fix belongs to T2d's render DPI,
+`--psm`, language set, and skip-OCR-when-native-text choices. The cap was not
+set from this quantity in any case — it rests on the two things that do bound it,
+the enforced 4 GiB resident ceiling and the real page and byte distribution, both
+measured.
 
 ## Basis: the configured vision provider
 
@@ -376,6 +423,11 @@ the numbers cannot drift from their evidence unnoticed:
 | 19 | `uv run --no-sync pytest -q tests/host/test_attachment_budgets.py` | 0 | 109 passed, after the harness edits (the module under test is untouched by them) |
 | 20 | `scripts/g4_pipeline/run_measured.sh data/corpus/pdf/2023_FY_GOOG.pdf` | 0 | after the gap-semantics repair; `results/2023_FY_GOOG_20260925T204930Z*`, 186 field paths against `…T195408Z` with exactly one out and one in |
 | 21 | `scripts/g4_pipeline/run_measured.sh data/corpus/g4_attachment_gold/g4-mixed-chart-001.pdf` | 0 | `results/g4-mixed-chart-001_20260925T204952Z*`; `pdf_image_objects 1 / 0 / 1`, page PNG bytes and `regions_total 24 / 0 / 2` identical to `…T174114Z` |
+| 22 | `scripts/g4_pipeline/run_measured.sh data/corpus/g4_attachment_gold/g4-scanned-001.pdf` | 0 | first scanned run to complete under the ceiling (`…T185551Z`), 64.6 min; produced by the harness one revision before the gap-semantics repair, which is why it is kept as the pair's second witness rather than as the primary record |
+| 23 | same command again, detached so the 10-minute tool timeout could not kill it mid-run | 0 | `results/g4-scanned-001_20260925T205348Z*`, 69.7 min; every content field identical to run 22, and its meta carries `json_lines` and `state_error`, which run 22's predates |
+| 24 | `scripts/g4_pipeline/run_measured.sh data/corpus/pdf/2023_FY_GOOG.pdf` then `… data/corpus/g4_attachment_gold/g4-mixed-chart-001.pdf`, serially, each with `/proc/loadavg`, `free -m` and `/proc/vmstat` captured around it | 0 / 0 | `results/serial_remeasure_20260925T220516Z.txt` plus the two run dirs it names; the quiet-host figures in *The quiet-host re-measure* |
+| 25 | `uv run --no-sync pytest -q tests/host/test_attachment_budgets.py` then `uv run --no-sync python -m py_compile scripts/g4_pipeline/driver.py scripts/g4_vision_probe.py scripts/g4_upload_distribution.py && bash -n scripts/g4_pipeline/run_measured.sh scripts/g4_pipeline/build.sh`, after committing the scanned and serial artifacts | 0 / 0 | 109 passed; the round's diff is records and artifacts only, so this is the unchanged-module guard rather than new evidence |
+| 26 | python one-liner: flatten each scanned run's first `measured.jsonl` tree to leaf paths, intersect, drop paths matching `memory_checkpoints\|latency\|t_monotonic\|vmhwm\|vmrss\|vmpeak\|vmss\|vmswap\|cgroup\|oom\|peak_rss\|swap`, compare the rest | 0 | 436 and 433 leaves, 312 content leaves, 0 differing — the measurement behind *measured twice* above |
 
 Run 6 is the real-boundary check: it spawns the compiled iknow-memory stdio
 server (`/home/winner/projects/iknow-memory/dist/index.js`, built 2026-09-25)
@@ -413,14 +465,14 @@ directory, an aggregate file — is evidence for a figure in this document.
 | case | pages | bytes | cgroup peak | `VmHWM` | OOM / exit | total ms | text / table / figure | state |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `g4-mixed-chart-001.pdf` | 3 | 35,324 | 1,671,122,944 | 1,402,855,424 | 0 / 0 | 31,823.1 | 24 / 0 / 2 | measured |
-| `g4-scanned-001.pdf` | 3 | 677,716 | — | — | — | — | — | **no committed measurement** |
+| `g4-scanned-001.pdf` | 3 | 677,716 | 1,337,163,776 | 1,568,075,776 | 0 / 0 | 4,179,289.7 | 0 / 4 / 0 | measured, twice |
 | `g4-image-chart-001.png` | 1 | 40,419 | — | — | 1 (not OOM) | — | — | **rejected by the harness** |
 
 * `g4-mixed-chart-001.pdf` is the load-bearing gold case for the crop bound:
   Heron returned `figure = 2` over its 3 pages, and `pages_needing_ocr = 0`. Its
   chart-page count is what `max_vision_crop_calls_per_run = 8` is priced against.
 
-#### Expected versus actual on the one measured case
+#### Expected versus actual on the mixed case
 
 Expectations are the committed `per_page` entries of
 `data/corpus/g4_attachment_gold/manifest.json`; actuals are the page records of
@@ -448,16 +500,32 @@ silently absorbed here:
   figure in 72 pages of `2023_Q1_MSFT.pdf`, and now 0 tables on a statement page
   that is one. This is further reason the spec's full-page scan rule is not
   optional.
-* `g4-scanned-001.pdf` has no committed measurement. Attempts on this host got
-  as far as rendering page bitmaps, and what they left under `results/` is
-  untracked — one meta with `json_lines: 0` and no peak, plus a later directory
-  whose meta and JSONL do carry figures — so **no pipeline-measured cost of any
-  kind — wall time, CPU time, or resident peak — is claimed for a scanned
-  page.** The two scanned-page time figures that *do* appear, in *Not covered*,
-  are stopwatch observations of a killed attempt with no artifact behind them,
-  and are labelled there as such. The bitmaps under `pages/` are gitignored
-  derivatives reproducible from the committed fixture; *Leftovers* 4 stays open
-  until a scanned-page run's meta and timer artifact are committed together.
+* `g4-scanned-001.pdf` is measured twice, and the two runs disagree only about
+  time and about where in the run the peak landed.
+  `…T185551Z` was produced by the harness before the gap-semantics repair
+  and `…T205348Z` after it. Every content metric is identical: page PNG sha256
+  `4cea21df…`, `1bd502f7…`, `a5d35ac2…`, `ocr_text_char_count`
+  5,570 / 3,842 / 5,978 (15,390 for the file), Heron regions `0 / 4 / 0`, and
+  `pages_needing_ocr = 3`. The render-plus-OCR pass cost 3,790,099.3 ms and
+  4,089,528.9 ms, i.e. `≈ 21.9 min` per page at the mean of the two. Neither run
+  came near the ceiling — `VmHWM` 1,444,216,832 and 1,568,075,776 with `VmSwap`
+  0 and `oom_kill_events_in_cgroup = 0` — so at this size OCR is a time cost, not
+  a memory cost. `VmHWM` is the driver process's own high-water mark and does not
+  cover the Tesseract child that does the OCR work; `cgroup_peak_bytes` counts
+  the whole tree, which is why both are quoted and why the margin arithmetic in
+  *Extrapolation* uses `VmHWM + VmSwap` only as the strictest reading available
+  to it. The two runs are committed as a pair so the claim can be checked
+  field by field rather than read from this summary: flattened, their
+  `measured.jsonl` trees have 436 and 433 leaf paths, and 312 of those are
+  content once timings and memory counters are excluded — all 312 identical.
+  What does differ is harness-side: the older tree carries
+  `pages[].native_text_codepoints`, a field the driver no longer emits, and its
+  `oom_killed_source` still reads
+  `docker inspect .State.OOMKilled (cgroup counter kept alongside)` where the
+  gap-semantics repair replaced that guess with
+  `cgroup memory.events oom_kill counter`. The older meta likewise carries 33
+  keys instead of 35, `json_lines` and `state_error` being harness-side and
+  postdating it.
 * `g4-image-chart-001.png` failed in the harness, not in the ceiling:
   `run_measured.sh` hands its argument to `pypdfium2.PdfDocument`, which raises
   `PdfiumError: Failed to load document (PDFium: Data format error)` on a bare
@@ -471,6 +539,38 @@ silently absorbed here:
 All three cases together are 7 pages, so
 `test_deployed_bounds_prepare_every_gold_case_in_one_run` prices
 `7 + 8 = 15` calls against the `88` run budget and passes.
+
+#### Expected versus actual on the scanned case
+
+Expectations are the same committed `per_page` entries; actuals are the page
+records of both `scripts/g4_pipeline/results/g4-scanned-001_20260925T*` runs,
+which agree exactly on every field below, so one row describes two runs.
+
+| page | expected | actual | verdict |
+| --- | --- | --- | --- |
+| 1 | no native text, OCR expected, text + table, quote `CONDENSED CONSOLIDATED BALANCE SHEETS (Unaudited)` | native 0, `ocr_required_by_repo_rule` true, `ocr_used` true (trigger `repo_rule`), 5,570 OCR chars whose committed sample opens with the quote verbatim, text **0** / table 1 | OCR as expected; **text-region miss** |
+| 2 | no native text, OCR expected, **text only**, quote `Notes to Condensed Consolidated Financial Statements (Unaudited)` | native 0, `ocr_used` true, 3,842 chars with the quote verbatim in the sample, text **0** / table **1** | OCR as expected; **two-way region miss** — a prose page returned a table and no text |
+| 3 | no native text, OCR expected, text + table, quote `Total net sales $ 81,797 $ 82,959 $ [private source value removed] $ 304,182` | native 0, `ocr_used` true, 5,978 chars, text **0** / table 2 | table as expected, text missing; **quote not checkable here** — the record keeps a 160-char sample and the row sits below it |
+
+Three things this establishes, none of them a budget question:
+
+* The repo's OCR trigger behaves correctly on a genuinely scanned page: every
+  page has `native_text_char_count = 0`, so `detect_ocr_required` fires and OCR
+  runs. That is the opposite of the mixed case's page 3, where a real text layer
+  hid pixel text — the two together are why the rule needs a region-level
+  counterpart (T2d) rather than a different threshold.
+* Heron's `text`-class recall on a rasterised page is **0 of 3** at this pin, and
+  it declares a table on a page the manifest says has none. The readable payload
+  of a scanned page came from OCR alone, so T2d cannot use region kinds as the
+  signal that a scanned page has been read.
+* The expensive call is named, not guessed: `src/fin/corpus/ocr.py:126` passes
+  the rendered PNG to `image_to_string(source, lang="chi_sim+eng")` with **no
+  `config` argument**, so Tesseract's default page-segmentation mode 3 runs on a
+  1700 × 2200, 200 dpi bitmap. That parameterisation is what the ~22 min/page
+  figure prices. The manifest's expected quotes were pinned at 150 dpi with
+  `--psm 6`, which is a different call from the one the shipped engine makes — so
+  the ~22 min/page figure and the reproduced quotes are both true of the pipeline
+  as configured, and neither is a bound on what T2d will choose to run.
 
 ### Two field-provenance corrections found while repairing the harness
 
@@ -614,24 +714,26 @@ Two runs prove this round moved no measurement:
   therefore whether the crop trigger fires at all: the crop *cost* is measured on
   the committed chart image, the crop *trigger* is not, because nothing asks a
   question of a page yet.
-* OCR cost on a genuinely scanned file at scale: the 72-page measurement had
-  `pages_needing_ocr = 0`, so the per-page parse figure above never included
-  OCR. No scanned-case run on this host left a committed meta, and
-  **scanned-page OCR cost is therefore unmeasured here** — the largest open
-  quantity in this ticket (*Leftovers* 4).
+* OCR cost for a **corpus-sized** scanned filing. What is measured is 3 pages,
+  twice, agreeing to the character; the `≈ 29 h` for an 80-page scanned filing in
+  *Extrapolation to the 80-page cap* is that per-page figure multiplied out, not
+  a run that happened. No scanned document of more than 3 pages was run here, so
+  the OCR term is extrapolated exactly as the 80-page memory point is
+  (*Leftovers* 1 and 4), with the same shape of risk: linear in pages, no
+  super-linear term observed anywhere in the four measured files, one fixture.
 
-  Two time figures were observed while those attempts were running, and neither
-  has a committed timer artifact behind it, so they are stated here as
-  observations that motivated the abort, not as measurements: CPU Tesseract at
-  the pinned configuration appeared to burn of the order of ten minutes of CPU
-  on page 1 of 3 and was still running when it was killed, and a separate
-  single-image run on a 1200 × 746 PNG took of the order of fifteen to twenty
-  minutes of wall time at about half of one core. What *is* committed for the
-  second one is its command line and exit status
-  (`scripts/g4_pipeline/results/g4-image-chart-001_tesseract_20260925T174249Z/command.txt`);
-  no timing was captured. With 3.9 GiB of swap in use and 817,456 major faults
-  on the backing VM, even the order of magnitude cannot be attributed to the OCR
-  algorithm rather than to the host.
+  Two time figures were observed while earlier attempts were being killed, and
+  they are now replaced by committed runs rather than withdrawn: CPU Tesseract at
+  the pinned configuration appeared to burn of the order of ten minutes of CPU on
+  page 1 of 3 and was still running when it was killed, which the measured
+  12–30 min/page render-plus-OCR pass confirms and sharpens. A separate
+  single-image run on a 1200 × 746 PNG — of the order of fifteen to twenty
+  minutes of wall time at about half of one core — is still committed with only
+  its command line and exit status
+  (`scripts/g4_pipeline/results/g4-image-chart-001_tesseract_20260925T174249Z/command.txt`)
+  and no timing. That is a bare-image OCR path, which the PDF-only harness does
+  not drive at all (*Leftovers* 7), so the two scanned-page runs do not speak for
+  it and it stays an observation, labelled as one.
 * Whether Heron's figure boxes cover the charts a filing actually contains.
   `1 figure in 72 pages` of `2023_Q1_MSFT.pdf` against `55` table regions says
   the answer is *no* for this corpus, which is why the spec's full-page scan
@@ -657,14 +759,22 @@ Two runs prove this round moved no measurement:
    so it fails `attachment_vision_budget_exceeded` by design. There is no
    per-message attachment-count limit in the product, so the guidance to send
    one large filing per turn belongs to T2b's composer work.
-4. **Scanned-page OCR is unquantified**, and it is the only cost in the
-   pipeline that could make the 80-page cap unusable in practice. Re-measure one
-   scanned page on an idle 4 GB device — with `VmHWM`, CPU-time, major faults,
-   render DPI, and `--psm` recorded, and with a timer artifact committed
-   alongside the command line — before T2d picks a rendering configuration from
-   these numbers. The `≈ 19.9 min` end-to-end figure in the cap comparison is a
-   parse-plus-full-page-scan extrapolation for a file that needed **no** OCR, so
-   it does not cover an OCR-bearing file at all.
+4. **Scanned-page OCR is now quantified, but the configuration it quantifies is
+   one nobody chose.** Two runs of the 3-page scanned fixture agree to the
+   character and cost `≈ 21.9 min` of render-plus-OCR per page, which prices an
+   80-page scanned filing at `≈ 29 h` and a 10-page one at `≈ 3.6 h`. That number
+   is a measurement of `lang="chi_sim+eng"` passed with **no `--psm` argument**
+   (Tesseract's own default, mode 3) over a 200 dpi bitmap: the call
+   `src/fin/corpus/ocr.py:126` makes today, not a configuration T2d picked. What
+   T2d owes, before any of the four bounds is authorised as a shipped default:
+   re-measure one scanned page at a deliberate render DPI, `--psm`, and language
+   set, with per-process CPU time and major faults recorded (the harness reads
+   the driver's own `VmHWM`, which does not cover the Tesseract child), and then
+   decide whether an OCR-bearing filing is bounded by the 80 pages this corpus
+   justifies, by a smaller page cap of its own, or by a budget error raised
+   before the first page is rendered. The `≈ 19.9 min` end-to-end figure in the
+   cap comparison is a parse-plus-full-page-scan extrapolation for a file that
+   needed **no** OCR, and is explicitly not the scanned-case figure.
 5. This record's "4 GB device" is a cgroup ceiling on a 7.7 GiB WSL2 VM that was
    itself swapping. The peaks and OOM counts are valid; the wall-clock figures
    are not comparable to a dedicated 4 GB machine, and the operator who
@@ -672,25 +782,29 @@ Two runs prove this round moved no measurement:
    *bounded and consistent*, not as *fast*. T2f's gold round is the run that
    owes the dedicated-device reading, because the End-of-round record claims
    measured peaks and latency for a device, not for a cgroup.
-6. **The latency re-measure under a quiet host has not been run.** The pinned
-   runs above share four cores with other work, so no millisecond figure here is
-   a device specification.
+6. **The quiet-host serial re-measure has been run; a quiet *machine* has not.**
+   Both re-measure runs (`…T220516Z`, `…T220537Z`) executed alone with the
+   1-minute load captured before, between and after in
+   `scripts/g4_pipeline/results/serial_remeasure_20260925T220516Z.txt`, at load
+   2.78–3.25 — the floor of this host while a session is open, not zero. What
+   that settles and what it does not:
 
    ```text
    Validation:
-   - Not run: host load at 8.5 on 4 cores at record time; a serial re-run would
-     be contaminated by the same contention that produced the 2.8× spread on
-     identical input.
-   - Expected command: scripts/g4_pipeline/run_measured.sh \
-       data/corpus/g4_attachment_gold/g4-mixed-chart-001.pdf
-     with `cat /proc/loadavg` and `grep -E "^pswpout|^pgmajfault" /proc/vmstat`
-     captured immediately before and after, on an otherwise idle machine.
-   - Blocking issue: no idle 4-core host available to this ticket.
+   - Run: two serial re-measures at captured load 2.78 / 3.01 / 3.25, both exit 0,
+     both recorded in the file above and in their own metas.
+   - Not run: the same inputs on a machine with nothing else on it, or on a real
+     4 GB device. 4,096 MiB of swap was already in use across the window, so the
+     host was still memory-bound.
+   - Blocking issue: no second host and no dedicated 4 GB device available to
+     this ticket.
    ```
 
-   T2d owns it: `--psm`, render DPI, and the skip-OCR decision are picked from
-   these figures, and picking them from contended numbers is the guess this
-   ticket refuses.
+   T2d still owns the pick: `--psm`, render DPI, language set and the skip-OCR
+   decision are chosen from these figures, and the quiet-host warm per-page rate
+   (`1,679.9 ms`, against `3,374.5–6,074.1 ms` under load 15.9) is now the figure
+   to choose against. The device-level reading stays with T2f's gold round
+   (*Leftovers* 5).
 
 7. A bare image has no measured preparation cost, because the harness only
    drives PDF inputs (see the `g4-image-chart-001.png` row above). T2d owns the
