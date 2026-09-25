@@ -127,10 +127,11 @@ interface WorkspaceState {
   // resolves with the terminal stopped frames, so this action only has
   // to signal and refresh the turn table.
   stopRun: (threadId: string) => Promise<void>;
-  // ADR 0047 **corpus ingest**: the ingest door. The ONLY action that
-  // triggers 切分 + push. It durably ACCEPTS the upload and hands back
-  // the job id — no parse outcome arrives on this response; a named
-  // failure rethrows for the control to render (ingestFailure.ts).
+  // ADR 0047 **corpus ingest**: the ingest door. This action durably
+  // ACCEPTS the upload and hands back the job id — parse/切分/push run
+  // off the request in a later worker, so no parse outcome arrives on
+  // this response; a named failure rethrows for the control to render
+  // (ingestFailure.ts).
   ingestFile: (file: File, meta: api.IngestMeta) => Promise<IngestResult>;
   // The accepted job's observable state, read through the status door.
   // ``ingestJobId`` is the id THIS browser last submitted, persisted so
@@ -142,8 +143,10 @@ interface WorkspaceState {
   ingestJob: JobStatus | null;
   // A status read that refused (``unknown_job``, transport). The
   // control renders it through the same typed-copy path as a submit
-  // failure — a dead job id is never a blank panel.
-  ingestJobFailure: api.IngestFailedError | null;
+  // failure — a dead job id is never a blank panel. A transport error is
+  // stored as a plain ``Error``; ``describeIngestFailure`` still renders
+  // it as the generic retry notice.
+  ingestJobFailure: Error | null;
   // Reads one job's status and keeps reading while it is non-terminal.
   // ``jobId`` defaults to the persisted submission, so a mount after
   // reload needs no argument. ``intervalMs`` is the poll cadence,
@@ -939,8 +942,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   async ingestFile(file, meta) {
-    // The corpus-ingest door (ADR 0047): the ONLY action that triggers
-    // 切分 + MCP push. Named failures rethrow so the control can render
+    // The corpus-ingest door (ADR 0047): it durably ACCEPTS the upload
+    // and starts polling the job; parse/切分/push happen off the request
+    // in a later worker. Named failures rethrow so the control can render
     // them (ingestFailure.ts) — no half-success here. A success is an
     // ACCEPT, not a completed ingest, so the corpus list is deliberately
     // NOT refreshed on this response: the catalog row only exists once
@@ -962,16 +966,15 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // The job to follow: an explicit id, else the one this session is
     // already on, else the id persisted before a reload. With nothing
     // ever submitted this is a no-op, so a first visit to home shows no
-    // job panel instead of an empty read.
+    // job panel instead of an empty read. The immediate read and the
+    // "keep following while non-terminal" decision share the one tick
+    // body so a transport blip is handled identically on first paint and
+    // every poll.
     const target = jobId ?? get().ingestJobId ?? readPersistedIngestJobId();
     if (!target) return;
     stopIngestJobPolling();
     set({ ingestJobId: target });
-    const status = await readIngestJobStatus(target);
-    if (status === null) return;
-    applyIngestJobStatus(status);
-    if (isIngestJobTerminal(status.state)) return;
-    scheduleIngestJobPollTick(target, intervalMs);
+    await ingestJobPollTick(target, intervalMs);
   },
 
   async attachFile(threadId: string, file: File) {
@@ -1261,22 +1264,23 @@ function isIngestJobTerminal(state: IngestJobState): boolean {
 }
 
 /**
- * One job's status, or ``null`` when the door refused. A refusal is
- * recorded for the control to render: a persisted id that no longer has
- * a job must read as a named miss, never as a blank "still queued".
+ * One job's status, or ``null`` when the door named the miss. A named
+ * refusal (``unknown_job`` and friends) is recorded for the control to
+ * render and stops the chain — the job is gone. A transport error is NOT
+ * a verdict on the job, so it rethrows for the caller to keep following
+ * it rather than freeze the panel at "pending".
  */
 async function readIngestJobStatus(jobId: string): Promise<JobStatus | null> {
   try {
     return await api.getIngestJobStatus(jobId);
   } catch (error) {
-    if (error instanceof api.IngestFailedError) {
-      useWorkspaceStore.setState({ ingestJobFailure: error });
-      if (error.code === "unknown_job") {
-        // The submitted id outlived its job, so drop the marker the
-        // same way a last-thread pointer to a deleted thread is
-        // dropped: a later reload stops re-reading a dead id.
-        forgetPersistedIngestJobIdIf(jobId);
-      }
+    if (!(error instanceof api.IngestFailedError)) throw error;
+    useWorkspaceStore.setState({ ingestJobFailure: error });
+    if (error.code === "unknown_job") {
+      // The submitted id outlived its job, so drop the marker the
+      // same way a last-thread pointer to a deleted thread is
+      // dropped: a later reload stops re-reading a dead id.
+      forgetPersistedIngestJobIdIf(jobId);
     }
     return null;
   }
@@ -1322,7 +1326,21 @@ async function ingestJobPollTick(
 ): Promise<void> {
   ingestJobPollTimer = null;
   if (useWorkspaceStore.getState().ingestJobId !== jobId) return;
-  const status = await readIngestJobStatus(jobId);
+  let status: JobStatus | null;
+  try {
+    status = await readIngestJobStatus(jobId);
+  } catch (error) {
+    // A transport blip says nothing about the job, so the chain must
+    // not die on it: surface the failed read and keep following.
+    useWorkspaceStore.setState({
+      ingestJobFailure:
+        error instanceof Error ? error : new Error(String(error)),
+    });
+    if (useWorkspaceStore.getState().ingestJobId === jobId) {
+      scheduleIngestJobPollTick(jobId, intervalMs);
+    }
+    return;
+  }
   if (status === null) return;
   if (useWorkspaceStore.getState().ingestJobId !== jobId) return;
   applyIngestJobStatus(status);
