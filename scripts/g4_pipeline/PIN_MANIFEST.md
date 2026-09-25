@@ -1,9 +1,25 @@
 # T2a PIN MANIFEST — pinned candidate PDF pipeline + 4 GiB measurement harness
 
-Ticket: `T2a` (measurement / decision ticket). This file is the **only** place the pin is
-recorded. `pyproject.toml` and `uv.lock` are deliberately **untouched**: docling is **not**
-a declared dependency of the repo yet, and adding it is T2d's runtime-dependency decision.
-Nothing under `src/`, `tests/`, `data/`, `docs/`, `web/` was modified by this task.
+Ticket: `T2a` (measurement / decision ticket). This file records the pin and the
+harness that measures against it: the image, the package resolutions, the model
+artifact hashes, and the 4 GiB ceiling commands. It is not the only place those
+versions appear, and it does not claim to be. Where each one is authoritative:
+
+| where | what it is the source of |
+|---|---|
+| `Dockerfile` (`ARG DOCLING_VERSION`, the two `==…+cpu` requirements) | what the build installs |
+| `results/image_pip_freeze.txt` | what pip actually resolved inside the built image |
+| per-run `pipeline_identity` in `results/*.json` | the classes, flags, device and thread counts a real run used, read out of the live objects |
+| `docs/validation/2026-09-26-g4-t2a-page-vision-budgets.md` | the decision the measurements fed, and the commands that ran |
+| this file | why the pin is what it is, and the guard commands that prove it |
+
+`pyproject.toml` and `uv.lock` are deliberately **untouched**: docling is **not**
+a declared dependency of the repo yet, and adding it is T2d's runtime-dependency
+decision. Everything else T2a changed sits outside this directory — the
+uploaded-byte and page distribution script, the vision probe, the gold fixtures
+under `data/corpus/`, `src/fin/host/attachment_budgets.py` with its tests, the
+`.env.example` bounds, and the validation record — and is enumerated in the
+document above.
 
 Everything below was resolved *by the build*, not written from memory: version strings come
 from `pip freeze` executed inside the built image (`results/image_pip_freeze.txt`), model
@@ -246,5 +262,7 @@ accounting should re-run this harness before the caps are frozen.
 | `PIN_MANIFEST.md` | this file |
 | `results/` | build snapshots (`image_*.txt`) + one dir and one `<name>.measured.jsonl` per measured run |
 
-No file outside `scripts/g4_pipeline/` was created or modified. No gold fixtures were authored,
-no vision provider was contacted, and the repo test suite was not run.
+This directory is the harness only. It was built and run before the rest of
+T2a, and the ticket's later work — gold fixtures under `data/corpus/`, the vision
+probe against the configured provider, and the `tests/host` suite — is recorded in
+the validation document above, not here.
