@@ -1,0 +1,12 @@
+# 0088. Thread attachments use fin-owned retrieval and unit locators
+
+Date: 2026-09-24
+Status: accepted
+
+Fin owns each thread's attachment text and searchable index for the lifetime of that thread. The host binds `retrieve` and `read_source` to the trusted active thread; a model-supplied thread identifier cannot grant access. An attachment becomes `ready` only after its index is usable, remains reusable across turns in that thread, and is removed with the thread. A process restart must retain the source data and restore index availability before reporting `ready` again. Company-corpus retrieval remains backed by iknow-memory. This boundary avoids putting private attachment data into iknow-memory's currently unscoped collection.
+
+The model copies a typed `source_ref` from `retrieve` into `read_source`: company sources retain `{document_id, version, unit}`, while attachments use `{kind: "attachment", attachment_id, version, unit}`. `unit` is the source identity throughout retrieval and citations; a PDF unit may be displayed as a physical page. G4 replaces the development-stage `page` locator shape without a compatibility layer. A known locator may be read directly. Reads return a bounded, contiguous part of one frozen unit and an explicit Unicode-code-point `next_position` when more text remains; the first read defaults to position zero, and a later read passes the returned position. The initial policy caps text at 8,000 code points and serialized output at 32 KiB. The source read must be bounded on the backend wire as well as in the model-facing result. Only text actually returned in the run can support a citation.
+
+Ready attachments in the active thread and authorized company sources are eligible by default. Naming one attachment limits the attachment branch to it; when the question also asks for company material, the company branch remains eligible. No source from another thread is eligible.
+
+Considered Options: storing attachments in iknow-memory would require a trusted thread namespace, authorization and deletion semantics that its current shared collection does not provide. Keeping `page` as a generic locator field would mislabel non-PDF source units and citations. Treating a named attachment as an exclusive source would prevent requested comparisons with company material.

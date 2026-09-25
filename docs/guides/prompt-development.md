@@ -1,5 +1,7 @@
 # 提示词开发指南
 
+> General golden-set acceptance for every change is in `.claude/rules/test.md`. G4's bounded source-read contract is in `specs/thread-attachment-source-read.md`; its implementation will replace the historical `read_file` tool name below with `read_source`.
+
 后续改 host / 记忆 / 抽取 / 梦境 / 研究轨说明书时用。不写提示词正文；写怎么改、怎么验收。词以 `docs/CONTEXT.md` 为准。
 
 ## 原则

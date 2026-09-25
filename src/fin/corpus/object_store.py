@@ -71,6 +71,8 @@ class ObjectStore(Protocol):
 
     def get_pointer(self, key: str) -> ObjectPointer: ...
 
+    def delete(self, key: str) -> None: ...
+
 
 def _validate_key(key: str) -> None:
     if not isinstance(key, str) or not key.strip() or "\x00" in key:
@@ -138,13 +140,21 @@ class InMemoryObjectStore:
                 raise UnknownObjectKeyError(f"unknown object key: {key}")
             return item[1]
 
+    def delete(self, key: str) -> None:
+        _validate_key(key)
+        with self._lock:
+            # Idempotent by contract: thread deletion retries, and a second
+            # delete of an absent key must not surface as an error.
+            self._objects.pop(key, None)
+
 
 class S3CompatibleObjectStore:
     """Adapter for a boto3/MinIO-shaped S3-compatible client.
 
-    ``client`` must expose ``put_object`` and ``get_object`` methods with
-    the usual ``Bucket``/``Key``/``Body`` keyword arguments. Dependency
-    selection and credentials are resolved by :func:`create_object_store`.
+    ``client`` must expose ``put_object``, ``get_object``, and
+    ``delete_object`` methods with the usual ``Bucket``/``Key``/``Body``
+    keyword arguments. Dependency selection and credentials are resolved
+    by :func:`create_object_store`.
     """
 
     def __init__(
@@ -228,6 +238,24 @@ class S3CompatibleObjectStore:
         with self._lock:
             self._pointers[key] = pointer
         return pointer
+
+    def delete(self, key: str) -> None:
+        _validate_key(key)
+        try:
+            self._client.delete_object(Bucket=self._bucket, Key=key)
+        except Exception as exc:
+            if not _is_missing_object_error(exc):
+                raise ObjectStoreUnavailableError(
+                    f"object store delete failed for key={key!r}"
+                ) from exc
+            # EXIT: some gateways surface a retried delete of an absent key
+            # as 404/NoSuchKey; the port contract is idempotent, so an
+            # already-absent object is success, while real outages above
+            # stay typed and are never swallowed.
+        with self._lock:
+            # Drop the cached pointer so get_pointer cannot resurrect
+            # metadata for deleted bytes.
+            self._pointers.pop(key, None)
 
 
 def _is_missing_object_error(exc: Exception) -> bool:

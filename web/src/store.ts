@@ -130,10 +130,27 @@ interface WorkspaceState {
   // refreshes the corpus list the operator is looking at, a named
   // failure rethrows for the control to render (ingestFailure.ts).
   ingestFile: (file: File) => Promise<IngestResult>;
-  // corpus-serve-ingest T5 (ADR 0047 **thread attach**): the attach
-  // door. Mints a turn-scoped attachment id; NEVER touches the
+  // ADRs 0047/0086: the attach door. Uploads to
+  // the thread-attach endpoint and folds the minted record (status
+  // "parsing") into the thread's attachment slice; NEVER touches the
   // ingest endpoint — the doors must not cross.
   attachFile: (threadId: string, file: File) => Promise<ThreadAttachment>;
+  // Attachments live for the WHOLE thread, not one turn: the slice
+  // below mirrors the thread's current records, and the ready states
+  // (parsing → ready / failed) are only observable by re-reading the
+  // list, hence the polling in ``loadAttachments``.
+  attachments: ThreadAttachment[];
+  // Seed the slice for the thread the Composer opens and keep it
+  // fresh while anything is "parsing". ``intervalMs`` is the poll
+  // cadence, injectable so tests advance the schedule without real
+  // waiting. A failed door read ends the chain and leaves the slice as
+  // it is — attachments are auxiliary to the thread view and must not
+  // fail navigation. The next open / attach / retry restarts it.
+  loadAttachments: (threadId: string, intervalMs?: number) => Promise<void>;
+  // Re-run preparation for one failed attachment (ADR 0086 retry).
+  // Rejects with the named ``AttachFailedError`` so the control can
+  // render the reason.
+  retryAttachment: (threadId: string, attachmentId: string) => Promise<void>;
   // T8: record (or flip) the operator's thumb for one run. Response-
   // driven (matching ``dismissNotice``'s convention): the turn row is
   // patched only after the host confirms the persisted value, so the
@@ -358,6 +375,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   filingMonitorStatus: "healthy",
   filingMonitorError: null,
   stoppingThreadId: null,
+  attachments: [],
 
   async refreshThreads() {
     set({ loadingThreads: true });
@@ -406,6 +424,11 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // Unknown id -> 404 -> surface as empty active thread so the
     // route can render its not-found copy. We do NOT re-invoke the
     // graph on reload; GET only.
+    // Attach door: the attachment slice belongs to the thread
+    // being opened — stop the previous thread's readiness poll and
+    // clear its records before the new detail lands.
+    stopAttachmentPolling();
+    set({ attachments: [] });
     const detail = await api.getThread(threadId);
     // T5 (#35): a successfully opened thread becomes the one a
     // returning visit restores.
@@ -428,7 +451,11 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // T5 (#35): a deleted thread must never be restored on the next
     // visit — drop the marker when it pointed here.
     forgetLastThreadIf(threadId);
+    // Attach door: the host drops the thread's attachment data
+    // with the thread, so the slice and its poll retire too.
+    if (get().activeThread?.id === threadId) stopAttachmentPolling();
     set((s) => ({
+      attachments: s.activeThread?.id === threadId ? [] : s.attachments,
       threads: s.threads.filter((t) => t.id !== threadId),
       activeThread:
         s.activeThread && s.activeThread.id === threadId
@@ -533,9 +560,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // still in_flight).
     let windowPending: ChoiceWindow | null = null;
     let answerFold: LiveAnswerState = EMPTY_LIVE_ANSWER;
-    // corpus-serve-ingest T5 (ADR 0047 thread attach): the ids the
-    // attach door minted ride THIS send and are consumed by it
-    // (single use). The attach path never touches /api/corpus/ingest.
+    // ADR 0086: the ids the attach door minted
+    // ride this send — and stay referenceable on every later one.
+    // The attach path never touches /api/corpus/ingest.
     const request: api.SendRequest = { question, thinking: thinkingOn };
     if (attachmentIds && attachmentIds.length > 0) {
       request.attachment_ids = attachmentIds;
@@ -899,10 +926,62 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   async attachFile(threadId: string, file: File) {
-    // The thread-attach door (ADR 0047): mints a turn-scoped
-    // attachment the NEXT send references once. Deliberately does
+    // ADR 0086: the POST answers while the host is
+    // still parsing, so the minted record enters the slice as
+    // ``parsing`` and the readiness poll starts. Deliberately does
     // NOT touch /api/corpus/ingest — the two doors must not cross.
-    return api.attachToThread(threadId, file);
+    const attachment = await api.attachToThread(threadId, file);
+    if (get().activeThread?.id === threadId) {
+      set((s) => ({
+        attachments: [
+          // A re-upload of the same id (retry races a poll) replaces
+          // rather than duplicates the record.
+          ...s.attachments.filter(
+            (a) => a.attachment_id !== attachment.attachment_id,
+          ),
+          attachment,
+        ],
+      }));
+    }
+    if (attachment.status === "parsing") {
+      startAttachmentPolling(threadId);
+    }
+    return attachment;
+  },
+
+  async loadAttachments(threadId, intervalMs = ATTACHMENT_POLL_INTERVAL_MS) {
+    // Seed the thread's attachment slice (Composer open) and keep it
+    // fresh while anything is ``parsing``. This read OWNS the poll
+    // cadence: the running chain (if any) is replaced so the caller's
+    // ``intervalMs`` cannot be silently ignored. Attachments are
+    // auxiliary to the thread view: a failed door read leaves the
+    // slice as-is and ENDS the chain rather than failing navigation
+    // or spinning on a dead endpoint — the next open / attach / retry
+    // restarts it.
+    stopAttachmentPolling();
+    const attachments = await readAttachmentList(threadId);
+    if (attachments === null) return;
+    if (get().activeThread?.id !== threadId) return;
+    set({ attachments });
+    if (attachments.some((a) => a.status === "parsing")) {
+      startAttachmentPolling(threadId, intervalMs);
+    }
+  },
+
+  async retryAttachment(threadId, attachmentId) {
+    // ADR 0086 retry: the host answers with the fresh record —
+    // typically back to ``parsing`` — and the poll follows it to
+    // ready / failed like any other.
+    const updated = await api.retryThreadAttachment(threadId, attachmentId);
+    if (get().activeThread?.id !== threadId) return;
+    set((s) => ({
+      attachments: s.attachments.map((a) =>
+        a.attachment_id === attachmentId ? updated : a,
+      ),
+    }));
+    if (updated.status === "parsing") {
+      startAttachmentPolling(threadId);
+    }
   },
 
   async setTurnFeedback(threadId, runId, value) {
@@ -1010,4 +1089,134 @@ function patchTurnByRunIdOn(
       ),
     },
   });
+}
+
+// ----- ADR 0086: readiness polling -----
+//
+// The attach door answers 200 while preparation still runs, so the
+// only way the SPA learns parsing → ready / failed is re-reading the
+// thread's list. One poller chain exists at a time, keyed by thread:
+// opening another thread replaces it, and a read that finds nothing
+// ``parsing`` stops the chain (the next open / attach / retry
+// restarts it). ``intervalMs`` threads through the chain as a
+// parameter so tests advance a fake schedule instead of really
+// waiting.
+
+const ATTACHMENT_POLL_INTERVAL_MS = 2000;
+
+/**
+ * The thread's attachment list, or ``null`` when the door refused.
+ *
+ * Both entry points that re-read the list (an open, a poll tick) treat a
+ * refusal the same way: stop, keep what is on screen, let the next action
+ * restart the chain. One place catches so the named door error is never
+ * dropped twice.
+ */
+async function readAttachmentList(
+  threadId: string,
+): Promise<ThreadAttachment[] | null> {
+  try {
+    return await api.listThreadAttachments(threadId);
+  } catch {
+    return null;
+  }
+}
+
+let attachmentPollTimer: ReturnType<typeof setTimeout> | null = null;
+
+function stopAttachmentPolling(): void {
+  if (attachmentPollTimer !== null) clearTimeout(attachmentPollTimer);
+  attachmentPollTimer = null;
+}
+
+function scheduleAttachmentPollTick(
+  threadId: string,
+  intervalMs: number,
+): void {
+  attachmentPollTimer = setTimeout(
+    () => void attachmentPollTick(threadId, intervalMs),
+    intervalMs,
+  );
+}
+
+/**
+ * (Re)start the chain for ``threadId``. Replaces any running chain
+ * rather than stacking one, so every entry point (open, attach,
+ * retry) provably owns the next read.
+ */
+function startAttachmentPolling(
+  threadId: string,
+  intervalMs = ATTACHMENT_POLL_INTERVAL_MS,
+): void {
+  stopAttachmentPolling();
+  scheduleAttachmentPollTick(threadId, intervalMs);
+}
+
+async function attachmentPollTick(
+  threadId: string,
+  intervalMs: number,
+): Promise<void> {
+  attachmentPollTimer = null;
+  const state = useWorkspaceStore.getState();
+  if (state.activeThread?.id !== threadId) {
+    stopAttachmentPolling();
+    return;
+  }
+  const attachments = await readAttachmentList(threadId);
+  if (attachments === null) {
+    // A failed read ENDS the chain: the next open / attach / retry
+    // restarts it, and a dead or deleted door must not leave a
+    // background loop spinning on timers.
+    stopAttachmentPolling();
+    return;
+  }
+  const current = useWorkspaceStore.getState();
+  if (current.activeThread?.id !== threadId) {
+    stopAttachmentPolling();
+    return;
+  }
+  // A list read issued before a concurrent attach can answer WITHOUT
+  // the just-minted record; dropping its chip would hide a live parse
+  // until the next manual open, so locally-known ``parsing`` records
+  // the stale response has not seen are carried over. Terminal
+  // statuses are never carried — the server list is authoritative
+  // for them.
+  const seen = new Set(attachments.map((a) => a.attachment_id));
+  const carried = current.attachments.filter(
+    (a) => a.status === "parsing" && !seen.has(a.attachment_id),
+  );
+  const merged = [...attachments, ...carried];
+  useWorkspaceStore.setState({ attachments: merged });
+  if (merged.some((a) => a.status === "parsing")) {
+    scheduleAttachmentPollTick(threadId, intervalMs);
+    return;
+  }
+  stopAttachmentPolling();
+}
+
+/**
+ * The one rule for what a send may reference, and what it deliberately
+ * did not.
+ *
+ * Only a ``ready`` attachment is named: the thread keeps every attachment
+ * for its whole life, so a question that never mentioned the still-parsing
+ * one must not be refused on its account (spec: an unrelated question can
+ * still use ready sources). ``withheld`` is the other half of the contract —
+ * the control renders it, so a record left out of a run is always said out
+ * loud rather than silently dropped.
+ */
+export function attachmentsForSend(attachments: readonly ThreadAttachment[]): {
+  ids: string[];
+  withheld: ThreadAttachment[];
+} {
+  const ids: string[] = [];
+  const withheld: ThreadAttachment[] = [];
+  for (const attachment of attachments) {
+    if (attachment.status === "ready" && attachment.searchable) {
+      ids.push(attachment.attachment_id);
+    } else {
+      withheld.push(attachment);
+    }
+  }
+  return { ids, withheld };
 }

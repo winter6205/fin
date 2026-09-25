@@ -120,7 +120,7 @@ _Avoid_: 第二份数据, 备份, 与权威源互为校验的对等副本
 ### Agent
 
 **agent loop**:
-On the **grounded** track, the model repeatedly picks `list_files`, `retrieve`, `read_file`, or `get_xbrl_fact` until it stops calling tools, or hits refuse (unknown locator or citation-repair cap) or step cap. Grounded `done` is only after the citation verifier (and numeric fact gate when a fact is claimed) passes; other tracks may `done` without tools or citations. Step order is not hardcoded.
+On the **grounded** track, the model repeatedly picks `list_files`, `retrieve`, `read_source`, or `get_xbrl_fact` until it stops calling tools, or hits refuse (unknown locator or citation-repair cap) or step cap. Grounded `done` is only after the citation verifier (and numeric fact gate when a fact is claimed) passes; other tracks may `done` without tools or citations. Step order is not hardcoded.
 _Avoid_: pipeline, chain, fixed graph of retrieve-then-generate, requiring the citation verifier on dialogue/clarify/off_topic
 
 **list_files**:
@@ -143,36 +143,36 @@ _Avoid_: a markdown table on the wire, re-parsing the answer prose for structure
 The tagged-numbers format inside official 10-Q/10-K iXBRL. Not a website; SEC.gov is the filing host.
 _Avoid_: using XBRL as a product or hostname, conflating it with iknow-memory retrieve
 
-**read_file**:
-Ordinary read of a known locator: fetch that body's text (from the retrieve backend when that is where the object lives). Misses return `{ error: "unknown_locator" }`. Returned text may be this-run citation evidence (ADR 0046). It is not a 切分 step and not a citation module.
-_Avoid_: read_locator, read_page, treating read as retrieve, reading embeddings
+**read_source**:
+The selected model-facing name for a known-locator source read, currently exposed in code as `read_file`: it resolves one authorized source unit from the company corpus or active-thread attachment without requiring a `retrieve` hit in the same run. Each read returns at most 8,000 Unicode code points and a complete serialized response of at most 32 KiB, including on the backend wire; continuation uses a zero-based code-point `next_position`, and only text returned in this run may become citation evidence (ADRs 0046 and 0088).
+_Avoid_: read_file as the future tool name, read_locator, read_page, read_chunk, treating read as retrieve, reading embeddings
 
 **ingest endpoint**:
 The product job that parses, applies **切分** from the format parameter table, and **入库推送** or invalidates via MCP. Version close/replace is an MCP call. Not a grounded-track tool.
 _Avoid_: chunk-any-string tool, model-chosen split points, EDGAR form name as the root document type
 
 **thread attach**:
-The operator places a file on the open **research thread** so the model can read it this turn. Default is no **入库推送**.
-_Avoid_: treating drag-into-chat as corpus ingest
+An operator-submitted file under a logical `attachment_id` for the **research thread** lifetime; fin owns its durable bytes, parsed units, thread-private searchable index, and `parsing`/`ready`/`failed` state. `ready` requires a usable index, including after restart; the host binds access to the active thread, deletion removes its attachment data, and attaching never pushes it into the permanent company corpus (ADRs 0083, 0085, 0086, and 0088).
+_Avoid_: treating drag-into-chat as corpus ingest, model-visible filesystem paths, injecting the attachment body into the prompt, page-only attachment browsing
 
 **corpus ingest**:
 The separate workspace control that sends a file through the **ingest endpoint** into the retrieve backend.
 _Avoid_: one control that both attaches and stores without an explicit ingest choice
 
 **locator**:
-Cite identity `{document_id, version, unit}`. The claimed span is a quote string, not a locator field. The **citation verifier** checks it is a contiguous substring of evidenced text this run retrieved or read (ADR 0046). Chunks carry the locator as `source_ref` and are not the identity.
-_Avoid_: chunk_id, char offset, bbox, page-less citation, unofficial PDF page as live EDGAR identity, verifying an HTML quote against a PDF page
+A typed source identity for citation and `read_source`: company sources use `{document_id, version, unit}` and thread attachments use `{kind: "attachment", attachment_id, version, unit}`. The host validates the attachment against the trusted active thread and parsed-content version; a read continuation position is separate from the locator. Retrieved chunks carry a locator as `source_ref`, while the claimed quote remains separate (ADRs 0046 and 0088).
+_Avoid_: chunk_id, char offset as citation identity, bbox, page as the generic unit field, unofficial PDF page as live EDGAR identity, verifying an HTML quote against a PDF page
 
 **citation verifier**:
-A code gate on the **grounded** track path to END: a supporting span is a contiguous substring of the answer (v1 minimum 32 characters) that appears in text this run received from **retrieve** / **read_file** (ADR 0046). Passed spans become the user-visible citations; unknown locators refuse immediately; missing or unmatched spans bounce with a hidden template until the citation-repair cap, then refuse. Other tracks skip this gate. _Stage: substring gate on main; Jev support pick out of this host Jev program (ADR 0082)._
+A code gate on the **grounded** track path to END: a supporting span is a contiguous substring of the answer (v1 minimum 32 characters) that appears in text this run received from **retrieve** / **read_source** (ADR 0046). Passed spans become unit-located user-visible citations; unknown locators refuse immediately; missing or unmatched spans bounce with a hidden template until the citation-repair cap, then refuse. Other tracks skip this gate. _Stage: substring gate on main; Jev support pick out of this host Jev program (ADR 0082)._
 _Avoid_: faithfulness prompt, LLM-as-judge as the citation gate, model-authored citation block, `verify` as a tool, running the gate on greetings or soft off-topic replies, web-search text as gate evidence, a second serve-time extracted tree as citation SSOT
 
 **citation span**:
-One user-visible citation row from the verifier: a ≥32-character contiguous substring of the answer that matched on a retrieved or read page. The workspace sources list may show many spans per page (sliding-window overlap); that granularity is expected, not a send failure.
-_Avoid_: treating each span as a full sentence, hiding overlap as a bug, conflating span count with page count
+One user-visible citation row from the verifier: a ≥32-character contiguous substring of the answer that matched on a retrieved or read source unit. The workspace sources list may show many spans per unit (sliding-window overlap); that granularity is expected, not a send failure.
+_Avoid_: treating each span as a full sentence, hiding overlap as a bug, conflating span count with unit count
 
 **citation-repair cap**:
-v1 limit of 3 recoverable citation-verifier failures (span not on the page, or a non-refuse final answer with no cites) before the run must refuse.
+v1 limit of 3 recoverable citation-verifier failures (span not in returned source text, or a non-refuse final answer with no cites) before the run must refuse.
 _Avoid_: retry budget, max repairs, using step cap as the cite-fail rule
 
 **step cap**:
@@ -191,7 +191,7 @@ _Avoid_: message-count windows, treating `/compact` as a grounded-track tool, pu
 
 **recall injection**:
 When memory is ON, advisory recall or **memory prefetch** text placed in the model-facing payload. It counts toward the same occupancy ledger as **session compaction**; a row-count limit is only a fuse, not the budget.
-_Avoid_: last-N memory window as the token budget, using recall as retrieve/`read_file` evidence
+_Avoid_: last-N memory window as the token budget, using recall as retrieve/`read_source` evidence
 
 **checkpointer**:
 v1 durable runs use LangGraph `PostgresSaver` via `FIN_CHECKPOINT_URL`; product HTTP/CLI raise if that URL is unset. Pytest uses `InMemorySaver` only (plus explicit `FIN_SCRIPTED_MODEL` e2e); it does not survive process exit.
@@ -308,7 +308,7 @@ _Avoid_: gpt-researcher, open_deep_research, blank-file StateGraph as the requir
 ### Corpus and eval
 
 **product corpus**:
-The operator-selected filings after ingest: freeze and **切分** in fin, then push to the retrieve backend. Serve-time `retrieve` / `read_file` / the citation verifier use this-run tool payloads (ADR 0046), not a second on-disk tree as company-corpus SSOT.
+The operator-selected filings after ingest: fin parses source text into **冻结单元**, then deterministically **切分**s and pushes its chunks to the retrieve backend. Serve-time `retrieve` / `read_source` / the citation verifier use this-run tool payloads (ADR 0046), not a second on-disk tree as company-corpus SSOT.
 _Avoid_: private fixture source 12 as product SSOT, unofficial PDF as live identity, S&P 500 backfill as the ingest default, a second PDF-page product path
 
 **eval fixture**:
@@ -348,8 +348,8 @@ Historical nine hand-authored cases against the private fixture source 12 (ADR 0
 _Avoid_: 40-question matrix as a v1 commitment, treating nine cases as the current ceiling
 
 **冻结单元**:
-fin 解析产出的最小可引用文本单位；一经产出即冻结。切出的块是其连续子串并 push；**citation verifier** 在运行时对的是本轮 retrieve/`read_file` 正文（ADR 0046）。
-_Avoid_: chunk, 原始文件, 任意段落, 未冻结的中间解析产物
+A versioned, locator-addressed unit of parsed source text that fin determines before retrieval chunking; "frozen" means its text is fixed for that parsed version, not that fin creates a cache or separate persistence tier. Search chunks are contiguous substrings of the unit, while citation evidence comes only from text returned by `retrieve` or `read_source` in the current run (ADR 0046).
+_Avoid_: chunk, raw file, arbitrary paragraph, session cache, second citation SSOT, query-time result
 
 **切分**:
 fin 把冻结单元文本切成块的过程与规则，是 fin 的职责；切分必须确定性可复现，同一（字节输入 + 规则版本 + 参数表版本）两次切分产物逐字节相同。检索服务对推送文本不做二次切分、截断、重组或归一化改写。
