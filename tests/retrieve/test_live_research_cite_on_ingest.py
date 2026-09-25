@@ -277,6 +277,7 @@ def ingested_live(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
         result = endpoint.ingest(
             _FIXTURE.read_bytes(),
             filename=_FIXTURE.name,
+            document_id="AAPL-2022Q3",
             doc_type=_DOC_TYPE,
         )
         assert result.written >= 1, "the fixture pushed no chunks"

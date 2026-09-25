@@ -18,11 +18,24 @@ const FORMAT_HINT = "支持 pdf / docx / xlsx / pptx / html / md / txt。";
 const UNSUPPORTED_FORMAT_COPY = `这种格式不支持入库。${FORMAT_HINT}`;
 const FORMAT_UNSPECIFIED_COPY = `认不出这份文件的格式（文件名没有可识别的扩展名）。请改用带扩展名的文件名再试。${FORMAT_HINT}`;
 const UPLOAD_TOO_LARGE_COPY = "这份文件超过入库大小上限，请拆分后再入库。";
+// The form requires company and period and the filename never
+// participates in the identity, so the fix is always the two fields —
+// telling the operator to rename the file would be a false lead.
 const DOCUMENT_ID_MISSING_COPY =
-  "无法确定这份文件的编号（document_id），也没有可用的文件名。请用带名称的文件再试。";
+  "没有确定这份文件的编号（document_id）：请填写公司（如 aapl）和期间（如 2022q3）。文件名不参与编号。";
 const INVALID_DOC_TYPE_COPY =
   "指定的文档场景（doc_type）不在参数表内。清空场景让它自动分类，或改用受支持的场景再试。";
 const MISSING_FILE_COPY = "没有选中任何文件，未执行入库。";
+// 409: the in-flight job for this document_id is untouched and this
+// submission started nothing, so the operator waits rather than retries
+// immediately (a retry would collide the same way).
+const CONCURRENT_RUN_COPY =
+  "同一份文件已有一轮入库在进行中，这次提交没有开始。请等它结束后再上传。";
+// The status door's typed miss: the id is gone (a job store that did not
+// survive a restart), so the state below it is unknown rather than
+// still-queued — the only way forward is a new submission.
+const UNKNOWN_JOB_COPY =
+  "查不到这一轮入库的记录，因此无法确认它的状态。请重新提交这份文件。";
 
 // Parser family (400): the uploader's bytes are unusable and nothing
 // was written — say that instead of implying a partial push.
@@ -46,6 +59,20 @@ function pushOutageCopy(code: string): string {
 const INVALIDATION_COPY =
   "文件已推送，但旧版本的清理没有完成，请重试一次以完成清理；重复入库是安全的。";
 
+// Fixed-message wire codes, one table so adding a named code never grows
+// the resolver's branching. Prefix families (push_ / invalidation_) and
+// the parse family stay resolved in :func:`describeIngestFailure`.
+const STATIC_COPY: Record<string, string> = {
+  missing_file: MISSING_FILE_COPY,
+  format_unspecified: FORMAT_UNSPECIFIED_COPY,
+  unsupported_format: UNSUPPORTED_FORMAT_COPY,
+  ingest_upload_too_large: UPLOAD_TOO_LARGE_COPY,
+  document_id_missing: DOCUMENT_ID_MISSING_COPY,
+  concurrent_run: CONCURRENT_RUN_COPY,
+  unknown_job: UNKNOWN_JOB_COPY,
+  invalid_doc_type: INVALID_DOC_TYPE_COPY,
+};
+
 function genericCopy(error: unknown): string {
   const detail = error instanceof Error ? error.message.trim() : "";
   return `入库没有完成${detail ? `（${detail}）` : ""}。请稍后重试；重复入库是安全的。`;
@@ -54,37 +81,13 @@ function genericCopy(error: unknown): string {
 /** Never returns empty copy — a failed ingest must be visible. */
 export function describeIngestFailure(error: unknown): IngestFailureNotice {
   const kind = error instanceof IngestFailedError ? error.code : "unknown";
-  let message: string;
-  switch (kind) {
-    case "missing_file":
-      message = MISSING_FILE_COPY;
-      break;
-    case "format_unspecified":
-      message = FORMAT_UNSPECIFIED_COPY;
-      break;
-    case "unsupported_format":
-      message = UNSUPPORTED_FORMAT_COPY;
-      break;
-    case "ingest_upload_too_large":
-      message = UPLOAD_TOO_LARGE_COPY;
-      break;
-    case "document_id_missing":
-      message = DOCUMENT_ID_MISSING_COPY;
-      break;
-    case "invalid_doc_type":
-      message = INVALID_DOC_TYPE_COPY;
-      break;
-    default:
-      if (kind in PARSE_FAMILY_COPY) {
-        message = PARSE_FAMILY_COPY[kind];
-      } else if (kind.startsWith("invalidation_")) {
-        message = INVALIDATION_COPY;
-      } else if (kind.startsWith("push_")) {
-        message = pushOutageCopy(kind);
-      } else {
-        message = genericCopy(error);
-      }
-      break;
-  }
+  const message =
+    STATIC_COPY[kind] ??
+    PARSE_FAMILY_COPY[kind] ??
+    (kind.startsWith("invalidation_")
+      ? INVALIDATION_COPY
+      : kind.startsWith("push_")
+        ? pushOutageCopy(kind)
+        : genericCopy(error));
   return { kind, message };
 }

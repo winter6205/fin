@@ -187,13 +187,18 @@ from fin.corpus.errors import (
     UnsupportedFormatParseError,
 )
 from fin.corpus.ingest_endpoint import (
+    IngestConcurrentRunError,
     IngestDocumentIdMissingError,
+    IngestDurableCommitError,
     IngestEndpoint,
     IngestedDocument,
     IngestFormatUnspecifiedError,
     IngestInvalidDocTypeError,
+    IngestObjectCleanupError,
+    IngestReplacementUnsupportedError,
     IngestUploadTooLargeError,
 )
+from fin.corpus.ingest_state_errors import UnknownJobError
 from fin.host.attachment_prepare import (
     AttachmentCleanupError,
     AttachmentNotFoundError,
@@ -1780,8 +1785,17 @@ _INGEST_ERROR_TABLE: Final[
     (IngestFormatUnspecifiedError, 422, False),
     (IngestDocumentIdMissingError, 422, False),
     (IngestInvalidDocTypeError, 422, False),
+    # Accept-time conflict families: the upload is refused, nothing was
+    # written, and the caller's next move differs (wait vs. give up).
+    (IngestConcurrentRunError, 409, False),
+    (IngestReplacementUnsupportedError, 409, False),
     (ParseError, 400, False),
     (InvalidationError, 503, False),
+    # A durable item could not be persisted: no job was accepted, so the
+    # caller retries the same upload. The compensating delete failing on
+    # top of that leaves an orphan object, which is its own named 500.
+    (IngestDurableCommitError, 503, False),
+    (IngestObjectCleanupError, 500, False),
     # PushError's status depends on the code: resolver, not a constant.
     (PushError, _push_error_status, False),
 )
@@ -1820,6 +1834,15 @@ def _ingest_error_response(exc: Exception) -> JSONResponse:
 
 # Segment size of the bounded read for the multipart ingest door.
 _INGEST_READ_SEGMENT: Final[int] = 1024 * 1024
+
+# Framing headroom for the pre-buffer declared gate on the multipart ingest
+# door. A multipart request's Content-Length is the file bytes PLUS part
+# boundaries and the metadata fields, so comparing the whole request length
+# to the per-file cap would refuse an exactly-at-cap upload. The authoritative
+# per-file boundary stays in the bounded read and the endpoint check, which
+# both read the same MAX_INGEST_BYTES; this allowance only covers framing so the
+# coarse memory guard never false-rejects a file that actually fits.
+_INGEST_MULTIPART_FRAMING_ALLOWANCE: Final[int] = 1024
 
 
 def _declared_upload_over(request: Request, cap: int) -> bool:
@@ -1963,6 +1986,47 @@ def _record_ingested_filing(doc: IngestedDocument) -> None:
         )
 
 
+def _ingest_ports_from_env() -> tuple[Any, Any, Any]:
+    """The three accept-time ports of the durable ingest door.
+
+    Selected once with the service, lazily so the workspace import surface
+    stays free of the object-store and database drivers until an ingest
+    actually happens. Without a configured object store the accept degrades
+    to process-local bytes and SAYS so — the same logged degradation the
+    attachment door uses, because an upload that looks accepted but is not
+    durable is the failure mode this route exists to rule out.
+    """
+    from fin.corpus.ingest_state import ingest_state_store_from_env
+    from fin.corpus.metadata_store import (
+        InMemoryMetadataStore,
+        metadata_store_from_env,
+    )
+    from fin.corpus.object_store import (
+        InMemoryObjectStore,
+        object_store_from_env,
+    )
+    from fin.corpus.object_store_errors import ObjectStoreNotConfiguredError
+
+    try:
+        objects: Any = object_store_from_env()
+    except ObjectStoreNotConfiguredError:
+        logger.warning(
+            "FIN_OBJECT_STORE_URL/FIN_OBJECT_STORE_BUCKET are not set; "
+            "corpus uploads keep their raw bytes in process memory and are "
+            "gone after a restart"
+        )
+        objects = InMemoryObjectStore()
+
+    pointers: Any = metadata_store_from_env()
+    if isinstance(pointers, InMemoryMetadataStore):
+        logger.warning(
+            "no FIN_METADATA_DSN/FIN_CHECKPOINT_URL is set; accepted corpus "
+            "uploads keep their object pointer in process memory"
+        )
+
+    return objects, pointers, ingest_state_store_from_env()
+
+
 def _build_default_ingest_service() -> IngestEndpoint:
     """Build the env-selected ingest service (``get_ingest_service``).
 
@@ -1977,19 +2041,29 @@ def _build_default_ingest_service() -> IngestEndpoint:
     free of the stdio transport (and its psycopg-heavy compile import)
     until an ingest actually happens.
 
+    Both kinds get the same three accept-time ports (object / pointer /
+    job state), so the durable accept of a fake boot exercises the real
+    port contracts rather than a second, weaker contract.
+
     Both kinds wire ``on_ingested`` to :func:`_record_ingested_filing`
     so a pushed filing is registered in the same catalog table the
     ``GET /api/corpus`` route lists — a fake boot is a real product
-    mode, not a second contract.
+    mode, not a second contract. The hook belongs to the synchronous
+    chain: the HTTP accept door does not parse or push, so it never
+    reaches the hook.
     """
     from fin.host.operator_env import resolve_retrieve_adapter_kind
 
+    objects, pointers, states = _ingest_ports_from_env()
     if resolve_retrieve_adapter_kind() == "fake":
         shared: FakePushPort = FakePushPort()
         return IngestEndpoint(
             push_port=shared,
             invalidation_port=shared,
             on_ingested=_record_ingested_filing,
+            object_store=objects,
+            metadata_store=pointers,
+            state_store=states,
         )
     from fin.retrieve.mcp_invalidation_port import MCPInvalidationPort
     from fin.retrieve.mcp_push_port import MCPPushPort
@@ -1998,6 +2072,9 @@ def _build_default_ingest_service() -> IngestEndpoint:
         push_port=MCPPushPort(),
         invalidation_port=MCPInvalidationPort(),
         on_ingested=_record_ingested_filing,
+        object_store=objects,
+        metadata_store=pointers,
+        state_store=states,
     )
 
 
@@ -3455,35 +3532,30 @@ def build_router(
         format: str | None = Form(default=None),
         service: IngestEndpoint = Depends(get_ingest_service),
     ) -> Response:
-        """Corpus-ingest door: parse + 切分 + push/invalidate (T3).
+        """Corpus-ingest door: accept one upload durably and return its job.
 
-        The ONLY product surface that triggers 切分 (ADR 0047); the
-        research graph binds no such tool (SC6 contract test). The
-        split decisions are the deterministic params table — no model
-        runs on this path.
+        The ONLY product surface that takes a company document into the
+        permanent corpus (ADR 0047). It is **accept-and-persist**: parse,
+        切分 and push run asynchronously off the request (the worker is a
+        later ticket), so a 200 here says the upload is durable and queued,
+        never that anything was ingested — ``accepted`` replaced the old
+        ``ingested`` token, and the outcome is polled at
+        ``GET /api/corpus/ingest/{job_id}``.
 
-        Multipart upload + optional metadata form fields:
-        ``format`` (explicit declaration; otherwise the filename
-        extension names the format), ``document_id`` / ``company`` /
-        ``period`` (locator metadata; ``company``+``period`` also
-        derive the default document id), ``doc_type`` (optional
+        Multipart upload + optional metadata form fields: ``format``
+        (explicit declaration; otherwise the filename extension names the
+        format), ``document_id`` (wins verbatim) or ``company`` +
+        ``period`` (the ``"{TICKER}-{FYQ}"`` identity; the filename is
+        metadata only and never names the document), ``doc_type`` (optional
         params-table scene override).
 
-        Every failure is a named code with no partial-success 200
-        (SC7 / SC8): the four endpoint codes and the parser family
-        map to 4xx (nothing was written); push/invalidation outage
-        codes map to 503. A 503 after the push landed means the push
-        is already in place (idempotent) and the retry is the
-        recovery — the code names invalidation, never a clean
-        success. The exception -> answer mapping lives in
+        Accepted means all four accept-time items are durable: the raw
+        object, its metadata pointer, the ``pending`` job record and the
+        ``(document_id, version)`` identity. Every validation that needs no
+        bytes runs before the first write, so a refused upload leaves
+        nothing behind; a persistence failure is a typed 5xx with no
+        accepted job. The exception -> answer mapping lives in
         :func:`_ingest_error_response` (table-driven).
-
-        After a fully successful chain the service's ``on_ingested``
-        hook registers the filing in the catalog (T2
-        ``record_filings``). A catalog-side failure there is NOT a
-        failed ingest (the push stands) and NOT a silent success: the
-        200 body carries the named ``catalog_warning``
-        (``catalog_record_failed: ...``); ``None`` on a clean ingest.
         """
         if file is None:
             return JSONResponse(
@@ -3495,26 +3567,23 @@ def build_router(
         # cap is the service's own (single source of truth; the
         # service cap check stays as defense in depth).
         cap = service.max_bytes
-        if _declared_upload_over(request, cap):
+        if _declared_upload_over(request, cap + _INGEST_MULTIPART_FRAMING_ALLOWANCE):
             return JSONResponse(
                 status_code=413,
                 content={"error": "ingest_upload_too_large"},
             )
         # Sync handler: read the underlying SpooledTemporaryFile (the
         # async ``file.read()`` coroutine would need an ``async def``
-        # route, putting the whole parse+push chain on the event loop)
-        # — bounded, so an unbounded upload never materializes here.
+        # route, putting the whole accept on the event loop) — bounded, so
+        # an unbounded upload never materializes here.
         data = _read_bounded_upload(file.file, cap)
         if data is None:
             return JSONResponse(
                 status_code=413,
                 content={"error": "ingest_upload_too_large"},
             )
-        # Reset BEFORE the call so a previous ingest on this threadpool
-        # thread can never leak its warning into this response.
-        _catalog_hook_slot.warning = None
         try:
-            result = service.ingest(
+            submission = service.submit_durable(
                 data,
                 filename=file.filename,
                 declared_format=format,
@@ -3525,39 +3594,55 @@ def build_router(
             )
         except Exception as exc:
             return _ingest_error_response(exc)
-        # The hook ran last (only on a fully successful chain); read
-        # the slot ON this thread — the reset above guarantees no
-        # stale warning from an earlier request is echoed here.
-        catalog_warning = getattr(_catalog_hook_slot, "warning", None)
         return JSONResponse(
             status_code=200,
             content={
-                "status": "ingested",
-                "document_id": result.document_id,
-                "version": result.version,
-                "fmt": result.fmt,
-                "doc_type": result.doc_type,
-                "unit_count": result.unit_count,
-                "block_count": result.block_count,
-                "written": result.written,
-                "duplicates": result.duplicates,
-                "block_ids": list(result.block_ids),
-                "catalog_warning": catalog_warning,
-                "invalidation": (
-                    None
-                    if result.invalidation is None
-                    else {
-                        "block_ids": list(result.invalidation.block_ids),
-                        "closed": result.invalidation.closed,
-                        "already_closed": result.invalidation.already_closed,
-                        "closed_at": [
-                            [block_id, instant]
-                            for block_id, instant in (
-                                result.invalidation.closed_at
-                            )
-                        ],
-                    }
-                ),
+                "status": "accepted",
+                "job_id": submission.job_id,
+                "document_id": submission.document_id,
+                "version": submission.version,
+                "state": submission.state.value,
+            },
+        )
+
+    @router.get("/corpus/ingest/{job_id}")
+    def corpus_ingest_status(
+        job_id: str,
+        service: IngestEndpoint = Depends(get_ingest_service),
+    ) -> Response:
+        """Poll one ingest job: the PERSISTED state, never a constant.
+
+        ``job_id`` is the state store's key, i.e. the ``document_id``, so
+        the handle returned at accept time is the one polled here. An
+        unknown id is the named ``unknown_job`` 404 — never an empty
+        success body that a poller would read as "still running".
+
+        ``text_ready`` is the chunk/text side of the pipeline (the job
+        reached ``ready``). ``graph`` is the iknow-memory index-job side,
+        which fin never owns: no fin API may claim corpus-wide graph/C
+        readiness from a push, so this stays ``null`` until the index-job
+        orchestration contract gives fin something to pass through.
+        """
+        try:
+            status = service.job_status(job_id)
+        except UnknownJobError as exc:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "unknown_job", "job_id": exc.document_id},
+            )
+        except Exception as exc:
+            return _ingest_error_response(exc)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "job_id": status.job_id,
+                "document_id": status.document_id,
+                "version": status.version,
+                "state": status.state.value,
+                "error_type": status.error_type,
+                "error_message": status.error_message,
+                "text_ready": status.text_ready,
+                "graph": None,
             },
         )
 

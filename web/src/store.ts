@@ -15,7 +15,9 @@ import {
 import type {
   ChoiceWindow,
   Filing,
+  IngestJobState,
   IngestResult,
+  JobStatus,
   Notice,
   ThreadAttachment,
   ThreadDetail,
@@ -125,11 +127,28 @@ interface WorkspaceState {
   // resolves with the terminal stopped frames, so this action only has
   // to signal and refresh the turn table.
   stopRun: (threadId: string) => Promise<void>;
-  // corpus-serve-ingest T5 (ADR 0047 **corpus ingest**): the ingest
-  // door. The ONLY action that triggers 切分 + push; a success
-  // refreshes the corpus list the operator is looking at, a named
+  // ADR 0047 **corpus ingest**: the ingest door. The ONLY action that
+  // triggers 切分 + push. It durably ACCEPTS the upload and hands back
+  // the job id — no parse outcome arrives on this response; a named
   // failure rethrows for the control to render (ingestFailure.ts).
-  ingestFile: (file: File) => Promise<IngestResult>;
+  ingestFile: (file: File, meta: api.IngestMeta) => Promise<IngestResult>;
+  // The accepted job's observable state, read through the status door.
+  // ``ingestJobId`` is the id THIS browser last submitted, persisted so
+  // a navigation or reload can resume following the job without
+  // re-uploading; ``ingestAccepted`` is the accept body (state
+  // ``pending``) shown until the first status read lands.
+  ingestJobId: string | null;
+  ingestAccepted: IngestResult | null;
+  ingestJob: JobStatus | null;
+  // A status read that refused (``unknown_job``, transport). The
+  // control renders it through the same typed-copy path as a submit
+  // failure — a dead job id is never a blank panel.
+  ingestJobFailure: api.IngestFailedError | null;
+  // Reads one job's status and keeps reading while it is non-terminal.
+  // ``jobId`` defaults to the persisted submission, so a mount after
+  // reload needs no argument. ``intervalMs`` is the poll cadence,
+  // injectable so tests advance the schedule without real waiting.
+  loadIngestJob: (jobId?: string, intervalMs?: number) => Promise<void>;
   // ADRs 0047/0086: the attach door. Uploads to
   // the thread-attach endpoint and folds the minted record (status
   // "parsing") into the thread's attachment slice; NEVER touches the
@@ -376,6 +395,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   filingMonitorError: null,
   stoppingThreadId: null,
   attachments: [],
+  ingestJobId: null,
+  ingestAccepted: null,
+  ingestJob: null,
+  ingestJobFailure: null,
 
   async refreshThreads() {
     set({ loadingThreads: true });
@@ -915,14 +938,40 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
   },
 
-  async ingestFile(file: File) {
-    // The corpus-ingest door (ADR 0047): the ONLY action that
-    // triggers 切分 + MCP push. Named failures rethrow so the control
-    // can render them (ingestFailure.ts) — no half-success here; the
-    // corpus list refresh happens only after a fully successful push.
-    const result = await api.ingestCorpus(file);
-    await get().loadCorpus();
-    return result;
+  async ingestFile(file, meta) {
+    // The corpus-ingest door (ADR 0047): the ONLY action that triggers
+    // 切分 + MCP push. Named failures rethrow so the control can render
+    // them (ingestFailure.ts) — no half-success here. A success is an
+    // ACCEPT, not a completed ingest, so the corpus list is deliberately
+    // NOT refreshed on this response: the catalog row only exists once
+    // the job has pushed and registered the source, which is when
+    // ``applyIngestJobStatus`` refreshes it.
+    const accepted = await api.ingestCorpus(file, meta);
+    persistIngestJobId(accepted.job_id);
+    set({
+      ingestJobId: accepted.job_id,
+      ingestAccepted: accepted,
+      ingestJob: null,
+      ingestJobFailure: null,
+    });
+    startIngestJobPolling(accepted.job_id);
+    return accepted;
+  },
+
+  async loadIngestJob(jobId, intervalMs = INGEST_JOB_POLL_INTERVAL_MS) {
+    // The job to follow: an explicit id, else the one this session is
+    // already on, else the id persisted before a reload. With nothing
+    // ever submitted this is a no-op, so a first visit to home shows no
+    // job panel instead of an empty read.
+    const target = jobId ?? get().ingestJobId ?? readPersistedIngestJobId();
+    if (!target) return;
+    stopIngestJobPolling();
+    set({ ingestJobId: target });
+    const status = await readIngestJobStatus(target);
+    if (status === null) return;
+    applyIngestJobStatus(status);
+    if (isIngestJobTerminal(status.state)) return;
+    scheduleIngestJobPollTick(target, intervalMs);
   },
 
   async attachFile(threadId: string, file: File) {
@@ -1192,6 +1241,126 @@ async function attachmentPollTick(
     return;
   }
   stopAttachmentPolling();
+}
+
+// ----- corpus-ingest job status polling -----
+//
+// The POST returns as soon as the upload is durable, so every later
+// state is observable only through the status door. The chain mirrors
+// the attachment one: one owner at a time, a failed read ends it rather
+// than spinning on a dead endpoint, and it stops by itself at a terminal
+// state. Only the state STRING is surfaced — no parse-progress UI, and
+// the graph/C field is never rendered as text readiness.
+
+const INGEST_JOB_POLL_INTERVAL_MS = 2000;
+
+/** ``ready`` (per-source text) and ``failed`` (typed terminal) are the
+ * two states the poll must not keep reading. */
+function isIngestJobTerminal(state: IngestJobState): boolean {
+  return state === "ready" || state === "failed";
+}
+
+/**
+ * One job's status, or ``null`` when the door refused. A refusal is
+ * recorded for the control to render: a persisted id that no longer has
+ * a job must read as a named miss, never as a blank "still queued".
+ */
+async function readIngestJobStatus(jobId: string): Promise<JobStatus | null> {
+  try {
+    return await api.getIngestJobStatus(jobId);
+  } catch (error) {
+    if (error instanceof api.IngestFailedError) {
+      useWorkspaceStore.setState({ ingestJobFailure: error });
+      if (error.code === "unknown_job") {
+        // The submitted id outlived its job, so drop the marker the
+        // same way a last-thread pointer to a deleted thread is
+        // dropped: a later reload stops re-reading a dead id.
+        forgetPersistedIngestJobIdIf(jobId);
+      }
+    }
+    return null;
+  }
+}
+
+/**
+ * Paint one confirmed status. Response-driven, like every other action
+ * here: the store never guesses a state between reads.
+ */
+function applyIngestJobStatus(status: JobStatus): void {
+  useWorkspaceStore.setState({ ingestJob: status, ingestJobFailure: null });
+  if (status.state === "ready") {
+    void useWorkspaceStore.getState().loadCorpus();
+  }
+}
+
+let ingestJobPollTimer: ReturnType<typeof setTimeout> | null = null;
+
+function stopIngestJobPolling(): void {
+  if (ingestJobPollTimer !== null) clearTimeout(ingestJobPollTimer);
+  ingestJobPollTimer = null;
+}
+
+function scheduleIngestJobPollTick(jobId: string, intervalMs: number): void {
+  ingestJobPollTimer = setTimeout(
+    () => void ingestJobPollTick(jobId, intervalMs),
+    intervalMs,
+  );
+}
+
+/** (Re)start the chain for ``jobId``, replacing any running one. */
+function startIngestJobPolling(
+  jobId: string,
+  intervalMs = INGEST_JOB_POLL_INTERVAL_MS,
+): void {
+  stopIngestJobPolling();
+  scheduleIngestJobPollTick(jobId, intervalMs);
+}
+
+async function ingestJobPollTick(
+  jobId: string,
+  intervalMs: number,
+): Promise<void> {
+  ingestJobPollTimer = null;
+  if (useWorkspaceStore.getState().ingestJobId !== jobId) return;
+  const status = await readIngestJobStatus(jobId);
+  if (status === null) return;
+  if (useWorkspaceStore.getState().ingestJobId !== jobId) return;
+  applyIngestJobStatus(status);
+  if (isIngestJobTerminal(status.state)) return;
+  scheduleIngestJobPollTick(jobId, intervalMs);
+}
+
+/**
+ * The last submitted job id. Kept in storage so the home door can show
+ * the job again after navigation or a reload, without re-uploading;
+ * unavailable storage just means nothing is resumed.
+ */
+export const LAST_INGEST_JOB_KEY = "fin.lastIngestJob";
+
+function readPersistedIngestJobId(): string | null {
+  try {
+    return window.localStorage.getItem(LAST_INGEST_JOB_KEY);
+  } catch {
+    return null; /* storage unavailable - nothing to resume. */
+  }
+}
+
+function persistIngestJobId(jobId: string): void {
+  try {
+    window.localStorage.setItem(LAST_INGEST_JOB_KEY, jobId);
+  } catch {
+    /* storage unavailable - the job simply is not resumed on reload. */
+  }
+}
+
+function forgetPersistedIngestJobIdIf(jobId: string): void {
+  try {
+    if (window.localStorage.getItem(LAST_INGEST_JOB_KEY) === jobId) {
+      window.localStorage.removeItem(LAST_INGEST_JOB_KEY);
+    }
+  } catch {
+    /* storage unavailable - nothing to clear. */
+  }
 }
 
 /**
