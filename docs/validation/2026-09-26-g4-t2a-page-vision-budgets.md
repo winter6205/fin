@@ -158,7 +158,7 @@ container was given `--cpus=4`, i.e. one whole host, so two concurrent runs
 contend 1:1. The same 1-page input measured 15,013.3 ms, 29,171.3 ms,
 16,407.2 ms, and 10,402.8 ms across the four runs that completed both model
 passes (`…T170956Z`, `…T184410Z`, `…T195408Z`, `…T204930Z`) — a 2.8× spread on
-identical input, and the same 1.8× spread on the warm per-page conversion
+identical input, and a 1.8× spread on the warm per-page conversion
 inside those runs (3,571.1 / 6,074.1 / 5,942.4 / 3,374.5 ms). Contention, not
 variance in the input; `driver.py` records no load figure for any of them,
 which is *Leftovers* 6.
@@ -679,7 +679,7 @@ Two runs prove this round moved no measurement:
    ```text
    Validation:
    - Not run: host load at 8.5 on 4 cores at record time; a serial re-run would
-     be contaminated by the same contention that produced the 1.9× spread on
+     be contaminated by the same contention that produced the 2.8× spread on
      identical input.
    - Expected command: scripts/g4_pipeline/run_measured.sh \
        data/corpus/g4_attachment_gold/g4-mixed-chart-001.pdf
