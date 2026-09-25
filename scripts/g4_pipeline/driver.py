@@ -43,7 +43,9 @@ import os
 import statistics
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Final
 
 # Packages whose *resolved* version is part of the pin record. Anything that
 # cannot be introspected is recorded as null rather than guessed.
@@ -71,6 +73,18 @@ PINNED_PACKAGES = [
 
 CGROUP_DIR = Path("/sys/fs/cgroup")
 
+# The cgroup's own spelling of "this limit is off". Recorded as the number the
+# committed measurements already carry, and kept distinct from ``None``, which
+# means the file answered nothing at all.
+CGROUP_NO_LIMIT_TEXT: Final[str] = "max"
+CGROUP_NO_LIMIT_BYTES: Final[int] = -1
+
+# pypdfium2's FPDF_PAGEOBJ_IMAGE enum value, used only when the raw module
+# cannot be imported; no other object kind counts as an image.
+FPDF_PAGEOBJ_IMAGE: Final[int] = 3
+
+_PROC_STATUS_FIELDS: Final[tuple[str, ...]] = ("VmHWM", "VmRSS", "VmSwap", "VmPeak")
+
 
 def log(msg: str) -> None:
     """Diagnostics on stderr only - stdout carries exactly one JSON line."""
@@ -80,59 +94,153 @@ def log(msg: str) -> None:
 # --------------------------------------------------------------------------
 # memory measurement (measured, never inferred)
 # --------------------------------------------------------------------------
-def _read_proc_status_field(names: tuple[str, ...]) -> dict[str, int | None]:
-    out: dict[str, int | None] = {}
+def _read_proc_status_fields(
+    names: tuple[str, ...],
+) -> tuple[dict[str, int | None], list[str]]:
+    """Requested ``/proc/self/status`` fields in bytes, plus every read failure.
+
+    A field is ``None`` only together with a named reason, so an unread memory
+    number can never be read back as a measured zero.
+    """
+    values: dict[str, int | None] = {name: None for name in names}
+    errors: list[str] = []
     try:
         with open("/proc/self/status", "r", encoding="utf-8") as fh:
             for line in fh:
                 key, _, rest = line.partition(":")
-                if key in names:
-                    parts = rest.split()
-                    if parts:
-                        try:
-                            out[key] = int(parts[0]) * (1024 if "kB" in parts else 1)
-                        except ValueError:
-                            out[key] = None
-    except OSError as exc:  # pragma: no cover - /proc always present in Linux
-        out["proc_status_error"] = None  # type: ignore[assignment]
+                if key not in values:
+                    continue
+                parts = rest.split()
+                if not parts:
+                    errors.append(f"/proc/self/status {key}: empty value")
+                    continue  # EXIT: an empty field is no reading, not a zero
+                try:
+                    values[key] = int(parts[0]) * (1024 if "kB" in parts else 1)
+                except ValueError:
+                    errors.append(
+                        f"/proc/self/status {key}: unparseable {parts[0]!r}"
+                    )  # EXIT: text that is not a number is a failed read, not a zero
+    except OSError as exc:
+        errors.append(
+            f"/proc/self/status: {type(exc).__name__}: {exc}"
+        )  # EXIT: no /proc means no process peak, named rather than guessed
         log(f"[mem] cannot read /proc/self/status: {exc}")
-    return {k: out.get(k) for k in names}
+    return values, errors
 
 
-def _read_cgroup_file(name: str) -> int | None:
-    path = CGROUP_DIR / name
+def _read_cgroup_int(
+    name: str, *, allow_unlimited: bool
+) -> tuple[int | None, str | None]:
+    """One cgroup integer as ``(value, error)``; at most one of them is set.
+
+    ``allow_unlimited`` marks a limit file, where ``max`` is a real answer. In a
+    counter file the same text answers nothing, so it becomes a named gap rather
+    than a peak.
+    """
     try:
-        raw = path.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    if raw == "max":
-        return -1
+        raw = (CGROUP_DIR / name).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        return (
+            None,
+            f"{name}: {type(exc).__name__}: {exc}",
+        )  # EXIT: an absent cgroup file is a gap, never a zero
+    if raw == CGROUP_NO_LIMIT_TEXT:
+        if allow_unlimited:
+            return (
+                CGROUP_NO_LIMIT_BYTES,
+                None,
+            )  # EXIT: "no limit" is a reading, but never a byte count
+        return (
+            None,
+            f"{name}: reported {CGROUP_NO_LIMIT_TEXT!r}, not a measured number",
+        )  # EXIT: an unbounded counter measured nothing, so it is not a peak
     try:
-        return int(raw)
+        return int(raw), None
     except ValueError:
-        # key/value files such as memory.events
-        out: dict[str, int] = {}
-        for line in raw.splitlines():
-            k, _, v = line.partition(" ")
-            try:
-                out[k] = int(v)
-            except ValueError:
-                continue
-        return out.get("oom_kill")  # type: ignore[return-value]
-    return None
+        return (
+            None,
+            f"{name}: not an integer: {raw[:60]!r}",
+        )  # EXIT: unexpected content is a failed read, not a zero
 
 
-def memory_snapshot(tag: str) -> dict[str, object]:
+@dataclass(slots=True)
+class MemorySnapshot:
+    """One process + cgroup reading, with every failed sub-read named.
+
+    Byte fields are ``int | None`` so the peak is only ever the max of real
+    readings; ``read_errors`` carries which file or field gave nothing.
+    """
+
+    tag: str
+    t_monotonic_s: float
+    proc_vmhwm_bytes: int | None
+    proc_vmrss_bytes: int | None
+    proc_vmswap_bytes: int | None
+    proc_vmpeak_bytes: int | None
+    cgroup_memory_peak_bytes: int | None
+    cgroup_memory_current_bytes: int | None
+    cgroup_memory_max_bytes: int | None
+    cgroup_memory_swap_current_bytes: int | None
+    cgroup_memory_swap_max_bytes: int | None
+    events: dict[str, int] = field(default_factory=dict)
+    read_errors: list[str] = field(default_factory=list)
+
+    def to_record(self) -> dict[str, object]:
+        """The flat JSON shape the committed measurements carry."""
+        out: dict[str, object] = {
+            "tag": self.tag,
+            "t_monotonic_s": self.t_monotonic_s,
+            "proc_vmhwm_bytes": self.proc_vmhwm_bytes,
+            "proc_vmrss_bytes": self.proc_vmrss_bytes,
+            "proc_vmswap_bytes": self.proc_vmswap_bytes,
+            "proc_vmpeak_bytes": self.proc_vmpeak_bytes,
+            "cgroup_memory_peak_bytes": self.cgroup_memory_peak_bytes,
+            "cgroup_memory_current_bytes": self.cgroup_memory_current_bytes,
+            "cgroup_memory_max_bytes": self.cgroup_memory_max_bytes,
+            "cgroup_memory_swap_current_bytes": self.cgroup_memory_swap_current_bytes,
+            "cgroup_memory_swap_max_bytes": self.cgroup_memory_swap_max_bytes,
+            **self.events,
+        }
+        # Errors are omitted when there are none: the whole record is one line.
+        if self.read_errors:
+            out["read_errors"] = list(self.read_errors)
+        return out
+
+
+def memory_snapshot(tag: str) -> MemorySnapshot:
     """One measured snapshot: process + cgroup v2 (v1 fallback included)."""
-    proc = _read_proc_status_field(("VmHWM", "VmRSS", "VmSwap", "VmPeak"))
-    peak_v2 = _read_cgroup_file("memory.peak")
-    if peak_v2 is None:  # cgroup v1 shape
-        peak_v2 = _read_cgroup_file("memory.max_usage_in_bytes")
-    events: dict[str, int | None] = {}
+    proc, errors = _read_proc_status_fields(_PROC_STATUS_FIELDS)
+
+    peak, error = _read_cgroup_int("memory.peak", allow_unlimited=False)
+    if peak is None:  # cgroup v1 shape
+        if error is not None:
+            errors.append(error)
+        peak, error = _read_cgroup_int(
+            "memory.max_usage_in_bytes", allow_unlimited=False
+        )
+    if error is not None:
+        errors.append(error)
+
+    scalars: dict[str, int | None] = {}
+    for filename, key, is_limit in (
+        ("memory.current", "cgroup_memory_current_bytes", False),
+        ("memory.max", "cgroup_memory_max_bytes", True),
+        ("memory.swap.current", "cgroup_memory_swap_current_bytes", False),
+        ("memory.swap.max", "cgroup_memory_swap_max_bytes", True),
+    ):
+        value, error = _read_cgroup_int(filename, allow_unlimited=is_limit)
+        scalars[key] = value
+        if error is not None:
+            errors.append(error)
+
+    events: dict[str, int] = {}
     for ev in ("memory.events", "memory.events.local"):
         try:
             body = (CGROUP_DIR / ev).read_text(encoding="utf-8")
-        except OSError:
+        except OSError as exc:
+            errors.append(
+                f"{ev}: {type(exc).__name__}: {exc}"
+            )  # EXIT: an absent events file is a gap in the OOM evidence
             continue
         for line in body.splitlines():
             k, _, v = line.partition(" ")
@@ -140,26 +248,37 @@ def memory_snapshot(tag: str) -> dict[str, object]:
                 try:
                     events[f"{ev}.{k}"] = int(v)
                 except ValueError:
-                    pass
-    return {
-        "tag": tag,
-        "t_monotonic_s": round(time.monotonic(), 3),
-        "proc_vmhwm_bytes": proc.get("VmHWM"),
-        "proc_vmrss_bytes": proc.get("VmRSS"),
-        "proc_vmswap_bytes": proc.get("VmSwap"),
-        "proc_vmpeak_bytes": proc.get("VmPeak"),
-        "cgroup_memory_peak_bytes": peak_v2,
-        "cgroup_memory_current_bytes": _read_cgroup_file("memory.current"),
-        "cgroup_memory_max_bytes": _read_cgroup_file("memory.max"),
-        "cgroup_memory_swap_current_bytes": _read_cgroup_file("memory.swap.current"),
-        "cgroup_memory_swap_max_bytes": _read_cgroup_file("memory.swap.max"),
-        **events,
-    }
+                    errors.append(
+                        f"{ev}.{k}: unparseable {v.strip()!r}"
+                    )  # EXIT: an unreadable OOM counter is not evidence of no OOM
+    return MemorySnapshot(
+        tag=tag,
+        t_monotonic_s=round(time.monotonic(), 3),
+        proc_vmhwm_bytes=proc.get("VmHWM"),
+        proc_vmrss_bytes=proc.get("VmRSS"),
+        proc_vmswap_bytes=proc.get("VmSwap"),
+        proc_vmpeak_bytes=proc.get("VmPeak"),
+        cgroup_memory_peak_bytes=peak,
+        events=events,
+        read_errors=errors,
+        **scalars,
+    )
 
 
 # --------------------------------------------------------------------------
 # pin / artifact identity
 # --------------------------------------------------------------------------
+def sha256_bytes(path: Path) -> tuple[int, str]:
+    """Bytes read and their digest, streamed so file size does not matter."""
+    h = hashlib.sha256()
+    size = 0
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            size += len(chunk)
+            h.update(chunk)
+    return size, h.hexdigest()
+
+
 def resolved_versions() -> dict[str, object]:
     from importlib import metadata
 
@@ -192,7 +311,7 @@ def artifact_identity(artifacts_path: Path) -> dict[str, object]:
         "layout_files": [],
     }
     if not info["exists"]:
-        return info
+        return info  # EXIT: an absent cache is the finding; the zeros say "nothing landed"
     total = 0
     count = 0
     files: list[dict[str, object]] = []
@@ -208,11 +327,7 @@ def artifact_identity(artifacts_path: Path) -> dict[str, object]:
         # the whole cache would dominate the measurement run.
         digest = None
         if "layout" in rel.lower() and size <= 2 * 1024**3:
-            h = hashlib.sha256()
-            with path.open("rb") as fh:
-                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-                    h.update(chunk)
-            digest = h.hexdigest()
+            digest = sha256_bytes(path)[1]
         entry = {"path": rel, "bytes": size}
         if digest:
             entry["sha256"] = digest
@@ -231,39 +346,123 @@ def artifact_identity(artifacts_path: Path) -> dict[str, object]:
 # the render and text-layer numbers below come from the same library the
 # pinned pipeline uses internally)
 # --------------------------------------------------------------------------
-def _image_object_type() -> int:
+def _image_object_type() -> tuple[int, str | None]:
+    """The image page-object kind, plus why it was not read from the library."""
     try:
-        from pypdfium2 import raw  # type: ignore[attr-defined]
+        from pypdfium2 import raw
 
-        return int(raw.FPDF_PAGEOBJ_IMAGE)
-    except Exception:
-        return 3  # FPDF_PAGEOBJ_IMAGE constant
+        return int(raw.FPDF_PAGEOBJ_IMAGE), None
+    except Exception as exc:
+        return (
+            FPDF_PAGEOBJ_IMAGE,
+            f"pypdfium2.raw unreadable, image kind assumed to be "
+            f"{FPDF_PAGEOBJ_IMAGE}: {type(exc).__name__}: {exc}",
+        )  # EXIT: a pinned constant, but the record must say it was not measured
 
 
-def _object_kind(obj: object) -> int:
+def _object_kind(obj: object) -> int | None:
+    """A page object's kind, or None when neither accessor answers."""
     for attr in ("get_type", "type"):
         val = getattr(obj, attr, None)
         if callable(val):
             try:
                 return int(val())
             except Exception:
-                continue
+                continue  # EXIT: this accessor refused; the other may still answer
         elif val is not None:
             try:
                 return int(val)
             except Exception:
-                pass
-    return -1
+                continue  # EXIT: an uncoercible kind is no knowledge of the kind
+    return None  # EXIT: unknown kind, so the object is neither image nor not-image
 
 
-def sha256_bytes(path: Path) -> tuple[int, str]:
-    h = hashlib.sha256()
-    size = 0
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            size += len(chunk)
-            h.update(chunk)
-    return size, h.hexdigest()
+def _page_image_objects(page: Any, img_type: int) -> tuple[int | None, str | None]:
+    """Count a page's image objects without decoding any bitmap.
+
+    ``image_only=True`` filters on the object type, which is what fin's rule
+    needs (a count, not a pixel). ``(None, reason)`` when no API shape answers:
+    an unavailable count is not "no images" and must not select the OCR rule.
+    """
+    try:
+        return len(page.get_objects(image_only=True)), None
+    except TypeError as exc:  # older pypdfium2 has no image_only shortcut
+        try:
+            count = 0
+            unreadable = 0
+            for obj in page.get_objects():
+                kind = _object_kind(obj)
+                if kind is None:
+                    unreadable += 1
+                elif kind == img_type:
+                    count += 1
+        except Exception as retry_exc:
+            return (
+                None,
+                f"type scan after {type(exc).__name__}: {exc}; "
+                f"{type(retry_exc).__name__}: {retry_exc}",
+            )  # EXIT: no count at all, so nothing is recorded as zero images
+        if unreadable:
+            return (
+                count,
+                f"{unreadable} objects with unreadable kind were not counted",
+            )  # EXIT: a partial count is labelled as one
+        return count, None
+    except Exception as exc:
+        return (
+            None,
+            f"{type(exc).__name__}: {exc}",
+        )  # EXIT: an unreadable object list is a gap, not a zero
+
+
+def _apply_page_ocr(
+    entry: dict[str, object],
+    pil: Any,
+    page_no: int,
+    ocr_engine: Any,
+    ocr_trigger: str,
+    image_dir: Path | None,
+    failures: list[str],
+) -> None:
+    """One rendered page through PNG -> the repo's Tesseract engine, recorded.
+
+    ``image_dir`` persists the PNG so the vision payload is measured; ``None``
+    means a temp file removed after the call.
+    """
+    png_path = (
+        image_dir / f"page_{page_no:04d}.png"
+        if image_dir is not None
+        else Path(f"/tmp/g4_page_{os.getpid()}_{page_no:04d}.png")
+    )
+    entry["ocr_trigger"] = ocr_trigger
+    pil.save(png_path, format="PNG")
+    try:
+        ocr_text = ocr_engine.recognize(source=png_path, page=page_no)
+    except Exception as exc:  # fin.corpus.ocr's typed OcrRequiredUnavailableError
+        entry["ocr_error_code"] = getattr(exc, "code", type(exc).__name__)
+        entry["ocr_error"] = (
+            f"{type(exc).__name__}: {exc}"  # EXIT: a code alone would hide why the page has no text
+        )
+        entry["ocr_used"] = False
+    else:
+        entry["ocr_used"] = True
+        entry["ocr_text_char_count"] = len(ocr_text)
+        # Short sample so the OCR output is auditable without shipping
+        # the whole page text in the measurement line.
+        entry["ocr_text_sample"] = " ".join(ocr_text.split())[:160]
+    finally:
+        entry["ocr_lang"] = ocr_engine.lang
+        if image_dir is None:
+            try:
+                png_path.unlink(missing_ok=True)
+            except OSError as exc:
+                failures.append(
+                    f"page {page_no}: temp PNG {png_path.name} not removed: "
+                    f"{type(exc).__name__}: {exc}"
+                )  # EXIT: a leaked bitmap is not a gap in a number, but not invisible either
+    if image_dir is not None:
+        entry["page_image_png_bytes"] = png_path.stat().st_size
+        entry["page_image_png_sha256"] = sha256_bytes(png_path)[1]
 
 
 # --------------------------------------------------------------------------
@@ -288,6 +487,8 @@ def build_converter(artifacts_path: Path, layout_preset: str, threads: int):
         # fall back to it but record that the explicit preset call failed.
         layout_note = f"from_preset failed ({type(exc).__name__}: {exc}); default"
         layout_options = LayoutObjectDetectionOptions()
+        # EXIT: the built pipeline is still Heron, but the record says the
+        # preset was not what selected it
 
     opts = PdfPipelineOptions(
         artifacts_path=artifacts_path,
@@ -365,7 +566,7 @@ def region_counts_from_document(doc) -> dict[int, dict[str, object]]:
         for prov in getattr(item, "prov", None) or []:
             page_no = getattr(prov, "page_no", None)
             if page_no is None:
-                continue
+                continue  # EXIT: provenance with no page number has no page to charge
             bucket(int(page_no))["text"] = int(bucket(int(page_no))["text"]) + 1
 
     for kind, attr in (("table", "tables"), ("figure", "pictures")):
@@ -373,7 +574,7 @@ def region_counts_from_document(doc) -> dict[int, dict[str, object]]:
             for prov in getattr(item, "prov", None) or []:
                 page_no = getattr(prov, "page_no", None)
                 if page_no is None:
-                    continue
+                    continue  # EXIT: provenance with no page number has no page to charge
                 b = bucket(int(page_no))
                 b[kind] = int(b[kind]) + 1
                 box = getattr(prov, "bbox", None)
@@ -445,7 +646,7 @@ def main() -> int:
     pdf_path: Path = args.pdf
     if not pdf_path.is_file():
         log(f"[driver] no such PDF: {pdf_path}")
-        return 2
+        return 2  # EXIT: nothing was measured, so no line is printed at all
 
     # The repo's OCR rule and language string, imported from the read-only
     # mount. Hard failure if absent: a locally re-implemented rule would stop
@@ -458,22 +659,30 @@ def main() -> int:
     )
     import pypdfium2 as pdfium  # noqa: E402
 
-    checkpoints: list[dict[str, object]] = [memory_snapshot("start")]
+    checkpoints: list[MemorySnapshot] = [memory_snapshot("start")]
+    harness_failures: list[str] = []
     file_bytes, file_sha256 = sha256_bytes(pdf_path)
 
     # ---------------------------------------------------------------- render
     t0 = time.monotonic()
     pdf_doc = pdfium.PdfDocument(str(pdf_path))
     page_count = len(pdf_doc)
-    img_type = _image_object_type()
+    img_type, img_type_error = _image_object_type()
+    if img_type_error is not None:
+        harness_failures.append(img_type_error)
     pages: list[dict[str, object]] = []
     ocr_engine = TesseractEngine(lang=DEFAULT_TESSERACT_LANG)
-    if args.write_images:
+    image_dir: Path | None = args.image_dir if args.write_images else None
+    if image_dir is not None:
         try:
-            args.image_dir.mkdir(parents=True, exist_ok=True)
+            image_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            log(f"[driver] cannot write images to {args.image_dir}: {exc}")
-            args.write_images = False
+            log(f"[driver] cannot write images to {image_dir}: {exc}")
+            harness_failures.append(
+                f"--write-images off: cannot create {image_dir}: "
+                f"{type(exc).__name__}: {exc}"
+            )  # EXIT: page bitmaps then carry no byte measurement at all
+            image_dir = None
 
     for idx in range(page_count):
         page_no = idx + 1
@@ -482,22 +691,9 @@ def main() -> int:
         width_pt, height_pt = page.get_size()
         textpage = page.get_textpage()
         native_text = textpage.get_text_range() or ""
-        try:
-            # image_only=True filters on the object type without decoding the
-            # bitmaps, which is what fin's rule needs (a count, not a pixel).
-            n_images = len(page.get_objects(image_only=True))
-        except TypeError:
-            # Older pypdfium2 without the image_only shortcut: scan by type.
-            try:
-                n_images = sum(
-                    1 for obj in page.get_objects() if _object_kind(obj) == img_type
-                )
-            except Exception as exc:  # pragma: no cover - defensive
-                log(f"[driver] page {page_no} object scan failed: {exc}")
-                n_images = -1
-        except Exception as exc:  # pragma: no cover - defensive
-            log(f"[driver] page {page_no} object scan failed: {exc}")
-            n_images = -1
+        n_images, images_error = _page_image_objects(page, img_type)
+        if images_error is not None:
+            log(f"[driver] page {page_no} object scan failed: {images_error}")
 
         entry: dict[str, object] = {
             "page_no": page_no,
@@ -505,9 +701,14 @@ def main() -> int:
             "native_text_char_count": len(native_text),
             "native_text_codepoints": len(native_text),
             "pdf_image_objects": n_images,
+            "pdf_image_objects_error": images_error,
+            # The rule's own "no image reference" input is 0, so a failed scan
+            # is readable only through pdf_image_objects_error.
             "ocr_required_by_repo_rule": bool(
                 detect_ocr_required(
-                    text=native_text, image_count=max(n_images, 0), min_text_chars=1
+                    text=native_text,
+                    image_count=n_images if n_images is not None else 0,
+                    min_text_chars=1,
                 )
             ),
             "ocr_used": False,
@@ -516,6 +717,7 @@ def main() -> int:
             "ocr_text_char_count": 0,
             "ocr_text_sample": None,
             "ocr_error_code": None,
+            "ocr_error": None,
         }
 
         bitmap = page.render(scale=args.dpi / 72.0)
@@ -525,8 +727,11 @@ def main() -> int:
         try:
             dpi_x, dpi_y = bitmap.get_dpi()
             entry["rendered_dpi"] = [round(float(dpi_x), 1), round(float(dpi_y), 1)]
-        except Exception:
-            entry["rendered_dpi"] = [args.dpi, args.dpi]
+        except Exception as exc:
+            entry["rendered_dpi"] = None
+            entry["rendered_dpi_error"] = (
+                f"{type(exc).__name__}: {exc}"  # EXIT: the requested DPI is not a measured one
+            )
 
         ocr_trigger = "repo_rule" if entry["ocr_required_by_repo_rule"] else None
         if args.force_ocr and ocr_trigger is None:
@@ -536,38 +741,17 @@ def main() -> int:
             # text layer. Never used to decide coverage in a measured run.
             ocr_trigger = "forced_selftest"
         if ocr_trigger is not None:
-            entry["ocr_trigger"] = ocr_trigger
-            png_path = None
-            if args.write_images:
-                png_path = args.image_dir / f"page_{page_no:04d}.png"
-            else:
-                tmp = Path(
-                    f"/tmp/g4_page_{os.getpid()}_{page_no:04d}.png"
-                )
-                png_path = tmp
-            pil.save(png_path, format="PNG")
-            try:
-                ocr_text = ocr_engine.recognize(source=png_path, page=page_no)
-                entry["ocr_used"] = True
-                entry["ocr_text_char_count"] = len(ocr_text)
-                # Short sample so the OCR output is auditable without shipping
-                # the whole page text in the measurement line.
-                entry["ocr_text_sample"] = " ".join(ocr_text.split())[:160]
-            except Exception as exc:  # typed OcrRequiredUnavailableError path
-                entry["ocr_error_code"] = getattr(exc, "code", type(exc).__name__)
-                entry["ocr_used"] = False
-            finally:
-                entry["ocr_lang"] = ocr_engine.lang
-                if not args.write_images:
-                    try:
-                        png_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-            if args.write_images:
-                entry["page_image_png_bytes"] = png_path.stat().st_size
-                entry["page_image_png_sha256"] = sha256_bytes(png_path)[1]
-        elif args.write_images:
-            png_path = args.image_dir / f"page_{page_no:04d}.png"
+            _apply_page_ocr(
+                entry,
+                pil,
+                page_no,
+                ocr_engine,
+                ocr_trigger,
+                image_dir,
+                harness_failures,
+            )
+        elif image_dir is not None:
+            png_path = image_dir / f"page_{page_no:04d}.png"
             pil.save(png_path, format="PNG")
             entry["page_image_png_bytes"] = png_path.stat().st_size
 
@@ -612,20 +796,23 @@ def main() -> int:
     except Exception as exc:
         full_error = f"{type(exc).__name__}: {exc}"
         log(f"[driver] Docling whole-document pass failed: {full_error}")
+        # EXIT: this pass is the only region source, so regions go None below
     full_doc_ms = (time.monotonic() - t_full) * 1000.0
     checkpoints.append(memory_snapshot("after_docling_whole_doc"))
 
-    # Docling's export is the authority for region boxes; fall back to the
-    # single-page pass below if the whole-document run blew up.
+    # Docling's export is the authority for region boxes, and a pass that blew
+    # up measured no regions at all, which is not the same fact as zero regions.
+    regions_measured = full_error is None
     for entry in pages:
         reg = regions.get(int(entry["page_no"]), {})
         entry["region_counts"] = {
-            "text": int(reg.get("text", 0)),
-            "table": int(reg.get("table", 0)),
-            "figure": int(reg.get("figure", 0)),
-        }
-        entry["table_boxes"] = reg.get("table_boxes", [])
-        entry["figure_boxes"] = reg.get("figure_boxes", [])
+            kind: (int(reg.get(kind, 0)) if regions_measured else None)
+            for kind in ("text", "table", "figure")
+        }  # EXIT: on a measured page an absent bucket really is zero
+        entry["table_boxes"] = reg.get("table_boxes", []) if regions_measured else None
+        entry["figure_boxes"] = (
+            reg.get("figure_boxes", []) if regions_measured else None
+        )
         entry["docling_page_size_pt"] = doc_page_sizes.get(int(entry["page_no"]))
 
     # ------------------------------------------------- per-page latency pass
@@ -649,10 +836,16 @@ def main() -> int:
                 pages[idx]["page_latency_ms"] = round(ms, 1)
                 pages[idx]["page_latency_mode"] = "single_page_slice"
             except Exception as exc:
-                slice_error = f"{type(exc).__name__}: {exc}"
+                slice_error = f"page {page_no}: {type(exc).__name__}: {exc}"
                 log(f"[driver] slice pass page {page_no} failed: {slice_error}")
                 pages[idx]["page_latency_ms"] = None
                 pages[idx]["page_latency_mode"] = "single_page_slice_failed"
+                for rest in pages[idx + 1 :]:
+                    rest["page_latency_ms"] = None
+                    rest["page_latency_mode"] = "not_measured_after_slice_failure"
+                # EXIT: pages after the stop are named as unmeasured instead of
+                # leaving their keys out, so a short n in the stats is not a
+                # silent shrink of the document
                 break
             finally:
                 if one is not None:
@@ -660,12 +853,19 @@ def main() -> int:
                     # handle per page inside the 4 GiB ceiling.
                     try:
                         one.close()
-                    except Exception:
+                    except Exception as exc:
+                        harness_failures.append(
+                            f"slice page {page_no}: document close failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        )  # EXIT: a handle left open would inflate the next peak
                         del one
                 try:
                     tmp_pdf.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    harness_failures.append(
+                        f"slice page {page_no}: temp PDF not removed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )  # EXIT: a slice left on disk is a cost, not a measurement
             if idx % 10 == 9:
                 checkpoints.append(memory_snapshot(f"slice_pass_page_{page_no}"))
     else:
@@ -676,24 +876,26 @@ def main() -> int:
     checkpoints.append(memory_snapshot("end"))
 
     final = memory_snapshot("final")
+    # A failed read is None and drops out of the peak; a limit file's "no limit"
+    # reading is CGROUP_NO_LIMIT_BYTES and must never enter this max at all.
     vmhwm = max(
-        [c["proc_vmhwm_bytes"] for c in checkpoints if c["proc_vmhwm_bytes"]]
-        + [final["proc_vmhwm_bytes"] or 0]
+        [c.proc_vmhwm_bytes for c in checkpoints if c.proc_vmhwm_bytes]
+        + [final.proc_vmhwm_bytes or 0]
     )
     cgroup_peak = max(
         [
-            c["cgroup_memory_peak_bytes"] or 0
+            c.cgroup_memory_peak_bytes or 0
             for c in checkpoints
-            if (c["cgroup_memory_peak_bytes"] or 0) > 0
+            if (c.cgroup_memory_peak_bytes or 0) > 0
         ]
-        + [final["cgroup_memory_peak_bytes"] or 0]
+        + [final.cgroup_memory_peak_bytes or 0]
     )
     oom_kill_events = max(
         [
             int(v)
             for c in checkpoints + [final]
-            for k, v in c.items()
-            if k.startswith("memory.events") and k.endswith("oom_kill") and v is not None
+            for k, v in c.events.items()
+            if k.startswith("memory.events") and k.endswith("oom_kill")
         ]
         or [0]
     )
@@ -742,10 +944,13 @@ def main() -> int:
                 "max": round(max(latencies), 1) if latencies else None,
             },
             "regions_total": {
-                "text": sum(p["region_counts"]["text"] for p in pages),
-                "table": sum(p["region_counts"]["table"] for p in pages),
-                "figure": sum(p["region_counts"]["figure"] for p in pages),
-            },
+                kind: (
+                    sum(int(p["region_counts"][kind]) for p in pages)
+                    if regions_measured
+                    else None
+                )
+                for kind in ("text", "table", "figure")
+            },  # EXIT: no sum over an unmeasured pass, so a null is never a zero
             "pages_needing_ocr": sum(
                 1 for p in pages if p["ocr_required_by_repo_rule"]
             ),
@@ -759,16 +964,15 @@ def main() -> int:
             "ocr_text_chars_total": sum(p["ocr_text_char_count"] for p in pages),
             "peak_rss_vmhwm_bytes": vmhwm,
             "cgroup_peak_bytes": cgroup_peak,
-            "cgroup_memory_max_bytes": final.get("cgroup_memory_max_bytes"),
-            "cgroup_memory_swap_max_bytes": final.get("cgroup_memory_swap_max_bytes"),
-            "cgroup_memory_swap_current_bytes": final.get(
-                "cgroup_memory_swap_current_bytes"
-            ),
-            "proc_vmswap_bytes": final.get("proc_vmswap_bytes"),
+            "cgroup_memory_max_bytes": final.cgroup_memory_max_bytes,
+            "cgroup_memory_swap_max_bytes": final.cgroup_memory_swap_max_bytes,
+            "cgroup_memory_swap_current_bytes": final.cgroup_memory_swap_current_bytes,
+            "proc_vmswap_bytes": final.proc_vmswap_bytes,
             "oom_kill_events_in_cgroup": oom_kill_events,
             "oom_killed": bool(oom_kill_events > 0),
             "oom_killed_source": "cgroup memory.events oom_kill counter",
-            "memory_checkpoints": checkpoints + [final],
+            "harness_failures": harness_failures,
+            "memory_checkpoints": [c.to_record() for c in checkpoints + [final]],
         },
         "pin_manifest": resolved_versions(),
         "pipeline_identity": pipeline_identity,
