@@ -199,9 +199,10 @@ def preflight_run(
     """Refuse a run that does not fit, before a single page is skipped.
 
     ``admitted_pages`` is one entry per eligible attachment, so the page cap
-    is per attachment while the vision budget is the run's own total; crops
-    are charged to that same total. Nothing is spent and nothing is mutated,
-    so the same request asked twice gets the same answer.
+    is per attachment while the vision budget is the run's own total. Crops are
+    charged to that total and are separately capped by their own headroom.
+    Nothing is spent and nothing is mutated, so the same request asked twice
+    gets the same answer.
     """
     validate(budgets)
     counts = _page_counts(admitted_pages)
@@ -212,11 +213,14 @@ def preflight_run(
                 f"attachment needs {pages} pages, cap is "
                 f"{budgets.max_pdf_pages}"
             )  # EXIT: page admission precedes any scan, so it is the honest code
+    if crops > budgets.max_vision_crop_calls_per_run:
+        raise AttachmentVisionBudgetExceeded(
+            f"run asks {crops} crop calls, headroom is "
+            f"{budgets.max_vision_crop_calls_per_run}"
+        )  # EXIT: a bound of its own, so a run total with room left stays refused
     needed = sum(counts) + crops
     if needed > budgets.max_vision_calls_per_run:
         raise AttachmentVisionBudgetExceeded(
             f"run needs {needed} visual calls, budget is "
             f"{budgets.max_vision_calls_per_run}"
         )  # EXIT: the run is refused whole, never truncated to fit
-    if not counts:
-        return  # EXIT: a turn with nothing eligible spends only what was priced
