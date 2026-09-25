@@ -10,9 +10,11 @@ what does one call cost in latency and tokens?
 
 This script is that evidence. It is a probe, not a seam:
 
-* it builds ONE throwaway chart image with PIL in ``/tmp/g4_vision_probe/``
-  (never a gold fixture — the measurement must be independent of the
-  suites that later consume the decision);
+* by default it builds ONE throwaway chart image with PIL in
+  ``/tmp/g4_vision_probe/``, so the recorded measurement is independent of the
+  suites that later consume the decision; ``--image`` points the same questions
+  at a file on disk instead, which is how a committed fixture or a figure crop
+  gets priced;
 * provider config comes from fin's own helper
   (:func:`fin.host.compile._build_default_model`), so the probe cannot
   drift from the product boot path and re-implements no provider
@@ -40,6 +42,12 @@ Usage::
     cd <dir whose .env holds FIN_MODEL / FIN_BASE_URL / FIN_API_KEY>
     uv run python <path>/scripts/g4_vision_probe.py
     uv run python <path>/scripts/g4_vision_probe.py --render-only
+    uv run python <path>/scripts/g4_vision_probe.py --image <file> \
+        --series "Total net sales" --mean 94186.5 --out <json>
+
+``--image`` points the same three questions at a file on disk instead of the
+throwaway page; ``--series`` and ``--mean`` then carry that file's witness, and
+``--out`` keeps the recorded default artifact from being overwritten.
 
 Exit codes: ``0`` the probe ran and image input is confirmed; ``1`` the
 probe ran but a verdict is negative (that finding IS a result, not a
@@ -55,6 +63,7 @@ import json
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -83,7 +92,25 @@ BAR_VALUES = [12, 17, 23, 31]
 EXPECTED_MEAN = sum(BAR_VALUES) / len(BAR_VALUES)  # 20.75
 MEAN_TEXT = f"{EXPECTED_MEAN:.2f}"
 
+# How the sentence describes the bytes sent. ``--image`` cannot claim to be a
+# page, and a page render is not a chart-only crop either.
+PAGE_MEDIUM = "one rendered page of a financial document"
+ATTACHED_MEDIUM = "one image attached to a financial document"
+
 ENV_NAMES_READ = ("FIN_MODEL", "FIN_BASE_URL", host_compile.FIN_API_KEY_ENV)
+
+
+@dataclass(frozen=True)
+class Target:
+    """The thing under probe and the one answer that proves it was seen.
+
+    ``expected_mean`` is never stated in a prompt and never sent as text, so
+    a correct mean can only come from the image bytes reaching the model.
+    """
+
+    series_name: str = SERIES_NAME
+    medium: str = PAGE_MEDIUM
+    expected_mean: float = EXPECTED_MEAN
 
 STRUCTURED_KEYS = (
     "has_chart",
@@ -107,17 +134,18 @@ class Blocked(Exception):
 # ----- provider config (fin's own helper) -----------------------------
 
 
-def build_client() -> Any:
-    """Return fin's configured ``ChatOpenAI`` for this machine.
+def build_client() -> tuple[Any, str]:
+    """fin's configured ``ChatOpenAI`` and the key value it resolved.
 
-    Delegates entirely to ``_build_default_model`` so the probe measures
-    the same model, base URL, key resolution (including the loud
-    ``sk-no-key-required`` placeholder), ``timeout=120.0`` and
-    ``max_retries=0`` the product boots with.
+    Private-symbol probe seam: ``fin.host.compile`` exports no model factory,
+    so this is the one place that touches ``_build_default_model`` and
+    ``_read_env``. The probe measures the product's own model, base URL, key
+    resolution (including the loud ``sk-no-key-required`` placeholder),
+    ``timeout=120.0`` and ``max_retries=0``, and re-implements none of them.
+    The key value is for the scrubber only and is never recorded.
     """
-    return host_compile._build_default_model(
-        model_name=None, base_url=None, env=None
-    )
+    client = host_compile._build_default_model(model_name=None, base_url=None, env=None)
+    return client, host_compile._read_env(None, host_compile.FIN_API_KEY_ENV) or ""
 
 
 def host_only(url: str) -> str:
@@ -148,8 +176,8 @@ def _font(size: int) -> Any:
     return ImageFont.load_default(size=size)
 
 
-def render_probe_page(path: Path) -> tuple[int, int]:
-    """Draw a page-like PNG with one bar chart; return its dimensions.
+def render_probe_page(path: Path) -> None:
+    """Draw a page-like PNG with one bar chart.
 
     The chart is deliberately the one thing a text-only model cannot
     guess: labelled axes, four bars, known values, stated mean.
@@ -226,13 +254,26 @@ def render_probe_page(path: Path) -> tuple[int, int]:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     image.save(path, format="PNG")
-    with Image.open(path) as saved:
-        return int(saved.width), int(saved.height)
+
+
+IMAGE_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
 
 
 def image_data_url(path: Path) -> str:
-    """The data URL a multimodal endpoint receives for this image."""
-    return "data:image/png;base64," + base64.b64encode(path.read_bytes()).decode(
+    """The data URL a multimodal endpoint receives for this image.
+
+    The declared type follows the file suffix: a provider that trusts it
+    must not be handed JPEG bytes labelled as PNG, which would turn an
+    input-path mistake into a negative capability verdict.
+    """
+    mime = IMAGE_MIME.get(path.suffix.lower(), "image/png")
+    return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode(
         "ascii"
     )
 
@@ -250,36 +291,34 @@ def _human(text: str, data_url: str | None) -> list[Any]:
     return [HumanMessage(content=parts)]
 
 
-def presence_prompt(data_url: str) -> list[Any]:
+def presence_prompt(target: Target, data_url: str) -> list[Any]:
     """Question (a): is a chart on this page at all?"""
     return _human(
-        "This image is one rendered page of a financial document. Does "
-        "this page contain a chart? Reply with exactly one word: yes or "
-        "no.",
+        f"This image is {target.medium}. Does it contain a chart? "
+        "Reply with exactly one word: yes or no.",
         data_url,
     )
 
 
-def meaning_prompt(data_url: str) -> list[Any]:
+def meaning_prompt(target: Target, data_url: str) -> list[Any]:
     """Question (b): what does the chart say, including the checkable mean?"""
     return _human(
-        "This image is one rendered page of a financial document. Read "
-        "the chart on it and answer in a few sentences: the chart type, "
-        "the name of the series it plots, the axis or category labels, "
-        f"the value of every bar, and the arithmetic mean of the "
-        f"{SERIES_NAME} series across all quarters stated to two decimal "
-        "places.",
+        f"This image is {target.medium}. Read the chart on it and answer in "
+        "a few sentences: the chart type, the name of the series it plots, "
+        "the axis or category labels, the value of every bar, and the "
+        f"arithmetic mean of the {target.series_name} series across all of "
+        "its categories, stated to two decimal places.",
         data_url,
     )
 
 
-def structured_prompt(data_url: str) -> list[Any]:
+def structured_prompt(target: Target, data_url: str) -> list[Any]:
     """Can T2e get a structured observation out of this provider?"""
     schema = ", ".join(
         [
             '"has_chart": true or false',
             '"chart_type": string',
-            f'"series_name": string (the series is {SERIES_NAME})',
+            f'"series_name": string (the series is {target.series_name})',
             '"category_labels": array of strings',
             '"bar_values": array of numbers',
             '"mean_of_series": number',
@@ -287,9 +326,8 @@ def structured_prompt(data_url: str) -> list[Any]:
         ]
     )
     return _human(
-        "This image is one rendered page of a financial document. Reply "
-        "with ONLY one JSON object and nothing else - no prose, no code "
-        "fence - with exactly these keys: "
+        f"This image is {target.medium}. Reply with ONLY one JSON object and "
+        "nothing else - no prose, no code fence - with exactly these keys: "
         + schema
         + ". Read every value from the chart in the image itself.",
         data_url,
@@ -409,16 +447,23 @@ def classify_error(exc: BaseException) -> str:
 class Probe:
     """Sends the calls under the hard cap and records what came back."""
 
-    def __init__(self, client: Any, image: Path, scrubber: Scrubber) -> None:
+    def __init__(
+        self, client: Any, image: Path, scrubber: Scrubber, target: Target
+    ) -> None:
         from PIL import Image
 
         self._client = client
+        self._target = target
         self.data_url = image_data_url(image)
         self._scrubber = scrubber
         with Image.open(image) as opened:
             self.dims = (int(opened.width), int(opened.height))
         self.image_bytes = image.stat().st_size
         self.calls: list[dict[str, Any]] = []
+
+    @property
+    def target(self) -> Target:
+        return self._target
 
     @property
     def used(self) -> int:
@@ -502,9 +547,19 @@ class Probe:
 # ----- verdicts -------------------------------------------------------
 
 
-def saw_the_image(text: str | None) -> bool:
-    """The witness: only the rendered page carries the mean this number."""
-    return bool(text) and MEAN_TEXT in text
+def saw_the_image(text: str | None, expected_mean: float) -> bool:
+    """The witness: only the image carries the numbers this mean averages.
+
+    Compared with a half-unit tolerance rather than a string match, so an
+    answer that rounds the mean correctly still counts while no value plotted
+    on the chart can be mistaken for it.
+    """
+    if not text:
+        return False
+    numbers = re.findall(r"\d[\d,]*(?:\.\d+)?", text)
+    return any(
+        abs(float(raw.replace(",", "")) - expected_mean) <= 0.5 for raw in numbers
+    )  # EXIT: no number in the answer, so the image was never read
 
 
 def structured_ok(text: str | None) -> bool:
@@ -534,7 +589,7 @@ def structured_ok(text: str | None) -> bool:
     return False
 
 
-def verdicts(calls: list[dict[str, Any]]) -> dict[str, bool]:
+def verdicts(calls: list[dict[str, Any]], target: Target) -> dict[str, bool]:
     meaning_text = next(
         (c["chart_meaning_answer"] for c in calls if c["prompt_kind"] == "meaning"),
         None,
@@ -551,7 +606,8 @@ def verdicts(calls: list[dict[str, Any]]) -> dict[str, bool]:
         None,
     )
     return {
-        "supports_image_input": (not image_rejected) and saw_the_image(meaning_text),
+        "supports_image_input": (not image_rejected)
+        and saw_the_image(meaning_text, target.expected_mean),
         "structured_output_ok": structured_ok(structured_text),
         "usage_reported": any(c["usage"] for c in calls),
     }
@@ -565,7 +621,7 @@ def run_probe(probe: Probe) -> None:
     """
     for kind, builder in PROMPTS:
         try:
-            probe.invoke(kind, builder(probe.data_url))
+            probe.invoke(kind, builder(probe.target, probe.data_url))
         except BudgetExhausted:
             return
     image_calls = [c for c in probe.calls if c["prompt_kind"] != "text_control"]
@@ -579,9 +635,9 @@ def run_probe(probe: Probe) -> None:
 # ----- entry point -----------------------------------------------------
 
 
-def write_artifact(payload: dict[str, Any]) -> None:
-    ARTIFACT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    ARTIFACT_PATH.write_text(
+def write_artifact(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
 
@@ -597,17 +653,63 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="build the throwaway page image and exit; makes no API call",
     )
     parser.add_argument(
+        "--image",
+        type=Path,
+        default=None,
+        help="probe this image file instead of the throwaway page; needs "
+        "--series and --mean, because a witness that does not belong to this "
+        "file proves nothing",
+    )
+    parser.add_argument(
+        "--series",
+        default=None,
+        help="series name read out of --image, used in the meaning prompts",
+    )
+    parser.add_argument(
+        "--mean",
+        type=float,
+        default=None,
+        help="arithmetic mean of that series, computed outside this script: "
+        "an answer counts as having seen the image only if it carries it",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=ARTIFACT_PATH,
+        help=f"artifact path (default: {ARTIFACT_PATH})",
+    )
+    parser.add_argument(
         "--dotenv-start",
         type=Path,
         default=Path.cwd(),
         help="directory to search for the operator .env (default: cwd), "
         "resolved by fin.host.operator_env.find_env_file",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.image is not None and (args.series is None or args.mean is None):
+        parser.error("--image needs --series and --mean to carry a witness")
+    if args.image is None and (args.series is not None or args.mean is not None):
+        parser.error("--series and --mean describe --image; pass them together")
+    return args
+
+
+def target_for(args: argparse.Namespace) -> Target:
+    """The subject under probe: the throwaway page, or the named file."""
+    if args.image is None:
+        return Target()
+    return Target(
+        series_name=args.series,
+        medium=ATTACHED_MEDIUM,
+        expected_mean=args.mean,
+    )
 
 
 def summary_line(
-    config: dict[str, Any], calls: list[dict[str, Any]], verdict: dict[str, bool]
+    config: dict[str, Any],
+    calls: list[dict[str, Any]],
+    verdict: dict[str, bool],
+    target: Target,
+    artifact: Path,
 ) -> str:
     """One grep-able line: the three verdicts plus the witness result."""
     meaning_text = next(
@@ -625,21 +727,30 @@ def summary_line(
         f"{str(verdict['structured_output_ok']).lower()} "
         "usage_reported="
         f"{str(verdict['usage_reported']).lower()} "
-        f"mean_expected={MEAN_TEXT} "
-        f"mean_answered={str(saw_the_image(meaning_text)).lower()} "
-        f"artifact={ARTIFACT_PATH}"
+        f"mean_expected={target.expected_mean:.2f} "
+        "mean_answered="
+        f"{str(saw_the_image(meaning_text, target.expected_mean)).lower()} "
+        f"artifact={artifact}"
     )
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    image_path = SCRATCH_DIR / "probe_page.png"
-    width, height = render_probe_page(image_path)
+    target = target_for(args)
+    if args.image is None:
+        image_path = SCRATCH_DIR / "probe_page.png"
+        render_probe_page(image_path)
+    else:
+        image_path = args.image
+        if not image_path.is_file():
+            print(f"probe: no such image: {image_path}", file=sys.stderr)
+            return 2  # EXIT: a missing file is a usage error, not a verdict
+
     if args.render_only:
         print(
             f"G4_VISION_PROBE result=render_only image={image_path} "
-            f"width={width} height={height} "
-            f"bytes={image_path.stat().st_size} expected_mean={MEAN_TEXT} calls=0"
+            f"bytes={image_path.stat().st_size} "
+            f"expected_mean={target.expected_mean:.2f} calls=0"
         )
         return 0
 
@@ -652,19 +763,14 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
     apply_dotenv(start=args.dotenv_start)
-    client = build_client()
+    client, api_key = build_client()
     config = config_block(client)
-    scrubber = Scrubber(
-        (
-            host_compile._read_env(None, host_compile.FIN_API_KEY_ENV) or "",
-            "sk-no-key-required",
-        )
-    )
+    scrubber = Scrubber((api_key, "sk-no-key-required"))
 
-    probe = Probe(client, image_path, scrubber)
+    probe = Probe(client, image_path, scrubber, target)
     try:
         run_probe(probe)
-        status = 0 if verdicts(probe.calls)["supports_image_input"] else 1
+        status = 0 if verdicts(probe.calls, target)["supports_image_input"] else 1
     except Blocked as exc:
         print(
             f"probe: BLOCKED on auth/permission, no further calls: {exc}",
@@ -673,16 +779,23 @@ def main(argv: list[str] | None = None) -> int:
         status = 3
 
     calls = probe.calls
-    verdict = verdicts(calls)
-    write_artifact(
-        {
-            "config": config,
-            "calls": calls,
-            "total_calls": len(calls),
-            "verdicts": verdict,
-        }
-    )
-    print(summary_line(config, calls, verdict))
+    verdict = verdicts(calls, target)
+    payload = {
+        "config": config,
+        "image": {
+            "path": str(image_path),
+            "width": probe.dims[0],
+            "height": probe.dims[1],
+            "bytes": probe.image_bytes,
+        },
+        "series_name": target.series_name,
+        "expected_mean": target.expected_mean,
+        "calls": calls,
+        "total_calls": len(calls),
+        "verdicts": verdict,
+    }
+    write_artifact(args.out, payload)
+    print(summary_line(config, calls, verdict, target, args.out))
     return status
 
 
