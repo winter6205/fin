@@ -263,7 +263,8 @@ def test_negative_zero_is_rejected_as_an_invalid_value() -> None:
 
     Python's ``int("-0")`` is ``0``, so a lenient parse would file it as
     "non-positive" and a sign-aware parse as "malformed". Either way it must
-    fail; pinned explicitly so the GREEN step cannot accept it.
+    fail, and which of the two it fails as is not a promise the module makes;
+    this pins that it cannot be accepted.
     """
     with pytest.raises(AttachmentBudgetConfigError):
         _load({PAGES_KEY: "-0"})
@@ -333,13 +334,14 @@ def test_non_canonical_or_unbounded_values_fail_config_validation(
     Rule pinned: after trimming, the text must be one or more ASCII decimal
     digits — no sign, no base prefix, no separator, no non-ASCII digit — and
     the resulting integer must be positive and at or below ``sys.maxsize``.
-    ``reason`` documents the class under test and is carried in the message
-    check below.
+    The failure must name both the key and the rejected text, because an
+    operator reading a boot log has only that line to find the setting.
     """
     with pytest.raises(AttachmentBudgetConfigError) as excinfo:
         _load({PAGES_KEY: value})
-    assert reason
-    assert PAGES_KEY in str(excinfo.value)
+    message = str(excinfo.value)
+    assert PAGES_KEY in message
+    assert value in message
 
 
 @pytest.mark.parametrize(
@@ -551,10 +553,6 @@ def test_crop_calls_consume_the_same_run_budget_as_full_page_scans() -> None:
 
 
 # ----- K: the trivial empty run -----
-
-# NOTE to the GREEN implementer: the empty-admitted-list early return is a
-# branch, and every early return must carry an `# EXIT:` comment, so
-# that branch must carry one saying why an empty run is a success.
 
 
 def test_empty_admitted_run_passes_and_still_enforces_the_run_budget() -> None:
