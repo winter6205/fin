@@ -168,21 +168,41 @@ keep their raw bytes in process memory`, so **restart durability is not
 exercisable in this configuration**; it remains SQL-seam evidence (runs 1/16/25),
 not a browser-proven property.
 
-Four by-products, none a T1 product defect:
+Three by-products, of which the most important one is a **false positive I am
+retracting**:
 
-- **F3, then F-B4-1 (Low, pre-existing, not attachment code)** — `GET /api/threads/{id}`
-  serializes the raw upstream provider error into each turn's `status_reason`
-  (`… OpenAIAuthenticationError: Error code: 401 - … Please carry the API secret
-  key in the 'Author…`). No credential value and no path leaks, and the UI's own
-  copy is sanitized, but third-party internals are reaching a client surface,
-  which cuts against the project's 错误信息不泄露敏感细节 rule. Owner: turn
-  serialization in `src/fin/host/workspace_http.py`. Reported, not fixed here.
-- **F-B4-2 / F-B4-3** — the two limits just described.
-- **F-B4-4 (coverage note)** — because `attachmentsForSend` strips non-ready ids
-  client-side (`web/src/Composer.tsx:126`), the host's typed `attachment_not_ready`
-  is unreachable from the browser; the on-screen withheld line is the only signal,
-  and `uploadDoors.test.ts:477` is the sole cover for that refusal. Consistent with
-  spec, but worth knowing the host code path has no UI traffic behind it.
+- **F-B4-1, reported by the browser worker as a client-surface leak — retracted
+  after reading the code.** It observed `GET /api/threads/{id}` putting provider
+  prose into each turn's `status_reason`, e.g.
+  `stream raised mid-flight: OpenAIAuthenticationError: Error code: 401 - …` cutting
+  off at `Please carry the API secret key in the 'Author`, and called it a hygiene
+  leak against the project's 错误信息不泄露敏感细节 rule. It is not. That string is
+  already post-sanitizer output: `_sanitize_reason_text`
+  (`src/fin/host/workspace_http.py:455`) applies the five `_SENSITIVE_PATTERNS`
+  redactions (`:442` — `authorization: bearer <token>`, `sk-…`, `api_key=/token=/
+  secret=`, ≥32-hex blobs, ≥40-char high-entropy runs) and caps the result at 200
+  characters, and the call site at `:1341` composes the reason as
+  `f"stream raised mid-flight: {type(exc).__name__}: {exc}"` and **then** passes it
+  through the sanitizer before anything is wire-bound. The contract is stated in
+  those words at `:330` — *"single-line, <=max_len chars, no tokens, no headers"* —
+  with hand-written Chinese operator copy keyed off a closed `kind` enum
+  (`_STREAM_FAILURE_USER_COPY`, `:344`) as the second layer, so the user-facing
+  bubble never reads provider text even if the redactor missed. The cut
+  mid-header-name the worker photographed is the length cap
+  working, not a secret escaping. The worker had already conceded "no credential
+  value, no path"; what it got wrong was naming a documented field a defect. **No
+  finding, nothing to fix** — and I removed F3 from the open list rather than
+  carrying a made-up security item into the merge.
+- **F-B4-4 (coverage note, real)** — because `attachmentsForSend` strips non-ready
+  ids client-side (`web/src/components/Composer.tsx:126`, defined at
+  `web/src/store.ts:1208`), the host's typed `attachment_not_ready` is unreachable
+  from the browser; the on-screen withheld line is the only signal, and
+  `uploadDoors.test.ts:477` is the sole cover for that refusal. Consistent with
+  spec, but worth knowing the host code path has no UI traffic behind it. (The
+  worker cited `web/src/Composer.tsx`; the real path carries `components/`, and the
+  line number was right — corrected here rather than passed through.)
+- **F-B4-2 / F-B4-3** — the two unobservable halves named above (no `.env` on this
+  box; `FIN_OBJECT_STORE_URL` unset).
 
 Residue from the pass, left deliberately: 5 threads and 9 attachment rows in the
 **dev** Postgres. The operator may want them cleaned; deleting data was not this
@@ -254,14 +274,6 @@ Still open, with the reason:
 - **B5** Not closed: SC12's committed G4 gold set (PDF-text, scanned PDF,
   image, 8,000-code-point continuation, cross-thread denial at retrieve,
   attachment/company comparison) — belongs to T2–T5 and the end-of-round run.
-- **F3** (was F-B4-1) Pre-existing hygiene leak found by the browser pass, not
-  repaired here: `GET /api/threads/{id}` puts the raw upstream provider error into
-  each turn's `status_reason`, so third-party internals reach the client surface.
-  No secret value and no path is included, and the UI copy is sanitized, but the
-  project rule *错误信息不泄露敏感细节* argues for mapping it to a named reason at
-  the serialization boundary. Owner: `src/fin/host/workspace_http.py`. Needs the
-  operator's call, since it is outside the attachment slice and touches the error
-  vocabulary the review rounds just aligned.
 - **F1a** New, and the only finding worth filing from the whole unblock: the
   live-iknow harness launches the sibling server on an `is_file()` check alone,
   so a gitignored artifact whose state cannot be reliably *observed* — two of my
