@@ -41,18 +41,19 @@ OVERALL: PASS
      `FIN_ATTACHMENT_MAX_PDF_PAGES=80`, `FIN_ATTACHMENT_VISION_CALLS_PER_RUN=88`,
      `FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN=8`, persisted as deployment settings
      in `.env.example` (no code default). All three gold cases are committed and fit
-     one run; only `g4-mixed-chart-001` has a committed run under the pinned
-     pipeline — the scanned case left no committed measurement and the bare image
-     is outside the harness's PDF-only input path. Per-case numbers, the
-     extrapolation to 80 pages, the rejected 40-page option, and the 4 GB device
-     limitation are in
+     one run; `g4-mixed-chart-001` and `g4-scanned-001` have committed runs under
+     the pinned pipeline — the scanned case twice, with content that agrees to the
+     character — while the bare image remains outside the harness's PDF-only
+     input path. Per-case numbers, the extrapolation to 80 pages, the rejected
+     40-page option, and the 4 GB device limitation are in
      [`docs/validation/2026-09-26-g4-t2a-page-vision-budgets.md`](../docs/validation/2026-09-26-g4-t2a-page-vision-budgets.md).
      Five of its *Leftovers* bound this decision rather than polish it, and each
      one has an owning ticket there: the 80-page point was never run at the 4 GiB
-     ceiling (1, T2f), scanned-page OCR — the one cost that could make the cap
-     unusable — is unquantified (4, T2d), no millisecond figure is a device
-     specification because the four cores were shared with other work (6, T2d), a
-     bare image has no measured preparation cost (7, T2d), and `88 = 80 + 8` sits
+     ceiling (1, T2f), scanned-page OCR is quantified at ≈ 21.9 min per page but
+     only at a Tesseract configuration nobody chose (4, T2d), no millisecond
+     figure is a device specification because the serial re-measure ran at this
+     host's load floor of 2.78–3.25 on a memory-bound VM (6, T2d), a bare image
+     has no measured preparation cost (7, T2d), and `88 = 80 + 8` sits
      on `validate()`'s exact floor, so a run that admits the page cap has no
      headroom for a retried full-page scan and T2e must price that retry against
      the run budget (9, T2e). The record's other items are owned there too: the
