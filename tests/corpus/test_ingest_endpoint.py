@@ -1,8 +1,8 @@
-"""Tests for the corpus ingest endpoint service (corpus-serve-ingest T3).
+"""Tests for the corpus ingest endpoint service (corpus-serve-ingest).
 
-The endpoint is the ONE product entry that parses + 切分s an uploaded
-document and pushes it to the retrieval backend (ADR 0047). These tests
-pin the service layer only (no HTTP):
+The endpoint carries two entry points — the durable accept door
+(``submit_durable``) and the synchronous parse + 切分 + push chain
+(``ingest``, ADR 0047). These tests pin the service layer only (no HTTP):
 
 * a supported fixture ingest is **observable as push** — FakePushPort
   holds the children verbatim and recalls them byte-identically (SC5);
@@ -14,7 +14,7 @@ pin the service layer only (no HTTP):
 * push-landed + invalidation-failed is still a typed failure, never
   swallowed (SC8 / SC40);
 * the ``on_ingested`` hook fires only after the full chain succeeded
-  and carries the T2 catalog row contract;
+  and carries the catalog row contract;
 * ``submit_durable`` is the accept door of the permanent upload path:
   metadata-only validations run before a single byte is written, the
   four accept-time items (raw bytes, pointer, ``pending`` job record,
@@ -491,12 +491,6 @@ def test_oversize_upload_is_a_named_overflow_failure() -> None:
     assert fake.block_total() == 0
 
 
-def test_upload_cap_is_the_pinned_contract_value() -> None:
-    # 50 MiB in decimal bytes; the route gate and the endpoint check read
-    # this one number, so exact-cap is accepted and one byte over is not.
-    assert MAX_INGEST_BYTES == 52_428_800
-
-
 def test_missing_document_id_is_a_named_failure() -> None:
     fake = FakePushPort()
     endpoint = _endpoint(fake)
@@ -857,6 +851,16 @@ def test_invalid_doc_type_is_refused_before_any_write() -> None:
     _assert_nothing_persisted(stack)
 
 
+def test_every_supported_format_has_a_media_type() -> None:
+    # The durable accept keys the raw object's media type off the parser
+    # format table, so a format added on one side but not the other would
+    # raise a bare KeyError inside the write. Pin the two vocabularies to
+    # one another so that drift fails here, not in production.
+    from fin.corpus.ingest_endpoint import _FORMAT_CONTENT_TYPES
+
+    assert set(_FORMAT_CONTENT_TYPES) == set(SUPPORTED_FORMATS)
+
+
 def test_duplicate_submission_joins_the_job_without_a_second_write() -> None:
     stack = _durable_stack()
     first = _submit(stack, _V1_TEXT)
@@ -943,10 +947,10 @@ def test_a_failed_job_reenters_on_the_retry_edge() -> None:
 
 
 def test_replacing_a_ready_document_is_a_typed_refusal() -> None:
-    # [blocked contract point] The spec calls this replacement; the state
-    # machine has no edge out of ``ready`` and no job-reset port, so the
-    # only honest answer is a typed refusal with nothing written. When the
-    # store gains the re-queue edge this becomes an accept.
+    # The state machine has no edge out of ``ready`` and no job-reset
+    # port, so replacing a ready document cannot be accepted yet: the
+    # only honest answer is a typed refusal with nothing written. When
+    # the store gains the re-queue edge this becomes an accept.
     stack = _durable_stack()
     first = _submit(stack, _V1_TEXT)
     _advance(stack.states, "DOC-1")

@@ -432,12 +432,33 @@ describe("ingest job status (store.loadIngestJob)", () => {
 
     const failure = useWorkspaceStore.getState().ingestJobFailure;
     expect(failure).toBeInstanceOf(IngestFailedError);
-    expect(failure?.code).toBe("unknown_job");
+    expect((failure as IngestFailedError).code).toBe("unknown_job");
     expect(useWorkspaceStore.getState().ingestJob).toBeNull();
     // A persisted id that outlived its job must not be re-read forever.
     expect(storage.getItem(LAST_INGEST_JOB_KEY)).toBeNull();
     await vi.advanceTimersByTimeAsync(10_000);
     expect(reads).toBe(1);
+  });
+
+  it("a transport blip on the status read surfaces and keeps following the job", async () => {
+    seedThread();
+    let reads = 0;
+    stubFetch(() => {
+      reads += 1;
+      throw new TypeError("network down");
+    });
+
+    await useWorkspaceStore.getState().loadIngestJob("AAPL-2022Q3", 1000);
+
+    // The failed read is visible (never a blank "still queued" panel)…
+    const failure = useWorkspaceStore.getState().ingestJobFailure;
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(IngestFailedError);
+    expect(useWorkspaceStore.getState().ingestJob).toBeNull();
+    // …and a blip is no verdict on the job, so the poll must continue.
+    const afterFirstRead = reads;
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(reads).toBeGreaterThan(afterFirstRead);
   });
 
   it("reads nothing when this browser never submitted a job", async () => {

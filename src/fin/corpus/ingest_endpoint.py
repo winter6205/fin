@@ -1,8 +1,18 @@
-"""The corpus ingest endpoint service (corpus-serve-ingest T3, ADR 0047).
+"""The corpus ingest endpoint service (corpus-serve-ingest, ADR 0047).
 
-This is the ONE product entry where company documents are parsed and
-chunked for storage on the retrieval backend. The chain is fully
-deterministic — no model participates in any split decision:
+This module owns two ingest entry points on one endpoint:
+
+* **durable accept** — :meth:`IngestEndpoint.submit_durable` is the HTTP
+  door: it makes the raw object, its metadata pointer, a queued job
+  record and the ``(document_id, version)`` identity durable, then
+  reports the upload accepted-and-queued WITHOUT parsing, chunking or
+  pushing, since those run off the request. :meth:`IngestEndpoint.job_status`
+  reads back what the machine has persisted.
+* **the synchronous chain** — :meth:`IngestEndpoint.ingest` is the
+  programmatic path that parses, chunks and pushes in one call. This is
+  the entry where company documents reach the retrieval backend, and the
+  chain is fully deterministic — no model participates in any split
+  decision:
 
 1. **format recognition** — the format is named by the caller (an
    explicit declared format, or the upload's filename extension). An
@@ -40,7 +50,7 @@ deterministic — no model participates in any split decision:
    never swallowed, never reported as a clean success (SC8); the push
    itself is idempotent, so retrying the ingest is the recovery.
 6. **on_ingested hook** — runs last, only after the whole chain
-   succeeded, carrying the row contract T2's catalog registration
+   succeeded, carrying the row contract catalog registration
    (``record_filings``) consumes: ``{document_id, company, period,
    version, page_count}``. The hook's own failures propagate typed.
 
@@ -56,7 +66,7 @@ import threading
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Final, Sequence
+from typing import TYPE_CHECKING, Callable, Final, Literal, Sequence
 
 from fin.corpus.chunking import (
     DocumentChunking,
@@ -207,6 +217,17 @@ class IngestReplacementUnsupportedError(IngestEndpointError):
     code = "replacement_unsupported"
 
 
+# The accept-time step that failed to persist. Typed so the free-form
+# string a caller sees is a closed set, not an open vocabulary.
+IngestDurableStage = Literal[
+    "unconfigured",
+    "object_write",
+    "pointer_write",
+    "job_record",
+    "pointer_read",
+]
+
+
 class IngestDurableCommitError(IngestEndpointError):
     """An accept-time durable item could not be persisted.
 
@@ -217,7 +238,7 @@ class IngestDurableCommitError(IngestEndpointError):
 
     code = "durable_commit_failed"
 
-    def __init__(self, message: str, *, stage: str) -> None:
+    def __init__(self, message: str, *, stage: IngestDurableStage) -> None:
         super().__init__(message)
         self.stage = stage
 
@@ -239,7 +260,7 @@ class IngestObjectCleanupError(IngestEndpointError):
 
 @dataclass(frozen=True)
 class IngestedDocument:
-    """What one successful ingest stored — the T2 catalog row contract.
+    """What one successful ingest stored — the catalog row contract.
 
     ``page_count`` is the frozen-unit count (the physical granularity
     of the parse: pages for PDF/PPT, row blocks for Excel, structure
@@ -1076,6 +1097,7 @@ __all__ = [
     "IngestConcurrentRunError",
     "IngestDocumentIdMissingError",
     "IngestDurableCommitError",
+    "IngestDurableStage",
     "IngestEndpoint",
     "IngestEndpointError",
     "IngestEndpointResult",
