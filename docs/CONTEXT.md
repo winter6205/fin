@@ -144,7 +144,7 @@ The tagged-numbers format inside official 10-Q/10-K iXBRL. Not a website; SEC.go
 _Avoid_: using XBRL as a product or hostname, conflating it with iknow-memory retrieve
 
 **read_source**:
-The selected model-facing name for a known-locator source read, currently exposed in code as `read_file`: it resolves one authorized source unit from the company corpus or active-thread attachment without requiring a `retrieve` hit in the same run. Each read returns at most 8,000 Unicode code points and a complete serialized response of at most 32 KiB, including on the backend wire; continuation uses a zero-based code-point `next_position`, and only text returned in this run may become citation evidence (ADRs 0046 and 0088).
+The selected model-facing name for a known-locator source read, currently exposed in code as `read_file`: it resolves one authorized source unit from the company corpus or active-thread attachment without requiring a `retrieve` hit in the same run. Each read returns at most 8,000 Unicode code points and a complete serialized response of at most 32 KiB, including on the backend wire; continuation uses a zero-based code-point `next_position`, and only text returned in this run may become quoted-text citation evidence (ADRs 0046 and 0088); visual claims use the separate **visual evidence** path (ADR 0089).
 _Avoid_: read_file as the future tool name, read_locator, read_page, read_chunk, treating read as retrieve, reading embeddings
 
 **ingest endpoint**:
@@ -152,8 +152,28 @@ The product job that parses, applies **切分** from the format parameter table,
 _Avoid_: chunk-any-string tool, model-chosen split points, EDGAR form name as the root document type
 
 **thread attach**:
-An operator-submitted file under a logical `attachment_id` for the **research thread** lifetime; fin owns its durable bytes, parsed units, thread-private searchable index, and `parsing`/`ready`/`failed` state. `ready` requires a usable index, including after restart; the host binds access to the active thread, deletion removes its attachment data, and attaching never pushes it into the permanent company corpus (ADRs 0083, 0085, 0086, and 0088).
-_Avoid_: treating drag-into-chat as corpus ingest, model-visible filesystem paths, injecting the attachment body into the prompt, page-only attachment browsing
+An operator-submitted file under a logical `attachment_id` for the **research thread** lifetime; fin owns its durable raw bytes, parsed units, versioned **visual observations**, thread-private searchable index, and lifecycle state. `uploaded` means only that raw bytes are durable; an eligible graph turn starts or joins preparation, `ready` requires parsed text, required visual observations, and an index usable after restart, and the host binds access to the active thread, tombstones before cleanup, and never pushes the attachment into the permanent company corpus (ADRs 0083, 0085, 0086, 0088, and 0089).
+_Avoid_: treating drag-into-chat as corpus ingest, treating `uploaded` as `ready`, model-visible filesystem paths, injecting the attachment body into the prompt, page-only attachment browsing
+
+**uploaded**:
+The thread-attachment state meaning its raw bytes are durably stored and may be attached to a message; no parsing, vision analysis, or indexing is implied.
+_Avoid_: prepared, ready, parsing
+
+**ready** (thread attachment):
+The thread-attachment state meaning parsed page text, required visual observations, and the thread-private index are usable for graph retrieval, including after restart. It does not mean a later run has already read visual evidence into its own context.
+_Avoid_: uploaded, merely indexed, model-memory-ready
+
+**attachment preparation job**:
+Durable, idempotent work keyed by attachment content version that begins when an eligible grounded graph turn reaches `ensure_attachment_ready`; it performs layout, OCR, page rendering, full-page vision analysis, and indexing, then resumes the waiting run after completion, including after restart.
+_Avoid_: upload-time parse, per-turn duplicate parse, background corpus ingest
+
+**visual observation**:
+A persisted, versioned description or structured result from fin's configured vision model inspecting an original attachment page or crop. It is derived search material tied to the attachment version and original image location, never source text or a verbatim quote (ADR 0089).
+_Avoid_: OCR text, source quote, unproven model recollection
+
+**visual evidence**:
+A current-run reference proving that the run explicitly retrieved or read a matching persisted **visual observation**, with provenance to the original attachment version, source unit, physical page, and crop when available. A later run reads and reuses a sufficient stored observation without uploading the attachment again or repeating vision; a question needing detail absent from it triggers inspection of the stored original image and a new observation version (ADR 0089).
+_Avoid_: model conversation memory, generated source quote, re-upload as citation, bare vision response without persisted provenance
 
 **corpus ingest**:
 The separate workspace control that sends a file through the **ingest endpoint** into the retrieve backend.
@@ -164,8 +184,8 @@ A typed source identity for citation and `read_source`: company sources use `{do
 _Avoid_: chunk_id, char offset as citation identity, bbox, page as the generic unit field, unofficial PDF page as live EDGAR identity, verifying an HTML quote against a PDF page
 
 **citation verifier**:
-A code gate on the **grounded** track path to END: a supporting span is a contiguous substring of the answer (v1 minimum 32 characters) that appears in text this run received from **retrieve** / **read_source** (ADR 0046). Passed spans become unit-located user-visible citations; unknown locators refuse immediately; missing or unmatched spans bounce with a hidden template until the citation-repair cap, then refuse. Other tracks skip this gate. _Stage: substring gate on main; Jev support pick out of this host Jev program (ADR 0082)._
-_Avoid_: faithfulness prompt, LLM-as-judge as the citation gate, model-authored citation block, `verify` as a tool, running the gate on greetings or soft off-topic replies, web-search text as gate evidence, a second serve-time extracted tree as citation SSOT
+A code gate on the **grounded** track path to END: a supporting text span is a contiguous substring of the answer (v1 minimum 32 characters) that appears in text this run received from **retrieve** / **read_source** (ADR 0046); visual claims use a separate typed path requiring current-run **visual evidence** tied to the original attachment page or crop, and a generated observation is never a source quote. Unknown locators refuse immediately; missing or unmatched evidence bounces with a hidden template until the citation-repair cap, then refuses; other tracks skip this gate (ADRs 0082 and 0089).
+_Avoid_: faithfulness prompt, LLM-as-judge as the citation gate, model-authored citation block, `verify` as a tool, running the gate on greetings or soft off-topic replies, web-search text as gate evidence, treating visual observations as quoted source text, a second serve-time extracted tree as citation SSOT
 
 **citation span**:
 One user-visible citation row from the verifier: a ≥32-character contiguous substring of the answer that matched on a retrieved or read source unit. The workspace sources list may show many spans per unit (sliding-window overlap); that granularity is expected, not a send failure.
@@ -348,7 +368,7 @@ Historical nine hand-authored cases against the private fixture source 12 (ADR 0
 _Avoid_: 40-question matrix as a v1 commitment, treating nine cases as the current ceiling
 
 **冻结单元**:
-A versioned, locator-addressed unit of parsed source text that fin determines before retrieval chunking; "frozen" means its text is fixed for that parsed version, not that fin creates a cache or separate persistence tier. Search chunks are contiguous substrings of the unit, while citation evidence comes only from text returned by `retrieve` or `read_source` in the current run (ADR 0046).
+A versioned, locator-addressed unit of parsed source text that fin determines before retrieval chunking; "frozen" means its text is fixed for that parsed version, not that fin creates a cache or separate persistence tier. Search chunks are contiguous substrings of the unit, while quoted-text citation evidence comes only from text returned by `retrieve` or `read_source` in the current run; visual evidence remains a separate page/region path (ADRs 0046 and 0089).
 _Avoid_: chunk, raw file, arbitrary paragraph, session cache, second citation SSOT, query-time result
 
 **切分**:
