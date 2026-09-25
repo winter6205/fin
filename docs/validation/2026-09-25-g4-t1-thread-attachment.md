@@ -254,24 +254,40 @@ Closed by runs 17–26, so they are no longer open questions:
   that 508-byte file, and `test_clarify_prompt.py` passes 11 on the branch — the
   fix removes the dependency, it does not hide the file.
 
-Still open, with the reason:
+- **B2b closed (runs 30–32).** `uv run --no-sync pytest -q -m mcp
+  tests/host/test_live_fin_launcher_acceptance.py` at `main` = `3c78aec` →
+  **5 passed in 104.18s**: full-stack `fin up`, `fin status` consistency, the
+  `.fin/ready` verdict, `fin logs`, and the 409-then-admit path. Two causes had
+  to be cleared and both were this round's own residue, not the operator's:
+  - **run 30 — a name squat.** The `iknow-memory-postgres` container blocking
+    `fin up` carried **no** `com.docker.compose.project` label, mounted a volume
+    called `iknow-memory-pg-test`, and held only the `postgres` superuser with
+    `postgres`/`template0`/`template1` — an empty hand-run instance rather than
+    the sibling's corpus database, created 2026-09-24 22:32 +0800, i.e. inside
+    this session's window. `docker rm -f` (operator-authorized) freed the name
+    and 5432; the volume is kept, so the container is recreatable.
+  - **run 31 — the actual next blocker, named by the launcher itself.**
+    `dev-up: port 5433 is already published by compose project 'fin-wt-g4-t1'
+    (this tree is 'fin')` — the throwaway Postgres this ticket had started for
+    its durability runs. `docker compose -p fin-wt-g4-t1 down` without `-v`
+    (so `fin-wt-g4-t1_postgres-data` survives) → 5 passed.
+  - **Correction to run 24's option (ii).** Pointing `FIN_IKNOW_ROOT` at another
+    checkout could not have worked: `../iknow-memory/docker-compose.yml:15` sets
+    `container_name: iknow-memory-postgres`, and a `container_name` is absolute,
+    so any checkout of that file collides on the same name *and* the same
+    published 5432. Only freeing the name and the port clears it, which is also
+    why `docker stop` alone did nothing for the name.
+  - **run 32 — machine state, left on purpose.** The suite's `fin down` removed
+    the containers it had started (postgres, ES, Neo4j); their data lives on the
+    `iknow-memory-infra_*` named volumes, and `docker compose up -d` in the
+    sibling brought all three back healthy: `iknow_memory` is a real role with 4
+    databases, and ES `iknow-memory-chunks` still holds 64 docs. The compose
+    Postgres's own volume `iknow-memory-infra_iknow-memory-pg` is 4.0K — no
+    corpus — which is why the live search/cite runs earlier in this record still
+    needed the seeded instance on host 5434 (`fin-g4-t1-iknowpg`, left running).
+    Nothing was deleted beyond the one squatter container.
 
-- **B2b attempted (run 24), still blocked on one named cause.** The two
-  candidate stops listed here before the run were resolved differently than
-  expected. (i) The teardown hazard is real — the suite's `fin down` did delete
-  three Compose containers — and it is survivable, so it is not a blocker; see
-  *What run 24 cost the machine*. (ii) The name collision is the blocker, and
-  `docker stop` does **not** clear it: `Error response from daemon: Conflict.
-  The container name "/iknow-memory-postgres" is already in use by container
-  "9824bfa07bc2…". You have to remove (or rename) that container`. The operator
-  must either bring that hand-run Postgres under the sibling's Compose project
-  or point `FIN_IKNOW_ROOT` at a self-consistent checkout; renaming or removing
-  someone else's container is outside this ticket's authority, so the worker
-  stopped and reported instead of forcing it. What is now proven about the
-  launcher: its hermetic layer (29 cases, run 17) plus preflight, build,
-  fin-owned Postgres health, `fin check`, and MCP reachability on the real box.
-  What remains unproven: full-stack `fin up`, `fin status` consistency, the
-  `.fin/ready` verdict, `fin logs`, and the 409-then-admit path.
+Still open, with the reason:
 - **B5** Not closed: SC12's committed G4 gold set (PDF-text, scanned PDF,
   image, 8,000-code-point continuation, cross-thread denial at retrieve,
   attachment/company comparison) — belongs to T2–T5 and the end-of-round run.
@@ -587,7 +603,8 @@ carried above.
   `plans/thread-attachment-source-read.md`.
 - Both merged branches were deleted locally and on the remote on the operator's
   2026-09-25 "做完完整合并就行" instruction.
+- **B2b is closed by runs 30–32** above, and this closeout (its evidence plus the
+  run 24 correction) ships as that pull request.
 - Not delivered by any of them: T2–T5, and with them spec Success Criteria 5–12
-  plus SC12's committed G4 gold set. Still open: B2b's five launcher-acceptance
-  cases (one operator container action away), F1a on the tracked change, and F2's fail-open
+  plus SC12's committed G4 gold set. Still open: F1a on the tracked change, and F2's fail-open
   archived guard.
