@@ -45,10 +45,15 @@ OVERALL: PASS
      scanned case did not finish and the bare image is outside the harness's PDF-only
      input path. Per-case numbers, the extrapolation to 80 pages, the rejected
      40-page option, and the 4 GB device limitation are in
-     [`docs/validation/2026-09-26-g4-t2a-page-vision-budgets.md`](../docs/validation/2026-09-26-g4-t2a-page-vision-budgets.md);
-     its *Leftovers* name the unmeasured quantities T2d and T2f must close before
-     these values ship as the product default. The enforcement seam is
-     `fin.host.attachment_budgets` (109 cases).
+     [`docs/validation/2026-09-26-g4-t2a-page-vision-budgets.md`](../docs/validation/2026-09-26-g4-t2a-page-vision-budgets.md).
+     Three of its *Leftovers* are the spec's own acceptance clause rather than
+     follow-up polish: the 80-page point was never run at the 4 GiB ceiling (1),
+     scanned-page OCR — the one cost that could make the cap unusable — is
+     unquantified (4), and the "4 GB device" is a cgroup ceiling on a swapping
+     WSL2 VM, so every figure there is bounded rather than fast (5). T2b–T2f build
+     against these four keys as the values under test; none of them may present
+     the numbers as the approved shipped default until those three close. The
+     enforcement seam is `fin.host.attachment_budgets` (109 cases).
 
 3. **T2b — Store uploads raw and gate sends** — tag: `[implementation]`
    - **Inherits:** spec: upload stores durable raw bytes only and returns `uploaded`; preparation starts only from an eligible grounded graph turn; no conversation starts or sends while any composer upload is in flight. T1's 2 MiB route constant is historical and is replaced by the finite, measured deployment setting from T2a.
