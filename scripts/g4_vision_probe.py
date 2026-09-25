@@ -56,8 +56,9 @@ the default artifact would mislabel its subject.
 
 Exit codes: ``0`` the probe ran and image input is confirmed; ``1`` the
 probe ran but a verdict is negative (that finding IS a result, not a
-crash); ``2`` argparse usage error; ``3`` blocked on an auth/permission
-failure, where no further call is made.
+crash); ``2`` usage error — bad arguments, an unreadable ``--image``, or one
+whose suffix this script cannot type — where no request is built at all;
+``3`` blocked on an auth/permission failure, where no further call is made.
 """
 
 from __future__ import annotations
@@ -282,9 +283,12 @@ def image_data_url(path: Path) -> str:
 
     The declared type follows the file suffix: a provider that trusts it
     must not be handed JPEG bytes labelled as PNG, which would turn an
-    input-path mistake into a negative capability verdict.
+    input-path mistake into a negative capability verdict.  ``main`` refuses
+    a suffix absent from ``IMAGE_MIME`` before a client exists, so the one
+    way this lookup can fail is a suffix admitted there without a declared
+    type.
     """
-    mime = IMAGE_MIME.get(path.suffix.lower(), "image/png")
+    mime = IMAGE_MIME[path.suffix.lower()]
     return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode(
         "ascii"
     )
@@ -765,6 +769,17 @@ def main(argv: list[str] | None = None) -> int:
         if not image_path.is_file():
             print(f"probe: no such image: {image_path}", file=sys.stderr)
             return 2  # EXIT: a missing file is a usage error, not a verdict
+        if image_path.suffix.lower() not in IMAGE_MIME:
+            print(
+                f"probe: unsupported image suffix "
+                f"{image_path.suffix or '(none)'} on {image_path}; this probe "
+                f"declares a type for {', '.join(sorted(IMAGE_MIME))} only",
+                file=sys.stderr,
+            )
+            # EXIT: bytes with no honest declared type must never reach the
+            # provider, where a rejection of this script's own labelling
+            # mistake would be recorded as supports_image_input=false.
+            return 2
 
     if args.render_only:
         print(

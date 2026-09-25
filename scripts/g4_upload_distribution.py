@@ -7,11 +7,10 @@ Usage::
     # equivalent, no env resolution: .venv/bin/python scripts/g4_upload_distribution.py
 
 G4 T2a must pick a finite upload-byte cap and PDF-page cap from the size
-and page-count distribution of actual filings (``plans/thread-attachment-
-source-read.md`` line 38: "record the real file-size distribution"), so
-that T2b can replace the historical 2 MiB route constant with the
-measured setting.  This script is that measurement, nothing else: it
-reports numbers and refuses to propose a budget.
+and page-count distribution of actual filings, so that T2b can replace the
+historical 2 MiB route constant with the measured setting.  This script is
+that measurement, nothing else: it reports numbers and refuses to propose a
+budget.
 
 Every number is taken from an independent source and cross-checked, so a
 drifted record shows up as a finding instead of a silent agreement:
