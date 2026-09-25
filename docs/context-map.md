@@ -26,7 +26,7 @@ The seam boundary: the **retrieve port** fin is allowed to depend on, plus its *
 | Context | Physical surface | Purpose | Owns | depends_on (legal direction) | Integration pattern |
 |---|---|---|---|---|---|
 | host-agent | `src/fin/host/` (`graph.py`, `compile.py`, `state.py`, `tools/`, `citation_gate.py`, `numeric_gate.py`, `thread_store.py`, `workspace_http.py`), `web/` | run a **research thread** to a cited answer | tracks, **agent loop**, host tools, **citation verifier**, **step cap** / **citation-repair cap**, **session compaction**, run + thread durability, **工作台** surface | corpus published value types; retrieve ports for every call, plus the two retrieve adapter classes it selects at the composition root | composition root — it selects and injects adapters |
-| attachment capability | `src/fin/host/attachment_store.py`, `attachment_prepare.py`, `attachment_index.py` | make one thread's own file answerable, then disposable | **uploaded** → **ready** lifecycle, **attachment preparation job**, parse/OCR/vision derivatives, thread-private index, retry, tombstone deletion | corpus `object_store` port, host `thread_store` + graph | thread-bound interface owned by host; never a package of its own while its data is host-resolved |
+| attachment capability | `src/fin/host/attachment_store.py`, `attachment_prepare.py`, `attachment_index.py`, `attachment_budgets.py` | make one thread's own file answerable, then disposable | **uploaded** → **ready** lifecycle, **attachment preparation job**, parse/OCR/vision derivatives, thread-private index, retry, tombstone deletion | corpus `object_store` port, host `thread_store` + graph | thread-bound interface owned by host; never a package of its own while its data is host-resolved |
 | corpus | `src/fin/corpus/` (`extracted.py`, `chunking.py`, `push.py`, `invalidation.py`, `object_store.py`, `catalog.py`, `facts.py`, `ingest_endpoint.py`, `parsers/`) | turn a file into reproducible pushed chunks | **冻结单元**, **切分**, **结构化元数据**, **幂等键**, **入库推送** payloads, **内容失效**, **object store** byte custody, catalog, XBRL fact table | retrieve push + invalidation ports | port consumer; iknow-facing transport stays in retrieve |
 | retrieve | `src/fin/retrieve/` (`port.py`, `read_port.py`, `push_port.py`, `invalidation_port/`, `mcp_adapter.py`, `mcp_session.py`, `capabilities/`) | keep iknow-memory swappable behind one seam | **retrieve port** contract, **retrieve adapter** (MCP client), **降级标记** reading, hit→locator mapping, input validation at the seam | corpus published types (`Locator`, push payload, `InvalidationTarget`) | port + adapter; out-of-process MCP 2.0 stdio client |
 
@@ -42,7 +42,9 @@ Outside this repository, **iknow-memory** is a context of its own: the product �
 
 ## Dependency direction
 
-Legal edges, measured on `src/fin/`. Counts are `from fin.<pkg>` import statements; the tree contains zero bare
+Legal edges, measured on `src/fin/`. Counts are `from fin.<pkg>` import statements,
+counted wherever they appear in a module including inside a function, and the
+quoted `2` on the debt edge is top-level only; the tree contains zero bare
 `import fin.<pkg>` statements, so the counts are complete.
 
 ```
@@ -55,6 +57,7 @@ eval  ──9/4/15──▶ corpus / host / retrieve            eval ──0─�
 Verification commands:
 
 ```bash
+grep -rh "from fin\.corpus import\|from fin\.corpus\." src/fin/host --include=*.py | wc -l   # → 31, the host ──▶ corpus row
 grep -rn "from fin\.host\|import fin\.host" src/fin/corpus --include=*.py   # → no matches (0)
 grep -rn "from fin\.eval\|import fin\.eval" src/fin/corpus src/fin/retrieve src/fin/host --include=*.py   # → 0
 grep -rn "^from fin\.host" src/fin/retrieve --include=*.py                  # → 2 lines
