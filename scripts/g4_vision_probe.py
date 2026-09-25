@@ -45,9 +45,14 @@ Usage::
     uv run python <path>/scripts/g4_vision_probe.py --image <file> \
         --series "Total net sales" --mean 94186.5 --out <json>
 
+A git worktree has no ``.env`` of its own; ``--dotenv-start <dir>`` then points
+the search at the checkout that does, otherwise the provider rejects fin's
+placeholder key.
+
 ``--image`` points the same three questions at a file on disk instead of the
-throwaway page; ``--series`` and ``--mean`` then carry that file's witness, and
-``--out`` keeps the recorded default artifact from being overwritten.
+throwaway page; ``--series``, ``--mean`` and ``--out`` are then required, because
+a witness that belongs to another file proves nothing and a record written over
+the default artifact would mislabel its subject.
 
 Exit codes: ``0`` the probe ran and image input is confirmed; ``1`` the
 probe ran but a verdict is negative (that finding IS a result, not a
@@ -90,7 +95,6 @@ SERIES_NAME = "Revenue"
 BAR_LABELS = ["Q1", "Q2", "Q3", "Q4"]
 BAR_VALUES = [12, 17, 23, 31]
 EXPECTED_MEAN = sum(BAR_VALUES) / len(BAR_VALUES)  # 20.75
-MEAN_TEXT = f"{EXPECTED_MEAN:.2f}"
 
 # How the sentence describes the bytes sent. ``--image`` cannot claim to be a
 # page, and a page render is not a chart-only crop either.
@@ -111,6 +115,10 @@ class Target:
     series_name: str = SERIES_NAME
     medium: str = PAGE_MEDIUM
     expected_mean: float = EXPECTED_MEAN
+
+
+# ----- the output contract --------------------------------------------
+
 
 STRUCTURED_KEYS = (
     "has_chart",
@@ -176,11 +184,13 @@ def _font(size: int) -> Any:
     return ImageFont.load_default(size=size)
 
 
-def render_probe_page(path: Path) -> None:
+def render_probe_page(path: Path, target: Target) -> None:
     """Draw a page-like PNG with one bar chart.
 
     The chart is deliberately the one thing a text-only model cannot
-    guess: labelled axes, four bars, known values, stated mean.
+    guess: labelled axes, four bars, known values, stated mean. The mean
+    printed on the page is taken from ``target``, so the page cannot be
+    drawn for one witness and judged against another.
     """
     from PIL import Image, ImageDraw
 
@@ -206,7 +216,8 @@ def render_probe_page(path: Path) -> None:
     )
     draw.text(
         (left, 112),
-        f"Quarterly {SERIES_NAME.lower()} by segment (USD millions, unaudited)",
+        f"Quarterly {target.series_name.lower()} by segment "
+        "(USD millions, unaudited)",
         fill="black",
         font=small_font,
     )
@@ -235,13 +246,14 @@ def render_probe_page(path: Path) -> None:
     draw.rectangle([left, 690, left + 26, 716], fill="#3b6ea5")
     draw.text(
         (left + 38, 690),
-        f"{SERIES_NAME} (USD millions)",
+        f"{target.series_name} (USD millions)",
         fill="black",
         font=small_font,
     )
     draw.text(
         (left, 740),
-        f"Mean of the {SERIES_NAME} series across the four quarters: {MEAN_TEXT}",
+        f"Mean of the {target.series_name} series across the four quarters: "
+        f"{target.expected_mean:.2f}",
         fill="black",
         font=small_font,
     )
@@ -675,8 +687,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--out",
         type=Path,
-        default=ARTIFACT_PATH,
-        help=f"artifact path (default: {ARTIFACT_PATH})",
+        default=None,
+        help=f"artifact path (default: {ARTIFACT_PATH}, and required with "
+        "--image so a file probe cannot overwrite the page record",
     )
     parser.add_argument(
         "--dotenv-start",
@@ -690,6 +703,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--image needs --series and --mean to carry a witness")
     if args.image is None and (args.series is not None or args.mean is not None):
         parser.error("--series and --mean describe --image; pass them together")
+    if args.image is not None and args.out is None:
+        parser.error(
+            "--image needs --out: a probe of some other file must not "
+            f"overwrite the recorded page artifact at {ARTIFACT_PATH}"
+        )
+    if args.out is None:
+        args.out = ARTIFACT_PATH
     return args
 
 
@@ -739,7 +759,7 @@ def main(argv: list[str] | None = None) -> int:
     target = target_for(args)
     if args.image is None:
         image_path = SCRATCH_DIR / "probe_page.png"
-        render_probe_page(image_path)
+        render_probe_page(image_path, target)
     else:
         image_path = args.image
         if not image_path.is_file():
@@ -768,18 +788,22 @@ def main(argv: list[str] | None = None) -> int:
     scrubber = Scrubber((api_key, "sk-no-key-required"))
 
     probe = Probe(client, image_path, scrubber, target)
+    blocked = False
     try:
         run_probe(probe)
-        status = 0 if verdicts(probe.calls, target)["supports_image_input"] else 1
     except Blocked as exc:
         print(
             f"probe: BLOCKED on auth/permission, no further calls: {exc}",
             file=sys.stderr,
         )
-        status = 3
+        blocked = True
 
     calls = probe.calls
     verdict = verdicts(calls, target)
+    if blocked:
+        status = 3  # EXIT: a run stopped on auth yields no capability verdict
+    else:
+        status = 0 if verdict["supports_image_input"] else 1
     payload = {
         "config": config,
         "image": {
