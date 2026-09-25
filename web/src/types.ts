@@ -385,13 +385,40 @@ export interface IngestResult {
   } | null;
 }
 
-// Success body of POST /api/threads/{id}/attachments (the
-// thread-attach door). ``scope`` is always "thread_attach": the model
-// may read the text on THIS turn only; nothing is pushed, nothing is
-// ingested (SC4). Mirrors the route's return dict.
+// ----- Thread attachment: the attachment lifecycle -----
+
+// Closed status set of a thread attachment (ADR 0086): the host
+// parses and indexes asynchronously after upload, so the SPA sees
+// ``parsing`` first, then ``ready`` (text + index usable) or
+// ``failed`` with a named reason that retry can clear.
+export type AttachmentStatus = "parsing" | "ready" | "failed";
+
+// Reasons the SPA names today. The wire may gain more (the parse
+// exits in specs/thread-attachment-source-read.md), so display code
+// must fall back to generic copy for an unrecognised reason rather
+// than break.
+export type AttachmentFailureReason =
+  | "attachment_empty_text"
+  | "attachment_index_unavailable"
+  | "attachment_not_text"
+  | "source_unavailable";
+
+// One attachment of a thread (the thread-attach door). ``scope`` is
+// always "thread_attach": the model may read the text, nothing is
+// pushed to the permanent corpus (SC4). Unlike the old door the
+// id is NOT single-use: it stays referenceable for the whole thread
+// lifetime while ``status`` tells whether a run may cite it yet.
+// Every attachment door — upload, list, status, retry — answers with
+// exactly this shape, so one record never has two field sets.
 export interface ThreadAttachment {
   attachment_id: string;
   filename: string;
   size_bytes: number;
   scope: "thread_attach";
+  status: AttachmentStatus;
+  // Parsed-content version; 0 until the first preparation publishes one.
+  version: number;
+  unit_count: number;
+  searchable: boolean;
+  failure_reason?: AttachmentFailureReason | string | null;
 }

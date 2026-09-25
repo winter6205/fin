@@ -13,6 +13,12 @@ When adding or changing business behavior, add or update tests before implementa
 
 Derive expected results from the relevant spec, ADR, or plan. Keep expected values independent of the implementation under test; tests must assert the promised behavior, not only that the code ran.
 
+## Golden-set acceptance for every change
+
+For every change, identify the applicable committed, versioned golden set, run it, compare actual per-case results with independently defined expected results, and record the command, dataset version, observed results, and exit status. If the change alters a product contract that the current gold set does not cover, add or update the gold cases before implementation; a documentation-only change with no contract change still runs the repository's baseline gold set.
+
+When changed behavior crosses a real service, storage, model, or MCP boundary, the golden run must exercise that real boundary and assert observable results. Fake or fixture-server runs remain useful for deterministic tests but do not satisfy this golden acceptance. Missing gold coverage or an unavailable required dependency is blocked evidence, not a pass or a green skip.
+
 ## Representative fin data
 
 When behavior depends on filing content, document structure, or fin's cross-module contracts, use a committed, versioned representative fixture from `data/corpus/` or the existing test fixtures. Keep the fixture small enough for routine tests, but preserve the real shapes that affect the behavior. Assert results against the relevant acceptance criteria in `specs/`, `plans/`, or `docs/adr/`; do not replace a relevant real-data case with invented toy input unless the test is specifically about an isolated edge case.

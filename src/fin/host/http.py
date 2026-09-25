@@ -204,6 +204,16 @@ def get_thread_store() -> Any:
     return default_thread_store()
 
 
+def get_attachment_service() -> Any:
+    """FastAPI dependency that returns the thread attachment service.
+
+    Tests override this to inject a service over in-memory stores; the
+    product boot gets the env-selected durable stores, built once per
+    process with interrupted preparation already resumed.
+    """
+    return default_attachment_service()
+
+
 def get_memory_port() -> Any:
     """FastAPI dependency that returns the configured memory port.
 
@@ -287,6 +297,7 @@ def get_observability_collector() -> ObservabilityCollector:
 # (``app.dependency_overrides[get_workspace_root]``) for both the
 # ``/ask`` route and the workspace send / resume routes.
 from fin.host.workspace_http import (  # noqa: E402
+    default_attachment_service,
     get_workspace_root,
     mount as _mount_workspace_routes,
 )
@@ -297,6 +308,7 @@ _mount_workspace_routes(
     app,
     get_graph=get_graph,
     get_thread_store=get_thread_store,
+    get_attachment_service=get_attachment_service,
     get_watchlist_store=get_watchlist_store,
     get_memory_port=get_memory_port,
     get_filing_monitor=get_filing_monitor,
@@ -610,6 +622,7 @@ __all__ = [
     "CitationSchema",
     "app",
     "compile_for_http",
+    "get_attachment_service",
     "get_feedback_store",
     "get_filing_monitor",
     "get_graph",
