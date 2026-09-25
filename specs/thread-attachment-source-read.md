@@ -1,6 +1,6 @@
 # Spec: thread attachment retrieval and bounded source reads
 
-> **Status:** G4 contract. Product decisions were confirmed in the operator's 2026-09-24 and 2026-09-25 G4 discussions; inherited runtime constraints are identified below. T2 implementation has not started. This spec spans fin and the company-source `read_source` wire in iknow-memory. Implementation plans belong in their respective repositories.
+> **Status:** G4 contract. Product decisions were confirmed in the operator's 2026-09-24 and 2026-09-25 G4 discussions; inherited runtime constraints are identified below. T2a–T2f implementation has not started. This spec spans fin and the company-source `read_source` wire in iknow-memory. Implementation plans belong in their respective repositories.
 
 ## Objective
 
@@ -114,7 +114,7 @@ The definitions above are synchronized with [`docs/CONTEXT.md`](../docs/CONTEXT.
 
 ## Architecture change reviewer
 
-Independent review: 2026-09-25.
+Affected surfaces: fin attachment storage/preparation, retrieve/read ports and adapters, host tools/evidence, HTTP DTOs, web citations; iknow-memory source-read tool and source-document storage boundary.
 
 bounded-context-guardian: yes — fin owns attachment bytes, parsing, visual derivatives, and thread-private indexing; iknow-memory remains the company-source boundary.
 input-contract-tests: yes — upload/send gating, lifecycle states, page and vision budgets, deletion races, locator bounds, and backend failures have explicit acceptance cases.
