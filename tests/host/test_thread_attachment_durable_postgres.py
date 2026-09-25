@@ -47,8 +47,7 @@ def postgres_url() -> str:
 @pytest.fixture
 def stack(postgres_url: str) -> Iterator[dict[str, Any]]:
     """A real thread store, attachment store, and byte store on one URL."""
-    import psycopg
-
+    _drop_all_threads(postgres_url)
     threads = PostgresThreadStore(postgres_url)
     objects = InMemoryObjectStore()
     yield {
@@ -59,6 +58,17 @@ def stack(postgres_url: str) -> Iterator[dict[str, Any]]:
             store=PostgresAttachmentStore(postgres_url), objects=objects
         ),
     }
+    _drop_all_threads(postgres_url)
+
+
+def _drop_all_threads(postgres_url: str) -> None:
+    """Empty the thread table; attachment rows leave with it by cascade.
+
+    Both sides of the fixture do this: a run killed before its teardown would
+    otherwise decide whether the next run's row counts hold.
+    """
+    import psycopg
+
     with psycopg.connect(postgres_url) as conn:
         conn.execute("DELETE FROM fin_thread")
         conn.commit()
@@ -191,3 +201,36 @@ def test_deleting_the_thread_removes_every_attachment_row(
 
     assert _counts(stack) == (0, 0, 0)
     assert _boot(stack).status(attachment_id) is None
+
+
+# ----- re-running against a database left dirty -----
+
+
+def test_an_interrupted_run_leaves_attachment_rows(postgres_url: str) -> None:
+    """Leave a thread and its ready attachment behind, as a killed process would.
+
+    This case takes the URL only, so no fixture cleans the rows it writes: the
+    next case must decide whether the suite can start from a dirty database.
+    """
+    import psycopg
+
+    thread_id = f"interrupted-{uuid.uuid4().hex[:8]}"
+    with psycopg.connect(postgres_url) as conn:
+        conn.execute(
+            "INSERT INTO fin_thread (id, title, created_at) VALUES (%s, %s, now())",
+            (thread_id, "interrupted run"),
+        )
+        conn.execute(
+            "INSERT INTO fin_thread_attachment (attachment_id, thread_id, filename,"
+            " size_bytes, sha256, object_key, status)"
+            " VALUES (%s, %s, 'old.txt', 1, %s, %s, 'ready')",
+            (f"orphan-{thread_id}", thread_id, "0" * 64, f"fin/{thread_id}/old.txt"),
+        )
+        conn.commit()
+
+
+def test_a_fresh_run_clears_rows_left_behind(
+    postgres_url: str, stack: dict[str, Any]
+) -> None:
+    """The suite is restartable: rows from an interrupted run do not decide it."""
+    assert _counts(stack) == (0, 0, 0)
