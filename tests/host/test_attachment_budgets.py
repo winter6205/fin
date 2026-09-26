@@ -30,6 +30,7 @@ defaults are recorded with the gold-set evidence.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -717,6 +718,7 @@ CORPUS_DISTRIBUTION_PATH = (
 GOLD_MANIFEST_PATH = (
     PROJECT_ROOT / "data" / "corpus" / "g4_attachment_gold" / "manifest.json"
 )
+CORPUS_PDF_DIR = PROJECT_ROOT / "data" / "corpus" / "pdf"
 
 
 def _deployed_environ() -> dict[str, str]:
@@ -749,11 +751,99 @@ def test_deployed_bounds_are_literals_with_no_shell_fallback() -> None:
     from_environ(environ=environ)
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _assert_describes_committed_bytes(
+    path: Path, declared_bytes: int, declared_sha256: str
+) -> None:
+    """Pin a recorded size to the file it was recorded from.
+
+    The bounds were chosen over recorded sizes and page counts, so a guard that
+    reads only the JSON would bless a cap that admits a listing rather than the
+    corpus. A matching digest makes the recorded page count a statement about
+    these exact bytes.
+    """
+    assert path.is_file(), f"{path} is not committed"
+    assert path.stat().st_size == declared_bytes, f"{path} size drifted from the record"
+    assert _sha256(path) == declared_sha256, f"{path} content drifted from the record"
+
+
+def test_corpus_distribution_records_describe_the_committed_files() -> None:
+    """Every measured filing the byte and page caps were chosen from is here.
+
+    A filing whose bytes changed since the distribution was written would leave
+    the cap decision describing a corpus that no longer exists.
+    """
+    measured = json.loads(CORPUS_DISTRIBUTION_PATH.read_text())["files"]
+    assert len(measured) > 0
+    for entry in measured:
+        _assert_describes_committed_bytes(
+            CORPUS_PDF_DIR / entry["filename"],
+            entry["bytes_on_disk"],
+            entry["sha256"],
+        )
+
+
+def test_gold_manifest_describes_the_committed_fixtures() -> None:
+    """The three gold cases the caps must fit are the bytes on disk.
+
+    The manifest is also the file that states each case's page count, which is
+    what the single-run preflight below charges against the vision budget.
+    """
+    cases = json.loads(GOLD_MANIFEST_PATH.read_text())["cases"]
+    assert len(cases) == 3
+    for case in cases:
+        _assert_describes_committed_bytes(
+            PROJECT_ROOT / case["path"], case["bytes"], case["sha256"]
+        )
+
+
+INK_SCREEN_PATH = PROJECT_ROOT / "data" / "corpus" / "g4_ink_screen.json"
+
+
+def test_ink_screen_artifact_is_what_the_gold_manifest_cites() -> None:
+    """The "no native chart in this corpus" gap is one artifact's numbers.
+
+    That gap is the reason a layout model's figure recall cannot be scored on
+    the committed filings and the reason the spec's full-page scan rule is not
+    optional, so it is evidence rather than commentary. Every count and fraction
+    its sentence states is read out of ``data/corpus/g4_ink_screen.json``, which
+    ``scripts/g4_ink_screen.py`` writes: a re-screen that moves a number has to
+    carry the sentence that quotes it along with it.
+    """
+    screen = json.loads(INK_SCREEN_PATH.read_text())
+    summary = screen["summary"]
+    gap = next(
+        entry
+        for entry in json.loads(GOLD_MANIFEST_PATH.read_text())["known_gaps"]
+        if entry.startswith("NO NATIVE CHART")
+    )
+    for figure in (
+        summary["pages_rendered"],
+        summary["pages_with_material_ink"],
+        summary["pages_with_any_solid_block"],
+        summary["max_solid_fraction"]["5"],
+        summary["max_solid_fraction"]["9"],
+    ):
+        assert str(figure) in gap, f"{figure} is no longer stated by known_gaps[0]"
+    assert {page["pdf"] for page in screen["pages"]} == {
+        path.name for path in CORPUS_PDF_DIR.glob("*.pdf")
+    }, "the screen does not cover the committed corpus"
+
+
 def test_deployed_bounds_admit_every_file_in_the_measured_distribution() -> None:
     """No real filing in the measured corpus is rejected on size or pages.
 
     The bound was selected from this distribution, so a cap that excludes one
-    of its own samples is either a stale value or a changed corpus.
+    of its own samples is either a stale value or a changed corpus. The files
+    themselves are checked by
+    ``test_corpus_distribution_records_describe_the_committed_files``.
     """
     budgets = from_environ(environ=_deployed_environ())
     measured = json.loads(CORPUS_DISTRIBUTION_PATH.read_text())["files"]
