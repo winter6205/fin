@@ -25,24 +25,57 @@ import {
   IngestFailedError,
   type SendRequest,
 } from "./api";
-import { attachmentsForSend, useWorkspaceStore } from "./store";
-import type { ThreadAttachment, ThreadDetail } from "./types";
+import {
+  attachmentsForSend,
+  LAST_INGEST_JOB_KEY,
+  useWorkspaceStore,
+} from "./store";
+import type { JobStatus, ThreadAttachment, ThreadDetail } from "./types";
 
 const THREAD_ID = "11111111-1111-4111-8111-111111111111";
 
+// The POST 200 of the corpus-ingest door: a DURABLE ACCEPT only. Parse,
+// 切分 and push happen off the request, so nothing about the outcome is
+// in this body — the state is followed through GET /api/corpus/ingest/{job_id}.
 const INGEST_OK = {
-  status: "ingested",
-  document_id: "AAPL-2024-Q3",
-  version: "abc123",
-  fmt: "md",
-  doc_type: "financial_statement",
-  unit_count: 3,
-  block_count: 7,
-  written: 7,
-  duplicates: 0,
-  block_ids: ["b1", "b2"],
-  invalidation: null,
-};
+  status: "accepted",
+  job_id: "AAPL-2022Q3",
+  document_id: "AAPL-2022Q3",
+  version: "a".repeat(64),
+  state: "pending",
+} as const;
+
+const STATUS_URL = "/api/corpus/ingest/AAPL-2022Q3";
+
+/** One polled job status; ``overrides`` selects the state under test. */
+function jobStatus(overrides: Partial<JobStatus> = {}): JobStatus {
+  return {
+    job_id: "AAPL-2022Q3",
+    document_id: "AAPL-2022Q3",
+    version: "a".repeat(64),
+    state: "extracting",
+    error_type: null,
+    error_message: null,
+    text_ready: false,
+    graph: null,
+    ...overrides,
+  };
+}
+
+/** Minimal Storage stand-in: the node env has no window.localStorage. */
+function fakeStorage(): Storage {
+  const map = new Map<string, string>();
+  return {
+    get length() {
+      return map.size;
+    },
+    clear: () => map.clear(),
+    getItem: (key: string) => map.get(key) ?? null,
+    key: (index: number) => [...map.keys()][index] ?? null,
+    removeItem: (key: string) => void map.delete(key),
+    setItem: (key: string, value: string) => void map.set(key, value),
+  };
+}
 
 // The POST 200 of the attach door: stored, not yet parsed. Every
 // attachment door answers with this same shape.
@@ -146,42 +179,48 @@ function seedThread(): void {
     sendingQuestion: false,
     resumingThreadId: null,
     attachments: [],
+    ingestJobId: null,
+    ingestAccepted: null,
+    ingestJob: null,
+    ingestJobFailure: null,
   });
 }
 
 const LIST_URL = `/api/threads/${encodeURIComponent(THREAD_ID)}/attachments`;
 
+let storage: Storage;
+const originalWindow = globalThis.window;
+
 beforeEach(() => {
   vi.useFakeTimers();
+  // The submitted job id is read back through window.localStorage and
+  // the node env has no window: a stand-in pins the storage path.
+  storage = fakeStorage();
+  (globalThis as { window?: unknown }).window = { localStorage: storage };
 });
 
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  (globalThis as { window?: unknown }).window = originalWindow;
 });
 
 describe("ingest door (store.ingestFile)", () => {
-  it("POSTs the file as multipart to /api/corpus/ingest and reloads the corpus", async () => {
+  it("POSTs the file plus company and period as multipart and keeps the accepted job", async () => {
     seedThread();
-    const filing = {
-      document_id: "AAPL-2024-Q3",
-      company: "Apple",
-      period: "2024-Q3",
-      version: "abc123",
-      page_count: 3,
-    };
-    const { calls } = stubFetch((url) => {
-      if (url === "/api/corpus/ingest") return jsonResponse(INGEST_OK);
-      if (url === "/api/corpus") return jsonResponse({ filings: [filing] });
-      return jsonResponse({}, 404);
-    });
+    const { calls } = stubFetch((url) =>
+      url === "/api/corpus/ingest" ? jsonResponse(INGEST_OK) : jsonResponse({}, 404),
+    );
 
     const file = new File(["# hello"], "aapl-10q.md", {
       type: "text/markdown",
     });
-    const result = await useWorkspaceStore.getState().ingestFile(file);
+    const result = await useWorkspaceStore
+      .getState()
+      .ingestFile(file, { company: "aapl", period: "2022q3" });
 
-    expect(result.document_id).toBe("AAPL-2024-Q3");
+    expect(result.status).toBe("accepted");
+    expect(result.job_id).toBe("AAPL-2022Q3");
     const ingestCall = calls.find((c) => c.url === "/api/corpus/ingest");
     expect(ingestCall).toBeDefined();
     expect(ingestCall?.method).toBe("POST");
@@ -190,10 +229,75 @@ describe("ingest door (store.ingestFile)", () => {
     const sent = form.get("file");
     expect(sent).toBeInstanceOf(File);
     expect((sent as File).name).toBe("aapl-10q.md");
-    // Success refreshes the list the operator is looking at.
-    expect(calls.some((c) => c.url === "/api/corpus")).toBe(true);
-    expect(useWorkspaceStore.getState().corpus).toEqual([filing]);
-    expect(useWorkspaceStore.getState().corpusLoaded).toBe(true);
+    expect(form.get("company")).toBe("aapl");
+    expect(form.get("period")).toBe("2022q3");
+    expect(useWorkspaceStore.getState().ingestJobId).toBe("AAPL-2022Q3");
+    expect(useWorkspaceStore.getState().ingestAccepted).toEqual(INGEST_OK);
+    // An accept is not a completion: the catalog row does not exist yet,
+    // so nothing is refreshed on this response.
+    expect(calls.some((c) => c.url === "/api/corpus")).toBe(false);
+  });
+
+  it("sends the optional format / document_id / doc_type only when supplied", async () => {
+    seedThread();
+    const { calls } = stubFetch((url) =>
+      url === "/api/corpus/ingest" ? jsonResponse(INGEST_OK) : jsonResponse({}, 404),
+    );
+
+    await useWorkspaceStore.getState().ingestFile(
+      new File(["x"], "aapl-10q.md"),
+      {
+        company: "aapl",
+        period: "2022q3",
+        format: "md",
+        document_id: "0000320193-23-000123",
+        doc_type: "financial_statement",
+      },
+    );
+    const form = calls[0].body as FormData;
+    expect(form.get("format")).toBe("md");
+    expect(form.get("document_id")).toBe("0000320193-23-000123");
+    expect(form.get("doc_type")).toBe("financial_statement");
+
+    await useWorkspaceStore
+      .getState()
+      .ingestFile(new File(["y"], "aapl-10q.md"), {
+        company: "aapl",
+        period: "2022q4",
+      });
+    const bare = calls[1].body as FormData;
+    expect(bare.has("format")).toBe(false);
+    expect(bare.has("document_id")).toBe(false);
+    expect(bare.has("doc_type")).toBe(false);
+  });
+
+  it("persists the submitted job id so a reload resumes the same job", async () => {
+    seedThread();
+    const { calls } = stubFetch((url) => {
+      if (url === "/api/corpus/ingest") return jsonResponse(INGEST_OK);
+      if (url === STATUS_URL) return jsonResponse(jobStatus());
+      return jsonResponse({}, 404);
+    });
+
+    await useWorkspaceStore
+      .getState()
+      .ingestFile(new File(["# hello"], "aapl-10q.md"), {
+        company: "aapl",
+        period: "2022q3",
+      });
+    expect(storage.getItem(LAST_INGEST_JOB_KEY)).toBe("AAPL-2022Q3");
+
+    // The reload itself: a fresh page whose only trace of the job is the
+    // persisted id — no file, no in-memory submission.
+    useWorkspaceStore.setState({
+      ingestJobId: null,
+      ingestAccepted: null,
+      ingestJob: null,
+    });
+    await useWorkspaceStore.getState().loadIngestJob();
+    expect(calls.some((c) => c.url === STATUS_URL)).toBe(true);
+    expect(useWorkspaceStore.getState().ingestJobId).toBe("AAPL-2022Q3");
+    expect(useWorkspaceStore.getState().ingestJob?.state).toBe("extracting");
   });
 
   it("throws the typed error carrying the named failure code", async () => {
@@ -206,7 +310,10 @@ describe("ingest door (store.ingestFile)", () => {
 
     const rejection = await useWorkspaceStore
       .getState()
-      .ingestFile(new File(["x"], "report.weird"))
+      .ingestFile(new File(["x"], "report.weird"), {
+        company: "aapl",
+        period: "2022q3",
+      })
       .then(() => null)
       .catch((error: unknown) => error);
 
@@ -214,6 +321,187 @@ describe("ingest door (store.ingestFile)", () => {
     expect((rejection as IngestFailedError).code).toBe("unsupported_format");
     // A named failure must not half-refresh the corpus list either.
     expect(useWorkspaceStore.getState().corpusLoaded).toBe(false);
+  });
+
+  it("starts no job on the 409 concurrent-run conflict", async () => {
+    seedThread();
+    const { calls } = stubFetch((url) =>
+      url === "/api/corpus/ingest"
+        ? jsonResponse({ error: "concurrent_run" }, 409)
+        : jsonResponse({}, 404),
+    );
+
+    const rejection = await useWorkspaceStore
+      .getState()
+      .ingestFile(new File(["x"], "aapl-10q.md"), {
+        company: "aapl",
+        period: "2022q3",
+      })
+      .then(() => null)
+      .catch((error: unknown) => error);
+
+    expect((rejection as IngestFailedError).code).toBe("concurrent_run");
+    // Nothing was accepted, so nothing is remembered to poll.
+    expect(useWorkspaceStore.getState().ingestJobId).toBeNull();
+    expect(storage.getItem(LAST_INGEST_JOB_KEY)).toBeNull();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(calls.filter((c) => c.url === STATUS_URL)).toEqual([]);
+  });
+});
+
+describe("ingest job status (store.loadIngestJob)", () => {
+  it("reads the accepted job's state and keeps polling until it is ready", async () => {
+    seedThread();
+    const filing = {
+      document_id: "AAPL-2022Q3",
+      company: "Apple",
+      period: "2022Q3",
+      version: "a".repeat(64),
+      page_count: 3,
+    };
+    let reads = 0;
+    const { calls } = stubFetch((url) => {
+      if (url === STATUS_URL) {
+        reads += 1;
+        return jsonResponse(
+          reads >= 2
+            ? jobStatus({ state: "ready", text_ready: true })
+            : jobStatus({ state: "cataloging" }),
+        );
+      }
+      if (url === "/api/corpus") return jsonResponse({ filings: [filing] });
+      return jsonResponse({}, 404);
+    });
+
+    await useWorkspaceStore.getState().loadIngestJob("AAPL-2022Q3", 1000);
+    expect(reads).toBe(1);
+    expect(useWorkspaceStore.getState().ingestJob?.state).toBe("cataloging");
+    // The list the operator is looking at refreshes when the source is
+    // actually catalogued, not on accept.
+    expect(calls.some((c) => c.url === "/api/corpus")).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(reads).toBe(2);
+    expect(useWorkspaceStore.getState().ingestJob?.state).toBe("ready");
+    expect(useWorkspaceStore.getState().ingestJob?.text_ready).toBe(true);
+    expect(useWorkspaceStore.getState().corpus).toEqual([filing]);
+
+    // Terminal: the chain stopped on its own.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(reads).toBe(2);
+  });
+
+  it("stops at a failed job and shows its typed reason without touching the corpus", async () => {
+    seedThread();
+    let reads = 0;
+    stubFetch((url) => {
+      if (url === STATUS_URL) {
+        reads += 1;
+        return jsonResponse(
+          jobStatus({
+            state: "failed",
+            error_type: "malformed_source",
+            error_message: "source bytes unreadable",
+          }),
+        );
+      }
+      if (url === "/api/corpus") return jsonResponse({ filings: [] });
+      return jsonResponse({}, 404);
+    });
+
+    await useWorkspaceStore.getState().loadIngestJob("AAPL-2022Q3", 1000);
+    const job = useWorkspaceStore.getState().ingestJob;
+    expect(job?.state).toBe("failed");
+    expect(job?.error_type).toBe("malformed_source");
+    expect(useWorkspaceStore.getState().corpusLoaded).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(reads).toBe(1);
+  });
+
+  it("a status read that refuses is a named miss and drops the dead marker", async () => {
+    seedThread();
+    storage.setItem(LAST_INGEST_JOB_KEY, "AAPL-2022Q3");
+    let reads = 0;
+    stubFetch(() => {
+      reads += 1;
+      return jsonResponse({ error: "unknown_job" }, 404);
+    });
+
+    await useWorkspaceStore.getState().loadIngestJob(undefined, 1000);
+
+    const failure = useWorkspaceStore.getState().ingestJobFailure;
+    expect(failure).toBeInstanceOf(IngestFailedError);
+    expect((failure as IngestFailedError).code).toBe("unknown_job");
+    expect(useWorkspaceStore.getState().ingestJob).toBeNull();
+    // A persisted id that outlived its job must not be re-read forever.
+    expect(storage.getItem(LAST_INGEST_JOB_KEY)).toBeNull();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(reads).toBe(1);
+  });
+
+  it("a transport blip on the status read surfaces and keeps following the job", async () => {
+    seedThread();
+    let reads = 0;
+    stubFetch(() => {
+      reads += 1;
+      throw new TypeError("network down");
+    });
+
+    await useWorkspaceStore.getState().loadIngestJob("AAPL-2022Q3", 1000);
+
+    // The failed read is visible (never a blank "still queued" panel)…
+    const failure = useWorkspaceStore.getState().ingestJobFailure;
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(IngestFailedError);
+    expect(useWorkspaceStore.getState().ingestJob).toBeNull();
+    // …and a blip is no verdict on the job, so the poll must continue.
+    const afterFirstRead = reads;
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(reads).toBeGreaterThan(afterFirstRead);
+  });
+
+  it("reads nothing when this browser never submitted a job", async () => {
+    seedThread();
+    const { calls } = stubFetch(() => jsonResponse({}, 404));
+
+    await useWorkspaceStore.getState().loadIngestJob();
+
+    expect(calls).toEqual([]);
+    expect(useWorkspaceStore.getState().ingestJob).toBeNull();
+    expect(useWorkspaceStore.getState().ingestJobFailure).toBeNull();
+  });
+
+  it("a newer submission owns the chain, so a stale read cannot paint the old job", async () => {
+    seedThread();
+    const otherUrl = "/api/corpus/ingest/MSFT-2022Q1";
+    stubFetch((url) => {
+      if (url === "/api/corpus/ingest") {
+        return jsonResponse({ ...INGEST_OK, job_id: "MSFT-2022Q1" });
+      }
+      if (url === otherUrl) {
+        return jsonResponse(
+          jobStatus({ job_id: "MSFT-2022Q1", document_id: "MSFT-2022Q1" }),
+        );
+      }
+      return jsonResponse(jobStatus({ state: "cataloging" }));
+    });
+
+    await useWorkspaceStore.getState().loadIngestJob("AAPL-2022Q3", 1000);
+    expect(useWorkspaceStore.getState().ingestJob?.state).toBe("cataloging");
+
+    // Second upload while the first chain is still ticking.
+    await useWorkspaceStore
+      .getState()
+      .ingestFile(new File(["# ms"], "msft-10q.md"), {
+        company: "msft",
+        period: "2022q1",
+      });
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    const job = useWorkspaceStore.getState().ingestJob;
+    expect(job?.job_id).toBe("MSFT-2022Q1");
+    expect(job?.state).toBe("extracting");
   });
 });
 

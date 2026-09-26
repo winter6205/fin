@@ -1,8 +1,18 @@
-"""The corpus ingest endpoint service (corpus-serve-ingest T3, ADR 0047).
+"""The corpus ingest endpoint service (corpus-serve-ingest, ADR 0047).
 
-This is the ONE product entry where company documents are parsed and
-chunked for storage on the retrieval backend. The chain is fully
-deterministic — no model participates in any split decision:
+This module owns two ingest entry points on one endpoint:
+
+* **durable accept** — :meth:`IngestEndpoint.submit_durable` is the HTTP
+  door: it makes the raw object, its metadata pointer, a queued job
+  record and the ``(document_id, version)`` identity durable, then
+  reports the upload accepted-and-queued WITHOUT parsing, chunking or
+  pushing, since those run off the request. :meth:`IngestEndpoint.job_status`
+  reads back what the machine has persisted.
+* **the synchronous chain** — :meth:`IngestEndpoint.ingest` is the
+  programmatic path that parses, chunks and pushes in one call. This is
+  the entry where company documents reach the retrieval backend, and the
+  chain is fully deterministic — no model participates in any split
+  decision:
 
 1. **format recognition** — the format is named by the caller (an
    explicit declared format, or the upload's filename extension). An
@@ -40,7 +50,7 @@ deterministic — no model participates in any split decision:
    never swallowed, never reported as a clean success (SC8); the push
    itself is idempotent, so retrying the ingest is the recovery.
 6. **on_ingested hook** — runs last, only after the whole chain
-   succeeded, carrying the row contract T2's catalog registration
+   succeeded, carrying the row contract catalog registration
    (``record_filings``) consumes: ``{document_id, company, period,
    version, page_count}``. The hook's own failures propagate typed.
 
@@ -52,10 +62,11 @@ never reads the environment and never imports FastAPI.
 from __future__ import annotations
 
 import hashlib
+import threading
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Final, Sequence
+from typing import TYPE_CHECKING, Callable, Final, Literal, Sequence
 
 from fin.corpus.chunking import (
     DocumentChunking,
@@ -64,6 +75,8 @@ from fin.corpus.chunking import (
 )
 from fin.corpus.doc_type import classify_page
 from fin.corpus.errors import UnsupportedFormatParseError
+from fin.corpus.ingest_state import IngestJob, IngestState
+from fin.corpus.ingest_state_errors import DuplicateJobError, UnknownJobError
 from fin.corpus.invalidation import VersionChange, plan_invalidations
 from fin.corpus.params import DOC_TYPES
 from fin.corpus.parsers import SUPPORTED_FORMATS, ParseResult, parse_document
@@ -83,10 +96,17 @@ from fin.retrieve.invalidation_port.ledger import InvalidationLedger
 from fin.retrieve.push_batching import PushJournal, push_in_batches
 from fin.retrieve.push_port import PushPort
 
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from fin.corpus.ingest_state import IngestStateStore
+    from fin.corpus.metadata_store import MetadataStore
+    from fin.corpus.object_store import ObjectPointer, ObjectStore
+
 # Overflow class (§B2 第 5 条 / test allocation): the largest upload the
 # endpoint accepts. Oversize is a named 413-class failure, never a
-# truncated parse of a prefix. The value is headroom, not contract.
-MAX_INGEST_BYTES: Final[int] = 50 * 1024 * 1024
+# truncated parse of a prefix. The value is the contract: the HTTP route's
+# pre-buffer gate and this endpoint's check read the same number, so an
+# upload of exactly this size is accepted and one byte more is refused.
+MAX_INGEST_BYTES: Final[int] = 52_428_800
 
 # Filename extension -> parser format. The root 文档类型 is the file
 # format (spec Focus 2), recognized from the name the uploader gave
@@ -101,6 +121,28 @@ _EXTENSION_FORMATS: Final[dict[str, str]] = {
     ".md": "md",
     ".markdown": "md",
     ".txt": "txt",
+}
+
+# Parser format -> media type recorded on the raw object. The durable
+# accept writes the object before anything is parsed, so the type can only
+# come from the recognized format name, never from sniffed content.
+_FORMAT_CONTENT_TYPES: Final[dict[str, str]] = {
+    "pdf": "application/pdf",
+    "docx": (
+        "application/vnd.openxmlformats-officedocument"
+        ".wordprocessingml.document"
+    ),
+    "xlsx": (
+        "application/vnd.openxmlformats-officedocument"
+        ".spreadsheetml.sheet"
+    ),
+    "pptx": (
+        "application/vnd.openxmlformats-officedocument"
+        ".presentationml.presentation"
+    ),
+    "html": "text/html",
+    "md": "text/markdown",
+    "txt": "text/plain",
 }
 
 
@@ -152,9 +194,73 @@ class IngestInvalidDocTypeError(IngestEndpointError):
     code = "invalid_doc_type"
 
 
+class IngestConcurrentRunError(IngestEndpointError):
+    """A different version arrived while the document's job is in flight.
+
+    Two flags racing on the same document would otherwise leave two raw
+    objects and one pointer; the in-flight job is left undisturbed.
+    """
+
+    code = "concurrent_run"
+
+
+class IngestReplacementUnsupportedError(IngestEndpointError):
+    """A ready document was re-submitted with different bytes.
+
+    That is the replacement case, and closing it needs the invalidation
+    side effect the state machine cannot express: ``ready`` is terminal, so
+    the accepted upload's chunks could never be produced. Refusing it is a
+    correctness gate, not a missing feature flag — until the state store
+    gains a re-queue edge for replacements.
+    """
+
+    code = "replacement_unsupported"
+
+
+# The accept-time step that failed to persist. Typed so the free-form
+# string a caller sees is a closed set, not an open vocabulary.
+IngestDurableStage = Literal[
+    "unconfigured",
+    "object_write",
+    "pointer_write",
+    "job_record",
+    "pointer_read",
+]
+
+
+class IngestDurableCommitError(IngestEndpointError):
+    """An accept-time durable item could not be persisted.
+
+    No job is reported as accepted unless the raw object, the metadata
+    pointer and the ``pending`` job record all landed, so every storage
+    failure surfaces typed with the :attr:`stage` that failed.
+    """
+
+    code = "durable_commit_failed"
+
+    def __init__(self, message: str, *, stage: IngestDurableStage) -> None:
+        super().__init__(message)
+        self.stage = stage
+
+
+class IngestObjectCleanupError(IngestEndpointError):
+    """The compensating delete of a rejected upload's raw object failed.
+
+    The orphan object is the residue of a persistence failure, so losing
+    it silently would leave an unaudited write; the original failure is
+    kept as ``__cause__`` and this one names the key.
+    """
+
+    code = "object_cleanup_failed"
+
+    def __init__(self, message: str, *, key: str) -> None:
+        super().__init__(message)
+        self.key = key
+
+
 @dataclass(frozen=True)
 class IngestedDocument:
-    """What one successful ingest stored — the T2 catalog row contract.
+    """What one successful ingest stored — the catalog row contract.
 
     ``page_count`` is the frozen-unit count (the physical granularity
     of the parse: pages for PDF/PPT, row blocks for Excel, structure
@@ -197,6 +303,49 @@ class IngestEndpointResult:
     invalidation: InvalidationOutcome | None
 
 
+@dataclass(frozen=True)
+class IngestSubmission:
+    """What a durable accept reports: the job exists, nothing else yet.
+
+    ``state`` is the persisted job state the accept left behind (or, for a
+    duplicate submission, the state the existing job has already reached).
+    """
+
+    document_id: str
+    version: str
+    state: IngestState
+
+    @property
+    def job_id(self) -> str:
+        """The job handle; ``document_id`` is the state store's key."""
+        return self.document_id
+
+
+@dataclass(frozen=True)
+class IngestJobStatus:
+    """The persisted state of one ingest job, as the status route reports it.
+
+    ``version`` is read back from the durable pointer, never recomputed
+    from a re-supplied upload, so what a poller sees is what was accepted.
+    """
+
+    document_id: str
+    version: str
+    state: IngestState
+    error_type: str | None
+    error_message: str | None
+
+    @property
+    def job_id(self) -> str:
+        """The job handle; ``document_id`` is the state store's key."""
+        return self.document_id
+
+    @property
+    def text_ready(self) -> bool:
+        """Whether the chunk/text side of the pipeline has landed."""
+        return self.state is IngestState.READY
+
+
 def resolve_format(
     *, filename: str | None, declared_format: str | None
 ) -> str:
@@ -236,27 +385,28 @@ def resolve_document_id(
     document_id: str | None,
     company: str | None,
     period: str | None,
-    filename: str | None,
 ) -> str:
     """Resolve the locator's ``document_id`` deterministically.
 
-    Precedence: explicit ``document_id``, then ``company`` + ``period``
-    joined with ``-`` (omitting empty parts), then the filename stem.
-    Nothing left is the named ``document_id_missing`` failure — the
-    locator triple cannot be built without it.
+    An explicit non-empty ``document_id`` is used verbatim (trimmed).
+    Otherwise the id is ``"{TICKER}-{FYQ}"`` from the metadata, upper-cased
+    so the same filing re-uploaded with different capitalization joins one
+    identity. The filename never participates: an uploader's file name is
+    free-form and would let one document land under several ids. Neither an
+    explicit id nor a complete metadata pair is the named
+    ``document_id_missing`` failure — the locator triple cannot be built
+    without it.
     """
     if document_id and document_id.strip():
         return document_id.strip()
-    parts = [part.strip() for part in (company, period) if part and part.strip()]
-    if parts:
-        return "-".join(parts)
-    if filename:
-        stem = Path(filename).stem.strip()
-        if stem:
-            return stem
+    ticker = company.strip() if company else ""
+    fiscal_period = period.strip() if period else ""
+    if ticker and fiscal_period:
+        return f"{ticker.upper()}-{fiscal_period.upper()}"
     raise IngestDocumentIdMissingError(
-        "no document_id was supplied and none is derivable from "
-        "company/period metadata or the filename"
+        "no document_id was supplied and none is derivable: both company "
+        "and period are required (e.g. company='aapl', period='2022q3' -> "
+        "'AAPL-2022Q3')"
     )
 
 
@@ -333,6 +483,18 @@ class IngestEndpoint:
         Optional callback invoked once per fully successful ingest
         with the :class:`IngestedDocument` row (the T2 catalog
         registration seam; leader wires it after the merge).
+    object_store:
+        Raw-bytes port used by :meth:`submit_durable`. Required only for
+        the durable accept path, so the synchronous ``ingest`` chain and
+        callers that never submit keep working without it.
+    metadata_store:
+        Pointer port used by :meth:`submit_durable` to associate the
+        document with its raw object (and to read back the accepted
+        version).
+    state_store:
+        :class:`~fin.corpus.ingest_state.IngestStateStore` carrying the
+        job's persisted state; ``document_id`` is the job id, so
+        ``job_id == document_id``.
     """
 
     def __init__(
@@ -346,6 +508,9 @@ class IngestEndpoint:
         version_signal: VersionChange | None = None,
         previous_records: Callable[[], Sequence[PushRecord]] | None = None,
         on_ingested: Callable[[IngestedDocument], None] | None = None,
+        object_store: ObjectStore | None = None,
+        metadata_store: MetadataStore | None = None,
+        state_store: IngestStateStore | None = None,
     ) -> None:
         self._push_port = push_port
         self._invalidation_port = invalidation_port
@@ -359,11 +524,25 @@ class IngestEndpoint:
         self._version_signal = version_signal
         self._previous_records = previous_records
         self._on_ingested = on_ingested
+        self._object_store = object_store
+        self._metadata_store = metadata_store
+        self._state_store = state_store
+        # A per-document submit lock serializes the check-write-read of
+        # submit_durable so two identical uploads cannot both pass the
+        # "no prior job" read and race on the durable write. The guard
+        # protects the registry itself, not any single document.
+        self._submit_locks: dict[str, threading.Lock] = {}
+        self._submit_locks_guard = threading.Lock()
 
     @property
     def push_port(self) -> PushPort:
         """The push port behind this endpoint (diagnostics / tests)."""
         return self._push_port
+
+    @property
+    def state_store(self) -> IngestStateStore | None:
+        """The persisted job store, when one is wired (diagnostics)."""
+        return self._state_store
 
     @property
     def max_bytes(self) -> int:
@@ -412,7 +591,6 @@ class IngestEndpoint:
             document_id=document_id,
             company=company,
             period=period,
-            filename=filename,
         )
         if doc_type is not None and doc_type not in DOC_TYPES:
             raise IngestInvalidDocTypeError(
@@ -549,15 +727,386 @@ class IngestEndpoint:
             ledger=self._invalidation_ledger,
         )
 
+    def submit_durable(
+        self,
+        data: bytes,
+        *,
+        filename: str | None = None,
+        declared_format: str | None = None,
+        document_id: str | None = None,
+        company: str | None = None,
+        period: str | None = None,
+        doc_type: str | None = None,
+    ) -> IngestSubmission:
+        """Persist one upload durably and report the job that owns it.
+
+        This is the HTTP ingest contract: nothing is parsed, chunked or
+        pushed here. The upload is accepted only once all four
+        accept-time items are durable — the raw object, the metadata
+        pointer, the job record and the ``(document_id, version)``
+        identity — and every validation that needs no bytes (size, format,
+        identity, doc_type) is decided BEFORE the first write, so a
+        rejected upload leaves nothing behind.
+
+        A submission of the bytes the document already points at idempotently
+        joins that job. A different version while the job is in flight is the
+        typed :class:`IngestConcurrentRunError`. A different version after a
+        ``failed`` job re-enters the machine at ``fetching``, the retry edge
+        the state machine already defines; a ``ready`` job has no outgoing
+        edge at all, so replacing it is the typed
+        :class:`IngestReplacementUnsupportedError` with nothing written,
+        never a pretend accept.
+
+        Any persistence failure yields no accepted job: the object written
+        for this attempt is deleted again, and a delete that itself fails is
+        the typed :class:`IngestObjectCleanupError`, never a swallow.
+        """
+        fmt, doc_id, _company, _period = self._validate_upload(
+            data,
+            filename=filename,
+            declared_format=declared_format,
+            document_id=document_id,
+            company=company,
+            period=period,
+            doc_type=doc_type,
+        )
+        objects, pointers, states = self._durable_stores()
+        version = hashlib.sha256(data).hexdigest()
+        # The key is identity-derived, so re-submitting the same bytes can
+        # never land a second object and a different filename cannot name a
+        # second copy of one version.
+        key = f"filings/{doc_id}/{version}"
+        # Resolved before the lock: a missing media type is a code bug in the
+        # format table, not a storage outage, so it must not be misclassified
+        # as a 503 by the write's except handler.
+        content_type = _FORMAT_CONTENT_TYPES[fmt]
+
+        with self._lock_for(doc_id):
+            prior_pointer = self._known_pointer(doc_id)
+            prior_job = self._known_job(doc_id)
+
+            joined = self._resolve_join(
+                prior_pointer, prior_job, doc_id, version
+            )
+            if joined is not None:
+                return joined
+            self._raise_if_conflict(prior_job, doc_id)
+
+            job = self._persist_accept(
+                objects,
+                pointers,
+                states,
+                key=key,
+                data=data,
+                content_type=content_type,
+                doc_id=doc_id,
+                version=version,
+                prior_pointer=prior_pointer,
+            )
+            return IngestSubmission(
+                document_id=doc_id, version=version, state=job.state
+            )
+
+    def _durable_stores(
+        self,
+    ) -> tuple[ObjectStore, MetadataStore, IngestStateStore]:
+        """The three durable ports, or a typed unconfigured failure.
+
+        The accept writes to all three; a missing one cannot be compensated,
+        so the boundary check happens before any write.
+        """
+        objects = self._object_store
+        pointers = self._metadata_store
+        states = self._state_store
+        if objects is None or pointers is None or states is None:
+            raise IngestDurableCommitError(
+                "the durable accept needs an object store, a metadata "
+                "pointer store and an ingest state store; at least one of "
+                "them is not wired",
+                stage="unconfigured",
+            )
+        return objects, pointers, states
+
+    def _lock_for(self, document_id: str) -> threading.Lock:
+        """The one submit lock for a document, created on first use."""
+        with self._submit_locks_guard:
+            lock = self._submit_locks.get(document_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._submit_locks[document_id] = lock
+            return lock
+
+    def _resolve_join(
+        self,
+        prior_pointer: ObjectPointer | None,
+        prior_job: IngestJob | None,
+        document_id: str,
+        version: str,
+    ) -> IngestSubmission | None:
+        """The submission that owns these bytes already, if there is one.
+
+        A re-upload of the version the document already points at is an
+        idempotent join onto the existing job — no second object, pointer or
+        job row is written.
+        """
+        if (
+            prior_pointer is not None
+            and prior_pointer.sha256 == version
+            and prior_job is not None
+        ):
+            return IngestSubmission(
+                document_id=document_id,
+                version=version,
+                state=prior_job.state,
+            )
+        return None
+
+    def _raise_if_conflict(
+        self, prior_job: IngestJob | None, document_id: str
+    ) -> None:
+        """Reject a version swap the state machine has no edge for.
+
+        A ``failed`` job is not a conflict: the retry edge re-enters it at
+        ``fetching``. A ``ready`` job has no outgoing edge, so replacing it is
+        the typed unsupported error; any other live state is the typed
+        concurrent-run error. Both raise before a write, so nothing lands.
+        """
+        if prior_job is None or prior_job.state is IngestState.FAILED:
+            return
+        if prior_job.state is IngestState.READY:
+            raise IngestReplacementUnsupportedError(
+                f"{document_id!r} is ready on another version and the upload "
+                "is not those bytes: the state machine has no edge out of "
+                "'ready', so the replacement cannot be accepted yet"
+            )
+        raise IngestConcurrentRunError(
+            f"a job for {document_id!r} is already in state "
+            f"{prior_job.state.value!r}; a different version is not "
+            "accepted while it is in flight"
+        )
+
+    def _persist_accept(
+        self,
+        objects: ObjectStore,
+        pointers: MetadataStore,
+        states: IngestStateStore,
+        *,
+        key: str,
+        data: bytes,
+        content_type: str,
+        doc_id: str,
+        version: str,
+        prior_pointer: ObjectPointer | None,
+    ) -> IngestJob:
+        """Write the object, pointer and job in order, compensating on failure.
+
+        Nothing is reported accepted until all three are durable. A failure at
+        any step deletes the object written this attempt (and restores the
+        overwritten pointer), so a rejected upload leaves the document exactly
+        as it was; a compensation that itself fails is the typed cleanup error.
+        """
+        try:
+            pointer = objects.put(key, data, content_type=content_type)
+        except Exception as exc:
+            raise IngestDurableCommitError(
+                f"the raw object for {doc_id!r} could not be written "
+                f"({type(exc).__name__})",
+                stage="object_write",
+            ) from exc
+        if pointer.sha256 != version or pointer.size_bytes != len(data):
+            # The version IS the object's identity; a store that reports a
+            # different digest cannot be trusted with the accept.
+            self._discard_rejected_upload(
+                objects=objects, pointers=pointers, key=key
+            )
+            raise IngestDurableCommitError(
+                f"the object store returned a pointer that does not match "
+                f"the upload for {doc_id!r}",
+                stage="object_write",
+            )
+
+        try:
+            pointers.put_pointer(doc_id, pointer)
+        except Exception as exc:
+            self._discard_rejected_upload(
+                objects=objects,
+                pointers=pointers,
+                key=key,
+                document_id=doc_id,
+                restore=prior_pointer,
+                cause=exc,
+            )
+            raise IngestDurableCommitError(
+                f"the metadata pointer for {doc_id!r} could not be written "
+                f"({type(exc).__name__})",
+                stage="pointer_write",
+            ) from exc
+
+        try:
+            return self._record_job(states, doc_id, version=version)
+        except IngestDurableCommitError:
+            raise
+        except Exception as exc:
+            self._discard_rejected_upload(
+                objects=objects,
+                pointers=pointers,
+                key=key,
+                document_id=doc_id,
+                restore=prior_pointer,
+                cause=exc,
+            )
+            raise IngestDurableCommitError(
+                f"the ingest job for {doc_id!r} could not be recorded "
+                f"({type(exc).__name__})",
+                stage="job_record",
+            ) from exc
+
+    def job_status(self, job_id: str) -> IngestJobStatus:
+        """Report the persisted state of one ingest job.
+
+        ``job_id`` is the state store's key, i.e. the ``document_id``. The
+        version is read back from the durable pointer, never recomputed from
+        a re-supplied upload, so a poller sees what was accepted. An unknown
+        id stays the store's typed :class:`UnknownJobError` — never an empty
+        success.
+        """
+        states = self._state_store
+        if states is None or self._metadata_store is None:
+            raise IngestDurableCommitError(
+                "job status needs a metadata pointer store and an ingest "
+                "state store; at least one of them is not wired",
+                stage="unconfigured",
+            )
+        job = states.get_job(job_id)
+        pointer = self._known_pointer(job.document_id)
+        if pointer is None:
+            raise IngestDurableCommitError(
+                f"job {job.document_id!r} has no durable object pointer",
+                stage="pointer_read",
+            )
+        return IngestJobStatus(
+            document_id=job.document_id,
+            version=pointer.sha256,
+            state=job.state,
+            error_type=job.error_type,
+            error_message=job.error_message,
+        )
+
+    def _record_job(
+        self, states: IngestStateStore, doc_id: str, *, version: str
+    ) -> IngestJob:
+        """Reach a queued job record for this upload's version.
+
+        A job already in ``failed`` re-enters at ``fetching`` — the retry
+        edge the state machine defines — instead of claiming a second
+        ``pending`` job for the same document.
+
+        A :class:`DuplicateJobError` here means another submission committed
+        the job between the caller's read and this create. The submit lock
+        makes that impossible within one process, so it can only be a
+        cross-process competitor that already accepted these same bytes; the
+        safe recovery is to join the committed job, never to raise — raising
+        would make the caller delete the shared object the winner depends on.
+        """
+        try:
+            return states.create_job(doc_id)
+        except DuplicateJobError:
+            job = states.get_job(doc_id)
+            if job.state is IngestState.FAILED:
+                states.transition(
+                    doc_id,
+                    IngestState.FETCHING,
+                    metadata={"replaced_version": version},
+                )
+                return states.get_job(doc_id)
+            return job
+
+    def _discard_rejected_upload(
+        self,
+        *,
+        objects: ObjectStore,
+        pointers: MetadataStore,
+        key: str,
+        document_id: str = "",
+        restore: ObjectPointer | None = None,
+        cause: BaseException | None = None,
+    ) -> None:
+        """Undo the writes a rejected accept already made; never silently.
+
+        The pointer store has no delete, so a replacement that fails after
+        its pointer overwrite puts the previous pointer back — otherwise the
+        document would keep pointing at bytes that were never accepted.
+        """
+        try:
+            objects.delete(key)
+        except Exception as del_exc:
+            # Both failures must stay recoverable: the persistence failure
+            # that triggered the rollback (``cause``) is the reason this
+            # object is being discarded at all, so it owns the exception
+            # chain; the delete's own failure (``del_exc``) is named in the
+            # message instead. When there is no triggering cause the delete
+            # failure is the whole story and chains itself.
+            chained = cause if cause is not None else del_exc
+            raise IngestObjectCleanupError(
+                f"the raw object {key!r} of a rejected upload is orphaned: "
+                f"the compensating delete failed "
+                f"({type(del_exc).__name__})"
+                + (
+                    f" after a persistence failure ({type(cause).__name__})"
+                    if cause is not None
+                    else ""
+                ),
+                key=key,
+            ) from chained
+        if restore is not None:
+            try:
+                pointers.put_pointer(document_id, restore)
+            except Exception as exc:
+                raise IngestObjectCleanupError(
+                    f"the pointer of {document_id!r} still names the deleted "
+                    "object of a rejected upload: the prior pointer could not "
+                    "be restored",
+                    key=key,
+                ) from exc
+
+    def _known_pointer(self, document_id: str) -> ObjectPointer | None:
+        """The document's durable pointer, or ``None`` when it has none."""
+        if self._metadata_store is None:
+            return None
+        # Imported here because the pointer store module pulls in the
+        # database driver, which must stay off this module's import surface.
+        from fin.corpus.metadata_store import MetadataPointerNotFoundError
+
+        try:
+            return self._metadata_store.get_pointer(document_id).pointer
+        except MetadataPointerNotFoundError:
+            return None
+
+    def _known_job(self, document_id: str) -> IngestJob | None:
+        """The document's job, or ``None`` when nothing was ever accepted."""
+        if self._state_store is None:
+            return None
+        try:
+            return self._state_store.get_job(document_id)
+        except UnknownJobError:
+            return None
+
 
 __all__ = [
     "MAX_INGEST_BYTES",
+    "IngestConcurrentRunError",
     "IngestDocumentIdMissingError",
+    "IngestDurableCommitError",
+    "IngestDurableStage",
     "IngestEndpoint",
     "IngestEndpointError",
     "IngestEndpointResult",
     "IngestFormatUnspecifiedError",
     "IngestInvalidDocTypeError",
+    "IngestJobStatus",
+    "IngestObjectCleanupError",
+    "IngestReplacementUnsupportedError",
+    "IngestSubmission",
     "IngestUploadTooLargeError",
     "IngestedDocument",
     "resolve_document_id",

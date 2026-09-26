@@ -11,6 +11,7 @@ import type {
   Comparison,
   Filing,
   IngestResult,
+  JobStatus,
   Notice,
   SoftTrack,
   StreamErrorKind,
@@ -659,8 +660,8 @@ export async function resumeThread(
 
 /**
  * Named failure of the corpus-ingest door. Every ingest failure
- * answers a stable ``error`` code (4xx input, 413 too large, 415
- * unsupported format, 503 push/invalidation outage) with NO
+ * answers a stable ``error`` code (422 metadata, 413 too large, 415
+ * unsupported format, 409 concurrent_run, 404 unknown_job) with NO
  * partial-success 200 (SC7/SC8); the SPA renders copy keyed off
  * ``code`` (see ingestFailure.ts) instead of a bare enum.
  */
@@ -717,13 +718,15 @@ async function namedErrorCode(res: Response): Promise<string> {
   return `http_${res.status}`;
 }
 
-/** Optional locator metadata for the ingest door. All optional: the
- * endpoint derives ``document_id`` from company+period or the
- * filename, and classifies doc_type per unit when omitted. */
+/** Metadata for the ingest door. ``company`` and ``period`` are
+ * required: with no explicit ``document_id`` they are the ONLY source
+ * of the stable identity, so the endpoint never falls back to the
+ * uploaded filename. Everything else is optional locator/classifier
+ * metadata. */
 export interface IngestMeta {
+  company: string;
+  period: string;
   document_id?: string;
-  company?: string;
-  period?: string;
   doc_type?: string;
   format?: string;
 }
@@ -731,20 +734,22 @@ export interface IngestMeta {
 /**
  * The corpus-ingest door (ADR 0047): multipart POST /api/corpus/ingest
  * — the ONLY client surface that triggers 切分 + MCP push. Named
- * failures throw ``IngestFailedError`` with the wire code; success
- * resolves the push summary (the store refreshes the corpus list).
+ * failures throw ``IngestFailedError`` with the wire code; success is
+ * an ACCEPT plus a ``job_id``, NOT a completed ingest — parse / 切分 /
+ * push run off the request, so the outcome is followed with
+ * ``getIngestJobStatus``.
  */
 export async function ingestCorpus(
   file: File,
-  meta: IngestMeta = {},
+  meta: IngestMeta,
 ): Promise<IngestResult> {
   const form = new FormData();
   form.append("file", file, file.name);
-  if (meta.document_id) form.append("document_id", meta.document_id);
-  if (meta.company) form.append("company", meta.company);
-  if (meta.period) form.append("period", meta.period);
-  if (meta.doc_type) form.append("doc_type", meta.doc_type);
+  form.append("company", meta.company);
+  form.append("period", meta.period);
   if (meta.format) form.append("format", meta.format);
+  if (meta.document_id) form.append("document_id", meta.document_id);
+  if (meta.doc_type) form.append("doc_type", meta.doc_type);
   const res = await fetch("/api/corpus/ingest", {
     method: "POST",
     body: form,
@@ -753,6 +758,21 @@ export async function ingestCorpus(
     throw new IngestFailedError(await namedErrorCode(res), res.status);
   }
   return (await res.json()) as IngestResult;
+}
+
+/**
+ * Status read for one accepted corpus job: GET /api/corpus/ingest/{job_id}.
+ * The accept response only says the upload is durable, so this is the
+ * single place the SPA learns the job's real state. An id with no job
+ * is the named ``unknown_job`` miss — never an empty status that looks
+ * like a still-queued job.
+ */
+export async function getIngestJobStatus(jobId: string): Promise<JobStatus> {
+  const res = await fetch(`/api/corpus/ingest/${encodeURIComponent(jobId)}`);
+  if (!res.ok) {
+    throw new IngestFailedError(await namedErrorCode(res), res.status);
+  }
+  return (await res.json()) as JobStatus;
 }
 
 /**
