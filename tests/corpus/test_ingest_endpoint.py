@@ -71,6 +71,7 @@ from fin.corpus.parsers import SUPPORTED_FORMATS
 from fin.corpus.push import REQUIRED_PUSH_METADATA_FIELDS
 from fin.retrieve.fake_port import FakeRetrievePort
 from fin.retrieve.fake_push_port import FakePushPort
+from fin.retrieve.iknow_identity import compute_iknow_content_identity
 from fin.retrieve.invalidation_port.errors import (
     InvalidationServiceUnavailableError,
 )
@@ -1088,3 +1089,64 @@ def test_job_status_reads_the_version_from_the_durable_pointer() -> None:
     assert stack.endpoint.job_status("DOC-1").version == (
         _pointer_of(stack.pointers, "DOC-1").sha256
     )
+
+
+# ----- T4 handoff: the ingest result carries the service's per-source identity --
+#
+# ``compute_iknow_content_identity`` is the one mirror of iknow's formula
+# the fake answers with, so re-deriving it here checks that the endpoint
+# passed the reported value through — neither dropping it nor substituting
+# fin's own hash. It is a re-derivation of the mirror, not an observation
+# of the service; the cross-repo claim belongs to the live driver
+# (``tests/retrieve/test_live_content_identity.py``, opt-in ``-m mcp``).
+
+
+def test_result_carries_the_content_identity_of_every_pushed_source() -> None:
+    fake = FakePushPort()
+    endpoint = _endpoint(fake)
+
+    result = endpoint.ingest(
+        _MD_SAMPLE.read_bytes(),
+        filename="AAPL-2022Q3__table_dense__md__md.md",
+        company="AAPL",
+        period="2022Q3",
+    )
+
+    assert set(result.content_identities) == {
+        record.source_ref for record in result.records
+    }
+    for block_id in result.block_ids:
+        stored = fake.recall(block_id)
+        assert (
+            result.content_identities[stored["source_ref"]]
+            == compute_iknow_content_identity(stored["body"])
+        )
+
+
+def test_result_identity_map_refuses_to_be_written_through() -> None:
+    """The result hands on the push run's map of what the service
+    reported, and that map is also read by the run's own outcome —
+    writing through the result would rewrite both."""
+    endpoint = _endpoint(FakePushPort())
+
+    result = endpoint.ingest(_V1_TEXT, document_id="DOC-1", declared_format="txt")
+
+    with pytest.raises(TypeError):
+        result.content_identities["invented"] = "0" * 64  # type: ignore[index]
+    assert "invented" not in result.content_identities
+
+
+def test_reingesting_the_same_bytes_reports_the_same_identities() -> None:
+    """``submit_index_job`` is keyed on the pair, so a replay that wrote
+    nothing must still hand back the identity of the stored row."""
+    fake = FakePushPort()
+    endpoint = _endpoint(fake)
+    first = endpoint.ingest(
+        _V1_TEXT, document_id="DOC-1", declared_format="txt"
+    )
+    second = endpoint.ingest(
+        _V1_TEXT, document_id="DOC-1", declared_format="txt"
+    )
+
+    assert second.written == 0
+    assert second.content_identities == first.content_identities

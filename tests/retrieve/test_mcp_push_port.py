@@ -156,16 +156,63 @@ class _ScriptedPushPort(MCPPushPort):
 def _success_envelope(chunk_ids: Sequence[str]) -> dict[str, Any]:
     """The canonical MCP ``tools/call`` envelope wrapping
     ``{"chunk_ids": [...]}`` inside ``result.content[0].text``."""
+    return _business_envelope({"chunk_ids": list(chunk_ids)})
+
+
+def _business_envelope(business: Mapping[str, Any]) -> dict[str, Any]:
+    """MCP ``tools/call`` envelope wrapping an arbitrary iknow ``push``
+    business payload — the shape ``src/tools/push.ts`` actually answers
+    with (a JSON string in the first text content block)."""
     return {
         "result": {
             "content": [
-                {
-                    "type": "text",
-                    "text": json.dumps({"chunk_ids": list(chunk_ids)}),
-                }
+                {"type": "text", "text": json.dumps(dict(business))}
             ]
         }
     }
+
+
+def _items_of(payload: dict) -> list[dict]:
+    """The ``push`` items one scripted ``tools/call`` payload carried."""
+    return payload["params"]["arguments"]["items"]
+
+
+class _ChunkCountingPushPort(_ScriptedPushPort):
+    """A scripted server that answers the way iknow's ``push`` does: one
+    ``chunk_id`` per slice of what fin sent, in send order
+    (``src/tools/push.ts`` ``allChunkIds``).
+
+    ``scripted_response`` still wins when a test needs an exact envelope,
+    so a test about the adapter's bookkeeping does not also script a
+    response that happens to match the chunk count by hand.
+    """
+
+    async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
+        if self._scripted_response is not None:
+            return self._scripted_response
+        chunk_count = sum(len(item.get("chunks") or []) for item in _items_of(payload))
+        return _success_envelope([f"chunk-{i}" for i in range(chunk_count)])
+
+
+class _CapturingPushPort(_ChunkCountingPushPort):
+    """``_ChunkCountingPushPort`` that also records the payloads it sent —
+    the request side of the wire-shape assertions."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.payloads: list[dict] = []
+
+    async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
+        self.payloads.append(payload)
+        return await super()._call_mcp(payload)
+
+
+# iknow stores ``content_identity`` as a sha256 hex digest; the tests use
+# plain hex so an assertion never depends on fin recomputing anything.
+_IDENTITY_A = "a" * 64
+_IDENTITY_B = "b" * 64
+_IDENTITY_C = "c" * 64
+_IDENTITY_D = "d" * 64
 
 
 # ----- boundary 1: wire shape matches the iknow schema -----
@@ -184,16 +231,7 @@ def test_push_items_envelope_matches_iknow_schema() -> None:
     failure the §B4 contract forbids.
     """
 
-    class _Capturing(MCPPushPort):
-        def __init__(self, **kwargs: object) -> None:
-            super().__init__(**kwargs)  # type: ignore[arg-type]
-            self.payloads: list[dict] = []
-
-        async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
-            self.payloads.append(payload)
-            return _success_envelope(["chunk-a", "chunk-b"])
-
-    port = _Capturing()
+    port = _CapturingPushPort()
     records = _wires(2)
     port.push(records)
 
@@ -507,25 +545,7 @@ def test_push_multi_chunk_envelope_chunk_count_matches_server() -> None:
     expected_chunk_count = sum(len(chunks) for _, chunks in specs)
     expected_chunk_ids = [f"chunk-{i}" for i in range(expected_chunk_count)]
 
-    class _PerChunkScripted(MCPPushPort):
-        def __init__(self) -> None:
-            self._command: list[str] | None = ["iknow-memory"]
-            self._timeout: float = 5.0
-            self._ledger = None  # type: ignore[assignment]
-            self._seen_keys: dict[tuple[str, str], bool] = {}
-
-        async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
-            # Mirror the server: one chunk_id per slice, in order.
-            chunk_count = sum(
-                len(item.get("chunks") or []) for item in (
-                    payload["params"]["arguments"]["items"]
-                )
-            )
-            return _success_envelope(
-                [f"chunk-{i}" for i in range(chunk_count)]
-            )
-
-    port = _PerChunkScripted()
+    port = _ChunkCountingPushPort()
     outcome = port.push(_multi_chunk_wires(specs))
 
     assert outcome["block_ids"] == expected_chunk_ids
@@ -548,24 +568,7 @@ def test_push_multi_chunk_envelope_replay_counts_chunks_not_envelopes() -> None:
         ("docs/b.md", ["gamma ", "delta ", "epsilon"]),  # 3 chunks
     ]
 
-    class _FixedScripted(MCPPushPort):
-        def __init__(self) -> None:
-            self._command: list[str] | None = ["iknow-memory"]
-            self._timeout: float = 5.0
-            self._ledger = None  # type: ignore[assignment]
-            self._seen_keys: dict[tuple[str, str], bool] = {}
-
-        async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
-            chunk_count = sum(
-                len(item.get("chunks") or []) for item in (
-                    payload["params"]["arguments"]["items"]
-                )
-            )
-            return _success_envelope(
-                [f"chunk-{i}" for i in range(chunk_count)]
-            )
-
-    port = _FixedScripted()
+    port = _ChunkCountingPushPort()
     envelopes = _multi_chunk_wires(specs)
 
     first = port.push(envelopes)
@@ -577,3 +580,204 @@ def test_push_multi_chunk_envelope_replay_counts_chunks_not_envelopes() -> None:
     # → every chunk is a duplicate.
     assert again["written"] == 0
     assert again["duplicates"] == 5
+
+
+# ----- stable identity handoff: iknow's ``content_identity`` reaches the caller -----
+#
+# ``submit_index_job`` takes the ``(source_ref, content_identity)`` pair
+# iknow itself stored (iknow ``src/tools/push.ts`` computes and persists
+# it; fin sends no identity at all). A fin-side recomputation would be a
+# second authority on a value the service owns, so the only correct
+# source is the push response.
+
+
+def test_push_exposes_the_single_document_content_identity() -> None:
+    """A one-资料 push answers with a top-level ``content_identity``; the
+    adapter must hand it back keyed by the ``source_ref`` it sent."""
+    port = _ScriptedPushPort(
+        scripted_response=_business_envelope(
+            {
+                "chunk_ids": ["chunk-a"],
+                "source_doc_id": "doc-1",
+                "content_identity": _IDENTITY_A,
+            }
+        )
+    )
+
+    outcome = port.push(_wires(1))
+
+    assert outcome["content_identities"] == {"docs/0.md": _IDENTITY_A}
+
+
+def test_push_zips_batch_content_identities_in_send_order() -> None:
+    """The legacy ``items[]`` batch answers with parallel
+    ``source_doc_ids`` / ``content_identities`` arrays in send order; the
+    adapter pairs each entry with the ``source_ref`` of the item that
+    produced it."""
+    port = _ScriptedPushPort(
+        scripted_response=_business_envelope(
+            {
+                "chunk_ids": ["chunk-a", "chunk-b", "chunk-c"],
+                "source_doc_ids": ["doc-0", "doc-1", "doc-2"],
+                "content_identities": [_IDENTITY_A, _IDENTITY_B, _IDENTITY_C],
+            }
+        )
+    )
+
+    outcome = port.push(_wires(3))
+
+    assert outcome["content_identities"] == {
+        "docs/0.md": _IDENTITY_A,
+        "docs/1.md": _IDENTITY_B,
+        "docs/2.md": _IDENTITY_C,
+    }
+
+
+def test_push_batch_content_identities_follow_sent_item_order_not_response_order(
+) -> None:
+    """The zip is against what fin SENT, so a multi-chunk batch still
+    attributes one identity per 资料."""
+    specs = [
+        ("docs/a.md", ["alpha ", "beta"]),
+        ("docs/b.md", ["gamma"]),
+        ("docs/c.md", ["delta ", "epsilon ", "zeta"]),
+    ]
+    port = _ScriptedPushPort(
+        scripted_response=_business_envelope(
+            {
+                "chunk_ids": [f"chunk-{i}" for i in range(6)],
+                "source_doc_ids": ["doc-a", "doc-b", "doc-c"],
+                "content_identities": [_IDENTITY_A, _IDENTITY_B, _IDENTITY_C],
+            }
+        )
+    )
+
+    outcome = port.push(_multi_chunk_wires(specs))
+
+    assert outcome["content_identities"] == {
+        "docs/a.md": _IDENTITY_A,
+        "docs/b.md": _IDENTITY_B,
+        "docs/c.md": _IDENTITY_C,
+    }
+
+
+def test_push_reports_no_content_identity_when_the_service_omits_it() -> None:
+    """An iknow build that predates the identity response is still a
+    successful write: the adapter answers "no identity known" rather
+    than inventing one fin could later hand to ``submit_index_job``."""
+    port = _ScriptedPushPort(scripted_response=_success_envelope(["chunk-a"]))
+
+    assert port.push(_wires(1))["content_identities"] == {}
+
+
+def test_push_replay_still_reports_the_stored_content_identity() -> None:
+    """An idempotent re-push echoes the stored identity, so a caller that
+    resolves the pair from the response gets the same value twice."""
+
+    class _EchoIdentity(_ChunkCountingPushPort):
+        """Answers every call with the one identity the service says it
+        stored for each 资料, so a replay reads the same pairs twice."""
+
+        async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
+            refs = [item["source_ref"] for item in _items_of(payload)]
+            return _business_envelope(
+                {
+                    "chunk_ids": [f"chunk-{i}" for i in range(len(refs))],
+                    "source_doc_ids": [f"doc-{i}" for i in range(len(refs))],
+                    "content_identities": [_IDENTITY_A] * len(refs),
+                }
+            )
+
+    port = _EchoIdentity()
+    envelopes = _wires(2)
+
+    assert port.push(envelopes)["content_identities"] == {
+        "docs/0.md": _IDENTITY_A,
+        "docs/1.md": _IDENTITY_A,
+    }
+    assert port.push(envelopes)["content_identities"] == {
+        "docs/0.md": _IDENTITY_A,
+        "docs/1.md": _IDENTITY_A,
+    }
+
+
+@pytest.mark.parametrize(
+    "business",
+    [
+        pytest.param({"content_identity": 42}, id="scalar-not-a-string"),
+        pytest.param({"content_identity": ""}, id="scalar-blank"),
+        pytest.param({"content_identities": "abc"}, id="list-not-a-list"),
+        pytest.param({"content_identities": []}, id="list-empty"),
+        pytest.param({"content_identities": [_IDENTITY_A]}, id="list-too-short"),
+        pytest.param(
+            {
+                "content_identities": [
+                    _IDENTITY_A,
+                    _IDENTITY_B,
+                    _IDENTITY_C,
+                    _IDENTITY_D,
+                ]
+            },
+            id="list-too-long",
+        ),
+        pytest.param(
+            {"content_identities": [_IDENTITY_A, _IDENTITY_B, 7]},
+            id="list-stray-non-string",
+        ),
+        pytest.param(
+            {"content_identities": {_IDENTITY_A: "docs/0.md"}},
+            id="list-keyed-the-wrong-way-round",
+        ),
+        pytest.param(
+            {"content_identity": _IDENTITY_A, "content_identities": [_IDENTITY_A]},
+            id="both-forms-at-once",
+        ),
+        pytest.param(
+            {"content_identity": _IDENTITY_A}, id="scalar-for-a-multi-doc-batch"
+        ),
+    ],
+)
+def test_push_off_contract_content_identity_is_a_named_protocol_failure(
+    business: dict[str, Any],
+) -> None:
+    """A misaligned or malformed identity is refused by name — never
+    guessed at, and never published as a pair the service does not hold."""
+    port = _ScriptedPushPort(
+        scripted_response=_business_envelope(
+            {
+                "chunk_ids": ["chunk-a", "chunk-b", "chunk-c"],
+                **business,
+            }
+        )
+    )
+
+    with pytest.raises(PushProtocolError) as excinfo:
+        port.push(_wires(3))
+
+    assert excinfo.value.code == "push_protocol_error"
+    assert isinstance(excinfo.value, PushError)
+
+
+def test_push_never_sends_an_identity_field_on_the_wire() -> None:
+    """iknow computes the identity itself and its ``strictObject`` refuses
+    unknown keys, so an identity on the request is a wire-shape bug —
+    pinned here because the response now carries one in the other
+    direction."""
+
+    port = _CapturingPushPort(
+        scripted_response=_business_envelope(
+            {
+                "chunk_ids": ["chunk-a"],
+                "source_doc_id": "doc-1",
+                "content_identity": _IDENTITY_A,
+            }
+        )
+    )
+    port.push(_wires(1))
+
+    items = _items_of(port.payloads[0])
+    assert len(items) == 1
+    for item in items:
+        assert set(item) <= _IKNOW_PUSH_ITEM_KEYS, item
+        assert "content_identity" not in item
+        assert "body_content_id" not in item

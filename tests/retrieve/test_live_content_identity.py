@@ -1,0 +1,574 @@
+"""The content_identity fin reads back is the value iknow actually stored.
+
+The default ``uv run pytest -q`` never runs this file — it is marked
+``mcp`` and ``tests/retrieve/conftest.py`` deselects that mark unless
+``-m mcp`` names it.  The opt-in command::
+
+    uv run pytest -q -m mcp tests/retrieve/test_live_content_identity.py
+
+Spec ``corpus-serve-ingest`` Decision 2 puts the authority for
+``content_identity`` on iknow-memory: the service computes it over the
+whole pushed body, stores it in ``source_documents.content_identity``
+(unique jointly with ``source_ref``), and answers with that STORED value,
+which :meth:`fin.retrieve.mcp_push_port.MCPPushPort.push` exposes as
+``content_identities`` keyed by ``source_ref``.  fin is forbidden from
+treating its own hash as authoritative, so the claim under test is about a
+value only the producing side can supply — the contract fake could merely
+echo itself, and an in-memory store has no ``source_documents`` row to
+check the echo against.  This driver therefore spawns the real stdio
+process and verifies it against real PG:
+
+1. one push of three 资料 answers one 64-hex identity per ``source_ref``,
+   equal to an independently derived oracle value over the WHOLE body —
+   for the multi-child 资料 it must not equal that value over any child;
+2. the row PG holds for that ``source_ref`` carries exactly the identity
+   the adapter exposed — byte for byte;
+3. re-pushing an unchanged body keeps the identity, the chunk ids, and the
+   row counts (the §B1 idempotency baseline on the identity, not just on
+   the ids);
+4. ``submit_index_job`` accepts that ``(source_ref, content_identity)``
+   pair and refuses a wrong one by name, which is the consumer the handoff
+   exists for;
+5. re-pushing the SAME ``source_ref`` with a changed body overwrites in
+   place: the answer, the stored identity, and the stored body all move to
+   the new text, and the pair fin would hand on is a different one.
+
+Everything the assertions read is built inside the module-scoped ``batch``
+fixture rather than at import: 切分 is expensive, its shape guards can fail,
+and neither may happen while pytest merely COLLECTS this file — collection
+of the whole suite imports every module in it, including under the default
+hermetic run that deselects ``mcp``.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import itertools
+import json
+import re
+import uuid
+from dataclasses import dataclass
+from typing import Any, Iterator
+
+import psycopg
+import pytest
+
+from fin.corpus.chunking import split_unit
+from fin.corpus.parsers._common import build_unit
+from fin.corpus.push import (
+    PushEnvelope,
+    deserialize_source_ref,
+    envelope_of_unit,
+)
+
+from live_iknow_support import (
+    IKNOW_PG_URL,
+    IKNOW_ROOT,
+    drop_es_indices,
+    live_iknow,
+)
+
+
+pytestmark = pytest.mark.mcp
+
+_RUN = uuid.uuid4().hex[:10]
+_DOCUMENT_ID = f"CID-{_RUN.upper()}"
+_VERSION = uuid.uuid4().hex + uuid.uuid4().hex
+_CHUNK_INDEX = f"fin_cid_chunks_{_RUN}"
+_ENTITY_INDEX = f"fin_cid_entities_{_RUN}"
+_PG_SCHEMA = f"fin_cid_pg_{_RUN}"
+
+# A content identity is a sha256 hex digest; anything else is not one.
+_IDENTITY_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# iknow's DEFAULT_CONTENT_IDENTITY_VERSIONS. The document-level identity is
+# keyed on these service-owned constants even though the envelope metadata
+# carries fin's own ``parse-2`` / ``params-1`` / ``norm-1`` rule versions —
+# only the per-slice ids honour caller overrides.
+_IDENTITY_VERSIONS = ("normalization-v1", "parse-v1", "parameters-v1")
+
+_SENTENCE = "现金流保持稳健，资本开支按计划推进，管理层维持全年指引不变。"
+
+_BODIES = (
+    "第三季度营业收入创历史新高，毛利率小幅回升。",
+    "研发投入集中于端侧模型，费用率同比持平。",
+    _SENTENCE * 60,  # long enough for 切分 to yield two children
+)
+
+# The changed body the overwrite arm re-pushes. It shares no text with any
+# first-push body, so "the stored value moved" cannot be a coincidence of
+# two 资料 hashing alike, and it is long enough to 切分 so the arm shows
+# the store replaced the old slices instead of appending to them.
+_REVISION_SENTENCE = (
+    "管理层将本季度重新披露的资本回报口径纳入指引，并同步更新分部利润率的定义。"
+)
+_REVISED_BODY = _REVISION_SENTENCE * 60
+
+_REQUEST_IDS = itertools.count(100)
+
+
+def _oracle_content_identity(body: str) -> str:
+    """The expected identity of one pushed body, derived independently.
+
+    Source of the expectation: the producing side's published formula —
+    iknow-memory ``computeContentIdentity`` (``src/tools/ingest.ts``) with
+    ``DEFAULT_CONTENT_IDENTITY_VERSIONS``, recorded in fin's spec
+    ``corpus-serve-ingest`` Decision 2 as
+    ``sha256(JSON([body, "normalization-v1", "parse-v1", "parameters-v1"]))``.
+    It is written from that spec/code fact, NOT read out of the push
+    response, so it can contradict the adapter: an adapter that echoed the
+    wrong field, or hashed the slice instead of the body, fails here rather
+    than passing by restating its own output.
+    """
+    payload = json.dumps(
+        [body, *_IDENTITY_VERSIONS],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _envelopes() -> tuple[PushEnvelope, ...]:
+    """Three 资料 pushed in one batch.
+
+    The first two are single-chunk, the third 切分 into several children.
+    A multi-child 资料 is what makes the body-level claim testable: for a
+    one-slice 资料 the body and its only slice are the same text, so an
+    answer that hashed the slice would be indistinguishable from one that
+    hashed the body.
+
+    Unit-granular ``source_ref`` values come from one per-run document /
+    version, so no other live driver on this cluster can address them.
+    """
+    envelopes: list[PushEnvelope] = []
+    for unit_number, text in enumerate(_BODIES, start=1):
+        unit = build_unit(
+            fmt="txt",
+            source_sha256=_VERSION,
+            document_id=_DOCUMENT_ID,
+            version=_VERSION,
+            unit=unit_number,
+            text=text,
+        )
+        envelope = envelope_of_unit(
+            split_unit(unit, doc_type="narrative"),
+            valid_from="2020-01-01T00:00:00.000Z",
+            valid_until="9999-12-31T23:59:59.999Z",
+        )
+        envelopes.append(envelope)
+
+    assert len(envelopes[0].chunks) == 1 and len(envelopes[1].chunks) == 1, (
+        "the two short 资料 must stay one-slice so the batch shape matches "
+        f"the ticket's per-资料 identity claim: {envelopes[:2]!r}"
+    )
+    multi = envelopes[2]
+    assert len(multi.chunks) >= 2 and all(
+        chunk.content != multi.body for chunk in multi.chunks
+    ), (
+        "the third 资料 must 切分 into children that are each smaller than "
+        "its body, or the body-vs-slice identity check is vacuous: "
+        f"{multi!r}"
+    )
+    return tuple(envelopes)
+
+
+@dataclass(frozen=True)
+class _Batch:
+    """The pushed 资料 and everything their 切分 produced.
+
+    One object owns the maps and the count so no test can pair an envelope
+    with a value derived from a different batch. Built lazily by the
+    ``batch`` fixture — see the module docstring for why import-time
+    construction is the wrong shape for this driver.
+    """
+
+    envelopes: tuple[PushEnvelope, ...]
+
+    @property
+    def bodies_by_source_ref(self) -> dict[str, str]:
+        return {env.source_ref: env.body for env in self.envelopes}
+
+    @property
+    def slices_by_source_ref(self) -> dict[str, tuple[str, ...]]:
+        return {
+            env.source_ref: tuple(chunk.content for chunk in env.chunks)
+            for env in self.envelopes
+        }
+
+    @property
+    def chunk_count(self) -> int:
+        return sum(len(env.chunks) for env in self.envelopes)
+
+    def wire(self) -> list[dict[str, Any]]:
+        return [env.to_wire() for env in self.envelopes]
+
+
+def _revised_envelope(reference: PushEnvelope, new_body: str) -> PushEnvelope:
+    """The very same 资料 reference, re-pushed with a changed body.
+
+    The locator is read back out of the reference's own ``source_ref``
+    instead of being rebuilt from this module's constants, so the arm
+    provably addresses the row the first push created — a look-alike
+    reference would have made it a plain new write.
+    """
+    locator = deserialize_source_ref(reference.source_ref)
+    unit = build_unit(
+        fmt="txt",
+        source_sha256=_VERSION,
+        document_id=locator.document_id,
+        version=locator.version,
+        unit=locator.unit,
+        text=new_body,
+    )
+    return envelope_of_unit(
+        split_unit(unit, doc_type="narrative"),
+        valid_from=reference.valid_from,
+        valid_until=reference.valid_until,
+    )
+
+
+@pytest.fixture(scope="module")
+def batch() -> _Batch:
+    """The three 资料 of this run, 切分 once inside the opt-in mcp run."""
+    return _Batch(_envelopes())
+
+
+def _pg_rows(sql: str, params: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
+    """Direct read of the run's ephemeral schema — the store's own verdict.
+
+    The schema name is this module's generated constant (the same shape
+    ``live_iknow_support`` validates before its DDL), never caller text, so
+    interpolating it into the qualified name is safe and keeps the query
+    pointed at THIS run's tables rather than the cluster's ``public`` ones.
+    """
+    with psycopg.connect(IKNOW_PG_URL, autocommit=True) as connection:
+        return list(connection.execute(sql, params).fetchall())
+
+
+def _call_tool(
+    live: Any, name: str, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """One raw ``tools/call`` on the session, parsed from its text block.
+
+    The index-job pair has no fin port yet, so the handoff is exercised on
+    the transport the ports use — same process, same connection, same
+    store the push wrote to.
+    """
+    response = live.session.call(
+        {
+            "jsonrpc": "2.0",
+            "id": next(_REQUEST_IDS),
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        },
+        20.0,
+    )
+    if "error" in response:
+        raise AssertionError(f"{name} returned a JSON-RPC error: {response!r}")
+    blocks = response["result"]["content"]
+    return json.loads(blocks[0]["text"])
+
+
+@pytest.fixture(scope="module")
+def live() -> Iterator[Any]:
+    """One real iknow subprocess on real PG + ES + Neo4j for the whole module.
+
+    The PG branch is what makes the stored-row comparison checkable at all;
+    the schema and indices are fin-owned, per-run unique, dropped at teardown.
+    """
+    entry = IKNOW_ROOT / "dist" / "index.js"
+    if not entry.is_file():
+        pytest.skip(
+            f"{entry} is missing; run `npm run build` in {IKNOW_ROOT} "
+            "to exercise the live content_identity handoff"
+        )
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        with live_iknow(
+            monkeypatch,
+            storage="pg_es",
+            es_chunk_index=_CHUNK_INDEX,
+            es_entity_index=_ENTITY_INDEX,
+            pg_schema=_PG_SCHEMA,
+        ) as session:
+            yield session
+    finally:
+        monkeypatch.undo()
+        drop_es_indices(_CHUNK_INDEX, _ENTITY_INDEX)
+
+
+@pytest.fixture(scope="module")
+def pushed(live: Any, batch: _Batch) -> dict[str, Any]:
+    """The one batch push both identity assertions read, and no more."""
+    outcome = live.push.push(batch.wire())
+    assert outcome["written"] == batch.chunk_count, outcome
+    assert outcome["duplicates"] == 0, outcome
+    return outcome
+
+
+def test_push_answers_one_oracle_identity_per_pushed_source_ref(
+    pushed: dict[str, Any], batch: _Batch
+) -> None:
+    """Spec Decision 2: the identities are 64-hex, per 资料, and oracle-equal.
+
+    A batch answers ``content_identities[]`` in send order, so this also
+    pins the attribution: a value present but paired with the wrong
+    ``source_ref`` fails the per-key equality below.
+    """
+    identities = pushed["content_identities"]
+    assert set(identities) == set(batch.bodies_by_source_ref), (
+        "the identities fin exposes are not attributed to exactly the "
+        f"资料 fin pushed: {sorted(identities)!r}"
+    )
+    for source_ref, identity in identities.items():
+        assert _IDENTITY_RE.match(identity), (
+            f"content_identity for {source_ref} is not a 64-hex sha256 "
+            f"digest: {identity!r}"
+        )
+        assert identity == _oracle_content_identity(
+            batch.bodies_by_source_ref[source_ref]
+        ), (
+            f"the identity exposed for {source_ref} is not the value the "
+            "producing side's formula gives for that body"
+        )
+        for slice_text in batch.slices_by_source_ref[source_ref]:
+            if slice_text == batch.bodies_by_source_ref[source_ref]:
+                continue
+            assert identity != _oracle_content_identity(slice_text), (
+                f"the identity for {source_ref} is the hash of one of its "
+                "children, not of the whole body — the document-level "
+                "identity and the per-slice one have been confused"
+            )
+
+
+def test_stored_pg_identity_equals_the_identity_fin_exposes(
+    pushed: dict[str, Any], batch: _Batch
+) -> None:
+    """The stored value is the authority fin hands on, byte for byte.
+
+    This is the end-to-end evidence the fake port cannot supply — the row
+    PG actually holds must carry the string the adapter handed on, and must
+    hold it for the body that was pushed (so the oracle comparison above is
+    about the bytes sent, not about a service-side rewrite of them).
+    """
+    rows = _pg_rows(
+        f"SELECT source_ref, content_identity, content "
+        f"FROM {_PG_SCHEMA}.source_documents ORDER BY source_ref"
+    )
+    assert len(rows) == len(batch.envelopes), (
+        f"expected one 资料 row per pushed envelope, got {len(rows)}: {rows!r}"
+    )
+    stored = {source_ref: identity for source_ref, identity, _ in rows}
+    assert stored == dict(pushed["content_identities"]), (
+        "the identity the adapter exposed is not what PG stores beside "
+        "the same source_ref"
+    )
+    for source_ref, _, content in rows:
+        assert content == batch.bodies_by_source_ref[source_ref], (
+            f"PG holds a body other than the one pushed for {source_ref}; "
+            "the identity comparison above would then be about a text this "
+            "driver never hashed"
+        )
+
+
+def test_repushing_an_unchanged_body_reuses_the_stored_identity(
+    live: Any, pushed: dict[str, Any], batch: _Batch
+) -> None:
+    """An unchanged re-push keeps the identity, the ids, and the row count."""
+    before_docs = _pg_rows(
+        f"SELECT count(*) FROM {_PG_SCHEMA}.source_documents"
+    )[0][0]
+    before_chunks = _pg_rows(
+        f"SELECT count(*) FROM {_PG_SCHEMA}.chunks"
+    )[0][0]
+
+    again = live.push.push(batch.wire())
+
+    assert again["content_identities"] == pushed["content_identities"], (
+        "an unchanged re-push answered a different identity for the same "
+        "source_ref; the pair fin hands submit_index_job would not match "
+        "the stored row"
+    )
+    assert again["block_ids"] == pushed["block_ids"], again
+    assert (
+        again["written"] == 0 and again["duplicates"] == batch.chunk_count
+    ), again
+    assert _pg_rows(
+        f"SELECT count(*) FROM {_PG_SCHEMA}.source_documents"
+    )[0][0] == before_docs
+    assert _pg_rows(
+        f"SELECT count(*) FROM {_PG_SCHEMA}.chunks"
+    )[0][0] == before_chunks
+    stored = dict(
+        _pg_rows(
+            f"SELECT source_ref, content_identity "
+            f"FROM {_PG_SCHEMA}.source_documents"
+        )
+    )
+    assert stored == dict(pushed["content_identities"])
+
+
+def test_submit_index_job_takes_the_pushed_pair_and_refuses_a_wrong_identity(
+    live: Any, pushed: dict[str, Any], batch: _Batch
+) -> None:
+    """``submit_index_job`` is the consumer that validates the handed-off pair.
+
+    The accepted submit is the point of exposing the stored identity; the
+    mismatching control is what makes the acceptance non-vacuous — a tool
+    that ignored ``content_identity`` would accept both calls, and the
+    wrong pair is the failure mode fin's no-recompute rule exists to stop.
+    """
+    source_ref = batch.envelopes[0].source_ref
+    identity = pushed["content_identities"][source_ref]
+
+    accepted = _call_tool(
+        live,
+        "submit_index_job",
+        {"source_ref": source_ref, "content_identity": identity},
+    )
+    assert accepted.get("error") != "index_job_identity_mismatch", accepted
+    assert accepted["source_ref"] == source_ref, accepted
+    assert accepted["content_identity"] == identity, accepted
+    assert accepted["status"] == "in_progress", accepted
+    job_id = accepted["job_id"]
+
+    joined = _call_tool(
+        live,
+        "submit_index_job",
+        {"source_ref": source_ref, "content_identity": identity},
+    )
+    assert joined["job_id"] == job_id and joined["reused"] is True, joined
+
+    refused = _call_tool(
+        live,
+        "submit_index_job",
+        {"source_ref": source_ref, "content_identity": "0" * 64},
+    )
+    assert refused.get("error") == "index_job_identity_mismatch", refused
+
+
+def test_repushing_a_changed_body_overwrites_the_stored_identity(
+    live: Any, pushed: dict[str, Any], batch: _Batch
+) -> None:
+    """A changed re-push moves the pair — 覆盖更新, in the answer and the row.
+
+    ``source_ref`` is UNIQUE in iknow's ``source_documents`` and the write
+    is ``ON CONFLICT (source_ref) DO UPDATE SET content = EXCLUDED.content,
+    content_identity = EXCLUDED.content_identity``, so after a revision the
+    pair fin hands ``submit_index_job`` is a DIFFERENT one. No other arm in
+    this module can show that: the unchanged re-push proves the value is
+    stable, and only this one proves it tracks the body it was computed
+    over.  Last in the file on purpose — it rewrites state every earlier
+    arm reads, and the precondition below turns an out-of-order run into a
+    named failure rather than a measurement against a store this driver no
+    longer filled.
+    """
+    target = batch.envelopes[0]
+    source_ref = target.source_ref
+    stale_identity = pushed["content_identities"][source_ref]
+    assert dict(
+        _pg_rows(
+            f"SELECT source_ref, content_identity "
+            f"FROM {_PG_SCHEMA}.source_documents"
+        )
+    )[source_ref] == stale_identity, (
+        "PG no longer holds the first push's identity for this source_ref; "
+        "another arm overwrote it before this one could measure it"
+    )
+
+    revised = _revised_envelope(target, _REVISED_BODY)
+    assert revised.source_ref == source_ref, (
+        "the revision does not carry the first push's source_ref, so "
+        "re-pushing it would be a new write and prove nothing about "
+        "overwriting an existing 资料"
+    )
+    assert revised.body != target.body, (
+        "the freeze turned the revision back into the body already pushed; "
+        "the write below would then be an unchanged re-push"
+    )
+    assert revised.body not in batch.bodies_by_source_ref.values(), (
+        "the revision duplicates another 资料's body, so a moved identity "
+        "could be coincidence instead of this body's own value"
+    )
+    revised_slices = tuple(chunk.content for chunk in revised.chunks)
+    # The first push gave this 资料 exactly one slice, so a revision that
+    # 切分 into several is what makes replaced-vs-appended slices countable.
+    assert len(revised_slices) >= 2, (
+        f"the revision collapsed to {len(revised_slices)} slice(s); the "
+        "chunk-count claim below would then pass for an append as well "
+        "as for an overwrite"
+    )
+
+    outcome = live.push.push([revised.to_wire()])
+
+    identities = outcome["content_identities"]
+    assert set(identities) == {source_ref}, (
+        "a one-资料 re-push answered identities for 资料 this call did not "
+        f"send: {sorted(identities)!r}"
+    )
+    new_identity = identities[source_ref]
+    assert _IDENTITY_RE.match(new_identity), new_identity
+    assert new_identity == _oracle_content_identity(revised.body), (
+        f"after a changed re-push {source_ref} answers with an identity "
+        "that is not the producing side's formula over the NEW body — the "
+        "answer still reflects the superseded text"
+    )
+    assert (source_ref, new_identity) != (source_ref, stale_identity), (
+        "the pair fin would hand submit_index_job did not move when the "
+        "body did; the stored value was not overwritten"
+    )
+    for slice_text in revised_slices:
+        if slice_text == revised.body:
+            continue
+        assert new_identity != _oracle_content_identity(slice_text), (
+            "the rewritten document-level identity is the hash of one of "
+            "the new body's children rather than of that body"
+        )
+    assert (
+        outcome["written"] == len(revised.chunks)
+        and outcome["duplicates"] == 0
+    ), (
+        "the store did not take the revision's slices as writes; the "
+        f"identity move would then be an echo: {outcome!r}"
+    )
+
+    rows = {
+        row_ref: (identity, content)
+        for row_ref, identity, content in _pg_rows(
+            f"SELECT source_ref, content_identity, content "
+            f"FROM {_PG_SCHEMA}.source_documents"
+        )
+    }
+    assert len(rows) == len(batch.envelopes), (
+        "a changed re-push must update the row its source_ref already "
+        f"owns, not add a second 资料 row: {sorted(rows)!r}"
+    )
+    assert rows[source_ref] == (
+        _oracle_content_identity(revised.body),
+        revised.body,
+    ), (
+        f"the row for {source_ref} does not hold the new body beside the "
+        "identity that hashes it — content and content_identity moved "
+        "apart, so the pair is only half-updated"
+    )
+    for untouched_ref, untouched_body in batch.bodies_by_source_ref.items():
+        if untouched_ref == source_ref:
+            continue
+        assert rows[untouched_ref] == (
+            _oracle_content_identity(untouched_body),
+            untouched_body,
+        ), (
+            f"overwriting {source_ref} also rewrote {untouched_ref}; the "
+            "pair for an untouched 资料 must survive it"
+        )
+
+    expected_chunks = (
+        batch.chunk_count - len(target.chunks) + len(revised.chunks)
+    )
+    assert _pg_rows(f"SELECT count(*) FROM {_PG_SCHEMA}.chunks")[0][0] == (
+        expected_chunks
+    ), (
+        "the superseded slices are still stored beside the new ones — the "
+        f"run should hold {expected_chunks} chunk rows after 覆盖更新, not "
+        "the old and the new at once"
+    )
