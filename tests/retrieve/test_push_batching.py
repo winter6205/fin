@@ -32,6 +32,7 @@ from types import MappingProxyType
 from fin.corpus.push import PushRecord, unit_push_records
 from fin.retrieve.fake_push_port import FakePushPort
 from fin.retrieve.push_batching import (
+    BatchedPushOutcome,
     PushJournal,
     PushJournalUnwritableError,
     expected_block_total,
@@ -44,6 +45,7 @@ from fin.retrieve.push_port import (
     PushBatchOverflowError,
     PushBatchSizeInvalidError,
     PushError,
+    PushProtocolError,
 )
 
 DOCUMENT_ID = "TEST-2024Q2"
@@ -586,3 +588,119 @@ def test_coerce_rejects_items_that_are_neither_envelope_nor_record() -> None:
             body_content_id="c0",
         )]
     )[0].envelopes[0].body_content_id == "c0"
+
+
+# ---------------------------------------------------------------------------
+# T4 handoff: the batched run merges the identities each batch reported
+# ---------------------------------------------------------------------------
+
+
+class _IdentityAnsweringPort:
+    """A `PushPort` that answers every batch with one identity per
+    envelope, in send order — the legacy ``items[]`` response shape.
+
+    ``identities`` maps a batch position to the hex value the "service"
+    claims for it, which is how a test scripts two batches contradicting
+    each other about one `source_ref`.
+    """
+
+    def __init__(self, identities: Mapping[str, str]) -> None:
+        self.identities = dict(identities)
+        self.calls = 0
+
+    def push(self, records: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+        self.calls += 1
+        refs = [str(record["source_ref"]) for record in records]
+        return {
+            "block_ids": [f"block-{self.calls}-{index}" for index in refs],
+            "written": len(refs),
+            "duplicates": 0,
+            "content_identities": [self.identities[ref] for ref in refs],
+        }
+
+
+class _ContradictingIdentityPort:
+    """Answers the same `source_ref` with a different identity per call."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def push(self, records: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+        self.calls += 1
+        refs = [str(record["source_ref"]) for record in records]
+        return {
+            "block_ids": [f"block-{index}" for index in refs],
+            "written": len(refs),
+            "duplicates": 0,
+            "content_identities": [
+                format(self.calls, "064x") for _ in refs
+            ],
+        }
+
+
+def test_batched_run_merges_the_identity_of_every_batch() -> None:
+    """One `source_ref` → one identity, across every batch the run pushed;
+    ``submit_index_job`` is fed the pair the service actually stored."""
+    records = _records(units=4, sentences=2)
+    port = _IdentityAnsweringPort(
+        {record.source_ref: format(index, "064x") for index, record in enumerate(records, start=1)}
+    )
+
+    outcome = push_in_batches(
+        port, records, journal=PushJournal(), batch_size=1
+    )
+
+    assert outcome.batches_pushed == len(records)
+    assert dict(outcome.content_identities) == port.identities
+
+
+def test_batched_run_reports_no_identity_when_no_batch_does() -> None:
+    """A service that answers without the identity field batches cleanly
+    and merges to an empty map — never a guessed one."""
+
+    class _LegacyPort:
+        def push(self, records):
+            refs = [str(record["source_ref"]) for record in records]
+            return {
+                "block_ids": list(refs),
+                "written": len(refs),
+                "duplicates": 0,
+            }
+
+    records = _records(units=2, sentences=2)
+
+    outcome = push_in_batches(
+        _LegacyPort(), records, journal=PushJournal(), batch_size=1
+    )
+
+    assert outcome.batches_pushed == len(records)
+    assert outcome.content_identities == {}
+
+
+def test_a_batched_run_without_identities_defaults_to_empty() -> None:
+    assert BatchedPushOutcome(
+        batches_planned=0,
+        batches_pushed=0,
+        batches_skipped=0,
+        written=0,
+        duplicates=0,
+        block_ids=(),
+    ).content_identities == {}
+
+
+def test_batches_disagreeing_on_one_source_ref_are_a_named_failure() -> None:
+    """Two batches claiming different identities for the same `source_ref`
+    is an off-contract answer: merging would publish whichever happened
+    to land last, and the durable index job would be keyed on a value the
+    service does not hold."""
+    port = _ContradictingIdentityPort()
+    records = [
+        _degenerate_record(block_id="b1", source_ref="docs/x.md", content_id="c1", text="one"),
+        _degenerate_record(block_id="b2", source_ref="docs/x.md", content_id="c2", text="two"),
+    ]
+
+    with pytest.raises(PushProtocolError) as excinfo:
+        push_in_batches(port, records, journal=PushJournal(), batch_size=1)
+
+    assert excinfo.value.code == "push_protocol_error"
+    assert port.calls == 2

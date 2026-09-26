@@ -68,6 +68,7 @@ from fin.retrieve.push_port import (
     PushMetadataIncompleteError,
     PushProtocolError,
     PushServiceUnavailableError,
+    content_identities_of,
     validate_batch_not_empty,
     validate_envelope_chunks,
     validate_wire_record,
@@ -362,6 +363,26 @@ def _chunk_ids_of(envelope: dict[str, Any], *, chunk_count: int) -> tuple[str, .
     return tuple(chunk_ids)
 
 
+def _wire_content_identities_of(
+    envelope: dict[str, Any], *, source_refs: Sequence[str]
+) -> dict[str, str]:
+    """Pair one ``push`` answer's identities with the ``source_ref``
+    values fin sent.
+
+    :func:`fin.retrieve.push_port.content_identities_of` also accepts an
+    already-keyed mapping, because that is the shape this adapter hands
+    to its own caller. The service never answers that way, so an object
+    under ``content_identities`` is either inverted or invented —
+    refused here rather than read as a pair.
+    """
+    if isinstance(envelope.get("content_identities"), Mapping):
+        raise PushProtocolError(
+            "push response content_identities is an object; the wire shape "
+            "is one identity per 资料, in send order"
+        )
+    return content_identities_of(envelope, source_refs=source_refs)
+
+
 # ----- port -----
 
 
@@ -441,6 +462,12 @@ class MCPPushPort:
         ``_seen_keys`` ledger keys on the envelope-level idempotency
         pair, not on chunk ids, so a multi-chunk envelope is one
         idempotency row.
+
+        ``content_identities`` maps each sent ``source_ref`` to the
+        ``content_identity`` the service says it stored beside it — the
+        only value fin may later pair with that `source_ref` at
+        ``submit_index_job``. A service that reports none yields an empty
+        mapping; this adapter never substitutes its own hash.
         """
         ledger = self.input_validation_failures
         validate_batch_not_empty(envelopes, ledger=ledger)
@@ -473,6 +500,10 @@ class MCPPushPort:
             len(item.get("chunks") or []) for item in items
         )
         chunk_ids = _chunk_ids_of(envelope, chunk_count=chunk_count)
+        content_identities = _wire_content_identities_of(
+            envelope,
+            source_refs=[str(wire["source_ref"]) for wire in envelopes],
+        )
 
         written, duplicates = 0, 0
         for wire in envelopes:
@@ -497,6 +528,7 @@ class MCPPushPort:
             "block_ids": list(chunk_ids),
             "written": written,
             "duplicates": duplicates,
+            "content_identities": content_identities,
         }
 
     # ----- helpers -----

@@ -1088,3 +1088,56 @@ def test_job_status_reads_the_version_from_the_durable_pointer() -> None:
     assert stack.endpoint.job_status("DOC-1").version == (
         _pointer_of(stack.pointers, "DOC-1").sha256
     )
+
+
+# ----- T4 handoff: the ingest result carries the service's per-source identity --
+
+
+def _iknow_content_identity(body: str) -> str:
+    """Restatement of the remote algorithm (iknow ``computeContentIdentity``)
+    used as an independent oracle: the endpoint must pass through what the
+    service reported, neither dropping it nor substituting fin's own hash."""
+    payload = json.dumps(
+        [body, "normalization-v1", "parse-v1", "parameters-v1"],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def test_result_carries_the_content_identity_of_every_pushed_source() -> None:
+    fake = FakePushPort()
+    endpoint = _endpoint(fake)
+
+    result = endpoint.ingest(
+        _MD_SAMPLE.read_bytes(),
+        filename="AAPL-2022Q3__table_dense__md__md.md",
+        company="AAPL",
+        period="2022Q3",
+    )
+
+    assert set(result.content_identities) == {
+        record.source_ref for record in result.records
+    }
+    for block_id in result.block_ids:
+        stored = fake.recall(block_id)
+        assert (
+            result.content_identities[stored["source_ref"]]
+            == _iknow_content_identity(stored["body"])
+        )
+
+
+def test_reingesting_the_same_bytes_reports_the_same_identities() -> None:
+    """``submit_index_job`` is keyed on the pair, so a replay that wrote
+    nothing must still hand back the identity of the stored row."""
+    fake = FakePushPort()
+    endpoint = _endpoint(fake)
+    first = endpoint.ingest(
+        _V1_TEXT, document_id="DOC-1", declared_format="txt"
+    )
+    second = endpoint.ingest(
+        _V1_TEXT, document_id="DOC-1", declared_format="txt"
+    )
+
+    assert second.written == 0
+    assert second.content_identities == first.content_identities

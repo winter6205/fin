@@ -17,6 +17,11 @@ What the fake guarantees (spec `operator-console-host-contract`, T1)
 * **idempotency** — the store is keyed on the envelope's
   ``(source_ref, body content identity)`` pair; a repeat push returns
   the stored block ids and writes nothing;
+* **the identity the service owns** — the answer carries a
+  ``content_identity`` for a one-资料 batch or a send-order
+  ``content_identities`` sequence for a larger one, each computed the
+  way iknow-memory computes it, so fin's read-back path has something
+  to read without the service running;
 * **envelope-shape invariants** — ``source_ref`` non-empty, body
   non-empty, ``chunks`` non-empty with monotonic ``index`` from 0,
   every chunk content a contiguous substring of the body;
@@ -93,6 +98,36 @@ from fin.retrieve.push_port import (
 # interval sets ``valid_to`` to this same value, making the half-open
 # interval empty — no query instant can fall inside it.
 VALID_FROM: Final[int] = 0
+
+
+def _stored_content_identity(envelope: Mapping[str, Any]) -> str:
+    """The ``content_identity`` the real service would have computed for
+    one envelope's body.
+
+    This is deliberately NOT :func:`fin.corpus.push.body_content_id`.
+    iknow-memory owns that value: it hashes the body together with three
+    **service-owned** version strings
+    (``sha256(JSON([body, "normalization-v1", "parse-v1",
+    "parameters-v1"]))``, ``src/tools/ingest.ts``
+    ``computeContentIdentity``) and stores it beside the `source_ref`.
+    The fake mirrors that semantics so the seam can be exercised offline
+    without teaching fin to derive an identity it is only ever supposed
+    to read back.
+    """
+    body = envelope.get("content")
+    if body is None:
+        body = envelope.get("body")
+    payload = json.dumps(
+        [
+            "" if body is None else str(body),
+            "normalization-v1",
+            "parse-v1",
+            "parameters-v1",
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _fake_chunk_id(source_ref: str, chunk: Mapping[str, Any]) -> str:
@@ -252,7 +287,25 @@ class FakePushPort:
             "block_ids": block_ids,
             "written": written,
             "duplicates": duplicates,
+            **self._identity_fields(envelopes),
         }
+
+    @staticmethod
+    def _identity_fields(
+        envelopes: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """The identity half of the answer, in the shape the real service
+        uses: one 资料 reports a scalar ``content_identity``, a batch
+        reports a ``content_identities`` sequence in send order.
+        """
+        identities: dict[str, str] = {}
+        for envelope in envelopes:
+            identities.setdefault(
+                str(envelope["source_ref"]), _stored_content_identity(envelope)
+            )
+        if len(identities) == 1:
+            return {"content_identity": next(iter(identities.values()))}
+        return {"content_identities": list(identities.values())}
 
     # ----- push helpers (each step of one push call) -----
 

@@ -39,6 +39,7 @@ from fin.retrieve.push_port import (
     PushEmptyDocumentError,
     PushError,
     PushMetadataIncompleteError,
+    PushOutcome,
     PushProtocolError,
     PushServiceUnavailableError,
     UnknownPushedBlockError,
@@ -436,3 +437,138 @@ def test_a_push_with_nothing_new_to_write_is_a_success_not_a_failure() -> None:
     assert replay.written == 0
     assert replay.duplicates == len(records)
     assert len(replay.block_ids) == len(records)
+
+
+# ---------------------------------------------------------------------------
+# T4 handoff: the ``content_identity`` the service stored survives the seam
+# ---------------------------------------------------------------------------
+
+_REF_A = '{"document_id":"T-2025Q3","version":"c","unit":1}'
+_REF_B = '{"document_id":"T-2025Q3","version":"c","unit":2}'
+_IDENTITY_A = "1" * 64
+_IDENTITY_B = "2" * 64
+
+
+def _wire(source_ref: str, body: str) -> dict[str, Any]:
+    """The smallest envelope the push shim forwards unchanged."""
+    return {
+        "source_ref": source_ref,
+        "body": body,
+        "chunks": [{"index": 0, "content": body}],
+        "metadata": {"fmt": "txt"},
+    }
+
+
+class _AnsweringPushPort:
+    """A `PushPort` that answers one fixed response dict."""
+
+    def __init__(self, response: Mapping[str, Any]) -> None:
+        self.response = response
+        self.calls = 0
+
+    def push(self, records: Sequence[Mapping[str, Any]]) -> Mapping[str, Any]:
+        self.calls += 1
+        return self.response
+
+
+def test_outcome_carries_a_single_document_content_identity() -> None:
+    port = _AnsweringPushPort(
+        {
+            "block_ids": ["b0"],
+            "written": 1,
+            "duplicates": 0,
+            "content_identity": _IDENTITY_A,
+        }
+    )
+
+    outcome = push_records(port, [_wire(_REF_A, "alpha")])
+
+    assert outcome.content_identities == {_REF_A: _IDENTITY_A}
+
+
+def test_outcome_carries_batch_content_identities_in_send_order() -> None:
+    port = _AnsweringPushPort(
+        {
+            "block_ids": ["b0", "b1"],
+            "written": 2,
+            "duplicates": 0,
+            "content_identities": [_IDENTITY_A, _IDENTITY_B],
+        }
+    )
+
+    outcome = push_records(
+        port, [_wire(_REF_A, "alpha"), _wire(_REF_B, "beta")]
+    )
+
+    assert outcome.content_identities == {_REF_A: _IDENTITY_A, _REF_B: _IDENTITY_B}
+
+
+def test_outcome_content_identities_are_empty_for_an_identity_less_response() -> None:
+    """A response that predates the identity field is still on-contract for
+    the write; the caller then simply has no identity to hand on."""
+    port = _AnsweringPushPort(
+        {"block_ids": ["b0"], "written": 1, "duplicates": 0}
+    )
+
+    assert push_records(port, [_wire(_REF_A, "alpha")]).content_identities == {}
+
+
+def test_push_outcome_without_the_identity_field_still_constructs() -> None:
+    """Call sites written before the identity handoff keep working: the new
+    field defaults to empty rather than becoming a required argument."""
+    outcome = PushOutcome(block_ids=("b0",), written=1, duplicates=0)
+
+    assert outcome.content_identities == {}
+
+
+@pytest.mark.parametrize(
+    "identity_fields",
+    [
+        pytest.param(
+            {"content_identity": _IDENTITY_A}, id="scalar-for-a-two-doc-batch"
+        ),
+        pytest.param({"content_identity": 7}, id="scalar-not-a-string"),
+        pytest.param(
+            {"content_identities": "abc"}, id="identities-not-a-sequence"
+        ),
+        pytest.param({"content_identities": [_IDENTITY_A]}, id="too-few"),
+        pytest.param(
+            {"content_identities": [_IDENTITY_A, _IDENTITY_B, _IDENTITY_A]},
+            id="too-many",
+        ),
+        pytest.param(
+            {"content_identities": [_IDENTITY_A, None]}, id="stray-non-string"
+        ),
+        pytest.param(
+            {"content_identities": {_REF_A: _IDENTITY_A, _REF_B: 9}},
+            id="keyed-with-a-non-string-identity",
+        ),
+        pytest.param(
+            {
+                "content_identity": _IDENTITY_A,
+                "content_identities": [_IDENTITY_A, _IDENTITY_B],
+            },
+            id="both-forms-at-once",
+        ),
+    ],
+)
+def test_off_contract_identity_fields_are_a_named_protocol_failure(
+    identity_fields: Mapping[str, Any],
+) -> None:
+    """An identity fin cannot attribute to exactly one pushed 资料 is
+    refused by name — publishing a guessed pair would send a wrong value
+    to ``submit_index_job``."""
+    port = MalformedResponsePushPort(
+        {
+            "block_ids": ["b0", "b1"],
+            "written": 2,
+            "duplicates": 0,
+            **identity_fields,
+        }
+    )
+
+    with pytest.raises(PushProtocolError) as excinfo:
+        push_records(port, [_wire(_REF_A, "alpha"), _wire(_REF_B, "beta")])
+
+    assert excinfo.value.code == "push_protocol_error"
+    assert isinstance(excinfo.value, PushError)

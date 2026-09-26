@@ -68,9 +68,9 @@ shape).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Final, Sequence
+from typing import Final, Mapping, Sequence
 
 from fin.corpus.push import (
     PushEnvelope,
@@ -87,6 +87,7 @@ from fin.retrieve.push_port import (
     PushBatchSizeInvalidError,
     PushError,
     PushPort,
+    PushProtocolError,
     push_envelopes,
     validate_batch_not_empty,
 )
@@ -150,6 +151,11 @@ class BatchedPushOutcome:
     ``block_ids`` covers the batches this run pushed, in envelope
     order; skipped batches contribute none (their ids were returned by
     the run that completed them).
+
+    ``content_identities`` is the merge of every pushed batch's
+    ``source_ref`` → service-reported ``content_identity``, which is the
+    pair form the index-job handoff needs. A skipped batch contributes
+    nothing: its identity came back with the run that completed it.
     """
 
     batches_planned: int
@@ -158,6 +164,7 @@ class BatchedPushOutcome:
     written: int
     duplicates: int
     block_ids: tuple[str, ...]
+    content_identities: Mapping[str, str] = field(default_factory=dict)
 
 
 class PushJournalUnwritableError(PushError):
@@ -453,16 +460,27 @@ def push_in_batches(
     :class:`PushRecord` rows (the per-child record the invalidation
     path still keys on); the latter are coerced into envelopes here so
     legacy callers don't break.
+
+    The identities each batch's response reported are merged into the
+    run's ``content_identities``; two batches contradicting each other
+    about one `source_ref` is refused as :class:`PushProtocolError`.
     """
     validate_batch_not_empty(items, ledger=input_validation_ledger)
     plans = plan_batches(items, batch_size=batch_size)
     pushed = skipped = written = duplicates = 0
     block_ids: list[str] = []
+    content_identities: dict[str, str] = {}
     for plan in plans:
         if journal.is_completed(plan.key):
             skipped += 1
             continue
         outcome = _push_one_batch(port, plan, journal=journal)
+        # Merged before the batch is journaled: a run whose identity map
+        # fin cannot stand behind must not leave progress behind either,
+        # or a replay would complete around the contradiction.
+        _merge_content_identities(
+            content_identities, outcome.content_identities
+        )
         journal.mark_completed(plan)
         pushed += 1
         written += outcome.written
@@ -475,7 +493,28 @@ def push_in_batches(
         written=written,
         duplicates=duplicates,
         block_ids=tuple(block_ids),
+        content_identities=content_identities,
     )
+
+
+def _merge_content_identities(
+    merged: dict[str, str], incoming: Mapping[str, str]
+) -> None:
+    """Fold one batch's ``source_ref`` → identity pairs into the run's map.
+
+    Two batches identifying the same `source_ref` differently is an
+    off-contract answer rather than a choice of preference: whichever
+    value survived, the index-job handoff would carry a pair no row
+    holds. Refused by name, keeping the whole run's map trustworthy.
+    """
+    for source_ref, identity in incoming.items():
+        known = merged.get(source_ref)
+        if known is not None and known != identity:
+            raise PushProtocolError(
+                f"push batches disagree on the content identity of "
+                f"{source_ref!r}: {known} vs {identity}"
+            )
+        merged[source_ref] = identity
 
 
 def _push_one_batch(port: PushPort, plan: BatchPlan, *, journal: PushJournal):
