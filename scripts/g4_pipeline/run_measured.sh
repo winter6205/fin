@@ -122,13 +122,14 @@ driver_keys = (
     "peak_rss_vmhwm_bytes", "cgroup_peak_bytes", "cgroup_memory_max_bytes",
     "cgroup_memory_swap_max_bytes", "cgroup_memory_swap_current_bytes",
     "proc_vmswap_bytes", "oom_kill_events_in_cgroup", "oom_killed",
-    "oom_killed_docker_inspect", "container_exit_code", "docker_run_exit_code",
-    "host_side_cgroup_memory_peak_bytes", "host_side_cgroup_memory_swap_peak_bytes",
-    "total_latency_ms", "render_and_ocr_latency_ms", "docling_whole_doc_latency_ms",
+    "oom_killed_source", "oom_killed_docker_inspect", "container_exit_code",
+    "docker_run_exit_code", "host_side_cgroup_memory_peak_bytes",
+    "host_side_cgroup_memory_swap_peak_bytes", "total_latency_ms", "wall_clock_ms",
+    "render_and_ocr_latency_ms", "docling_whole_doc_latency_ms",
     "page_latency_ms_stats", "regions_total", "pages_needing_ocr",
     "pages_with_ocr_applied", "pages_with_native_text", "native_text_chars_total",
     "ocr_text_chars_total", "docling_error", "docling_status", "docling_page_count",
-    "slice_pass_error", "ceiling")
+    "slice_pass_enabled", "slice_pass_error", "harness_failures", "ceiling")
 # These names also live in driver.py's build_totals, so the mirror is only
 # honest while it is checked: a rename there must fail loudly here rather than
 # summarise a real measurement as null. A failed run has no driver totals at all
@@ -138,7 +139,9 @@ if rec:
     if lost:
         sys.exit("[run] FATAL: driver totals lack " + ", ".join(sorted(lost)))
 file_info = rec.get("file", {}) if rec else {}
-meta = {"pdf": file_info.get("name") or env["G4_PDF"],
+# Basename, never the path given to the harness: this summary is committed, and
+# the caller's absolute host path is a fact about this machine, not the run.
+meta = {"pdf": file_info.get("name") or os.path.basename(env["G4_PDF"]),
         "pdf_bytes": file_info.get("bytes"),
         "pdf_sha256": file_info.get("sha256"),
         "page_count": rec.get("page_count") if rec else None,
@@ -278,3 +281,13 @@ emit_meta measured "${RUN_DIR}/${BASE}.raw.jsonl" "${RESULTS}/${BASE}_${STAMP}.m
 
 echo "[run] measured JSON   : ${RUN_DIR}/${BASE}.measured.jsonl"
 echo "[run] page bitmaps    : ${RUN_DIR}/pages"
+
+# A captured JSON line is not a succeeded run: the driver can print its record
+# and still be killed on the way out, and a caller scripting these runs has to be
+# able to tell the two apart from the exit status alone. The record is written
+# either way, because under this harness a failed measurement is a result.
+if [[ "${RUN_EXIT}" != "0" || ( -n "${STATE_EXIT}" && "${STATE_EXIT}" != "0" ) ]]; then
+    echo "[run] FAIL: measured line captured but the run did not succeed" >&2
+    echo "[run] docker_run_exit=${RUN_EXIT} container_exit=${STATE_EXIT:-unknown} state_error=${STATE_ERR:-none}" >&2
+    exit 1
+fi
