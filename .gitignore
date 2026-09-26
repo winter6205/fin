@@ -89,6 +89,10 @@ docs/verify/
 plans/archive/
 docs/guides/knowledge-agent.md
 
+# A session transcript kept beside the docs, not a product artifact. Same
+# local-only policy ADR 0090 records for the directories above.
+docs/会话备份.txt
+
 # Local operator shims (not product)
 .local-bin/
 .qoder
