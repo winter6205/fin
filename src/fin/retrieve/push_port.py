@@ -75,6 +75,7 @@ and the retrieve side alike.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Final, Mapping, Protocol, Sequence, runtime_checkable
 
 from fin.corpus.push import (
@@ -251,6 +252,24 @@ class PushEmptyDocumentError(PushError, InputValidationError):
     input_class = INPUT_CLASS_EMPTY_DOCUMENT
 
 
+def frozen_content_identities(
+    values: Mapping[str, str],
+) -> Mapping[str, str]:
+    """One read-only view of a push result's ``source_ref`` → identity map.
+
+    Every push result carries this map, and the run that built it hands
+    the same map on to the next result (the batched run's merge feeds the
+    ingest result), so a writable one would let any consumer edit what the
+    service reported. Wrapping — not copying — is enough: nothing in fin
+    keeps a mutable reference to these maps after the result is built.
+    """
+    return (
+        values
+        if isinstance(values, MappingProxyType)
+        else MappingProxyType(values)
+    )
+
+
 @dataclass(frozen=True)
 class PushOutcome:
     """The result of one push batch.
@@ -264,13 +283,23 @@ class PushOutcome:
     ``content_identities`` maps each pushed ``source_ref`` to the
     ``content_identity`` the service computed and stored for it — the
     other half of the pair ``submit_index_job`` takes. It is empty for a
-    service that reports no identity, and is never filled in by fin.
+    service that reports no identity, and is never filled in by fin. A
+    caller may read it and copy it, never write it: it is the record of
+    what the service said, and on the batched path the same map is handed
+    to every result built from that run.
     """
 
     block_ids: tuple[str, ...]
     written: int
     duplicates: int
     content_identities: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "content_identities",
+            frozen_content_identities(self.content_identities),
+        )
 
 
 @runtime_checkable
@@ -456,6 +485,83 @@ def _validated_identity(value: Any, *, where: str) -> str:
     return value
 
 
+def _pairs_from_scalar(value: Any, *, refs: tuple[str, ...]) -> dict[str, str]:
+    """The one-资料 answer: a scalar identity for exactly one pushed source.
+
+    The scalar carries no name, so it is only attributable when the batch
+    held exactly one 资料 — a whole batch answering with one identity
+    cannot be spread over the sources without inventing pairs.
+    """
+    identity = _validated_identity(value, where="content_identity")
+    if len(refs) != 1:
+        raise PushProtocolError(
+            f"push response reports one content_identity for "
+            f"{len(refs)} pushed 资料"
+        )
+    return {refs[0]: identity}
+
+
+def _pairs_from_keyed(
+    identities: Mapping[Any, Any], *, refs: tuple[str, ...]
+) -> dict[str, str]:
+    """The attributed answer: every key names the `source_ref` it belongs to.
+
+    Attribution by name cannot shift a pair the way a positional read can,
+    so this shape answers for exactly the keys it carries — an empty map
+    is the same "no identity" answer as an absent field, and a partial map
+    simply leaves out the sources the service reported nothing for. What
+    it may not do is name a `source_ref` this batch never pushed: that key
+    would be an invented pair, since the only thing this response can
+    speak for is the push it answers.
+    """
+    for source_ref in identities:
+        if not isinstance(source_ref, str) or not source_ref:
+            raise PushProtocolError(
+                f"push response content_identities has the "
+                f"{source_ref!r} key; expected a non-empty source_ref"
+            )
+    pushed = set(refs)
+    unpushed = tuple(ref for ref in identities if ref not in pushed)
+    if unpushed:
+        raise PushProtocolError(
+            f"push response content_identities names {list(unpushed)}, which "
+            "this batch did not push"
+        )
+    return {
+        source_ref: _validated_identity(
+            identity, where=f"content_identities[{source_ref!r}]"
+        )
+        for source_ref, identity in identities.items()
+    }
+
+
+def _pairs_from_sequence(
+    identities: Any, *, refs: tuple[str, ...]
+) -> dict[str, str]:
+    """The batch answer: one identity per pushed 资料, in the order fin sent.
+
+    Position is the only binding here, so the two sides must be the same
+    length — a short sequence would silently drop the tail's pairs and a
+    long one would attribute an identity to a source that does not exist.
+    """
+    if isinstance(identities, (str, bytes)) or not isinstance(
+        identities, Sequence
+    ):
+        raise PushProtocolError(
+            f"push response content_identities is "
+            f"{type(identities).__name__}, expected a sequence of identities"
+        )
+    if len(identities) != len(refs):
+        raise PushProtocolError(
+            f"push response carries {len(identities)} content identities "
+            f"for {len(refs)} pushed 资料"
+        )
+    return {
+        source_ref: _validated_identity(identity, where="content_identities")
+        for source_ref, identity in zip(refs, identities)
+    }
+
+
 def content_identities_of(
     response: Mapping[str, Any],
     *,
@@ -474,74 +580,41 @@ def content_identities_of(
     * ``content_identity`` — one 资料 wrote and its identity is the
       scalar;
     * ``content_identities`` — a sequence, parallel to the batch's 资料
-      in send order;
+      in the order fin sent them;
     * neither — a build that predates the field. That is still a
       successful write, so it reports *no* identity rather than an
       invented one.
 
-    A ``content_identities`` :class:`~typing.Mapping` is also accepted:
-    it is the shape the MCP adapter hands on once it has done the
-    attribution itself, so the read is idempotent across the seam.
+    A ``content_identities`` :class:`~typing.Mapping` is the fourth,
+    adapter-side shape: the MCP adapter hands on what it has already
+    attributed, so the read is idempotent across the seam. Its keys are
+    checked against the batch for the same reason the other shapes are —
+    an identity for a source this push did not send is a pair nothing
+    holds.
 
     Anything else — a value that is not a non-empty string, a count that
-    does not line up with the pushed 资料, both wire shapes at once, a
-    sequence with no batch to attribute it to — is a
-    :class:`PushProtocolError`: an identity fin cannot pin to exactly one
-    source is worse than no identity, because the wrong pair would reach
-    the durable index job silently.
+    does not line up with the pushed 资料, a key outside the batch, both
+    wire shapes at once, a sequence with no batch to attribute it to — is
+    a :class:`PushProtocolError`: an identity fin cannot pin to exactly
+    one source is worse than no identity, because the wrong pair would
+    reach the durable index job silently.
     """
     has_scalar = "content_identity" in response
     has_plural = "content_identities" in response
-    if not has_scalar and not has_plural:
-        return {}
     if has_scalar and has_plural:
         raise PushProtocolError(
             "push response reports both content_identity and "
             "content_identities; the service answers with one shape per batch"
         )
-
     refs = _pushed_source_refs(source_refs)
     if has_scalar:
-        identity = _validated_identity(
-            response["content_identity"], where="content_identity"
-        )
-        if len(refs) != 1:
-            raise PushProtocolError(
-                f"push response reports one content_identity for "
-                f"{len(refs)} pushed 资料"
-            )
-        return {refs[0]: identity}
-
+        return _pairs_from_scalar(response["content_identity"], refs=refs)
+    if not has_plural:
+        return {}
     identities = response["content_identities"]
     if isinstance(identities, Mapping):
-        for source_ref in identities:
-            if not isinstance(source_ref, str) or not source_ref:
-                raise PushProtocolError(
-                    f"push response content_identities has the "
-                    f"{source_ref!r} key; expected a non-empty source_ref"
-                )
-        return {
-            source_ref: _validated_identity(
-                identity, where=f"content_identities[{source_ref!r}]"
-            )
-            for source_ref, identity in identities.items()
-        }
-    if isinstance(identities, (str, bytes)) or not isinstance(
-        identities, Sequence
-    ):
-        raise PushProtocolError(
-            f"push response content_identities is "
-            f"{type(identities).__name__}, expected a sequence of identities"
-        )
-    if len(identities) != len(refs):
-        raise PushProtocolError(
-            f"push response carries {len(identities)} content identities "
-            f"for {len(refs)} pushed 资料"
-        )
-    return {
-        source_ref: _validated_identity(identity, where="content_identities")
-        for source_ref, identity in zip(refs, identities)
-    }
+        return _pairs_from_keyed(identities, refs=refs)
+    return _pairs_from_sequence(identities, refs=refs)
 
 
 def outcome_of_response(
@@ -745,6 +818,7 @@ __all__ = [
     "PushServiceUnavailableError",
     "UnknownPushedBlockError",
     "content_identities_of",
+    "frozen_content_identities",
     "missing_metadata_fields",
     "outcome_of_response",
     "push_envelopes",

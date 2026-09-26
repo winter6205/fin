@@ -28,7 +28,16 @@ process and verifies it against real PG:
    the ids);
 4. ``submit_index_job`` accepts that ``(source_ref, content_identity)``
    pair and refuses a wrong one by name, which is the consumer the handoff
-   exists for.
+   exists for;
+5. re-pushing the SAME ``source_ref`` with a changed body overwrites in
+   place: the answer, the stored identity, and the stored body all move to
+   the new text, and the pair fin would hand on is a different one.
+
+Everything the assertions read is built inside the module-scoped ``batch``
+fixture rather than at import: 切分 is expensive, its shape guards can fail,
+and neither may happen while pytest merely COLLECTS this file — collection
+of the whole suite imports every module in it, including under the default
+hermetic run that deselects ``mcp``.
 """
 
 from __future__ import annotations
@@ -38,6 +47,7 @@ import itertools
 import json
 import re
 import uuid
+from dataclasses import dataclass
 from typing import Any, Iterator
 
 import psycopg
@@ -45,7 +55,11 @@ import pytest
 
 from fin.corpus.chunking import split_unit
 from fin.corpus.parsers._common import build_unit
-from fin.corpus.push import PushEnvelope, envelope_of_unit
+from fin.corpus.push import (
+    PushEnvelope,
+    deserialize_source_ref,
+    envelope_of_unit,
+)
 
 from live_iknow_support import (
     IKNOW_PG_URL,
@@ -80,6 +94,15 @@ _BODIES = (
     "研发投入集中于端侧模型，费用率同比持平。",
     _SENTENCE * 60,  # long enough for 切分 to yield two children
 )
+
+# The changed body the overwrite arm re-pushes. It shares no text with any
+# first-push body, so "the stored value moved" cannot be a coincidence of
+# two 资料 hashing alike, and it is long enough to 切分 so the arm shows
+# the store replaced the old slices instead of appending to them.
+_REVISION_SENTENCE = (
+    "管理层将本季度重新披露的资本回报口径纳入指引，并同步更新分部利润率的定义。"
+)
+_REVISED_BODY = _REVISION_SENTENCE * 60
 
 _REQUEST_IDS = itertools.count(100)
 
@@ -149,17 +172,65 @@ def _envelopes() -> tuple[PushEnvelope, ...]:
     return tuple(envelopes)
 
 
-_ENVELOPES = _envelopes()
-_BODIES_BY_SOURCE_REF = {env.source_ref: env.body for env in _ENVELOPES}
-_SLICES_BY_SOURCE_REF = {
-    env.source_ref: tuple(chunk.content for chunk in env.chunks)
-    for env in _ENVELOPES
-}
-_CHUNK_COUNT = sum(len(env.chunks) for env in _ENVELOPES)
+@dataclass(frozen=True)
+class _Batch:
+    """The pushed 资料 and everything their 切分 produced.
+
+    One object owns the maps and the count so no test can pair an envelope
+    with a value derived from a different batch. Built lazily by the
+    ``batch`` fixture — see the module docstring for why import-time
+    construction is the wrong shape for this driver.
+    """
+
+    envelopes: tuple[PushEnvelope, ...]
+
+    @property
+    def bodies_by_source_ref(self) -> dict[str, str]:
+        return {env.source_ref: env.body for env in self.envelopes}
+
+    @property
+    def slices_by_source_ref(self) -> dict[str, tuple[str, ...]]:
+        return {
+            env.source_ref: tuple(chunk.content for chunk in env.chunks)
+            for env in self.envelopes
+        }
+
+    @property
+    def chunk_count(self) -> int:
+        return sum(len(env.chunks) for env in self.envelopes)
+
+    def wire(self) -> list[dict[str, Any]]:
+        return [env.to_wire() for env in self.envelopes]
 
 
-def _wire() -> list[dict[str, Any]]:
-    return [env.to_wire() for env in _ENVELOPES]
+def _revised_envelope(reference: PushEnvelope, new_body: str) -> PushEnvelope:
+    """The very same 资料 reference, re-pushed with a changed body.
+
+    The locator is read back out of the reference's own ``source_ref``
+    instead of being rebuilt from this module's constants, so the arm
+    provably addresses the row the first push created — a look-alike
+    reference would have made it a plain new write.
+    """
+    locator = deserialize_source_ref(reference.source_ref)
+    unit = build_unit(
+        fmt="txt",
+        source_sha256=_VERSION,
+        document_id=locator.document_id,
+        version=locator.version,
+        unit=locator.unit,
+        text=new_body,
+    )
+    return envelope_of_unit(
+        split_unit(unit, doc_type="narrative"),
+        valid_from=reference.valid_from,
+        valid_until=reference.valid_until,
+    )
+
+
+@pytest.fixture(scope="module")
+def batch() -> _Batch:
+    """The three 资料 of this run, 切分 once inside the opt-in mcp run."""
+    return _Batch(_envelopes())
 
 
 def _pg_rows(sql: str, params: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
@@ -227,16 +298,16 @@ def live() -> Iterator[Any]:
 
 
 @pytest.fixture(scope="module")
-def pushed(live: Any) -> dict[str, Any]:
+def pushed(live: Any, batch: _Batch) -> dict[str, Any]:
     """The one batch push both identity assertions read, and no more."""
-    outcome = live.push.push(_wire())
-    assert outcome["written"] == _CHUNK_COUNT, outcome
+    outcome = live.push.push(batch.wire())
+    assert outcome["written"] == batch.chunk_count, outcome
     assert outcome["duplicates"] == 0, outcome
     return outcome
 
 
 def test_push_answers_one_oracle_identity_per_pushed_source_ref(
-    pushed: dict[str, Any],
+    pushed: dict[str, Any], batch: _Batch
 ) -> None:
     """Spec Decision 2: the identities are 64-hex, per 资料, and oracle-equal.
 
@@ -245,7 +316,7 @@ def test_push_answers_one_oracle_identity_per_pushed_source_ref(
     ``source_ref`` fails the per-key equality below.
     """
     identities = pushed["content_identities"]
-    assert set(identities) == set(_BODIES_BY_SOURCE_REF), (
+    assert set(identities) == set(batch.bodies_by_source_ref), (
         "the identities fin exposes are not attributed to exactly the "
         f"资料 fin pushed: {sorted(identities)!r}"
     )
@@ -255,13 +326,13 @@ def test_push_answers_one_oracle_identity_per_pushed_source_ref(
             f"digest: {identity!r}"
         )
         assert identity == _oracle_content_identity(
-            _BODIES_BY_SOURCE_REF[source_ref]
+            batch.bodies_by_source_ref[source_ref]
         ), (
             f"the identity exposed for {source_ref} is not the value the "
             "producing side's formula gives for that body"
         )
-        for slice_text in _SLICES_BY_SOURCE_REF[source_ref]:
-            if slice_text == _BODIES_BY_SOURCE_REF[source_ref]:
+        for slice_text in batch.slices_by_source_ref[source_ref]:
+            if slice_text == batch.bodies_by_source_ref[source_ref]:
                 continue
             assert identity != _oracle_content_identity(slice_text), (
                 f"the identity for {source_ref} is the hash of one of its "
@@ -271,7 +342,7 @@ def test_push_answers_one_oracle_identity_per_pushed_source_ref(
 
 
 def test_stored_pg_identity_equals_the_identity_fin_exposes(
-    pushed: dict[str, Any],
+    pushed: dict[str, Any], batch: _Batch
 ) -> None:
     """The stored value is the authority fin hands on, byte for byte.
 
@@ -284,7 +355,7 @@ def test_stored_pg_identity_equals_the_identity_fin_exposes(
         f"SELECT source_ref, content_identity, content "
         f"FROM {_PG_SCHEMA}.source_documents ORDER BY source_ref"
     )
-    assert len(rows) == len(_ENVELOPES), (
+    assert len(rows) == len(batch.envelopes), (
         f"expected one 资料 row per pushed envelope, got {len(rows)}: {rows!r}"
     )
     stored = {source_ref: identity for source_ref, identity, _ in rows}
@@ -293,7 +364,7 @@ def test_stored_pg_identity_equals_the_identity_fin_exposes(
         "the same source_ref"
     )
     for source_ref, _, content in rows:
-        assert content == _BODIES_BY_SOURCE_REF[source_ref], (
+        assert content == batch.bodies_by_source_ref[source_ref], (
             f"PG holds a body other than the one pushed for {source_ref}; "
             "the identity comparison above would then be about a text this "
             "driver never hashed"
@@ -301,7 +372,7 @@ def test_stored_pg_identity_equals_the_identity_fin_exposes(
 
 
 def test_repushing_an_unchanged_body_reuses_the_stored_identity(
-    live: Any, pushed: dict[str, Any]
+    live: Any, pushed: dict[str, Any], batch: _Batch
 ) -> None:
     """An unchanged re-push keeps the identity, the ids, and the row count."""
     before_docs = _pg_rows(
@@ -311,7 +382,7 @@ def test_repushing_an_unchanged_body_reuses_the_stored_identity(
         f"SELECT count(*) FROM {_PG_SCHEMA}.chunks"
     )[0][0]
 
-    again = live.push.push(_wire())
+    again = live.push.push(batch.wire())
 
     assert again["content_identities"] == pushed["content_identities"], (
         "an unchanged re-push answered a different identity for the same "
@@ -319,7 +390,9 @@ def test_repushing_an_unchanged_body_reuses_the_stored_identity(
         "the stored row"
     )
     assert again["block_ids"] == pushed["block_ids"], again
-    assert again["written"] == 0 and again["duplicates"] == _CHUNK_COUNT, again
+    assert (
+        again["written"] == 0 and again["duplicates"] == batch.chunk_count
+    ), again
     assert _pg_rows(
         f"SELECT count(*) FROM {_PG_SCHEMA}.source_documents"
     )[0][0] == before_docs
@@ -336,7 +409,7 @@ def test_repushing_an_unchanged_body_reuses_the_stored_identity(
 
 
 def test_submit_index_job_takes_the_pushed_pair_and_refuses_a_wrong_identity(
-    live: Any, pushed: dict[str, Any]
+    live: Any, pushed: dict[str, Any], batch: _Batch
 ) -> None:
     """``submit_index_job`` is the consumer that validates the handed-off pair.
 
@@ -345,7 +418,7 @@ def test_submit_index_job_takes_the_pushed_pair_and_refuses_a_wrong_identity(
     that ignored ``content_identity`` would accept both calls, and the
     wrong pair is the failure mode fin's no-recompute rule exists to stop.
     """
-    source_ref = _ENVELOPES[0].source_ref
+    source_ref = batch.envelopes[0].source_ref
     identity = pushed["content_identities"][source_ref]
 
     accepted = _call_tool(
@@ -372,3 +445,130 @@ def test_submit_index_job_takes_the_pushed_pair_and_refuses_a_wrong_identity(
         {"source_ref": source_ref, "content_identity": "0" * 64},
     )
     assert refused.get("error") == "index_job_identity_mismatch", refused
+
+
+def test_repushing_a_changed_body_overwrites_the_stored_identity(
+    live: Any, pushed: dict[str, Any], batch: _Batch
+) -> None:
+    """A changed re-push moves the pair — 覆盖更新, in the answer and the row.
+
+    ``source_ref`` is UNIQUE in iknow's ``source_documents`` and the write
+    is ``ON CONFLICT (source_ref) DO UPDATE SET content = EXCLUDED.content,
+    content_identity = EXCLUDED.content_identity``, so after a revision the
+    pair fin hands ``submit_index_job`` is a DIFFERENT one. No other arm in
+    this module can show that: the unchanged re-push proves the value is
+    stable, and only this one proves it tracks the body it was computed
+    over.  Last in the file on purpose — it rewrites state every earlier
+    arm reads, and the precondition below turns an out-of-order run into a
+    named failure rather than a measurement against a store this driver no
+    longer filled.
+    """
+    target = batch.envelopes[0]
+    source_ref = target.source_ref
+    stale_identity = pushed["content_identities"][source_ref]
+    assert dict(
+        _pg_rows(
+            f"SELECT source_ref, content_identity "
+            f"FROM {_PG_SCHEMA}.source_documents"
+        )
+    )[source_ref] == stale_identity, (
+        "PG no longer holds the first push's identity for this source_ref; "
+        "another arm overwrote it before this one could measure it"
+    )
+
+    revised = _revised_envelope(target, _REVISED_BODY)
+    assert revised.source_ref == source_ref, (
+        "the revision does not carry the first push's source_ref, so "
+        "re-pushing it would be a new write and prove nothing about "
+        "overwriting an existing 资料"
+    )
+    assert revised.body != target.body, (
+        "the freeze turned the revision back into the body already pushed; "
+        "the write below would then be an unchanged re-push"
+    )
+    assert revised.body not in batch.bodies_by_source_ref.values(), (
+        "the revision duplicates another 资料's body, so a moved identity "
+        "could be coincidence instead of this body's own value"
+    )
+    revised_slices = tuple(chunk.content for chunk in revised.chunks)
+    # The first push gave this 资料 exactly one slice, so a revision that
+    # 切分 into several is what makes replaced-vs-appended slices countable.
+    assert len(revised_slices) >= 2, (
+        f"the revision collapsed to {len(revised_slices)} slice(s); the "
+        "chunk-count claim below would then pass for an append as well "
+        "as for an overwrite"
+    )
+
+    outcome = live.push.push([revised.to_wire()])
+
+    identities = outcome["content_identities"]
+    assert set(identities) == {source_ref}, (
+        "a one-资料 re-push answered identities for 资料 this call did not "
+        f"send: {sorted(identities)!r}"
+    )
+    new_identity = identities[source_ref]
+    assert _IDENTITY_RE.match(new_identity), new_identity
+    assert new_identity == _oracle_content_identity(revised.body), (
+        f"after a changed re-push {source_ref} answers with an identity "
+        "that is not the producing side's formula over the NEW body — the "
+        "answer still reflects the superseded text"
+    )
+    assert (source_ref, new_identity) != (source_ref, stale_identity), (
+        "the pair fin would hand submit_index_job did not move when the "
+        "body did; the stored value was not overwritten"
+    )
+    for slice_text in revised_slices:
+        if slice_text == revised.body:
+            continue
+        assert new_identity != _oracle_content_identity(slice_text), (
+            "the rewritten document-level identity is the hash of one of "
+            "the new body's children rather than of that body"
+        )
+    assert (
+        outcome["written"] == len(revised.chunks)
+        and outcome["duplicates"] == 0
+    ), (
+        "the store did not take the revision's slices as writes; the "
+        f"identity move would then be an echo: {outcome!r}"
+    )
+
+    rows = {
+        row_ref: (identity, content)
+        for row_ref, identity, content in _pg_rows(
+            f"SELECT source_ref, content_identity, content "
+            f"FROM {_PG_SCHEMA}.source_documents"
+        )
+    }
+    assert len(rows) == len(batch.envelopes), (
+        "a changed re-push must update the row its source_ref already "
+        f"owns, not add a second 资料 row: {sorted(rows)!r}"
+    )
+    assert rows[source_ref] == (
+        _oracle_content_identity(revised.body),
+        revised.body,
+    ), (
+        f"the row for {source_ref} does not hold the new body beside the "
+        "identity that hashes it — content and content_identity moved "
+        "apart, so the pair is only half-updated"
+    )
+    for untouched_ref, untouched_body in batch.bodies_by_source_ref.items():
+        if untouched_ref == source_ref:
+            continue
+        assert rows[untouched_ref] == (
+            _oracle_content_identity(untouched_body),
+            untouched_body,
+        ), (
+            f"overwriting {source_ref} also rewrote {untouched_ref}; the "
+            "pair for an untouched 资料 must survive it"
+        )
+
+    expected_chunks = (
+        batch.chunk_count - len(target.chunks) + len(revised.chunks)
+    )
+    assert _pg_rows(f"SELECT count(*) FROM {_PG_SCHEMA}.chunks")[0][0] == (
+        expected_chunks
+    ), (
+        "the superseded slices are still stored beside the new ones — the "
+        f"run should hold {expected_chunks} chunk rows after 覆盖更新, not "
+        "the old and the new at once"
+    )

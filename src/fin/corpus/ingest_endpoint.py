@@ -101,7 +101,7 @@ from fin.retrieve.invalidation_port.errors import (
 from fin.retrieve.invalidation_port.operation import invalidate_targets
 from fin.retrieve.invalidation_port.ledger import InvalidationLedger
 from fin.retrieve.push_batching import PushJournal, push_in_batches
-from fin.retrieve.push_port import PushPort
+from fin.retrieve.push_port import PushPort, frozen_content_identities
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from fin.corpus.ingest_state import IngestStateStore
@@ -294,7 +294,8 @@ class IngestEndpointResult:
     idempotency accounting). ``content_identities`` comes straight off
     the same push outcome: each pushed ``source_ref`` mapped to the
     ``content_identity`` the service reported for it — the half of the
-    pair the index-job handoff submits, which fin never recomputes.
+    pair the index-job handoff submits, which fin never recomputes. It is
+    the batched run's own map, so it is read here and never written.
     ``invalidation`` is ``None`` when
     nothing was stale; ``records`` is the full per-child record set
     so callers (tests, the future catalog seam, the invalidation
@@ -313,6 +314,13 @@ class IngestEndpointResult:
     records: tuple[PushRecord, ...]
     invalidation: InvalidationOutcome | None
     content_identities: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "content_identities",
+            frozen_content_identities(self.content_identities),
+        )
 
 
 @dataclass(frozen=True)
