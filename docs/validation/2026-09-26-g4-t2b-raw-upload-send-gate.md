@@ -25,9 +25,9 @@ Delivered by this change, and proved below against real storage:
   lost its `BackgroundTasks` parameter and its `prepare_async` call, and the
   non-text `400` branch is gone). "Durable" splits in two and the record keeps
   them apart: the **row** is durable in Postgres and is read back from a second
-  connection and a second process, while the **bytes** land in whatever adapter
-  `_build_default_attachment_service()` selects, which on this machine is the
-  in-memory one — see *Blocked leg*.
+  connection and a second process. The original run used the in-memory byte
+  adapter; the 2026-09-27 follow-up below reads the committed bytes back from a
+  configured S3-compatible service after the Uvicorn process exits.
 * Unsupported bytes are still uploadable; only preparation names them. The
   typed rejection `attachment_not_text` now comes from
   `fin.host.attachment_prepare`, never from the door.
@@ -73,20 +73,19 @@ real `serve()` process.
 | HTTP door | yes | the deployed `fin.host.http.app` routes, driven through `TestClient` (in-process) **and** through a real `uvicorn` child process (out-of-process) |
 | Server process | yes | `python -c "from fin.host.http import serve; serve()"`, a real PID, a real socket on `0.0.0.0:8000`, real SIGTERM shutdown |
 | Payloads | yes | the committed gold files and real corpus filings, byte-for-byte; boundary bodies are built from the real filing bytes, not from filler |
-| Byte adapter | **as the product chose** | see below |
+| Byte adapter | yes, for the follow-up | the original run selected in-memory storage; the follow-up used local SeaweedFS and read bytes in a new Python process |
 | iknow-memory | yes | the compiled `/home/winner/projects/iknow-memory/dist/index.js`, via the live MCP regression (command 10) |
 | Graph | no | `get_graph` is the only replaced dependency; T2b never touches the graph, so a `_NullGraph` that raises if called doubles as the "upload starts no work" assertion |
 
-**The durable byte adapter could not be exercised, and that is recorded as
-blocked, not as a pass.** `_build_default_attachment_service`
+**The original 2026-09-26 run could not exercise the durable byte adapter; that
+run is recorded as blocked, not as a pass.** `_build_default_attachment_service`
 (`src/fin/host/workspace_http.py:2163-2210`) asks `object_store_from_env()` for
 the real store and falls back to `InMemoryObjectStore()` with a `WARNING` at
 `workspace_http.py:2192` when `FIN_OBJECT_STORE_URL` /
-`FIN_OBJECT_STORE_BUCKET` are unset. This machine has no S3-compatible service
-(see *Blocked leg* below). Rather than install a dependency or stand up a fake
-S3 and call it durable, the live module **drives that factory itself** and
-asserts what it selected, so the degradation is observed evidence in the run
-rather than an assumption:
+`FIN_OBJECT_STORE_BUCKET` are unset. That was the original run's environment
+(see the historical *Blocked leg* below). The follow-up configured local
+SeaweedFS through the same factory and read the uploaded gold bytes in a fresh
+Python process; its result is recorded below.
 
 ```
 WARNING fin.host.workspace_http:workspace_http.py:2192 FIN_OBJECT_STORE_URL/FIN_OBJECT_STORE_BUCKET
@@ -94,12 +93,11 @@ are not set; thread attachments keep their raw bytes in process memory and will 
 source_unavailable after a restart
 ```
 
-Everything the module proves about *rows, statuses, caps and the door* is
-therefore real. What it proves about *bytes surviving a restart* is only that
-they survive inside the adapter this machine has, which is a process-local
-`InMemoryObjectStore`: read back in the same process, yes; across a restart, no
-— that leg is the *Blocked leg* below, and it stays unproven rather than
-partially credited.
+The original run proved *rows, statuses, caps and door behavior* against real
+Postgres and a real socket, but its byte read-back stayed inside the
+process-local `InMemoryObjectStore`. The follow-up below closes the adapter
+process-exit byte read-back against SeaweedFS; it does not test a restart of
+the object-store service itself.
 
 ## Old versus new byte cap, on the real files
 
@@ -453,15 +451,14 @@ standing on this branch: **an `uploaded` attachment is not usable for a turn
 until T2f lands**, and the PR says so as a merge-visible dependency rather than
 a note buried here.
 
-### Claims the evidence does not reach *(Spec High: durable bytes; Low: content type)*
+### Claims the original evidence did not reach *(durable bytes; content type)*
 
 Two sentences in the first version of this record were stronger than anything a
-test observed. The scope bullet now splits durability in two — the **row** is
-Postgres-durable and read back from a second connection and process; the
-**bytes** land in whatever adapter the factory selected, which here is the
-in-memory one — and the durable leg is *Blocked leg* evidence, owed to the next
-ticket that can reach a real bucket. `AttachmentPreparationService.accept()` also
-stopped stamping `content_type="text/plain"` on a raw object it had not judged
+test observed in the original run. The row was Postgres-durable; the bytes were
+in the in-memory adapter, so cross-process read-back was absent then. The
+follow-up below closes that evidence against SeaweedFS. The remaining content
+type caveat is that `AttachmentPreparationService.accept()` stopped stamping
+`content_type="text/plain"` on a raw object it had not judged
 (`attachment_prepare.py:140`): the door has no idea what the bytes are, and a
 stored type would have been an invented fact that T2d's type detection then had
 to argue with.
@@ -525,16 +522,17 @@ baseline, with commands 12 and 15 (`70 passed`, `361 passed`) and command 13 cle
   change that no acceptance point in this ticket asks for. Owner: the next
   ticket that adds an eleventh.
 * **The gate's per-process window** — *Leftovers* 3.
-* **The durable byte adapter leg** — *Leftovers* 1.
+* **Deployment object-store configuration** — *Leftovers* 1.
 * **`attachment_type_unsupported` as a named product code** — **T2d**, per the
   plan's task split.
 * **Waiting on preparation and resuming the run** — **T2f**, per *Not covered*.
 
 ## Not covered by this record
 
-* **A durable object-store adapter.** No S3-compatible bytes were involved in
-  any assertion. See *Blocked leg* below: this is blocked evidence, not a green
-  skip and not a Fake pass.
+* **Object-store service restart/replication and deployment configuration.**
+  The follow-up below proves byte read-back after fin exits against local
+  SeaweedFS; it does not restart the object-store service or validate a
+  deployment endpoint's credentials and bucket configuration.
 * **Graph-triggered preparation** — the `ensure_attachment_ready` node, the
   `uploaded → parsing` transition, run suspension, thread-lock release and
   auto-resume. That is **T2f**, and nothing here exercises it. Likewise the
@@ -564,16 +562,10 @@ baseline, with commands 12 and 15 (`70 passed`, `361 passed`) and command 13 cle
   refusal answers the workspace send and new-conversation routes only. `/ask`
   names no attachment, so nothing here observes an upload being raced into a run
   through it — but no test would notice one being added either.
-* **Restart durability of the bytes themselves.** `test_a_parsing_row_is_…`
-  and `…_uploaded_row_is_not_a_recovery_candidate` prove row durability across a
-  process boundary; with the in-memory adapter, cross-process *byte* durability
-  is impossible by construction, and this record does not pretend otherwise
-  (`source_unavailable` after restart is the documented consequence,
-  `workspace_http.py:2192-2196`).
 * **Multi-worker deployment.** One uvicorn process was booted, not the
   `--workers N` shape a real deployment uses.
 
-### Blocked leg
+### Blocked leg (original 2026-09-26 run)
 
 ```
 Validation:
@@ -590,20 +582,50 @@ Validation:
   fake cannot witness it.
 ```
 
-The consequence is bounded and named: every row-count, status, cap and
-door-semantics assertion in *The live door module* is real; the assertion that
-would read a stored object back from durable external storage after a restart
-is the one that is missing, and it is owed to the next ticket that can reach a
-real bucket.
+This original run established row-count, status, cap and door-semantics
+assertions against live Postgres and Uvicorn, but did not read bytes back from
+external storage. The follow-up below supplies that evidence against a running
+local S3-compatible service.
+
+### Durable-byte read-back follow-up (2026-09-27)
+
+The live door module now has
+`test_live_upload_bytes_persist_after_uvicorn_exit_in_fresh_adapter_process`.
+It gates on `FIN_OBJECT_STORE_URL` (or `FIN_OBJECT_STORE_ENDPOINT`) and
+`FIN_OBJECT_STORE_BUCKET`, uploads the committed mixed-chart PDF through a real
+Uvicorn process, stops that process, then starts a fresh Python process. The
+fresh process calls the product's `create_object_store()` and compares the
+stored bytes and SHA-256 with the committed gold file. Every live-server case
+deletes objects it created in `finally`, before removing the corresponding
+thread rows.
+
+Validation:
+
+- Command: `set -a; . /tmp/fin-t2b-s3.K29mi3/test.env; set +a; uv run --no-sync pytest -q -m mcp tests/host/test_live_attachment_upload_door.py`
+- Result: exit 0; 12 passed in 10.19s, including upload, Uvicorn shutdown, and fresh-process byte/hash read-back
+- S3-compatible service: local temporary SeaweedFS 4.43, container `fin-t2b-s3-validation`, image digest `sha256:7bea581f48155c069d3c725e60c386c88210c67cde8bce412344ff6ebea264da`, endpoint `127.0.0.1:8333`; credentials and bucket value are omitted
+- Object cleanup: each live upload case deleted its own object and verified a subsequent read returned the typed not-found result before deleting its Postgres thread row
+- Limit: this proves byte durability across fin process exit while SeaweedFS remains running; it does not prove object-store restart or replication durability
+
+The configured service gate was also checked without S3 settings:
+
+```text
+Command: env -u FIN_OBJECT_STORE_URL -u FIN_OBJECT_STORE_ENDPOINT -u FIN_OBJECT_STORE_BUCKET uv run --no-sync pytest -q -m mcp tests/host/test_live_attachment_upload_door.py::test_live_upload_bytes_persist_after_uvicorn_exit_in_fresh_adapter_process
+Result: exit 0; 1 skipped in 0.32s (durable S3 read-back was not run)
+```
+
+The blocked run above remains historical evidence for the machine and date on
+which the original validation ran. This run's local temporary SeaweedFS
+environment closed the live S3-compatible byte read-back evidence gap.
 
 ## Leftovers
 
-1. **The durable byte adapter leg.** Owner: **T2d** (the `docling`/runtime and
-   deployment-configuration ticket) or the operator ticket that owns
-   `FIN_OBJECT_STORE_URL`. It should re-run command 5 unchanged against a real
-   bucket and add the cross-process byte read-back this one cannot make; the
-   live module already drives `_build_default_attachment_service`, so only the
-   environment is missing, not a harness.
+1. **Deployment object-store configuration.** The durable-byte adapter leg is
+   closed against the local temporary SeaweedFS service above. Owner: **T2d**
+   (the `docling`/runtime and deployment-configuration ticket) or the operator
+   ticket that owns `FIN_OBJECT_STORE_URL`; rerun the same cross-process
+   read-back case against the deployment endpoint, bucket, and credentials
+   before relying on that deployment's configuration.
 2. **The `uploaded → parsing → ready` product path across the same real door**
    — including that `incomplete()` picks a torn `ready` up and that a resumed
    preparation rebuilds units and postings. Owner: **T2f**.
