@@ -100,18 +100,34 @@ describe("describeAttachFailure", () => {
     expect(notice.message).not.toContain("入库");
   });
 
-  it("points oversize rejections at the corpus-ingest door too", () => {
+  it("says the oversize file never landed and hands it to the ingest process", () => {
+    // ``attachment_too_large`` is decided AT the upload door: the bytes
+    // are refused, so the copy says they are not there and points a big
+    // file at 入库.
     const notice = describeAttachFailure(attachError("attachment_too_large"));
+    expect(notice.message).toContain("超过附件大小上限");
+    expect(notice.message).toContain("没有上传");
     expect(notice.message).toContain("入库");
   });
 
   it("names the 入库 process without pointing at a retired fin page", () => {
-    // /kb / KnowledgeBasePage left the product surface, so the copy
-    // must not tell the operator to open the 知识库 page by name.
-    for (const code of ["attachment_too_large", "attachment_not_text"]) {
-      const notice = describeAttachFailure(attachError(code));
-      expect(notice.message).not.toContain("知识库");
-    }
+    // The absence is the oversize copy's own contract: /kb and
+    // KnowledgeBasePage left the product surface, so the copy points at
+    // the process and never at a page the operator cannot open. The
+    // unparsable copy is not tested here because it says nothing about
+    // either door — asserting the absence there would prove nothing.
+    const notice = describeAttachFailure(attachError("attachment_too_large"));
+    expect(notice.message).not.toContain("知识库");
+  });
+
+  it("says the unparsable file is stored, and is no ingest business", () => {
+    // ``attachment_not_text`` now only comes from preparation, so its
+    // copy holds the opposite pair of promises: the bytes ARE kept, and
+    // the failure is still the attachment's own (SC4), never 入库.
+    const notice = describeAttachFailure(attachError("attachment_not_text"));
+    expect(notice.message).toContain("解析不了");
+    expect(notice.message).toContain("无法引用");
+    expect(notice.message).not.toContain("入库");
   });
 
   it("never borrows ingest-door vocabulary for the attach door's own code", () => {
@@ -215,16 +231,31 @@ describe("describeAttachmentFailureReason", () => {
 });
 
 describe("composer attach copy", () => {
-  it("says one large filing per turn is what fits the run budget", () => {
-    // A turn carrying two max-size attachments cannot fit the
-    // configured vision run budget, so the composer says so up front.
+  it("advises one large filing per turn without claiming an enforced bound", () => {
+    // Nothing caps how many attachments a turn may carry, so the copy
+    // may only recommend how to work. These are the promises the
+    // guidance actually makes.
     expect(ATTACH_ONE_FILING_HINT).toContain("一轮");
-    expect(ATTACH_ONE_FILING_HINT).toContain("预算");
+    expect(ATTACH_ONE_FILING_HINT).toContain("大文件");
+    expect(ATTACH_ONE_FILING_HINT).toContain("更稳妥");
   });
 
-  it("states no size or call bound — the server owns those", () => {
-    expect(ATTACH_ONE_FILING_HINT).not.toMatch(/[0-9]/);
-    expect(ATTACH_UPLOAD_IN_FLIGHT_HINT).not.toMatch(/[0-9]/);
+  it("states no budget outcome, size or call bound — the server owns those", () => {
+    // The retired wording asserted that two max-size filings 「会超出
+    // 本轮视觉解析预算」. The deployed bound is
+    // max_vision_calls_per_run >= max_pdf_pages + crop_calls, which
+    // nothing here measures, so the copy must not claim a turn exceeds
+    // it — and must not restate a byte or call number that would go
+    // stale on the next deployment config change.
+    expect(ATTACH_ONE_FILING_HINT).not.toContain("预算");
+    expect(ATTACH_ONE_FILING_HINT).not.toContain("超出");
+    for (const copy of [
+      ATTACH_ONE_FILING_HINT,
+      ATTACH_UPLOAD_IN_FLIGHT_HINT,
+    ]) {
+      expect(copy).not.toMatch(/[0-9]/);
+      expect(copy).not.toContain("上限");
+    }
   });
 
   it("names the in-flight upload as the reason the send is held", () => {

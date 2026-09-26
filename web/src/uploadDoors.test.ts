@@ -775,18 +775,18 @@ describe("attachment lifecycle (ADR 0086)", () => {
     expect(reads).toBe(2);
   });
 
-  it("retry re-runs preparation, follows the record to ready, and names an unknown id", async () => {
+  it("retry answers a settled record, and a settled record starts no poll", async () => {
     seedThread();
     useWorkspaceStore.setState({ attachments: [ATTACH_FAILED] });
     const retryUrl = `${LIST_URL}/att-1/retry`;
+    let listReads = 0;
     const { calls } = stubFetch((url) => {
       if (url === retryUrl) {
-        return jsonResponse({ ...ATTACH_PARSING, version: 2 });
+        return jsonResponse({ ...ATTACH_READY, version: 2 });
       }
       if (url === LIST_URL) {
-        return jsonResponse({
-          attachments: [{ ...ATTACH_READY, version: 2 }],
-        });
+        listReads += 1;
+        return jsonResponse({ attachments: [{ ...ATTACH_READY, version: 2 }] });
       }
       return jsonResponse({ error: "attachment_not_found" }, 400);
     });
@@ -794,13 +794,27 @@ describe("attachment lifecycle (ADR 0086)", () => {
     await useWorkspaceStore.getState().retryAttachment(THREAD_ID, "att-1");
     const retried = calls.find((c) => c.url === retryUrl);
     expect(retried?.method).toBe("POST");
-    expect(useWorkspaceStore.getState().attachments[0].status).toBe("parsing");
-
-    await vi.advanceTimersByTimeAsync(2000);
+    // The door runs preparation INSIDE the request, so the record it
+    // hands back is already FINAL: citable, at the new version, patched
+    // straight into the slice.
     expect(useWorkspaceStore.getState().attachments[0]).toEqual({
       ...ATTACH_READY,
       version: 2,
     });
+    // And nothing left to follow: a settled record cannot move by
+    // itself, so retry issues no list read behind it.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(listReads).toBe(0);
+
+    // The other settled answer the door gives: a re-drive that fails
+    // again is the record's own named failure, never a stuck chip.
+    stubFetch((url) =>
+      url === retryUrl
+        ? jsonResponse(ATTACH_FAILED)
+        : jsonResponse({ error: "attachment_not_found" }, 400),
+    );
+    await useWorkspaceStore.getState().retryAttachment(THREAD_ID, "att-1");
+    expect(useWorkspaceStore.getState().attachments[0]).toEqual(ATTACH_FAILED);
 
     // A deleted / foreign attachment id answers the named 400.
     const rejection = await useWorkspaceStore

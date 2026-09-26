@@ -49,12 +49,11 @@ export FIN_CHECKPOINT_URL="${FIN_CHECKPOINT_URL:-postgresql://fin:fin@localhost:
 # Attachment boot bounds
 # --------------------------------------------------------------------
 # serve() reads all four bounds before it binds a port, and this boot loads
-# no .env file, so a pod that injected none would not come up at all. These
-# are the .env.example values; an injected process variable still wins.
+# no .env file, so a pod that injected none would not come up at all. The
+# template is the source; an injected process variable still wins.
+# shellcheck source=scripts/lib/attachment-bounds.sh
+source "$REPO_ROOT/scripts/lib/attachment-bounds.sh"
 log "attachment bounds defaults"
-export FIN_ATTACHMENT_MAX_BYTES="${FIN_ATTACHMENT_MAX_BYTES:-4194304}"
-export FIN_ATTACHMENT_MAX_PDF_PAGES="${FIN_ATTACHMENT_MAX_PDF_PAGES:-80}"
-export FIN_ATTACHMENT_VISION_CALLS_PER_RUN="${FIN_ATTACHMENT_VISION_CALLS_PER_RUN:-88}"
-export FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN="${FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN:-8}"
+export_attachment_bounds cursor-start
 
 log "ready"

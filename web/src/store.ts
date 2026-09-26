@@ -175,11 +175,12 @@ interface WorkspaceState {
   // cadence, injectable so tests advance the schedule without real
   // waiting. A failed door read ends the chain and leaves the slice as
   // it is — attachments are auxiliary to the thread view and must not
-  // fail navigation. The next open / attach / retry restarts it.
+  // fail navigation. The next open or attach restarts it; a retry
+  // answers a settled record and therefore never restarts it.
   loadAttachments: (threadId: string, intervalMs?: number) => Promise<void>;
-  // Re-run preparation for one failed attachment (ADR 0086 retry).
-  // Rejects with the named ``AttachFailedError`` so the control can
-  // render the reason.
+  // Re-run preparation for one failed attachment. The door answers with
+  // the settled record (``ready`` / ``failed``); rejects with the named
+  // ``AttachFailedError`` so the control can render the reason.
   retryAttachment: (threadId: string, attachmentId: string) => Promise<void>;
   // T8: record (or flip) the operator's thumb for one run. Response-
   // driven (matching ``dismissNotice``'s convention): the turn row is
@@ -476,8 +477,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   async createThread(firstMessage: string | null) {
-    // Starting a conversation is gated by the SAME condition as a send:
-    // an upload still writing its bytes belongs to no thread yet.
+    // The same client-wide gate as a send: an upload in flight on ANY
+    // thread holds this one composer, and starting a conversation is
+    // part of it — the host, by contrast, holds only the thread that
+    // upload is landing in.
     refuseUploadInFlight(get().pendingUploads);
     const created = await api.createThread(firstMessage);
     set((s) => ({ threads: [created, ...s.threads] }));
@@ -516,8 +519,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
     // Upload gate: no conversation sends while ANY composer upload is in
     // flight, including a file the question does not name (its record
-    // does not exist yet). The host refuses on the same condition;
-    // deciding it here keeps a doomed POST off the wire.
+    // does not exist yet). This client scope is the stricter one: the
+    // composer is global, so it holds for every thread's upload, while
+    // the host refuses only the thread its own upload is landing in.
+    // Deciding it here keeps a doomed POST off the wire.
     refuseUploadInFlight(get().pendingUploads);
     set({ sendingQuestion: true });
 
@@ -1024,6 +1029,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           ],
         }));
       }
+      // Only a host on the superseded upload-time-parse contract reaches
+      // this: it answers ``parsing`` from the POST, and that chip must
+      // keep moving instead of sitting unpolled. The door in this repo
+      // answers ``uploaded`` and starts nothing.
       if (attachment.status === "parsing") {
         startAttachmentPolling(threadId);
       }
@@ -1048,7 +1057,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // ``intervalMs`` cannot be silently ignored. Attachments are
     // auxiliary to the thread view: a failed door read leaves the
     // slice as-is and ENDS the chain rather than failing navigation
-    // or spinning on a dead endpoint — the next open / attach / retry
+    // or spinning on a dead endpoint — the next open or attach
     // restarts it.
     stopAttachmentPolling();
     const attachments = await readAttachmentList(threadId);
@@ -1061,9 +1070,11 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   async retryAttachment(threadId, attachmentId) {
-    // ADR 0086 retry: the host answers with the fresh record —
-    // typically back to ``parsing`` — and the poll follows it to
-    // ready / failed like any other.
+    // This door drives preparation INSIDE the request, so the record it
+    // hands back is already settled — ``ready`` on success, ``failed``
+    // with its named reason. Patching the slice with it is the whole
+    // job: a settled record cannot change by itself, so retry starts no
+    // readiness poll (a list read owns the chain).
     const updated = await api.retryThreadAttachment(threadId, attachmentId);
     if (get().activeThread?.id !== threadId) return;
     set((s) => ({
@@ -1071,9 +1082,6 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         a.attachment_id === attachmentId ? updated : a,
       ),
     }));
-    if (updated.status === "parsing") {
-      startAttachmentPolling(threadId);
-    }
   },
 
   async setTurnFeedback(threadId, runId, value) {
@@ -1191,19 +1199,17 @@ function patchTurnByRunIdOn(
 // grounded graph turn asks for it, so polling an upload row would spin on
 // a state that cannot change by itself. One poller chain exists at a time,
 // keyed by thread: opening another thread replaces it, and a read that
-// finds nothing ``parsing`` stops the chain (the next open / attach /
-// retry restarts it). ``intervalMs`` threads through the chain as a
+// finds nothing ``parsing`` stops the chain (the next open or attach
+// restarts it). ``intervalMs`` threads through the chain as a
 // parameter so tests advance a fake schedule instead of really
 // waiting.
 
 const ATTACHMENT_POLL_INTERVAL_MS = 2000;
 
-/** A record the host may still move without a client action: bytes
- * waiting for a graph turn to request preparation (``uploaded``), or
- * preparation running (``parsing``). Only ``parsing`` is work in
- * progress the poll can follow to an answer; ``ready`` and ``failed``
- * are terminal for the list. */
-function isUnsettledAttachment(attachment: ThreadAttachment): boolean {
+/** True for a record this client holds that a server list read may not
+ * have reported yet (an upload it just minted, or a preparation the host
+ * says is running) — the statuses a stale list can still be behind. */
+function isRecordAwaitingServerList(attachment: ThreadAttachment): boolean {
   return (
     attachment.status === "uploaded" || attachment.status === "parsing"
   );
@@ -1246,8 +1252,8 @@ function scheduleAttachmentPollTick(
 
 /**
  * (Re)start the chain for ``threadId``. Replaces any running chain
- * rather than stacking one, so every entry point (open, attach,
- * retry) provably owns the next read.
+ * rather than stacking one, so every entry point (open, attach)
+ * provably owns the next read.
  */
 function startAttachmentPolling(
   threadId: string,
@@ -1289,7 +1295,7 @@ async function attachmentPollTick(
   // server list is authoritative for them.
   const seen = new Set(attachments.map((a) => a.attachment_id));
   const carried = current.attachments.filter(
-    (a) => isUnsettledAttachment(a) && !seen.has(a.attachment_id),
+    (a) => isRecordAwaitingServerList(a) && !seen.has(a.attachment_id),
   );
   const merged = [...attachments, ...carried];
   useWorkspaceStore.setState({ attachments: merged });
@@ -1438,12 +1444,16 @@ function forgetPersistedIngestJobIdIf(jobId: string): void {
 /**
  * The one rule for whether a conversation may start or send.
  *
- * ``true`` while any upload POST is in flight on any thread. It reads the
- * store's ``pendingUploads`` slice, not the attachment list: during that
- * window the record does not exist yet, so the list cannot answer. Both
- * doors use it — ``sendQuestion`` / ``createThread`` refuse with the named
- * ``attachment_upload_in_progress`` failure, and the Composer puts it in
- * ``busy`` so the button and Enter are blocked, not only the picker.
+ * ``true`` while any upload POST is in flight on any thread — the
+ * client's widest reading of the gate, because the composer is one box
+ * for every thread, whereas the host only ever holds the thread its own
+ * upload is landing in. It reads the store's ``pendingUploads`` slice,
+ * not the attachment list: during that window the record does not exist
+ * yet, so the list cannot answer. The three client surfaces share it —
+ * ``sendQuestion`` / ``createThread`` refuse with the named
+ * ``attachment_upload_in_progress`` failure, and the Composer holds the
+ * send on it separately from ``busy``, so the button and Enter are
+ * blocked, not only the picker.
  * A file the question never mentions still blocks the send, because the
  * gate is about the upload, not about the reference.
  */

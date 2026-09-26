@@ -81,10 +81,11 @@ def _prepare(
 
 
 def _force_parsing(store: InMemoryAttachmentStore, attachment_id: str) -> None:
-    """Pin the stored shape of a row whose preparation has already started.
+    """Pin the stored shape of a row whose preparation is in flight.
 
-    Production writes ``parsing`` only from the graph-triggered preparation
-    job, so the resume surface is exercised against the row shape itself.
+    A preparation settles its row before the caller returns, so no door
+    leaves one parked here; the resume surface is exercised against the
+    row shape itself.
     """
     cell = store._attachments[attachment_id]
     cell.record = replace(cell.record, status="parsing")

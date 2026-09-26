@@ -647,6 +647,164 @@ def test_lifecycle_scripts_share_one_iknow_resolver() -> None:
         )
 
 
+# The four attachment bounds `serve()` requires before it binds a port.
+BOUND_KEYS = (
+    "FIN_ATTACHMENT_MAX_BYTES",
+    "FIN_ATTACHMENT_MAX_PDF_PAGES",
+    "FIN_ATTACHMENT_VISION_CALLS_PER_RUN",
+    "FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN",
+)
+ATTACHMENT_BOUNDS_BASH = REPO_ROOT / "scripts" / "lib" / "attachment-bounds.sh"
+ATTACHMENT_BOUNDS_NODE = REPO_ROOT / "scripts" / "lib" / "attachment-bounds.mjs"
+BOUNDS_LANES = (
+    "scripts/dev-up.sh",
+    "scripts/cursor-start.sh",
+    "scripts/run-scripted-e2e.mjs",
+)
+
+
+def _bound_literals(text: str) -> dict[str, list[str]]:
+    """Every `KEY=<digits>` assignment in `text`, quoted or not."""
+    found: dict[str, list[str]] = {}
+    for key in BOUND_KEYS:
+        values = re.findall(rf"{key}\s*=\s*[\"']?(\d+)", text)
+        if values:
+            found[key] = values
+    return found
+
+
+def test_no_lane_repeats_an_attachment_bound_literal() -> None:
+    """Each boot lane must resolve the bounds, not re-type them.
+
+    The host accepts any positive integer, so a lane carrying a stale cap
+    boots happily and then measures the wrong thing. Four copies agreeing
+    by hand is how the cap drifted from the `.env.example` value this
+    round started; the template is the only place a number may appear.
+    """
+    offenders = {
+        name: _bound_literals((REPO_ROOT / name).read_text(encoding="utf-8"))
+        for name in BOUNDS_LANES
+    }
+
+    assert {name: found for name, found in offenders.items() if found} == {}, (
+        "attachment bound values belong in .env.example, read through "
+        "scripts/lib/attachment-bounds.{sh,mjs}"
+    )
+    for name in BOUNDS_LANES[:2]:
+        text = (REPO_ROOT / name).read_text(encoding="utf-8")
+        assert "scripts/lib/attachment-bounds.sh" in text, (
+            f"{name} must source the shared bounds resolver"
+        )
+    assert "attachment-bounds.mjs" in (REPO_ROOT / BOUNDS_LANES[2]).read_text(
+        encoding="utf-8"
+    ), f"{BOUNDS_LANES[2]} must import the shared bounds reader"
+
+
+def test_attachment_bound_resolver_reads_the_template_and_lets_env_win(
+    tmp_path: Path,
+) -> None:
+    """The bash resolver: unset keys come from `.env.example`, a value
+    already in the environment is never overridden, and the node reader
+    agrees with it key for key.
+    """
+    template = tmp_path / ".env.example"
+    template.write_text(
+        "# comment line, ignored\n"
+        f"{BOUND_KEYS[0]}=111\n"
+        f"export {BOUND_KEYS[1]}='222'\n"
+        f"{BOUND_KEYS[2]}=333\n"
+        f"{BOUND_KEYS[3]}=444\n",
+        encoding="utf-8",
+    )
+
+    resolved = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1/scripts/lib/attachment-bounds.sh" && '
+            "export REPO_ROOT=$2 && export_attachment_bounds probe && "
+            "for k in ${ATTACHMENT_BOUND_KEYS[@]}; do "
+            'printf "%s=%s\\n" "$k" "${!k}"; done',
+            "-",
+            str(REPO_ROOT),
+            str(tmp_path),
+        ],
+        env={**_BASE_ENV, BOUND_KEYS[0]: "999"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert resolved.returncode == 0, resolved.stderr
+    # The first key was already exported, so it wins over the template; the
+    # rest come through, with `export` and quotes stripped.
+    assert resolved.stdout.splitlines() == [
+        f"{BOUND_KEYS[0]}=999",
+        f"{BOUND_KEYS[1]}=222",
+        f"{BOUND_KEYS[2]}=333",
+        f"{BOUND_KEYS[3]}=444",
+    ]
+
+    node = subprocess.run(
+        [
+            "node",
+            "-e",
+            "import('file://' + process.argv[1]).then((m) => "
+            "console.log(JSON.stringify(m.attachmentBoundsFromExample("
+            "process.argv[2]))));",
+            str(ATTACHMENT_BOUNDS_NODE),
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert node.returncode == 0, node.stderr
+    assert json.loads(node.stdout) == {
+        BOUND_KEYS[0]: "111",
+        BOUND_KEYS[1]: "222",
+        BOUND_KEYS[2]: "333",
+        BOUND_KEYS[3]: "444",
+    }
+
+
+def test_attachment_bound_resolver_fails_loudly_on_a_missing_key(
+    tmp_path: Path,
+) -> None:
+    """A bound neither set nor in the template must stop the boot, by name.
+
+    Falling back to a number here is the drift this module removes, and a
+    lane that invented one would report a measurement it never made.
+    """
+    hollow = tmp_path / "checkout"
+    hollow.mkdir()
+    (hollow / ".env.example").write_text(
+        f"{BOUND_KEYS[0]}=1\n", encoding="utf-8"
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1/scripts/lib/attachment-bounds.sh" && '
+            "export REPO_ROOT=$2 && export_attachment_bounds probe && "
+            "echo UNREACHED",
+            "-",
+            str(REPO_ROOT),
+            str(hollow),
+        ],
+        env=_BASE_ENV,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "UNREACHED" not in result.stdout
+    assert "probe" in result.stderr
+    for key in BOUND_KEYS[1:]:
+        assert key in result.stderr, f"{key} must be named in the failure"
+
+
 # ----- the PATH shim -----
 
 INSTALLER = REPO_ROOT / "scripts" / "install-fin-shim.sh"

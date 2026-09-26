@@ -304,6 +304,57 @@ def test_attach_without_filename_uses_the_display_default(
     )
 
 
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("../../etc/passwd", "passwd"),
+        ("/abs/dir/note.md", "note.md"),
+        ("..\\..\\windows\\note.md", "..\\..\\windows\\note.md"),
+        ("note\x00\x01.md", "note.md"),
+        ("   ", "attachment.txt"),
+        ("quarterly 报告.md", "quarterly 报告.md"),
+    ],
+)
+def test_malformed_filename_lands_as_a_display_name_only(
+    client: TestClient, fresh_store, raw: str, expected: str
+) -> None:
+    """Input contract: a name is a label, never a path.
+
+    The model and the card read this string, and the object key must not
+    be derived from it, so traversal segments, control characters, and
+    blank names reduce to a printable basename. The Windows separators
+    survive because on this host they are not separators — what is
+    pinned is that they reach nothing but the label.
+    """
+    thread_id = _new_thread(client)
+    r = _attach(client, thread_id, b"raw text", filename=raw)
+    assert r.status_code == 200
+    attachment_id = r.json()["attachment_id"]
+    assert r.json()["filename"] == expected
+
+    record = fresh_store["attachments"].status(attachment_id)
+    assert record.filename == expected
+    assert "/" not in record.filename
+    assert all(char.isprintable() for char in record.filename)
+    assert len(record.filename) <= 200
+    assert record.object_key == f"thread-attachments/{thread_id}/{attachment_id}"
+    owned = fresh_store["attachments"].list_for_thread(thread_id)
+    assert [item.attachment_id for item in owned] == [attachment_id]
+
+
+def test_overlong_filename_is_truncated_to_the_stored_bound(
+    client: TestClient, fresh_store
+) -> None:
+    """200 characters is a bound the door enforces, not a display choice:
+    the name is stored and replayed on every later read."""
+    thread_id = _new_thread(client)
+    r = _attach(client, thread_id, b"raw text", filename="a" * 500)
+    assert r.status_code == 200
+    assert r.json()["filename"] == "a" * 200
+    stored = fresh_store["attachments"].status(r.json()["attachment_id"])
+    assert len(stored.filename) == 200
+
+
 def test_concurrent_uploads_complete_as_distinct_attachments(
     client: TestClient, fresh_store
 ) -> None:
@@ -462,7 +513,9 @@ def test_attach_bounded_body_read_stops_at_the_cap() -> None:
     assert asyncio.run(_read_bounded_body(within, 8)) == b"x" * 8
 
 
-def test_attach_non_text_named_400(client: TestClient, fresh_store) -> None:
+def test_attach_non_text_bytes_are_stored_and_rejected_at_preparation(
+    client: TestClient, fresh_store
+) -> None:
     """Non-UTF-8 bytes are STORED and reported ``uploaded``.
 
     The door no longer classifies: it takes raw bytes and nothing else
