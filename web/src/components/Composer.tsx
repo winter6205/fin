@@ -38,6 +38,13 @@ function sendGate(busy: boolean, uploadInFlight: boolean) {
   return { held: busy, label: busy ? "运行中…" : "发送" };
 }
 
+// The attach door: this file's own upload, or any upload the store is
+// holding. Drag-and-drop has no disabled state, which is why `attach()`
+// tests the same value rather than trusting the picker's.
+function attachHeldWhile(busy: boolean, uploadInFlight: boolean) {
+  return busy || uploadInFlight;
+}
+
 export default function Composer({ threadId }: ComposerProps) {
   const sendQuestion = useWorkspaceStore((s) => s.sendQuestion);
   const sending = useWorkspaceStore((s) => s.sendingQuestion);
@@ -101,6 +108,9 @@ export default function Composer({ threadId }: ComposerProps) {
   const [attachFailure, setAttachFailure] =
     useState<AttachFailureNotice | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  // One predicate for both doors, so the picker can never be enabled while
+  // `attach()` would bail.
+  const attachHeld = attachHeldWhile(attachBusy, uploadInFlight);
   const attachInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -108,7 +118,7 @@ export default function Composer({ threadId }: ComposerProps) {
   }, [threadId, loadAttachments]);
 
   const attach = async (file: File) => {
-    if (attachBusy || uploadInFlight) return;
+    if (attachHeld) return;
     setAttachBusy(true);
     setAttachFailure(null);
     try {
@@ -345,7 +355,7 @@ export default function Composer({ threadId }: ComposerProps) {
             <button
               type="button"
               data-testid="attach-file"
-              disabled={attachBusy}
+              disabled={attachHeld}
               title="上传附件（本对话内持续可引用，不入库）"
               onClick={() => attachInputRef.current?.click()}
               className="border border-black bg-card px-2 py-0.5 text-xs hover:bg-tool disabled:opacity-50"

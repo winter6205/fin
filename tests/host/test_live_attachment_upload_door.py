@@ -82,6 +82,8 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from fin.host.attachment_budgets import _ENV_BOUNDS as _PRODUCT_ENV_BOUNDS
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GOLD_DIR = REPO_ROOT / "data" / "corpus" / "g4_attachment_gold"
 PDF_DIR = REPO_ROOT / "data" / "corpus" / "pdf"
@@ -96,12 +98,9 @@ MSFT_Q1_PDF = PDF_DIR / "2023_Q1_MSFT.pdf"
 # real filing that the OLD cap rejected and the DEPLOYED bound accepts.
 RETIRED_ROUTE_CAP_BYTES = 2 * 1024 * 1024
 
-BOUND_KEYS = (
-    "FIN_ATTACHMENT_MAX_BYTES",
-    "FIN_ATTACHMENT_MAX_PDF_PAGES",
-    "FIN_ATTACHMENT_VISION_CALLS_PER_RUN",
-    "FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN",
-)
+# Read from the product's own table: a fifth bound would otherwise be
+# undeclared here and the boot gate below would silently test four of five.
+BOUND_KEYS = tuple(key for key, _ in _PRODUCT_ENV_BOUNDS)
 
 pytestmark = pytest.mark.mcp
 
@@ -806,6 +805,10 @@ def _load(raw: bytes) -> Any:
     try:
         return json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
+        # EXIT: a body that is not JSON — a proxy's plain-text 502, an empty
+        # HTML error page — is returned as bytes so the failing assertion
+        # reports what actually arrived instead of a decode error that hides
+        # it. Every route under test answers JSON.
         return raw
 
 
