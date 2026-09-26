@@ -44,6 +44,11 @@ docker run --rm --entrypoint /bin/cat "${IMAGE}" /opt/g4/pip_freeze.txt \
     > "${HERE}/results/image_pip_freeze.txt"
 docker run --rm --entrypoint /bin/cat "${IMAGE}" /opt/g4/python_version.txt \
     > "${HERE}/results/image_python_version.txt"
+# Tesseract is an apt package, so it is absent from pip freeze and its version
+# has no artifact of its own otherwise. PIN_MANIFEST.md cites 5.5.0, and a pin
+# the record cites has to be readable from a committed file, not from memory.
+docker run --rm --entrypoint /bin/cat "${IMAGE}" /opt/g4/tesseract_version.txt \
+    > "${HERE}/results/image_tesseract_version.txt"
 docker image inspect "${IMAGE}" \
     --format 'image_id={{.Id}}{{"\n"}}created={{.Created}}{{"\n"}}size_bytes={{.Size}}{{"\n"}}arch={{.Architecture}}{{"\n"}}repo_digests={{.RepoDigests}}' \
     > "${HERE}/results/image_identity.txt"
