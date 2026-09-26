@@ -22,6 +22,14 @@ runtime-dependency decision stays with T2d.
 | `FIN_ATTACHMENT_VISION_CALLS_PER_RUN` | `max_vision_calls_per_run` | `88` |
 | `FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN` | `max_vision_crop_calls_per_run` | `8` |
 
+Two of the four rows are not measured values. The crop headroom is arithmetic on
+the gold set — 2 chart-bearing pages × 4 labelled values — and no caller has
+ever wanted a crop (*Leftovers* 8, T2e); the run total is `80 + 8`, which is
+`validate()`'s exact floor, so a deployment running at the page cap has **no**
+spare call for a retried full-page scan and `88` must rise before T2e can retry
+one (*Leftovers* 9, T2e). Both facts belong to whoever lowers these numbers, so
+they are stated in the `.env.example` block as well as here.
+
 **These values are provisional, not a shipped default.** One of the three gold
 cases has no committed pipeline measurement here — the bare PNG, which the
 harness's PDF-only input path refuses (*Gold cases under the pinned
@@ -100,6 +108,15 @@ not a no-swap 4 GB device measurement. Margins are therefore computed with
 `VmSwap` added to resident peak, which is the strictest reading available on
 this host.
 
+The spec asks for peak *host/GPU* memory, and the GPU half of that is **not
+applicable to this pin** rather than unmeasured: the image installs
+`torch 2.9.1+cpu` from the CPU wheel index, `onnxruntime` is absent so
+Docling's ONNX layout override cannot load, and every committed record carries
+`pipeline_identity.device = cpu`. There is no device memory in this pipeline to
+peak. The one GPU that could appear in a G4 preparation run is the vision
+provider's, and it is inside the provider, outside fin's process, reported only
+as the token usage in *Basis: the configured vision provider*.
+
 Measured runs (`scripts/g4_pipeline/results/*.meta.json`):
 
 | file | pages | bytes | `VmHWM` | cgroup peak | `VmSwap` | OOM | exit | total ms |
@@ -134,10 +151,11 @@ render-plus-OCR pass `17,369.3 ms` (`241 ms/page`, with 0 pages needing OCR in
 this native-text file); Heron regions over 72 pages: 790 text, 55 table,
 **1 figure**; 222,233 native text characters.
 
-Model load, not page count, dominates the floor: the five 1-page runs that
-completed both passes peaked between 1,234,628,608 and 1,304,858,624 B, i.e.
-within 5.7% of each other and 1.15–1.22 GiB before the per-page term is worth
-anything.
+Model load, not page count, dominates the floor: the seven 1-page runs that
+completed Docling peaked between 1,234,628,608 and 1,309,020,160 B
+(`2023_FY_GOOG_…T170956Z`, `…T184410Z`, `…T195408Z`, `…T204930Z`, `…T220516Z`,
+`…T231119Z`, `…T000155Z`), i.e. within 6.0% of each other and 1.15–1.22 GiB
+before the per-page term is worth anything.
 
 ### Measurement conditions (they bound every latency figure here)
 
@@ -161,11 +179,18 @@ Four unrelated agent processes (`qoderclicn`, 0.4–1.0 GiB each) and the
 iknow-memory Elasticsearch/Neo4j containers share those four cores, and each
 pipeline container was given `--cpus=4`, i.e. one whole host, so two concurrent
 runs contend 1:1. The same 1-page input measured 15,013.3 ms, 29,171.3 ms,
-16,407.2 ms, and 10,402.8 ms across the four runs that completed both model
-passes (`…T170956Z`, `…T184410Z`, `…T195408Z`, `…T204930Z`) — a 2.8× spread on
+16,407.2 ms, and 10,402.8 ms across four of those seven runs (`…T170956Z`,
+`…T184410Z`, `…T195408Z`, `…T204930Z`) — a 2.8× spread on
 identical input, and a 1.8× spread on the warm per-page conversion
 inside those runs (3,571.1 / 6,074.1 / 5,942.4 / 3,374.5 ms). Contention, not
 variance in the input; `driver.py` records no load figure for any of them.
+
+The captured load around a run does not order its total either, which is why no
+millisecond figure here is promoted to a rate: `…T231119Z` measured 17,540.6 ms
+at a 1-minute load of 2.15 before and 3.41 after, while `…T220516Z` measured
+9,891.4 ms at a *higher* captured 2.78, and the `/3` re-run measured 25,747.5 ms
+at 3.61 before and 5.73 after. A 1-minute average is not the quantity that
+determines how four cores are shared over a 26-second run.
 
 ### The quiet-host re-measure, and how quiet this host gets
 
@@ -238,7 +263,13 @@ The baseline is the largest peak among the four runs made under load
 (`…T170956Z`). Substituting the quiet-host run's marginally larger
 `1,304,858,624` moves the plus-swap total by ~412 KB against a 563 MB margin —
 0.01% of the ceiling — so which 1-page run is subtracted is not what the decision
-rests on.
+rests on. The same holds in the other direction and for a larger reason: the
+largest 1-page peak now committed, `1,309,020,160` (`…T000155Z`), raises the
+baseline by 7,872,512 B but shrinks the per-page term derived from the same
+subtraction, so the 80-page total it produces is 874,679 B *lower*, not higher. A
+baseline is subtracted twice in this arithmetic, once as a floor and once inside
+the slope, which is why the band above moves the margin by at most 0.02% of the
+ceiling.
 
 So `max_pdf_pages = 80` fits a 4 GiB device with ~13% margin on the strict(plus-swap) reading, **but the 80-page point itself was never run** — it is
 11% beyond the largest measurement. That is the residual risk of this ticket
@@ -307,9 +338,11 @@ it is pinned by records rather than by the file: the probe artifact carries
 `1700 × 2200` over `205,088` bytes, the committed `…T174114Z` page-3 record
 carries the same dimensions and byte count, and the re-render under the repaired
 harness (`…T204952Z`) produced `205,088` bytes again with
-`page_image_png_sha256 = 72b000ce49688014…`. The probe's subject and that hash
-name the same bytes because two renderings of the same fixture at the same DPI
-agreed, not because one file was hashed twice.
+`page_image_png_sha256 = 72b000ce49688014…`. Every re-run since carries that same
+digest — `…T220537Z`, `…T231154Z` and the `/3` run `…T000242Z` — so the pin holds
+across each harness revision on this branch rather than resting on one rendering.
+The probe's subject and that hash name the same bytes because renderings of the
+same fixture at the same DPI agreed, not because one file was hashed twice.
 
 Each artifact is three calls — chart presence, chart meaning, structured JSON —
 and every one of the nine calls succeeded. Per-call latency and provider-reported
@@ -390,13 +423,34 @@ can cut crop work without cutting page admission, and `validate` keeps the pair
 self-consistent. A config failure has no outward code (spec's closed list), so
 `AttachmentBudgetConfigError` is internal by contract.
 
-Tests: `tests/host/test_attachment_budgets.py`, 109 cases. The three
-deployed-bound cases bind `.env.example` to the two measured data files, so
-the numbers cannot drift from their evidence unnoticed:
+Tests: `tests/host/test_attachment_budgets.py`, 157 cases. The four
+input-class tables run against every one of the four keys rather than against
+one representative, so a rule enforced on three of them cannot pass. The
+deployed-bound cases bind `.env.example` and the gold manifest to the measured
+data files behind their numbers, so the numbers cannot drift from their evidence
+unnoticed:
 
 * `test_deployed_bounds_are_literals_with_no_shell_fallback`
+* `test_corpus_distribution_records_describe_the_committed_files`
+* `test_gold_manifest_describes_the_committed_fixtures`
+* `test_ink_screen_artifact_is_what_the_gold_manifest_cites`
 * `test_deployed_bounds_admit_every_file_in_the_measured_distribution`
 * `test_deployed_bounds_prepare_every_gold_case_in_one_run`
+
+The two `…describe_the_committed_…` cases hash the files behind the recorded
+sizes, because the caps were chosen from recorded byte counts and page counts,
+and a page count is only a statement about the bytes it was read out of.
+
+The two harness seams the review round touched got their own tests, since both
+are contracts the record quotes numbers through:
+`tests/host/test_g4_pipeline_gap_contract.py` (11 cases) drives the driver with
+doubles and asserts that an unanswered page rule, a failed OCR pass, a
+region-less document and an absent model cache each produce a `null` with a named
+error rather than a `false`, a `0` or a crash, and that a Docling page size is
+read from the document's page *values* rather than guessed;
+`tests/host/test_g4_vision_probe_classification.py` (19 cases) pins the probe's
+error classes, including that an unrelated 400 is never classified as an image
+refusal, and pins which prompt kind may carry which answer.
 
 ## Commands and results
 
@@ -428,6 +482,25 @@ the numbers cannot drift from their evidence unnoticed:
 | 24 | `scripts/g4_pipeline/run_measured.sh data/corpus/pdf/2023_FY_GOOG.pdf` then `… data/corpus/g4_attachment_gold/g4-mixed-chart-001.pdf`, serially, each with `/proc/loadavg`, `free -m` and `/proc/vmstat` captured around it | 0 / 0 | `results/serial_remeasure_20260925T220516Z.txt` plus the two run dirs it names; the quiet-host figures in *The quiet-host re-measure* |
 | 25 | `uv run --no-sync pytest -q tests/host/test_attachment_budgets.py` then `uv run --no-sync python -m py_compile scripts/g4_pipeline/driver.py scripts/g4_vision_probe.py scripts/g4_upload_distribution.py && bash -n scripts/g4_pipeline/run_measured.sh scripts/g4_pipeline/build.sh`, after committing the scanned and serial artifacts | 0 / 0 | 109 passed; the round's diff is records and artifacts only, so this is the unchanged-module guard rather than new evidence |
 | 26 | python one-liner: flatten each scanned run's first `measured.jsonl` tree to leaf paths, intersect, drop paths matching `memory_checkpoints\|latency\|t_monotonic\|vmhwm\|vmrss\|vmpeak\|vmss\|vmswap\|cgroup\|oom\|peak_rss\|swap`, compare the rest | 0 | 436 and 433 leaves, 312 content leaves, 0 differing — the measurement behind *measured twice* above |
+| 27 | `uv run --no-sync pytest -q tests/host/test_g4_pipeline_gap_contract.py tests/host/test_g4_vision_probe_classification.py` with both harness files swapped for their `HEAD` versions (the pre-repair `driver.py` and `g4_vision_probe.py`, restored and hash-checked after) | 1 | **RED**: 8 failed, 12 passed — the six gap-contract cases above (`AttributeError: module 'g4_vision_probe' has no attribute 'IMAGE_INPUT_REJECTED'` for the two probe cases) fail on `false` and `0` where the repair records a gap; the control case, which pins that the rule *is* asked with `image_count=0`, passes before and after, which is what makes the other five about the gap rather than about the call |
+| 28 | same two files against the repaired harness | 0 | 20 passed |
+| 29 | `uv run --no-sync pytest -q tests/host/test_attachment_budgets.py` | 0 | 156 passed, after the F-matrix was spread over all four keys and the two recorded-bytes guards were added |
+| 30 | `uv run --no-sync pytest -q tests/host` | 0 | 1927 passed, 60 skipped, 227 deselected in 97.13 s; the skips are the pre-existing `FIN_CHECKPOINT_URL` and `web/dist` gates |
+| 31 | `uv run --no-sync python -m py_compile scripts/g4_pipeline/driver.py scripts/g4_vision_probe.py scripts/g4_upload_distribution.py src/fin/host/attachment_budgets.py tests/host/test_attachment_budgets.py tests/host/test_g4_pipeline_gap_contract.py tests/host/test_g4_vision_probe_classification.py && bash -n scripts/g4_pipeline/run_measured.sh scripts/g4_pipeline/build.sh` | 0 | the repo's typecheck seam, after this round |
+| 32 | AST walk over the four changed modules counting control-flow depth and function length, with ESLint's `max-depth` statement set (`If`, `For`, `While` — not `Try`) | 0 | deepest nesting `3` in `driver.py:memory_snapshot()`, `2` in `attachment_budgets.py:preflight_run()`; no function in `attachment_budgets.py`, the module under test, is over 4 parameters. The S5 hard gate is nesting ≤ 4. *Leftovers* 15 is the whole-branch re-measurement of this row, and it is the one that carries the parameter counts for the scripts |
+| 33 | `scripts/g4_pipeline/run_measured.sh` on `data/corpus/pdf/2023_FY_GOOG.pdf`, then on `data/corpus/g4_attachment_gold/g4-mixed-chart-001.pdf` | 0 / 0 | `results/2023_FY_GOOG_20260925T231119Z*` and `results/g4-mixed-chart-001_20260925T231154Z*`, the two `/2` runs above, under the same `--memory=4g --memory-swap=4g --cpus=4` ceiling |
+| 34 | `scripts/g4_pipeline/run_measured.sh data/corpus/g4_attachment_gold/g4-image-chart-001.png` | 1 | the exit-code contract: the rejection meta is written as before and the script now exits non-zero instead of 0 |
+| 35 | `docker run --rm --entrypoint /bin/cat fin-g4-pipeline:t2a /opt/g4/tesseract_version.txt` (the same command `build.sh` now runs) | 0 | `tesseract 5.5.0`, `leptonica-1.84.1` → `results/image_tesseract_version.txt` |
+| 36 | `pdfimages -list` over all 13 `data/corpus/pdf/*.pdf`, and a re-render of all 629 pages at 50 dpi screened for fully-dark 5×5 and 9×9 blocks with numpy | 0 | one embedded image in each of the 4 AAPL filings and none in the other 9; 4 pages of 629 with a solid block, all four an AAPL cover page — the check that corrected the filing count in the gold manifest's `known_gaps[0]` |
+| 37 | `uv run --no-sync python -m py_compile scripts/g4_ink_screen.py && uv run --no-sync python scripts/g4_ink_screen.py`, twice | 0 / 0 | `data/corpus/g4_ink_screen.json`: 629 pages of 13 filings rendered at 50 dpi, 627 with material ink, 4 with any solid block, max 0.000398 (5×5) and 0.000116 (9×9), all four the AAPL cover pages. Both runs produced the same summary, so the screen is reproducible rather than a one-off reading |
+| 38 | `docker run --rm --entrypoint python fin-g4-pipeline:t2a -c "…print(DoclingDocument.model_fields['pages'].annotation, PageItem.model_fields, Size.model_fields)"` | 0 | `dict[int, PageItem]`, `['size', 'image', 'page_no']`, `['width', 'height']` — the pinned shape that made the old `for p in doc.pages: p.number` read nothing, and the field names the repaired reader uses |
+| 39 | `scripts/g4_pipeline/run_measured.sh` on `2023_FY_GOOG.pdf`, then on `g4-mixed-chart-001.pdf`, serially, each with `/proc/loadavg` captured around it | 0 / 0 | `results/2023_FY_GOOG_20260926T000155Z*` and `results/g4-mixed-chart-001_20260926T000242Z*`, the two `/3` runs; load 3.61 at entry, 5.73 and 6.37 at the two exits |
+| 40 | python one-liner: flatten each `/3` tree and its `/2` predecessor to leaf paths, drop timings and memory counters, compare the rest | 0 | 363 → 365 and 425 → 429 leaves; 246 and 300 content leaves; **0 differing** in both. The arriving keys are `docling_page_size_pt[i]` and `totals.wall_clock_ms` |
+| 41 | `scripts/g4_pipeline/run_measured.sh data/corpus/g4_attachment_gold/g4-image-chart-001.png`, exit status observed directly rather than through a wrapper | 1 | `results/g4-image-chart-001.png_20260926T001448Z.meta.json`: `json_lines = 0`, `container_exit_code = 1`, `docker_run_exit_code = 1`, every measurement `null` — the exit-code contract, re-observed after this round's edits to the same script |
+| 42 | `uv run --no-sync pytest -q tests/host/test_g4_pipeline_gap_contract.py tests/host/test_g4_vision_probe_classification.py tests/host/test_attachment_budgets.py` | 0 | 187 passed (11 + 19 + 157) |
+| 43 | `uv run --no-sync pytest -q tests/host` | 0 | 1938 passed, 60 skipped, 227 deselected in 108.46 s; the skips are the pre-existing `FIN_CHECKPOINT_URL` and `web/dist` gates |
+| 44 | `uv run --no-sync python -m py_compile scripts/g4_pipeline/driver.py scripts/g4_vision_probe.py scripts/g4_upload_distribution.py scripts/g4_ink_screen.py src/fin/host/attachment_budgets.py tests/host/test_attachment_budgets.py tests/host/test_g4_pipeline_gap_contract.py tests/host/test_g4_vision_probe_classification.py && bash -n scripts/g4_pipeline/run_measured.sh scripts/g4_pipeline/build.sh` | 0 | the repo's typecheck seam, after this round |
+| 45 | `python3 scripts/g4_ink_screen.py` again after decomposing `aggregate()` for the CC gate, then a `json.tool` diff of the old and new artifacts, then command 42's three files again | 0 / 0 / 0 | the only line that differs across the whole artifact is `measured_at_utc`; `summary` and all 629 `pages` entries compare equal, and 187 tests still pass. The decomposition is therefore shown to be complexity-only, which is the claim *Leftovers* 15 makes about it |
 
 Run 6 is the real-boundary check: it spawns the compiled iknow-memory stdio
 server (`/home/winner/projects/iknow-memory/dist/index.js`, built 2026-09-25)
@@ -476,7 +549,20 @@ directory, an aggregate file — is evidence for a figure in this document.
 
 Expectations are the committed `per_page` entries of
 `data/corpus/g4_attachment_gold/manifest.json`; actuals are the page records of
-`scripts/g4_pipeline/results/g4-mixed-chart-001_20260925T174114Z/g4-mixed-chart-001.measured.jsonl`.
+`scripts/g4_pipeline/results/g4-mixed-chart-001_20260926T000242Z/g4-mixed-chart-001.measured.jsonl`,
+the current-schema run, whose per-page `region_counts`,
+`native_text_char_count` and `pdf_image_objects` are identical to those of the
+first `/1` record `…T174114Z`.
+
+The two character columns are **not the same extraction**, which is why the ±11,
+−70 and ±3 differences below are not misses: the expected count is
+`native_text_chars`, defined by the manifest's `field_definitions` as the length
+of `pdftotext -f N -l N <fixture> -` output stripped of leading and trailing
+whitespace (poppler 26.01.0), while the actual count is the driver's
+`native_text_char_count`, the length of pypdfium2 5.13.0's `get_text_range()` for
+the same page. Two independent text extractors agree on all three pages to within
+6.0% (449 → 460, 1,181 → 1,111, 334 → 337); neither number is a claim about what
+*should* be extracted, so the comparison that matters is presence, not count.
 
 | page | expected | actual | verdict |
 | --- | --- | --- | --- |
@@ -694,6 +780,153 @@ Two runs prove this round moved no measurement:
   exactly what the ladder counted. Its total (19,082.5 ms against 31,823.1 ms)
   is the same host-load spread as the 1-page runs above, not a speed-up.
 
+### Review round: the gap rule applied to the harness's own three remaining gaps
+
+The rule "a reading that never happened is a gap, never a value" was already
+written into the driver, and the review found three places where a specific
+reading could still come out as a number:
+
+* A page whose image-object scan failed recorded `ocr_required_by_repo_rule =
+  false`, which reads as "the rule answered: no OCR needed" when the rule was
+  never asked. It is now tri-state — `true`, `false`, or `null` with the scan's
+  named error beside it — and `totals.harness_failures` names the page, because a
+  coverage count built on a page the rule could not see would silently under-price
+  the OCR term this record quotes for the scanned case.
+* A failed OCR pass left `ocr_text_char_count` at its initialised `0`, so one
+  page's failure read as an empty page. It is now `null` with `ocr_error_code`
+  and `ocr_error` carrying the reason, and the three totals that sum page values
+  (`pages_needing_ocr`, `native_text_chars_total`, `ocr_text_chars_total`) are
+  `null` when any page contributing to them is `null`: a total of a set with a
+  hole in it is not a total.
+* Counting Heron regions reached through `doc.texts / doc.tables /
+  doc.pictures` directly, so a docling version that moved a section off the
+  `Document` object would raise inside the counting code and take the whole
+  conversion record with it. The three reads are now the one place the pass can
+  fail, and a failure resets `status`, `page_count`, the region counts and the
+  per-page sizes to `null` rather than emitting a partial count as a zero. It is
+  the same shape of fix the model-cache identity needed: an absent cache reported
+  `cache_total_bytes = 0` for a directory that was never walked.
+
+Because those three change what a field *means*, the record's own schema string
+went from `fin.g4.t2a.pipeline_measurement/1` to `…/2`. The committed `/1`
+artifacts are not restated: every number this record quotes from them is a field
+whose value the repaired driver would produce identically, because in each of
+those runs the image-object scan succeeded, OCR either ran or was not triggered,
+and the region pass did not fail. The two re-runs below are the check on that
+claim rather than an argument for it.
+
+Two runs and one rejection under the repaired harness, at 1-minute load 2.15
+before, 2.84 between and 3.41 after — the floor band this host sits in while a
+session is open, the same band the serial re-measure was captured in.
+
+* `results/2023_FY_GOOG_20260925T231119Z*` (exit 0) against the recorded
+  `…T204930Z`: 363 leaf paths in each, none missing and none extra, and exactly
+  one content difference between the two trees — the `schema` string itself.
+  Every other difference is a timing or a memory counter.
+* `results/g4-mixed-chart-001_20260925T231154Z*` (exit 0) against the recorded
+  `…T204952Z`: 425 leaf paths in each, again differing only in `schema`.
+  `regions_total 24 / 0 / 2`, `pdf_image_objects 1 / 0 / 1`,
+  `native_text_chars_total = 1,908` and `pages_needing_ocr = 0` carry the same
+  values the `/1` record carries; total latency is `19,769.1 ms` against
+  `19,082.5 ms`, i.e. this host's usual spread.
+* `results/g4-image-chart-001.png_20260925T231351Z.meta.json` — the same non-PDF
+  rejection as `…T195253Z`, now with the exit-code contract attached to it: the
+  meta is still written with `json_lines = 0` and `null` for every unread field,
+  and the script exits 1 rather than 0.
+
+The last two findings of the round were about the harness's outward face rather
+than its fields. `run_measured.sh` wrote a measured record and exited 0 even when
+the container had failed on the way out, so a scripted caller could not tell a
+completed measurement from a captured partial one without opening the meta; it now
+names `docker_run_exit`, `container_exit` and any `state_error` on stderr and
+exits 1 while still writing the record, because under this harness a failed
+measurement is a result. And Tesseract, an apt package that appears nowhere in
+`pip freeze`, had no committed artifact for the `5.5.0` this record and
+`PIN_MANIFEST.md` both cite: `build.sh` now copies the image's own
+`/opt/g4/tesseract_version.txt` to
+`scripts/g4_pipeline/results/image_tesseract_version.txt`, which reads
+`tesseract 5.5.0` over `leptonica-1.84.1`.
+
+### Review round (2): a size lane that answered nothing
+
+The second dual-axis pass found four defects in the two harness scripts. None of
+them moves a bound, and the first of them is the reason this record had been
+citing one page-size extractor while a second, independent one sat empty:
+
+* `docling_page_sizes()` iterated `doc.pages` and read `.number` off each
+  element. `DoclingDocument.pages` is `dict[int, PageItem]`, so iterating the
+  mapping yields `int` page numbers, which have neither `number` nor `size`;
+  every attribute read fell back to `None` and the function returned `{}` for a
+  document that had converted successfully. Both `/2` runs show the result:
+  `totals.docling_page_count` answers `1` and `3` while every page's
+  `docling_page_size_pt` is `null`. The repaired function takes the mapping's
+  *values* and keys them by `page_no`, and reads `size.width` / `size.height` —
+  which is what the pinned library actually exposes, printed inside
+  `fin-g4-pipeline:t2a` rather than assumed: `DoclingDocument`'s `pages` field is
+  annotated `dict[int, PageItem]`, `PageItem.model_fields` is
+  `['size', 'image', 'page_no']` and `Size.model_fields` is
+  `['width', 'height']`. A page whose `size` is genuinely absent is left
+  unanswered and the gap is named in `totals.harness_failures` with how many
+  pages it covers, because "Docling found no size" and "this page's size was not
+  read" are different findings.
+* `verdicts()` gated the chart answers on "any kind that is not presence", so the
+  text-only control call — the one sent with no image, whose answer says nothing
+  about charts — could be recorded as `chart_meaning_answer`. The four prompt
+  kinds are now named constants and the chart-bearing pair is one tuple,
+  `_CHART_ANSWER_KINDS`, so the control cannot be mistaken for a witness.
+* `classify_error()` was one function of 17 branches, and its output is control
+  flow: one class aborts, one authorises the single retry, one sets
+  `supports_image_input`. It is now an ordered table of frozen `_ErrorRule` rows
+  (status set, exception-name cues, message cues, modality requirement),
+  first-match-wins, so a new class is a new row. The 11 pinned inputs classify
+  identically before and after, which is the check that this was a decomposition
+  rather than a change of meaning.
+* `memory_snapshot()` read four lanes in one body. It is now three helpers over
+  one shared `read_errors` list, bound in the original order, because the order
+  those messages appear in is part of a committed record's leaves.
+
+Two provenance fixes came with them. `totals.wall_clock_ms` records the span
+between the first and last memory snapshot, so the three-phase
+`total_latency_ms` sum cannot be read as the cost of a run: the `/3` GOOG run
+sums 25,747.5 ms inside a 38,299.0 ms span, and converter construction, model
+load and the file open are what the 12,551.5 ms between them is.
+`run_measured.sh` now writes the file's own name into `meta.pdf`
+(`file_info["name"]`, falling back to the basename) instead of the caller's
+absolute host path, which is a fact about this machine rather than about the run,
+and it carries four more mirrored keys (`oom_killed_source`,
+`slice_pass_enabled`, `harness_failures`, `wall_clock_ms`) through the existing
+`driver_keys` assertion, so a renamed total fails the run instead of summarising
+as `null`.
+
+Because a field that used to answer nothing now answers, and one field arrived,
+the record's schema went from `…/2` to `…/3`. Both changes were re-measured
+against the `/2` records, and the claim that the bump moved no measurement is a
+leaf-by-leaf comparison rather than an argument:
+
+| run | leaves `/2` → `/3` | content leaves | differing |
+| --- | --- | --- | --- |
+| `2023_FY_GOOG…T000155Z` | 363 → 365 | 246 | **0** |
+| `g4-mixed-chart-001…T000242Z` | 425 → 429 | 300 | **0** |
+
+The only key differences are the expected ones: `pages[i].docling_page_size_pt`
+leaves `null` (one leaf) for two leaves per page, and `totals.wall_clock_ms`
+arrives.
+
+What the revived lane answers is worth stating, because it is the corroboration
+this record's page-cap arithmetic has been missing: on every page of both runs
+Docling's own `docling_page_size_pt` is `[612.0, 792.0]`, exactly the `size_pt`
+pypdfium2 reported for the same pages, and the rendered raster is 1700 × 2200 px
+on both. Two libraries that share no code agree on the medium the DPI arithmetic
+rests on.
+
+Both runs were made at a host the previous sections already describe as
+contended — 1-minute load 3.61 at the start, 5.73 and 6.37 at the two exits — so
+they are cited here for the **size lane and the key tree**, and their millisecond
+figures are added to the population in *Measurement conditions*, not used to
+order anything. The rejection case was re-run in the same batch and the script's
+own exit status observed directly: `json_lines = 0`, `container_exit_code = 1`,
+and `run_measured.sh` exits 1 (`…T001448Z`).
+
 ## Not covered by this record
 
 * Preparation execution itself: no parse job, no thread lock release, no index
@@ -726,14 +959,25 @@ Two runs prove this round moved no measurement:
   they are now replaced by committed runs rather than withdrawn: CPU Tesseract at
   the pinned configuration appeared to burn of the order of ten minutes of CPU on
   page 1 of 3 and was still running when it was killed, which the measured
-  12–30 min/page render-plus-OCR pass confirms and sharpens. A separate
-  single-image run on a 1200 × 746 PNG — of the order of fifteen to twenty
-  minutes of wall time at about half of one core — is still committed with only
-  its command line and exit status
-  (`scripts/g4_pipeline/results/g4-image-chart-001_tesseract_20260925T174249Z/command.txt`)
-  and no timing. That is a bare-image OCR path, which the PDF-only harness does
-  not drive at all (*Leftovers* 7), so the two scanned-page runs do not speak for
-  it and it stays an observation, labelled as one.
+  render-plus-OCR pass confirms and sharpens — `…T185551Z` and `…T205348Z` cost
+  3,790,099.3 ms and 4,089,528.9 ms over 3 pages, i.e. 21.1 and 22.7 min per page.
+  A separate single-image run on a 1200 × 746 PNG is committed with more than its
+  command line and exit status: under
+  `scripts/g4_pipeline/results/g4-image-chart-001_tesseract_20260925T174249Z/`,
+  `command.txt` ends with `TESSERACT_EXIT=0` and `ocr.txt` carries what that run
+  answered — all four plotted values (`117,154 / 94,836 / 82,959 / 81,797`), both
+  sets of period labels and the source line. It carries no timing, and it is a
+  bare-image OCR path, which the PDF-only harness does not drive at all
+  (*Leftovers* 7), so the two scanned-page runs do not speak for the wall time and
+  that stays an observation, labelled as one.
+
+  What is not an observation is that this answer exists, because it is the only
+  committed witness for the *other* page-segmentation mode: the run passed
+  `--psm 6`, the mode the shipped engine does not use
+  (`src/fin/corpus/ocr.py:126` passes no `config`, so Tesseract's default mode 3
+  runs), and it read a filing chart completely from a crop-resolution raster in
+  one call. That is the shape of the choice *Leftovers* 4 owes T2d, and it is
+  evidence for the cheap side of it.
 * Whether Heron's figure boxes cover the charts a filing actually contains.
   `1 figure in 72 pages` of `2023_Q1_MSFT.pdf` against `55` table regions says
   the answer is *no* for this corpus, which is why the spec's full-page scan
@@ -830,3 +1074,70 @@ Two runs prove this round moved no measurement:
    decision: it is the first ticket that issues a retry call, and it must price
    retries against the run budget before any of the four values is authorised as
    the shipped default.
+10. **The probe's own spend rule is untested.** `scripts/g4_vision_probe.py`
+    caps a run at `MAX_REAL_CALLS = 8` and retries once, on a transport failure
+    only. Both are control flow over paid calls, and the 19 classification cases
+    pin *which* class a failure receives, not what the caller then does with it:
+    nothing asserts that an 9th call is refused or that
+    `auth_or_permission` aborts without retrying. T2e owns it, because T2e
+    re-runs the probe for the first time in a product path and can drive both
+    rules against a fake client without spending a call.
+11. **The structured answer shares a field with the prose answer.**
+    `chart_meaning_answer` carries whatever the meaning *and* the structured-JSON
+    calls returned, because the two kinds are one carrier
+    (`_CHART_ANSWER_KINDS`). Splitting them into a `structured_answer` field is
+    what would let a reader compare the model's prose against its own JSON, but
+    it changes a committed artifact's key tree and costs three paid calls to
+    re-record — and the probe's output is the evidence three budget rows are
+    priced from. T2e makes that trade when it re-runs the probe anyway.
+12. **`rendered_dpi` is a permanently empty lane, not a gap being repaired.**
+    pypdfium2 5.13.0 exposes no dpi on a `PdfBitmap`, so the field reads `null`
+    with `rendered_dpi_error` on every page of every future run, and the real
+    scale is the arithmetic `rendered_width_px / (size_pt / 72)`. The honest
+    options are to rename the field to what it is (a harness *input*, recorded
+    beside the pass rather than per page) or to derive it; either moves the key
+    tree again, so it is T2d's, which already owes this harness a region-scoped
+    OCR path.
+13. **A host that enforces swap will need this projection revisited.** The driver
+    reads cgroup v2 scalar limits and writes `-1` when the file says `max`, which
+    is how "unlimited" reaches the record as an integer. It is indistinguishable
+    from a literal `-1`, and every meta committed here carries `-1` for exactly
+    that reason (this WSL2 kernel does not enforce the swap half). On T2f's
+    device, `memory.swap.max` will answer a number; if the same writer keeps
+    running there, `-1` should become either that number or a named gap rather
+    than staying an integer standing for "unknown".
+14. **Two kinds of duplication are left standing, both pre-existing in shape.**
+    This diff adds a fourth `_sha256` helper (`tests/host/test_attachment_budgets.py`,
+    beside three in `src/fin/corpus/`) and a third `importlib` script loader
+    (the two new harness test files, beside `tests/host/test_jev_live_gate.py`).
+    Neither has a shared seam to point at: promoting a corpus digest helper for a
+    test's use would widen the product surface for test-only reasons, which is the
+    one thing the review's own hygiene rule forbids. The loaders belong in
+    `tests/conftest.py` and the digests in whichever module `src/fin/corpus/`
+    unifies them into — T2d touches both directories for other reasons and owns
+    the cleanup.
+15. **Two soft S5 review triggers are tripped, in two files, and no hard gate is.**
+    AST re-measurement of every script this diff ships or changes:
+
+    | file | lines | max CC | functions over 4 parameters |
+    | --- | --- | --- | --- |
+    | `scripts/g4_pipeline/driver.py` | 1,361 | 9 | `build_record` 15, `render_pages` 9, `run_slice_pass` 8, `_apply_page_ocr` 7, `build_totals` 6, `_slice_one_page` 6 |
+    | `scripts/g4_vision_probe.py` | 938 | **10** (`main`, `parse_args`) | `_record` 7, `summary_line` 5 |
+    | `scripts/g4_ink_screen.py` | 267 | 8 | none |
+    | `src/fin/host/attachment_budgets.py` | 226 | 6 | none |
+
+    `driver.py` is past the 1,000-line soft trigger and has been decomposed as far
+    as an honest field order allows: the remaining length is the record's own key
+    tree, which *is* the artifact, and the six wide-parameter functions are the
+    record builders and the measurement passes that thread a page index, a raster,
+    a ceiling and a failure list through to it. Nesting is 3 and no function is
+    over CC 10, so both hard gates hold. T2d's region-scoped OCR work is the next
+    hand on that file and owns splitting `build_record` for real reasons.
+
+    `g4_vision_probe.py:main` and `:parse_args` sit *exactly at* the CC 10 limit,
+    which is a threshold, not a margin: the next `if` in either is a hard-gate
+    failure, and T2e is about to add the retry and monetary-ceiling branches to
+    `main`. The same gate is why `g4_ink_screen.py:aggregate` was decomposed into
+    `_has_solid_block` and `_peaks` during this round — it measured CC 12 against
+    the limit of 10 when it was written, and the decomposition is the reason the
+    row above reads 8. The regeneration that followed it is command 45.
