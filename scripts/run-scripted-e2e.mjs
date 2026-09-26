@@ -60,6 +60,17 @@ const PROVIDER_ENV = [
   "FIN_RETRIEVE_ADAPTER",
 ];
 
+// The four attachment bounds, as `.env.example` ships them. This lane reads
+// no ./.env and starts uvicorn directly rather than through `serve()`, so
+// nothing else would tell the server its upload cap: without these the door
+// answers a config failure instead of a bound.
+const ATTACHMENT_BOUNDS = {
+  FIN_ATTACHMENT_MAX_BYTES: "4194304",
+  FIN_ATTACHMENT_MAX_PDF_PAGES: "80",
+  FIN_ATTACHMENT_VISION_CALLS_PER_RUN: "88",
+  FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN: "8",
+};
+
 const USAGE = `Usage: node scripts/run-scripted-e2e.mjs [options]
 
 Options:
@@ -149,6 +160,9 @@ function childEnv(port, deltaMs, scenario) {
   // on a lane with no MCP server. The lane drives no upload today, so
   // this is the port it would get if it ever did.
   env.FIN_RETRIEVE_ADAPTER = "fake";
+  for (const [key, value] of Object.entries(ATTACHMENT_BOUNDS)) {
+    if (!(key in env)) env[key] = value;
+  }
   if (deltaMs !== "") env.FIN_SCRIPTED_DELTA_MS = String(deltaMs);
   env.FIN_E2E_BASE_URL = `http://127.0.0.1:${port}`;
   return { env, dropped };

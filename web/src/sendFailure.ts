@@ -9,14 +9,20 @@
 // still gets a non-empty message rather than silence.
 
 import {
+  AttachmentUploadInProgressError,
   ConcurrentRunError,
   IngestMissingError,
   KnowledgeMcpFaultError,
 } from "./api";
+import { ATTACHMENT_UPLOAD_IN_PROGRESS_COPY } from "./attachFailure";
 import { KNOWLEDGE_MCP_FAULT_COPY } from "./knowledgeMcp";
 
 export type SendFailureKind =
-  "concurrent_run" | "knowledge_mcp_fault" | "ingest_missing" | "unknown";
+  | "concurrent_run"
+  | "knowledge_mcp_fault"
+  | "ingest_missing"
+  | "attachment_upload_in_progress"
+  | "unknown";
 
 export interface SendFailureNotice {
   kind: SendFailureKind;
@@ -25,6 +31,11 @@ export interface SendFailureNotice {
 
 export function classifySendFailure(error: unknown): SendFailureKind {
   if (error instanceof KnowledgeMcpFaultError) return "knowledge_mcp_fault";
+  // A held upload is neither a running turn nor an MCP fault: it is
+  // this client's own pre-flight of the host's send gate.
+  if (error instanceof AttachmentUploadInProgressError) {
+    return "attachment_upload_in_progress";
+  }
   if (error instanceof ConcurrentRunError) return "concurrent_run";
   if (error instanceof IngestMissingError) return "ingest_missing";
   return "unknown";
@@ -43,6 +54,11 @@ const INGEST_MISSING_COPY =
 const KNOWLEDGE_MCP_FAULT_SEND_COPY =
   `${KNOWLEDGE_MCP_FAULT_COPY}：检索服务连接不上，问题没有发出，` +
   "已经放回输入框，等服务恢复后再试。";
+// The held-upload refusal keeps the attach door's own sentence (one
+// SSOT in attachFailure.ts) and adds only the put-back the send path
+// owes the operator.
+const UPLOAD_IN_FLIGHT_SEND_COPY =
+  `${ATTACHMENT_UPLOAD_IN_PROGRESS_COPY}你的问题已经放回输入框。`;
 
 function unknownCopy(error: unknown): string {
   const detail = error instanceof Error ? error.message.trim() : "";
@@ -60,6 +76,8 @@ export function describeSendFailure(error: unknown): SendFailureNotice {
       return { kind, message: CONCURRENT_RUN_COPY };
     case "ingest_missing":
       return { kind, message: INGEST_MISSING_COPY };
+    case "attachment_upload_in_progress":
+      return { kind, message: UPLOAD_IN_FLIGHT_SEND_COPY };
     default:
       return { kind, message: unknownCopy(error) };
   }
@@ -71,6 +89,10 @@ export function describeSendFailure(error: unknown): SendFailureNotice {
 const KNOWLEDGE_MCP_FAULT_CREATE_COPY =
   `${KNOWLEDGE_MCP_FAULT_COPY}：检索服务连接不上，` +
   "新建不了 thread。等服务恢复后再试。";
+// A pending upload blocks a conversation START as well as a send, and
+// the refusal is neither of the two faults above.
+const UPLOAD_IN_FLIGHT_CREATE_COPY =
+  "还有附件正在上传，先等上传完成再新建 thread。";
 
 function unknownCreateCopy(error: unknown): string {
   const detail = error instanceof Error ? error.message.trim() : "";
@@ -85,6 +107,9 @@ export function describeThreadCreateFailure(error: unknown): SendFailureNotice {
   const kind = classifySendFailure(error);
   if (kind === "knowledge_mcp_fault") {
     return { kind, message: KNOWLEDGE_MCP_FAULT_CREATE_COPY };
+  }
+  if (kind === "attachment_upload_in_progress") {
+    return { kind, message: UPLOAD_IN_FLIGHT_CREATE_COPY };
   }
   return { kind, message: unknownCreateCopy(error) };
 }

@@ -103,7 +103,9 @@ def test_apply_dotenv_twice_is_idempotent(tmp_path: Path) -> None:
     assert environ == {"FIN_MODEL": "once"}
 
 
-def test_serve_applies_dotenv_before_uvicorn(monkeypatch) -> None:
+def test_serve_applies_dotenv_before_uvicorn(
+    monkeypatch, deployed_attachment_bounds
+) -> None:
     order: list[str] = []
 
     def _dotenv() -> Path | None:
@@ -196,7 +198,7 @@ def test_boot_probe_silent_when_adapter_is_not_mcp(
 
 
 def test_serve_warns_about_unreachable_mcp_and_still_serves(
-    tmp_path: Path, monkeypatch, caplog
+    tmp_path: Path, monkeypatch, caplog, deployed_attachment_bounds
 ) -> None:
     """``fin-serve`` boot publishes 缺, logs the WARNING, keeps booting.
 

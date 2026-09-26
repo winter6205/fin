@@ -152,16 +152,24 @@ interface WorkspaceState {
   // reload needs no argument. ``intervalMs`` is the poll cadence,
   // injectable so tests advance the schedule without real waiting.
   loadIngestJob: (jobId?: string, intervalMs?: number) => Promise<void>;
-  // ADRs 0047/0086: the attach door. Uploads to
+  // ADRs 0047/0089: the attach door. Uploads raw bytes to
   // the thread-attach endpoint and folds the minted record (status
-  // "parsing") into the thread's attachment slice; NEVER touches the
-  // ingest endpoint — the doors must not cross.
+  // "uploaded") into the thread's attachment slice; NEVER touches the
+  // ingest endpoint — the doors must not cross. While the POST is
+  // in flight it is recorded in ``pendingUploads``, which is what
+  // holds the send and new-conversation gate.
   attachFile: (threadId: string, file: File) => Promise<ThreadAttachment>;
   // Attachments live for the WHOLE thread, not one turn: the slice
   // below mirrors the thread's current records, and the ready states
   // (parsing → ready / failed) are only observable by re-reading the
   // list, hence the polling in ``loadAttachments``.
   attachments: ThreadAttachment[];
+  // In-flight upload POSTs, counted per thread. A record does not exist
+  // on ``attachments`` until its POST answers, so the send gate cannot
+  // be read off the attachment list — this slice is the one place the
+  // client knows an upload is still running. Cleared per upload when
+  // its POST settles, success or refusal.
+  pendingUploads: Record<string, number>;
   // Seed the slice for the thread the Composer opens and keep it
   // fresh while anything is "parsing". ``intervalMs`` is the poll
   // cadence, injectable so tests advance the schedule without real
@@ -398,6 +406,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   filingMonitorError: null,
   stoppingThreadId: null,
   attachments: [],
+  pendingUploads: {},
   ingestJobId: null,
   ingestAccepted: null,
   ingestJob: null,
@@ -467,6 +476,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   async createThread(firstMessage: string | null) {
+    // Starting a conversation is gated by the SAME condition as a send:
+    // an upload still writing its bytes belongs to no thread yet.
+    refuseUploadInFlight(get().pendingUploads);
     const created = await api.createThread(firstMessage);
     set((s) => ({ threads: [created, ...s.threads] }));
     return created.id;
@@ -502,6 +514,11 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     if (gate && gate.id === threadId && hasPendingChoiceWindow(gate.turns)) {
       throw new api.ConcurrentRunError("concurrent_run");
     }
+    // Upload gate: no conversation sends while ANY composer upload is in
+    // flight, including a file the question does not name (its record
+    // does not exist yet). The host refuses on the same condition;
+    // deciding it here keeps a doomed POST off the wire.
+    refuseUploadInFlight(get().pendingUploads);
     set({ sendingQuestion: true });
 
     // T3: optimistic turn the SSE frames thread into. Allocated
@@ -978,27 +995,50 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   async attachFile(threadId: string, file: File) {
-    // ADR 0086: the POST answers while the host is
-    // still parsing, so the minted record enters the slice as
-    // ``parsing`` and the readiness poll starts. Deliberately does
-    // NOT touch /api/corpus/ingest — the two doors must not cross.
-    const attachment = await api.attachToThread(threadId, file);
-    if (get().activeThread?.id === threadId) {
-      set((s) => ({
-        attachments: [
-          // A re-upload of the same id (retry races a poll) replaces
-          // rather than duplicates the record.
-          ...s.attachments.filter(
-            (a) => a.attachment_id !== attachment.attachment_id,
-          ),
-          attachment,
-        ],
-      }));
+    // ADR 0089: the POST answers once the raw bytes are durable, so the
+    // minted record enters the slice as ``uploaded`` and NO readiness
+    // poll starts — that row only moves when a graph turn asks for
+    // preparation. Deliberately does NOT touch /api/corpus/ingest: the
+    // two doors must not cross.
+    //
+    // The upload is counted in ``pendingUploads`` for exactly the window
+    // in which no record exists yet to be read off the attachment list,
+    // which is the window the send gate has to cover.
+    set((s) => ({
+      pendingUploads: {
+        ...s.pendingUploads,
+        [threadId]: (s.pendingUploads[threadId] ?? 0) + 1,
+      },
+    }));
+    try {
+      const attachment = await api.attachToThread(threadId, file);
+      if (get().activeThread?.id === threadId) {
+        set((s) => ({
+          attachments: [
+            // A re-upload of the same id (retry races a poll) replaces
+            // rather than duplicates the record.
+            ...s.attachments.filter(
+              (a) => a.attachment_id !== attachment.attachment_id,
+            ),
+            attachment,
+          ],
+        }));
+      }
+      if (attachment.status === "parsing") {
+        startAttachmentPolling(threadId);
+      }
+      return attachment;
+    } finally {
+      set((s) => {
+        const next = { ...s.pendingUploads };
+        const remaining = (next[threadId] ?? 1) - 1;
+        // Drop the key at zero: a settled upload must never leave a
+        // count that keeps the composer locked.
+        if (remaining > 0) next[threadId] = remaining;
+        else delete next[threadId];
+        return { pendingUploads: next };
+      });
     }
-    if (attachment.status === "parsing") {
-      startAttachmentPolling(threadId);
-    }
-    return attachment;
   },
 
   async loadAttachments(threadId, intervalMs = ATTACHMENT_POLL_INTERVAL_MS) {
@@ -1143,18 +1183,31 @@ function patchTurnByRunIdOn(
   });
 }
 
-// ----- ADR 0086: readiness polling -----
+// ----- ADR 0089: readiness polling -----
 //
-// The attach door answers 200 while preparation still runs, so the
-// only way the SPA learns parsing → ready / failed is re-reading the
-// thread's list. One poller chain exists at a time, keyed by thread:
-// opening another thread replaces it, and a read that finds nothing
-// ``parsing`` stops the chain (the next open / attach / retry
-// restarts it). ``intervalMs`` threads through the chain as a
+// Preparation runs off the request, so the only way the SPA learns
+// parsing → ready / failed is re-reading the thread's list. An
+// ``uploaded`` record is NOT work in progress: preparation begins when a
+// grounded graph turn asks for it, so polling an upload row would spin on
+// a state that cannot change by itself. One poller chain exists at a time,
+// keyed by thread: opening another thread replaces it, and a read that
+// finds nothing ``parsing`` stops the chain (the next open / attach /
+// retry restarts it). ``intervalMs`` threads through the chain as a
 // parameter so tests advance a fake schedule instead of really
 // waiting.
 
 const ATTACHMENT_POLL_INTERVAL_MS = 2000;
+
+/** A record the host may still move without a client action: bytes
+ * waiting for a graph turn to request preparation (``uploaded``), or
+ * preparation running (``parsing``). Only ``parsing`` is work in
+ * progress the poll can follow to an answer; ``ready`` and ``failed``
+ * are terminal for the list. */
+function isUnsettledAttachment(attachment: ThreadAttachment): boolean {
+  return (
+    attachment.status === "uploaded" || attachment.status === "parsing"
+  );
+}
 
 /**
  * The thread's attachment list, or ``null`` when the door refused.
@@ -1228,14 +1281,15 @@ async function attachmentPollTick(
     return;
   }
   // A list read issued before a concurrent attach can answer WITHOUT
-  // the just-minted record; dropping its chip would hide a live parse
-  // until the next manual open, so locally-known ``parsing`` records
-  // the stale response has not seen are carried over. Terminal
-  // statuses are never carried — the server list is authoritative
-  // for them.
+  // the just-minted record; dropping its chip would hide a live
+  // attachment until the next manual open, so locally-known records the
+  // stale response has not seen are carried over. ``uploaded`` counts:
+  // an upload that starts no poll of its own would otherwise vanish
+  // until the next open. Terminal statuses are never carried — the
+  // server list is authoritative for them.
   const seen = new Set(attachments.map((a) => a.attachment_id));
   const carried = current.attachments.filter(
-    (a) => a.status === "parsing" && !seen.has(a.attachment_id),
+    (a) => isUnsettledAttachment(a) && !seen.has(a.attachment_id),
   );
   const merged = [...attachments, ...carried];
   useWorkspaceStore.setState({ attachments: merged });
@@ -1382,13 +1436,42 @@ function forgetPersistedIngestJobIdIf(jobId: string): void {
 }
 
 /**
+ * The one rule for whether a conversation may start or send.
+ *
+ * ``true`` while any upload POST is in flight on any thread. It reads the
+ * store's ``pendingUploads`` slice, not the attachment list: during that
+ * window the record does not exist yet, so the list cannot answer. Both
+ * doors use it — ``sendQuestion`` / ``createThread`` refuse with the named
+ * ``attachment_upload_in_progress`` failure, and the Composer puts it in
+ * ``busy`` so the button and Enter are blocked, not only the picker.
+ * A file the question never mentions still blocks the send, because the
+ * gate is about the upload, not about the reference.
+ */
+export function hasUploadInFlight(
+  pendingUploads: Readonly<Record<string, number>>,
+): boolean {
+  return Object.values(pendingUploads).some((count) => count > 0);
+}
+
+/** One throw for both doors, so the refusal cannot drift between them. */
+function refuseUploadInFlight(
+  pendingUploads: Readonly<Record<string, number>>,
+): void {
+  if (hasUploadInFlight(pendingUploads)) {
+    throw new api.AttachmentUploadInProgressError();
+  }
+}
+
+/**
  * The one rule for what a send may reference, and what it deliberately
  * did not.
  *
  * Only a ``ready`` attachment is named: the thread keeps every attachment
- * for its whole life, so a question that never mentioned the still-parsing
+ * for its whole life, so a question that never mentioned a not-yet-citable
  * one must not be refused on its account (spec: an unrelated question can
- * still use ready sources). ``withheld`` is the other half of the contract —
+ * still use ready sources). ``uploaded`` is withheld for the same reason
+ * ``parsing`` is — its bytes are stored but nothing is parsed or indexed
+ * yet. ``withheld`` is the other half of the contract —
  * the control renders it, so a record left out of a run is always said out
  * loud rather than silently dropped.
  */

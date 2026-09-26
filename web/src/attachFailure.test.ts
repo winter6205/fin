@@ -1,17 +1,21 @@
 // corpus-serve-ingest T5: the attach door's named failures must
-// surface as ordinary-person copy. The copy for size / binary-type
-// rejections points at the corpus-ingest door — the two doors stay
-// distinguishable (ADR 0047).
+// surface as ordinary-person copy. The copy for the oversize
+// rejection points at the corpus-ingest door — the two doors stay
+// distinguishable (ADR 0047). A non-text rejection no longer comes
+// from the upload door (raw bytes are stored), so its copy describes
+// a stored file whose content cannot be parsed here.
 //
 // ADR 0086 adds the lifecycle half: the chip
-// labels (parsing / ready / failed + named reason) and the send
-// refusal ``attachment_not_ready`` all render through this module,
+// labels (uploaded / parsing / ready / failed + named reason) and the
+// send refusal ``attachment_not_ready`` all render through this module,
 // and NONE of the async-state copy may borrow 入库 vocabulary —
 // the failure is the attachment's own.
 
 import { describe, expect, it } from "vitest";
 import { AttachFailedError } from "./api";
 import {
+  ATTACH_ONE_FILING_HINT,
+  ATTACH_UPLOAD_IN_FLIGHT_HINT,
   describeAttachFailure,
   describeAttachmentFailureReason,
   describeAttachmentStatus,
@@ -62,9 +66,38 @@ describe("describeAttachFailure", () => {
     }
   });
 
-  it("points binary-format rejections at the corpus-ingest door", () => {
+  it("says the accepted file cannot be parsed here without claiming a text-only door", () => {
+    // Upload stores raw bytes, so this code can now only come from
+    // preparation: the file WAS accepted. The old copy told the
+    // operator the door refuses everything but text, which is the
+    // opposite of the contract.
     const notice = describeAttachFailure(attachError("attachment_not_text"));
-    expect(notice.message).toContain("入库");
+    expect(notice.message).toContain("已收下");
+    expect(notice.message).toContain("解析");
+    expect(notice.message).not.toContain("只支持文本");
+    expect(notice.message).not.toContain("PDF / Word / Excel");
+  });
+
+  it("keeps a still-renderable mapping for the retired non-text rejection", () => {
+    // An older host answers this at upload; the code must not fall
+    // through to the generic "没有上传" copy, which would claim the
+    // bytes are gone when they are stored.
+    const notice = describeAttachFailure(attachError("attachment_not_text"));
+    expect(notice.kind).toBe("attachment_not_text");
+    expect(notice.message).not.toContain("没有上传");
+  });
+
+  it("names the send/new-thread refusal for an upload still in flight", () => {
+    const notice = describeAttachFailure(
+      attachError("attachment_upload_in_progress"),
+    );
+    expect(notice.kind).toBe("attachment_upload_in_progress");
+    expect(notice.message).toContain("正在上传");
+    // The upload is running, not refused: the generic 「没有上传」 copy
+    // would claim the bytes are gone.
+    expect(notice.message).not.toContain("没有上传");
+    // An in-flight upload is not an ingest business (SC4).
+    expect(notice.message).not.toContain("入库");
   });
 
   it("points oversize rejections at the corpus-ingest door too", () => {
@@ -77,7 +110,6 @@ describe("describeAttachFailure", () => {
     // must not tell the operator to open the 知识库 page by name.
     for (const code of ["attachment_too_large", "attachment_not_text"]) {
       const notice = describeAttachFailure(attachError(code));
-      expect(notice.message).toContain("入库");
       expect(notice.message).not.toContain("知识库");
     }
   });
@@ -118,7 +150,11 @@ describe("describeAttachFailure", () => {
 
 describe("describeAttachmentStatus (readiness chip)", () => {
   it("labels each lifecycle state distinctly and non-empty", () => {
+    // ``uploaded`` is a real state the operator must not read as
+    // citable: raw bytes are durable, preparation has not even been
+    // requested. Four states, four distinct labels.
     const labels = [
+      describeAttachmentStatus(attachment({ status: "uploaded" })),
       describeAttachmentStatus(attachment({ status: "parsing" })),
       describeAttachmentStatus(attachment({ status: "ready" })),
       describeAttachmentStatus(
@@ -127,6 +163,15 @@ describe("describeAttachmentStatus (readiness chip)", () => {
     ];
     for (const label of labels) expect(label.trim().length).toBeGreaterThan(0);
     expect(new Set(labels).size).toBe(labels.length);
+  });
+
+  it("does not read an uploaded record as citable or as already parsing", () => {
+    const uploaded = describeAttachmentStatus(
+      attachment({ status: "uploaded" }),
+    );
+    expect(uploaded).toContain("已上传");
+    expect(uploaded).not.toContain("可引用");
+    expect(uploaded).not.toContain("解析中");
   });
 
   it("names the failure reason on a failed record", () => {
@@ -165,6 +210,36 @@ describe("describeAttachmentFailureReason", () => {
       expect(describeAttachmentFailureReason(reason).length).toBeGreaterThan(
         0,
       );
+    }
+  });
+});
+
+describe("composer attach copy", () => {
+  it("says one large filing per turn is what fits the run budget", () => {
+    // A turn carrying two max-size attachments cannot fit the
+    // configured vision run budget, so the composer says so up front.
+    expect(ATTACH_ONE_FILING_HINT).toContain("一轮");
+    expect(ATTACH_ONE_FILING_HINT).toContain("预算");
+  });
+
+  it("states no size or call bound — the server owns those", () => {
+    expect(ATTACH_ONE_FILING_HINT).not.toMatch(/[0-9]/);
+    expect(ATTACH_UPLOAD_IN_FLIGHT_HINT).not.toMatch(/[0-9]/);
+  });
+
+  it("names the in-flight upload as the reason the send is held", () => {
+    expect(ATTACH_UPLOAD_IN_FLIGHT_HINT).toContain("上传");
+    expect(ATTACH_UPLOAD_IN_FLIGHT_HINT).toContain("发送");
+  });
+
+  it("never claims the attach door takes text only", () => {
+    // Formats the door used to refuse are ordinary uploads now.
+    for (const copy of [
+      ATTACH_ONE_FILING_HINT,
+      ATTACH_UPLOAD_IN_FLIGHT_HINT,
+    ]) {
+      expect(copy.trim().length).toBeGreaterThan(0);
+      expect(copy).not.toContain("只支持文本");
     }
   });
 });

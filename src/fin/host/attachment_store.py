@@ -54,9 +54,14 @@ class AttachmentThreadGoneError(AttachmentStoreError):
 # ----- records -----
 
 
-AttachmentStatus = Literal["parsing", "ready", "failed"]
+AttachmentStatus = Literal["uploaded", "parsing", "ready", "failed"]
 
-_STATUSES: tuple[AttachmentStatus, ...] = ("parsing", "ready", "failed")
+_STATUSES: tuple[AttachmentStatus, ...] = (
+    "uploaded",
+    "parsing",
+    "ready",
+    "failed",
+)
 
 
 @dataclass(frozen=True)
@@ -115,7 +120,7 @@ class AttachmentStore(Protocol):
         sha256: str,
         object_key: str,
     ) -> AttachmentRecord:
-        """Write the metadata row for an accepted upload in ``parsing``.
+        """Write the metadata row for an accepted upload in ``uploaded``.
 
         ``version`` starts at 0 with no derived data. Raises
         :class:`AttachmentThreadGoneError` when ``thread_id`` is not a live
@@ -205,7 +210,9 @@ class AttachmentStore(Protocol):
         """Attachments that must be resumed or rebuilt before they are usable.
 
         Covers ``parsing`` rows and any ``ready`` row whose parsed units or
-        index postings for the current version are missing.
+        index postings for the current version are missing. ``uploaded``
+        rows are deliberately NOT here: they hold durable bytes nobody has
+        asked to prepare, and a restart must not start work on them.
         """
         ...
 
@@ -273,7 +280,7 @@ def _new_record(
     sha256: str,
     object_key: str,
 ) -> AttachmentRecord:
-    """Build the ``parsing`` baseline row both implementations persist.
+    """Build the ``uploaded`` baseline row both implementations persist.
 
     WHY one builder: every derived write is only safe if the row it addresses
     started from the same closed baseline (no version, no units, no index),
@@ -299,7 +306,7 @@ def _new_record(
         size_bytes=size_bytes,
         sha256=sha256,
         object_key=object_key,
-        status="parsing",
+        status="uploaded",
         version=0,
         unit_count=0,
         indexed=False,

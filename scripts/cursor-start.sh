@@ -45,4 +45,16 @@ export FIN_BASE_URL="${FIN_BASE_URL:-https://api.minimaxi.com/v1}"
 export FIN_MODEL="${FIN_MODEL:-MiniMax-M3}"
 export FIN_CHECKPOINT_URL="${FIN_CHECKPOINT_URL:-postgresql://fin:fin@localhost:5432/fin?sslmode=disable}"
 
+# --------------------------------------------------------------------
+# Attachment boot bounds
+# --------------------------------------------------------------------
+# serve() reads all four bounds before it binds a port, and this boot loads
+# no .env file, so a pod that injected none would not come up at all. These
+# are the .env.example values; an injected process variable still wins.
+log "attachment bounds defaults"
+export FIN_ATTACHMENT_MAX_BYTES="${FIN_ATTACHMENT_MAX_BYTES:-4194304}"
+export FIN_ATTACHMENT_MAX_PDF_PAGES="${FIN_ATTACHMENT_MAX_PDF_PAGES:-80}"
+export FIN_ATTACHMENT_VISION_CALLS_PER_RUN="${FIN_ATTACHMENT_VISION_CALLS_PER_RUN:-88}"
+export FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN="${FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN:-8}"
+
 log "ready"
