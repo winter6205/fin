@@ -2,6 +2,8 @@
 
 > 本文件是项目领域词汇的**单一事实源 (SSOT)**.
 > 仅 `domain-modeling` 技能可写; 其他技能按 `docs/agents/context-contract.md` 消费.
+>
+> Product identity disambiguation: see [`docs/wayfinder/product-identity.md`](wayfinder/product-identity.md) (fin is a knowledge-QA assistant, not a finance/research product).
 
 ---
 
@@ -10,8 +12,8 @@
 ### Product identity
 
 **fin**:
-An enterprise knowledge-base Agent (the 入口, not the 库): the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **grounded** track. First corpus is operator-held **资料** behind the **retrieve port**.
-_Avoid_: research-agent product, workspace-as-kind, 10-Q as the product name, Q&A API as the product, treating grounded-track contracts as the whole product personality, treating fin as a parallel corpus store or 库门
+An enterprise **knowledge-QA** agent (知识问答助手) (the 入口, not the 库): the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **grounded** track. First corpus is operator-held **资料** behind the **retrieve port**.
+_Avoid_: research-agent product, treating fin as a finance/financial-research assistant product (finance is only the current corpus domain, not the product identity), workspace-as-kind, 10-Q as the product name, Q&A API as the product, treating grounded-track contracts as the whole product personality, treating fin as a parallel corpus store or 库门
 
 **host agent**:
 fin as the LangGraph runtime that routes tracks and calls grounded-track tools behind the **retrieve port**; it is not the ranking or vector store.

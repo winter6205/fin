@@ -64,9 +64,16 @@ from __future__ import annotations
 import hashlib
 import threading
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Final, Literal, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Final,
+    Literal,
+    Mapping,
+    Sequence,
+)
 
 from fin.corpus.chunking import (
     DocumentChunking,
@@ -94,7 +101,7 @@ from fin.retrieve.invalidation_port.errors import (
 from fin.retrieve.invalidation_port.operation import invalidate_targets
 from fin.retrieve.invalidation_port.ledger import InvalidationLedger
 from fin.retrieve.push_batching import PushJournal, push_in_batches
-from fin.retrieve.push_port import PushPort
+from fin.retrieve.push_port import PushPort, frozen_content_identities
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from fin.corpus.ingest_state import IngestStateStore
@@ -284,7 +291,12 @@ class IngestEndpointResult:
     handed back for this batch (one per slice, in chunk order across
     envelopes — the unit the citation gate keys on after T1).
     ``written`` / ``duplicates`` come from the push outcome (SC18
-    idempotency accounting). ``invalidation`` is ``None`` when
+    idempotency accounting). ``content_identities`` comes straight off
+    the same push outcome: each pushed ``source_ref`` mapped to the
+    ``content_identity`` the service reported for it — the half of the
+    pair the index-job handoff submits, which fin never recomputes. It is
+    the batched run's own map, so it is read here and never written.
+    ``invalidation`` is ``None`` when
     nothing was stale; ``records`` is the full per-child record set
     so callers (tests, the future catalog seam, the invalidation
     path) can hand it back as ``previous_records``.
@@ -301,6 +313,14 @@ class IngestEndpointResult:
     duplicates: int
     records: tuple[PushRecord, ...]
     invalidation: InvalidationOutcome | None
+    content_identities: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "content_identities",
+            frozen_content_identities(self.content_identities),
+        )
 
 
 @dataclass(frozen=True)
@@ -691,6 +711,7 @@ class IngestEndpoint:
             duplicates=push_outcome.duplicates,
             records=records,
             invalidation=invalidation,
+            content_identities=push_outcome.content_identities,
         )
 
     def _invalidate_stale(
