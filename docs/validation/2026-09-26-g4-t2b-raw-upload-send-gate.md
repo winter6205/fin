@@ -314,6 +314,14 @@ These are in the default hermetic run, so command 1's `343 passed` and command
 2's `423 passed` include them; the live-door module does not exercise the gate
 because its uploads all complete before any send.
 
+The plan's acceptance class *"object-store exceptions with typed outcomes"* is
+held by the door itself rather than by the gate: `test_attach_store_write_failure_named_500`
+(`tests/host/test_thread_attach.py:552`) swaps in an object store whose `put`
+raises, and asserts the refusal is `500 {"error": "attachment_store_failed"}`
+(the mapping at `workspace_http.py:3018-3026`, logged, never a silent `200`)
+**and** that the thread owns no attachment record afterwards, so a later send
+cannot reference an id nothing ever stored.
+
 ## Defects found by the run, and what closed them
 
 **Defect 1 — the Postgres twin of the durability suite asserted the

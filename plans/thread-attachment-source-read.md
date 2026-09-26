@@ -74,7 +74,14 @@ OVERALL: PASS
    - **Surface:** fin thread attachment capability, workspace HTTP, and web composer/status.
    - **Acceptance:** upload completion is reported only after durable storage; it does not invoke parsing, OCR, layout, vision, or indexing; unsupported bytes remain uploadable for typed rejection during graph-triggered preparation. The current 2 MiB constant is replaced by T2a's finite measured setting: an upload at the cap is accepted, while declared or streamed bytes over it return named `attachment_too_large` (413) and leave neither a partial object nor attachment row. The composer displays `uploaded` distinctly from `ready`, and both composer and host block a send while any upload is pending, including a file not named in the message. Public-entry tests cover empty/malformed requests, unsupported bytes accepted as raw input, exact and one-byte-over size boundaries, duplicate/concurrent upload completion, and object-store exceptions with typed outcomes. T2b is also the boot-wiring obligation T2a deliberately left unconnected: the composition root reads all four bounds through `fin.host.attachment_budgets.from_environ`, so a missing, non-positive, or unbounded key fails startup, and a caller test asserts that startup aborts rather than serving with no bound. Preserve the delivered T1 validation evidence at [`docs/validation/2026-09-25-g4-t1-thread-attachment.md`](../docs/validation/2026-09-25-g4-t1-thread-attachment.md).
    - `[blocks: T1, T2a]`
-   - Status: [ ] pending
+   - Status: [x] delivered — merged to `main` as `fd5a1d5` (that pull request); per-clause evidence in
+     [`docs/validation/2026-09-26-g4-t2b-raw-upload-send-gate.md`](../docs/validation/2026-09-26-g4-t2b-raw-upload-send-gate.md).
+     One acceptance clause is **not** closed by real evidence and is recorded as
+     blocked, not passed: "upload completion is reported only after durable
+     storage" is proved on real Postgres rows over a real socket, but the bytes
+     rested on the in-memory adapter, so the durable object-store leg belongs to
+     the ticket that owns `FIN_OBJECT_STORE_URL`. `uploaded` also has no waiter
+     yet — nothing advances it to `parsing`/`ready` until T2f.
 
 4. **T2c — Tombstone single-attachment deletion** — tag: `[implementation]`
    - **Inherits:** spec: deletion tombstones the attachment version before cleanup; late parse/vision results cannot recreate data or `ready`; failed cleanup remains blocked and retriable.
