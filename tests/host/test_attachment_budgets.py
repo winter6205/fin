@@ -290,58 +290,46 @@ def test_config_error_names_the_offending_key_and_rejected_value() -> None:
 # ----- F: unbounded and non-numeric input classes -----
 
 
+@pytest.mark.parametrize("key", ALL_KEYS)
 @pytest.mark.parametrize(
-    ("value", "reason"),
+    "value",
     [
-        ("abc", "not a number at all"),
-        ("unlimited", "the unbounded word the contract rejects"),
-        ("inf", "infinity spelled"),
-        ("Infinity", "infinity spelled, capitalised"),
-        ("-inf", "negative infinity spelled"),
-        ("nan", "a NaN spelled"),
-        ("1.5", "a fraction of a page or byte"),
-        ("1e999", "scientific notation, which int() rejects outright"),
-        ("True", "a boolean word, capitalised"),
-        ("true", "a boolean word, lowercase"),
-        ("+10", "int() accepts the sign; canonical form here is unsigned"),
-        ("1_000", "int() accepts the PEP 515 underscore; rejected"),
-        ("１０", "full-width digits: int() and isdigit() both accept them"),
-        ("0x10", "a base-prefixed literal"),
-        (str(sys.maxsize + 1), "one past the host's finite integer bound"),
-    ],
-    ids=[
-        "abc",
-        "unlimited",
-        "inf",
-        "Infinity",
-        "negative_inf",
-        "nan",
-        "decimal_fraction",
-        "scientific_notation",
-        "capital_true",
-        "lowercase_true",
-        "plus_prefixed",
-        "underscore_separated",
-        "full_width_digits",
-        "hex_prefix",
-        "above_sys_maxsize",
+        pytest.param("abc", id="not-a-number"),
+        pytest.param("unlimited", id="the-unbounded-word-the-contract-rejects"),
+        pytest.param("inf", id="infinity-spelled"),
+        pytest.param("Infinity", id="infinity-spelled-capitalised"),
+        pytest.param("-inf", id="negative-infinity-spelled"),
+        pytest.param("nan", id="a-nan-spelled"),
+        pytest.param("1.5", id="a-fraction-of-a-page-or-byte"),
+        pytest.param("1e999", id="scientific-notation-int-rejects-outright"),
+        pytest.param("True", id="a-boolean-word-capitalised"),
+        pytest.param("true", id="a-boolean-word-lowercase"),
+        # int() accepts the sign; the canonical form here is unsigned.
+        pytest.param("+10", id="plus-prefixed"),
+        # int() accepts the PEP 515 underscore; rejected.
+        pytest.param("1_000", id="underscore-separated"),
+        # int() and isdigit() both accept these.
+        pytest.param("１０", id="full-width-digits"),
+        pytest.param("0x10", id="a-base-prefixed-literal"),
+        pytest.param(str(sys.maxsize + 1), id="one-past-the-hosts-finite-bound"),
     ],
 )
 def test_non_canonical_or_unbounded_values_fail_config_validation(
-    value: str, reason: str
+    key: str, value: str
 ) -> None:
     """The adjudication table for every class ``int()`` would swallow (F).
 
     Rule pinned: after trimming, the text must be one or more ASCII decimal
     digits — no sign, no base prefix, no separator, no non-ASCII digit — and
     the resulting integer must be positive and at or below ``sys.maxsize``.
-    The failure must name both the key and the rejected text, because an
-    operator reading a boot log has only that line to find the setting.
+    Every key carries the rule, so the table is run against all four. The
+    failure must name both the key and the rejected text, because an operator
+    reading a boot log has only that line to find the setting.
     """
     with pytest.raises(AttachmentBudgetConfigError) as excinfo:
-        _load({PAGES_KEY: value})
+        _load({key: value})
     message = str(excinfo.value)
-    assert PAGES_KEY in message
+    assert key in message
     assert value in message
 
 
@@ -561,14 +549,16 @@ def test_empty_admitted_run_passes_and_still_enforces_the_run_budget() -> None:
 
     A turn that makes no attachment eligible is the common path, so an empty
     list must validate; it must not short-circuit the remaining checks, so a
-    crop request past the whole run budget still fails. The exact subclass
-    for that last request is open (budget overflow versus an impossible
-    crop headroom), so the family error is asserted rather than guessing.
+    crop request past the whole run budget still fails. 89 requested crops over
+    the deployed bounds is past the crop headroom of 8 before it is ever a run
+    total, so the crop-bound refusal is the determined answer and is asserted as
+    such, message included.
     """
     budgets = _load()
     preflight_run(budgets, [], MAX_CROP_CALLS)
-    with pytest.raises(AttachmentBudgetError):
+    with pytest.raises(AttachmentVisionBudgetExceeded) as excinfo:
         preflight_run(budgets, (), MAX_VISION_CALLS + 1)
+    assert f"headroom is {budgets.max_vision_crop_calls_per_run}" in str(excinfo.value)
 
 
 # ----- L: immutability and load independence -----
