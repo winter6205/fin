@@ -1,7 +1,8 @@
 // The two upload doors on the workspace: the corpus-ingest door and
 // the thread-attach door (ADR 0047), plus the thread-attachment
-// lifecycle (ADR 0086: parsing / ready / failed, retry, persistence
-// across sends).
+// lifecycle (uploaded / parsing / ready / failed, retry, persistence
+// across sends) and the send + new-conversation gate that holds while
+// an upload POST is still in flight.
 //
 // Acceptance core: the ingest door (store.ingestFile) is the ONLY
 // path that calls POST /api/corpus/ingest; the attach door
@@ -9,24 +10,27 @@
 // POST /api/threads/{id}/attachments + /messages and NEVER the
 // ingest endpoint (ADR 0047: the doors must not cross).
 //
-// The attach door's promise changed's promise: the POST answers while the
-// host still parses (status "parsing"), the id stays referenceable
-// for the WHOLE thread (no single-use consumption), and a failed
-// preparation is retryable. These tests live at the store/api seam
-// because the web suite runs in a node environment (no DOM) — the
-// components are thin wrappers over exactly these actions. Timers
-// are faked for the whole file: the readiness poll is driven by
-// advancing a schedule, never by really waiting.
+// The attach door's promise: the POST answers once the raw bytes are
+// durable (status "uploaded") and starts NO preparation — the graph
+// turn does. The id stays referenceable for the WHOLE thread (no
+// single-use consumption), and a failed preparation is retryable.
+// These tests live at the store/api seam because the web suite runs
+// in a node environment (no DOM) — the components are thin wrappers
+// over exactly these actions. Timers are faked for the whole file:
+// the readiness poll is driven by advancing a schedule, never by
+// really waiting.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AttachFailedError,
   AttachmentNotReadyError,
+  AttachmentUploadInProgressError,
   IngestFailedError,
   type SendRequest,
 } from "./api";
 import {
   attachmentsForSend,
+  hasUploadInFlight,
   LAST_INGEST_JOB_KEY,
   useWorkspaceStore,
 } from "./store";
@@ -77,22 +81,30 @@ function fakeStorage(): Storage {
   };
 }
 
-// The POST 200 of the attach door: stored, not yet parsed. Every
-// attachment door answers with this same shape.
-const ATTACH_PARSED_LATER: ThreadAttachment = {
+// The POST 200 of the attach door: raw bytes stored durably, NO
+// preparation started. Every attachment door answers with this same
+// shape.
+const ATTACH_UPLOADED: ThreadAttachment = {
   attachment_id: "att-1",
   filename: "notes.md",
   size_bytes: 6,
   scope: "thread_attach",
-  status: "parsing",
+  status: "uploaded",
   version: 0,
   unit_count: 0,
   searchable: false,
   failure_reason: null,
 };
 
+// A record whose preparation the graph has already requested: the only
+// state the readiness poll follows.
+const ATTACH_PARSING: ThreadAttachment = {
+  ...ATTACH_UPLOADED,
+  status: "parsing",
+};
+
 const ATTACH_READY: ThreadAttachment = {
-  ...ATTACH_PARSED_LATER,
+  ...ATTACH_UPLOADED,
   status: "ready",
   version: 1,
   unit_count: 2,
@@ -100,7 +112,7 @@ const ATTACH_READY: ThreadAttachment = {
 };
 
 const ATTACH_FAILED: ThreadAttachment = {
-  ...ATTACH_PARSED_LATER,
+  ...ATTACH_UPLOADED,
   status: "failed",
   unit_count: 0,
   searchable: false,
@@ -113,9 +125,14 @@ interface RecordedCall {
   body: unknown;
 }
 
-/** Record every fetch and answer from ``handler``. */
+/** Record every fetch and answer from ``handler``. A handler may
+ * answer with a promise so a test can hold one request open — the
+ * in-flight upload the send gate has to see. */
 function stubFetch(
-  handler: (url: string, init: RequestInit | undefined) => Response,
+  handler: (
+    url: string,
+    init: RequestInit | undefined,
+  ) => Response | Promise<Response>,
 ): { calls: RecordedCall[] } {
   const calls: RecordedCall[] = [];
   vi.stubGlobal(
@@ -179,6 +196,7 @@ function seedThread(): void {
     sendingQuestion: false,
     resumingThreadId: null,
     attachments: [],
+    pendingUploads: {},
     ingestJobId: null,
     ingestAccepted: null,
     ingestJob: null,
@@ -511,7 +529,7 @@ describe("attach door (store.attachFile)", () => {
     const { calls } = stubFetch((url) =>
       url === LIST_URL
         ? jsonResponse({ attachments: [ATTACH_READY] })
-        : jsonResponse(ATTACH_PARSED_LATER),
+        : jsonResponse(ATTACH_UPLOADED),
     );
 
     const file = new File(["hello!"], "notes.md", { type: "text/markdown" });
@@ -521,11 +539,12 @@ describe("attach door (store.attachFile)", () => {
 
     expect(attachment.attachment_id).toBe("att-1");
     expect(attachment.scope).toBe("thread_attach");
-    // The door answers BEFORE preparation finished, and the
-    // record lands in the thread slice as ``parsing``.
-    expect(attachment.status).toBe("parsing");
+    // The door answers once the bytes are durable. Preparation has
+    // NOT started: the graph turn requests it, so the record lands in
+    // the thread slice as ``uploaded``.
+    expect(attachment.status).toBe("uploaded");
     expect(useWorkspaceStore.getState().attachments).toEqual([
-      ATTACH_PARSED_LATER,
+      ATTACH_UPLOADED,
     ]);
     const call = calls[0];
     expect(call.url).toBe(`${LIST_URL}?filename=notes.md`);
@@ -534,22 +553,49 @@ describe("attach door (store.attachFile)", () => {
     expect(new TextDecoder().decode(call.body as Uint8Array)).toBe("hello!");
   });
 
+  it("stores non-text bytes instead of refusing them", async () => {
+    // The upload door does not classify content, so a PDF — bytes the
+    // old door rejected with 400 — is stored and reported
+    // ``uploaded``; a typed rejection, if any, comes later from
+    // preparation.
+    seedThread();
+    const pdf = { ...ATTACH_UPLOADED, filename: "10-K.pdf" };
+    const { calls } = stubFetch((url) =>
+      url === LIST_URL
+        ? jsonResponse({ attachments: [] })
+        : jsonResponse(pdf),
+    );
+
+    const attachment = await useWorkspaceStore
+      .getState()
+      .attachFile(
+        THREAD_ID,
+        new File([new Uint8Array([0x25, 0x50, 0x44, 0x46, 0xff])], "10-K.pdf"),
+      );
+
+    expect(attachment.status).toBe("uploaded");
+    expect(attachment.filename).toBe("10-K.pdf");
+    const body = calls[0].body as Uint8Array;
+    expect(body).not.toBeInstanceOf(FormData);
+    expect(useWorkspaceStore.getState().attachments).toEqual([attachment]);
+  });
+
   it("throws the typed error carrying the named failure code", async () => {
     seedThread();
     stubFetch((url) =>
       url.startsWith(LIST_URL) && url !== LIST_URL
-        ? jsonResponse({ error: "attachment_not_text" }, 400)
+        ? jsonResponse({ error: "attachment_too_large" }, 413)
         : jsonResponse({}, 404),
     );
 
     const rejection = await useWorkspaceStore
       .getState()
-      .attachFile(THREAD_ID, new File(["\xff"], "image.bin"))
+      .attachFile(THREAD_ID, new File(["\xff"], "huge-10k.pdf"))
       .then(() => null)
       .catch((error: unknown) => error);
 
     expect(rejection).toBeInstanceOf(AttachFailedError);
-    expect((rejection as AttachFailedError).code).toBe("attachment_not_text");
+    expect((rejection as AttachFailedError).code).toBe("attachment_too_large");
   });
 });
 
@@ -559,7 +605,7 @@ describe("two doors never cross (acceptance)", () => {
     const { calls } = stubFetch((url) => {
       if (url === LIST_URL) return jsonResponse({ attachments: [] });
       if (url.includes("/attachments")) {
-        return jsonResponse(ATTACH_PARSED_LATER);
+        return jsonResponse(ATTACH_UPLOADED);
       }
       if (url.endsWith("/messages")) return sseRunResponse();
       return jsonResponse("[]"); // refreshThreads tail
@@ -605,13 +651,17 @@ describe("send gate: what a send may reference", () => {
   it("references only READY records, so an unrelated question is never refused", () => {
     const selection = attachmentsForSend([
       { ...ATTACH_READY, attachment_id: "ready-1" },
-      { ...ATTACH_PARSED_LATER, attachment_id: "parsing-1" },
+      { ...ATTACH_UPLOADED, attachment_id: "uploaded-1" },
+      { ...ATTACH_PARSING, attachment_id: "parsing-1" },
       { ...ATTACH_FAILED, attachment_id: "failed-1" },
     ]);
     expect(selection.ids).toEqual(["ready-1"]);
     // What was left out stays visible with its reason — the rule may never
-    // drop a record silently.
+    // drop a record silently. An ``uploaded`` record is left out: its
+    // bytes are stored but nothing is parsed or indexed yet, so it is
+    // not citable.
     expect(selection.withheld.map((a) => a.attachment_id)).toEqual([
+      "uploaded-1",
       "parsing-1",
       "failed-1",
     ]);
@@ -626,7 +676,7 @@ describe("send gate: what a send may reference", () => {
     useWorkspaceStore.setState({
       attachments: [
         ATTACH_READY,
-        { ...ATTACH_PARSED_LATER, attachment_id: "att-2" },
+        { ...ATTACH_PARSING, attachment_id: "att-2" },
         ATTACH_FAILED,
       ],
     });
@@ -675,10 +725,10 @@ describe("attachment lifecycle (ADR 0086)", () => {
         reads += 1;
         // First read still parsing, second read ready.
         return jsonResponse({
-          attachments: [reads >= 2 ? ATTACH_READY : ATTACH_PARSED_LATER],
+          attachments: [reads >= 2 ? ATTACH_READY : ATTACH_PARSING],
         });
       }
-      return jsonResponse(ATTACH_PARSED_LATER);
+      return jsonResponse(ATTACH_PARSING);
     });
 
     await useWorkspaceStore
@@ -708,7 +758,7 @@ describe("attachment lifecycle (ADR 0086)", () => {
           attachments: reads >= 2 ? [ATTACH_READY] : [],
         });
       }
-      return jsonResponse(ATTACH_PARSED_LATER);
+      return jsonResponse(ATTACH_PARSING);
     });
 
     await useWorkspaceStore
@@ -716,7 +766,7 @@ describe("attachment lifecycle (ADR 0086)", () => {
       .attachFile(THREAD_ID, new File(["hello!"], "notes.md"));
     await vi.advanceTimersByTimeAsync(2000);
     expect(useWorkspaceStore.getState().attachments).toEqual([
-      ATTACH_PARSED_LATER,
+      ATTACH_PARSING,
     ]);
 
     await vi.advanceTimersByTimeAsync(2000);
@@ -725,18 +775,18 @@ describe("attachment lifecycle (ADR 0086)", () => {
     expect(reads).toBe(2);
   });
 
-  it("retry re-runs preparation, follows the record to ready, and names an unknown id", async () => {
+  it("retry answers a settled record, and a settled record starts no poll", async () => {
     seedThread();
     useWorkspaceStore.setState({ attachments: [ATTACH_FAILED] });
     const retryUrl = `${LIST_URL}/att-1/retry`;
+    let listReads = 0;
     const { calls } = stubFetch((url) => {
       if (url === retryUrl) {
-        return jsonResponse({ ...ATTACH_PARSED_LATER, version: 2 });
+        return jsonResponse({ ...ATTACH_READY, version: 2 });
       }
       if (url === LIST_URL) {
-        return jsonResponse({
-          attachments: [{ ...ATTACH_READY, version: 2 }],
-        });
+        listReads += 1;
+        return jsonResponse({ attachments: [{ ...ATTACH_READY, version: 2 }] });
       }
       return jsonResponse({ error: "attachment_not_found" }, 400);
     });
@@ -744,13 +794,27 @@ describe("attachment lifecycle (ADR 0086)", () => {
     await useWorkspaceStore.getState().retryAttachment(THREAD_ID, "att-1");
     const retried = calls.find((c) => c.url === retryUrl);
     expect(retried?.method).toBe("POST");
-    expect(useWorkspaceStore.getState().attachments[0].status).toBe("parsing");
-
-    await vi.advanceTimersByTimeAsync(2000);
+    // The door runs preparation INSIDE the request, so the record it
+    // hands back is already FINAL: citable, at the new version, patched
+    // straight into the slice.
     expect(useWorkspaceStore.getState().attachments[0]).toEqual({
       ...ATTACH_READY,
       version: 2,
     });
+    // And nothing left to follow: a settled record cannot move by
+    // itself, so retry issues no list read behind it.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(listReads).toBe(0);
+
+    // The other settled answer the door gives: a re-drive that fails
+    // again is the record's own named failure, never a stuck chip.
+    stubFetch((url) =>
+      url === retryUrl
+        ? jsonResponse(ATTACH_FAILED)
+        : jsonResponse({ error: "attachment_not_found" }, 400),
+    );
+    await useWorkspaceStore.getState().retryAttachment(THREAD_ID, "att-1");
+    expect(useWorkspaceStore.getState().attachments[0]).toEqual(ATTACH_FAILED);
 
     // A deleted / foreign attachment id answers the named 400.
     const rejection = await useWorkspaceStore
@@ -838,7 +902,7 @@ describe("attachment lifecycle (ADR 0086)", () => {
     stubFetch((url) => {
       if (url === LIST_URL) {
         reads += 1;
-        return jsonResponse({ attachments: [ATTACH_PARSED_LATER] });
+        return jsonResponse({ attachments: [ATTACH_PARSING] });
       }
       if (url === `/api/threads/${OTHER_ID}`) {
         return jsonResponse({
@@ -853,7 +917,7 @@ describe("attachment lifecycle (ADR 0086)", () => {
 
     await useWorkspaceStore.getState().loadAttachments(THREAD_ID, 1000);
     expect(useWorkspaceStore.getState().attachments).toEqual([
-      ATTACH_PARSED_LATER,
+      ATTACH_PARSING,
     ]);
     await useWorkspaceStore.getState().openThread(OTHER_ID);
     expect(useWorkspaceStore.getState().attachments).toEqual([]);
@@ -862,5 +926,242 @@ describe("attachment lifecycle (ADR 0086)", () => {
     // The old thread's chain stopped with the switch: no further
     // list reads for it.
     expect(reads).toBe(1);
+  });
+
+  it("an uploaded upload starts no readiness poll", async () => {
+    // Preparation is requested by a graph turn, not by the browser, so
+    // an ``uploaded`` record will not change on its own. Polling it
+    // would spin forever.
+    seedThread();
+    let reads = 0;
+    stubFetch((url) => {
+      if (url === LIST_URL) {
+        reads += 1;
+        return jsonResponse({ attachments: [] });
+      }
+      return jsonResponse(ATTACH_UPLOADED);
+    });
+
+    await useWorkspaceStore
+      .getState()
+      .attachFile(THREAD_ID, new File(["hello!"], "10-K.pdf"));
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(useWorkspaceStore.getState().attachments).toEqual([
+      ATTACH_UPLOADED,
+    ]);
+    expect(reads).toBe(0);
+  });
+
+  it("a list of only uploaded records does not keep the poll running", async () => {
+    seedThread();
+    let reads = 0;
+    stubFetch((url) => {
+      if (url === LIST_URL) {
+        reads += 1;
+        return jsonResponse({ attachments: [ATTACH_UPLOADED] });
+      }
+      return jsonResponse({}, 404);
+    });
+
+    await useWorkspaceStore.getState().loadAttachments(THREAD_ID, 1000);
+    expect(useWorkspaceStore.getState().attachments).toEqual([
+      ATTACH_UPLOADED,
+    ]);
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    // The one seeding read, then the chain stopped itself.
+    expect(reads).toBe(1);
+  });
+
+  it("a stale list read cannot erase the just-uploaded chip", async () => {
+    // The upload answers ``uploaded`` and starts no poll of its own, so
+    // a tick issued before the POST committed must still carry the fresh
+    // record — dropping it would hide a live attachment until the next
+    // manual open.
+    seedThread();
+    const parsing = { ...ATTACH_PARSING, attachment_id: "att-0" };
+    const uploaded = { ...ATTACH_UPLOADED, attachment_id: "att-1" };
+    stubFetch((url) => {
+      if (url === LIST_URL) return jsonResponse({ attachments: [parsing] });
+      return jsonResponse(uploaded);
+    });
+
+    await useWorkspaceStore.getState().loadAttachments(THREAD_ID, 1000);
+    await useWorkspaceStore
+      .getState()
+      .attachFile(THREAD_ID, new File(["x"], "10-K.pdf"));
+    expect(useWorkspaceStore.getState().attachments).toEqual([
+      parsing,
+      uploaded,
+    ]);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(useWorkspaceStore.getState().attachments).toEqual([
+      parsing,
+      uploaded,
+    ]);
+  });
+});
+
+describe("upload in flight gates send and new conversation", () => {
+  /** A fetch answer the test releases by hand: the upload POST stays
+   * in flight until ``resolve`` runs. */
+  function deferredResponse(): {
+    promise: Promise<Response>;
+    resolve: (res: Response) => void;
+  } {
+    let resolve!: (res: Response) => void;
+    const promise = new Promise<Response>((res) => {
+      resolve = res;
+    });
+    return { promise, resolve };
+  }
+
+  /** Starts one upload and waits until the store has it as in flight. */
+  async function startUpload(
+    threadId: string,
+    filename: string,
+  ): Promise<{
+    uploading: Promise<ThreadAttachment>;
+    release: (res: Response) => void;
+    calls: RecordedCall[];
+  }> {
+    const { promise, resolve } = deferredResponse();
+    const attachHandler = (url: string): Response | Promise<Response> => {
+      if (url === LIST_URL) {
+        return jsonResponse({
+          attachments: useWorkspaceStore.getState().attachments,
+        });
+      }
+      if (url.includes("/attachments")) return promise;
+      if (url.endsWith("/messages")) return sseRunResponse();
+      if (url === "/api/threads") return jsonResponse("[]");
+      return jsonResponse({}, 404);
+    };
+    const { calls } = stubFetch(attachHandler);
+    const uploading = useWorkspaceStore
+      .getState()
+      .attachFile(threadId, new File(["bytes"], filename));
+    await vi.advanceTimersByTimeAsync(0);
+    return { uploading, release: resolve, calls };
+  }
+
+  it("reads the gate off the in-flight uploads, not the attachment list", () => {
+    expect(hasUploadInFlight({})).toBe(false);
+    // A settled upload leaves no zero counter behind that could keep
+    // the composer locked.
+    expect(hasUploadInFlight({ [THREAD_ID]: 0 })).toBe(false);
+    expect(hasUploadInFlight({ [THREAD_ID]: 1 })).toBe(true);
+    // ANY thread's pending upload gates the composer: the record is
+    // not on the attachment list yet, so the list cannot answer this.
+    expect(
+      hasUploadInFlight({ "22222222-2222-4222-8222-222222222222": 1 }),
+    ).toBe(true);
+  });
+
+  it("refuses a send while an upload is in flight, naming the typed gate", async () => {
+    seedThread();
+    useWorkspaceStore.setState({ attachments: [ATTACH_READY] });
+    const { uploading, release, calls } = await startUpload(
+      THREAD_ID,
+      "10-K.pdf",
+    );
+    expect(
+      hasUploadInFlight(useWorkspaceStore.getState().pendingUploads),
+    ).toBe(true);
+
+    // The question names the READY att-1 and never mentions the file
+    // being uploaded — that unreferenced upload is exactly what must
+    // still block the send.
+    const rejection = await useWorkspaceStore
+      .getState()
+      .sendQuestion(THREAD_ID, "营收多少？", true, ["att-1"])
+      .then(() => null)
+      .catch((error: unknown) => error);
+
+    expect(rejection).toBeInstanceOf(AttachmentUploadInProgressError);
+    expect((rejection as AttachFailedError).code).toBe(
+      "attachment_upload_in_progress",
+    );
+    // Refused before the wire: no doomed run was started.
+    expect(calls.filter((c) => c.url.endsWith("/messages"))).toEqual([]);
+
+    release(jsonResponse(ATTACH_UPLOADED));
+    await uploading;
+    expect(
+      hasUploadInFlight(useWorkspaceStore.getState().pendingUploads),
+    ).toBe(false);
+  });
+
+  it("sends the same question once the upload has landed", async () => {
+    seedThread();
+    useWorkspaceStore.setState({ attachments: [ATTACH_READY] });
+    const { uploading, release, calls } = await startUpload(
+      THREAD_ID,
+      "10-K.pdf",
+    );
+    release(jsonResponse(ATTACH_UPLOADED));
+    await uploading;
+
+    await expect(
+      useWorkspaceStore.getState().sendQuestion(THREAD_ID, "营收多少？", true, [
+        "att-1",
+      ]),
+    ).resolves.toBeTruthy();
+    expect(calls.filter((c) => c.url.endsWith("/messages"))).toHaveLength(1);
+  });
+
+  it("refuses to start a new conversation while an upload is in flight", async () => {
+    // Spec: no conversation STARTS or sends while any composer upload
+    // is in flight — 新建 thread is a conversation start.
+    seedThread();
+    const { uploading, release, calls } = await startUpload(
+      THREAD_ID,
+      "10-K.pdf",
+    );
+
+    const rejection = await useWorkspaceStore
+      .getState()
+      .createThread(null)
+      .then(() => null)
+      .catch((error: unknown) => error);
+
+    expect(rejection).toBeInstanceOf(AttachmentUploadInProgressError);
+    expect((rejection as AttachFailedError).code).toBe(
+      "attachment_upload_in_progress",
+    );
+    expect(
+      calls.filter((c) => c.url === "/api/threads" && c.method === "POST"),
+    ).toEqual([]);
+
+    release(jsonResponse(ATTACH_UPLOADED));
+    await uploading;
+  });
+
+  it("clears the gate when the upload is refused, so the composer is never wedged", async () => {
+    seedThread();
+    stubFetch((url) =>
+      url.includes("/attachments") && url !== LIST_URL
+        ? jsonResponse({ error: "attachment_too_large" }, 413)
+        : jsonResponse({ attachments: [] }),
+    );
+
+    await expect(
+      useWorkspaceStore
+        .getState()
+        .attachFile(THREAD_ID, new File(["x"], "huge.pdf")),
+    ).rejects.toBeInstanceOf(AttachFailedError);
+    expect(
+      hasUploadInFlight(useWorkspaceStore.getState().pendingUploads),
+    ).toBe(false);
+
+    useWorkspaceStore.setState({ attachments: [ATTACH_READY] });
+    stubFetch((url) =>
+      url.endsWith("/messages") ? sseRunResponse() : jsonResponse("[]"),
+    );
+    await expect(
+      useWorkspaceStore.getState().sendQuestion(THREAD_ID, "营收多少？"),
+    ).resolves.toBeTruthy();
   });
 });

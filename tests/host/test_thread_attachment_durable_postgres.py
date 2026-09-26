@@ -135,8 +135,14 @@ def test_a_parsing_row_is_resumed_by_the_next_process(
     stack: dict[str, Any]
 ) -> None:
     attachment_id = _attach(stack)
-    assert stack["service"].status(attachment_id).status == "parsing"
+    # ``uploaded`` is a resting state: durable bytes nobody asked to
+    # prepare. The row a new process must resume is one whose preparation
+    # started and then lost its derived layer, so that is the premise.
+    assert stack["service"].status(attachment_id).status == "uploaded"
     assert _counts(stack) == (1, 0, 0)
+
+    stack["service"].prepare(attachment_id)
+    stack["service"].store.clear_index(attachment_id)
 
     restarted = _boot(stack)
     assert restarted.status(attachment_id).status == "parsing"
