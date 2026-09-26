@@ -1,0 +1,10 @@
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+[features]
+memories = false
+
+[mcp_servers.iknow-memory]
+command = "node"
+args = ["dist/index.js"]
+cwd = "../iknow-memory"
