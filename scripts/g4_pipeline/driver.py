@@ -81,6 +81,18 @@ CGROUP_NO_LIMIT_BYTES: Final[int] = -1
 
 _PROC_STATUS_FIELDS: Final[tuple[str, ...]] = ("VmHWM", "VmRSS", "VmSwap", "VmPeak")
 
+# filename -> snapshot field, plus whether "max" is a legal reading there. A
+# limit file may answer "no limit"; a usage file that says so read nothing.
+_CGROUP_SCALAR_FILES: Final[tuple[tuple[str, str, bool], ...]] = (
+    ("memory.current", "cgroup_memory_current_bytes", False),
+    ("memory.max", "cgroup_memory_max_bytes", True),
+    ("memory.swap.current", "cgroup_memory_swap_current_bytes", False),
+    ("memory.swap.max", "cgroup_memory_swap_max_bytes", True),
+)
+
+_CGROUP_EVENT_FILES: Final[tuple[str, ...]] = ("memory.events", "memory.events.local")
+_CGROUP_EVENT_KEYS: Final[frozenset[str]] = frozenset({"oom", "oom_kill", "max_usage"})
+
 # The three region kinds Docling's layout output is bucketed into; the record
 # names them in this order.
 REGION_KINDS: Final[tuple[str, ...]] = ("text", "table", "figure")
@@ -231,10 +243,13 @@ class MemorySnapshot:
         return out
 
 
-def memory_snapshot(tag: str) -> MemorySnapshot:
-    """One measured snapshot: process + cgroup v2 (v1 fallback included)."""
-    proc, errors = _read_proc_status_fields(_PROC_STATUS_FIELDS)
+def _cgroup_peak_with_fallback(errors: list[str]) -> int | None:
+    """``memory.peak`` on cgroup v2, falling back to its v1 name.
 
+    The v2 file is missing on a v1 host rather than empty, so the miss that
+    licenses the fallback is kept as a read error: a host with neither file has
+    to leave the peak null *and* say which two names it looked for.
+    """
     peak, error = _read_cgroup_int("memory.peak", allow_unlimited=False)
     if peak is None:  # cgroup v1 shape
         if error is not None:
@@ -244,21 +259,24 @@ def memory_snapshot(tag: str) -> MemorySnapshot:
         )
     if error is not None:
         errors.append(error)
+    return peak
 
+
+def _cgroup_scalars(errors: list[str]) -> dict[str, int | None]:
+    """The four usage-and-limit counters, each gap appended rather than zeroed."""
     scalars: dict[str, int | None] = {}
-    for filename, key, is_limit in (
-        ("memory.current", "cgroup_memory_current_bytes", False),
-        ("memory.max", "cgroup_memory_max_bytes", True),
-        ("memory.swap.current", "cgroup_memory_swap_current_bytes", False),
-        ("memory.swap.max", "cgroup_memory_swap_max_bytes", True),
-    ):
+    for filename, key, is_limit in _CGROUP_SCALAR_FILES:
         value, error = _read_cgroup_int(filename, allow_unlimited=is_limit)
         scalars[key] = value
         if error is not None:
             errors.append(error)
+    return scalars
 
+
+def _cgroup_events(errors: list[str]) -> dict[str, int]:
+    """The OOM counters, keyed by the file they were read from."""
     events: dict[str, int] = {}
-    for ev in ("memory.events", "memory.events.local"):
+    for ev in _CGROUP_EVENT_FILES:
         try:
             body = (CGROUP_DIR / ev).read_text(encoding="utf-8")
         except OSError as exc:
@@ -268,13 +286,25 @@ def memory_snapshot(tag: str) -> MemorySnapshot:
             continue
         for line in body.splitlines():
             k, _, v = line.partition(" ")
-            if k in {"oom", "oom_kill", "max_usage"}:
+            if k in _CGROUP_EVENT_KEYS:
                 try:
                     events[f"{ev}.{k}"] = int(v)
                 except ValueError:
                     errors.append(
                         f"{ev}.{k}: unparseable {v.strip()!r}"
                     )  # EXIT: an unreadable OOM counter is not evidence of no OOM
+    return events
+
+
+def memory_snapshot(tag: str) -> MemorySnapshot:
+    """One measured snapshot: process + cgroup v2 (v1 fallback included)."""
+    proc, errors = _read_proc_status_fields(_PROC_STATUS_FIELDS)
+    # Bound in this order, not inline: read_errors is one list every helper
+    # appends to, and the order its messages appear in is part of a committed
+    # record's leaves.
+    peak = _cgroup_peak_with_fallback(errors)
+    scalars = _cgroup_scalars(errors)
+    events = _cgroup_events(errors)
     return MemorySnapshot(
         tag=tag,
         t_monotonic_s=round(time.monotonic(), 3),
@@ -331,13 +361,13 @@ def artifact_identity(artifacts_path: Path) -> dict[str, object]:
     info: dict[str, object] = {
         "artifacts_path": str(artifacts_path),
         "exists": artifacts_path.is_dir(),
-        "cache_total_bytes": 0,
-        "file_count": 0,
+        "cache_total_bytes": None,
+        "file_count": None,
         "files": [],
         "layout_files": [],
     }
     if not info["exists"]:
-        return info  # EXIT: an absent cache is the finding; the zeros say "nothing landed"
+        return info  # EXIT: an absent cache was never walked, so it has no size
     total = 0
     count = 0
     files: list[dict[str, object]] = []
@@ -436,6 +466,9 @@ def _apply_page_ocr(
             error_text(exc)  # EXIT: a code alone would hide why the page has no text
         )
         entry["ocr_used"] = False
+        # No character count exists for a pass that produced nothing, and a zero
+        # here would sum into ocr_text_chars_total as a cheap page.
+        entry["ocr_text_char_count"] = None
     else:
         entry["ocr_used"] = True
         entry["ocr_text_char_count"] = len(ocr_text)
@@ -474,21 +507,23 @@ def _page_structure_entry(
     n_images, images_error = _page_image_objects(page)
     if images_error is not None:
         log(f"[driver] page {page_no} object scan failed: {images_error}")
+    # The rule cannot be asked without its image input: running it on a
+    # fabricated 0 would let a failed scan clear or select OCR, and
+    # pages_needing_ocr is one of the quantities the page cap is priced from.
+    rule = None
+    if n_images is not None:
+        rule = bool(
+            detect_ocr_required(
+                text=native_text, image_count=n_images, min_text_chars=1
+            )
+        )
     return {
         "page_no": page_no,
         "size_pt": [round(float(width_pt), 2), round(float(height_pt), 2)],
         "native_text_char_count": len(native_text),
         "pdf_image_objects": n_images,
         "pdf_image_objects_error": images_error,
-        # The rule's own "no image reference" input is 0, so a failed scan
-        # is readable only through pdf_image_objects_error.
-        "ocr_required_by_repo_rule": bool(
-            detect_ocr_required(
-                text=native_text,
-                image_count=n_images if n_images is not None else 0,
-                min_text_chars=1,
-            )
-        ),
+        "ocr_required_by_repo_rule": rule,
         "ocr_used": False,
         "ocr_trigger": None,
         "ocr_lang": None,
@@ -517,14 +552,25 @@ def _apply_render_geometry(
     return bitmap, pil
 
 
-def _ocr_trigger(entry: dict[str, object], force_ocr: bool) -> str | None:
+def _ocr_trigger(
+    entry: dict[str, object], force_ocr: bool, failures: list[str]
+) -> str | None:
     """Which rule asked for CPU Tesseract on this page, if any.
 
     ``forced_selftest`` exercises the OCR boundary on a page the repo rule would
     not select, so "the OCR path is live" is observed rather than assumed. It is
-    never used to decide coverage in a measured run.
+    never used to decide coverage in a measured run. A page whose scan failed
+    has no answer to trigger on, and forcing it would charge an OCR cost the
+    rule never asked for, so the gap is named and the page is left alone.
     """
-    if entry["ocr_required_by_repo_rule"]:
+    rule = entry["ocr_required_by_repo_rule"]
+    if rule is None:
+        failures.append(
+            f"page {entry['page_no']}: no OCR decision, the image-object scan "
+            f"failed ({entry['pdf_image_objects_error']})"
+        )
+        return None  # EXIT: an unanswered rule is a gap in the record, not a no
+    if rule:
         return "repo_rule"  # EXIT: the frozen rule selected OCR for this page
     if force_ocr:
         return "forced_selftest"
@@ -564,7 +610,7 @@ def render_pages(
         page = pdf_doc[idx]
         entry = _page_structure_entry(page, page_no, detect_ocr_required)
         bitmap, pil = _apply_render_geometry(page, entry, dpi)
-        trigger = _ocr_trigger(entry, force_ocr)
+        trigger = _ocr_trigger(entry, force_ocr, failures)
         if trigger is not None:
             _apply_page_ocr(entry, pil, page_no, ocr_engine, trigger, image_dir, failures)
         elif image_dir is not None:
@@ -579,7 +625,9 @@ def render_pages(
 # --------------------------------------------------------------------------
 # Docling + Heron
 # --------------------------------------------------------------------------
-def build_converter(artifacts_path: Path, layout_preset: str, threads: int):
+def build_converter(
+    artifacts_path: Path, layout_preset: str, threads: int
+) -> tuple[Any, dict[str, object]]:
     """Pinned standard-PDF pipeline: Heron layout + TableFormer, CPU, no OCR
     engine inside Docling, no VLM, no picture classifier (ADR 0089)."""
     from docling.datamodel.accelerator_options import AcceleratorOptions
@@ -663,8 +711,37 @@ def docling_builtin_limits() -> dict[str, object]:
     }
 
 
+def _record_region_box(bucket: dict[str, Any], kind: str, box: Any) -> None:
+    """One region's coordinates, with the record's own bound kept in view.
+
+    Forty boxes per page and kind bounds the single JSON line the harness may
+    print; reaching the bound is recorded as ``*_boxes_capped`` rather than
+    dropping coordinates silently.
+    """
+    key = f"{kind}_boxes"
+    if len(bucket[key]) >= 40:
+        bucket[f"{key}_capped"] = True
+        return  # EXIT: the line stays bounded, and the cap is visible in the page
+    bucket[key].append(
+        {
+            "l": round(float(box.l), 1),
+            "t": round(float(box.t), 1),
+            "r": round(float(box.r), 1),
+            "b": round(float(box.b), 1),
+        }
+    )
+
+
 def region_counts_from_document(doc) -> dict[int, dict[str, object]]:
-    """Bucket Docling's layout output per physical page: text/table/figure."""
+    """Bucket Docling's layout output per physical page: text/table/figure.
+
+    ``texts``, ``tables`` and ``pictures`` are read as attributes and not
+    defaulted to empty: a Docling release that renamed one would otherwise
+    report zero regions for a document it parsed successfully, and
+    ``regions_total`` is entitled to certify ``0 / 0 / 0`` only over a pass that
+    actually read them. The ``AttributeError`` reaches ``run_docling_pass``,
+    which fails the pass and sends the whole region lane to null.
+    """
     per_page: dict[int, dict[str, object]] = {}
 
     def bucket(page_no: int) -> dict[str, object]:
@@ -673,35 +750,20 @@ def region_counts_from_document(doc) -> dict[int, dict[str, object]]:
             {"text": 0, "table": 0, "figure": 0, "table_boxes": [], "figure_boxes": []},
         )
 
-    for item in getattr(doc, "texts", []) or []:
-        for prov in getattr(item, "prov", None) or []:
-            page_no = getattr(prov, "page_no", None)
-            if page_no is None:
-                continue  # EXIT: provenance with no page number has no page to charge
-            bucket(int(page_no))["text"] = int(bucket(int(page_no))["text"]) + 1
-
-    for kind, attr in (("table", "tables"), ("figure", "pictures")):
-        for item in getattr(doc, attr, []) or []:
-            for prov in getattr(item, "prov", None) or []:
+    def charge(items: Any, kind: str, *, boxed: bool) -> None:
+        for item in items:
+            for prov in item.prov or []:
                 page_no = getattr(prov, "page_no", None)
                 if page_no is None:
                     continue  # EXIT: provenance with no page number has no page to charge
-                b = bucket(int(page_no))
-                b[kind] = int(b[kind]) + 1
-                box = getattr(prov, "bbox", None)
-                if box is not None:
-                    key = f"{kind}_boxes"
-                    if len(b[key]) < 40:  # keep the single JSON line bounded
-                        b[key].append(
-                            {
-                                "l": round(float(box.l), 1),
-                                "t": round(float(box.t), 1),
-                                "r": round(float(box.r), 1),
-                                "b": round(float(box.b), 1),
-                            }
-                        )
-                    else:
-                        b[f"{kind}_boxes_capped"] = True
+                entry = bucket(page_no)
+                entry[kind] = int(entry[kind]) + 1
+                if boxed and getattr(prov, "bbox", None) is not None:
+                    _record_region_box(entry, kind, prov.bbox)
+
+    charge(doc.texts, "text", boxed=False)
+    charge(doc.tables, "table", boxed=True)
+    charge(doc.pictures, "figure", boxed=True)
     return per_page
 
 
@@ -736,13 +798,24 @@ class DoclingPass:
 
 
 def docling_page_sizes(doc: Any) -> dict[int, list[float]]:
-    """Docling's own per-page size in points, keyed by physical page number."""
+    """Docling's own per-page size in points, keyed by physical page number.
+
+    ``DoclingDocument.pages`` is ``dict[int, PageItem]`` and the pinned
+    ``PageItem``'s fields are ``page_no`` / ``size`` / ``image``, both read off
+    the image rather than from memory. So the pages are the mapping's *values*:
+    iterating the mapping itself yields ``int`` page numbers, which have no
+    ``size``, and a successful conversion would then answer nothing for every
+    page. A page whose ``size`` is missing is left unanswered rather than
+    guessed, and ``attach_regions`` names that gap in the record.
+    """
     sizes: dict[int, list[float]] = {}
-    for p in getattr(doc, "pages", []) or []:
-        no = getattr(p, "number", None)
-        size = getattr(p, "size", None)
-        if no is not None and size is not None:
-            sizes[int(no)] = [round(float(size.width), 2), round(float(size.height), 2)]
+    for page in doc.pages.values():
+        if page.size is None:
+            continue  # EXIT: nothing to read, so nothing to answer
+        sizes[int(page.page_no)] = [
+            round(float(page.size.width), 2),
+            round(float(page.size.height), 2),
+        ]
     return sizes
 
 
@@ -758,15 +831,21 @@ def run_docling_pass(
     sizes: dict[int, list[float]] = {}
     try:
         res = conv.convert(str(pdf_path))
-        status = str(getattr(res, "status", None))
         doc = res.document
-        doc_page_count = len(getattr(doc, "pages", []) or [])
+        status = str(res.status)
+        doc_page_count = len(doc.pages)
         regions = region_counts_from_document(doc)
         sizes = docling_page_sizes(doc)
     except Exception as exc:
         error = error_text(exc)
         log(f"[driver] Docling whole-document pass failed: {error}")
-        # EXIT: this pass is the only region source, so regions go null below
+        # EXIT: this pass is the only region source, so everything it owns goes
+        # null rather than leaving a half-read lane beside the failure that says
+        # it was not read.
+        status = None
+        doc_page_count = None
+        regions = {}
+        sizes = {}
     latency_ms = (time.monotonic() - t_full) * 1000.0
     checkpoints.append(memory_snapshot("after_docling_whole_doc"))
     return DoclingPass(
@@ -779,7 +858,9 @@ def run_docling_pass(
     )
 
 
-def attach_regions(pages: list[dict[str, object]], docling: DoclingPass) -> None:
+def attach_regions(
+    pages: list[dict[str, object]], docling: DoclingPass, failures: list[str]
+) -> None:
     """Give every physical page its Docling regions, or name why there are none."""
     measured = docling.regions_measured
     for entry in pages:
@@ -791,6 +872,15 @@ def attach_regions(pages: list[dict[str, object]], docling: DoclingPass) -> None
         entry["table_boxes"] = reg.get("table_boxes", []) if measured else None
         entry["figure_boxes"] = reg.get("figure_boxes", []) if measured else None
         entry["docling_page_size_pt"] = docling.page_sizes_pt.get(page_no)
+    # A whole-document pass that counted pages but read no size is the one case
+    # where per-page nulls carry no explanation: ``docling_error`` is null
+    # because nothing raised. Naming it keeps ``null`` meaning "not measured"
+    # rather than letting it mean "measured to be nothing".
+    unanswered = sum(1 for e in pages if e["docling_page_size_pt"] is None)
+    if measured and unanswered:
+        failures.append(
+            f"docling_page_size_pt: no size read for {unanswered} of {len(pages)} pages"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -942,14 +1032,42 @@ def regions_total(pages: list[dict[str, object]], measured: bool) -> dict[str, o
     }
 
 
+def _sum_or_gap(values: list[int | None]) -> int | None:
+    """Total over pages that each answered, or null when one of them did not.
+
+    Skipping an unread page would price a filing whose OCR failed as a filing
+    whose OCR returned nothing, and those are different facts about the same
+    page count.
+    """
+    total = 0
+    for value in values:
+        if value is None:
+            return None  # EXIT: one unanswered page makes the file total unread
+        total += value
+    return total
+
+
+def _answered(flag: object) -> int | None:
+    """A tri-state rule answer as a count: 1, 0, or null for "not asked"."""
+    if flag is None:
+        return None
+    return 1 if flag else 0
+
+
 def page_rule_counts(pages: list[dict[str, object]]) -> dict[str, object]:
     """How many pages the rule selected, and how much text the passes produced."""
     return {
-        "pages_needing_ocr": sum(1 for p in pages if p["ocr_required_by_repo_rule"]),
+        "pages_needing_ocr": _sum_or_gap(
+            [_answered(p["ocr_required_by_repo_rule"]) for p in pages]
+        ),
         "pages_with_ocr_applied": sum(1 for p in pages if p["ocr_used"]),
         "pages_with_native_text": sum(1 for p in pages if p["native_text_char_count"] > 0),
-        "native_text_chars_total": sum(p["native_text_char_count"] for p in pages),
-        "ocr_text_chars_total": sum(p["ocr_text_char_count"] for p in pages),
+        "native_text_chars_total": _sum_or_gap(
+            [p["native_text_char_count"] for p in pages]
+        ),
+        "ocr_text_chars_total": _sum_or_gap(
+            [p["ocr_text_char_count"] for p in pages]
+        ),
     }
 
 
@@ -1038,6 +1156,13 @@ def build_totals(
         "total_latency_ms": round(
             render.latency_ms + docling.latency_ms + sum(slice_pass.latencies_ms), 1
         ),
+        # The sum above covers three measured phases only. Converter init, the
+        # model load and the file open sit outside it, so the end-to-end span is
+        # recorded as its own reading rather than letting the phase sum be read
+        # as the cost of a run.
+        "wall_clock_ms": round(
+            (final.t_monotonic_s - checkpoints[0].t_monotonic_s) * 1000.0, 1
+        ),
         "page_latency_ms_stats": page_latency_stats(pages),
         "regions_total": regions_total(pages, docling.regions_measured),
         **page_rule_counts(pages),
@@ -1062,7 +1187,12 @@ def build_record(
 ) -> dict[str, object]:
     """Assemble the whole measurement line the harness contract emits."""
     return {
-        "schema": "fin.g4.t2a.pipeline_measurement/1",
+        # /1 kept an unread quantity as a zero in four places; /2 makes every
+        # failed reading null, which is what the committed records cannot show;
+        # /3 reads the Docling page sizes off the pages *mapping*, so a record on
+        # /2 or earlier has a null ``docling_page_size_pt`` beside a page count
+        # that answered, and its size evidence is the pypdfium2 ``size_pt`` only.
+        "schema": "fin.g4.t2a.pipeline_measurement/3",
         "file": {
             "path": str(pdf_path),
             "name": pdf_path.name,
@@ -1204,7 +1334,7 @@ def main() -> int:
     checkpoints.append(memory_snapshot("after_converter_init"))
 
     docling = run_docling_pass(conv, pdf_path, checkpoints)
-    attach_regions(render.pages, docling)
+    attach_regions(render.pages, docling, harness_failures)
 
     slice_pass = run_slice_pass(
         pdfium_mod=pdfium, pdf_doc=pdf_doc, conv=conv, pages=render.pages,
