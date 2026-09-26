@@ -41,9 +41,9 @@ and which ``AGENTS.md`` keeps out of the test path.
 The byte adapter is not hand-picked: :func:`create_object_store` raises
 ``ObjectStoreNotConfiguredError`` with no ``FIN_OBJECT_STORE_URL`` /
 ``FIN_OBJECT_STORE_BUCKET``, and the product's own builder then takes its
-documented degradation to the process-local adapter and logs it. That is
-what ran. The durable-S3 leg of the byte layer is therefore NOT proven
-here and is recorded as such in
+documented degradation to the process-local adapter and logs it. The original
+run used that degraded path; the configured S3 path now has a separate
+cross-process read-back case recorded in
 ``docs/validation/2026-09-26-g4-t2b-raw-upload-send-gate.md``.
 
 Opt-in
@@ -136,6 +136,17 @@ def postgres_url(deployed_bounds: dict[str, str]) -> str:
 
 
 @pytest.fixture
+def real_s3_object_store() -> None:
+    """Require endpoint and bucket configuration without exposing values."""
+    if not _s3_object_store_configured():
+        pytest.skip(
+            "FIN_OBJECT_STORE_URL/FIN_OBJECT_STORE_ENDPOINT and "
+            "FIN_OBJECT_STORE_BUCKET are not configured; durable S3 "
+            "read-back was not run"
+        )
+
+
+@pytest.fixture
 def budgets(
     monkeypatch: pytest.MonkeyPatch, deployed_bounds: dict[str, str]
 ) -> Any:
@@ -224,6 +235,54 @@ def _drop_threads(url: str, thread_ids: list[str]) -> None:
     with psycopg.connect(url) as conn:
         conn.execute("DELETE FROM fin_thread WHERE id = ANY(%s)", (thread_ids,))
         conn.commit()
+
+
+def _s3_object_store_configured() -> bool:
+    endpoint = (
+        os.environ.get("FIN_OBJECT_STORE_URL")
+        or os.environ.get("FIN_OBJECT_STORE_ENDPOINT")
+        or ""
+    ).strip()
+    bucket = (os.environ.get("FIN_OBJECT_STORE_BUCKET") or "").strip()
+    return bool(endpoint and bucket)
+
+
+def _cleanup_live_threads(url: str, thread_ids: list[str]) -> None:
+    """Delete live-test objects before their rows, even on assertion failure."""
+    if not thread_ids:
+        return
+
+    failures: list[Exception] = []
+    rows = _sql_rows(
+        url,
+        "SELECT object_key FROM fin_thread_attachment "
+        "WHERE thread_id = ANY(%s)",
+        (thread_ids,),
+    )
+    if rows and _s3_object_store_configured():
+        from fin.corpus.object_store import create_object_store
+        from fin.corpus.object_store_errors import UnknownObjectKeyError
+
+        objects = create_object_store()
+        for (key,) in rows:
+            try:
+                objects.delete(str(key))
+                objects.get(str(key))
+            except UnknownObjectKeyError:
+                continue
+            except Exception as exc:
+                failures.append(exc)
+            else:
+                failures.append(AssertionError("object still exists after delete"))
+
+    if failures:
+        error_types = sorted({type(error).__name__ for error in failures})
+        raise AssertionError(
+            f"failed to delete {len(failures)} live-test object(s); "
+            f"error types: {', '.join(error_types)}"
+        ) from failures[0]
+
+    _drop_threads(url, thread_ids)
 
 
 def _sha(payload: bytes) -> str:
@@ -744,6 +803,38 @@ uvicorn.run(
 """
 
 
+_READBACK_CHILD_SOURCE = """
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+from fin.corpus.object_store import create_object_store
+
+
+key, payload_path, expected_sha256 = sys.argv[1:4]
+try:
+    expected = Path(payload_path).read_bytes()
+    actual = create_object_store().get(key)
+except Exception as error:
+    print(json.dumps({"ok": False, "error_type": type(error).__name__}))
+    raise SystemExit(1)
+
+actual_sha256 = hashlib.sha256(actual).hexdigest()
+expected_actual_sha256 = hashlib.sha256(expected).hexdigest()
+if actual != expected or actual_sha256 != expected_sha256:
+    print(json.dumps({"ok": False, "error_type": "PayloadMismatch"}))
+    raise SystemExit(1)
+
+print(json.dumps({
+    "ok": True,
+    "size_bytes": len(actual),
+    "sha256": actual_sha256,
+    "expected_sha256": expected_actual_sha256,
+}))
+"""
+
+
 class _LiveServer:
     """One real uvicorn process serving the real app on a real socket."""
 
@@ -791,6 +882,8 @@ class _LiveServer:
         )
 
     def stop(self) -> None:
+        if self.process.poll() is not None:
+            return
         self.process.terminate()
         try:
             self.process.wait(timeout=30)
@@ -817,6 +910,17 @@ def live_server(
     postgres_url: str, deployed_bounds: dict[str, str]
 ) -> Iterator[_LiveServer]:
     """Boot the real app in a separate process against the real Postgres."""
+    server = _start_live_server(postgres_url, deployed_bounds)
+    try:
+        yield server
+    finally:
+        server.stop()
+
+
+def _start_live_server(
+    postgres_url: str, deployed_bounds: dict[str, str]
+) -> _LiveServer:
+    """Start an independent real Uvicorn child with the deployed bounds."""
     environ = dict(os.environ)
     environ["FIN_CHECKPOINT_URL"] = postgres_url
     environ.update(deployed_bounds)
@@ -836,9 +940,10 @@ def live_server(
     server = _LiveServer(port, process)
     try:
         _wait_for_server(server)
-        yield server
-    finally:
+    except Exception:
         server.stop()
+        raise
+    return server
 
 
 def _wait_for_server(server: _LiveServer) -> None:
@@ -895,7 +1000,78 @@ def test_live_server_uploads_every_gold_payload_as_uploaded(
             assert int(row["version"]) == 0 and int(row["unit_count"]) == 0, row
             assert _derived_counts(postgres_url, attachment_id) == (0, 0), row
     finally:
-        _drop_threads(postgres_url, threads)
+        _cleanup_live_threads(postgres_url, threads)
+
+
+def test_live_upload_bytes_persist_after_uvicorn_exit_in_fresh_adapter_process(
+    real_s3_object_store: None,
+    postgres_url: str,
+    deployed_bounds: dict[str, str],
+) -> None:
+    """A fresh product adapter reads exact committed bytes after Uvicorn exits.
+
+    The upload is made through the real HTTP app in a real Uvicorn process.
+    That process is stopped before another Python process constructs a new
+    product adapter and compares the S3 object byte-for-byte with the gold
+    payload and its SHA-256.
+    """
+    payload = _payload(MIXED_PDF)
+    expected_sha256 = _sha(payload)
+    server: _LiveServer | None = None
+    threads: list[str] = []
+    try:
+        server = _start_live_server(postgres_url, deployed_bounds)
+        thread_id = server.create_thread()
+        threads.append(thread_id)
+
+        status, body = server.attach(thread_id, payload, MIXED_PDF.name)
+        assert status == 200, (status, body)
+        assert isinstance(body, dict), body
+        assert body["status"] == "uploaded", body
+        assert body["size_bytes"] == len(payload), body
+        attachment_id = str(body["attachment_id"])
+
+        row = _attachment_row(postgres_url, attachment_id)
+        assert row is not None, attachment_id
+        assert row["status"] == "uploaded", row
+        assert row["sha256"] == expected_sha256, row
+        object_key = str(row["object_key"])
+
+        # The next read is made only after the server that performed the
+        # upload has fully exited; the new Python process must construct its
+        # own adapter from configuration and fetch the same object.
+        server.stop()
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _READBACK_CHILD_SOURCE,
+                object_key,
+                str(MIXED_PDF),
+                expected_sha256,
+            ],
+            cwd=str(REPO_ROOT),
+            env=dict(os.environ),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert completed.returncode == 0, (
+            "fresh product adapter could not verify the uploaded bytes; "
+            f"exit={completed.returncode}, result={completed.stdout.strip()}"
+        )
+        result = json.loads(completed.stdout)
+        assert result == {
+            "ok": True,
+            "size_bytes": len(payload),
+            "sha256": expected_sha256,
+            "expected_sha256": expected_sha256,
+        }, result
+    finally:
+        if server is not None:
+            server.stop()
+        _cleanup_live_threads(postgres_url, threads)
 
 
 def test_live_server_accepts_the_filing_the_retired_constant_rejected(
@@ -922,7 +1098,7 @@ def test_live_server_accepts_the_filing_the_retired_constant_rejected(
         assert row is not None and row["status"] == "uploaded", row
         assert int(row["size_bytes"]) == len(payload), row
     finally:
-        _drop_threads(postgres_url, [thread_id])
+        _cleanup_live_threads(postgres_url, [thread_id])
 
 
 def test_live_server_uploaded_row_is_not_a_recovery_candidate(
@@ -985,7 +1161,7 @@ def test_live_server_uploaded_row_is_not_a_recovery_candidate(
         assert control_id in second_ids, second_ids
         assert uploaded_id not in second_ids, second_ids
     finally:
-        _drop_threads(postgres_url, [uploaded_thread, control_thread])
+        _cleanup_live_threads(postgres_url, [uploaded_thread, control_thread])
 
 
 def test_module_leaves_the_real_tables_as_it_found_them(

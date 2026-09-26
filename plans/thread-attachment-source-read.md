@@ -76,12 +76,13 @@ OVERALL: PASS
    - `[blocks: T1, T2a]`
    - Status: [x] delivered — merged to `main` as `fd5a1d5` (that pull request); per-clause evidence in
      [`docs/validation/2026-09-26-g4-t2b-raw-upload-send-gate.md`](../docs/validation/2026-09-26-g4-t2b-raw-upload-send-gate.md).
-     One acceptance clause is **not** closed by real evidence and is recorded as
-     blocked, not passed: "upload completion is reported only after durable
-     storage" is proved on real Postgres rows over a real socket, but the bytes
-     rested on the in-memory adapter, so the durable object-store leg belongs to
-     the ticket that owns `FIN_OBJECT_STORE_URL`. `uploaded` also has no waiter
-     yet — nothing advances it to `parsing`/`ready` until T2f.
+     The configured S3-compatible byte leg was subsequently exercised against a
+     local SeaweedFS service: after upload through a real Uvicorn process, a fresh
+     process read back the original bytes and SHA-256 (12/12 live door cases;
+     see the 2026-09-27 follow-up in the validation record). Deployment-specific
+     object-store configuration and service restart durability remain to be
+     verified by the ticket owning `FIN_OBJECT_STORE_URL`. `uploaded` also has no
+     waiter yet — nothing advances it to `parsing`/`ready` until T2f.
 
 4. **T2c — Tombstone single-attachment deletion** — tag: `[implementation]`
    - **Inherits:** spec: deletion tombstones the attachment version before cleanup; late parse/vision results cannot recreate data or `ready`; failed cleanup remains blocked and retriable.
