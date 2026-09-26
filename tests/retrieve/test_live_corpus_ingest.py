@@ -171,6 +171,7 @@ def test_live_corpus_ingest_then_retrieve_returns_byte_identical_chunks(
     result = endpoint.ingest(
         _FIXTURE.read_bytes(),
         filename=_FIXTURE.name,
+        document_id="AAPL-2022Q3",
         doc_type=_DOC_TYPE,
     )
 

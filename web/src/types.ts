@@ -360,29 +360,54 @@ export interface Filing {
 
 // ----- corpus-serve-ingest T5: the two upload doors (ADR 0047) -----
 
+// The observable states of a durable corpus job (mirrors
+// fin.corpus.ingest_state.IngestState). ``pending`` is the QUEUED state
+// the accept response reports — bytes, pointer, job record and stable
+// identity are durable and nothing has been parsed yet. ``ready`` is
+// PER-SOURCE TEXT readiness only; it is never corpus-wide graph/C
+// readiness (that is the separate ``graph`` field below).
+export type IngestJobState =
+  | "pending"
+  | "fetching"
+  | "extracting"
+  | "ocr"
+  | "cataloging"
+  | "ready"
+  | "failed";
+
 // Success body of POST /api/corpus/ingest (the corpus-ingest door).
-// Mirrors fin.host.workspace_http.corpus_ingest's 200 payload. The
-// push is observable here as written / duplicates / block_ids;
-// ``invalidation`` is non-null only on a re-ingest that closed stale
-// blocks. Every ingest failure is a named ``error`` code instead of
-// a partial-success 200 (SC7/SC8) — see api.IngestFailedError.
+// Mirrors fin.host.workspace_http.corpus_ingest's 200 payload. This is
+// an ACCEPT, not a completion: 切分 / push / invalidation run off the
+// request, so the outcome is followed through ``JobStatus`` below.
+// Every ingest failure is a named ``error`` code instead of a
+// partial-success 200 — see api.IngestFailedError.
 export interface IngestResult {
-  status: "ingested";
+  status: "accepted";
+  // The store keys jobs by ``document_id``, so v1 answers
+  // ``job_id === document_id``; the versioned identity is the pair
+  // ``(document_id, version)``.
+  job_id: string;
   document_id: string;
   version: string;
-  fmt: string;
-  doc_type: string;
-  unit_count: number;
-  block_count: number;
-  written: number;
-  duplicates: number;
-  block_ids: string[];
-  invalidation: {
-    block_ids: string[];
-    closed: number;
-    already_closed: number;
-    closed_at: [string, string][];
-  } | null;
+  state: IngestJobState;
+}
+
+// Body of GET /api/corpus/ingest/{job_id} — the polled job status.
+// ``text_ready`` is fin's per-source readiness, derived from ``state``
+// being ``ready``; it is a distinct field precisely so the two
+// readiness meanings never merge into one boolean. ``graph`` carries
+// the corpus-wide graph/C sub-object, whose states are defined by the
+// sibling index-job contract, not here: this client renders it as
+// 「未报告」 and never as text readiness.
+export interface JobStatus {
+  job_id: string;
+  document_id: string;
+  version: string;
+  state: IngestJobState;
+  error_type: string | null;
+  error_message: string | null;
+  text_ready: boolean;
+  graph: unknown;
 }
 
 // ----- Thread attachment: the attachment lifecycle -----

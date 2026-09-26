@@ -28,12 +28,45 @@ describe("describeIngestFailure", () => {
       "ingest_upload_too_large",
       "document_id_missing",
       "invalid_doc_type",
+      "concurrent_run",
+      "unknown_job",
     ];
     for (const code of codes) {
       const notice = describeIngestFailure(ingestError(code));
       expect(notice.kind).toBe(code);
       expect(notice.message.length).toBeGreaterThan(0);
     }
+  });
+
+  it("never prints the bare enum for a named code", () => {
+    for (const code of [
+      "document_id_missing",
+      "invalid_doc_type",
+      "concurrent_run",
+      "unknown_job",
+    ]) {
+      expect(describeIngestFailure(ingestError(code)).message).not.toContain(
+        code,
+      );
+    }
+  });
+
+  // Identity now comes from the form's two required fields and the
+  // filename never participates, so renaming the file is not the fix.
+  it("points at company and period on document_id_missing", () => {
+    const notice = describeIngestFailure(ingestError("document_id_missing"));
+    expect(notice.message).toContain("公司");
+    expect(notice.message).toContain("期间");
+  });
+
+  it("says this submission started nothing on concurrent_run (409)", () => {
+    const notice = describeIngestFailure(ingestError("concurrent_run", 409));
+    expect(notice.message).toContain("没有开始");
+  });
+
+  it("says the job state is unverifiable on unknown_job (404)", () => {
+    const notice = describeIngestFailure(ingestError("unknown_job", 404));
+    expect(notice.message).toContain("查不到");
   });
 
   it("names the supported formats on unsupported_format (415)", () => {

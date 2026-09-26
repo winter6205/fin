@@ -1,8 +1,8 @@
-"""Tests for the corpus ingest endpoint service (corpus-serve-ingest T3).
+"""Tests for the corpus ingest endpoint service (corpus-serve-ingest).
 
-The endpoint is the ONE product entry that parses + 切分s an uploaded
-document and pushes it to the retrieval backend (ADR 0047). These tests
-pin the service layer only (no HTTP):
+The endpoint carries two entry points — the durable accept door
+(``submit_durable``) and the synchronous parse + 切分 + push chain
+(``ingest``, ADR 0047). These tests pin the service layer only (no HTTP):
 
 * a supported fixture ingest is **observable as push** — FakePushPort
   holds the children verbatim and recalls them byte-identically (SC5);
@@ -14,29 +14,60 @@ pin the service layer only (no HTTP):
 * push-landed + invalidation-failed is still a typed failure, never
   swallowed (SC8 / SC40);
 * the ``on_ingested`` hook fires only after the full chain succeeded
-  and carries the T2 catalog row contract.
+  and carries the catalog row contract;
+* ``submit_durable`` is the accept door of the permanent upload path:
+  metadata-only validations run before a single byte is written, the
+  four accept-time items (raw bytes, pointer, ``pending`` job record,
+  ``(document_id, version)`` identity) are all durable before an
+  accept, a duplicate ``(document_id, version)`` joins the existing
+  job, a different version in flight is a typed conflict, and a failed
+  commit leaves no accepted job (with a failed compensating delete
+  observable rather than swallowed);
+* ``job_status`` reports the persisted job state, never a constant.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import threading
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from fin.corpus.errors import EmptySourceParseError, UnsupportedFormatParseError
+from fin.corpus.errors import (
+    EmptySourceParseError,
+    UnsupportedFormatParseError,
+)
 from fin.corpus.extracted import Locator
 from fin.corpus.ingest_endpoint import (
     MAX_INGEST_BYTES,
+    IngestConcurrentRunError,
+    IngestDurableCommitError,
     IngestDocumentIdMissingError,
     IngestEndpoint,
     IngestFormatUnspecifiedError,
     IngestInvalidDocTypeError,
+    IngestObjectCleanupError,
+    IngestReplacementUnsupportedError,
     IngestUploadTooLargeError,
     IngestedDocument,
+    resolve_document_id,
     resolve_format,
 )
+from fin.corpus.ingest_state import InMemoryIngestStateStore, IngestState
+from fin.corpus.ingest_state_errors import UnknownJobError
+from fin.corpus.metadata_store import (
+    InMemoryMetadataStore,
+    MetadataPointerNotFoundError,
+    MetadataStoreError,
+)
+from fin.corpus.object_store import InMemoryObjectStore, ObjectPointer
+from fin.corpus.object_store_errors import ObjectStoreUnavailableError
 from fin.corpus.params import DOC_TYPES
+from fin.corpus.parsers import SUPPORTED_FORMATS
 from fin.corpus.push import REQUIRED_PUSH_METADATA_FIELDS
 from fin.retrieve.fake_port import FakeRetrievePort
 from fin.retrieve.fake_push_port import FakePushPort
@@ -84,6 +115,140 @@ def _endpoint(push_port, **kwargs) -> IngestEndpoint:
     return IngestEndpoint(push_port=push_port, **kwargs)
 
 
+class _RecordingObjectStore(InMemoryObjectStore):
+    """In-memory object store that records every key it was asked to write."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.puts: list[str] = []
+        self.deletes: list[str] = []
+
+    def put(
+        self,
+        key: str,
+        payload: bytes,
+        *,
+        content_type: str | None = None,
+    ) -> ObjectPointer:
+        self.puts.append(key)
+        return super().put(key, payload, content_type=content_type)
+
+    def delete(self, key: str) -> None:
+        self.deletes.append(key)
+        super().delete(key)
+
+
+class _FailingDeleteObjectStore(InMemoryObjectStore):
+    """Object store that cannot complete a delete (cleanup outage)."""
+
+    def delete(self, key: str) -> None:
+        raise ObjectStoreUnavailableError(f"delete failed for {key!r}")
+
+
+class _FailingPointerStore(InMemoryMetadataStore):
+    """Pointer store whose commit fails (metadata outage)."""
+
+    def put_pointer(self, document_id: str, pointer: ObjectPointer) -> None:
+        raise MetadataStoreError("pointer table is unavailable")
+
+
+class _FailingCreateStateStore(InMemoryIngestStateStore):
+    """State store that cannot record a job (state-table outage).
+
+    ``fail_after`` keeps the first N creates working so a test can reach
+    the job stage of a *replacement* and break there.
+    """
+
+    def __init__(self, *, fail_after: int | None = None) -> None:
+        super().__init__()
+        self._fail_after = fail_after
+        self._creates = 0
+
+    def create_job(
+        self, document_id: str, *, actor: str | None = None
+    ) -> Any:
+        self._creates += 1
+        if self._fail_after is not None and self._creates <= self._fail_after:
+            return super().create_job(document_id, actor=actor)
+        raise RuntimeError("job table is unavailable")
+
+
+@dataclass(frozen=True)
+class _DurableStack:
+    """One endpoint over the three accept-time ports, all observable."""
+
+    endpoint: IngestEndpoint
+    objects: Any
+    pointers: Any
+    states: InMemoryIngestStateStore
+    push: FakePushPort
+
+
+def _durable_stack(**overrides: Any) -> _DurableStack:
+    objects = overrides.pop("objects", None) or _RecordingObjectStore()
+    pointers = overrides.pop("pointers", None) or InMemoryMetadataStore()
+    states = overrides.pop("states", None) or InMemoryIngestStateStore()
+    push = FakePushPort()
+    endpoint = IngestEndpoint(
+        push_port=push,
+        invalidation_port=push,
+        object_store=objects,
+        metadata_store=pointers,
+        state_store=states,
+        **overrides,
+    )
+    return _DurableStack(
+        endpoint=endpoint,
+        objects=objects,
+        pointers=pointers,
+        states=states,
+        push=push,
+    )
+
+
+def _submit(
+    stack: _DurableStack,
+    data: bytes,
+    *,
+    document_id: str = "DOC-1",
+    **overrides: Any,
+) -> Any:
+    """Submit one durable upload with the text format declared."""
+    overrides.setdefault("declared_format", "txt")
+    return stack.endpoint.submit_durable(
+        data, document_id=document_id, **overrides
+    )
+
+
+def _pointer_of(pointers: Any, document_id: str) -> ObjectPointer | None:
+    try:
+        return pointers.get_pointer(document_id).pointer
+    except MetadataPointerNotFoundError:
+        return None
+
+
+def _assert_nothing_persisted(
+    stack: _DurableStack, document_id: str = "DOC-1"
+) -> None:
+    """The reject-before-write invariant: no durable item landed."""
+    assert stack.objects.puts == []
+    assert _pointer_of(stack.pointers, document_id) is None
+    with pytest.raises(UnknownJobError):
+        stack.states.get_job(document_id)
+    assert stack.push.written_total() == 0
+
+
+def _advance(states: InMemoryIngestStateStore, document_id: str) -> None:
+    """Walk one job through the whole legal chain to ``ready``."""
+    for to_state in (
+        IngestState.FETCHING,
+        IngestState.EXTRACTING,
+        IngestState.CATALOGING,
+        IngestState.READY,
+    ):
+        states.transition(document_id, to_state)
+
+
 # ----- SC5: supported fixture ingest is observable as push ------------
 
 
@@ -93,6 +258,8 @@ def test_md_fixture_ingest_is_observable_as_push() -> None:
     result = endpoint.ingest(
         _MD_SAMPLE.read_bytes(),
         filename="AAPL-2022Q3__table_dense__md__md.md",
+        company="AAPL",
+        period="2022Q3",
     )
 
     # After T1 the wire unit is one envelope per 资料; the
@@ -115,6 +282,8 @@ def test_docx_fixture_ingest_is_observable_as_push() -> None:
     result = endpoint.ingest(
         _DOCX_SAMPLE.read_bytes(),
         filename="AAPL-2022Q3__table_dense__docx__docx.docx",
+        company="AAPL",
+        period="2022Q3",
     )
     assert result.fmt == "docx"
     assert result.block_count > 0
@@ -130,6 +299,7 @@ def test_pushed_block_carries_sc20_metadata_and_parent_text() -> None:
     result = endpoint.ingest(
         _MD_SAMPLE.read_bytes(),
         filename="sample.md",
+        document_id="SAMPLE",
     )
 
     # After T1 every pushed envelope row carries SC20 metadata on
@@ -146,6 +316,7 @@ def test_pushed_text_is_verbatim_no_rechunking() -> None:
     result = endpoint.ingest(
         _MD_SAMPLE.read_bytes(),
         filename="sample.md",
+        document_id="SAMPLE",
     )
     # Every wire chunk's content is a contiguous substring of the
     # stored body — the spec T1 invariant on the wire side
@@ -168,7 +339,9 @@ def test_subsequent_retrieve_hits_the_pushed_text() -> None:
     """
     fake = FakePushPort()
     endpoint = _endpoint(fake)
-    result = endpoint.ingest(_MD_SAMPLE.read_bytes(), filename="sample.md")
+    result = endpoint.ingest(
+        _MD_SAMPLE.read_bytes(), document_id="SAMPLE", declared_format="md"
+    )
 
     record = result.records[0]
     locator = json.loads(record.source_ref)
@@ -196,8 +369,12 @@ def test_subsequent_retrieve_hits_the_pushed_text() -> None:
 def test_same_bytes_twice_is_idempotent() -> None:
     fake = FakePushPort()
     endpoint = _endpoint(fake)
-    first = endpoint.ingest(_MD_SAMPLE.read_bytes(), filename="sample.md")
-    second = endpoint.ingest(_MD_SAMPLE.read_bytes(), filename="sample.md")
+    first = endpoint.ingest(
+        _MD_SAMPLE.read_bytes(), document_id="SAMPLE", declared_format="md"
+    )
+    second = endpoint.ingest(
+        _MD_SAMPLE.read_bytes(), document_id="SAMPLE", declared_format="md"
+    )
 
     assert second.block_ids == first.block_ids
     assert second.written == 0
@@ -209,8 +386,12 @@ def test_result_is_deterministic_across_endpoints() -> None:
     endpoint_a = _endpoint(FakePushPort())
     endpoint_b = _endpoint(FakePushPort())
     data = _MD_SAMPLE.read_bytes()
-    first = endpoint_a.ingest(data, filename="sample.md")
-    second = endpoint_b.ingest(data, filename="sample.md")
+    first = endpoint_a.ingest(
+        data, document_id="SAMPLE", declared_format="md"
+    )
+    second = endpoint_b.ingest(
+        data, document_id="SAMPLE", declared_format="md"
+    )
 
     assert first.block_ids == second.block_ids
     assert first.unit_count == second.unit_count
@@ -254,6 +435,7 @@ def test_declared_format_overrides_filename_extension() -> None:
     endpoint = _endpoint(fake)
     result = endpoint.ingest(
         b"# Heading\n\nParagraph one body text.\n",
+        document_id="MISLEADING",
         filename="misleading.rtf",
         declared_format="md",
     )
@@ -293,7 +475,9 @@ def test_zero_byte_upload_is_the_named_empty_source_failure() -> None:
     fake = FakePushPort()
     endpoint = _endpoint(fake)
     with pytest.raises(EmptySourceParseError) as excinfo:
-        endpoint.ingest(b"", filename="empty.txt")
+        # The empty-source class is decided by the parse, not by the
+        # identity rule: the locator is supplied explicitly here.
+        endpoint.ingest(b"", document_id="EMPTY", declared_format="txt")
     assert excinfo.value.code == "empty_source"
     assert fake.block_total() == 0
 
@@ -302,13 +486,9 @@ def test_oversize_upload_is_a_named_overflow_failure() -> None:
     fake = FakePushPort()
     endpoint = _endpoint(fake, max_bytes=1024)
     with pytest.raises(IngestUploadTooLargeError) as excinfo:
-        endpoint.ingest(b"x" * 1025, filename="big.txt")
+        endpoint.ingest(b"x" * 1025, document_id="BIG", declared_format="txt")
     assert excinfo.value.code == "ingest_upload_too_large"
     assert fake.block_total() == 0
-
-
-def test_module_upload_cap_constant_is_positive() -> None:
-    assert MAX_INGEST_BYTES > 0
 
 
 def test_missing_document_id_is_a_named_failure() -> None:
@@ -323,12 +503,9 @@ def test_missing_document_id_is_a_named_failure() -> None:
 # ----- document id / metadata derivation -------------------------------
 
 
-def test_document_id_prefers_explicit_over_metadata_over_stem() -> None:
+def test_document_id_is_metadata_derived_or_explicit_never_the_filename() -> None:
     fake = FakePushPort()
     endpoint = _endpoint(fake)
-    by_stem = endpoint.ingest(_V1_TEXT, filename="DOC-1.txt")
-    assert by_stem.document_id == "DOC-1"
-
     by_metadata = endpoint.ingest(
         _V1_TEXT,
         filename="ignored.txt",
@@ -346,6 +523,13 @@ def test_document_id_prefers_explicit_over_metadata_over_stem() -> None:
     )
     assert by_explicit.document_id == "EXPLICIT"
 
+    # The filename is metadata only: an upload that names itself
+    # ``DOC-1.txt`` with no metadata at all has no identity, because a
+    # re-upload with a different file name would otherwise land a second
+    # logical document.
+    with pytest.raises(IngestDocumentIdMissingError):
+        endpoint.ingest(_V1_TEXT, filename="DOC-1.txt")
+
 
 # ----- doc_type: explicit vocabulary or deterministic per-unit table --
 
@@ -354,7 +538,12 @@ def test_explicit_doc_type_outside_vocabulary_is_a_named_failure() -> None:
     fake = FakePushPort()
     endpoint = _endpoint(fake)
     with pytest.raises(IngestInvalidDocTypeError) as excinfo:
-        endpoint.ingest(_V1_TEXT, filename="a.txt", doc_type="bogus")
+        endpoint.ingest(
+            _V1_TEXT,
+            document_id="DOC-1",
+            declared_format="txt",
+            doc_type="bogus",
+        )
     assert excinfo.value.code == "invalid_doc_type"
     assert fake.block_total() == 0
 
@@ -363,7 +552,10 @@ def test_explicit_doc_type_reaches_every_payload() -> None:
     fake = FakePushPort()
     endpoint = _endpoint(fake)
     result = endpoint.ingest(
-        _V1_TEXT, filename="a.txt", doc_type="clause_list"
+        _V1_TEXT,
+        document_id="DOC-1",
+        declared_format="txt",
+        doc_type="clause_list",
     )
     assert result.doc_type == "clause_list"
     for record in result.records:
@@ -378,6 +570,7 @@ def test_default_doc_type_is_deterministic_per_unit_classification() -> None:
     result = endpoint.ingest(
         (table_unit + "\n" + narrative_unit).encode("utf-8"),
         filename="mixed.txt",
+        document_id="MIXED-2024Q1",
     )
     assert result.unit_count == 2
     doc_types = {record.metadata["doc_type"] for record in result.records}
@@ -398,7 +591,9 @@ def test_push_unavailable_is_typed_and_pushes_nothing() -> None:
         push_port=MCPPushPort(command=None), invalidation_port=None
     )
     with pytest.raises(PushServiceUnavailableError) as excinfo:
-        endpoint.ingest(_V1_TEXT, filename="a.txt")
+        endpoint.ingest(
+            _V1_TEXT, document_id="DOC-1", declared_format="txt"
+        )
     assert excinfo.value.code == "push_service_unavailable"
     assert fake.block_total() == 0
 
@@ -413,7 +608,9 @@ def test_push_unavailable_runs_no_invalidation_and_no_hook() -> None:
         on_ingested=calls.append,
     )
     with pytest.raises(PushServiceUnavailableError):
-        endpoint.ingest(_V1_TEXT, filename="a.txt")
+        endpoint.ingest(
+            _V1_TEXT, document_id="DOC-1", declared_format="txt"
+        )
     assert calls == []
 
 
@@ -423,12 +620,15 @@ def test_push_unavailable_runs_no_invalidation_and_no_hook() -> None:
 def test_reingest_new_version_invalidates_old_blocks() -> None:
     fake = FakePushPort()
     endpoint = _endpoint(fake)
-    first = endpoint.ingest(_V1_TEXT, filename="DOC-1.txt")
+    first = endpoint.ingest(
+        _V1_TEXT, document_id="DOC-1", declared_format="txt"
+    )
     stale_ids = list(first.block_ids)
 
     second = endpoint.ingest(
         _V2_TEXT,
-        filename="DOC-1.txt",
+        document_id="DOC-1",
+        declared_format="txt",
         previous_records=lambda: first.records,
     )
 
@@ -446,10 +646,13 @@ def test_reingest_new_version_invalidates_old_blocks() -> None:
 def test_reingest_same_bytes_invalidates_nothing() -> None:
     fake = FakePushPort()
     endpoint = _endpoint(fake)
-    first = endpoint.ingest(_V1_TEXT, filename="DOC-1.txt")
+    first = endpoint.ingest(
+        _V1_TEXT, document_id="DOC-1", declared_format="txt"
+    )
     second = endpoint.ingest(
         _V1_TEXT,
-        filename="DOC-1.txt",
+        document_id="DOC-1",
+        declared_format="txt",
         previous_records=lambda: first.records,
     )
     assert second.invalidation is None
@@ -466,12 +669,15 @@ def test_invalidation_failure_after_push_lands_is_typed_not_swallowed() -> None:
 
     fake = FakePushPort()
     endpoint = _endpoint(fake, invalidation_port=DownInvalidationPort())
-    first = endpoint.ingest(_V1_TEXT, filename="DOC-1.txt")
+    first = endpoint.ingest(
+        _V1_TEXT, document_id="DOC-1", declared_format="txt"
+    )
 
     with pytest.raises(InvalidationServiceUnavailableError) as excinfo:
         endpoint.ingest(
             _V2_TEXT,
-            filename="DOC-1.txt",
+            document_id="DOC-1",
+            declared_format="txt",
             previous_records=lambda: first.records,
         )
     assert excinfo.value.code == "invalidation_service_unavailable"
@@ -483,11 +689,14 @@ def test_invalidation_failure_after_push_lands_is_typed_not_swallowed() -> None:
 def test_stale_targets_without_an_invalidation_port_is_typed() -> None:
     fake = FakePushPort()
     endpoint = _endpoint(fake, invalidation_port=None)
-    first = endpoint.ingest(_V1_TEXT, filename="DOC-1.txt")
+    first = endpoint.ingest(
+        _V1_TEXT, document_id="DOC-1", declared_format="txt"
+    )
     with pytest.raises(InvalidationServiceUnavailableError):
         endpoint.ingest(
             _V2_TEXT,
-            filename="DOC-1.txt",
+            document_id="DOC-1",
+            declared_format="txt",
             previous_records=lambda: first.records,
         )
 
@@ -529,14 +738,353 @@ def test_hook_not_called_when_invalidation_fails() -> None:
         invalidation_port=DownInvalidationPort(),
         on_ingested=seen.append,
     )
-    first = endpoint.ingest(_V1_TEXT, filename="DOC-1.txt")
+    first = endpoint.ingest(
+        _V1_TEXT, document_id="DOC-1", declared_format="txt"
+    )
     with pytest.raises(InvalidationServiceUnavailableError):
         endpoint.ingest(
             _V2_TEXT,
-            filename="DOC-1.txt",
+            document_id="DOC-1",
+            declared_format="txt",
             previous_records=lambda: first.records,
         )
     # Only the first (fully successful) ingest ran the hook; the
     # second push landed but its chain ended in a typed failure.
     assert len(seen) == 1
     assert seen[0].version == first.version
+
+
+# ----- durable accept: submit_durable (accept-time durability) ---------
+
+
+def test_derivation_is_ticker_plus_fiscal_period() -> None:
+    # The spec's worked example: the metadata pair is the identity.
+    assert (
+        resolve_document_id(document_id=None, company="aapl", period="2022q3")
+        == "AAPL-2022Q3"
+    )
+    assert (
+        resolve_document_id(
+            document_id=None, company="  aapl ", period=" 2022Q3"
+        )
+        == "AAPL-2022Q3"
+    )
+    assert (
+        resolve_document_id(document_id=" DOC-9 ", company="aapl", period="1")
+        == "DOC-9"
+    )
+
+
+@pytest.mark.parametrize(
+    "company, period",
+    [("aapl", None), ("aapl", "  "), (None, "2022q3"), (None, None), ("", "")],
+)
+def test_an_incomplete_metadata_pair_is_document_id_missing(
+    company: str | None, period: str | None
+) -> None:
+    with pytest.raises(IngestDocumentIdMissingError) as excinfo:
+        resolve_document_id(document_id=None, company=company, period=period)
+    assert excinfo.value.code == "document_id_missing"
+
+
+def test_filename_never_participates_in_identity() -> None:
+    stack = _durable_stack()
+    with pytest.raises(IngestDocumentIdMissingError):
+        stack.endpoint.submit_durable(_V1_TEXT, filename="AAPL-2022Q3.md")
+    _assert_nothing_persisted(stack)
+
+
+def test_acceptance_requires_the_four_durable_items_and_pushes_nothing() -> None:
+    stack = _durable_stack()
+    submission = _submit(stack, _V1_TEXT)
+    version = hashlib.sha256(_V1_TEXT).hexdigest()
+
+    assert submission.job_id == "DOC-1"
+    assert submission.document_id == "DOC-1"
+    assert submission.version == version
+    assert submission.state is IngestState.PENDING
+    # 1 raw bytes
+    key = f"filings/DOC-1/{version}"
+    assert stack.objects.puts == [key]
+    assert stack.objects.get(key) == _V1_TEXT
+    # 2 metadata pointer, carrying the same version
+    pointer = _pointer_of(stack.pointers, "DOC-1")
+    assert pointer is not None
+    assert pointer.key == key
+    assert pointer.sha256 == version
+    assert pointer.size_bytes == len(_V1_TEXT)
+    assert pointer.content_type == "text/plain"
+    # 3 the pending job record
+    assert stack.states.get_job("DOC-1").state is IngestState.PENDING
+    # the accept door does no pipeline work: parse / 切分 / push are the
+    # async worker's, so nothing reached the push port.
+    assert stack.push.written_total() == 0
+
+
+def test_exact_cap_is_accepted_and_one_byte_over_is_refused() -> None:
+    # The pinned contract value; the route gate reads the same number off
+    # the service, so the two can never disagree on the boundary.
+    assert MAX_INGEST_BYTES == 52_428_800
+    stack = _durable_stack()
+    at_cap = b"x" * MAX_INGEST_BYTES
+    accepted = _submit(stack, at_cap, document_id="CAP")
+    assert accepted.state is IngestState.PENDING
+    with pytest.raises(IngestUploadTooLargeError) as excinfo:
+        _submit(stack, at_cap + b"x", document_id="CAP-OVER")
+    assert excinfo.value.code == "ingest_upload_too_large"
+    assert stack.objects.puts == [f"filings/CAP/{accepted.version}"]
+
+
+def test_unsupported_format_is_refused_before_any_write() -> None:
+    stack = _durable_stack()
+    with pytest.raises(UnsupportedFormatParseError) as excinfo:
+        _submit(stack, _V1_TEXT, declared_format="rtf")
+    assert excinfo.value.code == "unsupported_format"
+    _assert_nothing_persisted(stack)
+
+
+def test_invalid_doc_type_is_refused_before_any_write() -> None:
+    stack = _durable_stack()
+    with pytest.raises(IngestInvalidDocTypeError) as excinfo:
+        _submit(stack, _V1_TEXT, doc_type="bogus")
+    assert excinfo.value.code == "invalid_doc_type"
+    _assert_nothing_persisted(stack)
+
+
+def test_every_supported_format_has_a_media_type() -> None:
+    # The durable accept keys the raw object's media type off the parser
+    # format table, so a format added on one side but not the other would
+    # raise a bare KeyError inside the write. Pin the two vocabularies to
+    # one another so that drift fails here, not in production.
+    from fin.corpus.ingest_endpoint import _FORMAT_CONTENT_TYPES
+
+    assert set(_FORMAT_CONTENT_TYPES) == set(SUPPORTED_FORMATS)
+
+
+def test_duplicate_submission_joins_the_job_without_a_second_write() -> None:
+    stack = _durable_stack()
+    first = _submit(stack, _V1_TEXT)
+    _advance(stack.states, "DOC-1")
+
+    joined = _submit(stack, _V1_TEXT, filename="renamed-by-the-uploader.txt")
+
+    assert joined.job_id == first.job_id
+    assert joined.version == first.version
+    # the joined job's CURRENT state is reported, not a fresh accept
+    assert joined.state is IngestState.READY
+    assert len(stack.objects.puts) == 1
+    assert stack.states.get_job("DOC-1").state is IngestState.READY
+
+
+def test_concurrent_identical_submissions_join_without_deleting() -> None:
+    # Two uploads of the same bytes racing on one document must both resolve
+    # to the accepted job and never compensate the shared object away: a
+    # loser that deleted the key the winner just committed would fail a
+    # durable accept that already succeeded. The per-document submit lock
+    # serializes the check-write-read, and a lost race joins rather than
+    # raising, so exactly one object lands and none is deleted.
+    stack = _durable_stack()
+    version = hashlib.sha256(_V1_TEXT).hexdigest()
+    key = f"filings/DOC-1/{version}"
+    start = threading.Barrier(2)
+    outcomes: list[object] = []
+    failures: list[BaseException] = []
+
+    def submit() -> None:
+        start.wait()
+        try:
+            outcomes.append(_submit(stack, _V1_TEXT))
+        except BaseException as exc:  # noqa: BLE001 - re-raised in main
+            failures.append(exc)
+
+    threads = [threading.Thread(target=submit) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert failures == [], failures
+    assert len(outcomes) == 2
+    assert {submission.version for submission in outcomes} == {version}
+    assert {submission.job_id for submission in outcomes} == {"DOC-1"}
+    # one object, one job, and no compensating delete of the shared key
+    assert stack.objects.puts == [key]
+    assert stack.objects.deletes == []
+    assert stack.states.get_job("DOC-1").state is IngestState.PENDING
+
+
+def test_different_version_while_in_flight_is_a_typed_conflict() -> None:
+    stack = _durable_stack()
+    first = _submit(stack, _V1_TEXT)
+    stack.states.transition("DOC-1", IngestState.FETCHING)
+
+    with pytest.raises(IngestConcurrentRunError) as excinfo:
+        _submit(stack, _V2_TEXT)
+
+    assert excinfo.value.code == "concurrent_run"
+    # the in-flight job and its version are untouched
+    assert stack.states.get_job("DOC-1").state is IngestState.FETCHING
+    assert _pointer_of(stack.pointers, "DOC-1").sha256 == first.version
+    assert len(stack.objects.puts) == 1
+
+
+def test_a_failed_job_reenters_on_the_retry_edge() -> None:
+    stack = _durable_stack()
+    _submit(stack, _V1_TEXT)
+    stack.states.transition("DOC-1", IngestState.FETCHING)
+    with pytest.raises(Exception):  # noqa: BLE001 - the store's own raise
+        stack.states.fail_step(
+            "DOC-1", step="extract", cause=RuntimeError("extractor died")
+        )
+
+    replacement = _submit(stack, _V2_TEXT)
+
+    # ``failed`` has no edge back to ``pending``; the machine's retry edge
+    # is ``failed -> fetching``, and that is what is reported.
+    assert replacement.state is IngestState.FETCHING
+    assert _pointer_of(stack.pointers, "DOC-1").sha256 == replacement.version
+    assert stack.states.get_job("DOC-1").state is IngestState.FETCHING
+
+
+def test_replacing_a_ready_document_is_a_typed_refusal() -> None:
+    # The state machine has no edge out of ``ready`` and no job-reset
+    # port, so replacing a ready document cannot be accepted yet: the
+    # only honest answer is a typed refusal with nothing written. When
+    # the store gains the re-queue edge this becomes an accept.
+    stack = _durable_stack()
+    first = _submit(stack, _V1_TEXT)
+    _advance(stack.states, "DOC-1")
+
+    with pytest.raises(IngestReplacementUnsupportedError) as excinfo:
+        _submit(stack, _V2_TEXT)
+
+    assert excinfo.value.code == "replacement_unsupported"
+    assert stack.objects.puts == [f"filings/DOC-1/{first.version}"]
+    assert _pointer_of(stack.pointers, "DOC-1").sha256 == first.version
+    assert stack.states.get_job("DOC-1").state is IngestState.READY
+
+
+def test_pointer_commit_failure_leaves_no_accepted_job() -> None:
+    stack = _durable_stack(pointers=_FailingPointerStore())
+    with pytest.raises(IngestDurableCommitError) as excinfo:
+        _submit(stack, _V1_TEXT)
+    assert excinfo.value.code == "durable_commit_failed"
+    assert excinfo.value.stage == "pointer_write"
+    # the object written first was compensated away, and no job exists
+    version = hashlib.sha256(_V1_TEXT).hexdigest()
+    assert stack.objects.deletes == [f"filings/DOC-1/{version}"]
+    with pytest.raises(UnknownJobError):
+        stack.states.get_job("DOC-1")
+
+
+def test_a_rejected_replacement_restores_the_previous_pointer() -> None:
+    # The job stage fails AFTER the pointer overwrite, so the compensating
+    # cleanup has to put the prior pointer back: the pointer store has no
+    # delete, and leaving the new one would advertise an unaccepted version.
+    stack = _durable_stack(states=_FailingCreateStateStore(fail_after=1))
+    first = _submit(stack, _V1_TEXT)
+    stack.states.transition("DOC-1", IngestState.FAILED)
+
+    with pytest.raises(IngestDurableCommitError) as excinfo:
+        _submit(stack, _V2_TEXT)
+
+    assert excinfo.value.stage == "job_record"
+    assert _pointer_of(stack.pointers, "DOC-1") is not None
+    assert _pointer_of(stack.pointers, "DOC-1").sha256 == first.version
+    assert len(stack.objects.puts) == 2
+    assert stack.objects.deletes == [stack.objects.puts[1]]
+    assert stack.states.get_job("DOC-1").state is IngestState.FAILED
+
+
+def test_a_failing_compensating_delete_is_observable_not_swallowed() -> None:
+    stack = _durable_stack(
+        objects=_FailingDeleteObjectStore(), pointers=_FailingPointerStore()
+    )
+    with pytest.raises(IngestObjectCleanupError) as excinfo:
+        _submit(stack, _V1_TEXT)
+    assert excinfo.value.code == "object_cleanup_failed"
+    assert excinfo.value.key == (
+        f"filings/DOC-1/{hashlib.sha256(_V1_TEXT).hexdigest()}"
+    )
+    # the cleanup failure names the persistence failure that triggered it
+    # as its cause, with the delete's own failure as the context
+    assert isinstance(excinfo.value.__cause__, MetadataStoreError)
+    assert isinstance(excinfo.value.__context__, ObjectStoreUnavailableError)
+
+
+def test_durable_accept_without_wired_stores_is_a_typed_failure() -> None:
+    endpoint = IngestEndpoint(push_port=FakePushPort())
+    with pytest.raises(IngestDurableCommitError) as excinfo:
+        endpoint.submit_durable(_V1_TEXT, document_id="DOC-1", declared_format="txt")
+    assert excinfo.value.code == "durable_commit_failed"
+    assert excinfo.value.stage == "unconfigured"
+
+
+def test_the_synchronous_ingest_chain_still_needs_no_stores() -> None:
+    # Backward compatibility: the existing chain works with only the push
+    # port wired, exactly as before the durable accept door existed.
+    fake = FakePushPort()
+    endpoint = IngestEndpoint(push_port=fake, invalidation_port=fake)
+    result = endpoint.ingest(_V1_TEXT, document_id="DOC-1", declared_format="txt")
+    assert result.block_count > 0
+    assert fake.block_total() == result.block_count
+
+
+# ----- job_status: the polled state is the persisted one ----------------
+
+
+def test_job_status_reports_the_persisted_state_not_a_constant() -> None:
+    stack = _durable_stack()
+    submission = _submit(stack, _V1_TEXT)
+
+    status = stack.endpoint.job_status("DOC-1")
+    assert status.job_id == "DOC-1"
+    assert status.document_id == "DOC-1"
+    assert status.version == submission.version
+    assert status.state is IngestState.PENDING
+    assert status.text_ready is False
+    assert status.error_type is None
+
+    stack.states.transition("DOC-1", IngestState.FETCHING)
+    moved = stack.endpoint.job_status("DOC-1")
+    assert moved.state is IngestState.FETCHING
+    assert moved.text_ready is False
+
+    for to_state in (IngestState.EXTRACTING, IngestState.CATALOGING,
+                     IngestState.READY):
+        stack.states.transition("DOC-1", to_state)
+    ready = stack.endpoint.job_status("DOC-1")
+    assert ready.state is IngestState.READY
+    assert ready.text_ready is True
+
+
+def test_job_status_carries_the_typed_failure_of_a_failed_job() -> None:
+    stack = _durable_stack()
+    _submit(stack, _V1_TEXT)
+    stack.states.transition("DOC-1", IngestState.FETCHING)
+    with pytest.raises(Exception):  # noqa: BLE001 - the store's own raise
+        stack.states.fail_step(
+            "DOC-1", step="extract", cause=RuntimeError("parser exploded")
+        )
+
+    status = stack.endpoint.job_status("DOC-1")
+
+    assert status.state is IngestState.FAILED
+    assert status.text_ready is False
+    assert status.error_type == "RuntimeError"
+    assert "parser exploded" in (status.error_message or "")
+
+
+def test_job_status_of_an_unknown_job_stays_typed() -> None:
+    stack = _durable_stack()
+    with pytest.raises(UnknownJobError):
+        stack.endpoint.job_status("NEVER-ACCEPTED")
+
+
+def test_job_status_reads_the_version_from_the_durable_pointer() -> None:
+    stack = _durable_stack()
+    _submit(stack, _V1_TEXT)
+    # The pointer, not the job row, is where the accepted version lives.
+    assert stack.endpoint.job_status("DOC-1").version == (
+        _pointer_of(stack.pointers, "DOC-1").sha256
+    )
