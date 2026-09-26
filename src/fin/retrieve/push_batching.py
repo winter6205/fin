@@ -86,8 +86,10 @@ from fin.retrieve.push_port import (
     PushBatchOverflowError,
     PushBatchSizeInvalidError,
     PushError,
+    PushOutcome,
     PushPort,
     PushProtocolError,
+    frozen_content_identities,
     push_envelopes,
     validate_batch_not_empty,
 )
@@ -155,7 +157,11 @@ class BatchedPushOutcome:
     ``content_identities`` is the merge of every pushed batch's
     ``source_ref`` → service-reported ``content_identity``, which is the
     pair form the index-job handoff needs. A skipped batch contributes
-    nothing: its identity came back with the run that completed it.
+    nothing: its identity came back with the run that completed it, so a
+    replay's map is empty rather than a partial one — a caller that needs
+    the pairs reuses the map of the completing run (spec
+    ``corpus-serve-ingest`` Decision 2). The map is read-only for the same
+    reason it is merged: it is the run's record of what the service said.
     """
 
     batches_planned: int
@@ -165,6 +171,13 @@ class BatchedPushOutcome:
     duplicates: int
     block_ids: tuple[str, ...]
     content_identities: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "content_identities",
+            frozen_content_identities(self.content_identities),
+        )
 
 
 class PushJournalUnwritableError(PushError):
@@ -463,7 +476,9 @@ def push_in_batches(
 
     The identities each batch's response reported are merged into the
     run's ``content_identities``; two batches contradicting each other
-    about one `source_ref` is refused as :class:`PushProtocolError`.
+    about one `source_ref` is refused as :class:`PushProtocolError`, and
+    because that contradiction is a batch outcome like a transport failure
+    it is journaled against the batch that produced it.
     """
     validate_batch_not_empty(items, ledger=input_validation_ledger)
     plans = plan_batches(items, batch_size=batch_size)
@@ -474,12 +489,12 @@ def push_in_batches(
         if journal.is_completed(plan.key):
             skipped += 1
             continue
-        outcome = _push_one_batch(port, plan, journal=journal)
-        # Merged before the batch is journaled: a run whose identity map
-        # fin cannot stand behind must not leave progress behind either,
-        # or a replay would complete around the contradiction.
-        _merge_content_identities(
-            content_identities, outcome.content_identities
+        # The merge belongs to the batch, not to the run's summary: a
+        # contradiction must neither leave progress behind — a replay
+        # would complete around it — nor stay out of the journal the
+        # operator replays from.
+        outcome = _push_one_batch(
+            port, plan, journal=journal, merged=content_identities
         )
         journal.mark_completed(plan)
         pushed += 1
@@ -508,19 +523,32 @@ def _merge_content_identities(
     holds. Refused by name, keeping the whole run's map trustworthy.
     """
     for source_ref, identity in incoming.items():
-        known = merged.get(source_ref)
-        if known is not None and known != identity:
+        if source_ref in merged and merged[source_ref] != identity:
             raise PushProtocolError(
                 f"push batches disagree on the content identity of "
-                f"{source_ref!r}: {known} vs {identity}"
+                f"{source_ref!r}: {merged[source_ref]} vs {identity}"
             )
         merged[source_ref] = identity
 
 
-def _push_one_batch(port: PushPort, plan: BatchPlan, *, journal: PushJournal):
-    """Push one batch, journaling a named failure before re-raising."""
+def _push_one_batch(
+    port: PushPort,
+    plan: BatchPlan,
+    *,
+    journal: PushJournal,
+    merged: dict[str, str],
+) -> PushOutcome:
+    """Push one batch, fold its identities into ``merged``, and journal a
+    named failure for either before re-raising.
+
+    A merge refusal is an off-contract answer from this batch — the same
+    class of failure as a transport one for the replay, so it takes the
+    same path.
+    """
     try:
-        return push_envelopes(port, plan.envelopes)
+        outcome = push_envelopes(port, plan.envelopes)
+        _merge_content_identities(merged, outcome.content_identities)
+        return outcome
     except PushError as exc:
         journal.record_failure(plan, code=exc.code, message=str(exc))
         raise

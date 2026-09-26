@@ -172,6 +172,41 @@ def _business_envelope(business: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _items_of(payload: dict) -> list[dict]:
+    """The ``push`` items one scripted ``tools/call`` payload carried."""
+    return payload["params"]["arguments"]["items"]
+
+
+class _ChunkCountingPushPort(_ScriptedPushPort):
+    """A scripted server that answers the way iknow's ``push`` does: one
+    ``chunk_id`` per slice of what fin sent, in send order
+    (``src/tools/push.ts`` ``allChunkIds``).
+
+    ``scripted_response`` still wins when a test needs an exact envelope,
+    so a test about the adapter's bookkeeping does not also script a
+    response that happens to match the chunk count by hand.
+    """
+
+    async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
+        if self._scripted_response is not None:
+            return self._scripted_response
+        chunk_count = sum(len(item.get("chunks") or []) for item in _items_of(payload))
+        return _success_envelope([f"chunk-{i}" for i in range(chunk_count)])
+
+
+class _CapturingPushPort(_ChunkCountingPushPort):
+    """``_ChunkCountingPushPort`` that also records the payloads it sent —
+    the request side of the wire-shape assertions."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.payloads: list[dict] = []
+
+    async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
+        self.payloads.append(payload)
+        return await super()._call_mcp(payload)
+
+
 # iknow stores ``content_identity`` as a sha256 hex digest; the tests use
 # plain hex so an assertion never depends on fin recomputing anything.
 _IDENTITY_A = "a" * 64
@@ -196,16 +231,7 @@ def test_push_items_envelope_matches_iknow_schema() -> None:
     failure the §B4 contract forbids.
     """
 
-    class _Capturing(MCPPushPort):
-        def __init__(self, **kwargs: object) -> None:
-            super().__init__(**kwargs)  # type: ignore[arg-type]
-            self.payloads: list[dict] = []
-
-        async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
-            self.payloads.append(payload)
-            return _success_envelope(["chunk-a", "chunk-b"])
-
-    port = _Capturing()
+    port = _CapturingPushPort()
     records = _wires(2)
     port.push(records)
 
@@ -519,25 +545,7 @@ def test_push_multi_chunk_envelope_chunk_count_matches_server() -> None:
     expected_chunk_count = sum(len(chunks) for _, chunks in specs)
     expected_chunk_ids = [f"chunk-{i}" for i in range(expected_chunk_count)]
 
-    class _PerChunkScripted(MCPPushPort):
-        def __init__(self) -> None:
-            self._command: list[str] | None = ["iknow-memory"]
-            self._timeout: float = 5.0
-            self._ledger = None  # type: ignore[assignment]
-            self._seen_keys: dict[tuple[str, str], bool] = {}
-
-        async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
-            # Mirror the server: one chunk_id per slice, in order.
-            chunk_count = sum(
-                len(item.get("chunks") or []) for item in (
-                    payload["params"]["arguments"]["items"]
-                )
-            )
-            return _success_envelope(
-                [f"chunk-{i}" for i in range(chunk_count)]
-            )
-
-    port = _PerChunkScripted()
+    port = _ChunkCountingPushPort()
     outcome = port.push(_multi_chunk_wires(specs))
 
     assert outcome["block_ids"] == expected_chunk_ids
@@ -560,24 +568,7 @@ def test_push_multi_chunk_envelope_replay_counts_chunks_not_envelopes() -> None:
         ("docs/b.md", ["gamma ", "delta ", "epsilon"]),  # 3 chunks
     ]
 
-    class _FixedScripted(MCPPushPort):
-        def __init__(self) -> None:
-            self._command: list[str] | None = ["iknow-memory"]
-            self._timeout: float = 5.0
-            self._ledger = None  # type: ignore[assignment]
-            self._seen_keys: dict[tuple[str, str], bool] = {}
-
-        async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
-            chunk_count = sum(
-                len(item.get("chunks") or []) for item in (
-                    payload["params"]["arguments"]["items"]
-                )
-            )
-            return _success_envelope(
-                [f"chunk-{i}" for i in range(chunk_count)]
-            )
-
-    port = _FixedScripted()
+    port = _ChunkCountingPushPort()
     envelopes = _multi_chunk_wires(specs)
 
     first = port.push(envelopes)
@@ -683,18 +674,12 @@ def test_push_replay_still_reports_the_stored_content_identity() -> None:
     """An idempotent re-push echoes the stored identity, so a caller that
     resolves the pair from the response gets the same value twice."""
 
-    class _EchoIdentity(MCPPushPort):
-        def __init__(self) -> None:
-            self._command: list[str] | None = ["iknow-memory"]
-            self._timeout: float = 5.0
-            self._ledger = None  # type: ignore[assignment]
-            self._seen_keys: dict[tuple[str, str], bool] = {}
+    class _EchoIdentity(_ChunkCountingPushPort):
+        """Answers every call with the one identity the service says it
+        stored for each 资料, so a replay reads the same pairs twice."""
 
         async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
-            refs = [
-                item["source_ref"]
-                for item in payload["params"]["arguments"]["items"]
-            ]
+            refs = [item["source_ref"] for item in _items_of(payload)]
             return _business_envelope(
                 {
                     "chunk_ids": [f"chunk-{i}" for i in range(len(refs))],
@@ -779,29 +764,20 @@ def test_push_never_sends_an_identity_field_on_the_wire() -> None:
     pinned here because the response now carries one in the other
     direction."""
 
-    class _Capturing(MCPPushPort):
-        def __init__(self) -> None:
-            self._command: list[str] | None = ["iknow-memory"]
-            self._timeout: float = 5.0
-            self._ledger = None  # type: ignore[assignment]
-            self._seen_keys: dict[tuple[str, str], bool] = {}
-            self.items: list[dict] = []
-
-        async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
-            self.items = payload["params"]["arguments"]["items"]
-            return _business_envelope(
-                {
-                    "chunk_ids": ["chunk-a"],
-                    "source_doc_id": "doc-1",
-                    "content_identity": _IDENTITY_A,
-                }
-            )
-
-    port = _Capturing()
+    port = _CapturingPushPort(
+        scripted_response=_business_envelope(
+            {
+                "chunk_ids": ["chunk-a"],
+                "source_doc_id": "doc-1",
+                "content_identity": _IDENTITY_A,
+            }
+        )
+    )
     port.push(_wires(1))
 
-    assert len(port.items) == 1
-    for item in port.items:
+    items = _items_of(port.payloads[0])
+    assert len(items) == 1
+    for item in items:
         assert set(item) <= _IKNOW_PUSH_ITEM_KEYS, item
         assert "content_identity" not in item
         assert "body_content_id" not in item

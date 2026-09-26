@@ -445,6 +445,7 @@ def test_a_push_with_nothing_new_to_write_is_a_success_not_a_failure() -> None:
 
 _REF_A = '{"document_id":"T-2025Q3","version":"c","unit":1}'
 _REF_B = '{"document_id":"T-2025Q3","version":"c","unit":2}'
+_REF_C = '{"document_id":"T-2025Q3","version":"c","unit":3}'
 _IDENTITY_A = "1" * 64
 _IDENTITY_B = "2" * 64
 
@@ -572,3 +573,88 @@ def test_off_contract_identity_fields_are_a_named_protocol_failure(
 
     assert excinfo.value.code == "push_protocol_error"
     assert isinstance(excinfo.value, PushError)
+
+
+def test_keyed_identities_covering_an_unpushed_source_ref_are_refused(
+) -> None:
+    """A keyed map may only restate the 资料 this batch pushed.
+
+    The keyed shape is the one fin's own adapter hands back, so it is
+    read again on the way out. Accepting a key the batch never sent would
+    let a response attribute an identity to a `source_ref` no row of this
+    push covers, and that pair would reach ``submit_index_job`` with
+    nothing on either side able to contradict it.
+    """
+    port = MalformedResponsePushPort(
+        {
+            "block_ids": ["b0", "b1"],
+            "written": 2,
+            "duplicates": 0,
+            "content_identities": {_REF_A: _IDENTITY_A, _REF_C: _IDENTITY_B},
+        }
+    )
+
+    with pytest.raises(PushProtocolError) as excinfo:
+        push_records(port, [_wire(_REF_A, "alpha"), _wire(_REF_B, "beta")])
+
+    assert excinfo.value.code == "push_protocol_error"
+    assert _REF_C in str(excinfo.value)
+
+
+def test_a_partial_keyed_map_only_leaves_out_the_identity_less_sources(
+) -> None:
+    """A keyed map is attributed by name, so it answers for the keys it
+    carries and nothing more — unlike the positional shape, where an
+    omitted slot would silently shift every later pair."""
+    port = MalformedResponsePushPort(
+        {
+            "block_ids": ["b0", "b1"],
+            "written": 2,
+            "duplicates": 0,
+            "content_identities": {_REF_B: _IDENTITY_B},
+        }
+    )
+
+    outcome = push_records(
+        port, [_wire(_REF_A, "alpha"), _wire(_REF_B, "beta")]
+    )
+
+    assert outcome.content_identities == {_REF_B: _IDENTITY_B}
+
+
+def test_an_empty_keyed_map_is_the_same_no_identity_answer_as_an_absent_field(
+) -> None:
+    """``{}`` and an absent field both mean "the service attributed no
+    identity"; neither is a count mismatch, and neither is filled in
+    fin-side."""
+    port = MalformedResponsePushPort(
+        {
+            "block_ids": ["b0", "b1"],
+            "written": 2,
+            "duplicates": 0,
+            "content_identities": {},
+        }
+    )
+
+    outcome = push_records(
+        port, [_wire(_REF_A, "alpha"), _wire(_REF_B, "beta")]
+    )
+
+    assert outcome.content_identities == {}
+
+
+def test_outcome_identities_are_not_left_for_the_caller_to_mutate() -> None:
+    """The map on a frozen result is the run's record of what the service
+    stored, so writing through it would edit that record — and, on the
+    batched path, reach the map other results still read."""
+    outcome = PushOutcome(
+        block_ids=("b0",),
+        written=1,
+        duplicates=0,
+        content_identities={_REF_A: _IDENTITY_A},
+    )
+
+    with pytest.raises(TypeError):
+        outcome.content_identities[_REF_B] = _IDENTITY_B  # type: ignore[index]
+
+    assert dict(outcome.content_identities) == {_REF_A: _IDENTITY_A}

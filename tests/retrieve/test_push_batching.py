@@ -694,13 +694,90 @@ def test_batches_disagreeing_on_one_source_ref_are_a_named_failure() -> None:
     to land last, and the durable index job would be keyed on a value the
     service does not hold."""
     port = _ContradictingIdentityPort()
+    journal = PushJournal()
     records = [
         _degenerate_record(block_id="b1", source_ref="docs/x.md", content_id="c1", text="one"),
         _degenerate_record(block_id="b2", source_ref="docs/x.md", content_id="c2", text="two"),
     ]
+    plans = plan_batches(records, batch_size=1)
 
     with pytest.raises(PushProtocolError) as excinfo:
-        push_in_batches(port, records, journal=PushJournal(), batch_size=1)
+        push_in_batches(port, records, journal=journal, batch_size=1)
 
     assert excinfo.value.code == "push_protocol_error"
     assert port.calls == 2
+    # The contradiction is a batch failure like any other, so the journal
+    # stays the replay work list: without this record an operator reading
+    # the journal would see a run that simply stopped after batch 0.
+    failures = journal.failures()
+    assert [(f.batch_index, f.code) for f in failures] == [(1, "push_protocol_error")]
+    assert failures[0].source_refs == ("docs/x.md",)
+    # The completing run is not progress the next one may skip past.
+    assert not journal.is_completed(plans[1].key)
+    assert journal.completed_keys() == (plans[0].key,)
+
+
+def test_a_journal_skipped_batch_contributes_no_identity_to_the_replay(
+) -> None:
+    """A skipped batch is not pushed, so the service reports nothing for
+    it and the replay's map is empty.
+
+    An empty map here is the honest answer rather than a partial one a
+    caller could misread as "the service holds no identity": the caller
+    that needs the pairs reuses the map the run that completed the
+    batches returned (spec ``corpus-serve-ingest`` Decision 2).
+    """
+    port = FakePushPort()
+    journal = PushJournal()
+    records = _records()
+
+    first = push_in_batches(port, records, journal=journal, batch_size=3)
+    replay = push_in_batches(port, records, journal=journal, batch_size=3)
+
+    assert first.content_identities
+    assert replay.batches_pushed == 0
+    assert replay.batches_skipped == replay.batches_planned
+    assert replay.content_identities == {}
+
+
+def test_a_run_result_identity_map_refuses_to_be_written_through() -> None:
+    """The merged map is the run's record of what the service stored.
+
+    Written through, it would edit that record after the fact and — the
+    map being built once and handed to several results — reach a map
+    another caller still reads.
+    """
+    port = FakePushPort()
+    records = _records()
+
+    outcome = push_in_batches(port, records, journal=PushJournal(), batch_size=3)
+
+    with pytest.raises(TypeError):
+        outcome.content_identities["invented"] = "0" * 64  # type: ignore[index]
+    assert "invented" not in outcome.content_identities
+
+
+def test_push_in_batches_hands_the_merged_map_on_by_alias() -> None:
+    """The run's map reaches the next result as the same object.
+
+    Freezing wraps instead of copying, so the hand-off chain (batched
+    run → ingest result → ``submit_index_job``) cannot fork two records
+    of what the service reported; a consumer holding the earlier result
+    reads exactly what the later one carries.
+    """
+    port = FakePushPort()
+    records = _records()
+
+    outcome = push_in_batches(port, records, journal=PushJournal(), batch_size=3)
+    handed_on = BatchedPushOutcome(
+        batches_planned=outcome.batches_planned,
+        batches_pushed=outcome.batches_pushed,
+        batches_skipped=outcome.batches_skipped,
+        written=outcome.written,
+        duplicates=outcome.duplicates,
+        block_ids=outcome.block_ids,
+        content_identities=outcome.content_identities,
+    )
+
+    assert isinstance(outcome.content_identities, MappingProxyType)
+    assert handed_on.content_identities is outcome.content_identities

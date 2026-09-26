@@ -27,9 +27,6 @@ Covered, one test per T14 acceptance clause:
 
 from __future__ import annotations
 
-import hashlib
-import json
-
 import pytest
 
 from fin.corpus.chunking import (
@@ -47,6 +44,7 @@ from fin.corpus.push import (
     envelopes_of_unit,
 )
 from fin.retrieve.fake_push_port import FakePushPort
+from fin.retrieve.iknow_identity import compute_iknow_content_identity
 from fin.retrieve.push_port import (
     IDEMPOTENCY_BASELINE_PUSHES,
     PushEmptyBatchError,
@@ -496,24 +494,14 @@ def test_off_contract_chunk_shapes_are_refused_by_name(chunks: list) -> None:
 # ---------------------------------------------------------------------------
 # T4 handoff: the fake answers with the identity field the real service does
 # ---------------------------------------------------------------------------
-
-
-def _iknow_content_identity(body: str) -> str:
-    """The identity iknow-memory computes server-side — sha256 over the
-    JSON array of the body and the three **service-owned** version
-    strings (``src/tools/ingest.ts`` ``computeContentIdentity``).
-
-    The expectation is written from the cross-repo contract, not from
-    fin's own hashing helper: if the fake ever drifts into mirroring
-    ``body_content_id`` instead of the remote value, this test is what
-    catches it.
-    """
-    payload = json.dumps(
-        [body, "normalization-v1", "parse-v1", "parameters-v1"],
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+#
+# ``compute_iknow_content_identity`` is the one mirror of iknow's formula
+# that both the fake and these expectations read, so what a test re-derives
+# here is that mirror rather than an independent observation of the
+# service: it pins that the fake answers with the mirrored value and not
+# with fin's own ``body_content_id``. Agreement with what iknow actually
+# stores is the live cross-repo driver's claim
+# (``tests/retrieve/test_live_content_identity.py``, opt-in ``-m mcp``).
 
 
 def test_fake_answers_a_single_document_push_with_content_identity() -> None:
@@ -524,7 +512,9 @@ def test_fake_answers_a_single_document_push_with_content_identity() -> None:
 
     response = port.push([envelope.to_wire()])
 
-    assert response["content_identity"] == _iknow_content_identity(envelope.body)
+    assert response["content_identity"] == compute_iknow_content_identity(
+        envelope.body
+    )
     assert "content_identities" not in response
 
 
@@ -536,7 +526,7 @@ def test_fake_answers_a_multi_document_batch_with_ordered_identities() -> None:
     response = port.push([envelope.to_wire() for envelope in envelopes])
 
     assert response["content_identities"] == [
-        _iknow_content_identity(envelope.body) for envelope in envelopes
+        compute_iknow_content_identity(envelope.body) for envelope in envelopes
     ]
     assert "content_identity" not in response
 
@@ -550,7 +540,7 @@ def test_fake_identity_reaches_the_caller_through_the_push_seam() -> None:
     outcome = push_envelopes(port, envelopes)
 
     assert dict(outcome.content_identities) == {
-        envelope.source_ref: _iknow_content_identity(envelope.body)
+        envelope.source_ref: compute_iknow_content_identity(envelope.body)
         for envelope in envelopes
     }
 

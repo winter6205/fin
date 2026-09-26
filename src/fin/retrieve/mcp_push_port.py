@@ -6,10 +6,12 @@ MCP ``push`` tool via JSON-RPC 2.0 over stdio. After T1 the wire shape
 is the **one envelope per 资料** declared by the spec — ``source_ref``
 + the unit's extracted body + ``chunks[]`` of ``{content, index}`` +
 ``metadata`` + ``valid_from`` / ``valid_until``. Wire field names are
-verbatim the **z.strictObject** schema in ``src/tools/push.ts``. Extra
-keys would either be rejected by ``strictObject`` or silently dropped
-on a mock without ``.strict()``; both are the same kind of wire-shape
-failure this module refuses to ship.
+verbatim the schema in ``src/tools/push.ts``. Only the single-envelope
+arm of that union is a ``z.strictObject``; fin sends the ``items[]``
+arm, whose item objects are a plain ``z.object``, so an extra key here
+would be silently ignored by the service rather than refused. That
+asymmetry is why this module validates its own wire shape and refuses
+to ship it.
 
 **no re-splitting** (§B4「不二次切分」): fin owns chunking; the bytes
 that leave here equal the bytes that were pushed. The chunks list is
@@ -249,8 +251,9 @@ def _validate_mcp_responses(
 def _is_metadata_incomplete_message(message: str) -> bool:
     """Detect the schema-side ``metadata`` rejection in a JSON-RPC error.
 
-    The iknow ``push`` schema (``z.strictObject(PushItemSchema)``)
-    rejects the WHOLE batch on missing ``metadata``. fin must
+    The iknow ``push`` schema (``PushItemSchema``, required on every
+    item of the batch fin sends) rejects the WHOLE batch on missing
+    ``metadata``. fin must
     translate that single rule into the §B4 / SC20 typed refusal
     rather than collapsing it into the generic protocol failure.
     """
@@ -363,26 +366,6 @@ def _chunk_ids_of(envelope: dict[str, Any], *, chunk_count: int) -> tuple[str, .
     return tuple(chunk_ids)
 
 
-def _wire_content_identities_of(
-    envelope: dict[str, Any], *, source_refs: Sequence[str]
-) -> dict[str, str]:
-    """Pair one ``push`` answer's identities with the ``source_ref``
-    values fin sent.
-
-    :func:`fin.retrieve.push_port.content_identities_of` also accepts an
-    already-keyed mapping, because that is the shape this adapter hands
-    to its own caller. The service never answers that way, so an object
-    under ``content_identities`` is either inverted or invented —
-    refused here rather than read as a pair.
-    """
-    if isinstance(envelope.get("content_identities"), Mapping):
-        raise PushProtocolError(
-            "push response content_identities is an object; the wire shape "
-            "is one identity per 资料, in send order"
-        )
-    return content_identities_of(envelope, source_refs=source_refs)
-
-
 # ----- port -----
 
 
@@ -467,7 +450,12 @@ class MCPPushPort:
         ``content_identity`` the service says it stored beside it — the
         only value fin may later pair with that `source_ref` at
         ``submit_index_job``. A service that reports none yields an empty
-        mapping; this adapter never substitutes its own hash.
+        mapping; this adapter never substitutes its own hash. The pairing
+        rule itself is :func:`fin.retrieve.push_port.content_identities_of`
+        's, shared with every other push reader: it attributes a batch
+        answer against the first-seen distinct ``source_ref`` values fin
+        SENT, so the ``source_doc_ids[]`` the service reports alongside
+        them is never a fin-side attribution input.
         """
         ledger = self.input_validation_failures
         validate_batch_not_empty(envelopes, ledger=ledger)
@@ -500,7 +488,7 @@ class MCPPushPort:
             len(item.get("chunks") or []) for item in items
         )
         chunk_ids = _chunk_ids_of(envelope, chunk_count=chunk_count)
-        content_identities = _wire_content_identities_of(
+        content_identities = content_identities_of(
             envelope,
             source_refs=[str(wire["source_ref"]) for wire in envelopes],
         )
@@ -537,7 +525,7 @@ class MCPPushPort:
     def _to_push_item(envelope: Mapping[str, Any]) -> dict[str, Any]:
         """Project one fin envelope into the iknow ``PushItem`` shape.
 
-        The wire shape (verbatim the **z.strictObject** schema in
+        The wire shape (verbatim the ``PushItemSchema`` in
         ``src/tools/push.ts``) is ``{content, source_ref, chunks,
         metadata, valid_from, valid_until}``. Every envelope field is
         forwarded verbatim — fin owns chunking (§B4「不二次切分」),

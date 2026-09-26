@@ -77,6 +77,7 @@ from fin.corpus.push import (
     body_content_id,
     content_identity,
 )
+from fin.retrieve.iknow_identity import compute_iknow_content_identity
 from fin.retrieve.invalidation_port import (
     InvalidationError,
     InvalidationUnknownTargetError,
@@ -104,30 +105,21 @@ def _stored_content_identity(envelope: Mapping[str, Any]) -> str:
     """The ``content_identity`` the real service would have computed for
     one envelope's body.
 
-    This is deliberately NOT :func:`fin.corpus.push.body_content_id`.
-    iknow-memory owns that value: it hashes the body together with three
-    **service-owned** version strings
-    (``sha256(JSON([body, "normalization-v1", "parse-v1",
-    "parameters-v1"]))``, ``src/tools/ingest.ts``
-    ``computeContentIdentity``) and stores it beside the `source_ref`.
-    The fake mirrors that semantics so the seam can be exercised offline
-    without teaching fin to derive an identity it is only ever supposed
-    to read back.
+    This is deliberately NOT :func:`fin.corpus.push.body_content_id`:
+    iknow-memory owns that value, and the fake answers with the same
+    construction the real service uses
+    (:func:`fin.retrieve.iknow_identity.compute_iknow_content_identity`)
+    so fin's read-back path has something to read without the service
+    running. The single formula lives in that module, not here.
     """
     body = envelope.get("content")
     if body is None:
         body = envelope.get("body")
-    payload = json.dumps(
-        [
-            "" if body is None else str(body),
-            "normalization-v1",
-            "parse-v1",
-            "parameters-v1",
-        ],
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    # EXIT: unreachable on a live push — :meth:`FakePushPort._validate_batch`
+    # runs ``validate_wire_record_text``, which refuses a body-less envelope
+    # before ``_identity_fields`` is reached; the empty-string arm is
+    # defensive only, so a direct helper call cannot raise here.
+    return compute_iknow_content_identity("" if body is None else str(body))
 
 
 def _fake_chunk_id(source_ref: str, chunk: Mapping[str, Any]) -> str:
