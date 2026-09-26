@@ -71,7 +71,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 from urllib.parse import urlsplit
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -307,6 +307,22 @@ def _human(text: str, data_url: str | None) -> list[Any]:
     return [HumanMessage(content=parts)]
 
 
+# The kinds a call may be sent as. ``PROMPTS`` keys the questions, ``_record``
+# keys which answer carrier a response lands in, and the control is decided by
+# ``image_sent``; each spelling is therefore load-bearing in three places and is
+# named once here.
+KIND_PRESENCE: Final[str] = "presence"
+KIND_MEANING: Final[str] = "meaning"
+KIND_STRUCTURED: Final[str] = "structured_json"
+KIND_TEXT_CONTROL: Final[str] = "text_control"
+
+# The two kinds that ask about the chart *in the image*, so their answer is what
+# ``chart_meaning_answer`` carries. The text-only control answers "ok" with no
+# image in the request, and a control reply recorded as a chart answer would put
+# a witness in the artifact that no image could have produced.
+_CHART_ANSWER_KINDS: Final[tuple[str, ...]] = (KIND_MEANING, KIND_STRUCTURED)
+
+
 def presence_prompt(target: Target, data_url: str) -> list[Any]:
     """Question (a): is a chart on this page at all?"""
     return _human(
@@ -351,9 +367,9 @@ def structured_prompt(target: Target, data_url: str) -> list[Any]:
 
 
 PROMPTS: tuple[tuple[str, Any], ...] = (
-    ("presence", presence_prompt),
-    ("meaning", meaning_prompt),
-    ("structured_json", structured_prompt),
+    (KIND_PRESENCE, presence_prompt),
+    (KIND_MEANING, meaning_prompt),
+    (KIND_STRUCTURED, structured_prompt),
 )
 
 
@@ -389,12 +405,14 @@ def message_text(message: Any) -> str:
     return str(content).strip()
 
 
-def message_usage(message: Any) -> dict[str, int | None] | None:
-    """Provider-reported usage, or ``None`` when the provider reported none.
+def _usage_mapping(message: Any) -> dict[str, Any]:
+    """Where a provider put its token counts, in whichever of its shapes.
 
-    Recorded as-is: a provider that omits usage leaves a visible null
-    rather than an invented number, because that token cost is exactly
-    what the budget decision is made from.
+    Three spellings are read - ``usage_metadata``, a nested
+    ``response_metadata["token_usage"]``, and a named-tuple-like object with
+    ``_asdict`` - and each miss falls to the next. An object that is none of
+    those yields ``{}``, which the caller records as "no usage reported" rather
+    than as a row of zeros.
     """
     raw: Any = getattr(message, "usage_metadata", None) or {}
     if not raw:
@@ -403,8 +421,17 @@ def message_usage(message: Any) -> dict[str, int | None] | None:
     if not isinstance(raw, dict):
         as_dict = getattr(raw, "_asdict", None)
         raw = as_dict() if callable(as_dict) else {}
-    if not isinstance(raw, dict):
-        return None
+    return raw if isinstance(raw, dict) else {}
+
+
+def message_usage(message: Any) -> dict[str, int | None] | None:
+    """Provider-reported usage, or ``None`` when the provider reported none.
+
+    Recorded as-is: a provider that omits usage leaves a visible null
+    rather than an invented number, because that token cost is exactly
+    what the budget decision is made from.
+    """
+    raw = _usage_mapping(message)
 
     def _num(*keys: str) -> int | None:
         for key in keys:
@@ -423,38 +450,107 @@ def message_usage(message: Any) -> dict[str, int | None] | None:
     return usage
 
 
-def classify_error(exc: BaseException) -> str:
-    """One error class per failure, so a verdict never rests on prose."""
-    name = type(exc).__name__.lower()
-    text = str(exc).lower()
+# The classes are compared at the call sites that decide what happens next, so
+# they are named once here rather than spelled at each branch.
+AUTH_OR_PERMISSION = "auth_or_permission"
+TRANSPORT = "transport"
+IMAGE_INPUT_REJECTED = "image_input_rejected"
+PROVIDER_REFUSAL = "provider_refusal"
+RATE_LIMITED = "rate_limited"
+BAD_REQUEST = "bad_request"
+PROVIDER_ERROR = "provider_error"
+
+# A modality rejection has to name both a modality and a refusal. Matching on
+# the bare word "image" would classify "this endpoint does not support
+# response_format" as an image rejection, and ``supports_image_input`` is the
+# verdict the per-run vision budget is set from: a loose match here turns an
+# unrelated 400 into a claim about what the provider can see.
+_MODALITY_CUES = ("image", "vision", "multimodal", "modalit", "picture", "photo")
+_REFUSAL_CUES = (
+    "does not support",
+    "do not support",
+    "not supported",
+    "not accept",
+    "unsupported",
+    "cannot process",
+    "unable to",
+    "rejected",
+    "invalid url",
+)
+
+
+def _refuses_image_input(text: str) -> bool:
+    """Whether provider text positively refuses an image input."""
+    return any(cue in text for cue in _MODALITY_CUES) and any(
+        cue in text for cue in _REFUSAL_CUES
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ErrorRule:
+    """One row of the classification table: a class and the evidence for it.
+
+    A status code is the provider's own answer and is tried before the prose,
+    but the two are alternatives rather than stages: an ``Unauthorized`` 401 and
+    an ``Invalid API key`` without a status are the same failure, and a chain of
+    ``if`` statements kept them in one order only by accident.
+    """
+
+    kind: str
+    statuses: frozenset[int] = frozenset()
+    name_cues: tuple[str, ...] = ()
+    text_cues: tuple[str, ...] = ()
+    modality: bool = False
+
+    def matches(self, name: str, text: str, status: Any) -> bool:
+        if self.modality:
+            return _refuses_image_input(text)
+        return (
+            status in self.statuses
+            or any(cue in name for cue in self.name_cues)
+            or any(cue in text for cue in self.text_cues)
+        )
+
+
+# Order is the adjudication: the modality question is asked only after auth and
+# transport had their turn, and it is answered before 429/400 can absorb a
+# provider that refuses images with a plain 400.
+_ERROR_RULES: Final[tuple[_ErrorRule, ...]] = (
+    _ErrorRule(
+        AUTH_OR_PERMISSION,
+        frozenset({401, 403}),
+        text_cues=("invalid_api_key", "unauthor"),
+    ),
+    _ErrorRule(TRANSPORT, name_cues=("timeout",), text_cues=("timeout",)),
+    _ErrorRule(
+        TRANSPORT,
+        name_cues=("connection", "remotedisconnected"),
+        text_cues=("connect",),
+    ),
+    _ErrorRule(IMAGE_INPUT_REJECTED, modality=True),
+    _ErrorRule(PROVIDER_REFUSAL, text_cues=("content policy", "safety")),
+    _ErrorRule(RATE_LIMITED, frozenset({429}), text_cues=("rate limit",)),
+    _ErrorRule(BAD_REQUEST, frozenset({400}), text_cues=("bad request",)),
+)
+
+
+def _error_signals(exc: BaseException) -> tuple[str, str, Any]:
+    """The three readings a provider failure can be recognised from."""
     status = getattr(exc, "status_code", None) or getattr(
         getattr(exc, "response", None), "status_code", None
     )
-    if status in (401, 403) or "invalid_api_key" in text or "unauthor" in text:
-        return "auth_or_permission"
-    if "timeout" in name or "timeout" in text:
-        return "transport"
-    if "connection" in name or "connect" in text or "remotedisconnected" in name:
-        return "transport"
-    if any(
-        marker in text
-        for marker in (
-            "image",
-            "vision",
-            "multimodal",
-            "modalit",
-            "unsupported file",
-            "invalid url",
-        )
-    ):
-        return "image_input_rejected"
-    if "content policy" in text or "safety" in text:
-        return "provider_refusal"
-    if status == 429 or "rate limit" in text:
-        return "rate_limited"
-    if status == 400 or "bad request" in text:
-        return "bad_request"
-    return "provider_error"
+    return type(exc).__name__.lower(), str(exc).lower(), status
+
+
+def classify_error(exc: BaseException) -> str:
+    """One error class per failure, so a verdict never rests on prose."""
+    name, text, status = _error_signals(exc)
+    for rule in _ERROR_RULES:
+        if rule.matches(name, text, status):
+            return rule.kind
+    # EXIT: unclassified is its own named class, so a caller never reads an
+    # unknown failure as one of the verdict-bearing ones above.
+    return PROVIDER_ERROR
 
 
 # ----- the probe ------------------------------------------------------
@@ -513,9 +609,9 @@ class Probe:
                 f"{self._scrubber.clean(str(exc))[:300]}",
                 file=sys.stderr,
             )
-            if record["error_class"] == "auth_or_permission":
+            if record["error_class"] == AUTH_OR_PERMISSION:
                 raise Blocked(self._scrubber.clean(str(exc))) from exc
-            if record["error_class"] == "transport" and self.has_budget():
+            if record["error_class"] == TRANSPORT and self.has_budget():
                 # The single permitted retry, for a transport error only.
                 print(f"probe: retrying {kind} once (transport)", file=sys.stderr)
                 return self.invoke(kind, messages)
@@ -543,7 +639,7 @@ class Probe:
         usage: dict[str, int | None] | None,
         error_class: str | None,
     ) -> dict[str, Any]:
-        image_sent = kind != "text_control"
+        image_sent = kind != KIND_TEXT_CONTROL
         width, height = self.dims
         return {
             "seq": len(self.calls) + 1,
@@ -553,8 +649,8 @@ class Probe:
             "image_bytes": self.image_bytes if image_sent else None,
             "latency_ms": latency_ms,
             "response_char_count": response_char_count,
-            "chart_presence_answer": text if kind == "presence" else None,
-            "chart_meaning_answer": text if kind != "presence" else None,
+            "chart_presence_answer": text if kind == KIND_PRESENCE else None,
+            "chart_meaning_answer": text if kind in _CHART_ANSWER_KINDS else None,
             "usage": usage,
             "error_class": error_class,
         }
@@ -607,17 +703,17 @@ def structured_ok(text: str | None) -> bool:
 
 def verdicts(calls: list[dict[str, Any]], target: Target) -> dict[str, bool]:
     meaning_text = next(
-        (c["chart_meaning_answer"] for c in calls if c["prompt_kind"] == "meaning"),
+        (c["chart_meaning_answer"] for c in calls if c["prompt_kind"] == KIND_MEANING),
         None,
     )
     image_rejected = any(
-        c["error_class"] == "image_input_rejected" for c in calls
+        c["error_class"] == IMAGE_INPUT_REJECTED for c in calls
     )
     structured_text = next(
         (
             c["chart_meaning_answer"]
             for c in calls
-            if c["prompt_kind"] == "structured_json"
+            if c["prompt_kind"] == KIND_STRUCTURED
         ),
         None,
     )
@@ -640,12 +736,12 @@ def run_probe(probe: Probe) -> None:
             probe.invoke(kind, builder(probe.target, probe.data_url))
         except BudgetExhausted:
             return
-    image_calls = [c for c in probe.calls if c["prompt_kind"] != "text_control"]
+    image_calls = [c for c in probe.calls if c["prompt_kind"] != KIND_TEXT_CONTROL]
     all_failed = bool(image_calls) and all(c["error_class"] for c in image_calls)
     if all_failed and probe.has_budget():
         # Separates "cannot see" from "cannot answer at all" - the budget
         # decision must not conflate them.
-        probe.invoke("text_control", _human("Reply with exactly one word: ok", None))
+        probe.invoke(KIND_TEXT_CONTROL, _human("Reply with exactly one word: ok", None))
 
 
 # ----- entry point -----------------------------------------------------
@@ -737,7 +833,7 @@ def summary_line(
 ) -> str:
     """One grep-able line: the three verdicts plus the witness result."""
     meaning_text = next(
-        (c["chart_meaning_answer"] for c in calls if c["prompt_kind"] == "meaning"),
+        (c["chart_meaning_answer"] for c in calls if c["prompt_kind"] == KIND_MEANING),
         None,
     )
     result = "ok" if verdict["supports_image_input"] else "negative"
