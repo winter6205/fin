@@ -4,7 +4,7 @@
 **Approach:** First supersede the leftover MDP T5/T6 and dream→MCP contracts so implementers do not follow them. Then evolve the store, keep code default OFF while documenting this-checkout ON, assemble prefetch/existence-pointer, wire explicit tools, gate auto-extract and dream, prove memory cannot cite, then run the over-attention gold set.
 **Spec link:** `specs/cross-session-operator-memory.md`
 **Worktree:** `/home/winner/projects/fin-wt-cross-session-memory` · branch `feat/cross-session-operator-memory`
-**Tracker:** FALLBACK — local markdown. Operator ruled no GitHub issues for [公司操作者跨会话私人记忆](../docs/wayfinder/cross-session-operator-memory-map.md); do not `gh issue create`.
+**Tracker:** FALLBACK — local markdown. Operator ruled no GitHub issues for 公司操作者跨会话私人记忆, in force as `specs/cross-session-operator-memory.md` assumption 11 ("Tracker stays local markdown (operator: no GitHub issues for this map)"); do not `gh issue create`. The topic map this line used to link was a session-local note and is not in this repo (ADR 0090).
 **Out of this worktree:** retrieve ranking; citation span rules; Soft-Track rename; iknow-memory code; memory index UI; vector search on facts.
 **Per-ticket loop (all bullets, header 声明一次):** test-driven-development → typecheck+tests（`uv run pytest -q`；memory cases as the spec’s ON path; web only if a bullet touches `web/`: `npx tsc --noEmit`）→ verification-before-completion → one commit on this worktree branch
 **End-of-round:** 全部子弹落地后对整轮 diff 做一次 code-review（Standards + Spec）；单弹 loop 不重复整轮 review。
@@ -46,7 +46,7 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
 
 1. **Supersede leftover MDP T5/T6 and dream→MCP contracts** — tag: `[decision]`
    - **Inherits:** spec SC30; ADR 0048 2026-09-06; this spec wins over `specs/memory-dialogue-platform.md` assumptions 5–6 and `specs/memory-dream.md` SC17–SC18.
-   - **Surface:** `specs/memory-dialogue-platform.md`, `specs/memory-dream.md`, `plans/memory-dialogue-platform.md`, `docs/wayfinder/cross-session-operator-memory-map.md`
+   - **Surface:** `specs/memory-dialogue-platform.md`, `specs/memory-dream.md`, `plans/memory-dialogue-platform.md`（该主题的会话本地主题地图不入库，不在可同步文件之列）
    - **Acceptance:** those files point at this spec/plan for remaining memory product wiring; they no longer instruct dream MCP upload or unconditional post-SSE dream as in-force work; commit touches no product code.
    - Status: [ ] pending
 

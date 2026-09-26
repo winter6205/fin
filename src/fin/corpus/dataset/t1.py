@@ -1,8 +1,8 @@
 """T1 public-source eval corpus (plan T1 / spec Focus 1).
 
 T1 is the **provenance-only** slice that pairs the live retrieve wave
-(spec ``live-retrieve-eval-wave`` Focus 1) with the scene coverage
-defined by ``docs/wayfinder/next-wave-workspace-kb-agent-map.md`` T1:
+(spec ``live-retrieve-eval-wave`` Focus 1) with this corpus's scene
+coverage, enumerated here:
 
 * Scene 1 — onboarding (GitLab Handbook CC BY-SA 4.0)
 * Scene 2 — presales (GitLab Handbook CC BY-SA 4.0)

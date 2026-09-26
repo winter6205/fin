@@ -1,6 +1,6 @@
 # Spec: workspace
 
-> **Identity banner (2026-09-06):** this spec is the frozen **workspace UI contract**, not current product identity. Quoted **fin** = 「bounded 10-Q research agent」and **workspace** as the UI name are v1 wording. Current SSOT: [`docs/CONTEXT.md`](../docs/CONTEXT.md) — **fin** is an enterprise knowledge-base Agent; the UI is **工作台**. Do not copy those quoted lines into new product copy.
+> **Identity banner (2026-09-06):** this spec is the frozen **workspace UI contract**, not current product identity. Quoted **fin** = 「bounded 10-Q research agent」and **workspace** as the UI name are v1 wording. Current SSOT: [`docs/CONTEXT.md`](../docs/CONTEXT.md) — **fin** is an enterprise **knowledge-QA** agent, the entry point that answers from the corpus rather than a knowledge base ([ADR 0090](../docs/adr/0090-product-identity-knowledge-qa-entry-point.md)); the UI is **工作台**. Do not copy those quoted lines into new product copy.
 
 ## Objective
 
@@ -21,8 +21,8 @@ Quoted from `docs/CONTEXT.md`:
 
 - **Does:**
   - One FastAPI process: existing `POST /ask` (sync `invoke`) plus workspace routes and the built SPA. Same compiled host graph object as CLI (ADR 0013).
-  - Frontend at repo-root `web/`: React 18 + TypeScript + Vite + TailwindCSS + Radix Primitives + Zustand. FastAPI serves `web/dist` same-origin. Vite dev proxies `/api` and `/ask`. Archived under `docs/design-references/prototype-workspace/`, the prototype variants are not product code and are not copied into `web/`.
-  - Look: Soft Brutalism (`#FAFAF7`, 1px black border, single `#2563EB` accent). Left sidebar ~280px; active thread highlighted with the blue accent. Title from the first user question, max 50 characters + ellipsis. Cassette Futurism stays archive-only under `docs/design-references/cassette-futurism/`.
+  - Frontend at repo-root `web/`: React 18 + TypeScript + Vite + TailwindCSS + Radix Primitives + Zustand. FastAPI serves `web/dist` same-origin. Vite dev proxies `/api` and `/ask`. The `prototype_workspace` prototype variants are kept out of the product: they are not product code and are not copied into `web/`.
+  - Look: Soft Brutalism (`#FAFAF7`, 1px black border, single `#2563EB` accent). Left sidebar ~280px; active thread highlighted with the blue accent. Title from the first user question, max 50 characters + ellipsis. Cassette Futurism stays archive-only — an explored alternative, never a product theme.
   - Chrome only: create, list, open, resume, delete. Path-addressable `/t/{thread_id}`. Catch-all after `/api` and `/ask` returns `index.html`. No rename, folders, search, Stop, or extra navigation chrome. Delete asks for confirmation (dialog, not a new surface).
   - Thread metadata (id, title, created_at) in a Postgres side table on `FIN_CHECKPOINT_URL`. Graph state stays in `PostgresSaver`. Delete removes the side row and `PostgresSaver.delete_thread` for that `thread_id`. Tests use `InMemorySaver` plus an in-process metadata stand-in.
   - Send path: `POST /api/threads/{thread_id}/messages` with JSON `{question}` returns `text/event-stream`. Client uses `fetch` (not native EventSource). Concurrent send on the same thread returns **409** `{error: concurrent_run}` **before** SSE headers. Composer is a textarea: Enter sends, Shift+Enter newline, empty submit is a no-op; disabled while that thread's run is in flight (no queue).
@@ -97,7 +97,7 @@ Supersedes the Does bullets that described one unframed thinking region with sta
 
 ## Planned files (ACR input, not a filename freeze)
 
-Host surface: `src/fin/host/http.py`, `src/fin/host/graph.py`, `src/fin/host/state.py`, `src/fin/host/compile.py`, `src/fin/host/scripted_model.py`, plus new host-owned modules for thread metadata / turn rows / SSE mapping / thinking converter as the implementer splits them. Tests under `tests/host/`. SPA under `web/`. No copy of `docs/design-references/prototype-workspace/` into product paths.
+Host surface: `src/fin/host/http.py`, `src/fin/host/graph.py`, `src/fin/host/state.py`, `src/fin/host/compile.py`, `src/fin/host/scripted_model.py`, plus new host-owned modules for thread metadata / turn rows / SSE mapping / thinking converter as the implementer splits them. Tests under `tests/host/`. SPA under `web/`. No copy of the `prototype_workspace` prototype variants into product paths.
 
 ## 待写入 (persist after ACR)
 

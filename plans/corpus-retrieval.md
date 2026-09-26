@@ -1,6 +1,6 @@
 # Plan: corpus-retrieval（fin 侧 tracer bullets）
 
-**Status（2026-09-04）：** 全部 tracer 已勾完。本文件留作已交付切片的 tracker，不是实施入口。进度：`docs/handoff/2026-09-05-status.md`。闭合队列归档：`plans/archive/2026-09-retrieve-queue/`。
+**Status（2026-09-04）：** 全部 tracer 已勾完（本文件 24 条 `Status: [x]`，无待勾项）。本文件留作已交付切片的 tracker，不是实施入口。现状与开工入口：本树 `plans/README.md` + `specs/` + `docs/CONTEXT.md`。会话进度笔记与闭合队列归档都是会话本地文件，自 `ed186eb` 起不入库，仓库内无副本（见 `docs/adr/0090-product-identity-knowledge-qa-entry-point.md`「Citing session-only documents」）。
 
 **Goal:** fin 成为语料的唯一解析与切分权威：多格式文档产出冻结单元文本、按确定性查表切成父子块、以幂等方式推送给检索服务 **iknow-memory**，且推送出去的每段文本都能被引用门在同一冻结单元上逐字符命中。
 

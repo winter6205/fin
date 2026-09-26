@@ -59,7 +59,7 @@ Quoted from `docs/CONTEXT.md`:
 - Scripted retrieve with a fake port still returns `{chunks:[]}` for empty query, unknown `document_id`, and mapper-drop; never raises on those misses (`src/fin/retrieve/port.py` contract).
 - `list_files(company="AAPL")` still returns the v1-shaped filings list; `list_files` with unknown `cik` or conflicting `ticker`+`cik` returns `{filings:[]}`; optional `form` accepts values other than only the demo 10-Q when rows exist.
 - Ingest CLI with unset `FIN_EDGAR_USER_AGENT` does not open a network connection to SEC hosts (unit/scripted test).
-- Ingest CLI over existing corpus can emit/update catalog fields for `AAPL-2023Q3` without SEC GET (pipeline in `docs/design-references/s1-html-ingest-dump/` behaviour preserved as product CLI).
+- Ingest CLI over existing corpus can emit/update catalog fields for `AAPL-2023Q3` without SEC GET (the HTML-ingest pipeline proven in the throwaway S1 spike is preserved as product CLI behaviour).
 - `get_xbrl_fact` miss returns a structured error dict (not throw); claimed numeric answer without a matching evidenced fact does not `done` as a passing research cite.
 - Product retrieve with scripted MCP-down returns `{error: "retrieve_unavailable"}` (not `{chunks:[]}`, not BM25).
 - Live ingest with UA set and simulated SEC HTTP fail exits non-zero and does not mark that accession complete (`sec_http_fail`).

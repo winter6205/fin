@@ -32,7 +32,7 @@ fi
 
 # Seconds the readiness reporter waits for `GET /api/status` to answer.
 # Generous: a cold iknow handshake can exceed the product probe's own 2s
-# budget (docs/wayfinder/operator-cold-start-acceptance-map.md R1).
+# budget.
 READY_TIMEOUT_SECONDS="${FIN_READY_TIMEOUT_SECONDS:-90}"
 CHECKPOINT_PORT=5433
 STATE_DIR="$REPO_ROOT/.fin"

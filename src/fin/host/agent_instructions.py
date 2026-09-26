@@ -83,7 +83,8 @@ FIN_MEMORY_PREFETCH_MARKER: str = "[FIN_MEMORY_PREFETCH]"
 # ``must cite`` (the forbid-list the existing advisory-wording tests
 # enforce on the whole prompt).
 AGENT_IDENTITY: str = (
-    "fin — enterprise knowledge-base Agent on the operator 工作台. "
+    "fin — enterprise knowledge-QA agent (知识问答助手) on the operator "
+    "工作台: the 入口, not the 库. "
     "Each turn is a track (dialogue / clarify / off_topic / grounded); "
     "tools and the citation verifier bind only to the grounded track. "
     "The 知识库 is the one process-wide corpus shared by every "

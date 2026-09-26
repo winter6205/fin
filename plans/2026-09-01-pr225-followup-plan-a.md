@@ -1,10 +1,10 @@
 # Plan: PR #225 follow-up — Plan A（fin 侧可独立推进项收口，2026-09-01）
 
-**Status（2026-09-04）：** 文中「跨仓缺口 1–6 / 对侧无基线」已过期（见 `docs/handoff/2026-09-05-status.md`）。本文件只还覆盖 **retrieve 内部 maintainability**（ledger 抽取等），不是跨仓主线。跨仓提案 stub：`docs/cross-repo/alignment-proposal.md`。
+**Status（2026-09-04）：** 文中「跨仓缺口 1–6 / 对侧无基线」已过期——对侧 `specs/retrieval-stack.md` 已含同名「跨仓对齐基线」章节，SC41 校验器（`src/fin/corpus/baseline.py`）双侧 sha256 比对 exit 0；该状态记录在 `plans/retrieval-upgrade.md`「跨仓对齐基线指针」，验收规则权威是 `specs/corpus-retrieval.md` §B6 与 ADR 0040。本文件只还覆盖 **retrieve 内部 maintainability**（ledger 抽取等），不是跨仓主线。跨仓基线的契约权威：`docs/adr/0040-cross-repo-alignment-baseline.md`；2026-09-01 的提案 stub 是会话本地笔记、不入库，只作 audit。
 
 **Goal:** 把 PR #225 合 main 之后 fin 侧**不依赖跨仓 wire** 即可推进的事项收口为单一 plan，避免继续追加到 `plans/retrieve-maintainability-followup.md` 造成单点膨胀。本 plan 是「fin 侧 follow-up」轮次的第一刀。
 
-**Approach:** 本轮会话已知跨仓契约 6 项缺口（见 `docs/handoff/archive/2026-09/2026-09-01-pr225-merged.md` 与 `docs/cross-repo/alignment-proposal.md`），且当前 iknow-memory 仓侧 spec/`plans/` 下尚无任何「跨仓对齐基线」章节、SC41 校验器事实单边跑过。因此本 plan **冻结**如下边界（任何越界改动都需另开 plan 并经 explicit 授权）：
+**Approach:** 本轮会话当时记录跨仓契约 6 项缺口，并判断对侧 spec/`plans/` 下尚无「跨仓对齐基线」章节、SC41 校验器实际只在 fin 侧单边跑过（那份缺口清单是会话本地笔记、不入库，仓内无副本；基线章节的契约权威是 ADR 0040 与 `specs/corpus-retrieval.md` §B6，其 2026-09-04 达成状态见 `plans/retrieval-upgrade.md`）。因此本 plan **冻结**如下边界（任何越界改动都需另开 plan 并经 explicit 授权）：
 
 - 不动跨仓契约字段名：`source_ref` / `retrieval_id` / `degraded` / `degraded_reasons` / 8 能力键（`vector` / `keyword_bm25` / `cjk_segmentation` / `phrase` / `field_boost` / `graph_ppr` / `rrf` / `rerank`）
 - 不动 `specs/corpus-retrieval.md` §B1–§B6
@@ -96,7 +96,7 @@
 
 ### A6. fin 侧缺口 1 静默失败监控 — tag: `[implementation]`
 
-- **Inherits:** `docs/handoff/archive/2026-09/2026-09-01-pr225-merged.md` 风险与已知 gap 节（缺口 1 静默失败随 fin 上 main）；`docs/cross-repo/alignment-proposal.md` 缺口 1；T16 (`tests/retrieve/test_push_failures.py`) 既有静默失败检测路径
+- **Inherits:** ADR 0041（`docs/adr/0041-degraded-signal-and-partial-failure.md`：禁止的静默形态——任何失败路径必须留下可断言的痕迹，信封标记 / 具名错误码 / 可列举失败记录三者必居其一；消费方不得把残缺结果当完整结果）+ CONTEXT **降级标记**；T16 (`tests/retrieve/test_push_failures.py`) 既有静默失败检测路径。「缺口 1」（对侧剥键后 fin 侧静默；该静默形态当时已随 fin 侧改动进 `main`——本轮起点即 PR #225，合入记录 merge `1dc5d30`）这一编号出自 2026-09-01 会话本地的缺口清单，该清单不入库，仓内无副本。
 - **Surface:** `tests/retrieve/test_mcp_adapter.py` 新增集成测试 + `src/fin/retrieve/mcp_adapter.py` 内警告日志（若需）
 - **Acceptance:**
   - mock zod schema **无 `.strict()`**（与 iknow-memory 仓当前实情一致），断言 fin 发送 `top_k` / `filter` / `document_id` 后被剥键时 fin 侧记录警告日志
@@ -107,7 +107,7 @@
 
 ### A7. fin 侧缺口 3 serve 入口放宽 — tag: `[implementation]`
 
-- **Inherits:** `docs/handoff/archive/2026-09/2026-09-01-pr225-merged.md` 风险节（缺口 3 入口不存在）；`docs/cross-repo/alignment-proposal.md` 缺口 3
+- **Inherits:** 2026-09-01 会话记录的第 3 号跨仓缺口——**iknow-memory** 侧没有 `serve` 子命令，fin 当时默认 `("iknow-memory", "serve")` 起不来（该编号出自不入库的会话本地缺口清单，仓内无副本）；此常量的现行单一权威是 `src/fin/host/compile.py` 的 `DEFAULT_MCP_COMMAND`（现值 `("iknow-memory",)`，push / invalidation / 知识 MCP 三侧都从它 import），产品侧 知识 MCP 的可达口径按 ADR 0051 是 `initialize` + `tools/list` 探测，启动命令本身不构成可达证据。
 - **Surface:** `src/fin/host/compile.py:130` 与 `src/fin/host/graph.py:1442` 的 `DEFAULT_MCP_COMMAND = ("iknow-memory", "serve")` → `("iknow-memory",)`
 - **Acceptance:**
   - 两处常量值同步更新；先走 stdio MCP（让 `npm start` 形态可启动）；纯兜底
@@ -142,7 +142,7 @@
 
 **A1–A7 完成后停下**，等待如下两项同时闭合再继续 A8–A9：
 
-1. **跨仓基线对齐完成** —— `docs/cross-repo/alignment-proposal.md` 的反向提案（A / B / C 任一）由对方仓 operator 采纳并落盘，对方仓 spec/`plans/` 下出现「跨仓对齐基线」同名章节，fin 侧 SC41 校验器（`uv run python -m fin.corpus.baseline`）双侧 sha256 比对 exit 0
+1. **跨仓基线对齐完成** —— 2026-09-01 那份反向提案（A / B / C 任一；提案笔记为会话本地文件、不入库，仓内无副本）由对方仓 operator 采纳并落盘，对方仓 spec/`plans/` 下出现「跨仓对齐基线」同名章节，fin 侧 SC41 校验器（`uv run python -m fin.corpus.baseline`，实现 `src/fin/corpus/baseline.py`）双侧 sha256 比对 exit 0；该门禁的规则权威是 ADR 0040 与 `specs/corpus-retrieval.md` §B6，2026-09-04 的达成状态见 `plans/retrieval-upgrade.md`
 2. **跨仓契约缺口 1–6 真实联调那一刀**（第三个 plan）落地 —— 至少缺口 1（请求形状）/ 2（响应形状）/ 3（启动入口）三项端到端跑通
 
 CHECKPOINT 闭合之前，A8（数据集会涨到 §B1 上限，且 A8 触及真实网络）不建议在生产路径上跑；A9 不在本 plan 推进。
@@ -159,8 +159,8 @@ CHECKPOINT 闭合之前，A8（数据集会涨到 §B1 上限，且 A8 触及真
 
 | 类型             | 路径                                                                         |
 | ---------------- | ---------------------------------------------------------------------------- |
-| 上版 handoff     | `docs/handoff/archive/2026-09/2026-09-01-pr225-merged.md`                    |
-| 跨仓对齐提案     | `docs/cross-repo/alignment-proposal.md`                                      |
+| 本轮起点 PR      | PR #225 合入记录 merge `1dc5d30`；上版 handoff 笔记不入库                    |
+| 跨仓基线权威     | `docs/adr/0040-cross-repo-alignment-baseline.md`；提案笔记不入库，只作 audit |
 | 维护性 follow-up | `plans/retrieve-maintainability-followup.md`（T1–T5 pending，由 A1–A5 承接） |
 | 总计划           | `plans/retrieval-upgrade.md`                                                 |
 | fin 侧分计划     | `plans/corpus-retrieval.md`                                                  |

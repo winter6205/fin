@@ -1,8 +1,8 @@
 # Spec: first closed loop (ingest + retrieve + cite)
 
 > **Status:** assumption gate = 图 2 G-arrive closed 2026-09-16 + live MCP retrieve probe the same day.
-> **Map:** [`docs/wayfinder/first-operator-business-loop-map.md`](../docs/wayfinder/first-operator-business-loop-map.md)
-> **Landing list:** [`docs/wayfinder/闭环与分档-落计划-2026-09-16.md`](../docs/wayfinder/闭环与分档-落计划-2026-09-16.md)
+> **Map:** 图 1 is `specs/workbench-retrieve-product-seam.md`; this spec is 图 2, and its Confirmed assumptions (gate) below are the decision record.
+> **Landing list:** the **Boundaries / Does** and **Success Criteria** below are the landed items.
 > **Sibling spec (iknow-memory):** [`../../iknow-memory/specs/corpus-ready-retrieve.md`](../../iknow-memory/specs/corpus-ready-retrieve.md)
 > **Plan:** `plans/first-closed-loop.md`
 
@@ -27,7 +27,7 @@ Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 1. This spec is **阶段一第一闭环** only. C 综述 and D 真数据库 are **plan slots**, not this spec’s implementation. A 查找 may stay unopened if named.
 2. Default retrieve **档 B** means: use the live iknow **retrieve** path as it ranks today (graph-priority + fill); fin does not reimplement ranking. Prompt/档分类 beyond default B is out except named “档未开”.
 3. **知识存入** is in scope: without push, retrieve stays empty (measured 2026-09-16: three queries, `chunks: []`, mapping_failures=0).
-4. **thread attach** default remains no push (`docs/wayfinder/升级收口-2026-09-13.md` §1). Explicit language/path **corpus ingest** is the write door.
+4. **thread attach** default remains no push (ADR 0047 two doors; ADR 0083 keeps attachments thread-scoped). Explicit language/path **corpus ingest** is the write door.
 5. `GET /api/status` `corpus_filing_count` is the local catalog, **not** iknow chunk count. Product must not treat that number as “库就绪”.
 6. Default `uv run pytest -q` stays Fake retrieve; live MCP/ingest is opt-in.
 7. Citation hard gate stays the **citation verifier**; prompts do not replace it.
@@ -67,7 +67,7 @@ Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 
 ## Inherits / Changes
 
-**Inherits:** ADR 0032 retrieve MCP; ADR 0037 切分 in fin; ADR 0046/0047 cite from this-run MCP text; ADR 0045 corpus not dream; `specs/corpus-serve-ingest.md` two doors; `specs/workbench-retrieve-product-seam.md` 进对话硬拦; 升级收口 §1 attach default; 落计划 2026-09-16 四条到达.
+**Inherits:** ADR 0032 retrieve MCP; ADR 0037 切分 in fin; ADR 0046/0047 cite from this-run MCP text; ADR 0045 corpus not dream; `specs/corpus-serve-ingest.md` two doors; `specs/workbench-retrieve-product-seam.md` 进对话硬拦; ADR 0083/0085 attach no-push default; `plans/first-closed-loop.md` for the landed sequence.
 
 **Changes:** live empty iknow is a **blocking** product fact; status catalog count ≠ 库就绪; 具名失败 for empty-bound vs mapping vs verifier; 工作台绑定展示; ingest is on the closed-loop critical path.
 

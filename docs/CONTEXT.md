@@ -3,7 +3,7 @@
 > 本文件是项目领域词汇的**单一事实源 (SSOT)**.
 > 仅 `domain-modeling` 技能可写; 其他技能按 `docs/agents/context-contract.md` 消费.
 >
-> Product identity disambiguation: see [`docs/wayfinder/product-identity.md`](wayfinder/product-identity.md) (fin is a knowledge-QA assistant, not a finance/research product).
+> Product identity disambiguation: see [ADR 0090](adr/0090-product-identity-knowledge-qa-entry-point.md) (fin is a knowledge-QA entry point, not a knowledge base and not a finance/research product).
 
 ---
 

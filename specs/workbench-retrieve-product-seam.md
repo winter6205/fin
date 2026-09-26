@@ -1,7 +1,7 @@
 # Spec: workbench retrieve product seam
 
 > **Status:** assumption gate confirmed in-thread 2026-09-13 (10 items).
-> **Map:** [`docs/wayfinder/workbench-retrieve-product-seam-map.md`](../docs/wayfinder/workbench-retrieve-product-seam-map.md) (图 1；grilling G1/G2/G3/R1 closed).
+> **Map:** 图 1 grilling G1/G2/G3/R1 closed 2026-09-13 — the decisions are the Confirmed assumptions (gate) below and [ADR 0051](../docs/adr/0051-knowledge-mcp-conversation-gate.md).
 > **Sequence:** this spec → `architecture-change-reviewer` (all-yes 2026-09-13) → persist → `writing-plans`. Plan: `plans/workbench-retrieve-product-seam.md`.
 
 ## Objective
@@ -14,7 +14,7 @@ Product runtime has one retrieve path: **工作台** session plus **retrieve por
 
 Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 
-- **fin**: An enterprise knowledge-base Agent: the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held filings behind the **retrieve port**.
+- **fin**: An enterprise **knowledge-QA** agent (the 入口, not the 库): the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held filings behind the **retrieve port**.
 - **工作台**: The local web UI: chrome is **知识库** / **监控**; **research thread**s live in a 会话 list, not a 对话 nav; create, list, open, resume, and delete a **research thread**; **thinking fold**s and **tool fold**s stream then collapse; citations sit on the assistant turn.
 - **retrieve port**: The only retrieve dependency fin is allowed to have: `query` (+ optional filters) in, ranked chunks with `source_ref` out — MCP-shaped, transport-agnostic.
 - **retrieve adapter**: The implementation behind the retrieve port. Default pytest uses a Fake port. When configured, product retrieve is an MCP 2.0 client (protocol-testable against a compliant public or fixture server); hits map to fin locators as `source_ref` and their returned text is serve-time citation evidence (ADR 0046).

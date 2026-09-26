@@ -1,6 +1,6 @@
 # Spec: workbench chrome (对话 / 知识库 / 监控)
 
-> **Identity:** quote [`docs/CONTEXT.md`](../docs/CONTEXT.md). **fin** is an enterprise knowledge-base Agent. The UI is **工作台**. **知识库** is the one shared corpus. Chrome labels 对话 / 知识库 / 监控 are **工作台** surfaces; 对话 here is not Soft-Track `dialogue`.
+> **Identity:** quote [`docs/CONTEXT.md`](../docs/CONTEXT.md). **fin** is an enterprise **knowledge-QA** agent (知识问答助手) — the 入口, not the 库 ([ADR 0090](../docs/adr/0090-product-identity-knowledge-qa-entry-point.md)). The UI is **工作台**. **知识库** is the one shared corpus. Chrome labels 对话 / 知识库 / 监控 are **工作台** surfaces; 对话 here is not Soft-Track `dialogue`.
 
 ## Assumption gate (confirmed 2026-09-07 in-thread)
 
@@ -23,7 +23,7 @@ The operator can tell the **工作台** apart from diagnostics. Daily path is **
 
 Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 
-- **fin**: An enterprise knowledge-base Agent: the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held filings behind the **retrieve port**.
+- **fin**: An enterprise **knowledge-QA** agent (the 入口, not the 库): the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held filings behind the **retrieve port**.
 - **工作台**: The local web UI: chrome is 对话 / **知识库** / **监控**; create, list, open, resume, and delete a **research thread**; **thinking fold**s and **tool fold**s stream then collapse; citations sit on the assistant turn.
 - **知识库**: The one process-wide corpus (catalog, ingest tree, **retrieve port**) shared by every **research thread**.
 - **监控**: The **工作台** route `/monitor`: issuer watchlist, in-app notices, and retrieve-reachability (with reconnect as a re-read of `GET /api/status`). It is not a second **知识库**.

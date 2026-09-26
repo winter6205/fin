@@ -22,7 +22,7 @@ minimal-change-verifier: yes — one plan of ten sequenced tracer bullets, one c
 
 **End-of-round:** after T10, one code-review pass on the whole fidelity diff (not per-commit during WIP). Live-provider smoke (T8) is never part of default `uv run pytest -q`.
 
-**Round closed 2026-08-26** on `winter/fidelity-integrate-8400` — the first tree that carries all ten bullets plus the F-series live-verification fixes (F1 reasoning outbound replay, #116/#117, F3 streamed/persisted answer parity) at once. That branch is where each bullet's acceptance was actually exercised end to end: the per-bullet branches were only ever green in isolation. Evidence matrix, the end-of-round `code-review` verdict, and LIVE_GAPS v2 live in `docs/verify/2026-08-26-workspace-stream-fidelity-integration.md`.
+**Round closed 2026-08-26** — the integration branch `winter/fidelity-integrate-8400` (since deleted; not in `git branch -a`) was squashed into `main` as PR #120, merge commit `b50cacc`: the first tree that carried all ten bullets plus the F-series live-verification fixes (F1 reasoning outbound replay, #116/#117, F3 streamed/persisted answer parity) at once, which is where each bullet's acceptance was actually exercised end to end — the per-bullet branches were only ever green in isolation. That merge commit's message is the in-repo record of what was verified on the integrated tree (live MiniMax + SPA): soft-track leaf deltas forwarded onto the live turn; reasoning → the SSE `thinking` channel with no leak into `answer`; prior-turn reasoning replayed on the next request (F1); streamed answer deltas equal to the persisted GET answer (F3); bounce no longer blanking the bubble and reload not repainting; `/api/status` rendering typed retrieve reachability (ADR 0033). The separate evidence matrix, the end-of-round `code-review` verdict, and LIVE_GAPS v2 lived in session-local notes under the directories ADR 0090 rules unreachable — they are not in a fresh clone.
 
 **待写入:** (empty — no new CONTEXT term is settled by this plan itself; T5 and T9 are `[decision]` bullets whose outcomes flush their own spec-amendment / ADR / CONTEXT deltas via `domain-modeling` when they land)
 
@@ -35,7 +35,7 @@ minimal-change-verifier: yes — one plan of ten sequenced tracer bullets, one c
    - **Surface:** `host` SSE generator (`src/fin/host/workspace_http.py`) + `tests/host/test_workspace_http.py`
    - **Acceptance:** a scripted non-research run (dialogue or clarify) emits multiple `answer` delta frames on `POST /api/threads/{id}/messages` before its terminal `status` frame — not zero deltas followed by a dump; a scripted research run keeps its current frame sequence unchanged (thinking/tool/answer/citations); deltas from nodes that must stay silent (e.g. the classify tier) still never reach the wire; `uv run pytest -q` stays green.
    - **Completion:** headroom holds — an allowlist set, a metadata tag, or an inverted denylist all pass; the bullet fixes the observable (soft-track turns stream), not the predicate's spelling.
-   - Status: [x] done — integrated and verified on `winter/fidelity-integrate-8400`; see `docs/verify/2026-08-26-workspace-stream-fidelity-integration.md`.
+   - Status: [x] done — integrated and verified on the round-closed tree; see the "Round closed 2026-08-26" note above (PR #120, squash `b50cacc`).
    - [parallel]
 
 2. **Reasoning channel captured in the shape the provider emits** — tag: `[implementation]`
@@ -43,7 +43,7 @@ minimal-change-verifier: yes — one plan of ten sequenced tracer bullets, one c
    - **Surface:** `host` stream mapping (`src/fin/host/stream_map.py`, `graph.py` touch only if the fallback seam moves) + `tests/host/test_stream_map.py` fake chunk mapper
    - **Acceptance:** a fake chunk stream carrying reasoning in the shape(s) the live provider actually emits yields `thinking` SSE frames during the model step and an assembled checkpointed `AIMessage` whose replayable reasoning survives `assemble_final_ai_message`; a fake stream with the split channel absent but inline blocks present still populates thinking via the strip path; in every shape, no reasoning prose appears in any `answer` frame and `verify_citations` receives thinking-stripped prose only; `uv run pytest -q` stays green.
    - **Completion:** headroom holds — the implementer chooses whether the new shape is normalized at chunk read, at assembly, or via a second extractor; both designs pass the same fake-mapper observables.
-   - Status: [x] done — integrated and verified on `winter/fidelity-integrate-8400`; see `docs/verify/2026-08-26-workspace-stream-fidelity-integration.md`.
+   - Status: [x] done — integrated and verified on the round-closed tree; see the "Round closed 2026-08-26" note above (PR #120, squash `b50cacc`).
    - [parallel]
 
 3. **Bounce reset never retracts the live bubble** — tag: `[implementation]`
@@ -51,7 +51,7 @@ minimal-change-verifier: yes — one plan of ten sequenced tracer bullets, one c
    - **Surface:** `host` SSE generator pending-reset state + `web/` fold helpers (`turnStream.ts`) + `tests/host/test_workspace_http.py` + `web/src/turnStream.test.ts`
    - **Acceptance:** a scripted bounce-then-retry run shows the retracted draft replaced only when retry prose arrives — at no frame between the bounce and the first retry delta is the visible answer empty; a scripted bounce that refuses with zero further answer deltas ends with the stale draft cleared and the refuse copy visible (not a blank bubble, not the pre-bounce draft); the empty-`reset`-frame case is asserted on both the wire fold and the live-bubble fold; `uv run pytest -q` and the `web/` unit tests stay green.
    - **Completion:** headroom holds — whether the fix lands generator-side, fold-side, or both is the implementer's call; the observable is the no-blank-frame invariant across the bounce boundary.
-   - Status: [x] done — integrated and verified on `winter/fidelity-integrate-8400`; see `docs/verify/2026-08-26-workspace-stream-fidelity-integration.md`.
+   - Status: [x] done — integrated and verified on the round-closed tree; see the "Round closed 2026-08-26" note above (PR #120, squash `b50cacc`).
    - [parallel]
 
 4. **GET reconcile merges without repainting watched prose** — tag: `[implementation]`
@@ -59,7 +59,7 @@ minimal-change-verifier: yes — one plan of ten sequenced tracer bullets, one c
    - **Surface:** `web/` open-thread path (store / thread page) consuming the existing helper; `host` GET handler unchanged
    - **Acceptance:** after the operator watches a run stream to `done`, the open-thread GET reconcile does not visibly retract-and-repaint the answer prose already on screen, while citations, `run_id`, and thinking duration come from the server row; opening a thread mid-run still shows running with the composer disabled; the helper is consumed by the live open path (no longer dead code) and its existing unit tests still describe the wired behaviour; `web/` `tsc --noEmit` and unit tests stay green.
    - **Completion:** headroom holds — where the merge call sites live (store action, page effect, or api layer) is open; the observable is the no-repaint merge plus server-authoritative persisted fields.
-   - Status: [x] done — integrated and verified on `winter/fidelity-integrate-8400`; see `docs/verify/2026-08-26-workspace-stream-fidelity-integration.md`.
+   - Status: [x] done — integrated and verified on the round-closed tree; see the "Round closed 2026-08-26" note above (PR #120, squash `b50cacc`).
    - [parallel]
 
 5. **E2E scope amendment: Playwright lanes enter the spec** — tag: `[decision]`
@@ -67,7 +67,7 @@ minimal-change-verifier: yes — one plan of ten sequenced tracer bullets, one c
    - **Surface:** `specs/workspace.md` (amendment section) plus an ADR if the lane gating is a one-way door — the amended spec text is this bullet's outcome; no product code in the commit
    - **Acceptance:** the spec names the browser e2e lanes now in scope (a scripted-provider lane and a live-provider smoke lane), states where each runs (opt-in command / CI lane vs never-in-default-pytest), and keeps everything else in the Playwright exclusion out; the amendment cites this plan; the commit touches spec/ADR files only.
    - **Completion:** headroom holds — the decision fixes which lanes exist and their gating, not runner filenames, harness libraries, or assertion lists.
-   - Status: [x] done — integrated and verified on `winter/fidelity-integrate-8400`; see `docs/verify/2026-08-26-workspace-stream-fidelity-integration.md`.
+   - Status: [x] done — integrated and verified on the round-closed tree; see the "Round closed 2026-08-26" note above (PR #120, squash `b50cacc`).
    - gates T6–T8
 
 6. **Playwright runner runs to a verdict** — tag: `[implementation]`
@@ -75,7 +75,7 @@ minimal-change-verifier: yes — one plan of ten sequenced tracer bullets, one c
    - **Surface:** `scripts/` e2e runner + whatever local serve wiring it needs; `.claude/skills/playwright-cli` conventions as read-side context
    - **Acceptance:** one documented command runs the stream checks against a locally served workspace and terminates with per-check pass/fail plus a non-zero exit on any failure — no hang, no silent skip; a deliberately broken check demonstrably fails (the lane can say no); the command and its prerequisites are written where an operator will find them.
    - **Completion:** headroom holds — harness choice, config layout, and serve strategy are open; the observable is a terminating, falsifiable runner.
-   - Status: [x] done — integrated and verified on `winter/fidelity-integrate-8400`; see `docs/verify/2026-08-26-workspace-stream-fidelity-integration.md`.
+   - Status: [x] done — integrated and verified on the round-closed tree; see the "Round closed 2026-08-26" note above (PR #120, squash `b50cacc`).
    - [blocks: T5]
 
 7. **Scripted-provider e2e lane: browser fidelity without credentials** — tag: `[implementation]`
@@ -83,7 +83,7 @@ minimal-change-verifier: yes — one plan of ten sequenced tracer bullets, one c
    - **Surface:** `scripts/` lane entry + `host` scripted-model boot path + `web/` build; assertions ride the T6 runner
    - **Acceptance:** one command boots the workspace on the scripted provider and drives a browser through send → stream → collapse → reload, passing deterministically with no network and no `ANTHROPIC_AUTH_TOKEN`; the lane fails (non-zero) when a fidelity observable regresses; it runs where T5 said it runs and default `uv run pytest -q` does not invoke a browser.
    - **Completion:** headroom holds — script topology, fixture questions, and how the scripted provider is injected are open; the observable is the deterministic credential-free browser pass.
-   - Status: [x] done — integrated and verified on `winter/fidelity-integrate-8400`; see `docs/verify/2026-08-26-workspace-stream-fidelity-integration.md`.
+   - Status: [x] done — integrated and verified on the round-closed tree; see the "Round closed 2026-08-26" note above (PR #120, squash `b50cacc`).
    - [blocks: T6]
 
 8. **Live-provider smoke lane with a typed credential abort** — tag: `[implementation]`
@@ -91,7 +91,7 @@ minimal-change-verifier: yes — one plan of ten sequenced tracer bullets, one c
    - **Surface:** `scripts/` smoke lane + operator env reads; provider config via `FIN_MODEL` / `FIN_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` env names only (values never printed)
    - **Acceptance:** with credentials present, one command sends at least one real question and asserts the fidelity observables end-to-end (streamed answer deltas, thinking frames when the provider emits reasoning, terminal status, citations on a research turn); with `ANTHROPIC_AUTH_TOKEN` unset, the lane exits non-zero printing which variable is missing and runs nothing; the lane is reachable only by its explicit opt-in command.
    - **Completion:** headroom holds — question choice, pass thresholds, and output format are open; the observables are the live pass and the loud typed abort.
-   - Status: [x] done — integrated and verified on `winter/fidelity-integrate-8400`; see `docs/verify/2026-08-26-workspace-stream-fidelity-integration.md`.
+   - Status: [x] done — integrated and verified on the round-closed tree; see the "Round closed 2026-08-26" note above (PR #120, squash `b50cacc`).
    - [blocks: T7, T2]
 
 9. **Agent-context surface decision: what `/api/status` may say** — tag: `[decision]`
@@ -99,7 +99,7 @@ minimal-change-verifier: yes — one plan of ten sequenced tracer bullets, one c
    - **Surface:** `docs/adr/` (and a spec touch if the surface becomes contract) — the decision record is this bullet's outcome; no product code in the commit
    - **Acceptance:** the record names the field set the workspace status surface exposes (retrieve reachability is in; candidates like corpus/ingest presence and model identity are decided in or out explicitly), states that the read path is the in-process retrieve port (not an MCP client, not a cross-repo call), and lists the exclusions above; if a CONTEXT term is introduced, this bullet flushes it via `domain-modeling`.
    - **Completion:** headroom holds — the decision fixes the exposed field set and the read seam, not the route's response schema spelling or the UI copy.
-   - Status: [x] done — integrated and verified on `winter/fidelity-integrate-8400`; see `docs/verify/2026-08-26-workspace-stream-fidelity-integration.md`.
+   - Status: [x] done — integrated and verified on the round-closed tree; see the "Round closed 2026-08-26" note above (PR #120, squash `b50cacc`).
    - gates T10
 
 10. **Context telemetry renders as a Sidebar strip** — tag: `[implementation]`
@@ -107,5 +107,5 @@ minimal-change-verifier: yes — one plan of ten sequenced tracer bullets, one c
     - **Surface:** `host` (new status route beside the existing workspace routes) + `web/` Sidebar + `tests/host/` + `web/` unit tests
     - **Acceptance:** `GET /api/status` returns the T9-decided shape in both the reachable and the unreachable retrieve state — the unreachable case is a typed value in the payload, not an error status or an empty body; the Sidebar strip renders both states with the degraded state readable to an ordinary operator; the route handler stays separate from send/GET-thread; `uv run pytest -q` and `web/` `tsc --noEmit` + unit tests stay green.
     - **Completion:** headroom holds — payload key names, polling vs on-open fetch, and strip layout are open; the observables are the typed two-state route and the never-blank strip.
-    - Status: [x] done — integrated and verified on `winter/fidelity-integrate-8400`; see `docs/verify/2026-08-26-workspace-stream-fidelity-integration.md`.
+    - Status: [x] done — integrated and verified on the round-closed tree; see the "Round closed 2026-08-26" note above (PR #120, squash `b50cacc`).
     - [blocks: T9]
