@@ -24,6 +24,7 @@ server over the shared graph.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import uuid
 from pathlib import Path
@@ -35,6 +36,7 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
 from fin.corpus.errors import IngestMissingError
+from fin.host.attachment_budgets import AttachmentBudgets, from_environ
 from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER
 from fin.host.graph import ConcurrentRunError, KnowledgeMCPFaultError, compile_graph
 from fin.host.knowledge_mcp import (
@@ -122,6 +124,13 @@ _http_singleton_lock = threading.Lock()
 # once per process too (see ``get_memory_port``).
 _http_memory_singleton: Any | None = None
 _http_memory_lock = threading.Lock()
+
+# The deployed attachment bounds are read once per process: they are
+# deployment configuration, which cannot change under a running server,
+# and reading them at boot is what makes an unusable bound abort the
+# startup instead of the first upload (see ``get_attachment_budgets``).
+_http_attachment_budgets_singleton: AttachmentBudgets | None = None
+_http_attachment_budgets_lock = threading.Lock()
 
 
 def compile_for_http(
@@ -212,6 +221,27 @@ def get_attachment_service() -> Any:
     process with interrupted preparation already resumed.
     """
     return default_attachment_service()
+
+
+def get_attachment_budgets() -> AttachmentBudgets:
+    """FastAPI dependency that returns the deployed attachment bounds.
+
+    One instance per process, read through
+    :func:`fin.host.attachment_budgets.from_environ` — the module that
+    owns the four bounds and their validation. Missing, non-positive, or
+    unbounded values raise ``AttachmentBudgetConfigError`` here, so a
+    server that cannot state its own upload cap fails at boot rather
+    than serving an unbounded door.
+
+    Tests override this via
+    ``app.dependency_overrides[get_attachment_budgets]`` to re-deploy a
+    smaller cap without shipping megabytes through the test process.
+    """
+    global _http_attachment_budgets_singleton
+    with _http_attachment_budgets_lock:
+        if _http_attachment_budgets_singleton is None:
+            _http_attachment_budgets_singleton = from_environ(environ=os.environ)
+        return _http_attachment_budgets_singleton
 
 
 def get_memory_port() -> Any:
@@ -309,6 +339,7 @@ _mount_workspace_routes(
     get_graph=get_graph,
     get_thread_store=get_thread_store,
     get_attachment_service=get_attachment_service,
+    get_attachment_budgets=get_attachment_budgets,
     get_watchlist_store=get_watchlist_store,
     get_memory_port=get_memory_port,
     get_filing_monitor=get_filing_monitor,
@@ -598,12 +629,18 @@ def serve() -> None:
     are in ``os.environ`` before compile. Explicit process env
     still wins.
 
+    The attachment bounds are read next, BEFORE anything is published,
+    compiled, or bound: the upload door takes its cap from them, so a
+    boot that cannot name a finite, positive byte budget fails here
+    rather than serving a door with no bound.
+
     The retrieve preflight runs on the assembled env, before
     uvicorn binds. The host graph compiles at this same moment:
     a missing ``FIN_CHECKPOINT_URL`` must fail boot, not the
     first ``/ask``.
     """
     apply_dotenv()
+    get_attachment_budgets()
     # T1 (workbench retrieve seam): probe the knowledge MCP with a real
     # ``initialize`` + ``tools/list`` handshake and publish 缺 / 坏 / 可达
     # into the in-process snapshot the status route and the conversation
@@ -622,6 +659,7 @@ __all__ = [
     "CitationSchema",
     "app",
     "compile_for_http",
+    "get_attachment_budgets",
     "get_attachment_service",
     "get_feedback_store",
     "get_filing_monitor",

@@ -705,6 +705,22 @@ export class AttachmentNotReadyError extends AttachFailedError {
   }
 }
 
+/** A conversation start or send refused because an attachment upload is
+ * still in flight (``attachment_upload_in_progress``). The two doors
+ * cover different scopes on purpose: the client holds the composer while
+ * an upload is in flight on ANY thread, because its composer is global —
+ * one box that sends into whichever thread is open; the host refuses
+ * only the thread whose bytes are landing, which is what stops a second
+ * tab from slipping a send past that upload. The client is the stricter
+ * side. Subclasses ``AttachFailedError`` for the same reason as
+ * ``AttachmentNotReadyError``: the refusal is about an attachment. */
+export class AttachmentUploadInProgressError extends AttachFailedError {
+  constructor() {
+    super("attachment_upload_in_progress", 409);
+    this.name = "AttachmentUploadInProgressError";
+  }
+}
+
 /** Read the named ``error`` code off a failed response body; an
  * unparseable body still yields a non-empty code (statusText is
  * often empty on fetch errors, so the status itself is the code). */
@@ -781,17 +797,19 @@ export async function getIngestJobStatus(jobId: string): Promise<JobStatus> {
  * one undecorated blob (no form fields), so a plain ``fetch`` body is
  * the whole contract and neither side needs multipart parsing. The
  * minted ``attachment_id`` is referenceable for the WHOLE thread
- * lifetime (ADR 0086): the door answers while the host still parses
- * and indexes, so the 200 carries ``status: "parsing"`` and the
- * caller follows the lifecycle through the GET doors below. Nothing
- * is pushed to the corpus.
+ * lifetime (ADR 0089): the POST answers once the bytes are DURABLE and
+ * starts nothing — no classification, OCR, layout, vision or indexing —
+ * so the 200 carries ``status: "uploaded"``. Preparation begins from a
+ * grounded graph turn; the caller follows the lifecycle through the GET
+ * doors below. Nothing is pushed to the corpus.
  */
 export async function attachToThread(
   threadId: string,
   file: File,
 ): Promise<ThreadAttachment> {
-  // Raw bytes, not file.text(): the host decodes UTF-8 itself and
-  // answers the named 400 attachment_not_text for undecodable bytes.
+  // Raw bytes, not file.text(): the door stores whatever it is given.
+  // Content the parsers cannot read fails LATER, in preparation, with
+  // its own named code — never as an upload refusal.
   const bytes = new Uint8Array(await file.arrayBuffer());
   const url =
     `/api/threads/${encodeURIComponent(threadId)}/attachments` +
@@ -823,10 +841,11 @@ export async function listThreadAttachments(
 }
 
 /**
- * Re-run preparation for one failed attachment (ADR 0086 retry).
- * The 200 is the fresh single record — typically back to
- * ``"parsing"``. Unknown or foreign attachment ids answer the named
- * 400 ``attachment_not_found``.
+ * Re-run preparation for one failed attachment. Preparation runs INSIDE
+ * this request, so the 200 is the settled single record — ``"ready"``
+ * when the re-drive worked, ``"failed"`` with its named reason when it
+ * did not; this door never answers ``"parsing"``. Unknown or foreign
+ * attachment ids answer the named 400 ``attachment_not_found``.
  */
 export async function retryThreadAttachment(
   threadId: string,

@@ -9,14 +9,16 @@ an attach failure must be named and must never look like ingest success.
 Boundary classes exercised (defensive-contract-validator):
 
 * empty      — empty upload body -> named 400 ``empty_attachment``.
-* negative   — non-UTF-8 bytes -> named 400 ``attachment_not_text``
-               (the door admits text only until document-type
-               classification lands; binaries that need 切分 belong to
-               the ingest door, ADR 0047); unknown attachment id on
-               send -> named 400.
-* overflow   — oversize upload -> named 413 ``attachment_too_large``.
+* negative   — non-UTF-8 bytes are stored raw and reported ``uploaded``
+               (the door does not classify; ADR 0089); the typed
+               ``attachment_not_text`` failure comes from preparation.
+               Unknown attachment id on send -> named 400.
+* overflow   — upload over the configured ``max_upload_bytes`` budget ->
+               named 413 ``attachment_too_large``, with no partial object
+               and no attachment row.
 * concurrent — 409 concurrent_run is unchanged; a 409'd send does NOT
-               lose the referenced attachments (retry keeps them).
+               lose the referenced attachments (retry keeps them); two
+               concurrent uploads complete as distinct attachments.
 * exception  — failures are typed JSON errors, never silent 200s; a
                durable write failure is the named 500
                ``attachment_store_failed`` (and nothing half-stores).
@@ -31,6 +33,7 @@ from __future__ import annotations
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -41,6 +44,8 @@ from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import Field
 
+from fin.corpus.object_store import InMemoryObjectStore
+from fin.host.attachment_budgets import AttachmentBudgets
 from fin.host.scripted_model import ScriptedChatModel
 
 from fin.retrieve import ExtractedTreeReadPort
@@ -60,6 +65,32 @@ _TREE_READ_PORT = ExtractedTreeReadPort(
 # A unique sentinel no corpus fixture contains; the recording model
 # asserts it reaches (or never reaches) the prompt.
 ATTACH_SENTINEL = "THREAD-ATTACH-SENTINEL revenue was 4,242 pesos"
+
+# The deployed budget the door reads its byte cap from. Tests take it as
+# the default and shrink ``max_upload_bytes`` per case instead of
+# shipping megabytes through the test process.
+DEFAULT_BUDGETS = AttachmentBudgets(
+    max_upload_bytes=1_048_576,
+    max_pdf_pages=8,
+    max_vision_calls_per_run=16,
+    max_vision_crop_calls_per_run=8,
+)
+
+
+class _RecordingObjectStore(InMemoryObjectStore):
+    """Byte store that remembers every key it was asked to put.
+
+    The overflow clause is "no partial object", which needs the call
+    history — the final contents alone cannot prove nothing landed.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.puts: list[str] = []
+
+    def put(self, key, payload, *, content_type=None):  # type: ignore[no-untyped-def]
+        self.puts.append(key)
+        return super().put(key, payload, content_type=content_type)
 
 
 class RecordingScriptedModel(ScriptedChatModel):
@@ -95,22 +126,33 @@ def client(http_app: FastAPI) -> TestClient:
 
 @pytest.fixture
 def fresh_store(http_app: FastAPI):
-    from fin.corpus.object_store import InMemoryObjectStore
     from fin.host.attachment_prepare import AttachmentPreparationService
     from fin.host.attachment_store import InMemoryAttachmentStore
-    from fin.host.http import get_attachment_service, get_graph, get_thread_store
+    from fin.host.http import (
+        get_attachment_budgets,
+        get_attachment_service,
+        get_graph,
+        get_thread_store,
+    )
     from fin.host.thread_store import InMemoryThreadStore
 
     store = InMemoryThreadStore()
+    objects = _RecordingObjectStore()
     service = AttachmentPreparationService(
-        store=InMemoryAttachmentStore(store), objects=InMemoryObjectStore()
+        store=InMemoryAttachmentStore(store), objects=objects
     )
     http_app.dependency_overrides[get_thread_store] = lambda: store
     http_app.dependency_overrides[get_attachment_service] = lambda: service
+    http_app.dependency_overrides[get_attachment_budgets] = lambda: DEFAULT_BUDGETS
     model = RecordingScriptedModel(script=[AIMessage(content="ok")])
     g = _compile_with(model)
     http_app.dependency_overrides[get_graph] = lambda: g
-    return {"store": store, "model": model, "attachments": service}
+    return {
+        "store": store,
+        "model": model,
+        "attachments": service,
+        "objects": objects,
+    }
 
 
 def _compile_with(model: ScriptedChatModel) -> Any:
@@ -159,6 +201,24 @@ def _new_thread(client: TestClient) -> str:
     return client.post("/api/threads", json={"first_message": "q"}).json()["id"]
 
 
+def _override_upload_cap(http_app: FastAPI, cap: int) -> None:
+    """Re-deploy the byte budget with a cap small enough for a test body."""
+    from fin.host.http import get_attachment_budgets
+
+    budgets = replace(DEFAULT_BUDGETS, max_upload_bytes=cap)
+    http_app.dependency_overrides[get_attachment_budgets] = lambda: budgets
+
+
+def _prepare(fresh_store, attachment_id: str) -> None:
+    """Drive the preparation the upload door no longer starts itself.
+
+    Attachment text reaches a turn only through ``searchable``, and
+    preparation is no longer part of the upload — every turn-visibility
+    case has to ask for it, exactly as the graph-triggered job will.
+    """
+    fresh_store["attachments"].prepare(attachment_id)
+
+
 # ----- attach endpoint: named boundaries -----
 
 
@@ -191,37 +251,185 @@ def test_attach_empty_body_named_400(client: TestClient, fresh_store) -> None:
     r = _attach(client, thread_id, b"", filename="empty.md")
     assert r.status_code == 400
     assert r.json() == {"error": "empty_attachment"}
+    assert fresh_store["objects"].puts == []
+    assert fresh_store["attachments"].store.list_for_thread(thread_id) == []
 
     send = _send(client, thread_id, attachment_ids=["whatever"])
     assert send.status_code == 400
     assert send.json() == {"error": "attachment_not_found"}
 
 
-def test_attach_oversize_named_413(
-    client: TestClient, fresh_store, monkeypatch: pytest.MonkeyPatch
+def test_attach_stores_raw_bytes_and_defers_every_derived_step(
+    client: TestClient, fresh_store
 ) -> None:
-    """Upload beyond the cap -> named 413. The cap is a module
-    constant so operators can tune it; the test shrinks it instead of
-    shipping megabytes through the test process."""
-    from fin.host import workspace_http
+    """The upload door durably stores bytes and nothing else.
 
-    monkeypatch.setattr(workspace_http, "ATTACHMENT_MAX_BYTES", 8)
+    ``TestClient`` runs any background task the route registered before
+    handing back the response, so a row that still reads ``uploaded``
+    after the response — no version, no units, no index — is proof the
+    door scheduled no parsing, OCR, layout, vision, or indexing behind
+    it. Preparation is reached only when it is asked for.
+    """
+    thread_id = _new_thread(client)
+    attached = _attach(client, thread_id, ATTACH_SENTINEL.encode()).json()
+    attachment_id = attached["attachment_id"]
+
+    assert attached["status"] == "uploaded"
+    assert attached["searchable"] is False
+    assert attached["version"] == 0
+    assert attached["unit_count"] == 0
+
+    service = fresh_store["attachments"]
+    record = service.status(attachment_id)
+    assert record.status == "uploaded"
+    assert record.version == 0
+    assert service.units(attachment_id) == ()
+    assert service.store.indexed_versions(attachment_id) == ()
+
+
+def test_attach_without_filename_uses_the_display_default(
+    client: TestClient, fresh_store
+) -> None:
+    """Input contract: the ``filename`` parameter is optional. A missing
+    name yields the stored display default, never an empty label or a
+    400 — the bytes are what the door is for."""
+    thread_id = _new_thread(client)
+    r = client.post(
+        f"/api/threads/{thread_id}/attachments", content=b"raw text"
+    )
+    assert r.status_code == 200
+    assert r.json()["filename"] == "attachment.txt"
+    assert fresh_store["attachments"].status(r.json()["attachment_id"]).filename == (
+        "attachment.txt"
+    )
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("../../etc/passwd", "passwd"),
+        ("/abs/dir/note.md", "note.md"),
+        ("..\\..\\windows\\note.md", "..\\..\\windows\\note.md"),
+        ("note\x00\x01.md", "note.md"),
+        ("   ", "attachment.txt"),
+        ("quarterly 报告.md", "quarterly 报告.md"),
+    ],
+)
+def test_malformed_filename_lands_as_a_display_name_only(
+    client: TestClient, fresh_store, raw: str, expected: str
+) -> None:
+    """Input contract: a name is a label, never a path.
+
+    The model and the card read this string, and the object key must not
+    be derived from it, so traversal segments, control characters, and
+    blank names reduce to a printable basename. The Windows separators
+    survive because on this host they are not separators — what is
+    pinned is that they reach nothing but the label.
+    """
+    thread_id = _new_thread(client)
+    r = _attach(client, thread_id, b"raw text", filename=raw)
+    assert r.status_code == 200
+    attachment_id = r.json()["attachment_id"]
+    assert r.json()["filename"] == expected
+
+    record = fresh_store["attachments"].status(attachment_id)
+    assert record.filename == expected
+    assert "/" not in record.filename
+    assert all(char.isprintable() for char in record.filename)
+    assert len(record.filename) <= 200
+    assert record.object_key == f"thread-attachments/{thread_id}/{attachment_id}"
+    owned = fresh_store["attachments"].list_for_thread(thread_id)
+    assert [item.attachment_id for item in owned] == [attachment_id]
+
+
+def test_overlong_filename_is_truncated_to_the_stored_bound(
+    client: TestClient, fresh_store
+) -> None:
+    """200 characters is a bound the door enforces, not a display choice:
+    the name is stored and replayed on every later read."""
+    thread_id = _new_thread(client)
+    r = _attach(client, thread_id, b"raw text", filename="a" * 500)
+    assert r.status_code == 200
+    assert r.json()["filename"] == "a" * 200
+    stored = fresh_store["attachments"].status(r.json()["attachment_id"])
+    assert len(stored.filename) == 200
+
+
+def test_concurrent_uploads_complete_as_distinct_attachments(
+    client: TestClient, fresh_store
+) -> None:
+    """Concurrency boundary: two uploads racing on one thread BOTH land
+    as their own rows with their own ids. Neither is lost and neither
+    overwrites the other."""
+    thread_id = _new_thread(client)
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futures = [
+            ex.submit(_attach, client, thread_id, body, filename)
+            for body, filename in (
+                (b"first attach text", "one.md"),
+                (b"second attach text", "two.md"),
+            )
+        ]
+        responses = [future.result(timeout=10.0) for future in futures]
+
+    assert [r.status_code for r in responses] == [200, 200]
+    ids = {r.json()["attachment_id"] for r in responses}
+    assert len(ids) == 2
+    rows = fresh_store["attachments"].store.list_for_thread(thread_id)
+    assert {row.attachment_id for row in rows} == ids
+    assert {row.status for row in rows} == {"uploaded"}
+    assert len(fresh_store["objects"].puts) == 2
+
+
+def test_attach_oversize_named_413(
+    client: TestClient, fresh_store, http_app: FastAPI
+) -> None:
+    """Upload beyond the deployed byte budget -> named 413. The cap is
+    read through the injected ``AttachmentBudgets`` dependency, so the
+    test re-deploys the budget rather than patching a module constant."""
+    _override_upload_cap(http_app, 8)
     thread_id = _new_thread(client)
     r = _attach(client, thread_id, b"x" * 16, filename="big.md")
     assert r.status_code == 413
     assert r.json() == {"error": "attachment_too_large"}
 
 
+def test_attach_exact_budget_fits_and_one_byte_over_leaves_nothing(
+    client: TestClient, fresh_store, http_app: FastAPI
+) -> None:
+    """Overflow boundary, decided at the cap: exactly ``max_upload_bytes``
+    is stored, one byte more is the named 413 — and the refusal leaves
+    neither a partial object in the byte store nor an attachment row."""
+    _override_upload_cap(http_app, 8)
+    thread_id = _new_thread(client)
+
+    exact = _attach(client, thread_id, b"x" * 8, filename="exact.md")
+    assert exact.status_code == 200
+    exact_id = exact.json()["attachment_id"]
+    assert exact.json()["size_bytes"] == 8
+
+    over = _attach(client, thread_id, b"x" * 9, filename="over.md")
+    assert over.status_code == 413
+    assert over.json() == {"error": "attachment_too_large"}
+
+    service = fresh_store["attachments"]
+    assert [row.attachment_id for row in service.store.list_for_thread(thread_id)] == [
+        exact_id
+    ]
+    assert fresh_store["objects"].puts == [
+        f"thread-attachments/{thread_id}/{exact_id}"
+    ]
+
+
 def test_attach_oversize_content_length_refused_without_buffering(
-    client: TestClient, fresh_store, monkeypatch: pytest.MonkeyPatch
+    client: TestClient, fresh_store, http_app: FastAPI
 ) -> None:
     """Input-boundary fix: a DECLARED oversize Content-Length is the
-    named 413 BEFORE a single body byte is read into memory. The
-    raising stream below is the tripwire — any full-body buffering
-    surfaces its error instead of the named 413."""
-    from fin.host import workspace_http
-
-    monkeypatch.setattr(workspace_http, "ATTACHMENT_MAX_BYTES", 8)
+    named 413 BEFORE a single body byte is read into memory, and the
+    refusal stores nothing. The raising stream below is the tripwire —
+    any full-body buffering surfaces its error instead of the named
+    413."""
+    _override_upload_cap(http_app, 8)
     thread_id = _new_thread(client)
 
     def _never_buffered() -> Iterator[bytes]:
@@ -238,10 +446,12 @@ def test_attach_oversize_content_length_refused_without_buffering(
     )
     assert r.status_code == 413
     assert r.json() == {"error": "attachment_too_large"}
+    assert fresh_store["objects"].puts == []
+    assert fresh_store["attachments"].store.list_for_thread(thread_id) == []
 
 
 def test_attach_chunked_oversize_refused_by_bounded_read(
-    client: TestClient, fresh_store, monkeypatch: pytest.MonkeyPatch
+    client: TestClient, fresh_store, http_app: FastAPI
 ) -> None:
     """Input-boundary fix: with NO Content-Length (chunked) the route
     reads in bounded segments and refuses at cap+1 bytes instead of
@@ -249,9 +459,7 @@ def test_attach_chunked_oversize_refused_by_bounded_read(
     by ``test_attach_bounded_body_read_stops_at_the_cap`` — the
     TestClient materializes a generator body on first receive, so the
     end-to-end probe can only pin the named 413 outcome.)"""
-    from fin.host import workspace_http
-
-    monkeypatch.setattr(workspace_http, "ATTACHMENT_MAX_BYTES", 8)
+    _override_upload_cap(http_app, 8)
     thread_id = _new_thread(client)
 
     r = client.post(
@@ -261,6 +469,7 @@ def test_attach_chunked_oversize_refused_by_bounded_read(
     )
     assert r.status_code == 413
     assert r.json() == {"error": "attachment_too_large"}
+    assert fresh_store["attachments"].store.list_for_thread(thread_id) == []
 
 
 def test_attach_bounded_body_read_stops_at_the_cap() -> None:
@@ -304,18 +513,34 @@ def test_attach_bounded_body_read_stops_at_the_cap() -> None:
     assert asyncio.run(_read_bounded_body(within, 8)) == b"x" * 8
 
 
-def test_attach_non_text_named_400(client: TestClient, fresh_store) -> None:
-    """Non-UTF-8 bytes -> named 400 ``attachment_not_text``.
+def test_attach_non_text_bytes_are_stored_and_rejected_at_preparation(
+    client: TestClient, fresh_store
+) -> None:
+    """Non-UTF-8 bytes are STORED and reported ``uploaded``.
 
-    Text-only is the CONTRACT, not a missing feature: binary formats
-    (PDF/DOCX/...) belong to the corpus-ingest door where 切分 runs
-    deterministically (ADR 0047). The attach path must never parse
-    binaries, so undecodable bytes are rejected by name.
+    The door no longer classifies: it takes raw bytes and nothing else
+    (ADR 0089). The named ``attachment_not_text`` rejection is the
+    preparation's, so it surfaces when preparation is asked for.
     """
     thread_id = _new_thread(client)
     r = _attach(client, thread_id, b"\xff\xfe\x00\x9f", filename="x.bin")
-    assert r.status_code == 400
-    assert r.json() == {"error": "attachment_not_text"}
+    assert r.status_code == 200
+    uploaded = r.json()
+    assert uploaded["status"] == "uploaded"
+    assert uploaded["searchable"] is False
+    attachment_id = uploaded["attachment_id"]
+
+    service = fresh_store["attachments"]
+    assert service.status(attachment_id).status == "uploaded"
+    assert service.units(attachment_id) == ()
+
+    failed = service.prepare(attachment_id)
+    assert failed.status == "failed"
+    assert failed.failure_reason == "attachment_not_text"
+    shown = client.get(f"/api/threads/{thread_id}/attachments/{attachment_id}")
+    assert shown.status_code == 200
+    assert shown.json()["status"] == "failed"
+    assert shown.json()["failure_reason"] == "attachment_not_text"
 
 
 def test_attach_unknown_thread_404(client: TestClient, fresh_store) -> None:
@@ -381,6 +606,211 @@ def test_attachment_id_cannot_be_used_from_another_thread(
     assert r.json() == {"error": "attachment_not_found"}
 
 
+# ----- host send gate: an upload in flight holds its own thread -----
+
+
+class _BlockingPutStore:
+    """Delegates to the real byte store; ``put`` waits for the test.
+
+    The window the send gate must cover is exactly "``put`` has not
+    returned yet", so the test has to hold that window open from the
+    inside and be told when it is open — a sleep cannot say both.
+    """
+
+    def __init__(self, inner: InMemoryObjectStore) -> None:
+        self.inner = inner
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def put(self, key, payload, *, content_type=None):  # type: ignore[no-untyped-def]
+        self.entered.set()
+        assert self.release.wait(
+            timeout=5.0
+        ), "the upload gate was never released; the upload is stuck"
+        return self.inner.put(key, payload, content_type=content_type)
+
+    def get(self, key: str) -> bytes:
+        return self.inner.get(key)
+
+    def get_pointer(self, key: str):
+        return self.inner.get_pointer(key)
+
+    def delete(self, key: str) -> None:
+        self.inner.delete(key)
+
+
+def _hold_an_upload(
+    client: TestClient, thread_id: str, gate: _BlockingPutStore
+) -> tuple[ThreadPoolExecutor, Any]:
+    """Start one upload on its own thread and wait until it is inside
+    the byte store — the only ordering the next send may rely on."""
+    in_flight = ThreadPoolExecutor(max_workers=1)
+    started = in_flight.submit(
+        _attach, client, thread_id, ATTACH_SENTINEL.encode()
+    )
+    assert gate.entered.wait(timeout=5.0), "upload never reached the byte store"
+    return in_flight, started
+
+
+def test_send_is_refused_while_an_upload_is_in_flight(
+    client: TestClient, fresh_store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrency boundary, host half of the send gate: while this
+    thread's bytes are still being stored, a send is the named 409 with
+    NO run started and no turn row, title, or lock touched — and the
+    same send proceeds once the upload lands."""
+    thread_id = _new_thread(client)
+    store = fresh_store["store"]
+    title_before = store.get_thread(thread_id).title
+    gate = _BlockingPutStore(fresh_store["objects"])
+    monkeypatch.setattr(fresh_store["attachments"], "objects", gate)
+
+    in_flight, started = _hold_an_upload(client, thread_id, gate)
+
+    blocked = _send(client, thread_id)
+    assert blocked.status_code == 409, blocked.text
+    assert blocked.json() == {"error": "attachment_upload_in_progress"}
+    assert fresh_store["model"].seen_calls == [], "gated send reached the graph"
+    assert store.list_runs(thread_id) == []
+    assert store.get_thread(thread_id).title == title_before
+
+    gate.release.set()
+    landed = started.result(timeout=10.0)
+    in_flight.shutdown(wait=True)
+
+    assert landed.status_code == 200, landed.text
+    assert landed.json()["status"] == "uploaded"
+    proceeded = _send(client, thread_id)
+    assert proceeded.status_code == 200, proceeded.text
+    assert fresh_store["model"].seen_calls, "send after the upload never ran"
+
+
+def test_send_is_refused_by_an_upload_the_message_does_not_name(
+    client: TestClient, fresh_store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate is per thread, not per reference: the message names a
+    ready attachment while a SECOND file is still writing its bytes, so
+    the send is refused even though the pending record — the id the
+    reference rule would have checked — does not exist yet."""
+    thread_id = _new_thread(client)
+    ready = _attach(client, thread_id, ATTACH_SENTINEL.encode()).json()
+    _prepare(fresh_store, ready["attachment_id"])
+    gate = _BlockingPutStore(fresh_store["objects"])
+    monkeypatch.setattr(fresh_store["attachments"], "objects", gate)
+
+    in_flight, started = _hold_an_upload(client, thread_id, gate)
+
+    named_elsewhere = _send(
+        client, thread_id, attachment_ids=[ready["attachment_id"]]
+    )
+    assert named_elsewhere.status_code == 409, named_elsewhere.text
+    assert named_elsewhere.json() == {"error": "attachment_upload_in_progress"}
+    assert fresh_store["model"].seen_calls == []
+
+    gate.release.set()
+    assert started.result(timeout=10.0).status_code == 200
+    in_flight.shutdown(wait=True)
+
+    model = fresh_store["model"]
+    model.seen_calls.clear()
+    resumed = _send(client, thread_id, attachment_ids=[ready["attachment_id"]])
+    assert resumed.status_code == 200, resumed.text
+    assert _model_saw_sentinel(model)
+
+
+def test_every_upload_refusal_leaves_the_send_gate_closed_again(
+    client: TestClient,
+    fresh_store,
+    http_app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``finally`` half of the gate: every named refusal path of the
+    upload door hands the thread back. One leak would hold that thread's
+    sends at 409 for the life of the process — and a thread the door
+    never found must still answer its own 404, not the gate's 409."""
+    thread_id = _new_thread(client)
+    service = fresh_store["attachments"]
+
+    refused = client.post(
+        "/api/threads/no-such-thread/attachments",
+        content=b"hello",
+        params={"filename": "a.md"},
+    )
+    assert refused.status_code == 404
+    ghost = _send(client, "no-such-thread")
+    assert (ghost.status_code, ghost.json()) == (
+        404,
+        {"error": "thread_not_found"},
+    )
+
+    _override_upload_cap(http_app, 8)
+
+    def _never_read() -> Iterator[bytes]:
+        raise AssertionError("route buffered a declared-oversize body")
+        yield b""  # pragma: no cover - generator marker only
+
+    declared = client.post(
+        f"/api/threads/{thread_id}/attachments",
+        content=_never_read(),
+        params={"filename": "big.md"},
+        headers={"Content-Length": "9999"},
+    )
+    assert declared.status_code == 413
+    assert _send(client, thread_id).status_code == 200
+
+    streamed = client.post(
+        f"/api/threads/{thread_id}/attachments",
+        content=iter([b"x" * 16]),
+        params={"filename": "big.md"},
+    )
+    assert streamed.status_code == 413
+    assert _send(client, thread_id).status_code == 200
+
+    empty = _attach(client, thread_id, b"", filename="empty.md")
+    assert empty.status_code == 400
+    assert _send(client, thread_id).status_code == 200
+
+    class _FailingStore(InMemoryObjectStore):
+        def put(self, key, payload, *, content_type=None):  # type: ignore[no-untyped-def]
+            raise MemoryError("simulated blob allocation failure")
+
+    monkeypatch.setattr(service, "objects", _FailingStore())
+    broken = _attach(client, thread_id, b"123", filename="x.md")
+    assert broken.status_code == 500
+    assert broken.json() == {"error": "attachment_store_failed"}
+
+    sent = _send(client, thread_id)
+    assert sent.status_code == 200, sent.text
+    assert service.store.list_for_thread(thread_id) == []
+
+
+def test_an_upload_in_flight_does_not_hold_another_thread(
+    client: TestClient, fresh_store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Thread isolation of the gate: a send on a different thread is
+    untouched by the bytes this thread is still writing."""
+    busy = _new_thread(client)
+    idle = _new_thread(client)
+    gate = _BlockingPutStore(fresh_store["objects"])
+    monkeypatch.setattr(fresh_store["attachments"], "objects", gate)
+
+    in_flight, started = _hold_an_upload(client, busy, gate)
+
+    elsewhere = _send(client, idle)
+    assert elsewhere.status_code == 200, elsewhere.text
+    assert fresh_store["model"].seen_calls, "other thread's run never ran"
+    held = _send(client, busy)
+    assert held.status_code == 409, held.text
+    assert held.json() == {"error": "attachment_upload_in_progress"}
+
+    gate.release.set()
+    assert started.result(timeout=10.0).status_code == 200
+    in_flight.shutdown(wait=True)
+
+    released = _send(client, busy)
+    assert released.status_code == 200, released.text
+
+
 # ----- this-turn visibility / next-turn disappearance -----
 
 
@@ -402,6 +832,7 @@ def test_attachment_text_visible_this_turn_gone_next_turn(
     thread_id = _new_thread(client)
     model: RecordingScriptedModel = fresh_store["model"]
     attached = _attach(client, thread_id, ATTACH_SENTINEL.encode()).json()
+    _prepare(fresh_store, attached["attachment_id"])
 
     first = _send(client, thread_id, attachment_ids=[attached["attachment_id"]])
     assert first.status_code == 200
@@ -427,6 +858,7 @@ def test_attachment_text_visible_on_dialogue_turn(
     thread_id = _new_thread(client)
     model: RecordingScriptedModel = fresh_store["model"]
     attached = _attach(client, thread_id, ATTACH_SENTINEL.encode()).json()
+    _prepare(fresh_store, attached["attachment_id"])
 
     sent = _send(
         client,
@@ -447,6 +879,7 @@ def test_attachment_remains_referenceable_for_the_thread_lifetime(
     instead of forcing the operator to re-attach."""
     thread_id = _new_thread(client)
     attached = _attach(client, thread_id, ATTACH_SENTINEL.encode()).json()
+    _prepare(fresh_store, attached["attachment_id"])
     assert _send(
         client, thread_id, attachment_ids=[attached["attachment_id"]]
     ).status_code == 200
@@ -482,6 +915,7 @@ def test_concurrent_send_409_does_not_consume_attachments(
 
     thread_id = _new_thread(client)
     attached = _attach(client, thread_id, ATTACH_SENTINEL.encode()).json()
+    _prepare(fresh_store, attached["attachment_id"])
 
     first_status: dict[str, int] = {}
 
@@ -548,6 +982,9 @@ def test_attach_and_send_never_ingest_or_push(
 
     thread_id = _new_thread(client)
     attached = _attach(client, thread_id, ATTACH_SENTINEL.encode()).json()
+    # The upload alone is already silent on both doors.
+    assert calls == []
+    _prepare(fresh_store, attached["attachment_id"])
     sent = _send(client, thread_id, attachment_ids=[attached["attachment_id"]])
     assert sent.status_code == 200
     assert calls == []
@@ -592,6 +1029,7 @@ def test_attach_does_not_trigger_mcp_read_source(
 
     thread_id = _new_thread(client)
     attached = _attach(client, thread_id, ATTACH_SENTINEL.encode()).json()
+    _prepare(fresh_store, attached["attachment_id"])
     sent = _send(client, thread_id, attachment_ids=[attached["attachment_id"]])
     assert sent.status_code == 200
 
@@ -632,6 +1070,7 @@ def test_attachment_text_cannot_satisfy_citation_gate(
 
     thread_id = _new_thread(client)
     attached = _attach(client, thread_id, attachment_span.encode()).json()
+    _prepare(fresh_store, attached["attachment_id"])
     sent = _send(client, thread_id, attachment_ids=[attached["attachment_id"]])
     assert sent.status_code == 200
 

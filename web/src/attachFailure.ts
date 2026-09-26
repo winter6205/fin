@@ -1,15 +1,17 @@
 // Ordinary-person copy for a thread-attach failure (the attach door
 // in the Composer). The door's own failures describe what happened
 // to the ATTACHMENT — nothing about 入库 — so an attach failure can
-// never read as ingest business (SC4). The two rejections that are
-// actually "wrong door" signals (oversize, non-text bytes) name the
-// 入库 process, not a fin page: the corpus-ingest UI lives outside
-// the fin chrome, so the copy must not point at a retired entry.
+// never read as ingest business (SC4). The one rejection that is a
+// "wrong door" signal (oversize) names the 入库 process, not a fin
+// page: the corpus-ingest UI lives outside the fin chrome, so the
+// copy must not point at a retired entry.
 //
-// ADR 0086 adds the lifecycle half: the door can
-// now fail LATER (async parse / index), and a send may be refused
-// because a referenced attachment is still parsing. Those states
-// surface through the chip helpers below, not a door rejection.
+// ADR 0089 keeps the lifecycle half: the upload door stores raw bytes
+// and answers ``uploaded``; preparation starts from a graph turn and
+// can fail LATER (parse / index / vision). Those states surface
+// through the chip helpers below, not a door rejection — with one
+// exception the composer enforces locally: a send or a new
+// conversation while an upload is still in flight.
 
 import { AttachFailedError } from "./api";
 import type {
@@ -21,6 +23,12 @@ export interface AttachFailureNotice {
   kind: string; // the wire error code, or "unknown"
   message: string;
 }
+
+/** The one sentence for the in-flight-upload gate, shared by the attach
+ * door's notice and the send / new-thread refusal copy (sendFailure.ts)
+ * so the two surfaces cannot name the same refusal differently. */
+export const ATTACHMENT_UPLOAD_IN_PROGRESS_COPY =
+  "还有附件正在上传，本轮没有发送，等上传完成后再试。";
 
 function genericCopy(error: unknown): string {
   const detail = error instanceof Error ? error.message.trim() : "";
@@ -43,8 +51,15 @@ export function describeAttachFailure(error: unknown): AttachFailureNotice {
         "这份文件超过附件大小上限，没有上传。大文件请在入库流程里处理。";
       break;
     case "attachment_not_text":
-      message =
-        "附件只支持文本文件。PDF / Word / Excel 等请在入库流程里处理，再在对话里提问。";
+      // The upload door no longer rejects non-text bytes, so this code
+      // can only come from preparation. Kept mapped so an older host's
+      // upload-time 400 still renders — as a stored file whose content
+      // cannot be parsed here, never as "not uploaded".
+      message = "这份文件已收下，但它的内容在这里解析不了，无法引用。";
+      break;
+    case "attachment_upload_in_progress":
+      // Decided before the run: an upload is still writing its bytes.
+      message = ATTACHMENT_UPLOAD_IN_PROGRESS_COPY;
       break;
     case "attachment_store_failed":
       message = "附件保存失败，请重试。";
@@ -67,19 +82,41 @@ export function describeAttachFailure(error: unknown): AttachFailureNotice {
   return { kind, message };
 }
 
-// ----- ADR 0086: the readiness chip -----
+// ----- ADR 0089: the readiness chip -----
 //
-// A stored attachment can sit in ``parsing`` (async preparation
-// running), ``ready`` (referenceable), or ``failed`` with a NAMED
-// reason the operator can act on. The composer renders exactly these
-// labels; unknown wire values (a newer host) fall back to generic
-// copy instead of breaking the row.
+// A stored attachment can sit in ``uploaded`` (raw bytes durable,
+// preparation not yet requested), ``parsing`` (a graph turn asked for
+// preparation and it is running), ``ready`` (referenceable), or
+// ``failed`` with a NAMED reason the operator can act on. The composer
+// renders exactly these labels; unknown wire values (a newer host) fall
+// back to generic copy instead of breaking the row.
 
 const STATUS_LABEL: Record<AttachmentStatus, string> = {
+  // Distinct from 「可引用」 on purpose: the bytes are stored, nothing
+  // is parsed or indexed yet, so the file cannot be cited.
+  uploaded: "已上传，待解析",
   parsing: "解析中…",
   ready: "可引用",
   failed: "解析失败",
 };
+
+// ----- Composer copy -----
+//
+// Kept as exported strings rather than JSX so the composer's guidance
+// is unit-testable in the node environment (no DOM in the web suite)
+// and has one source the component reads.
+
+/** The one-large-filing-per-turn guidance, offered as advice about how to
+ * work, not as a bound: nothing in the product refuses a turn that
+ * carries two attachments, and the server owns every byte, page and call
+ * limit, so this copy claims none of its own. */
+export const ATTACH_ONE_FILING_HINT =
+  "一轮专注一份大文件更稳妥：先把手里这份问清楚，再传下一份。";
+
+/** Shown while an upload POST is in flight — the reason the send is
+ * held is the upload, not a running turn. */
+export const ATTACH_UPLOAD_IN_FLIGHT_HINT =
+  "附件正在上传，上传完成前不能发送。";
 
 /** Copy for ``failure_reason`` on a failed record. Never empty: an
  * unrecognised reason still reads as a failure with retry offered

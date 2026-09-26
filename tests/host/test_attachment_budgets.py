@@ -22,6 +22,9 @@ What this file pins:
   share that one budget.
 * the module holds integers only — no provider or model identifier, since
   hardcoding one is out of contract.
+* the composition root reads the four bounds before anything is published or
+  bound: ``serve()`` aborts on a missing, non-positive, blank, non-numeric or
+  unbounded key, and a boot that cannot state a bound never enters uvicorn.
 
 The values below are test fixtures, not the deployment defaults; the measured
 defaults are recorded with the gold-set evidence.
@@ -780,6 +783,27 @@ def test_corpus_distribution_records_describe_the_committed_files() -> None:
         )
 
 
+def test_deployed_upload_cap_admits_the_measured_corpus() -> None:
+    """The bound ships to admit every filing it was priced over.
+
+    The artifact is the measurement producer's own output, so this row is
+    also proof the producer still runs: its deployed-cap value comes from
+    ``from_environ`` over the shipped template, which is the same seam the
+    upload door reads.
+    """
+    findings = json.loads(CORPUS_DISTRIBUTION_PATH.read_text())["cap_findings"]
+    deployed = from_environ(environ=_deployed_environ()).max_upload_bytes
+    assert findings["deployed_attachment_cap_bytes"] == deployed
+    assert findings["deployed_attachment_cap_source"] == (
+        ".env.example:FIN_ATTACHMENT_MAX_BYTES"
+    )
+    assert findings["files_over_deployed_attachment_cap"] == []
+    # The retired constant is historical: the filings it rejected are the
+    # reason the deployed bound is larger.
+    assert findings["route_constant_bytes"] < deployed
+    assert findings["count_over_route_constant"] > 0
+
+
 def test_gold_manifest_describes_the_committed_fixtures() -> None:
     """The three gold cases the caps must fit are the bytes on disk.
 
@@ -861,3 +885,148 @@ def test_deployed_bounds_prepare_every_gold_case_in_one_run() -> None:
         c["filename"] for c in cases if c["bytes"] > budgets.max_upload_bytes
     ] == []
     preflight_run(budgets, pages, budgets.max_vision_crop_calls_per_run)
+
+
+# ----- N: the composition root reads the four bounds before it serves -----
+
+
+def _stage_environ(
+    monkeypatch: pytest.MonkeyPatch, deployment: Mapping[str, str | None]
+) -> None:
+    """``os.environ`` carrying exactly the four keys as ``deployment`` has them.
+
+    Every key is cleared first, so an operator ``.env`` loaded by
+    ``tests/conftest.py`` cannot supply a bound a case means to omit. The
+    composition root's per-process cache goes back to unread with it:
+    ``http`` reads the four bounds once and keeps them, so a case that deploys
+    an environ has to pin the cache too or it answers from whatever the
+    previous boot saw, and the abort table below would pass or fail by file
+    order instead of by its own input. ``monkeypatch.setattr`` restores the
+    previous value at teardown, so these cases neither read nor leak a bound.
+    """
+    import fin.host.http as http_module
+
+    monkeypatch.setattr(
+        http_module, "_http_attachment_budgets_singleton", None, raising=False
+    )
+    for key in ALL_KEYS:
+        monkeypatch.delenv(key, raising=False)
+        value = deployment.get(key)
+        if value is not None:
+            monkeypatch.setenv(key, value)
+
+
+def _stage_serve(
+    monkeypatch: pytest.MonkeyPatch, deployment: Mapping[str, str | None]
+) -> tuple[list[str], list[str]]:
+    """Stage ``fin.host.http.serve()`` against one deployment env.
+
+    ``apply_dotenv``, the knowledge-MCP boot probe and the graph compile are
+    stubbed and ``uvicorn.run`` only records that it was entered, so a bound
+    is the only thing in this boot that can abort. Nothing here touches a
+    network, a model, or a database.
+
+    Returns the recorders: ``served`` (uvicorn entries) and ``published``
+    (probe entries).
+    """
+    import fin.host.http as http_module
+    import uvicorn
+
+    _stage_environ(monkeypatch, deployment)
+    served: list[str] = []
+    published: list[str] = []
+    monkeypatch.setattr(http_module, "apply_dotenv", lambda: None)
+    monkeypatch.setattr(
+        http_module, "publish_knowledge_mcp", lambda: published.append("probe")
+    )
+    monkeypatch.setattr(http_module, "compile_for_http", lambda: None)
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: served.append("uvicorn"))
+    return served, published
+
+
+@pytest.mark.parametrize("key", ALL_KEYS, ids=ALL_KEYS)
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param("", id="blank"),
+        pytest.param("   ", id="whitespace-only"),
+        pytest.param("0", id="zero"),
+        pytest.param("-1", id="negative"),
+        pytest.param("abc", id="not-a-number"),
+        pytest.param("unlimited", id="the-unbounded-word"),
+        pytest.param(str(sys.maxsize + 1), id="one-past-the-finite-bound"),
+    ],
+)
+def test_serve_aborts_boot_on_an_unusable_bound_and_never_serves(
+    monkeypatch: pytest.MonkeyPatch, key: str, bad_value: str | None
+) -> None:
+    """Startup aborts for every bound and every unusable class.
+
+    This is the boot-wiring half of the contract: ``serve()`` reads the four
+    bounds through :func:`fin.host.attachment_budgets.from_environ`, so a
+    deployment that cannot state a finite positive bound fails there instead
+    of opening the upload door with no cap. The recorded lists are the actual
+    promise — an exception alone would also come from a boot that had already
+    bound the port — and the probe list also pins the ordering, since a bound
+    that was read after publication would let a mis-deployed server announce
+    itself reachable first. The abort names the offending key, which is the
+    only line an operator gets in a boot log.
+    """
+    import fin.host.http as http_module
+
+    served, published = _stage_serve(
+        monkeypatch, {**VALID_ENVIRON, key: bad_value}
+    )
+
+    with pytest.raises(AttachmentBudgetConfigError) as excinfo:
+        http_module.serve()
+
+    assert served == []
+    assert published == []
+    assert key in str(excinfo.value)
+
+
+def test_serve_boots_and_serves_when_all_four_bounds_are_finite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The counter-case that keeps every abort row above honest.
+
+    A gate that raised for any env would satisfy the table beside it while no
+    deployment could start, so the same door is walked from the accepted side:
+    one finite bound set gets the probe, then uvicorn, exactly once.
+    """
+    import fin.host.http as http_module
+
+    served, published = _stage_serve(monkeypatch, VALID_ENVIRON)
+
+    http_module.serve()
+
+    assert published == ["probe"]
+    assert served == ["uvicorn"]
+
+
+def test_get_attachment_budgets_reads_the_deployed_values_from_the_environ(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dependency hands the door the deployed numbers, not its own.
+
+    Four deliberately different values are read out of ``os.environ`` in field
+    order, so a composition root that baked a constant cap, or crossed two
+    keys, is caught here rather than serving a bound nobody deployed.
+    """
+    import fin.host.http as http_module
+
+    _stage_environ(
+        monkeypatch,
+        {BYTES_KEY: "2097152", PAGES_KEY: "4", VISION_KEY: "12", CROP_KEY: "4"},
+    )
+
+    budgets = http_module.get_attachment_budgets()
+
+    assert budgets == AttachmentBudgets(
+        max_upload_bytes=2_097_152,
+        max_pdf_pages=4,
+        max_vision_calls_per_run=12,
+        max_vision_crop_calls_per_run=4,
+    )
