@@ -24,6 +24,8 @@ cd "$REPO_ROOT"
 source "$REPO_ROOT/scripts/lib/readiness.sh"
 # shellcheck source=scripts/lib/fin-root.sh
 source "$REPO_ROOT/scripts/lib/fin-root.sh"
+# shellcheck source=scripts/lib/attachment-bounds.sh
+source "$REPO_ROOT/scripts/lib/attachment-bounds.sh"
 
 CHECK_ONLY=0
 if [[ "${1:-}" == "--check" ]]; then
@@ -157,6 +159,11 @@ export FIN_CHECKPOINT_URL="${FIN_CHECKPOINT_URL:-postgresql://fin:fin@localhost:
 export FIN_RETRIEVE_ADAPTER="${FIN_RETRIEVE_ADAPTER:-mcp}"
 export FIN_BASE_URL="${FIN_BASE_URL:-https://api.minimaxi.com/v1}"
 export FIN_MODEL="${FIN_MODEL:-MiniMax-M3}"
+
+# serve() reads all four attachment bounds before it binds, so a tree whose
+# .env predates them would not come up at all. The template is the source;
+# a value set above (process env or .env) still wins.
+export_attachment_bounds dev-up
 
 export GRAPHRAG_MEMORY_STORAGE="${GRAPHRAG_MEMORY_STORAGE:-pgvector}"
 export GRAPHRAG_MEMORY_DB_URL="${GRAPHRAG_MEMORY_DB_URL:-postgresql://iknow_memory:iknow_memory@localhost:5432/iknow_memory}"

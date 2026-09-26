@@ -412,11 +412,23 @@ export interface JobStatus {
 
 // ----- Thread attachment: the attachment lifecycle -----
 
-// Closed status set of a thread attachment (ADR 0086): the host
-// parses and indexes asynchronously after upload, so the SPA sees
-// ``parsing`` first, then ``ready`` (text + index usable) or
-// ``failed`` with a named reason that retry can clear.
-export type AttachmentStatus = "parsing" | "ready" | "failed";
+// Closed status set of a thread attachment (ADR 0089): the upload door
+// stores raw bytes only and answers ``uploaded``, so a record can be
+// durable before any preparation exists.
+//
+// - ``uploaded``: the original bytes are durable; preparation has NOT
+//   been requested, and the row will not change by itself.
+// - ``parsing``: a grounded graph turn requested preparation and it is
+//   running. The only state the SPA follows with a readiness poll.
+// - ``ready``: parsed units, required visual derivatives and the
+//   thread-private index are usable — the record is citable.
+// - ``failed``: preparation stopped with a named reason retry can
+//   clear.
+export type AttachmentStatus =
+  | "uploaded"
+  | "parsing"
+  | "ready"
+  | "failed";
 
 // Reasons the SPA names today. The wire may gain more (the parse
 // exits in specs/thread-attachment-source-read.md), so display code

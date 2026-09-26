@@ -26,6 +26,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { attachmentBoundsFromExample } from "./lib/attachment-bounds.mjs";
 import {
   REPO_ROOT,
   ensureSpaBuild,
@@ -59,6 +60,13 @@ const PROVIDER_ENV = [
   "FIN_CHECKPOINT_URL",
   "FIN_RETRIEVE_ADAPTER",
 ];
+
+// This lane reads no ./.env and starts uvicorn directly rather than through
+// `serve()`, so nothing else would tell the server its upload cap: without
+// the four bounds the door answers a config failure instead of a bound.
+// Resolved once, at load: a checkout whose template lost a bound fails here,
+// naming the key, before a server is booted or a browser is opened.
+const ATTACHMENT_BOUNDS = attachmentBoundsFromExample();
 
 const USAGE = `Usage: node scripts/run-scripted-e2e.mjs [options]
 
@@ -149,6 +157,9 @@ function childEnv(port, deltaMs, scenario) {
   // on a lane with no MCP server. The lane drives no upload today, so
   // this is the port it would get if it ever did.
   env.FIN_RETRIEVE_ADAPTER = "fake";
+  for (const [key, value] of Object.entries(ATTACHMENT_BOUNDS)) {
+    if (!(key in env)) env[key] = value;
+  }
   if (deltaMs !== "") env.FIN_SCRIPTED_DELTA_MS = String(deltaMs);
   env.FIN_E2E_BASE_URL = `http://127.0.0.1:${port}`;
   return { env, dropped };

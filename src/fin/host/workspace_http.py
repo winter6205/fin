@@ -152,6 +152,7 @@ import re
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Iterator, Literal
@@ -199,12 +200,12 @@ from fin.corpus.ingest_endpoint import (
     IngestUploadTooLargeError,
 )
 from fin.corpus.ingest_state_errors import UnknownJobError
+from fin.host.attachment_budgets import AttachmentBudgets
 from fin.host.attachment_prepare import (
     AttachmentCleanupError,
     AttachmentNotFoundError,
     AttachmentNotReadyError,
     AttachmentPreparationService,
-    text_rejection_reason,
 )
 from fin.host.attachment_store import (
     AttachmentRecord,
@@ -597,12 +598,9 @@ _TITLE_MAX_CHARS: int = 50
 _DEFAULT_TITLE: str = "New thread"
 
 
-# corpus-serve-ingest T4 (ADR 0047 thread attach): hard cap on one
-# attachment upload, in bytes. The cap keeps a drag-and-drop from
-# ballooning the byte store and the model context. Oversize is a named
-# 413, never a silent truncate. Module-level so operators can tune it
-# and tests can shrink it.
-ATTACHMENT_MAX_BYTES: Final[int] = 2 * 1024 * 1024
+# The scope label one attach carries; the byte cap is NOT here — it is
+# the deployed :class:`~fin.host.attachment_budgets.AttachmentBudgets`
+# value the route reads through its dependency.
 ATTACHMENT_SCOPE: Final[str] = "thread_attach"
 
 
@@ -1908,6 +1906,67 @@ def _read_bounded_upload(file: Any, cap: int) -> bytes | None:
     return b"".join(chunks)
 
 
+# ----- send gate: uploads this process is still storing -----
+
+
+class AttachmentUploadInFlight:
+    """Per-thread count of attachment uploads whose bytes are still landing.
+
+    The gate's truth is server-side and narrow: an upload is in flight
+    from the moment the attach door starts reading its body until the
+    record exists. Counted per thread, so a pending file the
+    message never names still holds its own thread. The counts live in
+    this process only, which is what the single-operator 工作台 on one
+    server process needs; a multi-worker deployment would need shared
+    state.
+
+    Why the lock: an upload can be mid-body on one request thread while
+    a send is being checked on another.
+
+    EXIT: one process holds the counts, so a send that lands on a second
+    worker would not see an upload the first is still storing. The
+    工作台 runs one uvicorn process; sharing state is a prerequisite of
+    adding a second worker, not a gap in this gate.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counts: dict[str, int] = {}
+
+    @contextmanager
+    def hold(self, thread_id: str) -> Iterator[None]:
+        """Close ``thread_id``'s send gate for the duration of one upload.
+
+        A context manager rather than public ``enter`` / ``exit`` calls:
+        every door path — stored, refused, failed, client gone — must
+        release, and ``with`` is the only spelling that cannot forget one.
+        """
+        self._enter(thread_id)
+        try:
+            yield
+        finally:
+            self._exit(thread_id)
+
+    def _enter(self, thread_id: str) -> None:
+        """Open the gate for ``thread_id`` for the duration of one upload."""
+        with self._lock:
+            self._counts[thread_id] = self._counts.get(thread_id, 0) + 1
+
+    def _exit(self, thread_id: str) -> None:
+        """Hand the thread back; the last upload out clears its entry."""
+        with self._lock:
+            left = self._counts.get(thread_id, 0) - 1
+            if left > 0:
+                self._counts[thread_id] = left
+            else:
+                self._counts.pop(thread_id, None)
+
+    def pending(self, thread_id: str) -> bool:
+        """True while ``thread_id`` has an upload this process is storing."""
+        with self._lock:
+            return self._counts.get(thread_id, 0) > 0
+
+
 # One ingest service per process: the fake boot shares one observable
 # store across requests; the MCP boot's adapters are stateless enough
 # (one subprocess per push call) that sharing changes nothing.
@@ -2169,6 +2228,7 @@ def build_router(
     get_graph,
     get_thread_store,
     get_attachment_service=None,
+    get_attachment_budgets=None,
     get_watchlist_store=None,
     get_memory_port=None,
     get_filing_monitor=None,
@@ -2195,12 +2255,20 @@ def build_router(
 
     The stop registry (:class:`RunControl`) is created HERE rather than
     at module level: one registry per mounted router means two apps in
-    one test session cannot stop each other's runs.
+    one test session cannot stop each other's runs. The send gate's
+    in-flight counter (:class:`AttachmentUploadInFlight`) is created HERE
+    for the same reason.
     """
     router = APIRouter(prefix="/api")
     run_control = RunControl()
+    upload_in_flight = AttachmentUploadInFlight()
     if get_attachment_service is None:
         get_attachment_service = default_attachment_service
+    if get_attachment_budgets is None:
+        # Lazily imported: ``fin.host.http`` owns the deployed-budget
+        # dependency and imports this module at its bottom, so a
+        # module-level import here would close the cycle.
+        from fin.host.http import get_attachment_budgets
     if get_watchlist_store is None:
         get_watchlist_store = default_watchlist_store
     if get_memory_port is None:
@@ -2428,6 +2496,20 @@ def build_router(
                 status_code=404, content={"error": "thread_not_found"}
             )
 
+        # ADR 0083/0089 send gate, host half: while this thread has an
+        # upload still writing its bytes, no run starts here — a second
+        # client cannot slip past an in-flight attach. The pending file
+        # needs no mention in the message: its record does not exist yet,
+        # so the reference check below could never see it. Decided before
+        # the concurrency probe, the title rewrite, and any graph work, so
+        # the refusal leaves the thread's rows, title, lock, and run record
+        # untouched (the same zero-side-effect ordering as that check).
+        if upload_in_flight.pending(thread_id):
+            return JSONResponse(
+                status_code=409,
+                content={"error": "attachment_upload_in_progress"},
+            )
+
         # T6 (spec SC9): an explicitly named 检索档 that this product
         # does not implement refuses HERE — before the concurrency
         # probe, before any side effect, and long before a retrieve
@@ -2470,8 +2552,16 @@ def build_router(
         # thread's durable store BEFORE the lock probe and BEFORE the title
         # rewrite, so a bad reference is a named 400 with zero side effects.
         # Unknown OR other-thread ids share one error (no existence leak
-        # across threads); a named attachment that is still ``parsing`` is
-        # ``attachment_not_ready`` rather than an empty context block.
+        # across threads); a named attachment whose preparation has not
+        # published searchable text yet is ``attachment_not_ready`` rather
+        # than an empty context block.
+        # Refusing is the fail-safe, not the finished contract: spec line 25
+        # asks the host to accept a stored ``uploaded`` attachment without
+        # waiting, which needs the run suspended and resumed around a
+        # preparation the graph starts. Until that trigger exists, the retry
+        # door is the only path from ``uploaded`` to ``ready``, and an answer
+        # built without the named source the operator asked for is the
+        # failure this refusal prevents.
         # Resolution is read-only — an attachment stays referenceable for the
         # rest of the thread's life.
         referenced_ids = list(dict.fromkeys(body.attachment_ids or []))
@@ -2844,21 +2934,24 @@ def build_router(
     async def attach_to_thread(
         thread_id: str,
         request: Request,
-        background: BackgroundTasks,
         store: ThreadStore = Depends(get_thread_store),
         attachments: AttachmentPreparationService = Depends(
             get_attachment_service
         ),
+        budgets: AttachmentBudgets = Depends(get_attachment_budgets),
     ) -> dict:
-        """ADR 0083/0086 **thread attach**: the durable attach door.
+        """ADR 0083/0086/0089 **thread attach**: the durable upload door.
 
-        A file dropped into the open research thread is stored as bytes
-        under this thread's ownership and answered with a logical
-        ``attachment_id`` plus ``parsing``. Parsing and indexing then run
-        off the request path; the attachment is ``ready`` for every later
-        turn of this thread once its frozen units and derived index exist.
-        Nothing is pushed and nothing enters the permanent company corpus
-        (ADR 0047 keeps those doors separate).
+        A file dropped into the open research thread is stored as raw
+        bytes under this thread's ownership and answered with a logical
+        ``attachment_id`` plus ``uploaded``. Nothing else happens on this
+        path: no parsing, OCR, layout, vision, or indexing, and no
+        background task behind the response. Preparation is a separate,
+        requested step (ADR 0089) and is what later makes the attachment
+        ``ready`` for every turn of this thread. Nothing is pushed and
+        nothing enters the permanent company corpus (ADR 0047 keeps those
+        doors separate).
+
         Wire shape: raw bytes body with the filename as the
         ``filename`` query parameter. Deliberately NOT multipart
         ``UploadFile``: this door takes one file and no form fields, so
@@ -2873,54 +2966,65 @@ def build_router(
         * unknown thread            -> 404 ``thread_not_found``
         * empty body                -> 400 ``empty_attachment``
         * body over the byte cap    -> 413 ``attachment_too_large``
-        * bytes that are not text   -> 400 ``attachment_not_text``
         * durable write fails       -> 500 ``attachment_store_failed``
           (the exception boundary: never a half-stored 200 whose id the
           next send could reference, and never ingest vocabulary here)
 
-        The 413 is decided at the ROUTE layer before the body is
-        buffered: a declared oversize Content-Length is refused
-        unread, and a chunked body is read in bounded segments
-        (:func:`_read_bounded_body`) — the cap is never discovered
-        after a full-buffer allocation.
+        The byte cap is the deployed
+        :attr:`~fin.host.attachment_budgets.AttachmentBudgets.max_upload_bytes`,
+        read through the ``get_attachment_budgets`` dependency — not a
+        constant this module carries, so the door cannot drift from the
+        bound the operator configured. The 413 is decided at the ROUTE
+        layer before the body is buffered: a declared oversize
+        Content-Length is refused unread, and a chunked body is read in
+        bounded segments (:func:`_read_bounded_body`) — the cap is never
+        discovered after a full-buffer allocation. Either way the refusal
+        stores no object and no attachment row.
+
+        Bytes this door cannot classify are still accepted: judging the
+        content is preparation's job, which names the rejection there.
+
+        While this route is reading and storing the body the thread's send
+        gate is closed (:meth:`AttachmentUploadInFlight.hold`), so no refusal
+        can strand it: the handle releases on every return AND every raise,
+        including a client that walks away mid-body.
         """
-        if store.get_thread(thread_id) is None:
-            return JSONResponse(
-                status_code=404, content={"error": "thread_not_found"}
+        with upload_in_flight.hold(thread_id):
+            if store.get_thread(thread_id) is None:
+                return JSONResponse(
+                    status_code=404, content={"error": "thread_not_found"}
+                )
+            if _declared_upload_over(request, budgets.max_upload_bytes):
+                return JSONResponse(
+                    status_code=413, content={"error": "attachment_too_large"}
+                )
+            body = await _read_bounded_body(
+                request, budgets.max_upload_bytes
             )
-        if _declared_upload_over(request, ATTACHMENT_MAX_BYTES):
-            return JSONResponse(
-                status_code=413, content={"error": "attachment_too_large"}
-            )
-        body = await _read_bounded_body(request, ATTACHMENT_MAX_BYTES)
-        if body is None:
-            return JSONResponse(
-                status_code=413, content={"error": "attachment_too_large"}
-            )
-        if not body:
-            return JSONResponse(
-                status_code=400, content={"error": "empty_attachment"}
-            )
-        rejected = text_rejection_reason(body)
-        if rejected:
-            return JSONResponse(status_code=400, content={"error": rejected})
-        try:
-            record = attachments.accept(
-                thread_id=thread_id,
-                filename=request.query_params.get("filename") or "",
-                payload=body,
-            )
-        except AttachmentStoreError:
-            logger.exception(
-                "attach_to_thread: durable write failed for thread_id=%s",
-                thread_id,
-            )
-            return JSONResponse(
-                status_code=500,
-                content={"error": "attachment_store_failed"},
-            )
-        background.add_task(attachments.prepare_async, record.attachment_id)
-        return _attachment_wire_record(record)
+            if body is None:
+                return JSONResponse(
+                    status_code=413, content={"error": "attachment_too_large"}
+                )
+            if not body:
+                return JSONResponse(
+                    status_code=400, content={"error": "empty_attachment"}
+                )
+            try:
+                record = attachments.accept(
+                    thread_id=thread_id,
+                    filename=request.query_params.get("filename") or "",
+                    payload=body,
+                )
+            except AttachmentStoreError:
+                logger.exception(
+                    "attach_to_thread: durable write failed for thread_id=%s",
+                    thread_id,
+                )
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": "attachment_store_failed"},
+                )
+            return _attachment_wire_record(record)
 
     @router.get("/threads/{thread_id}/attachments")
     def list_thread_attachments(
@@ -3683,6 +3787,7 @@ def mount(
     get_graph,
     get_thread_store,
     get_attachment_service=None,
+    get_attachment_budgets=None,
     get_watchlist_store=None,
     get_memory_port=None,
     get_filing_monitor=None,
@@ -3696,6 +3801,7 @@ def mount(
             get_graph=get_graph,
             get_thread_store=get_thread_store,
             get_attachment_service=get_attachment_service,
+            get_attachment_budgets=get_attachment_budgets,
             get_watchlist_store=get_watchlist_store,
             get_memory_port=get_memory_port,
             get_filing_monitor=get_filing_monitor,
