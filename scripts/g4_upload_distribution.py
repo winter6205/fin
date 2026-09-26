@@ -200,7 +200,12 @@ def read_product_constant(module_name: str, constant_name: str) -> dict[str, Any
 
 
 def read_product_constants() -> dict[str, dict[str, Any]]:
-    """Both quoted caps, keyed by the door they belong to."""
+    """The caps quoted under ``cap_findings``, keyed by the door they belong to.
+
+    ``ingest`` is read from the module that enforces it; ``route`` is the
+    retired thread-door constant, stated here because nothing enforces it
+    any more.
+    """
     return {
         "route": {
             "constant_bytes": RETIRED_ROUTE_CAP_BYTES,
@@ -668,8 +673,8 @@ def build_artifact() -> dict[str, Any]:
         )
 
     filenames = _pdf_filenames()
-    # Both quoted caps come out of the modules that enforce them, so neither
-    # number nor its provenance can be a copy that time forgot.
+    # The live caps are read from the seams that enforce them; only the
+    # retired row is a stated number, and it is labelled retired.
     constants = read_product_constants()
     deployed_cap = read_deployed_attachment_cap()
     manifest_records, manifest_gaps = _manifest_pdf_records(_load_json_object(MANIFEST_REL))

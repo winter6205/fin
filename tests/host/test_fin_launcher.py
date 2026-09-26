@@ -32,6 +32,7 @@ from pathlib import Path
 
 import pytest
 
+from fin.host.attachment_budgets import _ENV_BOUNDS as _PRODUCT_ENV_BOUNDS
 from fin.host.knowledge_mcp import (
     knowledge_mcp_gate_closed,
     publish_knowledge_mcp_state,
@@ -647,13 +648,10 @@ def test_lifecycle_scripts_share_one_iknow_resolver() -> None:
         )
 
 
-# The four attachment bounds `serve()` requires before it binds a port.
-BOUND_KEYS = (
-    "FIN_ATTACHMENT_MAX_BYTES",
-    "FIN_ATTACHMENT_MAX_PDF_PAGES",
-    "FIN_ATTACHMENT_VISION_CALLS_PER_RUN",
-    "FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN",
-)
+# The bounds `serve()` requires before it binds a port. The product's own
+# table is the authority: a guard that typed its own copy of the key list
+# would keep passing if a fifth bound were added.
+BOUND_KEYS = tuple(key for key, _ in _PRODUCT_ENV_BOUNDS)
 ATTACHMENT_BOUNDS_BASH = REPO_ROOT / "scripts" / "lib" / "attachment-bounds.sh"
 ATTACHMENT_BOUNDS_NODE = REPO_ROOT / "scripts" / "lib" / "attachment-bounds.mjs"
 BOUNDS_LANES = (
@@ -698,6 +696,15 @@ def test_no_lane_repeats_an_attachment_bound_literal() -> None:
     assert "attachment-bounds.mjs" in (REPO_ROOT / BOUNDS_LANES[2]).read_text(
         encoding="utf-8"
     ), f"{BOUNDS_LANES[2]} must import the shared bounds reader"
+    # The two resolvers name the keys by hand, being unable to import the
+    # product table, so this is where a bound added on the product side
+    # stops being resolved by the lanes silently.
+    for lib in (ATTACHMENT_BOUNDS_BASH, ATTACHMENT_BOUNDS_NODE):
+        text = lib.read_text(encoding="utf-8")
+        unresolvable = [key for key in BOUND_KEYS if key not in text]
+        assert not unresolvable, (
+            f"scripts/lib/{lib.name} does not resolve {unresolvable}"
+        )
 
 
 def test_attachment_bound_resolver_reads_the_template_and_lets_env_win(
@@ -707,16 +714,19 @@ def test_attachment_bound_resolver_reads_the_template_and_lets_env_win(
     already in the environment is never overridden, and the node reader
     agrees with it key for key.
     """
-    template = tmp_path / ".env.example"
-    template.write_text(
-        "# comment line, ignored\n"
-        f"{BOUND_KEYS[0]}=111\n"
-        f"export {BOUND_KEYS[1]}='222'\n"
-        f"{BOUND_KEYS[2]}=333\n"
-        f"{BOUND_KEYS[3]}=444\n",
-        encoding="utf-8",
+    # `export` and quoting vary per row so the resolver is exercised on
+    # every shape its docstring claims to accept.
+    template_values = {
+        key: str(333 * (index + 1)) for index, key in enumerate(BOUND_KEYS)
+    }
+    template_rows = "".join(
+        f"{key}={value}\n" if index % 2 == 0 else f"export {key}='{value}'\n"
+        for index, (key, value) in enumerate(template_values.items())
     )
+    template = tmp_path / ".env.example"
+    template.write_text(f"# comment line, ignored\n{template_rows}", encoding="utf-8")
 
+    exported = BOUND_KEYS[0]
     resolved = subprocess.run(
         [
             "bash",
@@ -729,19 +739,17 @@ def test_attachment_bound_resolver_reads_the_template_and_lets_env_win(
             str(REPO_ROOT),
             str(tmp_path),
         ],
-        env={**_BASE_ENV, BOUND_KEYS[0]: "999"},
+        env={**_BASE_ENV, exported: "999"},
         capture_output=True,
         text=True,
         check=False,
     )
     assert resolved.returncode == 0, resolved.stderr
-    # The first key was already exported, so it wins over the template; the
-    # rest come through, with `export` and quotes stripped.
+    # The one key already in the environment wins over the template; the
+    # rest come through with `export` and quotes stripped.
     assert resolved.stdout.splitlines() == [
-        f"{BOUND_KEYS[0]}=999",
-        f"{BOUND_KEYS[1]}=222",
-        f"{BOUND_KEYS[2]}=333",
-        f"{BOUND_KEYS[3]}=444",
+        f"{key}={'999' if key == exported else template_values[key]}"
+        for key in BOUND_KEYS
     ]
 
     node = subprocess.run(
@@ -759,12 +767,7 @@ def test_attachment_bound_resolver_reads_the_template_and_lets_env_win(
         check=False,
     )
     assert node.returncode == 0, node.stderr
-    assert json.loads(node.stdout) == {
-        BOUND_KEYS[0]: "111",
-        BOUND_KEYS[1]: "222",
-        BOUND_KEYS[2]: "333",
-        BOUND_KEYS[3]: "444",
-    }
+    assert json.loads(node.stdout) == template_values
 
 
 def test_attachment_bound_resolver_fails_loudly_on_a_missing_key(

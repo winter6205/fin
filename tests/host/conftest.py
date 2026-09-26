@@ -41,6 +41,7 @@ import pytest
 
 from fin.corpus.extracted import Locator
 from fin.corpus.facts import Fact, write_facts
+from fin.host.attachment_budgets import _ENV_BOUNDS as _PRODUCT_ENV_BOUNDS
 from fin.host.jev_choice import JevChoiceClient
 from fin.host.jev_config import JevConfig
 
@@ -133,12 +134,9 @@ def _memory_on_env_for_marked_tests(
     monkeypatch.setenv("FIN_MEMORY_ENABLED", "true")
 
 
-_ATTACHMENT_BOUND_KEYS = (
-    "FIN_ATTACHMENT_MAX_BYTES",
-    "FIN_ATTACHMENT_MAX_PDF_PAGES",
-    "FIN_ATTACHMENT_VISION_CALLS_PER_RUN",
-    "FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN",
-)
+# The product's table is the authority: a fixture that typed its own copy of
+# the keys would keep passing, and deploy too few bounds, if a fifth landed.
+_ATTACHMENT_BOUND_KEYS = tuple(key for key, _ in _PRODUCT_ENV_BOUNDS)
 
 
 @pytest.fixture
