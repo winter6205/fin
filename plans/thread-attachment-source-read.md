@@ -20,7 +20,12 @@ OVERALL: PASS
 
 - Inherits the spec's typed source locators, thread-bound attachment ownership, raw-only `uploaded` state, graph-triggered `parsing`/`ready`/`failed` lifecycle, 8,000-code-point and 32-KiB limits, and this-run text/visual evidence rules (ADRs 0046 and 0083–0089).
 - Open for implementation within those constraints: durable job/index schema, parser adapter decomposition, and UI placement for readiness and retry. The finite page and vision-call defaults are decided from measurement by T2a and recorded in [`docs/validation/2026-09-26-g4-t2a-page-vision-budgets.md`](../docs/validation/2026-09-26-g4-t2a-page-vision-budgets.md): a 4 MiB upload cap, an 80-page cap, and a per-run budget of 88 visual calls of which up to 8 are crops. They are deployment settings in `.env.example`, not code constants.
-- **To persist:** empty. The approved vocabulary and lifecycle updates are already in `docs/CONTEXT.md` and ADRs 0084, 0086, 0088, and 0089.
+- **To persist:** one item, already written. T2a added
+  [`docs/context-map.md`](../docs/context-map.md), which names the bounded
+  contexts, their ownership edges and the legal dependency direction for
+  `src/fin/`; it defines no term and consumes its vocabulary from
+  `docs/CONTEXT.md`. The approved vocabulary and lifecycle updates are already
+  in `docs/CONTEXT.md` and ADRs 0084, 0086, 0088, and 0089.
 - Existing pre-G4 gold output and its limits are recorded in [`docs/validation/2026-09-24-g4-planning-baseline.md`](../docs/validation/2026-09-24-g4-planning-baseline.md); it does not close any G4 real-gold criterion.
 
 ## Tasks (ordered by dependency)
@@ -35,7 +40,7 @@ OVERALL: PASS
 2. **T2a — Measure and decide page and visual-call defaults** — tag: `[decision]`
    - **Inherits:** spec: “The plan must set the initial finite defaults before implementation using the real gold suite and a 4 GB device measurement.” The first preparation scans every physical page once; crop inspections and retries consume the same per-run budget.
    - **Surface:** fin attachment preparation, the committed G4 attachment gold cases, Docling/Heron, CPU Tesseract, fin's configured vision provider, and the 4 GB target device.
-   - **Acceptance:** commit representative mixed text/chart PDF, scanned-page, and image gold cases with independent page/region, OCR, chart-presence, and chart-meaning expectations; record the real file-size distribution and run the pinned candidate pipeline, capturing actual per-case results, image dimensions, peak host/GPU memory, latency, and provider usage. Select a finite upload-byte cap, PDF page cap, and per-run visual-call budget from these observations so every gold file fits. The visual budget covers one initial full-page call for every page admitted for first preparation in that run, across eligible attachments, plus measured headroom for question-specific crops and retries; validate the page/call relationship before starting work. Missing, non-positive, or unbounded configured limits fail validation. An over-budget request fails with its typed limit error before any page is silently skipped. Record the measured defaults and evidence before model-dependent implementation proceeds; do not substitute a guessed or hardcoded limit.
+   - **Acceptance:** commit representative mixed text/chart PDF, scanned-page, and image gold cases with independent page/region, OCR, chart-presence, and chart-meaning expectations; record the real file-size distribution and run the pinned candidate pipeline, capturing actual per-case results, image dimensions, peak host/GPU memory, latency, and provider usage. *(Scoped after review, 2026-09-26: "per-case" covers the two PDF cases — the pinned harness takes PDF input only, and its one attempt at the bare image is a committed rejection with* `container_exit_code = 1`*, while that image's OCR side is measured and committed as* `results/g4-image-chart-001_tesseract_…/ocr.txt`*. The image case's pinned-pipeline per-case result is T2d's, whose acceptance names the standalone-image gold case.)* Select a finite upload-byte cap, PDF page cap, and per-run visual-call budget from these observations so every gold file fits. The visual budget covers one initial full-page call for every page admitted for first preparation in that run, across eligible attachments, plus measured headroom for question-specific crops and retries; validate the page/call relationship before starting work. *(Amended after review, 2026-09-26: the crop term is what T2a counted, and it counted it from the gold set rather than from observed demand; the shipped run total is exactly* `pages + crops`*, so it leaves no call for the page retry this clause also names. That term is priced by T2e against observed retry demand — see* ***Leftovers*** *10 of the validation record, and the* `.env.example` *note beside* `FIN_ATTACHMENT_VISION_CALLS_PER_RUN`*.) Missing, non-positive, or unbounded configured limits fail validation. An over-budget request fails with its typed limit error before any page is silently skipped. Record the measured defaults and evidence before model-dependent implementation proceeds; do not substitute a guessed or hardcoded limit.
    - Status: [x] decided — **provisional**, from partial measurement with named
      gaps: `FIN_ATTACHMENT_MAX_BYTES=4194304`,
      `FIN_ATTACHMENT_MAX_PDF_PAGES=80`, `FIN_ATTACHMENT_VISION_CALLS_PER_RUN=88`,
@@ -61,7 +66,7 @@ OVERALL: PASS
      one-filing-per-turn guidance by T2b (3), the dedicated-device reading by T2f
      (5). T2b–T2f build against these four keys as the values under test; none of
      them may present the numbers as the approved shipped default until 1, 4, 6,
-     7, and 9 close. The enforcement seam is `fin.host.attachment_budgets` (109
+     7, and 9 close. The enforcement seam is `fin.host.attachment_budgets` (157
      cases).
 
 3. **T2b — Store uploads raw and gate sends** — tag: `[implementation]`

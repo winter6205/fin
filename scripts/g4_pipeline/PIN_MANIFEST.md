@@ -18,8 +18,8 @@ a declared dependency of the repo yet, and adding it is T2d's runtime-dependency
 decision. Everything else T2a changed sits outside this directory — the
 uploaded-byte and page distribution script, the vision probe, the gold fixtures
 under `data/corpus/`, `src/fin/host/attachment_budgets.py` with its tests, the
-`.env.example` bounds, and the validation record — and is enumerated in the
-document above.
+`.env.example` bounds, the `docs/context-map.md` entry that places the attachment
+capability, and the validation record — and is enumerated in the document above.
 
 Everything below was resolved *by the build*, not written from memory: version strings come
 from `pip freeze` executed inside the built image (`results/image_pip_freeze.txt`), model
@@ -51,8 +51,12 @@ ca-certificates curl libgl1 libglib2.0-0 libgomp1
 tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim
 ```
 
-Tesseract is **not** version-pinned by apt on this base; the installed binary is recorded by
-measurement instead: `tesseract 5.5.0` (baked to `/opt/g4/tesseract_version.txt`).
+Tesseract is **not** version-pinned by apt on this base; the installed binary is
+recorded by measurement instead. `tesseract --version` is baked into the image at
+`/opt/g4/tesseract_version.txt`, and `build.sh` copies it out to
+`results/image_tesseract_version.txt`, so the `tesseract 5.5.0` cited by the
+validation record is readable from a committed artifact rather than from memory
+(leptonica 1.84.1, AVX2/FMA/SSE4.1 and OpenMP 201511 found).
 
 OCR language guard (runs at build time and aborts the build on failure):
 
@@ -232,16 +236,17 @@ accepted but **not applied**: `memory.swap.max` reads `max` (the driver records 
 `cgroup_memory_swap_max_bytes: -1`). Swap *usage* is still accounted, and it is nonzero where
 it matters. `memory.peak` counts memory charged to the cgroup, not the bytes the kernel moved
 out, so on this host the 4 GiB-relevant footprint of a run is its `memory.peak` plus its swap,
-and `VmSwap` has to be read rather than assumed away. Twelve of the fourteen metas tracked under
+and `VmSwap` has to be read rather than assumed away. Sixteen of the twenty metas tracked under
 `results/` do report `proc_vmswap_bytes = 0` and `cgroup_memory_swap_current_bytes = 0` — the
-seven `2023_FY_GOOG.pdf` runs (`…T164419Z`, `…T170133Z`, `…T170956Z`, `…T184410Z`, `…T195408Z`,
-`…T204930Z`, `…T220516Z`), the three `g4-mixed-chart-001` runs (`…T174114Z`, `…T204952Z`,
-`…T220537Z`) and both `g4-scanned-001` runs (`…T185551Z`, `…T205348Z`), all of them one to three
+nine `2023_FY_GOOG.pdf` runs (`…T164419Z`, `…T170133Z`, `…T170956Z`, `…T184410Z`, `…T195408Z`,
+`…T204930Z`, `…T220516Z`, `…T231119Z`, `…T000155Z`), the five `g4-mixed-chart-001` runs
+(`…T174114Z`, `…T204952Z`, `…T220537Z`, `…T231154Z`, `…T000242Z`) and both `g4-scanned-001`
+runs (`…T185551Z`, `…T205348Z`), all of them one to three
 pages. The scanned pair is the whole-tree case worth naming: its 63 to 68 minutes of
 render-plus-OCR work runs mostly in a Tesseract child process, and
-`memory.swap.current` still read 0 at the end of each run. The non-PDF
-rejection meta (`g4-image-chart-001.png…T195253Z`) records `null` for both because it measured
-nothing.
+`memory.swap.current` still read 0 at the end of each run. The three non-PDF
+rejection metas (`g4-image-chart-001.png…T195253Z`, `…T231351Z`, `…T001448Z`) each record
+`null` for both because they measured nothing.
 The load-bearing run is the exception:
 `2023_Q1_MSFT_20260925T171056Z.meta.json`, the 72-page conversion, reports
 `proc_vmswap_bytes = 182738944` with `cgroup_memory_swap_current_bytes = 275591168`. Both are
@@ -276,7 +281,7 @@ the swap half of the ceiling should re-run this harness before the caps are froz
 | `Dockerfile` | pinned runtime (docling + CPU torch + tesseract eng/chi_sim), with build-time guards |
 | `build.sh` | ceiling-constrained build + `tesseract --list-langs` verification + freeze snapshot |
 | `driver.py` | in-container measurement driver; emits exactly one JSON line, logs to stderr |
-| `run_measured.sh` | ceiling-constrained `docker run` wrapper; merges `docker inspect` OOMKilled with its own out-of-band read of the container scope's `memory.peak` / `memory.swap.peak`. That host-side cross-check read nothing on this host — `host_side_cgroup_memory_peak_bytes` and `host_side_cgroup_memory_swap_peak_bytes` are `null` in every committed meta — so every peak here comes from the driver's in-container reads |
+| `run_measured.sh` | ceiling-constrained `docker run` wrapper; merges `docker inspect` OOMKilled with its own out-of-band read of the container scope's `memory.peak` / `memory.swap.peak`. That host-side cross-check read nothing on this host — `host_side_cgroup_memory_peak_bytes` and `host_side_cgroup_memory_swap_peak_bytes` are `null` in every committed meta — so every peak here comes from the driver's in-container reads. It writes the measured line whether or not the run succeeded, then **exits non-zero** when `docker run` failed or the container exited non-zero, naming `docker_run_exit`, `container_exit` and any `state_error` on stderr, so a captured record can never be read as a succeeded run from the exit status alone |
 | `PIN_MANIFEST.md` | this file |
 | `results/` | build snapshots (`image_*.txt`) + one dir and one `<name>.measured.jsonl` per measured run |
 
