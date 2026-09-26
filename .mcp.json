@@ -1,9 +1,8 @@
 {
   "mcpServers": {
     "iknow-memory": {
-      "command": "node",
-      "args": ["dist/index.js"],
-      "cwd": "../iknow-memory"
+      "command": "bash",
+      "args": ["-c", "cd ../iknow-memory && exec node dist/index.js"]
     }
   }
 }
