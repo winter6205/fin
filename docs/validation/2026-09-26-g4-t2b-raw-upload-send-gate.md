@@ -7,8 +7,9 @@ task **T2b (Store uploads raw and gate sends)**.
 Worktree `/home/winner/projects/fin/.qoder/worktrees/g4-attachment-t2b`,
 branch `worktree-g4-attachment-t2b`, base `c8eeb52`
 (`Merge that pull request from winter6205/feat/g4-corpus-upload-parser`).
-The change under test is the working tree on top of that base; nothing here was
-committed or pushed.
+Every command below was run against the working tree on that base; the tree is
+now committed on the branch (`001d5da`), and the two sections marked *Defect*
+record what the run found and what closed it.
 
 ## Scope: what T2b delivers, and what it deliberately does not
 
@@ -16,7 +17,7 @@ Delivered by this change, and proved below against real storage:
 
 * `POST /api/threads/{id}/attachments` stores **durable raw bytes only** and
   answers `uploaded`. No background task, no parse, no OCR, no layout, no
-  vision, no index (`src/fin/host/workspace_http.py:2848` — `attach_to_thread`
+  vision, no index (`src/fin/host/workspace_http.py:2907` — `attach_to_thread`
   lost its `BackgroundTasks` parameter and its `prepare_async` call, and the
   non-text `400` branch is gone).
 * Unsupported bytes are still uploadable; only preparation names them. The
@@ -34,7 +35,14 @@ Delivered by this change, and proved below against real storage:
   (`src/fin/host/attachment_store.py:916`) selects only `parsing` or a torn
   `ready`, and its in-memory twin is `attachment_store.py:491`.
 * The composer holds send and new-conversation while any upload is in flight
-  (`web/src/store.ts:482,526`, `web/src/components/Composer.tsx:53`).
+  (`web/src/store.ts:481,521`, `web/src/components/Composer.tsx:62`).
+* The host holds the same condition: `AttachmentUploadInFlight`
+  (`src/fin/host/workspace_http.py:1911`) counts an in-flight upload per thread,
+  the upload door enters it before anything else happens
+  (`workspace_http.py:2965`) and leaves it in a `finally`
+  (`workspace_http.py:3005`), and the send route answers
+  `409 attachment_upload_in_progress` (`workspace_http.py:2487`). See
+  *The host-side gate*.
 
 **Not** delivered here, by design: no graph-triggered preparation. The
 `ensure_attachment_ready` node, the `uploaded → parsing` transition, the run
@@ -64,9 +72,9 @@ real `serve()` process.
 
 **The durable byte adapter could not be exercised, and that is recorded as
 blocked, not as a pass.** `_build_default_attachment_service`
-(`src/fin/host/workspace_http.py:2101-2147`) asks `object_store_from_env()` for
+(`src/fin/host/workspace_http.py:2143-2177`) asks `object_store_from_env()` for
 the real store and falls back to `InMemoryObjectStore()` with a `WARNING` at
-`workspace_http.py:2130` when `FIN_OBJECT_STORE_URL` /
+`workspace_http.py:2172` when `FIN_OBJECT_STORE_URL` /
 `FIN_OBJECT_STORE_BUCKET` are unset. This machine has no S3-compatible service
 (see *Blocked leg* below). Rather than install a dependency or stand up a fake
 S3 and call it durable, the live module **drives that factory itself** and
@@ -74,7 +82,7 @@ asserts what it selected, so the degradation is observed evidence in the run
 rather than an assumption:
 
 ```
-WARNING fin.host.workspace_http:workspace_http.py:2130 FIN_OBJECT_STORE_URL/FIN_OBJECT_STORE_BUCKET
+WARNING fin.host.workspace_http:workspace_http.py:2172 FIN_OBJECT_STORE_URL/FIN_OBJECT_STORE_BUCKET
 are not set; thread attachments keep their raw bytes in process memory and will report
 source_unavailable after a restart
 ```
@@ -114,9 +122,9 @@ neither store rather than merely asserted not to have.
 
 | # | Command | Exit | Result |
 | --- | --- | --- | --- |
-| 1 | `uv run --no-sync pytest -q tests/host/test_thread_attach.py tests/host/test_attachment_store.py tests/host/test_thread_attachment_durable.py tests/host/test_attachment_budgets.py tests/host/test_scripted_boot.py tests/host/test_operator_env.py` | 0 | `331 passed, 7 skipped, 7 warnings in 9.37s`; the 7 skips are the pre-existing `FIN_CHECKPOINT_URL` gate (`test_attachment_store.py:697,722,743,772,780,799,815`) |
-| 2 | `uv run --no-sync pytest -q tests/host -k "attach or budget or boot or serve"` | 0 | `408 passed, 14 skipped, 1860 deselected in 23.37s` — containment: nothing outside the attachment/budget/boot surface moved |
-| 3 | same six files **plus** `tests/host/test_thread_attachment_durable_postgres.py`, with `FIN_CHECKPOINT_URL` exported from the `.env.example:23` template value | **1** | `1 failed, 344 passed, 7 warnings in 14.61s`. **14 previously-skipped cases became executed, 13 pass.** Failure: `test_thread_attachment_durable_postgres.py::test_a_parsing_row_is_resumed_by_the_next_process`, `assert 'uploaded' == 'parsing'` at line 138 — see *Defect 1* |
+| 1 | `uv run --no-sync pytest -q tests/host/test_thread_attach.py tests/host/test_attachment_store.py tests/host/test_thread_attachment_durable.py tests/host/test_attachment_budgets.py tests/host/test_scripted_boot.py tests/host/test_operator_env.py` | 0 | `335 passed, 7 skipped, 7 warnings in 8.53s`; the 7 skips are the pre-existing `FIN_CHECKPOINT_URL` gate (`test_attachment_store.py:696,721,742,771,779,798,814`) |
+| 2 | `uv run --no-sync pytest -q tests/host -k "attach or budget or boot or serve"` | 0 | `412 passed, 14 skipped, 1860 deselected in 19.20s` — containment: nothing outside the attachment/budget/boot surface moved |
+| 3 | same six files **plus** `tests/host/test_thread_attachment_durable_postgres.py`, with `FIN_CHECKPOINT_URL` exported from the `.env.example:23` template value | 0 | `349 passed, 7 warnings in 12.33s`, no skip: **14 previously-hidden cases became executed and all 14 pass.** The first run of this command was red — see *Defect 1* |
 | 4 | `uv run --no-sync pytest -q tests/host/test_live_attachment_upload_door.py` (no `-m`) | 5 | `11 deselected in 0.25s`; `--collect-only` agrees: `no tests collected (11 deselected)` — the default hermetic suite is untouched by the new file |
 | 5 | `uv run --no-sync pytest -m mcp tests/host/test_live_attachment_upload_door.py -v` | 0 | `11 passed in 6.44s`, with `FIN_CHECKPOINT_URL` exported and the real `PostgresAttachmentStore` asserted by type. Per case in *The live door module, per case* |
 | 6 | `env -u FIN_ATTACHMENT_MAX_BYTES -u FIN_ATTACHMENT_MAX_PDF_PAGES -u FIN_ATTACHMENT_VISION_CALLS_PER_RUN -u FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN uv run --no-sync python -c "from fin.host.http import serve; serve()"` | **1** | aborts before binding; last stderr line `fin.host.attachment_budgets.AttachmentBudgetConfigError: FIN_ATTACHMENT_MAX_BYTES must be set to a positive integer, got None`; first stderr line is the benign `SPA dist directory …/web/dist not found` warning; traceback `http.py:643 serve → http.py:226 get_attachment_budgets → attachment_budgets.py:153 → :117`; `ss -ltn` shows **no listener on 8000** |
@@ -124,14 +132,14 @@ neither store rather than merely asserted not to have.
 | 8 | the same command with `FIN_ATTACHMENT_MAX_BYTES` set to `0`, `-1`, `abc`, `""` (other three at the deployed values) | 1 / 1 / 1 / 1 | four named refusals, quoted verbatim in *The boot gate, per case* |
 | 9 | four bounds at the deployed values, no `FIN_CHECKPOINT_URL` | 1 | gets **past** the bound gate — `grep -c AttachmentBudgetConfigError` = `0` — and dies later at the next requirement: `fin.host.compile.MissingCheckpointURLError: FIN_CHECKPOINT_URL is required for the durable v1 compile (ADR 0015)` |
 | 10 | four bounds at the deployed values **and** the real `FIN_CHECKPOINT_URL`, under `timeout 30` | **124** | the bound gate is passed (`0` `AttachmentBudgetConfigError` mentions) and the real server binds: `INFO: Started server process [3714145]`, `INFO: Uvicorn running on http://0.0.0.0:8000`; on the timeout `INFO: Shutting down` → `INFO: Finished server process [3714145]`. Exit 124 is the harness cutting a **successful** boot, not a failure. No process and no listener left: `ss -ltn \| grep -c ':8000'` = `0` |
-| 11 | `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_mcp_t2.py … t5.py tests/retrieve/test_live_mcp_read_source.py tests/retrieve/test_live_research_cite_on_ingest.py tests/retrieve/test_live_host_graph_hop.py` | 0 | `11 passed in 23.99s` — the same 11 named cases T2a recorded as `11 passed in 36.65s`, still passing with the compiled iknow-memory server |
+| 11 | `uv run --no-sync pytest -q -m mcp tests/retrieve/test_live_mcp_t2.py … t5.py tests/retrieve/test_live_mcp_read_source.py tests/retrieve/test_live_research_cite_on_ingest.py tests/retrieve/test_live_host_graph_hop.py tests/host/test_live_attachment_upload_door.py` | 0 | `22 passed in 28.47s` — the 11 live-MCP cases T2a recorded as `11 passed in 36.65s`, still passing with the compiled iknow-memory server, plus the 11 live upload-door cases of command 5 in the same run |
 | 12 | `cd web && npx vitest run src/uploadDoors.test.ts src/attachFailure.test.ts src/sendFailure.test.ts` | 0 | `Test Files 3 passed (3)`, `Tests 69 passed (69)`, `Duration 1.58s` — `sendFailure.test.ts (12)`, `attachFailure.test.ts (22)`, `uploadDoors.test.ts (35)` |
 | 13 | `cd web && npm run typecheck` | 0 | `tsc --noEmit`, no diagnostics |
-| 14 | `uv run --no-sync pytest -q tests/host` (whole host surface, new file present) | 0 | `1983 passed, 61 skipped, 238 deselected, 8 warnings in 113.47s` — see *Whole-surface guards* |
+| 14 | `uv run --no-sync pytest -q tests/host` (whole host surface, new file present) | 0 | `1987 passed, 61 skipped, 238 deselected, 8 warnings in 113.47s` — see *Whole-surface guards* |
 
-Commands 1-3, 5, 10 and 11 were re-run in this session against the live
-dependencies and the tail lines above are copied from that output; commands
-6-9 and 12-13 are the boot and web matrices recorded per case below.
+Commands 1-3, 5, 11 and 14 were re-run against the final tree and the tail
+lines above are copied from that output; commands 6-9 are the real-process boot
+matrix recorded per case below, and 12-13 are the web gates.
 
 ## The real boundary, in detail
 
@@ -149,7 +157,7 @@ durability is not an artefact of shared memory).
 | case | what it shows |
 | --- | --- |
 | `test_upload_of_each_gold_payload_lands_as_durable_bytes_with_nothing_derived` | all four gold payloads → `200` with `status == "uploaded"`; the object store holds exactly the file's bytes (hash-compared); `fin_thread_attachment_unit` and `fin_thread_attachment_index` hold **zero** rows for that attachment; no `parsing`/`ready`/`failed` observed anywhere |
-| `test_byte_adapter_is_the_one_the_product_itself_selected` | the store under test is the one `_build_default_attachment_service()` returns, with the `WARNING` from `workspace_http.py:2130` captured as the reason; a durable S3 adapter would be selected by the same call, unchanged |
+| `test_byte_adapter_is_the_one_the_product_itself_selected` | the store under test is the one `_build_default_attachment_service()` returns, with the `WARNING` from `workspace_http.py:2172` captured as the reason; a durable S3 adapter would be selected by the same call, unchanged |
 | `test_refusal_at_the_deployed_cap_leaves_no_object_and_no_row` | `4,194,304` B accepted; `4,194,305` B → `413 attachment_too_large`, recording lens saw no `put`, table row count unchanged; also covers the `Content-Length`-over path and the streamed-overflow path |
 | `test_upload_starts_no_work_behind_the_response` | `_NullGraph` is never touched, and a settle delay after the `200` still shows zero units and zero postings — nothing lands behind the response |
 | `test_unsupported_bytes_upload_and_only_preparation_names_them` | the non-UTF-8 PNG is accepted as raw bytes with a `200`/`uploaded`; the named rejection `attachment_not_text` appears only when `accept()`/`prepare()` is driven, and only *after* the bytes were read back out of the byte store — which is itself proof the store held them |
@@ -168,15 +176,16 @@ attachment tables are `ON DELETE CASCADE` from `fin_thread`).
 
 The 14 cases that the `FIN_CHECKPOINT_URL` gate hides:
 
-* `tests/host/test_attachment_store.py:697,722,743,772,780,799,815` — 7 cases,
+* `tests/host/test_attachment_store.py:696,721,742,771,779,798,814` — 7 cases,
   all pass on real SQL rows.
-* `tests/host/test_thread_attachment_durable_postgres.py:112,134,147,168,188,209,232`
-  — 7 cases, **6 pass, 1 fails**. Passing ones include
+* `tests/host/test_thread_attachment_durable_postgres.py:112,134,153,174,194,215,238`
+  — 7 cases, all pass. Passing ones include
   `test_postgres_round_trip_uploaded_to_ready`,
   `test_postgres_incomplete_after_index_loss` and
   `test_postgres_incomplete_does_not_list_uploaded_rows`, i.e. the `uploaded`
-  baseline and the non-recovery rule both hold on real rows. The failing one is
-  *Defect 1*.
+  baseline and the non-recovery rule both hold on real rows. The first run of
+  this list was 6/1: `test_a_parsing_row_is_resumed_by_the_next_process` was red
+  for the reason in *Defect 1*, and is now green for the reason in that section.
 
 ### The boot gate, per case (commands 6-10, all out of process)
 
@@ -202,7 +211,7 @@ which is where `uvicorn.run` is no longer a recorder.
 
 ### Whole-surface guards (command 14)
 
-`1983 passed, 61 skipped, 238 deselected in 113.47s`, exit 0 — the 238
+`1987 passed, 61 skipped, 238 deselected in 113.47s`, exit 0 — the 238
 deselections include this module's 11 (command 4), so the new file contributes
 nothing to the default run. The skips are the pre-existing `FIN_CHECKPOINT_URL`
 and `web/dist` gates. Also re-checked: the delivered test deltas are additive
@@ -213,26 +222,28 @@ on the T1 evidence the plan asks to preserve
 
 Read from `web/src/store.ts` and `web/src/components/Composer.tsx`, then run:
 
-* **Where send is blocked.** `store.ts:526-528` — `sendQuestion` throws
+* **Where send is blocked.** `store.ts:521` — `sendQuestion` calls
+  `refuseUploadInFlight` (`store.ts:1457`), which throws
   `api.AttachmentUploadInProgressError` (client-decided, `409
   attachment_upload_in_progress`, `web/src/api.ts:714`) whenever
-  `hasUploadInFlight(get().pendingUploads)` (`store.ts:1457`) is true. The
-  counter is bumped in `attachFile` (`store.ts:~1014`) and released in a
-  `finally` (`store.ts:~1038-1046`), so a failed upload cannot wedge the door.
-* **Where a new conversation is blocked.** Same predicate at `store.ts:482-484`
+  `hasUploadInFlight(get().pendingUploads)` (`store.ts:1450`) is true. The
+  counter is bumped in `attachFile` (`store.ts:~1008`) and released in a
+  `finally` (`store.ts:~1033-1039`), so a failed upload cannot wedge the door.
+* **Where a new conversation is blocked.** Same call at `store.ts:481`
   in `createThread`, so the gate is global to the composer rather than scoped to
   the thread the file is landing in — which is what spec line 25 requires
   ("even if the pending file is not referenced by the message").
-* **What the user sees.** `Composer.tsx:47` selects the in-flight state, `:53`
-  `const held = busy || uploadInFlight`, `:99` refuses an attach while one is
-  already running, `:377` relabels the send button `上传中…`, and `:260-265`
+* **What the user sees.** `Composer.tsx:59` selects the in-flight state, `:62`
+  derives `held`/`sendLabel` through the pure `sendGate` (`Composer.tsx:33`),
+  `:108` refuses an attach while one is
+  already running, `:386` renders the `上传中…` label, and `:269-275`
   renders `ATTACH_UPLOAD_IN_FLIGHT_HINT` (`attachFailure.ts:119`,
   "附件正在上传，上传完成前不能发送。") under `data-testid="attach-upload-pending"`.
   `uploaded` is displayed distinctly from `ready` (`attachFailure.ts:97`
   `uploaded: "已上传，待解析"`).
 * **T2a *Leftovers* 3 is carried.** The composer does display the
   one-large-filing-per-turn guidance: `ATTACH_ONE_FILING_HINT`
-  (`web/src/attachFailure.ts:114`) is rendered at `Composer.tsx:351-352` under
+  (`web/src/attachFailure.ts:114`) is rendered at `Composer.tsx:360-361` under
   `data-testid="attach-one-filing-hint"` with the copy "一份大文件一轮更稳妥：同一轮里
   放两份最大尺寸的附件，会超出本轮视觉解析预算。" That closes the hand-off T2a
   recorded, as guidance only — there is still no per-message attachment-count
@@ -241,36 +252,78 @@ Read from `web/src/store.ts` and `web/src/components/Composer.tsx`, then run:
   these doors (`uploadDoors.test.ts` 35, `attachFailure.test.ts` 22,
   `sendFailure.test.ts` 12), and command 13, `tsc --noEmit` clean.
 
-## Defects found (reported, not fixed)
+## The host-side gate
 
-**Defect 1 — the Postgres twin of the durability suite still asserts the
-pre-T2b baseline.**
-`tests/host/test_thread_attachment_durable_postgres.py:138`
-(`test_a_parsing_row_is_resumed_by_the_next_process`) expects
-`status == "parsing"` from an upload, and now gets `uploaded`:
+The composer half is client state and can be walked around by any other client,
+so the server decides the same condition for itself. `AttachmentUploadInFlight`
+(`src/fin/host/workspace_http.py:1911`) is a per-mount counter keyed by thread:
+the upload door calls `enter(thread_id)` as its first statement after the thread
+is resolved and `exit(thread_id)` in a `finally`, so every way out of the door —
+`200`, `400`, `404`, `413`, `500`, or a client that hangs up mid-body — hands the
+thread back. The send route refuses with `409
+{"error": "attachment_upload_in_progress"}` at `workspace_http.py:2487`, after
+the unknown-thread `404` and before tier, MCP status, `/compact`, the title
+rewrite and the run-lock probe, so a gated send starts no run and writes no row.
+
+Three cases in `tests/host/test_thread_attach.py` hold it, driven by a byte
+store whose `put` blocks on an `Event` (`_BlockingPutStore`, `:559`) — no
+sleeps, so the assertion is about the window, not about timing:
+
+| case | what it shows |
+| --- | --- |
+| `test_send_is_refused_while_an_upload_is_in_flight` (`:602`) | while the bytes are still landing, `_model_saw_sentinel` is impossible: `409` with the named error, `model.seen_calls == []`, and the same send returning `200` with its attachment after the upload completes |
+| `test_every_upload_refusal_leaves_the_send_gate_closed_again` (`:668`) | each named refusal (`400` empty, `413` over the cap, `404` unknown thread, `500` store failure) is followed by a `200` send, so one leaked counter cannot wedge a thread for the life of the process |
+| `test_an_upload_in_flight_does_not_hold_another_thread` (`:734`) | the gate is per thread: a second thread sends `200` while the first is blocked, and the blocked thread releases to `200` once its own upload lands |
+
+These are in the default hermetic run, so command 1's `335 passed` and command
+2's `412 passed` include them; the live-door module does not exercise the gate
+because its uploads all complete before any send.
+
+## Defects found by the run, and what closed them
+
+**Defect 1 — the Postgres twin of the durability suite asserted the
+pre-change baseline.**
+`tests/host/test_thread_attachment_durable_postgres.py`
+(`test_a_parsing_row_is_resumed_by_the_next_process`) expected
+`status == "parsing"` from an upload, and the first command-3 run answered:
 
 ```
 >       assert stack["service"].status(attachment_id).status == "parsing"
 E       AssertionError: assert 'uploaded' == 'parsing'
 ```
 
-The in-memory twin (`tests/host/test_thread_attachment_durable.py`) was updated
-by the change; its Postgres mirror was not. This is invisible in the default
-run because the file is `FIN_CHECKPOINT_URL`-gated, which is precisely the
-mechanism the ticket exists to exercise: **a red that only real storage can
-show.** Command 3 is that red. Not fixed here, per the assignment.
+The in-memory twin was updated by the change; its Postgres mirror was not. This
+is invisible in the default run because the file is `FIN_CHECKPOINT_URL`-gated,
+which is precisely the mechanism the ticket exists to exercise: **a red that only
+real storage can show.**
 
-**Defect 2 — the host half of the send gate is not delivered.**
-`grep -rn "attachment_upload_in_progress\|upload_in_flight\|UploadInProgress"
-src/` → no hits; the flag exists only under `web/src/`. But
+Closed by moving the premise, not the assertion. The case now drives a real
+`prepare()` and then tears the index down, so the row a new process must resume
+is a genuinely torn `parsing` row — the state that test exists to reach — and it
+still asserts `restarted.recover() == 1`. Nothing was deleted or weakened: with
+the old one-line premise the test would have passed for the wrong reason, and
+with a weakened assertion it would pass for no reason.
+
+**Defect 2 — the host half of the send gate was not delivered.**
+The first `grep -rn "attachment_upload_in_progress" src/` returned nothing; the
+flag existed only under `web/src/`. But
 `web/src/api.ts:711-713` states *"the host enforces the same condition, so a
 second tab cannot slip a send past a running upload"*, spec line 25 says *"The
 host enforces the same condition"*, and plan line 75 requires *"both composer
-and host block a send while any upload is pending"*. The enforcement is
-client-side only, so a second tab, a second browser, or any non-composer client
-can start a run while an upload is in flight. Spec success criteria 1 and 11
-are therefore only half met, and the `api.ts` docstring documents a guarantee
-the server does not give.
+and host block a send while any upload is pending"*. With enforcement only in
+the browser, a second tab, a second client, or a direct `POST /ask` could start a
+run while an upload was still writing its bytes.
+
+Closed by `AttachmentUploadInFlight` — see *The host-side gate*. The design
+question the previous version of this record left open (a pending-upload marker
+vs. a lease) resolved to a process-scoped counter rather than a stored flag,
+because "in flight" is a property of the request that is currently reading the
+body, not of the attachment row: the row does not exist until the bytes land, and
+a durable marker would need cleaning up after a crash that happened *before* it
+was written. The consequence, stated plainly: **the gate is per uvicorn
+process.** A `--workers N` deployment lets a send through on a worker that is not
+running the in-flight upload, which is why *Multi-worker deployment* stays under
+*Not covered*.
 
 ## Not covered by this record
 
@@ -299,7 +352,7 @@ the server does not give.
   process boundary; with the in-memory adapter, cross-process *byte* durability
   is impossible by construction, and this record does not pretend otherwise
   (`source_unavailable` after restart is the documented consequence,
-  `workspace_http.py:2130-2133`).
+  `workspace_http.py:2172-2176`).
 * **Multi-worker deployment.** One uvicorn process was booted, not the
   `--workers N` shape a real deployment uses.
 
@@ -328,38 +381,32 @@ real bucket.
 
 ## Leftovers
 
-1. **Defect 1** — update
-   `tests/host/test_thread_attachment_durable_postgres.py:134-141` to the
-   `uploaded` baseline (and re-check the rest of that file's expectations while
-   it is open). Owner: **T2b** (it is the ticket that changed the status the
-   file asserts). The fix is small; what matters is that the file stops being a
-   red that only shows up with `FIN_CHECKPOINT_URL` set.
-2. **Defect 2** — the host-side in-flight send gate: refuse a start/send while
-   an upload for that thread is pending, returning
-   `409 attachment_upload_in_progress`, and make `web/src/api.ts:711-713` true.
-   Owner: **T2b**, whose acceptance line 75 names both halves. It needs a
-   server-visible notion of "upload in flight", which the current
-   `uploaded → parsing` model does not carry, so the design question (a pending
-   upload marker vs. a lease) belongs to this ticket, not to T2f.
-3. **The durable byte adapter leg.** Owner: **T2d** (the `docling`/runtime and
+1. **The durable byte adapter leg.** Owner: **T2d** (the `docling`/runtime and
    deployment-configuration ticket) or the operator ticket that owns
    `FIN_OBJECT_STORE_URL`. It should re-run command 5 unchanged against a real
    bucket and add the cross-process byte read-back this one cannot make; the
    live module already drives `_build_default_attachment_service`, so only the
    environment is missing, not a harness.
-4. **The `uploaded → parsing → ready` product path across the same real door**
+2. **The `uploaded → parsing → ready` product path across the same real door**
    — including that `incomplete()` picks a torn `ready` up and that a resumed
    preparation rebuilds units and postings. Owner: **T2f**.
-5. **Per-run recording of page count, vision calls, usage/cost, latency and the
+3. **The gate's process scope.** `AttachmentUploadInFlight` counts uploads in the
+   process that received them, so a `--workers N` or multi-replica deployment has
+   a window the host does not close. Owner: the ticket that moves the counter
+   into shared state (a Postgres advisory lock or a row on the thread would both
+   do); until then the deployment is single-process or accepts the window.
+   Recorded here rather than fixed because the storage shape is a door the whole
+   run-control surface shares.
+4. **Per-run recording of page count, vision calls, usage/cost, latency and the
    4 GB resource peak** at a real preparation, which T2a priced but nobody has
    produced from the product. Owner: **T2e**.
-6. **No attachment-count limit exists**; the one-large-filing guidance is now in
+5. **No attachment-count limit exists**; the one-large-filing guidance is now in
    the composer copy (T2a *Leftovers* 3 → delivered, see *Web-side gates*), but
    a turn that carries two max-size filings is still only refused late, by the
    vision budget, once preparation runs. Whether that deserves a door-side rule
    is an open product call. Owner: **T2e** (first ticket with a real call
    budget to enforce) with the decision recorded before the caps ship.
-7. **Command 14's whole-suite figure is a wall-clock number from one host** and
-   moves with load (the containment pair measured 18.30 s then 23.37 s across
+6. **Command 14's whole-suite figure is a wall-clock number from one host** and
+   moves with load (the containment pair measured 18.30 s then 19.20 s across
    two runs in this session). Owner: none — recorded so a later reader does not
    treat a timing in this document as an assertion.
