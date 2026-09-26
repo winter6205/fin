@@ -21,13 +21,13 @@ Operator confirmed map G1–G4, then corrected boot: code default OFF, this chec
 
 ## Objective
 
-Give the operator **cross-session private memory** on the existing **workspace** knowledge-base Agent: atomic **memory facts**, two-layer **user profile**, a short **memory existence pointer** in system, and at most three lexical **memory hooks** on the user side — without turning memory into a second company corpus or into citation evidence.
+Give the operator **cross-session private memory** on the existing **workspace** **knowledge-QA** agent: atomic **memory facts**, two-layer **user profile**, a short **memory existence pointer** in system, and at most three lexical **memory hooks** on the user side — without turning memory into a second company corpus or into citation evidence.
 
 Success is: relevant habits persist across threads; unrelated turns inject no memory catalog; research-track numbers still come only from retrieve/`read_file` + the **citation verifier**; default pytest stays retrieve-only.
 
 Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 
-- **fin**: A **workspace** knowledge-base Agent: the operator asks in a **research thread**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held SEC filings; retrieve ranking stays off-graph behind the **retrieve port**.
+- **fin**: A **workspace** **knowledge-QA** entry point (the 入口, not the 库): the operator asks in a **research thread**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held SEC filings; retrieve ranking stays off-graph behind the **retrieve port**.
 - **memory port**: The only dependency fin is allowed for switchable session/buffer memory (extract, recall, GC, dream): port in, typed results out. Boot default is **OFF**; this checkout turns it **ON** in project env so local evals see auto-extract and **memory prefetch**; default pytest stays **OFF** even when that env is set (ADR 0035, ADR 0048).
 - **memory fact**: One atomic cross-session note from a single extract or explicit save: title plus body. The first non-empty body line is the **memory hook**. It is not a filing claim.
 - **memory hook**: The ≤80-character first body line of a **memory fact**; the only payload **memory prefetch** injects.
@@ -77,7 +77,7 @@ Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
   - Multi-account user profiles.
   - Changing retrieve ranking, citation span rules, or Soft-Track track names.
   - iknow-memory / sibling coding-agent code.
-  - Closing the wayfinder program.
+  - Closing the GitHub program map.
 
 ## Success Criteria
 
@@ -120,7 +120,7 @@ Each line is binary. Default `uv run pytest -q` stays green with no live SEC and
 
 ## Inherits / Changes
 
-**Inherits:** Soft-Track ADR 0027; **retrieve port** ADR 0032 / 0045 / 0046; **session compaction** ADR 0044; Postgres checkpointer ADR 0015; **memory port** seam and `fin_memory` / `fin_memory_dream_cursor` tables; `FIN_MEMORY_ENABLED` / `FIN_MEMORY_DREAM_BACKEND` env names; `OffMemoryAdapter`; `uv run pytest -q`; map [公司操作者跨会话私人记忆](../docs/wayfinder/cross-session-operator-memory-map.md); `docs/guides/prompt-development.md`.
+**Inherits:** Soft-Track ADR 0027; **retrieve port** ADR 0032 / 0045 / 0046; **session compaction** ADR 0044; Postgres checkpointer ADR 0015; **memory port** seam and `fin_memory` / `fin_memory_dream_cursor` tables; `FIN_MEMORY_ENABLED` / `FIN_MEMORY_DREAM_BACKEND` env names; `OffMemoryAdapter`; `uv run pytest -q`; the map G1–G4 decisions recorded in the Assumption gate above; `docs/guides/prompt-development.md`.
 
 **Changes this spec adds:** code boot OFF + this-checkout env ON; fact+hook prefetch; existence pointer only in system; two-layer **user profile** files; graph tools = save / recall / edit profile; gated auto-extract N=3 cap 1; dream local merge with 24h + threshold, no MCP write, no per-turn SSE; gold set as acceptance; supersedes remaining MDP T5/T6 product wiring and `specs/memory-dream.md` MCP/SSE clauses.
 
@@ -147,4 +147,4 @@ Affected surfaces (declared):
 - `src/fin/host/` — memory port default, store/fact shape, prefetch assembly, graph tools, extract gate, dream trigger, SSE wiring
 - `tests/host/` — default-OFF pytest, ON gold / memory cases
 - `specs/memory-dialogue-platform.md`, `specs/memory-dream.md`, `plans/memory-dialogue-platform.md` — supersede pointers only
-- `docs/wayfinder/cross-session-operator-memory-map.md` — spec/plan pointer
+- `plans/cross-session-operator-memory.md` — spec/plan pointer

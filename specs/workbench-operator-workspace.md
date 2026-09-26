@@ -4,7 +4,7 @@
 
 Operator confirmed the program in-thread (issue the tracked change as Focus 5, not as the first knife). Amendment 2026-09-06 confirmed via Wave A freeze: one global default 工作区; no `workspaces/<slug>`; no left-rail 指定/新建. These are in force:
 
-1. Product is **fin**, an enterprise knowledge-base Agent. Product copy and identity must not call fin a research agent. SEC filings are the first corpus seed, not the product name (the tracked change).
+1. Product is **fin**, an enterprise **knowledge-QA** entry point (the 入口, not the 库; [ADR 0090](../docs/adr/0090-product-identity-knowledge-qa-entry-point.md)). Product copy and identity must not call fin a research agent. SEC filings are the first corpus seed, not the product name (the tracked change).
 2. Three names, one each: **工作台** = the local web UI; **工作区** = the one global default directory `$HOME/.fin/default`; **知识库** = the one shared corpus behind retrieve / `list_files` / ingest. There is no sidebar control that creates a 工作区 or a second 知识库.
 3. Every **research thread** lives in that one 工作区. Multiplicity is threads, not filesystem folders. No left rail 指定/新建. No `$HOME/.fin/workspaces/<slug>`. Future many-libraries / tenants / collections is out of this spec.
 4. Do not add `fin_thread.project_root` as a product column. Do not scope `GET /api/threads` by directory. In-flight Wave A T3 WIP that added per-thread roots is discarded, not completed.
@@ -25,7 +25,7 @@ The operator uses the **工作台**: new dialogue and the thread list are one pr
 
 Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 
-- **fin**: An enterprise knowledge-base Agent: the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **grounded** track. First corpus is operator-held filings behind the **retrieve port**.
+- **fin**: An enterprise **knowledge-QA** agent (the 入口, not the 库): the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **grounded** track. First corpus is operator-held filings behind the **retrieve port**.
 - **工作台**: The local web UI: create, list, open, resume, and delete a **research thread**; **thinking fold**s and **tool fold**s stream then collapse; citations sit on the assistant turn.
 - **工作区**: The one global default operator directory `$HOME/.fin/default` (created if missing). Every **research thread**, profile read, and **memory fact** workspace key uses this path.
 - **知识库**: The one process-wide corpus (catalog, ingest tree, **retrieve port**) shared by every **research thread**.
@@ -46,7 +46,7 @@ Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 - **Does:**
 
   **Focus 1 — 钉词**
-  - Persist glossary so **fin** is the enterprise knowledge-base Agent, **工作台** is the UI, **工作区** is the one default directory, **知识库** is the one shared corpus. README one-liner matches. `docs/guides/prompt-development.md` three-layer table names identity / soul / usage / **user profile**, and states the corpus listing does not enter the system prefix.
+  - Persist glossary so **fin** is the enterprise **knowledge-QA** entry point, **工作台** is the UI, **工作区** is the one default directory, **知识库** is the one shared corpus. README one-liner matches. `docs/guides/prompt-development.md` three-layer table names identity / soul / usage / **user profile**, and states the corpus listing does not enter the system prefix.
 
   **Focus 2 — 钉根**
   - Product boot resolves **工作区** to `$HOME/.fin/default` (mkdir). Never `Path.cwd()`. Helper takes an explicit `home` (tests inject). T2 already shipped this plus a multi-root registry (`known_roots.json`, `/api/workspaces` list/bind/create, `$HOME/.fin/workspaces/<slug>`). Remaining work **unships** those multi-root surfaces; it keeps `default_workspace_root`. The SPA does not grow a left rail.
@@ -60,7 +60,7 @@ Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
   - `GET /api/corpus`, ingest doors (ADR 0047), and `list_files` stay one 知识库 for the process. Empty catalog is empty (no fallback to a hardcoded 12-filing SEC list). Repo `data/corpus/` may seed the first-run library; it is not identity text.
 
   **Focus 5 — 钉说明书** (the tracked change)
-  - Split host prompts: identity (Name / Kind = fin, enterprise knowledge-base Agent) → soul (how to speak / refuse; parametric memory is not evidence) → usage (tool _choice_ and citation _behavior_ per **track**) → **user profile** → **memory existence pointer**.
+  - Split host prompts: identity (Name / Kind = fin, enterprise **knowledge-QA** agent — the 入口, not the 库) → soul (how to speak / refuse; parametric memory is not evidence) → usage (tool _choice_ and citation _behavior_ per **track**) → **user profile** → **memory existence pointer**.
   - Identity does not name 10-Q, frozen-12, `cwd`, or “`$HOME/.fin` is the home of sessions”. Usage may say answers are grounded in this 知识库 via tools. Clarify options are not a hardcoded AAPL/MSFT/AMZN quarter list in all four prompts; research usage does not restate `page_limit` or “32 or more characters”.
   - Fixtures first, then copy (`docs/guides/prompt-development.md`). Adjacent turns in one thread: system prefix deep-equal (profile block may change if the file changed; identity/soul/usage/pointer bytes do not). Existing prompt tests re-pin.
 

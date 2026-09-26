@@ -27,9 +27,8 @@ producer, the verdict file records the code, and — the assertion the
 whole feature exists for — conversation entry is NOT refused with
 `knowledge_mcp_fault` afterwards.
 
-NOT proven here: the cold-boot `fault` race (R1 in
-`docs/wayfinder/operator-cold-start-acceptance-map.md`: the boot probe's
-2s budget vs a cold handshake ≥~2s). A cold boot legitimately reports
+NOT proven here: the cold-boot `fault` race — the boot probe's 2s budget
+vs a cold handshake ≥~2s. A cold boot legitimately reports
 `fault` and the documented remedy is a warm restart; asserting
 `reachable` on a cold machine would encode a race as a contract. This
 module waits for the infra to be healthy before it serves, which is the

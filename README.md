@@ -1,8 +1,8 @@
 # fin
 
-**Enterprise knowledge-base Agent** (企业知识库 Agent): the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **grounded** track. The first corpus is operator-held filings behind the **retrieve port** — a **source**, not the product. Citation checks run in code; LangGraph is the durable runtime (checkpoint / resume), not a retrieve-then-generate flowchart.
+**Enterprise knowledge-QA agent** (企业知识问答助手) — the 入口, not the 库: the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **grounded** track. The first corpus is operator-held filings behind the **retrieve port** — a **source**, not the product. Citation checks run in code; LangGraph is the durable runtime (checkpoint / resume), not a retrieve-then-generate flowchart.
 
-Product identity is SSOT'd in [`docs/CONTEXT.md`](docs/CONTEXT.md); the program contract is [`specs/enterprise-kb-agent.md`](specs/enterprise-kb-agent.md), mapped by wayfinder.
+Product identity is SSOT'd in [`docs/CONTEXT.md`](docs/CONTEXT.md) and ruled in [ADR 0090](docs/adr/0090-product-identity-knowledge-qa-entry-point.md); the program contract is [`specs/enterprise-kb-agent.md`](specs/enterprise-kb-agent.md), mapped by wayfinder.
 
 This repository is the SSOT. Do not keep parallel copies under `projects/test`.
 
@@ -11,30 +11,30 @@ This repository is the SSOT. Do not keep parallel copies under `projects/test`.
 | Path                                                     | What                                                                                 |
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------ |
 | `docs/CONTEXT.md`                                        | Domain terms **and product identity** (SSOT)                                         |
-| `docs/adr/`                                              | Accepted decisions (0001–0027)                                                       |
-| `specs/enterprise-kb-agent.md`                           | Program contract: the five foci of the knowledge-base Agent                          |
-| `docs/research/README.md`                                | Research folder gate — identity is CONTEXT, not 003–009                              |
-| `docs/research/002-demo-corpus-and-evidence-contract.md` | Inherited corpus/evidence contract (snapshot from iknow wayfinder)                   |
-| `docs/research/archive/2026-08-sec-research-workbench/`  | Archived 2026-08 「SEC 财报研究工作台」research — **not** current identity           |
-| `data/corpus/pdf/`                                       | Frozen 12 SEC 10-Q PDFs (AAPL, MSFT, AMZN)                                           |
+| `docs/adr/`                                              | Accepted decisions (0001–0090)                                                       |
+| `docs/adr/0003-v1-inherits-002-thin-slice.md`            | Inherited corpus/evidence contract — page-level citations, refuse-when-missing       |
+| `specs/enterprise-kb-agent.md`                           | Program contract: the five foci of the knowledge-QA agent                            |
+| `data/corpus/pdf/`                                       | Frozen 12 SEC 10-Q PDFs (AAPL, MSFT, AMZN) plus a local GOOG `10-K` fixture          |
 | `data/corpus/manifest.json`                              | document_id, periods, sha256, upstream commit                                        |
 | `data/upstream/`                                         | private fixture source LICENSE, sec-10-q README, `qna_data.csv` (upstream QA; not the v1 gold set) |
 
 Upstream freeze: [docugami/private fixture source](https://github.com/docugami/private fixture source) `547f132`. Packaging license is MIT; filings are public 10-Qs.
 
+The archived 2026-08 「SEC 财报研究工作台」 research is session-only — git-ignored by design, so it is absent from a clone — and is **not** fin's current identity; [ADR 0090](docs/adr/0090-product-identity-knowledge-qa-entry-point.md) is the tracked ruling.
+
 ## Status
 
 v1 host-agent ships: ingest artifacts are in git; CLI (`python -m fin`) and HTTP `POST /ask` share one compiled host graph. Default model is `MiniMax-M3` via `FIN_MODEL` + official MiniMax Chat Completions `FIN_BASE_URL` (ADR 0022). Soft-Track (ADR 0027, that pull request) routes each turn to `dialogue` / `clarify` / `off_topic` / `grounded`; only the grounded track binds tools and the citation verifier. Opt-in contracts: `uv run pytest -q -m soft_track`.
 
-**NOW (2026-08-30):** the destination is **fin as an enterprise knowledge-base Agent** — wayfinder, contracted by `specs/enterprise-kb-agent.md` in five foci:
+**NOW (2026-08-30):** the destination is **fin as an enterprise knowledge-QA agent** — wayfinder, contracted by `specs/enterprise-kb-agent.md` in five foci:
 
 1. **Grounded answers in the workspace** — comparisons and numbers come from host tools, not free-prose tables; the citation verifier still gates any prose answer.
-2. **Operable corpus on Corpus 首页** — grow the library past the frozen 12 (`10-K`, `8-K`, more issuers) through `list_files` filters and ingest.
+2. **Operable corpus on Corpus 首页** — grow the library past the frozen 12 — a local GOOG `10-K` fixture is the first such addition, then `8-K`, more issuers — through `list_files` filters and ingest.
 3. **Work after the answer** — watchlist, in-app notices, comparison / citation export, stop.
 4. **Multi-issuer synthesize** — fan out in the host graph, then synthesize; every surviving claim still passes the verifier; over-cap is a typed overflow.
 5. **Trust in the workspace** — `evidence_locators` persisted on the run row, `GET /health`, and the eval count command.
 
-The **工作台** web UI is the only product entry; SEC filings are the first corpus, not the product name. the tracked change and the tracked change stay useful as **workstream** notes (vertical slice, quality loop) and are superseded as the product destination. Naming rule from the tracked change: the internal track enum is `grounded` (ADR 0061); product copy and `docs/CONTEXT.md` must not call fin a research agent. Opt-in eval: `uv run pytest -q -m eval` (9 gold cases).
+The **工作台** web UI is the only product entry; SEC filings are the first corpus, not the product name. the tracked change and the tracked change stay useful as **workstream** notes (vertical slice, quality loop) and are superseded as the product destination. Naming rule from [ADR 0090](docs/adr/0090-product-identity-knowledge-qa-entry-point.md): the internal track enum is `grounded` (ADR 0061); product copy and `docs/CONTEXT.md` must not call fin a research agent. Opt-in eval: `uv run pytest -q -m eval` (9 gold cases).
 
 ## Running the workspace server (T1)
 

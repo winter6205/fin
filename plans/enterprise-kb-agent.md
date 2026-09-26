@@ -1,6 +1,6 @@
 # Plan: enterprise-kb-agent
 
-**Goal:** 操作者只在 **workspace** 里把 fin 当企业知识库 Agent 用：问得到带引用的答案、库能看能扩、问完能盯/导出/停、多家合成仍过 citation gate、每轮可审计且进程健康。
+**Goal:** 操作者只在 **workspace** 里把 fin 当企业知识问答入口用（**knowledge-QA** entry point，不是知识库；`docs/CONTEXT.md` **fin**、ADR 0090）：问得到带引用的答案、库能看能扩、问完能盯/导出/停、多家合成仍过 citation gate、每轮可审计且进程健康。
 **Approach:** 粗颗粒度五波，对齐 spec 五个 Focus：Trust 与 Corpus 不互相阻塞；Grounded answers 可与它们并行；Workflow 的导出依赖对比工具；Fan-out 先接受 ADR 0034 再改 **host graph**。每波一条可演示竖切（API + UI 如需要 + 测试）。默认 `uv run pytest -q` 不碰 live SEC / live memory。BM25 保持归档（ADR 0032）。
 **Spec link:** `specs/enterprise-kb-agent.md`
 **Map:** fin wayfinder: enterprise knowledge-base Agent

@@ -1,12 +1,12 @@
 # Spec: enterprise-kb-agent
 
-> **Identity banner (2026-09-06):** this file is still the program contract (enterprise knowledge-base Agent). Do not replace it with archived `docs/research/006-enterprise-feature-spec.md` (SEC 财报研究工作台). Frozen-12 SEC is the first corpus seed, not the product name. Current glossary: [`docs/CONTEXT.md`](../docs/CONTEXT.md).
+> **Identity banner (2026-09-06; wording ruled by [ADR 0090](../docs/adr/0090-product-identity-knowledge-qa-entry-point.md)):** this file is still the program contract, and **fin** in it is the enterprise **knowledge-QA** entry point — the 入口 that answers from the corpus behind the **retrieve port**, not a knowledge base. Do not replace it with the archived 2026-08 SEC-research feature spec (SEC 财报研究工作台). Frozen-12 SEC is the first corpus seed, not the product name. Current glossary: [`docs/CONTEXT.md`](../docs/CONTEXT.md).
 
 ## Assumption gate (confirmed 2026-08-27)
 
 Operator waived per-item grilling (`/spec-driven-development` + prior thread). These are in force:
 
-1. Product is an enterprise knowledge-base Agent; the **workspace** web UI is the only product entry.
+1. Product is an enterprise **knowledge-QA** entry point, not a knowledge base; the **workspace** web UI is the only product entry.
 2. First knowledge corpus is SEC filings (expand in-repo; do not wait on another store).
 3. Same compiled **host graph** as CLI / `POST /ask`; local no-auth `fin-serve` unchanged.
 4. **citation verifier** stays a code gate; retrieve ranking stays behind the **retrieve port** (ADR 0032).
@@ -14,13 +14,13 @@ Operator waived per-item grilling (`/spec-driven-development` + prior thread). T
 
 ## Objective
 
-Ship **fin** on the existing **workspace** so an operator can treat it as a knowledge-base Agent: ask in the thread, get answers grounded in the corpus with citations, grow and operate that corpus, continue work after the answer (watch, export, stop), and see that runs are auditable and the process is healthy.
+Ship **fin** on the existing **workspace** as the operator's **knowledge-QA** entry point: ask in the thread, get answers grounded in the corpus with citations, grow and operate that corpus, continue work after the answer (watch, export, stop), and see that runs are auditable and the process is healthy.
 
 Success is: each Does focus below has binary checks that later wave plans can take as their Acceptance; the operator never leaves the workspace to use those capabilities.
 
 Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 
-- **fin**: A **workspace** knowledge-base Agent: the operator asks in a **research thread**; each turn is a **track**; tools and the **citation verifier** bind only to the **grounded** track. First corpus is operator-held SEC filings; retrieve ranking stays off-graph behind the **retrieve port**.
+- **fin**: A **workspace** **knowledge-QA** entry point (the 入口, not the 库): the operator asks in a **research thread**; each turn is a **track**; tools and the **citation verifier** bind only to the **grounded** track. First corpus is operator-held SEC filings; retrieve ranking stays off-graph behind the **retrieve port**.
 - **workspace**: A local web UI server: create, list, open, resume, and delete a research thread; **thinking fold** and **tool fold** stream then collapse (`specs/turn-trace-folds.md`); citations sit on the assistant turn (inline chips plus a sources list); research turns may show a light track hint without a mode picker. Streaming HTTP is that UI's transport on the same compiled graph; GET history is turn rows; thinking on/off is the model `extra_body.thinking` knob; crash resume continues the in-flight run from the last complete host-graph node.
 - **research thread**: The product conversation: one `thread_id` the operator talks in; each question is a run that may be any **track**; follow-ups keep full messages, citations when present, and status-snapshot history. This is how fin is used after v1; it is not a one-shot `/ask` demo.
 - **citation verifier**: A code gate on the **grounded** track path to END: a supporting span is a contiguous substring of the answer (v1 minimum 32 characters) that appears in a frozen locator unit this run retrieved or read. Passed spans become the user-visible citations; unknown locators refuse immediately; missing or unmatched spans bounce with a hidden template until the citation-repair cap, then refuse. Other tracks skip this gate.
@@ -88,7 +88,7 @@ Each line is binary. Wave plans map 1:1 onto a subset; default `uv run pytest -q
 
 ## Inherits / Changes
 
-**Inherits:** Python 3.12 + uv + pytest; slices `src/fin/corpus/`, `src/fin/retrieve/`, `src/fin/host/`, SPA `web/`; ScriptedChatModel + InMemorySaver default tests; marks `soft_track`, `eval`, `mcp` stay opt-in; typed EXITs `retrieve_unavailable`, `unknown_locator`, `{chunks: []}`, `{filings: []}`, 409 `{error: concurrent_run}`, 503 `{error: ingest_missing}`; ADR 0013 one compiled graph; ADR 0021 citations from verifier; ADR 0023–0026 workspace conversation; ADR 0027 Soft-Track; ADR 0032 retrieve adapter MCP client + Fake pytest; ADR 0033 `/api/status` boot-scoped (no `%` context window on that route). Prior specs: `specs/workspace.md`, `specs/soft-track.md`, `specs/s1-corpus-retrieve.md`, `specs/vertical-slice-hardening.md`. Map: fin wayfinder: enterprise knowledge-base Agent.
+**Inherits:** Python 3.12 + uv + pytest; slices `src/fin/corpus/`, `src/fin/retrieve/`, `src/fin/host/`, SPA `web/`; ScriptedChatModel + InMemorySaver default tests; marks `soft_track`, `eval`, `mcp` stay opt-in; typed EXITs `retrieve_unavailable`, `unknown_locator`, `{chunks: []}`, `{filings: []}`, 409 `{error: concurrent_run}`, 503 `{error: ingest_missing}`; ADR 0013 one compiled graph; ADR 0021 citations from verifier; ADR 0023–0026 workspace conversation; ADR 0027 Soft-Track; ADR 0032 retrieve adapter MCP client + Fake pytest; ADR 0033 `/api/status` boot-scoped (no `%` context window on that route). Prior specs: `specs/workspace.md`, `specs/soft-track.md`, `specs/s1-corpus-retrieve.md`, `specs/vertical-slice-hardening.md`. Map: wayfinder.
 
 **Changes this spec adds:** comparison / watchlist / stop / export / multi-issuer fan-out / corpus form expansion / `evidence_locators` / `GET /health` / eval count command — all on the **workspace** + **host graph** + **corpus** slices. `POST /ask` stays eval adapter (sync `invoke`).
 

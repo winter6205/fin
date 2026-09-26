@@ -41,7 +41,7 @@ minimal-change-verifier: yes — discard uncommitted T3 project_root WIP; remain
    - Status: [ ] pending
 
 2. **Split identity / soul / usage for all four tracks** — tag: `[implementation]`
-   - **Inherits:** spec SC10–SC12; identity = **fin** enterprise knowledge-base Agent; soul = how to speak/refuse + parametric memory is not evidence; usage = tool choice + citation _behavior_ per **track**; pointer stays last.
+   - **Inherits:** spec SC10–SC12; identity = **fin** as the enterprise **knowledge-QA** entry point, not a knowledge base (`docs/CONTEXT.md` **fin**; ruling in ADR 0090); soul = how to speak/refuse + parametric memory is not evidence; usage = tool choice + citation _behavior_ per **track**; pointer stays last.
    - **Surface:** host agent instructions
    - **Acceptance:** research prefix has no `12 SEC`, no `page_limit is capped at 3`, no `32 or more characters`; `messages_for_model` research head is identity then soul then usage; dialogue / off_topic / clarify reuse the same identity/soul bytes and differ only in usage. T1 fixtures go green.
    - Status: [ ] pending

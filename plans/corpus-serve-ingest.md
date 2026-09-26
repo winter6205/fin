@@ -47,7 +47,7 @@ minimal-change-verifier: yes — one logical program, not one commit; writing-pl
    - **Inherits:** spec Focus 1；CONTEXT **list_files**。
    - **Surface:** host catalog + tests
    - **Acceptance:** catalog empty/miss is `filings: []` without requiring a serve-time HTML tree SSOT; `uv run pytest -q` exits 0。
-   - **Completion:** whether catalog is MCP list vs host metadata table open — resolved: host metadata table `data/corpus/catalog.json`（iknow-memory 无 list 类 MCP 端点，见 docs/handoff/2026-09-05-status.md）；写侧 seam `fin.corpus.catalog.record_filings`（document_id+version upsert）留给 T3 接线。
+   - **Completion:** whether catalog is MCP list vs host metadata table open — resolved: host metadata table `data/corpus/catalog.json`（定稿文字见 `src/fin/corpus/catalog.py` 模块 docstring 首段，引用 ADR 0047）；「iknow-memory 无 list 类 MCP 端点」一侧的既有记录见 `plans/first-closed-loop.md` bullet 4 的 Reach limitation（**none returns a collection identity or a source list**）；写侧 seam `fin.corpus.catalog.record_filings`（document_id+version upsert）留给 T3 接线。
    - Status: [x]
    - [blocks: T1]
 

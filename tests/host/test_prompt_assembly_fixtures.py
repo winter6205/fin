@@ -160,7 +160,7 @@ def test_track_prompts_share_identity_soul_bytes() -> None:
 def test_identity_is_not_a_research_agent() -> None:
     """SC10 / CONTEXT **agent identity** _Avoid_: fin is not a research agent.
 
-    fin is an enterprise knowledge-base Agent; ``grounded`` names a
+    fin is an enterprise knowledge-QA agent; ``grounded`` names a
     **track**, never the product kind.
     """
     assert "research agent" not in HOST_SYSTEM_PROMPT

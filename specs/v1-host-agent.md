@@ -1,6 +1,6 @@
 # Spec: v1 host agent
 
-> **Identity banner (2026-09-06):** this spec is the frozen **v1 host-agent contract**, not current product identity. Quoted **fin** = 「bounded 10-Q research agent」is the v1 slice. Current **fin** SSOT: [`docs/CONTEXT.md`](../docs/CONTEXT.md) (enterprise knowledge-base Agent). Do not copy that quoted line into new product copy.
+> **Identity banner (2026-09-06):** this spec is the frozen **v1 host-agent contract**, not current product identity. Quoted **fin** = 「bounded 10-Q research agent」is the v1 slice. Current **fin** SSOT: [`docs/CONTEXT.md`](../docs/CONTEXT.md) — enterprise **knowledge-QA** agent (知识问答助手), the 入口, not the 库 ([ADR 0090](../docs/adr/0090-product-identity-knowledge-qa-entry-point.md)). Do not copy that quoted line into new product copy.
 
 ## Objective
 

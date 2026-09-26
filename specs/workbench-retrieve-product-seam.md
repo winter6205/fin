@@ -1,7 +1,7 @@
 # Spec: workbench retrieve product seam
 
 > **Status:** assumption gate confirmed in-thread 2026-09-13 (10 items).
-> **Map:** [`docs/wayfinder/workbench-retrieve-product-seam-map.md`](../docs/wayfinder/workbench-retrieve-product-seam-map.md) (图 1；grilling G1/G2/G3/R1 closed).
+> **Map:** 图 1 grilling G1/G2/G3/R1 closed 2026-09-13 — the decisions are the Confirmed assumptions (gate) below and [ADR 0051](../docs/adr/0051-knowledge-mcp-conversation-gate.md).
 > **Sequence:** this spec → `architecture-change-reviewer` (all-yes 2026-09-13) → persist → `writing-plans`. Plan: `plans/workbench-retrieve-product-seam.md`.
 
 ## Objective
@@ -14,7 +14,7 @@ Product runtime has one retrieve path: **工作台** session plus **retrieve por
 
 Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 
-- **fin**: An enterprise knowledge-base Agent: the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held filings behind the **retrieve port**.
+- **fin**: An enterprise **knowledge-QA** agent (the 入口, not the 库): the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held filings behind the **retrieve port**.
 - **工作台**: The local web UI: chrome is **知识库** / **监控**; **research thread**s live in a 会话 list, not a 对话 nav; create, list, open, resume, and delete a **research thread**; **thinking fold**s and **tool fold**s stream then collapse; citations sit on the assistant turn.
 - **retrieve port**: The only retrieve dependency fin is allowed to have: `query` (+ optional filters) in, ranked chunks with `source_ref` out — MCP-shaped, transport-agnostic.
 - **retrieve adapter**: The implementation behind the retrieve port. Default pytest uses a Fake port. When configured, product retrieve is an MCP 2.0 client (protocol-testable against a compliant public or fixture server); hits map to fin locators as `source_ref` and their returned text is serve-time citation evidence (ADR 0046).
@@ -33,7 +33,7 @@ Chrome sentences for **工作台** / **知识库** / **监控** / **Corpus 首�
 6. Deep links `/kb` and `/monitor` are **404** (no 302 to dashboard, no silent `/`). Sidebar has no 「知识库」 or 「监控」 items. Watchlist / 重连 / Fake 「演示搜索」 copy leave the product surface.
 7. Left corner reports MCP three-state only (not dashboard HTTP, not model, not corpus count). Icon / expand copy are **not** pinned; three-state semantics still tested.
 8. Fake only via existing explicit flags (`FIN_RETRIEVE_ADAPTER=fake`, `FIN_SCRIPTED_MODEL`). Product default must not point at Fake.
-9. No change to retrieve envelope, **切分** ownership, citation verifier, **memory port**, ingest push shape (`specs/operator-console-host-contract.md`). Dashboard/中台 upload stays the tracked change. fin does not add a discovery door to those UIs.
+9. No change to retrieve envelope, **切分** ownership, citation verifier, **memory port**, ingest push shape (`specs/operator-console-host-contract.md`). Dashboard/中台 upload stays in iknow-memory. fin does not add a discovery door to those UIs.
 10. After ACR, persist amends CONTEXT **工作台** / **知识库** / **监控** / **Corpus 首页**, ADR 0050, ADR 0033 probe/render; add glossary 资料 / fin=入口 / iknow=库 if still missing.
 
 ## Boundaries

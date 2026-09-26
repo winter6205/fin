@@ -18,7 +18,7 @@ Operator confirmed the numbered gate in-thread (`/spec-driven-development`). The
 10. Thumbs up/down land in Postgres; they do not directly change the verifier or retrieve ranking; training-set export is Out / future unless a wave explicitly adds it.
 11. Includes Postgres connection pooling, optional Redis queue/rate-limit skeleton, and minimal observability (latency / refuse counts visible — not the third-party 300ms/800ms hard SLA).
 12. Agent rewrite / empty-hit retry is a **tool-loop enhancement**, not a fixed retrieve pipeline.
-13. `#141` / Soft-Track / workspace stream baseline are **Inherits**.
+13. Soft-Track / workspace stream baseline are **Inherits**.
 
 ## Objective
 
@@ -28,7 +28,7 @@ Success is: each Does focus below has binary checks that later wave plans can ta
 
 Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 
-- **fin**: A **workspace** knowledge-base Agent: the operator asks in a **research thread**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held SEC filings; retrieve ranking stays off-graph behind the **retrieve port**.
+- **fin**: A **workspace** **knowledge-QA** entry point (the 入口, not the 库): the operator asks in a **research thread**; each turn is a **track**; tools and the **citation verifier** bind only to the **research track**. First corpus is operator-held SEC filings; retrieve ranking stays off-graph behind the **retrieve port**.
 - **host agent**: fin as the LangGraph runtime that routes tracks and calls research tools behind the **retrieve port**; it is not the ranking or vector store.
 - **Soft-Track**: The v1 turn-orchestration shape: one compiled host graph, multi-track routing, tiered track decision (rules → ambiguous LLM → inherit → grounded clarify → conditional policy), flat graph until upgrade triggers in ADR 0027.
 - **status snapshot**: One append-only per-turn record of research working context (e.g. company, period, document ids, active track cues) stored on `AgentState` in the checkpointer. History is retained; the latest snapshot is the active view for routing; dependent fields may be empty on a new snapshot.

@@ -4,7 +4,7 @@
 **Approach:** Expand host keys and copy beside `B`/`C`; normalize former letters before the port; then the port only forwards the new closed set. Assignment cookbook stays in search-mode-host / Soft-Track plans. Do not land port-only `graph`/`global` before iknow expand accepts those tokens.
 **Spec link:** `specs/search-mode-graph-global.md`
 **Sibling plan:** [`../../iknow-memory/plans/search-mode-graph-global.md`](../../iknow-memory/plans/search-mode-graph-global.md)
-**Jev 档灰区（不在本文件）：** [`../docs/handoff/host-jev-choice.md`](../docs/handoff/host-jev-choice.md) T4–T5。本文件只改 wire token / copy。T2 勾完才允许那份 T4。
+**Jev 档灰区（不在本文件）：** 由 [ADR 0081](../docs/adr/0081-search-mode-gray-zone-jev-choice.md) 裁定——**grounded** 之后的 ambiguous 档层是闭集 **Jev** Choice，默认 pytest 注入 Fake Choice，落地必带一条 live Jev 项；阶段标注见 `docs/CONTEXT.md` **检索档**。本文件只改 wire token / copy。原先挂在会话本地笔记上的那份 T4–T5 排期不入库，"T2 勾完才允许那份 T4"的门禁随之失效。
 **ACR:** all-yes (from spec)
 
 bounded-context-guardian: yes — one retrieve port + host copy/cascade tokens; ranking remains iknow; no four retrieve tools.
