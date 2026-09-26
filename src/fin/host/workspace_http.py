@@ -152,6 +152,7 @@ import re
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Iterator, Literal
@@ -1913,7 +1914,7 @@ class AttachmentUploadInFlight:
 
     The gate's truth is server-side and narrow: an upload is in flight
     from the moment the attach door starts reading its body until the
-    durable record exists. Counted per thread, so a pending file the
+    record exists. Counted per thread, so a pending file the
     message never names still holds its own thread. The counts live in
     this process only, which is what the single-operator 工作台 on one
     server process needs; a multi-worker deployment would need shared
@@ -1921,18 +1922,37 @@ class AttachmentUploadInFlight:
 
     Why the lock: an upload can be mid-body on one request thread while
     a send is being checked on another.
+
+    EXIT: one process holds the counts, so a send that lands on a second
+    worker would not see an upload the first is still storing. The
+    工作台 runs one uvicorn process; sharing state is a prerequisite of
+    adding a second worker, not a gap in this gate.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._counts: dict[str, int] = {}
 
-    def enter(self, thread_id: str) -> None:
+    @contextmanager
+    def hold(self, thread_id: str) -> Iterator[None]:
+        """Close ``thread_id``'s send gate for the duration of one upload.
+
+        A context manager rather than public ``enter`` / ``exit`` calls:
+        every door path — stored, refused, failed, client gone — must
+        release, and ``with`` is the only spelling that cannot forget one.
+        """
+        self._enter(thread_id)
+        try:
+            yield
+        finally:
+            self._exit(thread_id)
+
+    def _enter(self, thread_id: str) -> None:
         """Open the gate for ``thread_id`` for the duration of one upload."""
         with self._lock:
             self._counts[thread_id] = self._counts.get(thread_id, 0) + 1
 
-    def exit(self, thread_id: str) -> None:
+    def _exit(self, thread_id: str) -> None:
         """Hand the thread back; the last upload out clears its entry."""
         with self._lock:
             left = self._counts.get(thread_id, 0) - 1
@@ -2535,6 +2555,13 @@ def build_router(
         # across threads); a named attachment whose preparation has not
         # published searchable text yet is ``attachment_not_ready`` rather
         # than an empty context block.
+        # Refusing is the fail-safe, not the finished contract: spec line 25
+        # asks the host to accept a stored ``uploaded`` attachment without
+        # waiting, which needs the run suspended and resumed around a
+        # preparation the graph starts. Until that trigger exists, the retry
+        # door is the only path from ``uploaded`` to ``ready``, and an answer
+        # built without the named source the operator asked for is the
+        # failure this refusal prevents.
         # Resolution is read-only — an attachment stays referenceable for the
         # rest of the thread's life.
         referenced_ids = list(dict.fromkeys(body.attachment_ids or []))
@@ -2924,6 +2951,7 @@ def build_router(
         ``ready`` for every turn of this thread. Nothing is pushed and
         nothing enters the permanent company corpus (ADR 0047 keeps those
         doors separate).
+
         Wire shape: raw bytes body with the filename as the
         ``filename`` query parameter. Deliberately NOT multipart
         ``UploadFile``: this door takes one file and no form fields, so
@@ -2957,13 +2985,11 @@ def build_router(
         content is preparation's job, which names the rejection there.
 
         While this route is reading and storing the body the thread's send
-        gate is closed (:meth:`AttachmentUploadInFlight.enter`), and the
-        ``finally`` below releases it on every return AND every raise —
-        including a client that walks away mid-body — so no refusal can
-        strand the gate and hold that thread's sends at 409.
+        gate is closed (:meth:`AttachmentUploadInFlight.hold`), so no refusal
+        can strand it: the handle releases on every return AND every raise,
+        including a client that walks away mid-body.
         """
-        upload_in_flight.enter(thread_id)
-        try:
+        with upload_in_flight.hold(thread_id):
             if store.get_thread(thread_id) is None:
                 return JSONResponse(
                     status_code=404, content={"error": "thread_not_found"}
@@ -2999,10 +3025,6 @@ def build_router(
                     content={"error": "attachment_store_failed"},
                 )
             return _attachment_wire_record(record)
-        finally:
-            # The door is done with these bytes one way or another — stored,
-            # refused, or failed — and the thread's sends resume either way.
-            upload_in_flight.exit(thread_id)
 
     @router.get("/threads/{thread_id}/attachments")
     def list_thread_attachments(

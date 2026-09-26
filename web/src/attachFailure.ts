@@ -106,13 +106,12 @@ const STATUS_LABEL: Record<AttachmentStatus, string> = {
 // is unit-testable in the node environment (no DOM in the web suite)
 // and has one source the component reads.
 
-/** The one-large-filing-per-turn guidance. A turn that carries two
- * max-size attachments cannot fit the configured vision run budget, so
- * the composer says so before the operator uploads. Deliberately
- * limit-free: the server owns every byte and call bound, and a number
- * here would go stale the moment the deployment config changes. */
+/** The one-large-filing-per-turn guidance, offered as advice about how to
+ * work, not as a bound: nothing in the product refuses a turn that
+ * carries two attachments, and the server owns every byte, page and call
+ * limit, so this copy claims none of its own. */
 export const ATTACH_ONE_FILING_HINT =
-  "一份大文件一轮更稳妥：同一轮里放两份最大尺寸的附件，会超出本轮视觉解析预算。";
+  "一轮专注一份大文件更稳妥：先把手里这份问清楚，再传下一份。";
 
 /** Shown while an upload POST is in flight — the reason the send is
  * held is the upload, not a running turn. */

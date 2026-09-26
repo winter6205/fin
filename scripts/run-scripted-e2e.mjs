@@ -26,6 +26,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { attachmentBoundsFromExample } from "./lib/attachment-bounds.mjs";
 import {
   REPO_ROOT,
   ensureSpaBuild,
@@ -60,16 +61,12 @@ const PROVIDER_ENV = [
   "FIN_RETRIEVE_ADAPTER",
 ];
 
-// The four attachment bounds, as `.env.example` ships them. This lane reads
-// no ./.env and starts uvicorn directly rather than through `serve()`, so
-// nothing else would tell the server its upload cap: without these the door
-// answers a config failure instead of a bound.
-const ATTACHMENT_BOUNDS = {
-  FIN_ATTACHMENT_MAX_BYTES: "4194304",
-  FIN_ATTACHMENT_MAX_PDF_PAGES: "80",
-  FIN_ATTACHMENT_VISION_CALLS_PER_RUN: "88",
-  FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN: "8",
-};
+// This lane reads no ./.env and starts uvicorn directly rather than through
+// `serve()`, so nothing else would tell the server its upload cap: without
+// the four bounds the door answers a config failure instead of a bound.
+// Resolved once, at load: a checkout whose template lost a bound fails here,
+// naming the key, before a server is booted or a browser is opened.
+const ATTACHMENT_BOUNDS = attachmentBoundsFromExample();
 
 const USAGE = `Usage: node scripts/run-scripted-e2e.mjs [options]
 

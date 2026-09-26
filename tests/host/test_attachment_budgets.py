@@ -783,6 +783,27 @@ def test_corpus_distribution_records_describe_the_committed_files() -> None:
         )
 
 
+def test_deployed_upload_cap_admits_the_measured_corpus() -> None:
+    """The bound ships to admit every filing it was priced over.
+
+    The artifact is the measurement producer's own output, so this row is
+    also proof the producer still runs: its deployed-cap value comes from
+    ``from_environ`` over the shipped template, which is the same seam the
+    upload door reads.
+    """
+    findings = json.loads(CORPUS_DISTRIBUTION_PATH.read_text())["cap_findings"]
+    deployed = from_environ(environ=_deployed_environ()).max_upload_bytes
+    assert findings["deployed_attachment_cap_bytes"] == deployed
+    assert findings["deployed_attachment_cap_source"] == (
+        ".env.example:FIN_ATTACHMENT_MAX_BYTES"
+    )
+    assert findings["files_over_deployed_attachment_cap"] == []
+    # The retired constant is historical: the filings it rejected are the
+    # reason the deployed bound is larger.
+    assert findings["route_constant_bytes"] < deployed
+    assert findings["count_over_route_constant"] > 0
+
+
 def test_gold_manifest_describes_the_committed_fixtures() -> None:
     """The three gold cases the caps must fit are the bytes on disk.
 

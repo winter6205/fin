@@ -706,10 +706,13 @@ export class AttachmentNotReadyError extends AttachFailedError {
 }
 
 /** A conversation start or send refused because an attachment upload is
- * still in flight (``attachment_upload_in_progress``). The client
- * decides it before the run POST goes out; the host enforces the same
- * condition, so a second tab cannot slip a send past a running upload.
- * Subclasses ``AttachFailedError`` for the same reason as
+ * still in flight (``attachment_upload_in_progress``). The two doors
+ * cover different scopes on purpose: the client holds the composer while
+ * an upload is in flight on ANY thread, because its composer is global —
+ * one box that sends into whichever thread is open; the host refuses
+ * only the thread whose bytes are landing, which is what stops a second
+ * tab from slipping a send past that upload. The client is the stricter
+ * side. Subclasses ``AttachFailedError`` for the same reason as
  * ``AttachmentNotReadyError``: the refusal is about an attachment. */
 export class AttachmentUploadInProgressError extends AttachFailedError {
   constructor() {
@@ -838,10 +841,11 @@ export async function listThreadAttachments(
 }
 
 /**
- * Re-run preparation for one failed attachment (ADR 0086 retry).
- * The 200 is the fresh single record — typically back to
- * ``"parsing"``. Unknown or foreign attachment ids answer the named
- * 400 ``attachment_not_found``.
+ * Re-run preparation for one failed attachment. Preparation runs INSIDE
+ * this request, so the 200 is the settled single record — ``"ready"``
+ * when the re-drive worked, ``"failed"`` with its named reason when it
+ * did not; this door never answers ``"parsing"``. Unknown or foreign
+ * attachment ids answer the named 400 ``attachment_not_found``.
  */
 export async function retryThreadAttachment(
   threadId: string,

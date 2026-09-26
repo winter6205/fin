@@ -1,11 +1,11 @@
-"""G4 T2b: the raw-upload door against real fin storage and a real process.
+"""The raw-upload door against real fin storage and a real process.
 
 Why this file exists
 --------------------
 ``tests/host/test_thread_attach.py`` proves the upload door's contract on
 ``InMemoryAttachmentStore`` + ``InMemoryObjectStore`` inside the test
 process. That is the right shape for the boundary matrix, but it cannot
-answer the two questions T2b's acceptance actually turns on:
+answer the two questions this door's acceptance turns on:
 
 * does a durable ``uploaded`` row reach a *different* process that never
   saw the upload, and does that process's recovery leave it alone?
@@ -91,8 +91,8 @@ SCANNED_PDF = GOLD_DIR / "g4-scanned-001.pdf"
 CHART_PNG = GOLD_DIR / "g4-image-chart-001.png"
 MSFT_Q1_PDF = PDF_DIR / "2023_Q1_MSFT.pdf"
 
-# The size that makes the byte-cap claim non-trivial. T2b retired the
-# route constant; this is its value, pinned here so the record can show a
+# The size that makes the byte-cap claim non-trivial. The route constant
+# this door retired; pinned here so the record can show a
 # real filing that the OLD cap rejected and the DEPLOYED bound accepts.
 RETIRED_ROUTE_CAP_BYTES = 2 * 1024 * 1024
 
@@ -130,7 +130,7 @@ def postgres_url(deployed_bounds: dict[str, str]) -> str:
     url = (os.environ.get("FIN_CHECKPOINT_URL") or "").strip()
     if not url:
         pytest.skip(
-            "FIN_CHECKPOINT_URL is not set; this module is T2b's real-storage "
+            "FIN_CHECKPOINT_URL is not set; this module is the real-storage "
             "evidence and cannot run against an in-memory stand-in"
         )
     return url
@@ -249,7 +249,7 @@ def _unknown_thread_id() -> str:
     return f"no-such-thread-{uuid.uuid4().hex}"
 
 
-# The payloads T2b's acceptance names: every committed gold case plus the
+# The payloads this acceptance names: every committed gold case plus the
 # real filing that straddles the retired constant and the deployed bound.
 # A plain table, not ``parametrize``, because both harnesses walk the whole
 # set in one pass and assert on each other's storage.
@@ -318,7 +318,7 @@ def door(postgres_url: str, budgets: Any) -> Iterator[dict[str, Any]]:
 
     built = workspace_http._build_default_attachment_service()
     assert isinstance(built.store, PostgresAttachmentStore), (
-        "T2b's real-storage evidence needs the Postgres attachment store, "
+        "This lane's evidence needs the Postgres attachment store, "
         f"got {type(built.store).__name__}"
     )
     objects = _ObjectStoreLens(built.objects)
@@ -554,9 +554,9 @@ def test_upload_starts_no_work_behind_the_response(
 ) -> None:
     """The response is the whole request: one put, and then nothing happens.
 
-    T1's door handed the minted row to ``BackgroundTasks``, so a second
-    wave of writes landed after the client had already been told. T2b
-    removed that hand-off, and the observable shape is a byte store whose
+    The superseded door handed the minted row to ``BackgroundTasks``, so a
+    second wave of writes landed after the client had already been told.
+    This door removed that hand-off; the observable shape is a byte store whose
     call history and a derived-data count that both stay flat after the
     200 — a short settle later, not just in the instant of the answer.
     """
@@ -592,8 +592,8 @@ def test_unsupported_bytes_upload_and_only_preparation_names_them(
 ) -> None:
     """The non-UTF-8 PNG is raw bytes at the door and a rejection at preparation.
 
-    T2b moved the content judgement off the upload path. This is that
-    move observed end to end: the 40,419-byte PNG that the pre-T2b door
+    The content judgement lives off the upload path. This is that move
+    observed end to end: the 40,419-byte PNG that the superseded door
     answered 400 ``attachment_not_text`` for now answers 200
     ``uploaded`` with no failure reason, and ``attachment_not_text``
     appears only when preparation reads the stored bytes back.
@@ -718,13 +718,11 @@ def uuid4_hex() -> str:
 # =========================================================================
 
 _CHILD_SOURCE = """
-import os
 import sys
 
 import uvicorn
 
 from fin.host import http as http_module
-from fin.host.attachment_budgets import from_environ
 
 
 class _NullGraph:
@@ -732,10 +730,12 @@ class _NullGraph:
         return None
 
 
+# Only the graph is replaced, and only because a run would need model
+# credentials this lane never holds. Everything the door reads — bounds,
+# stores, adapters — comes from this process's own environment, so the
+# byte cap under test is the one `get_attachment_budgets()` resolved from
+# the deployed keys rather than an object this harness handed it.
 http_module.app.dependency_overrides[http_module.get_graph] = lambda: _NullGraph()
-http_module.app.dependency_overrides[http_module.get_attachment_budgets] = (
-    lambda: from_environ(environ=os.environ)
-)
 uvicorn.run(
     http_module.app,
     host="127.0.0.1",
@@ -901,8 +901,8 @@ def test_live_server_accepts_the_filing_the_retired_constant_rejected(
     """``2023_Q1_MSFT.pdf`` is over the retired cap and under the deployed one.
 
     This is the case that makes the byte cap a deployment fact rather
-    than a route detail: ``2,223,272 > 2,097,152``, so the constant T2b
-    retired answered 413 for a real filing the shipped door now accepts.
+    than a route detail: ``2,223,272 > 2,097,152``, so the retired route
+    constant answered 413 for a real filing the shipped door now accepts.
     """
     payload = _payload(MSFT_Q1_PDF)
     assert len(payload) == 2_223_272, len(payload)

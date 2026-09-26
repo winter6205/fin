@@ -34,11 +34,14 @@ Two consequences follow for records that cannot be read at all:
   a named gap with its own reason, never a dropped row -- a silently
   dropped manifest row would otherwise be reported later as "on disk but
   absent from manifest.json", which is the wrong reason for the hole;
-* the two product caps quoted under ``cap_findings`` are read from the
-  modules that enforce them at run time, and their ``file:line``
-  provenance is derived from that same live object, so a cap the product
-  later changes cannot be cited here from a stale copy.  A cap that cannot
-  be read blocks the run instead of falling back to a literal.
+* the caps quoted under ``cap_findings`` are read from the seams that
+  enforce them at run time, and their provenance is derived from that same
+  live source, so a cap the product later changes cannot be cited here from
+  a stale copy.  A cap that cannot be read blocks the run instead of
+  falling back to a literal.  The one exception is named: the upload door's
+  *retired* constant is a historical quantity -- the module no longer
+  defines it -- so it is stated as a literal with its old address, while the
+  cap the door enforces now is read live.
 
 Deterministic by construction: fixed file set sorted by name, integer
 measurements, a documented nearest-rank percentile, sorted JSON keys, no
@@ -96,14 +99,17 @@ MANIFEST_REL: Final[str] = "data/corpus/manifest.json"
 CATALOG_REL: Final[str] = "data/corpus/catalog.json"
 ARTIFACT_REL: Final[str] = "data/corpus/g4_upload_distribution.json"
 
-# The constant T2a's measurement exists to replace: the thread-attachment
-# upload cap enforced in ``fin.host.workspace_http``.  Only its address is
-# stated here -- the value and the ``file:line`` provenance are read from
-# the live module, so neither can drift from what the product enforces.
-ROUTE_ATTACHMENT_CONSTANT: Final[tuple[str, str]] = (
-    "fin.host.workspace_http",
-    "ATTACHMENT_MAX_BYTES",
+# The cap T2a's measurement exists to price a replacement for.  The thread
+# attachment door enforced it as a module constant; that constant is gone,
+# so the historical comparison states the number here and names the address
+# it came from.  It is not a candidate for the live cap -- the row below is.
+RETIRED_ROUTE_CAP_BYTES: Final[int] = 2 * 1024 * 1024
+RETIRED_ROUTE_CAP_SOURCE: Final[str] = (
+    "retired: fin.host.workspace_http.ATTACHMENT_MAX_BYTES"
 )
+
+# The cap the door enforces now, read through the seam that enforces it.
+DEPLOYED_CAP_ENV_KEY: Final[str] = "FIN_ATTACHMENT_MAX_BYTES"
 
 # A different door, kept separate on purpose: the corpus ingest endpoint
 # bound.  Reported as context for the byte comparison above; it is not a
@@ -196,8 +202,42 @@ def read_product_constant(module_name: str, constant_name: str) -> dict[str, Any
 def read_product_constants() -> dict[str, dict[str, Any]]:
     """Both quoted caps, keyed by the door they belong to."""
     return {
-        "route": read_product_constant(*ROUTE_ATTACHMENT_CONSTANT),
+        "route": {
+            "constant_bytes": RETIRED_ROUTE_CAP_BYTES,
+            "source": RETIRED_ROUTE_CAP_SOURCE,
+        },
         "ingest": read_product_constant(*INGEST_CONSTANT),
+    }
+
+
+def read_deployed_attachment_cap() -> dict[str, Any]:
+    """The byte bound the attachment door enforces today.
+
+    Read through ``from_environ``, the same seam the door reads, over the
+    template the deployment ships -- so this row cannot quote a number the
+    product stopped enforcing, and a template that lost the key blocks the
+    run instead of inventing one.
+    """
+    from fin.host.attachment_budgets import (
+        AttachmentBudgetConfigError,
+        from_environ,
+    )
+    from fin.host.operator_env import parse_env_file
+
+    deployed = parse_env_file((REPO_ROOT / ".env.example").read_text())
+    if DEPLOYED_CAP_ENV_KEY not in deployed:
+        raise MeasurementBlockedError(
+            f".env.example does not configure {DEPLOYED_CAP_ENV_KEY}"
+        )
+    try:
+        budgets = from_environ(environ=deployed)
+    except AttachmentBudgetConfigError as exc:
+        raise MeasurementBlockedError(
+            f".env.example configures {DEPLOYED_CAP_ENV_KEY} unusably: {exc}"
+        ) from exc
+    return {
+        "constant_bytes": budgets.max_upload_bytes,
+        "source": f".env.example:{DEPLOYED_CAP_ENV_KEY}",
     }
 
 
@@ -575,18 +615,25 @@ def _page_extremes_block(records: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _cap_findings_block(
-    records: list[dict[str, Any]], constants: dict[str, dict[str, Any]]
+    records: list[dict[str, Any]],
+    constants: dict[str, dict[str, Any]],
+    deployed: dict[str, Any],
 ) -> dict[str, Any]:
     """The measured distribution read against the caps the product itself enforces."""
     route = constants["route"]
     ingest = constants["ingest"]
     over_route = _files_over_limit(records, route["constant_bytes"])
+    over_deployed = _files_over_limit(records, deployed["constant_bytes"])
     extremes = _page_extremes_block(records)
     return {
         "route_constant_bytes": route["constant_bytes"],
         "route_constant_source": route["source"],
         "files_over_route_constant": over_route,
         "count_over_route_constant": len(over_route),
+        "deployed_attachment_cap_bytes": deployed["constant_bytes"],
+        "deployed_attachment_cap_source": deployed["source"],
+        "files_over_deployed_attachment_cap": over_deployed,
+        "count_over_deployed_attachment_cap": len(over_deployed),
         "smallest_page_count_observed": extremes["smallest_page_count_observed"],
         "largest_page_count_observed": extremes["largest_page_count_observed"],
         "separate_ingest_door": {
@@ -624,6 +671,7 @@ def build_artifact() -> dict[str, Any]:
     # Both quoted caps come out of the modules that enforce them, so neither
     # number nor its provenance can be a copy that time forgot.
     constants = read_product_constants()
+    deployed_cap = read_deployed_attachment_cap()
     manifest_records, manifest_gaps = _manifest_pdf_records(_load_json_object(MANIFEST_REL))
     catalog_pages, catalog_gaps = _catalog_page_counts(_load_json_object(CATALOG_REL))
     gaps: list[dict[str, Any]] = [*manifest_gaps, *catalog_gaps]
@@ -644,7 +692,7 @@ def build_artifact() -> dict[str, Any]:
         "aggregate": _distribution_block(records),
         "disagreements": _disagreement_block(findings),
         "gaps": gaps,
-        "cap_findings": _cap_findings_block(records, constants),
+        "cap_findings": _cap_findings_block(records, constants, deployed_cap),
         "notes": [
             "Numbers only: this artifact deliberately proposes no budget value.",
             "2023_FY_GOOG.pdf is 624 B with 1 page, a placeholder-shaped fixture "
@@ -672,6 +720,9 @@ def summary_line(artifact: dict[str, Any], artifact_sha256: str) -> dict[str, An
         },
         "files_over_route_constant": artifact["cap_findings"][
             "count_over_route_constant"
+        ],
+        "files_over_deployed_attachment_cap": artifact["cap_findings"][
+            "count_over_deployed_attachment_cap"
         ],
         "disagreements": {
             "bytes": len(disagreements["bytes"]),

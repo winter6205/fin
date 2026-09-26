@@ -53,9 +53,12 @@ export default function Composer({ threadId }: ComposerProps) {
   );
   const busy = sending || threadInFlight || resumingThis;
   // The upload gate is store state, not local picker state: it holds
-  // for a file the question never mentions, and the same predicate is
-  // what ``sendQuestion`` / ``createThread`` refuse with — so the
-  // control and the store can never disagree about who is blocked.
+  // for a file the question never mentions, and it is the ONE predicate
+  // ``sendQuestion`` / ``createThread`` refuse with — so the control and
+  // the store can never disagree about who is blocked. Its scope is
+  // deliberately wider than the host's: this door holds the composer for
+  // an upload on ANY thread because the composer itself is global, while
+  // the host refuses only the thread its own upload is landing in.
   const uploadInFlight = useWorkspaceStore((s) =>
     hasUploadInFlight(s.pendingUploads),
   );
@@ -353,10 +356,10 @@ export default function Composer({ threadId }: ComposerProps) {
               本对话内持续可引用，不入库
             </span>
           </span>
-          {/* A turn carrying two max-size attachments cannot fit the
-              configured vision run budget, so the composer says so
-              before the operator uploads. The bound itself belongs to
-              the server and is never quoted here. */}
+          {/* Advice on how to work one filing at a time — not a bound.
+              Nothing caps how many attachments a turn may carry, and the
+              server owns every byte / page / call limit, so this copy
+              quotes none of them. */}
           <p data-testid="attach-one-filing-hint" className="text-xs text-gray-400">
             {ATTACH_ONE_FILING_HINT}
           </p>

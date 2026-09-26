@@ -137,9 +137,10 @@ class AttachmentPreparationService:
         attachment_id = str(uuid.uuid4())
         key = f"thread-attachments/{thread_id}/{attachment_id}"
         try:
-            pointer = self.objects.put(
-                key, payload, content_type="text/plain"
-            )
+            # No content type: this door has not judged the bytes, and a
+            # declared media type would be a claim about content nothing
+            # here has looked at.
+            pointer = self.objects.put(key, payload)
         except Exception as exc:
             # EXIT: the byte store rejected the upload; there is nothing to
             # record and the door turns this into its named store failure.
