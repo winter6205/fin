@@ -27,6 +27,9 @@ Covered, one test per T14 acceptance clause:
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 import pytest
 
 from fin.corpus.chunking import (
@@ -488,3 +491,90 @@ def test_off_contract_chunk_shapes_are_refused_by_name(chunks: list) -> None:
         validate_envelope_chunks(_wire_with_chunks(chunks))
 
     assert excinfo.value.code == "push_protocol_error"
+
+
+# ---------------------------------------------------------------------------
+# T4 handoff: the fake answers with the identity field the real service does
+# ---------------------------------------------------------------------------
+
+
+def _iknow_content_identity(body: str) -> str:
+    """The identity iknow-memory computes server-side — sha256 over the
+    JSON array of the body and the three **service-owned** version
+    strings (``src/tools/ingest.ts`` ``computeContentIdentity``).
+
+    The expectation is written from the cross-repo contract, not from
+    fin's own hashing helper: if the fake ever drifts into mirroring
+    ``body_content_id`` instead of the remote value, this test is what
+    catches it.
+    """
+    payload = json.dumps(
+        [body, "normalization-v1", "parse-v1", "parameters-v1"],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def test_fake_answers_a_single_document_push_with_content_identity() -> None:
+    """One 资料 in a batch answers with a top-level ``content_identity``
+    (iknow ``src/tools/push.ts`` singles shape), not an array."""
+    port = FakePushPort()
+    envelope = _unit_envelope(n=6)[0]
+
+    response = port.push([envelope.to_wire()])
+
+    assert response["content_identity"] == _iknow_content_identity(envelope.body)
+    assert "content_identities" not in response
+
+
+def test_fake_answers_a_multi_document_batch_with_ordered_identities() -> None:
+    port = FakePushPort()
+    envelopes = _document_envelopes()
+    assert len(envelopes) > 1
+
+    response = port.push([envelope.to_wire() for envelope in envelopes])
+
+    assert response["content_identities"] == [
+        _iknow_content_identity(envelope.body) for envelope in envelopes
+    ]
+    assert "content_identity" not in response
+
+
+def test_fake_identity_reaches_the_caller_through_the_push_seam() -> None:
+    """The pair ``submit_index_job`` needs is readable off the outcome,
+    keyed by the very ``source_ref`` fin sent."""
+    port = FakePushPort()
+    envelopes = _document_envelopes()
+
+    outcome = push_envelopes(port, envelopes)
+
+    assert dict(outcome.content_identities) == {
+        envelope.source_ref: _iknow_content_identity(envelope.body)
+        for envelope in envelopes
+    }
+
+
+def test_fake_replay_echoes_the_stored_identity() -> None:
+    """An idempotent re-push reports the identity of the row that is
+    actually stored, so the handoff never depends on which of the two
+    calls a caller happened to read."""
+    port = FakePushPort()
+    envelopes = _unit_envelope(n=6)
+
+    first = push_envelopes(port, envelopes)
+    replay = push_envelopes(port, envelopes)
+
+    assert replay.content_identities == first.content_identities
+
+
+def test_fake_identity_is_the_remote_value_not_fins_body_hash() -> None:
+    """fin's ``body_content_id`` and iknow's ``content_identity`` are two
+    different constructions over two different owners; the fake must not
+    collapse them, or T4 would submit a pair the real service rejects."""
+    port = FakePushPort()
+    envelope = _unit_envelope(n=6)[0]
+
+    response = port.push([envelope.to_wire()])
+
+    assert response["content_identity"] != envelope.body_content_id

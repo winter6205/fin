@@ -33,6 +33,11 @@ batch again (the §B1「幂等基准」row: :data:`IDEMPOTENCY_BASELINE_PUSHES`
 = 3 consecutive pushes) must leave the block total increment at 0
 and the block id set unchanged, and must return the same block ids.
 
+The service keeps its own copy of that second component — it computes
+the stored ``content_identity`` and answers with it — and the pair it
+later validates at ``submit_index_job`` is *its* value, not fin's hash.
+:func:`content_identities_of` is the one place that reads it back out.
+
 Failure contract
 ----------------
 
@@ -69,7 +74,7 @@ and the retrieve side alike.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Final, Mapping, Protocol, Sequence, runtime_checkable
 
 from fin.corpus.push import (
@@ -255,11 +260,17 @@ class PushOutcome:
     so a replay returns the same ids as the original write. ``written``
     counts first-time writes, ``duplicates`` counts envelopes
     recognized as an existing write.
+
+    ``content_identities`` maps each pushed ``source_ref`` to the
+    ``content_identity`` the service computed and stored for it — the
+    other half of the pair ``submit_index_job`` takes. It is empty for a
+    service that reports no identity, and is never filled in by fin.
     """
 
     block_ids: tuple[str, ...]
     written: int
     duplicates: int
+    content_identities: Mapping[str, str] = field(default_factory=dict)
 
 
 @runtime_checkable
@@ -267,7 +278,9 @@ class PushPort(Protocol):
     """Structural protocol for push adapters.
 
     ``push`` takes wire envelopes (``PushEnvelope.to_wire()`` shape) and
-    returns ``{"block_ids": [...], "written": int, "duplicates": int}``.
+    returns ``{"block_ids": [...], "written": int, "duplicates": int}``
+    plus, for a service that reports one, the ``content_identity`` /
+    ``content_identities`` fields the receiving side computed.
     Implementations raise a :class:`PushError` subclass on failure and
     never report a refused batch as an empty success.
     """
@@ -411,8 +424,131 @@ def validate_envelope_chunks(
         expected += 1
 
 
+def _pushed_source_refs(
+    source_refs: Sequence[str] | None,
+) -> tuple[str, ...]:
+    """The 资料 one response's identities belong to: first-seen distinct
+    ``source_ref`` values, the order the receiving service answers in.
+
+    ``None`` means the caller has no batch to attribute an identity to,
+    which is a legal answer only for a response that carries none.
+    """
+    if source_refs is None:
+        return ()
+    seen: dict[str, None] = {}
+    for source_ref in source_refs:
+        seen.setdefault(source_ref, None)
+    return tuple(seen)
+
+
+def _validated_identity(value: Any, *, where: str) -> str:
+    """One identity off the wire, or a named protocol failure.
+
+    The value is checked for shape only, never recomputed: a hash fin
+    derived itself would let a wrong pair reach ``submit_index_job`` with
+    nothing to contradict it.
+    """
+    if not isinstance(value, str) or not value:
+        raise PushProtocolError(
+            f"push response {where} carries {value!r}, expected a "
+            "non-empty content identity"
+        )
+    return value
+
+
+def content_identities_of(
+    response: Mapping[str, Any],
+    *,
+    source_refs: Sequence[str] | None = None,
+) -> dict[str, str]:
+    """Attribute the identities of one push response to their `source_ref`.
+
+    The service owns ``content_identity`` — it computes the value, stores
+    it beside the `source_ref`, and validates the pair at
+    ``submit_index_job``. So the only authority for the pair fin hands on
+    is this response; recomputing it fin-side would be a second,
+    unverifiable one.
+
+    Three shapes are on-contract (iknow ``src/tools/push.ts``):
+
+    * ``content_identity`` — one 资料 wrote and its identity is the
+      scalar;
+    * ``content_identities`` — a sequence, parallel to the batch's 资料
+      in send order;
+    * neither — a build that predates the field. That is still a
+      successful write, so it reports *no* identity rather than an
+      invented one.
+
+    A ``content_identities`` :class:`~typing.Mapping` is also accepted:
+    it is the shape the MCP adapter hands on once it has done the
+    attribution itself, so the read is idempotent across the seam.
+
+    Anything else — a value that is not a non-empty string, a count that
+    does not line up with the pushed 资料, both wire shapes at once, a
+    sequence with no batch to attribute it to — is a
+    :class:`PushProtocolError`: an identity fin cannot pin to exactly one
+    source is worse than no identity, because the wrong pair would reach
+    the durable index job silently.
+    """
+    has_scalar = "content_identity" in response
+    has_plural = "content_identities" in response
+    if not has_scalar and not has_plural:
+        return {}
+    if has_scalar and has_plural:
+        raise PushProtocolError(
+            "push response reports both content_identity and "
+            "content_identities; the service answers with one shape per batch"
+        )
+
+    refs = _pushed_source_refs(source_refs)
+    if has_scalar:
+        identity = _validated_identity(
+            response["content_identity"], where="content_identity"
+        )
+        if len(refs) != 1:
+            raise PushProtocolError(
+                f"push response reports one content_identity for "
+                f"{len(refs)} pushed 资料"
+            )
+        return {refs[0]: identity}
+
+    identities = response["content_identities"]
+    if isinstance(identities, Mapping):
+        for source_ref in identities:
+            if not isinstance(source_ref, str) or not source_ref:
+                raise PushProtocolError(
+                    f"push response content_identities has the "
+                    f"{source_ref!r} key; expected a non-empty source_ref"
+                )
+        return {
+            source_ref: _validated_identity(
+                identity, where=f"content_identities[{source_ref!r}]"
+            )
+            for source_ref, identity in identities.items()
+        }
+    if isinstance(identities, (str, bytes)) or not isinstance(
+        identities, Sequence
+    ):
+        raise PushProtocolError(
+            f"push response content_identities is "
+            f"{type(identities).__name__}, expected a sequence of identities"
+        )
+    if len(identities) != len(refs):
+        raise PushProtocolError(
+            f"push response carries {len(identities)} content identities "
+            f"for {len(refs)} pushed 资料"
+        )
+    return {
+        source_ref: _validated_identity(identity, where="content_identities")
+        for source_ref, identity in zip(refs, identities)
+    }
+
+
 def outcome_of_response(
-    response: Any, *, chunk_count: int
+    response: Any,
+    *,
+    chunk_count: int,
+    source_refs: Sequence[str] | None = None,
 ) -> PushOutcome:
     """Read one push response envelope, or fail by name (SC21).
 
@@ -424,15 +560,20 @@ def outcome_of_response(
     same total. Anything else is a :class:`PushProtocolError` — a
     short envelope is never padded and a stray one is never truncated
     into a plausible outcome.
+
+    ``source_refs`` are the `source_ref` values of the envelopes this
+    response answers, in send order; they let an unattributed
+    ``content_identity`` / ``content_identities`` field be pinned to the
+    资料 it describes (see :func:`content_identities_of`).
     """
     if not isinstance(response, Mapping):
         raise PushProtocolError(
             f"push response is {type(response).__name__}, expected a mapping"
         )
     missing = [
-        field
-        for field in ("block_ids", *_RESPONSE_COUNT_FIELDS)
-        if field not in response
+        name
+        for name in ("block_ids", *_RESPONSE_COUNT_FIELDS)
+        if name not in response
     ]
     if missing:
         raise PushProtocolError(
@@ -458,14 +599,14 @@ def outcome_of_response(
         )
 
     counts: dict[str, int] = {}
-    for field in _RESPONSE_COUNT_FIELDS:
-        value = response[field]
+    for name in _RESPONSE_COUNT_FIELDS:
+        value = response[name]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise PushProtocolError(
-                f"push response {field} is {value!r}, expected a "
+                f"push response {name} is {value!r}, expected a "
                 "non-negative integer"
             )
-        counts[field] = value
+        counts[name] = value
     total = sum(counts.values())
     if total != chunk_count:
         raise PushProtocolError(
@@ -476,6 +617,9 @@ def outcome_of_response(
         block_ids=tuple(block_ids),
         written=counts["written"],
         duplicates=counts["duplicates"],
+        content_identities=content_identities_of(
+            response, source_refs=source_refs
+        ),
     )
 
 
@@ -519,7 +663,11 @@ def push_envelopes(
             f"push to the retrieval service failed to reach it: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
-    return outcome_of_response(response, chunk_count=chunk_count)
+    return outcome_of_response(
+        response,
+        chunk_count=chunk_count,
+        source_refs=[envelope.source_ref for envelope in envelopes],
+    )
 
 
 def push_records(
@@ -558,7 +706,11 @@ def push_records(
             f"push to the retrieval service failed to reach it: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
-    return outcome_of_response(response, chunk_count=chunk_count)
+    return outcome_of_response(
+        response,
+        chunk_count=chunk_count,
+        source_refs=[item["source_ref"] for item in wire_envelopes],
+    )
 
 
 def _record_or_wire_to_envelope(item: Any) -> Mapping[str, Any]:
@@ -592,6 +744,7 @@ __all__ = [
     "PushProtocolError",
     "PushServiceUnavailableError",
     "UnknownPushedBlockError",
+    "content_identities_of",
     "missing_metadata_fields",
     "outcome_of_response",
     "push_envelopes",
