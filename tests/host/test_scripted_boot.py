@@ -318,7 +318,12 @@ def test_compile_for_http_unset_checkpoint_url_raises(
 
 
 def test_serve_refuses_boot_when_checkpoint_url_is_unset(monkeypatch) -> None:
-    """``fin-serve`` must not bind the port, then fail on first ask."""
+    """``fin-serve`` must not bind the port, then fail on first ask.
+
+    ``serve()`` reads the attachment bounds before it compiles, so this
+    deployment env carries a finite set: the refusal asserted below stays the
+    checkpoint URL's, not a mis-declared byte cap's.
+    """
     from fin.host.compile import MissingCheckpointURLError
     import fin.host.http as http_module
     import uvicorn
@@ -330,10 +335,28 @@ def test_serve_refuses_boot_when_checkpoint_url_is_unset(monkeypatch) -> None:
     monkeypatch.setattr(http_module, "publish_knowledge_mcp", lambda: None)
     monkeypatch.setattr(uvicorn, "run", lambda *a, **k: served.append("uvicorn"))
     monkeypatch.setattr(http_module, "_http_graph_singleton", None, raising=False)
+    # The bounds are read before the graph is compiled, so this boot's read
+    # has to start from unset: otherwise whatever an earlier case cached
+    # answers here and this test would not be deploying an env at all.
+    monkeypatch.setattr(
+        http_module, "_http_attachment_budgets_singleton", None, raising=False
+    )
     monkeypatch.delenv(SCRIPTED_BOOT_ENV_VAR, raising=False)
     monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
+    # Test fixtures, not the deployed numbers: any finite set where the run
+    # budget covers pages plus crop headroom gets this boot past its own door.
+    for key, value in {
+        "FIN_ATTACHMENT_MAX_BYTES": "1048576",
+        "FIN_ATTACHMENT_MAX_PDF_PAGES": "8",
+        "FIN_ATTACHMENT_VISION_CALLS_PER_RUN": "16",
+        "FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN": "8",
+    }.items():
+        monkeypatch.setenv(key, value)
 
     with pytest.raises(MissingCheckpointURLError):
         http_module.serve()
     assert served == []
     monkeypatch.setattr(http_module, "_http_graph_singleton", None, raising=False)
+    monkeypatch.setattr(
+        http_module, "_http_attachment_budgets_singleton", None, raising=False
+    )

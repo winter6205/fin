@@ -1,10 +1,11 @@
 """A text attachment is durable for the research thread lifetime.
 
 Replaces the turn-blob contract (single-use, process-local dict) with the
-thread-owned durable attachment of ADRs 0083/0085/0086/0088: ``parsing``
-on acceptance, ``ready`` only once the derived index is searchable,
-restart keeps bytes and the parsed version, and deleting the thread
-removes metadata, bytes, parsed units, and index entries.
+thread-owned durable attachment of ADRs 0083/0085/0086/0088/0089:
+``uploaded`` on acceptance (raw bytes only, no derived work), ``ready``
+only once a requested preparation has frozen units and a searchable
+index, restart keeps bytes and the parsed version, and deleting the
+thread removes metadata, bytes, parsed units, and index entries.
 
 """
 
@@ -23,6 +24,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.object_store import InMemoryObjectStore
 from fin.corpus.object_store_errors import UnknownObjectKeyError
+from fin.host.attachment_budgets import AttachmentBudgets
 from fin.host.attachment_index import search
 from fin.host.attachment_prepare import (
     AttachmentNotReadyError,
@@ -34,7 +36,12 @@ from fin.host.attachment_store import (
     InMemoryAttachmentStore,
     ParsedAttachmentUnit,
 )
-from fin.host.http import get_attachment_service, get_graph, get_thread_store
+from fin.host.http import (
+    get_attachment_budgets,
+    get_attachment_service,
+    get_graph,
+    get_thread_store,
+)
 from fin.host.scripted_model import ScriptedChatModel
 from fin.host.thread_store import InMemoryThreadStore
 from fin.retrieve import ExtractedTreeReadPort
@@ -49,6 +56,16 @@ _TREE_READ_PORT = ExtractedTreeReadPort(
 REVENUE_TEXT = (
     "Q3 revenue was 89,493 million dollars.\n"
     "Operating cash flow stayed strong across the quarter.\n"
+)
+
+# The door reads its byte cap through this dependency, so every wired
+# test app pins the deployed budget instead of reading the operator's
+# process environment.
+BUDGETS = AttachmentBudgets(
+    max_upload_bytes=1_048_576,
+    max_pdf_pages=8,
+    max_vision_calls_per_run=16,
+    max_vision_crop_calls_per_run=8,
 )
 
 
@@ -137,6 +154,7 @@ def wired(
     thread = threads.create_thread(title="durable thread")
     http_app.dependency_overrides[get_thread_store] = lambda: threads
     http_app.dependency_overrides[get_attachment_service] = lambda: service
+    http_app.dependency_overrides[get_attachment_budgets] = lambda: BUDGETS
     http_app.dependency_overrides[get_graph] = lambda: _compile_graph(
         ScriptedChatModel(script=[AIMessage(content="ok")] * 6)
     )
@@ -153,20 +171,41 @@ def _attach(client: TestClient, thread_id: str, payload: bytes) -> dict:
     return response.json()
 
 
+def _prepare_through_door(
+    client: TestClient, thread_id: str, attachment_id: str
+) -> dict:
+    """Ask the door to prepare an accepted upload.
+
+    The upload itself only stores bytes; the retry door is the public
+    path to preparation until the graph-triggered job exists, so a test
+    that needs ``ready`` text walks the same door an operator would.
+    """
+    response = client.post(
+        f"/api/threads/{thread_id}/attachments/{attachment_id}/retry"
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 def _status(client: TestClient, thread_id: str, attachment_id: str) -> Any:
     return client.get(f"/api/threads/{thread_id}/attachments/{attachment_id}")
 
 
-# ----- parsing -> ready, searchable across turns -----
+# ----- uploaded -> ready, searchable across turns -----
 
 
-def test_upload_returns_parsing_and_becomes_ready_with_searchable_index(
+def test_upload_returns_uploaded_and_becomes_ready_with_searchable_index(
     client: TestClient, wired: dict[str, Any]
 ) -> None:
     body = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
-    assert body["status"] == "parsing"
+    assert body["status"] == "uploaded"
     assert body["scope"] == "thread_attach"
     assert body["attachment_id"]
+
+    prepared = _prepare_through_door(
+        client, wired["thread_id"], body["attachment_id"]
+    )
+    assert prepared["status"] == "ready"
 
     response = _status(client, wired["thread_id"], body["attachment_id"])
     assert response.status_code == 200, response.text
@@ -187,7 +226,7 @@ def test_an_unprepared_attachment_never_reads_as_ready(
         payload=REVENUE_TEXT.encode("utf-8"),
     )
     body = _status(client, wired["thread_id"], record.attachment_id).json()
-    assert body["status"] == "parsing"
+    assert body["status"] == "uploaded"
     assert body["searchable"] is False
 
 
@@ -207,6 +246,9 @@ def test_a_later_turn_can_reference_the_same_attachment_again(
 ) -> None:
     body = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
     aid = body["attachment_id"]
+    assert _prepare_through_door(client, wired["thread_id"], aid)["status"] == (
+        "ready"
+    )
 
     for turn in range(2):
         response = client.post(
@@ -220,7 +262,7 @@ def test_a_later_turn_can_reference_the_same_attachment_again(
     assert _status(client, wired["thread_id"], aid).json()["status"] == "ready"
 
 
-def test_send_naming_a_parsing_attachment_is_typed_not_ready(
+def test_send_naming_an_unprepared_attachment_is_typed_not_ready(
     client: TestClient, wired: dict[str, Any]
 ) -> None:
     record = wired["service"].accept(
@@ -325,6 +367,32 @@ def test_restart_rebuilds_lost_units_from_retained_bytes(
     )
 
 
+def test_a_restart_never_prepares_an_upload_nobody_asked_to_prepare(
+    wired: dict[str, Any], objects: InMemoryObjectStore
+) -> None:
+    """Restart boundary of the new lifecycle: an ``uploaded`` row holds
+    durable bytes with no preparation requested yet, so recovery must
+    leave it exactly as it was — nothing parsed, nothing indexed, no
+    work started behind the operator.
+    """
+    restarted = AttachmentPreparationService(
+        store=wired["service"].store, objects=objects
+    )
+    record = wired["service"].accept(
+        thread_id=wired["thread_id"],
+        filename="notes.txt",
+        payload=REVENUE_TEXT.encode("utf-8"),
+    )
+
+    assert restarted.recover() == 0
+    after = restarted.status(record.attachment_id)
+    assert after.status == "uploaded"
+    assert after.version == 0
+    assert restarted.units(record.attachment_id) == ()
+    assert restarted.store.indexed_versions(record.attachment_id) == ()
+    assert objects.get(record.object_key) == REVENUE_TEXT.encode("utf-8")
+
+
 # ----- thread deletion cascades -----
 
 
@@ -335,6 +403,7 @@ def test_deleting_the_thread_removes_metadata_bytes_units_and_index(
 ) -> None:
     body = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
     aid = body["attachment_id"]
+    _prepare_through_door(client, wired["thread_id"], aid)
     object_key = wired["service"].status(aid).object_key
     assert wired["service"].units(aid)
 
@@ -446,12 +515,23 @@ def test_empty_body_is_rejected(client: TestClient, wired: dict[str, Any]) -> No
 def test_non_utf8_body_is_rejected(
     client: TestClient, wired: dict[str, Any]
 ) -> None:
+    """Raw bytes are the contract: undecodable content still uploads, and
+    the typed rejection is named when preparation reads it back.
+    """
     response = client.post(
         f"/api/threads/{wired['thread_id']}/attachments",
         content=b"\xff\xfe\x00\x01",
     )
-    assert response.status_code == 400
-    assert response.json() == {"error": "attachment_not_text"}
+    assert response.status_code == 200, response.text
+    uploaded = response.json()
+    assert uploaded["status"] == "uploaded"
+    assert uploaded["failure_reason"] is None
+
+    rejected = _prepare_through_door(
+        client, wired["thread_id"], uploaded["attachment_id"]
+    )
+    assert rejected["status"] == "failed"
+    assert rejected["failure_reason"] == "attachment_not_text"
 
 
 def test_unknown_thread_upload_is_404(
@@ -528,6 +608,7 @@ def test_redriving_a_lost_index_keeps_the_published_version_addressable(
     # already cited has to survive an attempt that then fails.
     body = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
     attachment_id = body["attachment_id"]
+    _prepare_through_door(client, wired["thread_id"], attachment_id)
     published = wired["service"].status(attachment_id)
     assert published.status == "ready"
 
@@ -579,6 +660,10 @@ def test_the_list_door_reports_a_row_that_lost_its_index_as_parsing(
 ) -> None:
     published = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
     lost = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
+    for attachment in (published, lost):
+        _prepare_through_door(
+            client, wired["thread_id"], attachment["attachment_id"]
+        )
     wired["service"].store.clear_index(lost["attachment_id"])
 
     listed = client.get(f"/api/threads/{wired['thread_id']}/attachments")
