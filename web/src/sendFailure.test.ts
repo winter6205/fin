@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
+  AttachmentUploadInProgressError,
   ConcurrentRunError,
   IngestMissingError,
   KnowledgeMcpFaultError,
 } from "./api";
-import { classifySendFailure, describeSendFailure } from "./sendFailure";
+import {
+  classifySendFailure,
+  describeSendFailure,
+  describeThreadCreateFailure,
+} from "./sendFailure";
 
 describe("classifySendFailure", () => {
   it("maps the 409 typed EXIT to concurrent_run", () => {
@@ -77,5 +82,29 @@ describe("describeSendFailure", () => {
 
   it("says something even when the rejection is not an Error", () => {
     expect(describeSendFailure(undefined).message.length).toBeGreaterThan(0);
+  });
+
+  it("names an in-flight upload as its own kind, not a held run", () => {
+    const gate = new AttachmentUploadInProgressError();
+    expect(classifySendFailure(gate)).toBe("attachment_upload_in_progress");
+    expect(classifySendFailure(gate)).not.toBe("concurrent_run");
+    const notice = describeSendFailure(gate);
+    expect(notice.message).toContain("上传");
+    expect(notice.message).not.toContain("还有一轮在运行");
+    expect(notice.message).not.toContain("attachment_upload_in_progress");
+  });
+});
+
+describe("describeThreadCreateFailure", () => {
+  it("refuses a new conversation during an upload without the send wording", () => {
+    // 新建 thread has no draft, so the create copy must not promise a
+    // put-back, and must not leak the wire code.
+    const notice = describeThreadCreateFailure(
+      new AttachmentUploadInProgressError(),
+    );
+    expect(notice.kind).toBe("attachment_upload_in_progress");
+    expect(notice.message).toContain("上传");
+    expect(notice.message).not.toContain("放回输入框");
+    expect(notice.message).not.toContain("attachment_upload_in_progress");
   });
 });

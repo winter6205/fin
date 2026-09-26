@@ -23,6 +23,10 @@ It also owns the mis-wired-criteria containment client (see
 question never reaches the wire" with their own private copy of the same
 sentinel transport and fake config — one fixture is how the two lanes'
 containment semantics cannot drift apart.
+
+And the ``deployed_attachment_bounds`` boot fixture: ``serve()`` refuses a
+deployment that cannot state its four attachment bounds, so every boot test
+about something else needs that bound from one place.
 """
 
 from __future__ import annotations
@@ -127,6 +131,41 @@ def _memory_on_env_for_marked_tests(
     if request.node.get_closest_marker("memory_on") is None:
         return
     monkeypatch.setenv("FIN_MEMORY_ENABLED", "true")
+
+
+_ATTACHMENT_BOUND_KEYS = (
+    "FIN_ATTACHMENT_MAX_BYTES",
+    "FIN_ATTACHMENT_MAX_PDF_PAGES",
+    "FIN_ATTACHMENT_VISION_CALLS_PER_RUN",
+    "FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN",
+)
+
+
+@pytest.fixture
+def deployed_attachment_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deploy the four attachment bounds as ``.env.example`` ships them.
+
+    ``serve()`` reads the bounds before it binds, so any boot-level test that
+    is about something else has to state a usable bound first or it aborts for
+    the wrong reason. The values come from the template rather than a copy
+    here, so a bound that stops matching its measured source fails the test
+    that pins it instead of being blessed by this one. The composition root
+    caches one bound set per process, so a test that deploys an environ has to
+    pin the cache with it.
+    """
+    import fin.host.http as http_module
+    from fin.host.operator_env import parse_env_file
+
+    deployed = parse_env_file(
+        (Path(__file__).resolve().parents[2] / ".env.example").read_text()
+    )
+    missing = [key for key in _ATTACHMENT_BOUND_KEYS if key not in deployed]
+    assert not missing, f".env.example lost {missing}"
+    monkeypatch.setattr(
+        http_module, "_http_attachment_budgets_singleton", None, raising=False
+    )
+    for key in _ATTACHMENT_BOUND_KEYS:
+        monkeypatch.setenv(key, deployed[key])
 
 
 # ----- mis-wired-criteria containment: one shared never-sent client -----

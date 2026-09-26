@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import threading
 import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
@@ -70,7 +71,7 @@ def _create(
 def _prepare(
     store: InMemoryAttachmentStore, thread_id: str, *, version: int = 1
 ) -> AttachmentRecord:
-    """A ``parsing`` row with BOTH derived layers written for ``version``."""
+    """An accepted row with BOTH derived layers written for ``version``."""
     record = _create(store, thread_id)
     store.record_units(attachment_id=record.attachment_id, version=version, units=UNITS)
     store.put_index(
@@ -79,10 +80,20 @@ def _prepare(
     return record
 
 
+def _force_parsing(store: InMemoryAttachmentStore, attachment_id: str) -> None:
+    """Pin the stored shape of a row whose preparation has already started.
+
+    Production writes ``parsing`` only from the graph-triggered preparation
+    job, so the resume surface is exercised against the row shape itself.
+    """
+    cell = store._attachments[attachment_id]
+    cell.record = replace(cell.record, status="parsing")
+
+
 # ----- create / get / list -----
 
 
-def test_create_starts_in_parsing_with_no_parsed_version() -> None:
+def test_create_starts_in_uploaded_with_no_parsed_version() -> None:
     _, store, thread_id = _threads_and_store()
 
     record = _create(store, thread_id, attachment_id="att-1")
@@ -93,7 +104,7 @@ def test_create_starts_in_parsing_with_no_parsed_version() -> None:
     assert record.size_bytes == 1_024
     assert record.sha256 == "ab" * 32
     assert record.object_key == f"threads/{thread_id}/att-1"
-    assert record.status == "parsing"
+    assert record.status == "uploaded"
     assert record.version == 0
     assert record.unit_count == 0
     assert record.indexed is False
@@ -247,7 +258,7 @@ def test_clear_units_drops_every_version_and_leaves_status_alone() -> None:
 
     assert store.units(aid, 1) == ()
     assert store.units(aid, 2) == ()
-    assert store.get(aid).status == "parsing"
+    assert store.get(aid).status == "uploaded"
 
 
 def test_record_units_on_a_deleted_attachment_raises_thread_gone() -> None:
@@ -366,7 +377,7 @@ def test_mark_ready_refuses_a_version_without_parsed_units() -> None:
     store.put_index(attachment_id=aid, version=1, postings=POSTINGS)
     with pytest.raises(AttachmentStoreError):
         store.mark_ready(attachment_id=aid, version=1, unit_count=2)
-    assert store.get(aid).status == "parsing"
+    assert store.get(aid).status == "uploaded"
 
 
 def test_mark_ready_refuses_a_version_without_index_postings() -> None:
@@ -384,7 +395,7 @@ def test_mark_ready_refuses_a_version_whose_derived_data_landed_elsewhere() -> N
     aid = _prepare(store, thread_id, version=2).attachment_id
     with pytest.raises(AttachmentStoreError):
         store.mark_ready(attachment_id=aid, version=1, unit_count=2)
-    assert store.get(aid).status == "parsing"
+    assert store.get(aid).status == "uploaded"
 
 
 def test_mark_ready_refuses_a_unit_count_that_is_not_on_disk() -> None:
@@ -392,7 +403,7 @@ def test_mark_ready_refuses_a_unit_count_that_is_not_on_disk() -> None:
     aid = _prepare(store, thread_id).attachment_id
     with pytest.raises(AttachmentStoreError):
         store.mark_ready(attachment_id=aid, version=1, unit_count=5)
-    assert store.get(aid).status == "parsing"
+    assert store.get(aid).status == "uploaded"
 
 
 def test_mark_ready_on_a_deleted_attachment_raises_thread_gone() -> None:
@@ -444,7 +455,7 @@ def test_mark_failed_rejects_an_empty_reason() -> None:
     aid = _create(store, thread_id).attachment_id
     with pytest.raises(AttachmentStoreError):
         store.mark_failed(attachment_id=aid, version=1, reason="   ")
-    assert store.get(aid).status == "parsing"
+    assert store.get(aid).status == "uploaded"
 
 
 def test_mark_failed_on_a_deleted_attachment_raises_thread_gone() -> None:
@@ -462,11 +473,26 @@ def test_incomplete_lists_every_parsing_row() -> None:
     _, store, thread_id = _threads_and_store()
     first = _create(store, thread_id)
     second = _create(store, thread_id)
+    _force_parsing(store, first.attachment_id)
+    _force_parsing(store, second.attachment_id)
 
     assert [row.attachment_id for row in store.incomplete()] == [
         first.attachment_id,
         second.attachment_id,
     ]
+
+
+def test_incomplete_does_not_list_uploaded_rows() -> None:
+    """``uploaded`` is durable bytes that nobody asked to prepare yet.
+
+    Listing it would make a restart parse an attachment the operator only
+    stored, which is the upload-trigger behavior ADR 0089 removed.
+    """
+    _, store, thread_id = _threads_and_store()
+    _create(store, thread_id)
+    _create(store, thread_id)
+
+    assert store.incomplete() == []
 
 
 def test_incomplete_lists_a_ready_row_whose_index_was_lost() -> None:
@@ -667,13 +693,13 @@ def _pg_create(store: Any, thread_id: str, *, attachment_id: str | None = None) 
     return _create(store, thread_id, attachment_id=attachment_id)
 
 
-def test_postgres_round_trip_parsing_to_ready(pg: tuple[Any, Any]) -> None:
+def test_postgres_round_trip_uploaded_to_ready(pg: tuple[Any, Any]) -> None:
     threads, store = pg
     thread = threads.create_thread(title="pg attach")
     aid = f"pg-{uuid.uuid4().hex[:8]}"
 
     record = _pg_create(store, thread.id, attachment_id=aid)
-    assert record.status == "parsing"
+    assert record.status == "uploaded"
     assert record.version == 0
 
     assert store.record_units(attachment_id=aid, version=1, units=UNITS) == 2
@@ -761,7 +787,7 @@ def test_postgres_mark_ready_refuses_missing_derived_data(
 
     with pytest.raises(AttachmentStoreError):
         store.mark_ready(attachment_id=aid, version=1, unit_count=2)
-    assert store.get(aid).status == "parsing"
+    assert store.get(aid).status == "uploaded"
 
     store.put_index(attachment_id=aid, version=1, postings=POSTINGS)
     store.clear_index(aid)
@@ -783,3 +809,11 @@ def test_postgres_incomplete_after_index_loss(pg: tuple[Any, Any]) -> None:
 
     assert [row.attachment_id for row in store.incomplete()] == [aid]
     assert store.delete_for_thread(thread.id) == [f"threads/{thread.id}/{aid}"]
+
+
+def test_postgres_incomplete_does_not_list_uploaded_rows(pg: tuple[Any, Any]) -> None:
+    threads, store = pg
+    thread = threads.create_thread(title="pg uploaded idle")
+    _pg_create(store, thread.id, attachment_id=f"pg-{uuid.uuid4().hex[:8]}")
+
+    assert store.incomplete() == []

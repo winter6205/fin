@@ -158,6 +158,14 @@ export FIN_RETRIEVE_ADAPTER="${FIN_RETRIEVE_ADAPTER:-mcp}"
 export FIN_BASE_URL="${FIN_BASE_URL:-https://api.minimaxi.com/v1}"
 export FIN_MODEL="${FIN_MODEL:-MiniMax-M3}"
 
+# serve() reads all four attachment bounds before it binds, so a tree whose
+# .env predates them would not come up at all. These are the .env.example
+# values; a value set above (process env or .env) still wins.
+export FIN_ATTACHMENT_MAX_BYTES="${FIN_ATTACHMENT_MAX_BYTES:-4194304}"
+export FIN_ATTACHMENT_MAX_PDF_PAGES="${FIN_ATTACHMENT_MAX_PDF_PAGES:-80}"
+export FIN_ATTACHMENT_VISION_CALLS_PER_RUN="${FIN_ATTACHMENT_VISION_CALLS_PER_RUN:-88}"
+export FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN="${FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN:-8}"
+
 export GRAPHRAG_MEMORY_STORAGE="${GRAPHRAG_MEMORY_STORAGE:-pgvector}"
 export GRAPHRAG_MEMORY_DB_URL="${GRAPHRAG_MEMORY_DB_URL:-postgresql://iknow_memory:iknow_memory@localhost:5432/iknow_memory}"
 export GRAPHRAG_MEMORY_NEO4J_URI="${GRAPHRAG_MEMORY_NEO4J_URI:-bolt://localhost:7687}"

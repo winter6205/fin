@@ -1,8 +1,8 @@
 // Composer: textarea; Enter sends, Shift+Enter newline; disabled while
-// the active run is in flight; empty submit is a no-op (server also
-// enforces 204).
+// the active run is in flight or while an attachment upload is still
+// running; empty submit is a no-op (server also enforces 204).
 //
-// ADRs 0047/0086: the thread-attach door lives
+// ADRs 0047/0089: the thread-attach door lives
 // here — a file picker button AND a drop on the composer both upload
 // the file to POST /threads/{id}/attachments. Attachments persist for
 // the WHOLE thread (no longer one-use): each send names the READY ones
@@ -12,16 +12,30 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
+  ATTACH_ONE_FILING_HINT,
+  ATTACH_UPLOAD_IN_FLIGHT_HINT,
   describeAttachFailure,
   describeAttachmentStatus,
   type AttachFailureNotice,
 } from "../attachFailure";
 import { AttachFailedError } from "../api";
 import { describeSendFailure, type SendFailureNotice } from "../sendFailure";
-import { attachmentsForSend, useWorkspaceStore } from "../store";
+import { attachmentsForSend, hasUploadInFlight, useWorkspaceStore } from "../store";
 
 interface ComposerProps {
   threadId: string;
+}
+
+/**
+ * Why the send is unavailable, and what the control says about it.
+ *
+ * ``busy`` alone means a RUN is live (it drives Stop and the 运行中
+ * label); an upload holding the door is not a running turn and must not
+ * read as one.
+ */
+function sendGate(busy: boolean, uploadInFlight: boolean) {
+  if (uploadInFlight) return { held: true, label: "上传中…" };
+  return { held: busy, label: busy ? "运行中…" : "发送" };
 }
 
 export default function Composer({ threadId }: ComposerProps) {
@@ -38,6 +52,14 @@ export default function Composer({ threadId }: ComposerProps) {
     (s) => s.resumingThreadId === threadId,
   );
   const busy = sending || threadInFlight || resumingThis;
+  // The upload gate is store state, not local picker state: it holds
+  // for a file the question never mentions, and the same predicate is
+  // what ``sendQuestion`` / ``createThread`` refuse with — so the
+  // control and the store can never disagree about who is blocked.
+  const uploadInFlight = useWorkspaceStore((s) =>
+    hasUploadInFlight(s.pendingUploads),
+  );
+  const { held, label: sendLabel } = sendGate(busy, uploadInFlight);
   // T4 workflow (the tracked change): Stop ends the in-flight run on this thread.
   // Shown only while something is running — the host answers 204 on an
   // idle thread, so a stale click is harmless, but a permanently
@@ -83,7 +105,7 @@ export default function Composer({ threadId }: ComposerProps) {
   }, [threadId, loadAttachments]);
 
   const attach = async (file: File) => {
-    if (attachBusy) return;
+    if (attachBusy || uploadInFlight) return;
     setAttachBusy(true);
     setAttachFailure(null);
     try {
@@ -118,11 +140,16 @@ export default function Composer({ threadId }: ComposerProps) {
   const submit = async () => {
     const q = draft.trim();
     if (!q) return; // Empty submit no-op.
+    // Guarded here, not only by the disabled control: Enter on the
+    // textarea reaches ``submit`` directly, and a send started while an
+    // upload is still writing its bytes is refused by the store anyway.
+    if (held) return;
     setDraft("");
     setFailure(null);
     // The store owns the one reference rule. Only a READY attachment is
-    // named, so a question unrelated to a still-parsing one is never
-    // refused on its account; what was left out is rendered below.
+    // named, so a question unrelated to an uploaded or still-parsing one
+    // is never refused on its account; what was left out is rendered
+    // below.
     const { ids } = attachmentsForSend(attachments);
     try {
       await sendQuestion(threadId, q, thinkingOn, ids);
@@ -239,6 +266,14 @@ export default function Composer({ threadId }: ComposerProps) {
             .join("、")}。就绪后它会自动随后续问题带上。`}
         </p>
       ) : null}
+      {uploadInFlight ? (
+        <p
+          data-testid="attach-upload-pending"
+          className="mb-2 text-xs text-gray-600"
+        >
+          {ATTACH_UPLOAD_IN_FLIGHT_HINT}
+        </p>
+      ) : null}
       {dragOver ? (
         <p
           data-testid="attach-drop-hint"
@@ -258,7 +293,7 @@ export default function Composer({ threadId }: ComposerProps) {
           }
         }}
         placeholder="输入问题…"
-        disabled={busy}
+        disabled={held}
         rows={3}
         className="w-full resize-none border border-black bg-card p-2 text-sm disabled:opacity-50"
       />
@@ -318,6 +353,13 @@ export default function Composer({ threadId }: ComposerProps) {
               本对话内持续可引用，不入库
             </span>
           </span>
+          {/* A turn carrying two max-size attachments cannot fit the
+              configured vision run budget, so the composer says so
+              before the operator uploads. The bound itself belongs to
+              the server and is never quoted here. */}
+          <p data-testid="attach-one-filing-hint" className="text-xs text-gray-400">
+            {ATTACH_ONE_FILING_HINT}
+          </p>
         </div>
         <span className="text-xs text-gray-500">
           Enter 发送 · Shift+Enter 换行
@@ -338,10 +380,10 @@ export default function Composer({ threadId }: ComposerProps) {
         <button
           type="submit"
           data-testid="composer-send"
-          disabled={busy || !draft.trim()}
+          disabled={held || !draft.trim()}
           className="border border-black bg-card px-4 py-1.5 text-sm font-medium hover:bg-accent hover:text-white disabled:opacity-50"
         >
-          {busy ? "运行中…" : "发送"}
+          {sendLabel}
         </button>
       </div>
     </form>

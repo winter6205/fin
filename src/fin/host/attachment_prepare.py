@@ -1,11 +1,17 @@
 """Preparation lifecycle for thread-owned attachments (ADR 0086).
 
-The HTTP door accepts bytes and gets back a ``parsing`` record; this service
-owns what happens after that — freezing the parsed text into versioned
-units, building the thread-private derived index over the same text, and
-publishing ``ready`` only when both are usable. A restart resumes or
-rebuilds whatever is missing instead of trusting a stored status, and
-deleting the thread removes every layer this service created.
+The HTTP door accepts bytes and gets back an ``uploaded`` record; this
+service owns what happens after that, once preparation has been asked
+for — freezing the parsed text into versioned units, building the
+thread-private derived index over the same text, and publishing
+``ready`` only when both are usable. A restart resumes or rebuilds
+whatever is missing instead of trusting a stored status, and deleting
+the thread removes every layer this service created.
+
+``uploaded`` is a deliberate resting state: durable bytes nobody has
+asked to prepare. Recovery repairs rows whose preparation is in flight,
+never an accepted upload, so a restart cannot start work that was never
+requested.
 
 Layered recovery is what makes ``ready`` mean something: raw bytes in the
 object store, parsed units in the attachment store, derived postings on
@@ -95,9 +101,9 @@ def _safe_display_filename(raw: str) -> str:
 def text_rejection_reason(payload: bytes) -> str | None:
     """Name why these bytes cannot be a text attachment, or ``None``.
 
-    One authority for both the HTTP door (reject the upload before any
-    byte is stored) and preparation (name the failure of bytes already
-    stored), so the two can never disagree about what "text" means.
+    Preparation owns this call: the door stores raw bytes without
+    classifying them, so the rejection is what a stored-but-unusable
+    upload is reported as when its preparation runs.
     """
     try:
         payload.decode("utf-8")
@@ -121,11 +127,12 @@ class AttachmentPreparationService:
     def accept(
         self, *, thread_id: str, filename: str, payload: bytes
     ) -> AttachmentRecord:
-        """Store the raw bytes and record the attachment as ``parsing``.
+        """Store the raw bytes and record the attachment as ``uploaded``.
 
-        The bytes land first so an orphan is removable; a store rejection
-        (thread gone mid-upload, backing failure) takes those bytes with it
-        so the door never leaves bytes no record owns.
+        Nothing else happens here: no parse, no OCR, no layout, no vision,
+        no index. The bytes land first so an orphan is removable; a store
+        rejection (thread gone mid-upload, backing failure) takes those
+        bytes with it so the door never leaves bytes no record owns.
         """
         attachment_id = str(uuid.uuid4())
         key = f"thread-attachments/{thread_id}/{attachment_id}"
@@ -173,26 +180,6 @@ class AttachmentPreparationService:
             # version for identical bytes and race a reader that is done.
             return record
         return self._prepare(record, version=record.version + 1)
-
-    def prepare_async(self, attachment_id: str) -> None:
-        """Drive preparation off the request path; failures are recorded."""
-        try:
-            self.prepare(attachment_id)
-        except (AttachmentNotFoundError, AttachmentThreadGoneError):
-            # EXIT: the thread is gone, so there is no reader left to serve
-            # and no row left to leave half-published.
-            logger.info(
-                "attachment preparation lost the race with its thread delete: "
-                "attachment_id=%s",
-                attachment_id,
-            )
-        except AttachmentStoreError:
-            # EXIT: the store itself refused the status write, so the row
-            # stays ``parsing`` and the next restart re-drives it here.
-            logger.exception(
-                "attachment preparation could not be recorded: attachment_id=%s",
-                attachment_id,
-            )
 
     def _prepare(self, record: AttachmentRecord, *, version: int) -> AttachmentRecord:
         attachment_id = record.attachment_id
@@ -256,8 +243,10 @@ class AttachmentPreparationService:
         self, filename: str, payload: bytes
     ) -> tuple[ParsedAttachmentUnit, ...] | str:
         """Freeze the payload into versioned units, or name why it cannot be."""
-        # The door admits text only until document-type classification lands,
-        # so the whole decoded file is one frozen unit addressed as unit 1.
+        # This is where an upload the door could not classify is finally
+        # read: until document-type handling lands, only bytes that decode
+        # as UTF-8 become text, and the whole file is one unit addressed as
+        # unit 1.
         rejected = text_rejection_reason(payload)
         if rejected:
             return rejected
