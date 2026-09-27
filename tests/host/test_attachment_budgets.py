@@ -940,6 +940,11 @@ def _stage_serve(
         http_module, "publish_knowledge_mcp", lambda: published.append("probe")
     )
     monkeypatch.setattr(http_module, "compile_for_http", lambda: None)
+    # The ingest worker drain is another boot collaborator, not what a
+    # bound test exercises: stubbed so a staged boot never acquires the
+    # real thread or builds the real service.
+    monkeypatch.setattr(http_module, "start_ingest_worker", lambda: None)
+    monkeypatch.setattr(http_module, "stop_ingest_worker", lambda: None)
     monkeypatch.setattr(uvicorn, "run", lambda *a, **k: served.append("uvicorn"))
     return served, published
 

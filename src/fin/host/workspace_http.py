@@ -199,6 +199,8 @@ from fin.corpus.ingest_endpoint import (
     IngestUploadTooLargeError,
 )
 from fin.corpus.ingest_state_errors import UnknownJobError
+from fin.corpus.ingest_worker import IngestWorker
+from fin.corpus.pushed_records import PushedRecordsStore
 from fin.host.attachment_budgets import AttachmentBudgets
 from fin.host.attachment_prepare import (
     AttachmentCleanupError,
@@ -280,6 +282,8 @@ from fin.host.watchlist import (
 from fin.host.workspace_registry import default_workspace_root
 from fin.retrieve.fake_push_port import FakePushPort
 from fin.retrieve.invalidation_port.errors import InvalidationError
+from fin.retrieve.invalidation_port.ledger import InvalidationLedger
+from fin.retrieve.push_batching import PushJournal
 from fin.retrieve.push_port import PushError
 
 
@@ -2078,6 +2082,48 @@ def _record_ingested_filing(doc: IngestedDocument) -> None:
         )
 
 
+# The three durable append-only journals the ingest service owns between
+# pushes: the push batch journal (resume across processes), the
+# invalidation ledger (settled closures), and the pushed-record journal
+# (what a replacement upload must close). Each defaults to the catalog's
+# own data dir — the visible ``data/corpus`` the ``GET /api/corpus``
+# route reads — and each is individually relocatable by env var, so a
+# deployment moves the ingest journals as typed config, never as a
+# silent temp dir. Constructing the service never writes these files;
+# the first append does.
+_PUSH_JOURNAL_PATH_ENV: Final[str] = "FIN_CORPUS_PUSH_JOURNAL_PATH"
+_INVALIDATION_LEDGER_PATH_ENV: Final[str] = "FIN_CORPUS_INVALIDATION_LEDGER_PATH"
+_PUSHED_RECORDS_PATH_ENV: Final[str] = "FIN_CORPUS_PUSHED_RECORDS_PATH"
+
+
+def _configured_journal_path(env_var: str, default: Path) -> Path:
+    configured = (os.environ.get(env_var) or "").strip()
+    return Path(configured) if configured else default
+
+
+def _ingest_components(*, catalog_path: Path | None = None) -> dict[str, Path]:
+    """Where the three durable ingest journals live.
+
+    The default sits beside the catalog (``DEFAULT_CATALOG_PATH``'s
+    parent) so one visible data dir holds all ingest state; an env var
+    overrides one journal without moving the others.
+    """
+    from fin.corpus.catalog import DEFAULT_CATALOG_PATH
+
+    data_dir = Path(catalog_path or DEFAULT_CATALOG_PATH).parent
+    return {
+        "push_journal_path": _configured_journal_path(
+            _PUSH_JOURNAL_PATH_ENV, data_dir / "push_journal.jsonl"
+        ),
+        "invalidation_ledger_path": _configured_journal_path(
+            _INVALIDATION_LEDGER_PATH_ENV, data_dir / "invalidation_ledger.jsonl"
+        ),
+        "pushed_records_path": _configured_journal_path(
+            _PUSHED_RECORDS_PATH_ENV, data_dir / "pushed_records.jsonl"
+        ),
+    }
+
+
 def _ingest_ports_from_env() -> tuple[Any, Any, Any]:
     """The three accept-time ports of the durable ingest door.
 
@@ -2092,6 +2138,42 @@ def _ingest_ports_from_env() -> tuple[Any, Any, Any]:
 
     ports = preflight_ingest_storage()
     return ports.objects, ports.pointers, ports.states
+
+
+class _JournaledIngestEndpoint(IngestEndpoint):
+    """The product endpoint: every successful push also journals its records.
+
+    ``IngestedDocument`` carries no records, so the ``on_ingested`` hook
+    cannot persist them; this subclass journals the full ``PushRecord``
+    rows after ``ingest`` returns, keyed ``(document_id, version)``. The
+    journal is what makes the replacement closure real: the accept door's
+    ``previous_records`` provider reads it, so a version's stale blocks
+    are still closable after the process that pushed them is gone.
+
+    Journaling failure warns with the same posture as catalog failure —
+    the push already stands — and never fails the ingest.
+    """
+
+    def __init__(
+        self, *, pushed_records_store: PushedRecordsStore, **kwargs: Any
+    ) -> None:
+        super().__init__(**kwargs)
+        self._pushed_records_store = pushed_records_store
+
+    def ingest(self, data: bytes, **kwargs: Any) -> Any:
+        result = super().ingest(data, **kwargs)
+        try:
+            self._pushed_records_store.replace(
+                result.document_id, result.version, result.records
+            )
+        except Exception as exc:
+            logger.warning(
+                "ingest: pushed-record journaling failed for %s "
+                "(the push stands): %s",
+                result.document_id,
+                exc,
+            )
+        return result
 
 
 def _build_default_ingest_service() -> IngestEndpoint:
@@ -2112,6 +2194,16 @@ def _build_default_ingest_service() -> IngestEndpoint:
     job state), so the durable accept of a fake boot exercises the real
     port contracts rather than a second, weaker contract.
 
+    Both kinds also get the three durable journals from
+    :func:`_ingest_components`: a path-backed ``PushJournal`` (batch
+    resume outlives the process), a path-backed ``InvalidationLedger``
+    (settled closures stay queryable), and a path-backed
+    ``PushedRecordsStore`` whose zero-argument reader is the
+    ``previous_records`` provider. Without that provider the
+    replacement stale-block closure at the accept door is the
+    documented no-op; with it a shipped boot closes the superseded
+    version's blocks on every replacement upload.
+
     Both kinds wire ``on_ingested`` to :func:`_record_ingested_filing`
     so a pushed filing is registered in the same catalog table the
     ``GET /api/corpus`` route lists — a fake boot is a real product
@@ -2121,27 +2213,44 @@ def _build_default_ingest_service() -> IngestEndpoint:
     """
     from fin.host.operator_env import resolve_retrieve_adapter_kind
 
+    components = _ingest_components()
+    pushed_records_store = PushedRecordsStore(
+        path=components["pushed_records_path"]
+    )
+    journal_wiring: dict[str, Any] = {
+        "journal": PushJournal(path=components["push_journal_path"]),
+        "invalidation_ledger": InvalidationLedger(
+            path=components["invalidation_ledger_path"]
+        ),
+        # zero-arg provider shape the endpoint seam documents; the
+        # planner filters this view by document and skips the incoming
+        # version, so a same-version re-push plans no targets.
+        "previous_records": pushed_records_store.all_records,
+        "pushed_records_store": pushed_records_store,
+    }
     objects, pointers, states = _ingest_ports_from_env()
     if resolve_retrieve_adapter_kind() == "fake":
         shared: FakePushPort = FakePushPort()
-        return IngestEndpoint(
+        return _JournaledIngestEndpoint(
             push_port=shared,
             invalidation_port=shared,
             on_ingested=_record_ingested_filing,
             object_store=objects,
             metadata_store=pointers,
             state_store=states,
+            **journal_wiring,
         )
     from fin.retrieve.mcp_invalidation_port import MCPInvalidationPort
     from fin.retrieve.mcp_push_port import MCPPushPort
 
-    return IngestEndpoint(
+    return _JournaledIngestEndpoint(
         push_port=MCPPushPort(),
         invalidation_port=MCPInvalidationPort(),
         on_ingested=_record_ingested_filing,
         object_store=objects,
         metadata_store=pointers,
         state_store=states,
+        **journal_wiring,
     )
 
 
@@ -2159,6 +2268,166 @@ def get_ingest_service() -> IngestEndpoint:
         if _ingest_service_singleton is None:
             _ingest_service_singleton = _build_default_ingest_service()
         return _ingest_service_singleton
+
+
+# The durable ingest queue's execution side: one drain loop per process,
+# started only from the boot path (``fin.host.http.serve``). Nothing here
+# runs at import — the suite imports this module heavily and must never
+# acquire a background thread unless a test opts in by calling
+# ``start_ingest_worker`` itself.
+_ingest_worker_thread: threading.Thread | None = None
+_ingest_worker_stop_event: threading.Event | None = None
+_ingest_worker_lock = threading.Lock()
+
+
+class IngestWorkerStoppingError(RuntimeError):
+    """Start refused while a timed-out stop's thread is still draining.
+
+    The singleton guard of :func:`start_ingest_worker`: a stop whose
+    join times out keeps the live thread registered, and a start over it
+    would run a second drain loop in one process. Callers retry once the
+    old sweep finishes (the durable store makes waiting cheap; the loop
+    exits through its stop_event on its own).
+    """
+
+    code = "ingest_worker_stopping"
+
+#: Seconds between queue re-checks after the startup drain. Bounded so
+#: a submit landing between two checks still runs within one interval.
+INGEST_WORKER_CHECK_INTERVAL_SECONDS: Final[float] = 30.0
+
+INGEST_WORKER_THREAD_NAME: Final[str] = "fin-ingest-worker"
+
+
+def _ingest_worker_journal_dir() -> Path:
+    """The durable directory for the boot worker's per-document journals.
+
+    Sits beside the configured push journal (same data dir, env override
+    honored), so restart-replayed runs skip exactly the batches that
+    already landed instead of starting from a blank journal.
+    """
+    components = _ingest_components()
+    return Path(components["push_journal_path"]).parent / "ingest_worker_journals"
+
+
+def _drain_ingest_queue(
+    worker: IngestWorker,
+    stop_event: threading.Event,
+    check_interval_seconds: float,
+) -> None:
+    """Startup drain, then a bounded periodic re-check, until stopped.
+
+    The chosen boot posture is startup drain + periodic re-check (not
+    event-on-submit): it satisfies "resume after restart" from the
+    durable store alone, and a job submitted later still runs within one
+    interval, without the HTTP accept door gaining any execution
+    coupling. Posture on a failing drain: log with exception context
+    and keep the loop — the durable store plus the journals make the
+    next sweep the recovery, so a transient store outage must not kill
+    the only executor in the process. Silent thread death is the failure
+    mode this rule excludes; the loop exits only through ``stop_event``.
+    """
+    while True:
+        try:
+            worker.run_pending()
+        except Exception:
+            logger.exception(
+                "ingest worker: drain failed; continuing to the next check"
+            )
+        if stop_event.wait(check_interval_seconds):
+            return
+
+
+def start_ingest_worker(
+    *,
+    endpoint: IngestEndpoint | None = None,
+    journal_dir: Path | None = None,
+    check_interval_seconds: float | None = None,
+) -> threading.Thread:
+    """Start the process's single durable ingest drain (idempotent).
+
+    The boot path for the durable resume clause: a fresh
+    :class:`IngestWorker` over ``get_ingest_service()`` (unless an
+    endpoint is injected)
+    discovers every resumable job from the durable state store and
+    drives it — queued, failed and interrupted jobs alike, with no
+    re-upload. Calling this again while the loop is alive returns the
+    existing thread without building a second worker (one executor per
+    process; the claim CAS still guards two processes). A live thread
+    whose stop_event is already set is a timed-out stop still draining:
+    this start raises :class:`IngestWorkerStoppingError` rather than
+    replace it, because the dying loop would leave the process with no
+    executor and (if a second were spawned) a window of two. The thread
+    is a daemon so a host that forgets to stop never blocks interpreter
+    exit; ``stop_ingest_worker`` is the clean shutdown.
+    """
+    global _ingest_worker_thread, _ingest_worker_stop_event
+    with _ingest_worker_lock:
+        current = _ingest_worker_thread
+        if current is not None and current.is_alive():
+            if (
+                _ingest_worker_stop_event is not None
+                and _ingest_worker_stop_event.is_set()
+            ):
+                raise IngestWorkerStoppingError(
+                    "the ingest worker is stopping (a prior stop join "
+                    "timed out); start again once its thread exits"
+                )
+            return current
+        service = endpoint if endpoint is not None else get_ingest_service()
+        worker = IngestWorker(
+            service,
+            journal_dir=(
+                journal_dir
+                if journal_dir is not None
+                else _ingest_worker_journal_dir()
+            ),
+        )
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=_drain_ingest_queue,
+            args=(
+                worker,
+                stop_event,
+                (
+                    check_interval_seconds
+                    if check_interval_seconds is not None
+                    else INGEST_WORKER_CHECK_INTERVAL_SECONDS
+                ),
+            ),
+            name=INGEST_WORKER_THREAD_NAME,
+            daemon=True,
+        )
+        _ingest_worker_stop_event = stop_event
+        _ingest_worker_thread = thread
+        thread.start()
+        return thread
+
+
+def stop_ingest_worker(*, timeout: float = 60.0) -> None:
+    """Signal the drain loop to exit and join it. Idempotent.
+
+    The in-flight sweep finishes its current job first (a half-run job
+    is exactly what the next boot's startup drain resumes), then the
+    loop returns. Stopping a worker that was never started is a no-op.
+    The globals are cleared only after the join confirms the thread
+    exited; on a join timeout the live thread stays registered — the
+    stopped tombstone — so ``start_ingest_worker`` refuses it
+    (:class:`IngestWorkerStoppingError`) instead of letting two drain
+    loops share the process.
+    """
+    global _ingest_worker_thread, _ingest_worker_stop_event
+    with _ingest_worker_lock:
+        if _ingest_worker_stop_event is not None:
+            _ingest_worker_stop_event.set()
+        thread = _ingest_worker_thread
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=timeout)
+    if thread is not None and not thread.is_alive():
+        with _ingest_worker_lock:
+            if _ingest_worker_thread is thread:
+                _ingest_worker_thread = None
+                _ingest_worker_stop_event = None
 
 
 # One attachment service per process, over the env-selected thread store
@@ -3751,8 +4020,9 @@ def build_router(
 
         The ONLY product surface that takes a company document into the
         permanent corpus (ADR 0047). It is **accept-and-persist**: parse,
-        切分 and push run asynchronously off the request (the worker is a
-        later ticket), so a 200 here says the upload is durable and queued,
+        切分 and push run asynchronously off the request (drained by the
+        boot worker, :func:`start_ingest_worker`), so a 200 here says the
+        upload is durable and queued,
         never that anything was ingested — ``accepted`` replaced the old
         ``ingested`` token, and the outcome is polled at
         ``GET /api/corpus/ingest/{job_id}``.
@@ -3924,10 +4194,13 @@ def mount(
 
 
 __all__ = [
+    "IngestWorkerStoppingError",
     "build_router",
     "default_attachment_service",
     "default_workspace_root_for_process",
     "get_ingest_service",
     "get_workspace_root",
     "mount",
+    "start_ingest_worker",
+    "stop_ingest_worker",
 ]

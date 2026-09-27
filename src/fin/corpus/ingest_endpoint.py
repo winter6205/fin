@@ -1,6 +1,6 @@
 """The corpus ingest endpoint service (corpus-serve-ingest, ADR 0047).
 
-This module owns two ingest entry points on one endpoint:
+This module owns three ingest entry points on one endpoint:
 
 * **durable accept** — :meth:`IngestEndpoint.submit_durable` is the HTTP
   door: it makes the raw object, its metadata pointer, a queued job
@@ -54,6 +54,15 @@ This module owns two ingest entry points on one endpoint:
    (``record_filings``) consumes: ``{document_id, company, period,
    version, page_count}``. The hook's own failures propagate typed.
 
+* **the durable execution** — :meth:`IngestEndpoint.run_durable` drives
+  a job :meth:`submit_durable` persisted: it claims the job with a
+  compare-and-set, reads the raw bytes back through the durable pointer,
+  runs the synchronous chain above under a per-document push journal,
+  and walks the state machine to ``ready``; every stage failure lands as
+  a typed ``failed`` job the retry edge can pick up. A job another live
+  worker owns is never failed: every busy the run's transitions can
+  raise — claim, adoption, or landing — reports the typed busy join.
+
 The HTTP surface (``fin.host.workspace_http``) and a future CLI both
 construct :class:`IngestEndpoint` with their own ports; this module
 never reads the environment and never imports FastAPI.
@@ -83,7 +92,12 @@ from fin.corpus.chunking import (
 from fin.corpus.doc_type import classify_page
 from fin.corpus.errors import UnsupportedFormatParseError
 from fin.corpus.ingest_state import IngestJob, IngestState
-from fin.corpus.ingest_state_errors import DuplicateJobError, UnknownJobError
+from fin.corpus.ingest_state_errors import (
+    DuplicateJobError,
+    IngestBusyError,
+    IngestStepError,
+    UnknownJobError,
+)
 from fin.corpus.invalidation import (
     VersionChange,
     plan_invalidations,
@@ -155,6 +169,17 @@ _FORMAT_CONTENT_TYPES: Final[dict[str, str]] = {
     "md": "text/markdown",
     "txt": "text/plain",
 }
+
+# Media type -> parser format. The durable worker resolves the format
+# back from the accepted pointer, so the media types must stay one-to-one
+# with the formats above; a collision would silently pick a parser.
+_CONTENT_TYPE_FORMATS: Final[dict[str, str]] = {
+    media: fmt for fmt, media in _FORMAT_CONTENT_TYPES.items()
+}
+if len(_CONTENT_TYPE_FORMATS) != len(_FORMAT_CONTENT_TYPES):  # pragma: no cover
+    raise RuntimeError(
+        "the format table's media types are not one-to-one with its formats"
+    )
 
 
 class IngestEndpointError(RuntimeError):
@@ -305,6 +330,11 @@ class IngestEndpointResult:
     records: tuple[PushRecord, ...]
     invalidation: InvalidationOutcome | None
     content_identities: Mapping[str, str] = field(default_factory=dict)
+    #: The wire envelopes this run pushed, in order. A resuming run needs
+    #: them to re-read the identity of batches its journal skipped (an
+    #: idempotent re-push returns the stored pair); the completing map is
+    #: persisted on the durable ``cataloging -> ready`` edge.
+    envelopes: tuple[PushEnvelope, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -355,6 +385,28 @@ class IngestJobStatus:
     def text_ready(self) -> bool:
         """Whether the chunk/text side of the pipeline has landed."""
         return self.state is IngestState.READY
+
+
+@dataclass(frozen=True)
+class DurableRunOutcome:
+    """What one :meth:`IngestEndpoint.run_durable` call reports.
+
+    ``state`` is the job's persisted state after the call — never a
+    local guess. ``ran`` says this call executed the chain (through to
+    ``ready`` or to a typed ``failed``); a losing concurrent claim
+    reports ``busy`` with the state it found, and a job already
+    ``ready`` reports a plain join. ``error`` is the typed
+    :class:`~fin.corpus.ingest_state_errors.IngestStepError` recorded
+    on the job when the run failed.
+    """
+
+    document_id: str
+    version: str
+    state: IngestState
+    ran: bool
+    busy: bool
+    result: IngestEndpointResult | None = None
+    error: IngestStepError | None = None
 
 
 def resolve_format(
@@ -621,6 +673,7 @@ class IngestEndpoint:
         period: str | None = None,
         doc_type: str | None = None,
         previous_records: Callable[[], Sequence[PushRecord]] | None = None,
+        journal: PushJournal | None = None,
     ) -> IngestEndpointResult:
         """Run the full chain on one upload (see module docstring).
 
@@ -631,6 +684,11 @@ class IngestEndpoint:
         hook) leaves the idempotent push in place and is the caller's
         signal to retry. The pre-parse validations live in
         :meth:`_validate_upload`.
+
+        ``journal`` overrides the endpoint's push journal for this run
+        only — the durable worker hands in a per-document journal whose
+        completed batches survive a restart, so a replay skips exactly
+        the batches that already landed.
         """
         fmt, doc_id, company, period = self._validate_upload(
             data,
@@ -663,9 +721,7 @@ class IngestEndpoint:
         push_outcome = push_in_batches(
             self._push_port,
             envelopes,
-            journal=(
-                self._journal if self._journal is not None else PushJournal()
-            ),
+            journal=self._journal_for_run(journal),
         )
         invalidation = self._invalidate_stale(
             doc_id=doc_id,
@@ -703,6 +759,7 @@ class IngestEndpoint:
             records=records,
             invalidation=invalidation,
             content_identities=push_outcome.content_identities,
+            envelopes=envelopes,
         )
 
     def _invalidate_stale(
@@ -738,6 +795,16 @@ class IngestEndpoint:
             targets,
             ledger=self._invalidation_ledger,
         )
+
+    def _journal_for_run(
+        self, journal: PushJournal | None
+    ) -> PushJournal:
+        """This run's push journal: per-run override, endpoint-owned, fresh."""
+        if journal is not None:
+            return journal
+        if self._journal is not None:
+            return self._journal
+        return PushJournal()
 
     def submit_durable(
         self,
@@ -1044,6 +1111,324 @@ class IngestEndpoint:
             error_message=job.error_message,
         )
 
+    def run_durable(
+        self,
+        document_id: str,
+        *,
+        journal: PushJournal | None = None,
+        actor: str | None = None,
+    ) -> DurableRunOutcome:
+        """Drive one accepted job through the state machine to ``ready``.
+
+        This is the worker-side composition of :meth:`submit_durable`'s
+        persistence and the synchronous chain: the raw bytes are read
+        back through the durable pointer, the format is the one the
+        accept recorded, and the existing transitions carry the run
+        ``fetching -> extracting -> cataloging -> ready``. Nothing is
+        re-uploaded and no second pipeline exists — :meth:`ingest` is
+        the single splitter.
+
+        The claim is a compare-and-set (``expected_state``): a
+        ``pending`` or ``failed`` job is taken into ``fetching`` only by
+        the worker whose CAS lands, so a concurrent worker for the same
+        version gets the typed busy outcome instead of double-running.
+        A job found mid-run (``fetching``/``extracting``/``ocr``/
+        ``cataloging``) is interrupted work a restart must resume; a
+        ``ready`` job is a no-op join.
+
+        Any stage failure lands on the job as typed ``failed`` with
+        ``error_type`` / ``error_message`` (``job_status`` reads it
+        back); the ``failed -> fetching`` retry edge plus the per-
+        document push journal keep the replay retryable and idempotent.
+        ``ready`` is reached only after the whole chain settled, so a
+        partial push is never reported complete. The completing run
+        persists the authoritative ``content_identities`` map on the
+        ``cataloging -> ready`` transition metadata; a restart whose
+        journal skipped batches re-reads those pairs from the service
+        through an idempotent re-push instead of handing out an empty
+        map.
+
+        Every busy the run's own transitions can raise — the claim CAS,
+        an adoption move on a job found mid-run, or the landing edge —
+        reports the typed busy outcome: a concurrent worker joins or
+        gets busy, and a job another live worker owns is never failed.
+        """
+        objects, _pointers, states = self._durable_stores()
+        claim = self._claim_for_run(states, document_id, actor=actor)
+        if isinstance(claim, DurableRunOutcome):
+            return claim
+        version = claim.sha256
+        try:
+            fetched = self._fetch_for_run(
+                objects, states, claim, document_id, actor=actor
+            )
+        except Exception as exc:
+            return self._fail_or_join(
+                states,
+                document_id,
+                step="fetch",
+                cause=exc,
+                actor=actor,
+                version=version,
+            )
+        if isinstance(fetched, DurableRunOutcome):
+            return fetched
+        data, fmt = fetched
+        try:
+            return self._complete_and_land(
+                states,
+                document_id,
+                version=version,
+                data=data,
+                declared_format=fmt,
+                journal=journal,
+                actor=actor,
+            )
+        except Exception as exc:
+            return self._fail_or_join(
+                states,
+                document_id,
+                step="ingest",
+                cause=exc,
+                actor=actor,
+                version=version,
+            )
+
+    def _claim_for_run(
+        self,
+        states: IngestStateStore,
+        document_id: str,
+        *,
+        actor: str | None,
+    ) -> ObjectPointer | DurableRunOutcome:
+        """Take the job for this run, or return the join outcome.
+
+        A ``pending``/``failed`` job is claimed through the CAS into
+        ``fetching``; the CAS loser reports the typed busy join and a
+        ``ready`` job the plain no-op join. Any other state is
+        interrupted work this run adopts. The accepted pointer is read
+        up front because a join outcome still reports its version.
+        """
+        job = states.get_job(document_id)
+        pointer = self._known_pointer(document_id)
+        if pointer is None:
+            raise IngestDurableCommitError(
+                f"job {document_id!r} has no durable object pointer",
+                stage="pointer_read",
+            )
+        version = pointer.sha256
+        if job.state is IngestState.READY:
+            return DurableRunOutcome(
+                document_id=document_id,
+                version=version,
+                state=IngestState.READY,
+                ran=False,
+                busy=False,
+            )
+        if job.state in (IngestState.PENDING, IngestState.FAILED):
+            try:
+                states.transition(
+                    document_id,
+                    IngestState.FETCHING,
+                    actor=actor,
+                    expected_state=job.state,
+                    metadata={"claim_version": version},
+                )
+            except IngestBusyError:
+                return self._busy_outcome(states, document_id, version)
+        return pointer
+
+    def _busy_outcome(
+        self,
+        states: IngestStateStore,
+        document_id: str,
+        version: str,
+    ) -> DurableRunOutcome:
+        """The typed join while another live worker owns the job."""
+        return DurableRunOutcome(
+            document_id=document_id,
+            version=version,
+            state=states.get_job(document_id).state,
+            ran=False,
+            busy=True,
+        )
+
+    def _fetch_for_run(
+        self,
+        objects: ObjectStore,
+        states: IngestStateStore,
+        pointer: ObjectPointer,
+        document_id: str,
+        *,
+        actor: str | None,
+    ) -> tuple[bytes, str] | DurableRunOutcome:
+        """Read the accepted bytes back and drive the job into extraction.
+
+        The bytes must match the accepted digest and the pointer must
+        name a supported format — either way out is a typed failure,
+        never a parse of corrupt or mislabeled input. An adopted job
+        can lose its adoption transition to a live holder that moves
+        first; that busy is the join outcome, not a failure of the
+        other worker's live job.
+        """
+        data = objects.get(pointer.key)
+        if hashlib.sha256(data).hexdigest() != pointer.sha256:
+            raise IngestDurableCommitError(
+                f"the raw object for {document_id!r} no longer matches "
+                "the digest of its accepted pointer",
+                stage="pointer_read",
+            )
+        fmt = _CONTENT_TYPE_FORMATS.get(pointer.content_type or "")
+        if fmt is None:
+            raise IngestFormatUnspecifiedError(
+                f"the accepted pointer for {document_id!r} records no "
+                f"supported format (media type "
+                f"{pointer.content_type!r})"
+            )
+        if states.get_job(document_id).state is IngestState.FETCHING:
+            try:
+                states.transition(
+                    document_id,
+                    IngestState.EXTRACTING,
+                    actor=actor,
+                )
+            except IngestBusyError:
+                return self._busy_outcome(
+                    states, document_id, pointer.sha256
+                )
+        return data, fmt
+
+    def _complete_and_land(
+        self,
+        states: IngestStateStore,
+        document_id: str,
+        *,
+        version: str,
+        data: bytes,
+        declared_format: str,
+        journal: PushJournal | None,
+        actor: str | None,
+    ) -> DurableRunOutcome:
+        """Run the chain and land the finished run on the job.
+
+        The authoritative push identities are completed before the
+        ``cataloging -> ready`` edge carries the job to ``ready``.
+        """
+        result = self.ingest(
+            data,
+            declared_format=declared_format,
+            document_id=document_id,
+            journal=journal,
+        )
+        identities = self._complete_content_identities(result)
+        try:
+            self._drive_to_ready(
+                states, document_id, identities, actor=actor
+            )
+        except IngestBusyError:
+            # A concurrent holder landed the job while this run was
+            # in flight: its re-ran chain was made harmless by the
+            # push's idempotency, and the landing edge is the store's
+            # CAS that says which run owns the ``ready`` generation.
+            # The join is the contract's typed outcome, not a failure.
+            return self._busy_outcome(states, document_id, version)
+        return DurableRunOutcome(
+            document_id=document_id,
+            version=version,
+            state=IngestState.READY,
+            ran=True,
+            busy=False,
+            result=result,
+        )
+
+    def _fail_or_join(
+        self,
+        states: IngestStateStore,
+        document_id: str,
+        *,
+        step: str,
+        cause: BaseException,
+        actor: str | None,
+        version: str,
+    ) -> DurableRunOutcome:
+        """Land a run exception on the job as typed ``failed``.
+
+        A job that reached ``ready`` while this run was in flight
+        belongs to a holder that finished it, so the exception is
+        re-raised rather than failing a completed generation.
+        ``fail_step`` always raises its own typed step error (the
+        store's return type is ``NoReturn``); the failed outcome is
+        built from that error.
+        """
+        if states.get_job(document_id).state is IngestState.READY:
+            raise cause
+        try:
+            states.fail_step(
+                document_id, step=step, cause=cause, actor=actor
+            )
+        except IngestStepError as step_error:
+            return DurableRunOutcome(
+                document_id=document_id,
+                version=version,
+                state=IngestState.FAILED,
+                ran=True,
+                busy=False,
+                error=step_error,
+            )
+
+    def _complete_content_identities(
+        self, result: IngestEndpointResult
+    ) -> dict[str, str]:
+        """The full ``source_ref`` -> identity map for one finished run.
+
+        A journal-skipped batch produces neither a push nor a pair (the
+        pair came back with the run that completed it), so a resuming
+        run re-pushes exactly those envelopes: the store recognizes the
+        unchanged ``(source_ref, body_content_id)`` pair, writes
+        nothing, and returns the stored identity. The identity stays the
+        service's answer; it is never recomputed here.
+        """
+        identities = dict(result.content_identities)
+        missing = tuple(
+            envelope
+            for envelope in result.envelopes
+            if envelope.source_ref not in identities
+        )
+        if not missing:
+            return identities
+        repushed = push_in_batches(
+            self._push_port, missing, journal=PushJournal()
+        )
+        identities.update(repushed.content_identities)
+        return identities
+
+    def _drive_to_ready(
+        self,
+        states: IngestStateStore,
+        document_id: str,
+        identities: Mapping[str, str],
+        *,
+        actor: str | None,
+    ) -> None:
+        """Walk the job from wherever the run left it to ``ready``.
+
+        ``ocr`` is traversed only when a prior holder of the job entered
+        it: this chain's parse has no separately observable OCR phase,
+        so the machine's ``extracting -> cataloging`` skip edge is the
+        honest path and no state is invented.
+        """
+        current = states.get_job(document_id).state
+        if current in (IngestState.EXTRACTING, IngestState.OCR):
+            states.transition(
+                document_id, IngestState.CATALOGING, actor=actor
+            )
+        states.transition(
+            document_id,
+            IngestState.READY,
+            actor=actor,
+            metadata={"content_identities": dict(identities)},
+        )
+
     def _invalidate_replaced(
         self, document_id: str, *, version: str
     ) -> InvalidationOutcome | None:
@@ -1193,6 +1578,7 @@ class IngestEndpoint:
 
 __all__ = [
     "MAX_INGEST_BYTES",
+    "DurableRunOutcome",
     "IngestConcurrentRunError",
     "IngestDocumentIdMissingError",
     "IngestDurableCommitError",

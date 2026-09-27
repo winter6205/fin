@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import socket
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -71,6 +71,21 @@ class IngestStateStore(Protocol):
     ) -> IngestState: ...
 
     def get_job(self, document_id: str) -> IngestJob: ...
+
+    def list_jobs(
+        self,
+        *,
+        states: Collection[IngestState | str] | None = None,
+    ) -> tuple[IngestJob, ...]:
+        """Snapshot the persisted jobs, optionally filtered by state.
+
+        ``states=None`` is the unfiltered read. An iterable keeps only
+        jobs in one of those states (an unknown name is the typed
+        :class:`InvalidStateError`); an empty iterable selects nothing.
+        The ordering is by ``document_id`` so a worker sweep is
+        deterministic.
+        """
+        ...
 
     def supersede_job(
         self,
@@ -191,6 +206,20 @@ def coerce_state(value: IngestState | str) -> IngestState:
         return IngestState(value)
     except (TypeError, ValueError) as exc:
         raise InvalidStateError(f"unknown ingest state: {value!r}") from exc
+
+
+def coerce_state_filter(
+    states: Collection[IngestState | str] | None,
+) -> frozenset[IngestState] | None:
+    """Resolve a ``list_jobs`` state filter once, before any store reads.
+
+    ``None`` is the unfiltered read; an unknown state name is refused
+    with the same typed error both stores share, and an empty iterable
+    selects nothing.
+    """
+    if states is None:
+        return None
+    return frozenset(coerce_state(state) for state in states)
 
 
 def coerce_request(request: TransitionRequest) -> TransitionRequest:
@@ -369,6 +398,7 @@ __all__ = [
     "StepFailure",
     "TransitionRequest",
     "coerce_state",
+    "coerce_state_filter",
     "coerce_request",
     "failure_guard",
     "job_created_audit",

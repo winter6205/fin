@@ -1,5 +1,13 @@
 """PDF parser: physical pages -> frozen page units (T6 granularity).
 
+STATUS: retired from the corpus dispatch path — ``parse_document(fmt=
+"pdf")`` now consumes the shared page/region core
+(:class:`fin.corpus.parsers._pages.PageRegionParser`). This function
+stays as the pinned behavior contract for its direct callers
+(``tests/corpus/test_ocr_branch``, ``tests/corpus/test_ocr_region``,
+``tests/retrieve/test_failure_catalog``) and as the comparison target
+for the core-path equivalence tests.
+
 Reuses the repo's existing PDF dependency (``pdfplumber``, already a
 hard dependency of ``fin.corpus.ingest``) so the multi-format path and
 the committed extracted tree agree on one extraction stack. Each
@@ -33,7 +41,7 @@ yields the same units.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 from fin.corpus.errors import (
@@ -62,6 +70,19 @@ class OcrParsedUnit(ParsedUnit):
     """
 
     ocr_applied: bool = True
+
+    @classmethod
+    def from_unit(cls, unit: ParsedUnit) -> "OcrParsedUnit":
+        """Re-stamp a plain unit as OCR-frozen, copying every base field.
+
+        The copy iterates ``ParsedUnit``'s dataclass fields at call time,
+        so a field added to the base later reaches the OCR unit by
+        construction instead of being silently dropped at each call site.
+        """
+        return cls(
+            **{f.name: getattr(unit, f.name) for f in fields(ParsedUnit)},
+            ocr_applied=True,
+        )
 
 
 def _is_encryption_failure(exc: BaseException) -> bool:

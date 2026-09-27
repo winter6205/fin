@@ -9,7 +9,7 @@ Postgres store cannot diverge on the rules; only the storage mechanics
 from __future__ import annotations
 
 import threading
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from typing import Any, NoReturn
 
 from fin.corpus.ingest_state_errors import (
@@ -28,6 +28,7 @@ from fin.corpus.ingest_state_model import (
     StepFailure,
     TransitionRequest,
     coerce_request,
+    coerce_state_filter,
     failure_guard,
     job_created_audit,
     job_superseded_audit,
@@ -89,12 +90,18 @@ class InMemoryIngestStateStore:
         with self._lock:
             return self._require_job(document_id)
 
-    def list_jobs(self) -> tuple[IngestJob, ...]:
-        """Return a deterministic snapshot of all jobs."""
+    def list_jobs(
+        self,
+        *,
+        states: Collection[IngestState | str] | None = None,
+    ) -> tuple[IngestJob, ...]:
+        """Return a deterministic snapshot, optionally state-filtered."""
+        wanted = coerce_state_filter(states)
         with self._lock:
             return tuple(
                 self._jobs[document_id]
                 for document_id in sorted(self._jobs)
+                if wanted is None or self._jobs[document_id].state in wanted
             )
 
     def list_audit(
