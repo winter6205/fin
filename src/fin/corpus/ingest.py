@@ -63,6 +63,7 @@ from fin.corpus.errors import (
     ManifestShaMismatchError,
 )
 from fin.corpus.ocr import (
+    PAGE_COLLAPSE_TEXT_CHARS,
     OCREngine,
     OCRError,
     OcrRequiredUnavailableError,
@@ -298,6 +299,7 @@ def _process_page_with_ocr(
     if ocr_required_marker is None and not detect_ocr_required(
         text=text,
         image_count=len(getattr(page, "images", []) or []),
+        min_text_chars=PAGE_COLLAPSE_TEXT_CHARS,
     ):
         return text, False
     if ocr_engine is None:

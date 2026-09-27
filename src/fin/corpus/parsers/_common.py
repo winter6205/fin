@@ -11,6 +11,9 @@ This module owns the pieces every format parser needs:
   ``ParseMetadataIncompleteError`` if any of the eight fields would be
   missing (SC10: no "field missing but still successful" unit);
 * ``detect_language`` — a deterministic heuristic (CJK share);
+* the content-signature authority — :func:`has_pdf_signature` and the
+  :data:`CONTENT_SIGNATURES` table, the only place a magic byte string
+  is written down, read by :func:`content_family` and by the page lane;
 * ``merge_blocks`` / ``merge_structured_blocks`` — the deterministic
   "heading split + cap merge" assembly used by the HTML / Markdown /
   Word structure-block rule (both delegate to the one merge rule;
@@ -82,6 +85,11 @@ SUPPORTED_FORMATS: Final[tuple[str, ...]] = (
 
 # ---------------------------------------------------------------------------
 # Content-signature families (T8) — failure classification only.
+#
+# This section is the whole signature authority of the package: one
+# predicate for "does this carry a PDF header", one table for the
+# container families and the image media types, and no second copy of a
+# byte literal anywhere else.
 # ---------------------------------------------------------------------------
 
 # Magic prefixes of the container families a source can carry. The
@@ -102,29 +110,69 @@ FAMILY_ZIP: Final[str] = "zip"
 FAMILY_CFB: Final[str] = "cfb"
 FAMILY_BINARY: Final[str] = "binary"
 
+# How far from offset 0 a ``%PDF-`` marker still names a PDF; why the
+# answer is not "only at offset 0" is :func:`has_pdf_signature`'s to say.
+_PDF_SIGNATURE_WINDOW: Final[int] = 1024
+
+
+def has_pdf_signature(raw: bytes) -> bool:
+    """Whether ``raw`` carries the ``%PDF-`` marker in its first 1024 bytes.
+
+    The PDF specification permits leading bytes before the header (an
+    envelope, a junk line), so the marker is searched within that window
+    instead of matched at offset 0. Empty input and input shorter than the
+    marker are ``False``. The test is a plain byte search and never raises
+    on arbitrary input.
+    """
+    return PDF_MAGIC in raw[:_PDF_SIGNATURE_WINDOW]
+
+
+@dataclass(frozen=True, slots=True)
+class ContentSignature:
+    """One known container signature: its magic prefix, the family it
+    names, and the media type it yields for a standalone image.
+
+    ``image_media_type`` is ``None`` for a container the standalone-image
+    lane does not accept, which is why one row (GIF) is a known binary
+    family with no media type: the failure gate recognises more shapes
+    than the image lane is allowed to decode, and that asymmetry is a
+    decision of this table rather than a second table to drift from it.
+    """
+
+    magic: bytes
+    family: str
+    image_media_type: str | None = None
+
+    def matches(self, source_bytes: bytes) -> bool:
+        return source_bytes.startswith(self.magic)
+
+
+CONTENT_SIGNATURES: Final[tuple[ContentSignature, ...]] = (
+    ContentSignature(ZIP_MAGIC, FAMILY_ZIP),
+    ContentSignature(CFB_MAGIC, FAMILY_CFB),
+    ContentSignature(_PNG_MAGIC, FAMILY_BINARY, "png"),
+    ContentSignature(_JPEG_MAGIC, FAMILY_BINARY, "jpeg"),
+    ContentSignature(_GIF_MAGIC, FAMILY_BINARY),
+)
+
 
 def content_family(source_bytes: bytes) -> str | None:
-    """Classify the source's container family from its magic prefix.
+    """Classify the source's container family from its content signature.
 
     Returns ``"pdf"`` / ``"zip"`` / ``"cfb"`` / ``"binary"``, or
     ``None`` when no known signature is present (which includes every
     plain-text shape — html / md / txt have no magic). Deterministic
-    prefix check, stdlib only; the result feeds only the T8 failure
+    byte test, stdlib only; the result feeds only the T8 failure
     classification (encryption, declared-format mismatch), never the
-    parse dispatch itself.
+    parse dispatch itself. The PDF answer is :func:`has_pdf_signature`,
+    the same predicate the page lane gates on, so one file is never a
+    PDF to one lane and not to the other.
     """
-    if source_bytes.startswith(PDF_MAGIC):
+    if has_pdf_signature(source_bytes):
         return FAMILY_PDF
-    if source_bytes.startswith(ZIP_MAGIC):
-        return FAMILY_ZIP
-    if source_bytes.startswith(CFB_MAGIC):
-        return FAMILY_CFB
-    if (
-        source_bytes.startswith(_PNG_MAGIC)
-        or source_bytes.startswith(_GIF_MAGIC)
-        or source_bytes.startswith(_JPEG_MAGIC)
-    ):
-        return FAMILY_BINARY
+    for signature in CONTENT_SIGNATURES:
+        if signature.matches(source_bytes):
+            return signature.family
     return None
 
 
@@ -429,6 +477,8 @@ def merge_structured_blocks(
 __all__ = [
     "BLOCK_MERGE_CAP_CHARS",
     "CFB_MAGIC",
+    "CONTENT_SIGNATURES",
+    "ContentSignature",
     "FAMILY_BINARY",
     "FAMILY_CFB",
     "FAMILY_PDF",
@@ -447,6 +497,7 @@ __all__ = [
     "content_family",
     "detect_language",
     "freeze_text",
+    "has_pdf_signature",
     "merge_blocks",
     "merge_structured_blocks",
 ]
