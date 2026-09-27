@@ -84,7 +84,11 @@ from fin.corpus.doc_type import classify_page
 from fin.corpus.errors import UnsupportedFormatParseError
 from fin.corpus.ingest_state import IngestJob, IngestState
 from fin.corpus.ingest_state_errors import DuplicateJobError, UnknownJobError
-from fin.corpus.invalidation import VersionChange, plan_invalidations
+from fin.corpus.invalidation import (
+    VersionChange,
+    plan_invalidations,
+    plan_replacement_invalidations,
+)
 from fin.corpus.params import DOC_TYPES
 from fin.corpus.parsers import SUPPORTED_FORMATS, ParseResult, parse_document
 from fin.corpus.push import (
@@ -209,19 +213,6 @@ class IngestConcurrentRunError(IngestEndpointError):
     """
 
     code = "concurrent_run"
-
-
-class IngestReplacementUnsupportedError(IngestEndpointError):
-    """A ready document was re-submitted with different bytes.
-
-    That is the replacement case, and closing it needs the invalidation
-    side effect the state machine cannot express: ``ready`` is terminal, so
-    the accepted upload's chunks could never be produced. Refusing it is a
-    correctness gate, not a missing feature flag — until the state store
-    gains a re-queue edge for replacements.
-    """
-
-    code = "replacement_unsupported"
 
 
 # The accept-time step that failed to persist. Typed so the free-form
@@ -773,10 +764,12 @@ class IngestEndpoint:
         joins that job. A different version while the job is in flight is the
         typed :class:`IngestConcurrentRunError`. A different version after a
         ``failed`` job re-enters the machine at ``fetching``, the retry edge
-        the state machine already defines; a ``ready`` job has no outgoing
-        edge at all, so replacing it is the typed
-        :class:`IngestReplacementUnsupportedError` with nothing written,
-        never a pretend accept.
+        the state machine already defines. A different version after a
+        ``ready`` job settles as a replacement: the stale blocks of the
+        version being replaced are invalidated, the pointer moves to the new
+        object and the job reopens as a fresh ``pending`` generation of the
+        same document job, so one document never carries two logical
+        versions at once.
 
         Any persistence failure yields no accepted job: the object written
         for this attempt is deleted again, and a delete that itself fails is
@@ -811,7 +804,22 @@ class IngestEndpoint:
             )
             if joined is not None:
                 return joined
-            self._raise_if_conflict(prior_job, doc_id)
+            replacing = (
+                prior_job is not None
+                and prior_job.state is IngestState.READY
+            )
+            if replacing and prior_pointer is None:
+                # ``ready`` is reached only by an accept that made its pointer
+                # durable, so a ready job with no pointer is the store
+                # disagreeing with itself. This accept must not paper over it
+                # by guessing what was replaced.
+                raise IngestDurableCommitError(
+                    f"{doc_id!r} reports a ready job with no durable object "
+                    "pointer",
+                    stage="pointer_read",
+                )  # EXIT: no accepted job, nothing was written
+            if not replacing:
+                self._raise_if_conflict(prior_job, doc_id)
 
             job = self._persist_accept(
                 objects,
@@ -823,6 +831,9 @@ class IngestEndpoint:
                 doc_id=doc_id,
                 version=version,
                 prior_pointer=prior_pointer,
+                superseded_version=(
+                    prior_pointer.sha256 if replacing else None
+                ),
             )
             return IngestSubmission(
                 document_id=doc_id, version=version, state=job.state
@@ -885,21 +896,16 @@ class IngestEndpoint:
     def _raise_if_conflict(
         self, prior_job: IngestJob | None, document_id: str
     ) -> None:
-        """Reject a version swap the state machine has no edge for.
+        """Reject a version swap the machine has no settled path for.
 
         A ``failed`` job is not a conflict: the retry edge re-enters it at
-        ``fetching``. A ``ready`` job has no outgoing edge, so replacing it is
-        the typed unsupported error; any other live state is the typed
-        concurrent-run error. Both raise before a write, so nothing lands.
+        ``fetching``. A ``ready`` job is the settled replacement case and is
+        owned by the caller. Any other state is a job still in flight, so a
+        different version is the typed concurrent-run error and nothing is
+        written.
         """
         if prior_job is None or prior_job.state is IngestState.FAILED:
             return
-        if prior_job.state is IngestState.READY:
-            raise IngestReplacementUnsupportedError(
-                f"{document_id!r} is ready on another version and the upload "
-                "is not those bytes: the state machine has no edge out of "
-                "'ready', so the replacement cannot be accepted yet"
-            )
         raise IngestConcurrentRunError(
             f"a job for {document_id!r} is already in state "
             f"{prior_job.state.value!r}; a different version is not "
@@ -918,6 +924,7 @@ class IngestEndpoint:
         doc_id: str,
         version: str,
         prior_pointer: ObjectPointer | None,
+        superseded_version: str | None = None,
     ) -> IngestJob:
         """Write the object, pointer and job in order, compensating on failure.
 
@@ -925,6 +932,13 @@ class IngestEndpoint:
         any step deletes the object written this attempt (and restores the
         overwritten pointer), so a rejected upload leaves the document exactly
         as it was; a compensation that itself fails is the typed cleanup error.
+
+        A replacement adds one step before the pointer moves: the blocks of
+        the version being superseded are closed through the invalidation port.
+        It runs FIRST because it is the one accept-time side effect fin cannot
+        undo here — a failure must still leave the superseded version's
+        pointer and ``ready`` job untouched, and a retry converges because the
+        invalidation request is idempotent.
         """
         try:
             pointer = objects.put(key, data, content_type=content_type)
@@ -946,6 +960,18 @@ class IngestEndpoint:
                 stage="object_write",
             )
 
+        if superseded_version is not None:
+            try:
+                self._invalidate_replaced(doc_id, version=version)
+            except Exception as exc:
+                self._discard_rejected_upload(
+                    objects=objects,
+                    pointers=pointers,
+                    key=key,
+                    cause=exc,
+                )
+                raise
+
         try:
             pointers.put_pointer(doc_id, pointer)
         except Exception as exc:
@@ -964,7 +990,12 @@ class IngestEndpoint:
             ) from exc
 
         try:
-            return self._record_job(states, doc_id, version=version)
+            return self._record_job(
+                states,
+                doc_id,
+                version=version,
+                superseded_version=superseded_version,
+            )
         except IngestDurableCommitError:
             raise
         except Exception as exc:
@@ -1013,10 +1044,52 @@ class IngestEndpoint:
             error_message=job.error_message,
         )
 
+    def _invalidate_replaced(
+        self, document_id: str, *, version: str
+    ) -> InvalidationOutcome | None:
+        """Close the blocks of the version this accept supersedes.
+
+        The incoming version has produced no blocks yet — that is exactly what
+        the accept door knows — so the stale set is every block the document
+        pushed under a version it no longer points at. Without a record
+        provider fin cannot name what is stale, which is the same documented
+        no-op the synchronous chain has; with stale blocks and no invalidation
+        port the failure is typed rather than accepted, because an accept that
+        left the predecessor hittable would be the stale read this closes.
+        """
+        if self._previous_records is None:
+            return None
+        targets = plan_replacement_invalidations(
+            self._previous_records(), document_id, version=version
+        )
+        if not targets:
+            return None
+        if self._invalidation_port is None:
+            raise InvalidationServiceUnavailableError(
+                f"replacing {document_id!r} would leave "
+                f"{len(targets)} pushed blocks hittable and no invalidation "
+                "port is configured"
+            )
+        return invalidate_targets(
+            self._invalidation_port,
+            targets,
+            ledger=self._invalidation_ledger,
+        )
+
     def _record_job(
-        self, states: IngestStateStore, doc_id: str, *, version: str
+        self,
+        states: IngestStateStore,
+        doc_id: str,
+        *,
+        version: str,
+        superseded_version: str | None = None,
     ) -> IngestJob:
         """Reach a queued job record for this upload's version.
+
+        A replacement does not transition the generation that completed:
+        ``ready`` is terminal, so the store opens the document's next
+        ``pending`` generation over the same job key and the completed
+        generation stays in the audit trail.
 
         A job already in ``failed`` re-enters at ``fetching`` — the retry
         edge the state machine defines — instead of claiming a second
@@ -1029,6 +1102,11 @@ class IngestEndpoint:
         safe recovery is to join the committed job, never to raise — raising
         would make the caller delete the shared object the winner depends on.
         """
+        if superseded_version is not None:
+            return states.supersede_job(
+                doc_id,
+                metadata={"superseded_version": superseded_version},
+            )
         try:
             return states.create_job(doc_id)
         except DuplicateJobError:
@@ -1037,7 +1115,7 @@ class IngestEndpoint:
                 states.transition(
                     doc_id,
                     IngestState.FETCHING,
-                    metadata={"replaced_version": version},
+                    metadata={"retry_version": version},
                 )
                 return states.get_job(doc_id)
             return job
@@ -1126,7 +1204,6 @@ __all__ = [
     "IngestInvalidDocTypeError",
     "IngestJobStatus",
     "IngestObjectCleanupError",
-    "IngestReplacementUnsupportedError",
     "IngestSubmission",
     "IngestUploadTooLargeError",
     "IngestedDocument",

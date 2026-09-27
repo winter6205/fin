@@ -80,6 +80,13 @@ os.environ.pop("TYPESAFE_API_KEY", None)
 os.environ.pop("TYPESAFE_DEFAULT_MODEL", None)
 os.environ.pop("TYPESAFE_BASE_URL", None)
 
+# The default run declares its corpus-ingest job store process-local, the way
+# it declares no live MCP and no operator LLM: an accepted upload must not
+# depend on services this run does not control. Production boot has no such
+# default -- without a DSN or this declaration the ingest door refuses to
+# start -- so a suite that wants the durable leg sets the key itself.
+os.environ["FIN_CORPUS_INGEST_STORE"] = "memory"
+
 
 def _drop_unreachable_checkpoint_url() -> None:
     """If ``FIN_CHECKPOINT_URL`` cannot accept a connection, unset it.

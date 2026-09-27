@@ -80,12 +80,32 @@ class AuditOverflowError(IngestStateError):
         )
 
 
+class IngestStateStoreConfigError(IngestStateError):
+    """The deployed job-store configuration cannot promise durability.
+
+    A mis-deployment is not a product exit a client may retry, so it
+    carries no wire code; it names the configuration key an operator has
+    to set. Refusing here is what keeps an accepted upload from living
+    only in the process that accepted it.
+    """
+
+    def __init__(self, message: str, *, key: str) -> None:
+        self.key = key
+        super().__init__(message)
+
+
+class IngestStateStoreUnavailableError(IngestStateError):
+    """A configured durable job store could not be reached or written."""
+
+
 __all__ = [
     "AuditOverflowError",
     "DuplicateJobError",
     "IllegalTransitionError",
     "IngestBusyError",
     "IngestStateError",
+    "IngestStateStoreConfigError",
+    "IngestStateStoreUnavailableError",
     "IngestStepError",
     "InvalidStateError",
     "UnknownJobError",
