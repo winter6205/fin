@@ -54,6 +54,7 @@ from fin.host.attachment_budgets import (
     ATTACHMENT_PAGE_LIMIT_EXCEEDED,
     AttachmentBudgetConfigError,
     AttachmentBudgets,
+    required_run_calls,
 )
 from fin.host.attachment_prepare import (
     ATTACHMENT_EMPTY_TEXT,
@@ -210,12 +211,27 @@ def _parser(
 # ----- fixtures -----
 
 
+_CROP_CALLS = 8
+
+
 def _budgets(*, max_pages: int = 8) -> AttachmentBudgets:
+    # The run budget is derived through the module that prices a run, so this
+    # fixture cannot drift from the page + crop + retry-reserve relationship.
+    run_calls = required_run_calls(
+        AttachmentBudgets(
+            max_upload_bytes=1_048_576,
+            max_pdf_pages=max_pages,
+            # Only the page and crop counts price a run, so this total is what
+            # the call returns, never an input to it.
+            max_vision_calls_per_run=max_pages + _CROP_CALLS,
+            max_vision_crop_calls_per_run=_CROP_CALLS,
+        )
+    )
     return AttachmentBudgets(
         max_upload_bytes=1_048_576,
         max_pdf_pages=max_pages,
-        max_vision_calls_per_run=16,
-        max_vision_crop_calls_per_run=8,
+        max_vision_calls_per_run=run_calls,
+        max_vision_crop_calls_per_run=_CROP_CALLS,
     )
 
 

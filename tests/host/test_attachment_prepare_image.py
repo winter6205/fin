@@ -34,7 +34,7 @@ from fin.corpus.parsers import (
     PageRegionParser,
     Region,
 )
-from fin.host.attachment_budgets import AttachmentBudgets
+from fin.host.attachment_budgets import AttachmentBudgets, required_run_calls
 from fin.host.attachment_prepare import (
     ATTACHMENT_EMPTY_TEXT,
     ATTACHMENT_TYPE_UNSUPPORTED,
@@ -150,14 +150,27 @@ def _service(
 ) -> tuple[AttachmentPreparationService, str]:
     threads = InMemoryThreadStore()
     thread = threads.create_thread(title="image lane thread")
+    crop_calls = 8
+    # Derive the run budget through the module that prices a run, so this
+    # fixture cannot drift from the page + crop + retry-reserve relationship.
+    run_calls = required_run_calls(
+        AttachmentBudgets(
+            max_upload_bytes=1_048_576,
+            max_pdf_pages=max_pages,
+            # Only the page and crop counts price a run, so this total is what
+            # the call returns, never an input to it.
+            max_vision_calls_per_run=max_pages + crop_calls,
+            max_vision_crop_calls_per_run=crop_calls,
+        )
+    )
     service = AttachmentPreparationService(
         store=InMemoryAttachmentStore(threads),
         objects=InMemoryObjectStore(),
         budgets=AttachmentBudgets(
             max_upload_bytes=1_048_576,
             max_pdf_pages=max_pages,
-            max_vision_calls_per_run=16,
-            max_vision_crop_calls_per_run=8,
+            max_vision_calls_per_run=run_calls,
+            max_vision_crop_calls_per_run=crop_calls,
         ),
         pages=parser,
     )

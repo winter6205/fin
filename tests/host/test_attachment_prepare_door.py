@@ -1,29 +1,40 @@
-"""What the shipped door answers for a page document it cannot read.
+"""What the shipped door answers for a page document, either lane state.
 
 Why this file exists
 --------------------
-The page/region core can read PDFs and images, but the process the product
-ships builds its attachment service with no page budget and no extraction
-ports (``_build_default_attachment_service`` passes only a store and a byte
-store). That unwired state is what an operator actually runs, so the
-promise it has to keep is narrow and was never pinned anywhere: a name-declared
-page document is stored, answered with a named failure the row keeps, and
-nothing raises past the door. The refusal is judged per family: a ``.pdf``
-is the multi-page source whose pricing the missing lane owns, so it is
-named as a deployment fact, while a standalone image waits on no lane
-economics and the text-only door answers it by content — the promise this
-file also re-pins, because an earlier repair had the refusal preempt that
-content judgement for image bytes too.
+The composition root now deploys the page lane: every service
+``_build_default_attachment_service`` builds carries the run's bounds, a
+pages port, and a vision port, so the shipped process cannot produce the
+refusal this file used to pin through the real builder — a name-declared
+page document answered ``attachment_page_lane_unwired`` because no
+deployment had a lane. That answer is now owed only by a service wired
+without ports (an embedded caller builds the door itself), and this file
+pins both sides of that line from the door's point of view:
 
-Both halves are read from the real thing rather than from a hand-wired
-service: the first cases call the composition root's own builder, the later
-ones drive the real upload, retry, and status routes. Hermetic either way —
-in-memory stores, no model, no provider, no OCR binary, no page ever
-rasterized.
+* a lane deployed: a claimed page document is read — the gold PDF and the
+  gold raster freeze their units and reach ``ready``, the upload/retry/
+  status doors agree on one field set, and nothing raises past the door;
+* a lane deployed, and what a page reader now judges: an image name's
+  claim is taken at its word, so text bytes under ``.png`` end at the
+  type the image reader refused (``attachment_type_unsupported``) rather
+  than at the old text-ladder success;
+* a lane absent: the same document is answered with the deployment code,
+  and an image name falls to the content ladder the door always owned —
+  the half of the old promise that survives the wiring, because the code
+  names a service's wiring, not a deployment the product ships;
+* and one answer no wiring changes: no bytes is empty before any reader
+  is asked.
+
+Hermetic either way: the page port here is the real core over stub render
+and OCR ports with the null layout, and the scan seam is left at its
+documented default-open value (no vision port), so no container, OCR
+binary, or provider is crossed — those boundaries have their own suites.
+The root-built service is read as a wiring fact, never fed a document.
 """
 
 from __future__ import annotations
 
+import io
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -31,13 +42,16 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from fin.corpus.object_store import InMemoryObjectStore
-from fin.host.attachment_budgets import AttachmentBudgets
+from fin.corpus.parsers import NullLayout, PageRegionParser, PageRaster
+from fin.host.attachment_budgets import AttachmentBudgets, required_run_calls
 from fin.host.attachment_prepare import (
     ATTACHMENT_EMPTY_TEXT,
     ATTACHMENT_NOT_TEXT,
     ATTACHMENT_PAGE_LANE_UNWIRED,
+    ATTACHMENT_TYPE_UNSUPPORTED,
     AttachmentPreparationService,
 )
 from fin.host.attachment_store import InMemoryAttachmentStore
@@ -54,14 +68,29 @@ GOLD_DIR = REPO_ROOT / "data" / "corpus" / "g4_attachment_gold"
 MIXED_BYTES = (GOLD_DIR / "g4-mixed-chart-001.pdf").read_bytes()
 CHART_BYTES = (GOLD_DIR / "g4-image-chart-001.png").read_bytes()
 
-# The door reads its upload bound through its own dependency, so the route
-# needs a deployed number. It is unrelated to the answer under test: no
-# bound here is ever handed to the service.
+# The mixed fixture is 3 physical pages (the gold manifest's own count).
+MIXED_PAGE_COUNT = 3
+
+# Deployed bounds, priced through the module that prices a run: the lane
+# reads preflight (page cap + crop + the one reserved retry) before it
+# opens a page, so a door fixture whose totals cannot cover its own caps
+# would pin a startup error rather than a door answer.
+_CROP_CALLS = 8
+_MAX_PAGES = 8
 DOOR_BUDGETS = AttachmentBudgets(
     max_upload_bytes=1_048_576,
-    max_pdf_pages=8,
-    max_vision_calls_per_run=16,
-    max_vision_crop_calls_per_run=8,
+    max_pdf_pages=_MAX_PAGES,
+    max_vision_calls_per_run=required_run_calls(
+        AttachmentBudgets(
+            max_upload_bytes=1_048_576,
+            max_pdf_pages=_MAX_PAGES,
+            # Only the page and crop counts price a run, so this stand-in
+            # total is what the call returns, never an input to it.
+            max_vision_calls_per_run=_MAX_PAGES + _CROP_CALLS,
+            max_vision_crop_calls_per_run=_CROP_CALLS,
+        )
+    ),
+    max_vision_crop_calls_per_run=_CROP_CALLS,
 )
 
 # Every store the root picks up from the environment: scrubbed, the builder
@@ -73,28 +102,54 @@ _ROOT_ENV = (
     "FIN_OBJECT_STORE_BUCKET",
 )
 
-# The refusal is judged per family, so each row names the verdict its own
-# family must get on this deployment: the multi-page document the missing
-# lane was priced for is named as a deployment fact, and the standalone
-# image — one page, no lane economics to wait on — is named by content.
-PAGE_DOCUMENTS = [
-    pytest.param(
-        "g4-mixed-chart-001.pdf", MIXED_BYTES, ATTACHMENT_PAGE_LANE_UNWIRED,
-        id="gold-pdf",
-    ),
-    pytest.param(
-        "g4-image-chart-001.png", CHART_BYTES, ATTACHMENT_NOT_TEXT,
-        id="gold-image",
-    ),
-]
+_RASTER_PNG = io.BytesIO()
+Image.new("RGB", (1, 1)).save(_RASTER_PNG, format="PNG")
+RASTER_BYTES = _RASTER_PNG.getvalue()
 
 
-def _unwired_service(
+class StubRenderer:
+    """``PageRenderPort`` handing out a 1-pixel raster for every page."""
+
+    def render_page(self, *, page_no: int) -> PageRaster:
+        return PageRaster.of(RASTER_BYTES, width_px=1, height_px=1)
+
+
+class StubOcr:
+    """``RasterOcrPort`` answering every read with one usable line."""
+
+    def recognize_raster(self, *, png: bytes, reference: str) -> str:
+        return "stub page read"
+
+
+def _laneless_service(
     threads: InMemoryThreadStore,
 ) -> AttachmentPreparationService:
-    """The service exactly as the composition root builds it."""
+    """A door wired without a page lane: the shape the root no longer builds.
+
+    An embedded caller still constructs this; the codes below are pinned
+    against it precisely because the shipped builder cannot produce it.
+    """
     return AttachmentPreparationService(
         store=InMemoryAttachmentStore(threads), objects=InMemoryObjectStore()
+    )
+
+
+def _deployed_service(
+    threads: InMemoryThreadStore,
+) -> AttachmentPreparationService:
+    """A door with the lane deployed, as the root deploys it, faking only
+    the boundaries the default suite may not cross (pixels, OCR, provider).
+    """
+    return AttachmentPreparationService(
+        store=InMemoryAttachmentStore(threads),
+        objects=InMemoryObjectStore(),
+        budgets=DOOR_BUDGETS,
+        pages=PageRegionParser(
+            layout=NullLayout(), renderer=StubRenderer(), ocr=StubOcr()
+        ),
+        # vision stays None: the lane documents that shape as default-open —
+        # units freeze, the row publishes, the unscanned gap is the suite's
+        # own fact, and no provider import happens here.
     )
 
 
@@ -107,18 +162,6 @@ def http_app() -> Iterator[FastAPI]:
 
 
 @pytest.fixture
-def unwired_door(
-    http_app: FastAPI, threads: InMemoryThreadStore
-) -> dict[str, Any]:
-    thread = threads.create_thread(title="unwired lane door")
-    service = _unwired_service(threads)
-    http_app.dependency_overrides[get_thread_store] = lambda: threads
-    http_app.dependency_overrides[get_attachment_service] = lambda: service
-    http_app.dependency_overrides[get_attachment_budgets] = lambda: DOOR_BUDGETS
-    return {"thread_id": thread.id, "service": service}
-
-
-@pytest.fixture
 def threads() -> InMemoryThreadStore:
     return InMemoryThreadStore()
 
@@ -128,61 +171,248 @@ def client(http_app: FastAPI) -> TestClient:
     return TestClient(http_app)
 
 
-# ----- the composition root itself -----
+def _door(http_app: FastAPI, service: AttachmentPreparationService,
+          threads: InMemoryThreadStore, title: str) -> dict[str, Any]:
+    thread = threads.create_thread(title=title)
+    http_app.dependency_overrides[get_thread_store] = lambda: threads
+    http_app.dependency_overrides[get_attachment_service] = lambda: service
+    http_app.dependency_overrides[get_attachment_budgets] = lambda: DOOR_BUDGETS
+    return {"thread_id": thread.id, "service": service}
 
 
-@pytest.mark.parametrize(("filename", "payload", "reason"), PAGE_DOCUMENTS)
-def test_the_shipped_root_answers_a_page_document_with_a_code(
+@pytest.fixture
+def laneless_door(
+    http_app: FastAPI, threads: InMemoryThreadStore
+) -> dict[str, Any]:
+    return _door(http_app, _laneless_service(threads), threads,
+                 "lane-less door")
+
+
+@pytest.fixture
+def deployed_door(
+    http_app: FastAPI, threads: InMemoryThreadStore
+) -> dict[str, Any]:
+    return _door(http_app, _deployed_service(threads), threads,
+                 "deployed lane door")
+
+
+# ----- the shipped root: the lane is deployed, so its refusal is gone -----
+
+
+def test_the_shipped_root_builds_no_door_that_can_refuse_a_page_document(
     monkeypatch: pytest.MonkeyPatch,
-    filename: str,
-    payload: bytes,
-    reason: str,
 ) -> None:
-    """No 500 out of the builder the product actually runs.
+    """The old pin was ``(budgets, pages) == (None, None)``; it cannot hold.
 
-    The row is the answer: ``failed``, carrying the code its family earns on
-    this deployment, with the bytes kept so a later preparation — under a
-    wired lane or a reader this door has for these bytes — can take them.
+    The builder reads the bounds through the same boot singleton
+    ``serve()`` gates on and wires the pages port and the vision port on
+    every success path, so ``attachment_page_lane_unwired`` is unreachable
+    in a built product process: a door without a lane was never one of the
+    shapes this root returns.
     """
     for key in _ROOT_ENV:
         monkeypatch.delenv(key, raising=False)
+    # The bounds the boot singleton must find, and no Heron knob but the
+    # shipped defaults: this pins the door's wiring, not the lane's config
+    # reads (the boot suite owns those).
+    monkeypatch.setenv("FIN_ATTACHMENT_MAX_BYTES", "1048576")
+    monkeypatch.setenv("FIN_ATTACHMENT_MAX_PDF_PAGES", "8")
+    monkeypatch.setenv("FIN_ATTACHMENT_VISION_CALLS_PER_RUN", "17")
+    monkeypatch.setenv("FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN", "8")
+    import fin.host.http as http_module
+
+    monkeypatch.setattr(
+        http_module, "_http_attachment_budgets_singleton", None, raising=False
+    )
+
     service = _build_default_attachment_service()
-    assert (service.budgets, service.pages) == (None, None)
-    thread = default_thread_store().create_thread(title="root unwired")
+
+    assert service.budgets is not None
+    assert service.pages is not None
+    assert service.vision is not None
+    # And the plain-text promise the door always owned survives the wiring:
+    thread = default_thread_store().create_thread(title="root wired text")
+    accepted = service.accept(
+        thread_id=thread.id,
+        filename="notes.txt",
+        payload=b"quarterly revenue rose 12%\n",
+    )
+    ready = service.prepare(accepted.attachment_id)
+    assert ready.status == "ready", ready
+
+
+# ----- the deployed lane reads the documents the lane-less door refused -----
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload", "unit_count"),
+    [
+        pytest.param(
+            "g4-mixed-chart-001.pdf", MIXED_BYTES, MIXED_PAGE_COUNT,
+            id="gold-pdf",
+        ),
+        pytest.param(
+            "g4-image-chart-001.png", CHART_BYTES, 1, id="gold-image",
+        ),
+    ],
+)
+def test_a_deployed_lane_freezes_the_page_document_it_once_refused(
+    threads: InMemoryThreadStore,
+    filename: str,
+    payload: bytes,
+    unit_count: int,
+) -> None:
+    """The other half of the flip: the same bytes now come back ``ready``.
+
+    One unit per physical page for the PDF, one from the raster's own
+    pixels for the image — the answers the page core gives over stub
+    ports; the door's job here is that a lane-deployed preparation reaches
+    ``ready`` with its units and keeps the row consistent.
+    """
+    service = _deployed_service(threads)
+    thread = threads.create_thread(title="deployed lane reads pages")
 
     accepted = service.accept(
         thread_id=thread.id, filename=filename, payload=payload
     )
-    assert accepted.status == "uploaded", accepted
+    ready = service.prepare(accepted.attachment_id)
 
+    assert ready.status == "ready", ready
+    assert ready.failure_reason is None, ready
+    assert ready.searchable is True, ready
+    assert ready.unit_count == unit_count, ready
+    assert service.status(accepted.attachment_id) == ready
+
+
+def test_the_deployed_door_answers_200_and_agrees_with_itself(
+    client: TestClient, deployed_door: dict[str, Any]
+) -> None:
+    """Upload, retry, status, list over a lane-deployed service.
+
+    ``TestClient`` re-raises an unhandled server exception by default, so
+    this case fails on any escape — the original door promise — and the
+    one-field-set rule now carries a success: the status door cannot
+    disagree with the retry that published the row.
+    """
+    thread_id = deployed_door["thread_id"]
+
+    uploaded = client.post(
+        f"/api/threads/{thread_id}/attachments",
+        params={"filename": "g4-mixed-chart-001.pdf"},
+        content=MIXED_BYTES,
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    attachment_id = uploaded.json()["attachment_id"]
+
+    retried = client.post(
+        f"/api/threads/{thread_id}/attachments/{attachment_id}/retry"
+    )
+
+    assert retried.status_code == 200, retried.text
+    body = retried.json()
+    assert body["status"] == "ready", body
+    assert body["failure_reason"] is None, body
+    assert body["searchable"] is True, body
+    shown = client.get(
+        f"/api/threads/{thread_id}/attachments/{attachment_id}"
+    )
+    assert shown.status_code == 200, shown.text
+    assert shown.json() == body, shown.json()
+    listed = client.get(f"/api/threads/{thread_id}/attachments")
+    assert listed.status_code == 200, listed.text
+    assert body in listed.json()["attachments"], listed.json()
+
+
+# ----- what the deployed lane now judges that the lane-less door did not -----
+
+
+def test_an_image_name_is_taken_at_its_word_by_the_reader_it_claims(
+    threads: InMemoryThreadStore,
+) -> None:
+    """The old text-ladder success flips once a reader owns the name.
+
+    With no lane the door answered an image name by content, because the
+    content ladder was the only reader; with the lane deployed the name's
+    claim is judged by the image reader, and bytes carrying no image
+    signature end at the named type the reader refused — the same verdict
+    any undecodable raster earns. The bytes stay, exactly as they did for
+    the refusal this replaced.
+    """
+    service = _deployed_service(threads)
+    thread = threads.create_thread(title="image name, text bytes, lane on")
+
+    accepted = service.accept(
+        thread_id=thread.id,
+        filename="chart.png",
+        payload="quarterly revenue rose 12%\n".encode("utf-8"),
+    )
     failed = service.prepare(accepted.attachment_id)
 
     assert failed.status == "failed", failed
-    assert failed.failure_reason == reason, failed
-    assert failed.searchable is False, failed
-    assert service.status(accepted.attachment_id) == failed
-    # A refusal that judged the deployment or the content, not the upload:
-    # the bytes stay either way.
-    assert service.objects.get(accepted.object_key) == payload
+    assert failed.failure_reason == ATTACHMENT_TYPE_UNSUPPORTED, failed
+    assert service.objects.get(accepted.object_key) == (
+        "quarterly revenue rose 12%\n".encode("utf-8")
+    )
 
 
-# ----- the HTTP door -----
+@pytest.mark.parametrize("laneless", [True, False], ids=["laneless", "deployed"])
+def test_no_bytes_is_empty_before_any_reader_decides(
+    threads: InMemoryThreadStore, laneless: bool
+) -> None:
+    """One answer wiring cannot move: an empty payload is empty by name.
+
+    The preflight exits on no bytes before the lane is consulted and
+    before any reader is picked up, so the same blank upload reads the
+    same way on both doors.
+    """
+    service = (
+        _laneless_service(threads) if laneless else _deployed_service(threads)
+    )
+    thread = threads.create_thread(title="image name, no bytes")
+
+    accepted = service.accept(
+        thread_id=thread.id, filename="chart.png", payload=b""
+    )
+    failed = service.prepare(accepted.attachment_id)
+
+    assert failed.status == "failed", failed
+    assert failed.failure_reason == ATTACHMENT_EMPTY_TEXT, failed
 
 
-@pytest.mark.parametrize(("filename", "payload", "reason"), PAGE_DOCUMENTS)
-def test_the_page_door_answers_200_with_the_code_not_an_exception(
+# ----- the lane-less door: codes of a wiring the root no longer ships -----
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload", "reason"),
+    [
+        pytest.param(
+            "g4-mixed-chart-001.pdf", MIXED_BYTES, ATTACHMENT_PAGE_LANE_UNWIRED,
+            id="gold-pdf",
+        ),
+        pytest.param(
+            "g4-image-chart-001.png", CHART_BYTES, ATTACHMENT_NOT_TEXT,
+            id="gold-image",
+        ),
+    ],
+)
+def test_the_lane_less_door_still_names_its_code_instead_of_escaping(
     client: TestClient,
-    unwired_door: dict[str, Any],
+    laneless_door: dict[str, Any],
     filename: str,
     payload: bytes,
     reason: str,
 ) -> None:
-    """Upload, retry, and status over the shipped unwired service.
+    """The refusal belongs to a service's wiring, not to this deployment.
 
-    ``TestClient`` re-raises an unhandled server exception by default, so
-    this case fails on the escape itself — a 500 could not be asserted past.
+    A door built without ports (only an embedded caller does that today)
+    still owes the same narrow promise: a 200 whose row carries the code
+    its family earns — the page cap and wired ports the PDF prices
+    against, the content judgement the one-page image gets without them —
+    with the bytes kept for a retry under a wired lane. What changed is
+    only that the shipped root can no longer hand the door such a
+    service.
     """
-    thread_id = unwired_door["thread_id"]
+    thread_id = laneless_door["thread_id"]
 
     uploaded = client.post(
         f"/api/threads/{thread_id}/attachments",
@@ -201,33 +431,27 @@ def test_the_page_door_answers_200_with_the_code_not_an_exception(
     assert body["status"] == "failed", body
     assert body["failure_reason"] == reason, body
     assert body["searchable"] is False, body
-    # One field set for one row: the status door cannot disagree with the
-    # retry that wrote the reason.
     shown = client.get(
         f"/api/threads/{thread_id}/attachments/{attachment_id}"
     )
     assert shown.status_code == 200, shown.text
     assert shown.json() == body, shown.json()
-    listed = client.get(f"/api/threads/{thread_id}/attachments")
-    assert listed.status_code == 200, listed.text
-    assert body in listed.json()["attachments"], listed.json()
 
 
-# ----- the content judgement the unwired door still owes an image name -----
-
-
-def test_an_image_named_payload_the_door_can_read_is_read_as_text(
+def test_the_lane_less_door_still_reads_an_image_name_by_content(
     threads: InMemoryThreadStore,
 ) -> None:
-    """The refusal judges families, not filenames.
+    """The content ladder is the lane-less answer, and stays pinned as one.
 
-    A standalone image waits on no lane economics, so on this deployment
-    its name's lane claim falls to the door's own content ladder: bytes
-    that decode as UTF-8 become text the way any no-suffix upload does —
-    the answer the lane refusal must never preempt.
+    A standalone image waits on no lane economics, so a door without a
+    page lane judges its name's claim by content — bytes that decode as
+    UTF-8 become text the way any no-suffix upload does. The deployed
+    door replaced this verdict with the reader's own (above); this row
+    keeps both halves honest: which promise the absence of a lane earns,
+    and which promise only a present lane can make.
     """
-    service = _unwired_service(threads)
-    thread = threads.create_thread(title="image name, text bytes")
+    service = _laneless_service(threads)
+    thread = threads.create_thread(title="image name, text bytes, no lane")
 
     accepted = service.accept(
         thread_id=thread.id,
@@ -241,19 +465,3 @@ def test_an_image_named_payload_the_door_can_read_is_read_as_text(
     assert [unit.text for unit in service.units(ready.attachment_id)] == [
         "quarterly revenue rose 12%\n"
     ]
-
-
-def test_an_image_named_empty_payload_stays_empty_on_the_unwired_door(
-    threads: InMemoryThreadStore,
-) -> None:
-    """The same ladder, its blank boundary: empty is empty deployment-free."""
-    service = _unwired_service(threads)
-    thread = threads.create_thread(title="image name, no bytes")
-
-    accepted = service.accept(
-        thread_id=thread.id, filename="chart.png", payload=b""
-    )
-    failed = service.prepare(accepted.attachment_id)
-
-    assert failed.status == "failed", failed
-    assert failed.failure_reason == ATTACHMENT_EMPTY_TEXT, failed

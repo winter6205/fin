@@ -149,6 +149,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 import uuid
@@ -200,9 +201,21 @@ from fin.corpus.ingest_endpoint import (
 )
 from fin.corpus.ingest_state_errors import UnknownJobError
 from fin.corpus.ingest_worker import IngestWorker
+from fin.corpus.ocr import TesseractEngine
+from fin.corpus.parsers import (
+    NullLayout,
+    PageParseResult,
+    PageRegionParser,
+)
 from fin.corpus.pushed_records import PushedRecordsStore
 from fin.host.attachment_budgets import AttachmentBudgets
+from fin.host.attachment_layout import (
+    HeronLayoutConfig,
+    HeronPageLayout,
+    LayoutRecordRunner,
+)
 from fin.host.attachment_prepare import (
+    ATTACHMENT_PAGE_LANE_UNWIRED,
     AttachmentCleanupError,
     AttachmentNotFoundError,
     AttachmentNotReadyError,
@@ -213,6 +226,7 @@ from fin.host.attachment_store import (
     AttachmentStoreError,
     AttachmentThreadGoneError,
 )
+from fin.host.attachment_vision import ChatModelVisionAdapter
 from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER, strip_hidden_bounce_marker
 from fin.host.collection_bind import resolve_bound_collection_name
 from fin.host.export import (
@@ -2437,6 +2451,98 @@ _attachment_service_singleton: AttachmentPreparationService | None = None
 _attachment_service_lock = threading.Lock()
 
 
+class HeronPageLaneParser(PageRegionParser):
+    """The deployed pages port: one pinned Heron pass per PDF document.
+
+    The core binds its layout at construction and never hands a document
+    to it, while :class:`~fin.host.attachment_layout.HeronPageLayout` is
+    built over one file on disk; uploads, though, are bytes the door has
+    already stored. So this composition-root port owns the per-document
+    meeting of the two shapes: a PDF extract stages the bytes as a
+    private 0600 file, runs the core with one fresh Heron layout over
+    it, and destroys the copy on the way out — a thread's filing does
+    not survive the preparation that read it.
+
+    The image lane keeps the base behavior over
+    :class:`~fin.corpus.parsers.NullLayout`: the pinned harness takes
+    PDF input only (its one attempt at a bare raster is a committed
+    refusal), and a standalone image's page is its own raster, so its
+    region and text need no box to address.
+
+    Nothing here is a container dependency at boot: the pass is taken
+    lazily by the layout port on the first page that asks, and every
+    host-side absence it can meet — no harness, no container, no
+    configured image — is its own named pass state answered with no
+    regions, never a raise (regions are additive metadata).
+    """
+
+    def __init__(
+        self,
+        *,
+        config: HeronLayoutConfig,
+        runner: LayoutRecordRunner | None = None,
+    ) -> None:
+        # The OCR port is the module's own production engine: lazy on the
+        # optional ``[ocr]`` extra, so a host without it ends a page that
+        # needed a read at the typed ``ocr_required_unavailable`` exit
+        # rather than at boot. One engine serves every document: it holds
+        # no per-document state.
+        ocr = TesseractEngine()
+        super().__init__(layout=NullLayout(), ocr=ocr)
+        self._ocr_engine = ocr
+        self._heron_config = config
+        # ``None`` keeps the adapter's own measured-harness default; a
+        # caller may hand in another runner, and this is the seam the
+        # lane's boot tests take so a wiring check never crosses a
+        # container.
+        self._runner = runner
+
+    @property
+    def heron_config(self) -> HeronLayoutConfig:
+        """The boot-resolved harness knobs every document's pass is taken with."""
+        return self._heron_config
+
+    def extract_pdf(
+        self,
+        *,
+        source_bytes: bytes,
+        source_sha256: str,
+        document_id: str,
+        version: str,
+        max_pages: int | None = None,
+    ) -> PageParseResult:
+        handle, staged_name = tempfile.mkstemp(
+            prefix="fin-attachment-", suffix=".pdf"
+        )
+        staged = Path(staged_name)
+        try:
+            with os.fdopen(handle, "wb") as staged_file:
+                staged_file.write(source_bytes)
+            document_parser = PageRegionParser(
+                layout=HeronPageLayout(
+                    pdf_path=staged,
+                    runner=self._runner,
+                    config=self._heron_config,
+                ),
+                ocr=self._ocr_engine,
+            )
+            return document_parser.extract_pdf(
+                source_bytes=source_bytes,
+                source_sha256=source_sha256,
+                document_id=document_id,
+                version=version,
+                max_pages=max_pages,
+            )
+        finally:
+            # A copy this process wrote for one preparation is removed even
+            # when that preparation failed: the row already carries the
+            # typed exit, and a private filing must not leak into tmp.
+            try:
+                staged.unlink(missing_ok=True)
+            except OSError as cleanup_exc:
+                logger.debug("staged copy %s not removed: %s", staged, cleanup_exc)
+
+
 def _build_default_attachment_service() -> AttachmentPreparationService:
     """Build the default attachment service and resume interrupted work.
 
@@ -2450,16 +2556,35 @@ def _build_default_attachment_service() -> AttachmentPreparationService:
     uses — because attachment rows outlive the blobs then, and recovery
     reports them as ``source_unavailable`` rather than as empty text.
 
-    This root wires no page lane: it passes no page budget and no
-    extraction ports, so a document whose name declares the multi-page lane
-    (``.pdf``) is stored and answered with the failed reason
-    :data:`~fin.host.attachment_prepare.ATTACHMENT_PAGE_LANE_UNWIRED` on the
-    same ladder as any document this service cannot read, while a standalone
-    image (``.png`` / ``.jpg`` / ``.jpeg``) is answered by this door's own
-    content judgement — ``attachment_not_text`` for bytes that do not decode
-    as UTF-8. Wiring the lane is a deployment decision about per-document
-    container renders and per-run vision pricing, and neither is settled
-    here; until it is, no attachment door raises past its own typed answers.
+    This root deploys the page lane whenever the run has declared its
+    bounds: every wired service carries the run's own bounds, a
+    per-document Heron pages port, and the host's vision port. Once the
+    lane is deployed, two config facts can stop the build from succeeding
+    — the four ``FIN_ATTACHMENT_*`` bounds read through the boot singleton
+    (:func:`fin.host.http.get_attachment_budgets`, the same read
+    ``serve()`` makes before binding, so a missing or non-positive bound
+    is a startup failure here too) and a malformed
+    ``FIN_ATTACHMENT_HERON_*`` value, which is a named boot failure
+    (:meth:`HeronLayoutConfig.from_environ`) rather than a fallback. No
+    optional knob has to be present: with no harness image configured the
+    pass answers its own named state per document and the lane still
+    serves native text, rendering, OCR, and the page scan. The vision
+    port is constructed without a credential — its client is built
+    lazily on the first scan — so boot never pays a provider import, and
+    a keyless scan at preparation time is the typed
+    ``vision_call_failed`` exit, never a silent skip.
+
+    WHY the bounds gate the lane: declaring any one of the four
+    ``FIN_ATTACHMENT_*`` keys is the operator's word that this process
+    prices pages, and then every sibling bound and every Heron knob is
+    validated strictly at build time. A process that declares none has
+    not opted in, and this root does not crash it: it builds T2d's
+    shipped text-only door, where a page document answers the pinned
+    :class:`~fin.host.attachment_prepare.AttachmentPageLaneUnwiredError`
+    and text keeps working. That is not an operator escape hatch —
+    ``serve()`` reads the boot singleton before binding regardless, so a
+    server without its bounds still fails at startup; only non-``serve``
+    entry points (tests, embedded doors) ever meet the unwired lane.
     """
     import os
 
@@ -2473,6 +2598,43 @@ def _build_default_attachment_service() -> AttachmentPreparationService:
         PostgresAttachmentStore,
     )
     from fin.host.thread_store import default_thread_store
+
+    # WHY the lane config first: both reads are boot facts, and a
+    # deployment that declared its bounds but cannot state them legally,
+    # or misspelled a harness knob, must fail before it opens a pool,
+    # stores a byte, or resumes work. Lazily imported: ``fin.host.http``
+    # owns the deployed-budget singleton and imports this module at its
+    # bottom, so a module-level import here would close the cycle — the
+    # same seam ``build_router`` reads the door's copy of these bounds
+    # through. ``BOUND_ENV_KEYS`` is imported for the key NAMES only: the
+    # module that owns the bounds owns how they are spelled, so the gate
+    # here can never drift from what ``from_environ`` reads.
+    from fin.host.attachment_budgets import BOUND_ENV_KEYS
+
+    lane_declared = any(key in os.environ for key, _ in BOUND_ENV_KEYS)
+    budgets: AttachmentBudgets | None = None
+    pages: HeronPageLaneParser | None = None
+    vision: ChatModelVisionAdapter | None = None
+    if lane_declared:
+        from fin.host.http import get_attachment_budgets
+
+        budgets = get_attachment_budgets()
+        pages = HeronPageLaneParser(
+            config=HeronLayoutConfig.from_environ(environ=os.environ)
+        )
+        # The one production vision port: the host's own chat-model
+        # settings, no separate credentials, client built lazily at the
+        # first scan.
+        vision = ChatModelVisionAdapter()
+    else:
+        # EXIT: no bounds declared — the unwired text-only door, not a
+        # crash. See the docstring: serve() still gates a boundless
+        # server at boot.
+        logger.info(
+            "no FIN_ATTACHMENT_* bounds are set; the page lane stays "
+            "unwired and page documents will answer %s",
+            ATTACHMENT_PAGE_LANE_UNWIRED,
+        )
 
     try:
         objects: Any = object_store_from_env()
@@ -2493,7 +2655,9 @@ def _build_default_attachment_service() -> AttachmentPreparationService:
         store: Any = PostgresAttachmentStore(url)
     else:
         store = InMemoryAttachmentStore(default_thread_store())
-    service = AttachmentPreparationService(store=store, objects=objects)
+    service = AttachmentPreparationService(
+        store=store, objects=objects, budgets=budgets, pages=pages, vision=vision
+    )
     service.recover()
     return service
 
