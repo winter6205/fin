@@ -4,15 +4,25 @@ Replaces the turn-blob contract (single-use, process-local dict) with the
 thread-owned durable attachment of ADRs 0083/0085/0086/0088/0089:
 ``uploaded`` on acceptance (raw bytes only, no derived work), ``ready``
 only once a requested preparation has frozen units and a searchable
-index, restart keeps bytes and the parsed version, and deleting the
-thread removes metadata, bytes, parsed units, and index entries.
+index, restart keeps bytes and the parsed version, and deleting removes
+metadata, parsed units, index entries and finally the bytes — one attachment
+at a time or a whole thread at once, always in that order, so a refusal that
+leaves bytes behind leaves a tombstone behind too.
 
+The order itself is pinned where only it can be seen: the byte store reports
+what the durable record looked like at the instant it was called, and the
+races and that report both run a second time against real Postgres rows on
+two connections when ``FIN_CHECKPOINT_URL`` names a reachable server.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 import threading
+import time
 import uuid
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -27,14 +37,18 @@ from fin.corpus.object_store_errors import UnknownObjectKeyError
 from fin.host.attachment_budgets import AttachmentBudgets
 from fin.host.attachment_index import search
 from fin.host.attachment_prepare import (
+    AttachmentCleanupError,
+    AttachmentNotFoundError,
     AttachmentNotReadyError,
     AttachmentPreparationService,
 )
 from fin.host.attachment_store import (
     AttachmentRecord,
+    AttachmentStoreError,
     AttachmentThreadGoneError,
     InMemoryAttachmentStore,
     ParsedAttachmentUnit,
+    PostgresAttachmentStore,
 )
 from fin.host.http import (
     get_attachment_budgets,
@@ -43,7 +57,7 @@ from fin.host.http import (
     get_thread_store,
 )
 from fin.host.scripted_model import ScriptedChatModel
-from fin.host.thread_store import InMemoryThreadStore
+from fin.host.thread_store import InMemoryThreadStore, PostgresThreadStore
 from fin.retrieve import ExtractedTreeReadPort
 
 AAPL_2022Q3 = "AAPL-2022Q3"
@@ -52,6 +66,11 @@ _TREE_READ_PORT = ExtractedTreeReadPort(
     Path("data/corpus/manifest.json"),
     Path("data/corpus/extracted"),
 )
+
+# The repo's gate for every Postgres-backed case: unset means the durable
+# half of these promises is not exercised on this machine at all.
+POSTGRES_URL_ENV = "FIN_CHECKPOINT_URL"
+
 
 REVENUE_TEXT = (
     "Q3 revenue was 89,493 million dollars.\n"
@@ -92,6 +111,269 @@ class GateObjectStore:
         if self.delete_fails:
             raise RuntimeError("object store unreachable")
         self.inner.delete(key)
+
+
+class ByteTouchSpy(GateObjectStore):
+    """Byte store that reports the durable state while each delete is in flight.
+
+    WHY the report is taken inside :meth:`delete`: once the door has returned,
+    void-then-delete and delete-then-void leave exactly the same stored state,
+    so no later read can tell the two apart. The byte store is the one caller
+    that runs at the moment the first byte is touched, and what it sees then
+    is either an already-voided attachment or a live one.
+    """
+
+    def __init__(self, inner: InMemoryObjectStore) -> None:
+        super().__init__(inner)
+        self.snapshots: list[dict[str, Any]] = []
+        self.touched: list[str] = []
+        self.report: Callable[[str, list[str]], dict[str, Any]] | None = None
+
+    def delete(self, key: str) -> None:
+        if self.report is not None:
+            self.snapshots.append({"key": key, **self.report(key, list(self.touched))})
+        super().delete(key)
+        self.touched.append(key)
+
+
+def _void_report(
+    reader: Any,
+    *,
+    thread_id: str,
+    attachments: Sequence[tuple[str, str, int]],
+) -> Callable[[str, list[str]], dict[str, Any]]:
+    """Report what ``reader`` can still reach while a byte is being deleted.
+
+    ``attachments`` names every attachment the running deletion is on the hook
+    for — id, object key, published version — so one report also shows whether
+    a *sibling* of the key being removed was still readable at that instant.
+    ``reader`` is a separate view of the durable state: another store instance
+    and therefore another connection against Postgres, never the writer's own
+    uncommitted transaction.
+    """
+
+    def report(key: str, touched: list[str]) -> dict[str, Any]:
+        return {
+            "already_removed": touched,
+            "live_rows": [
+                attachment_id
+                for attachment_id, _, _ in attachments
+                if reader.get(attachment_id) is not None
+            ],
+            "owed_keys": sorted(reader.pending_cleanup(thread_id)),
+            "derived_left": [
+                attachment_id
+                for attachment_id, _, version in attachments
+                if reader.units(attachment_id, version)
+                or reader.indexed_versions(attachment_id)
+            ],
+        }
+
+    return report
+
+
+def _voided_once(object_key: str, owed: Sequence[str]) -> dict[str, Any]:
+    """The one report a byte delete is allowed to produce: nothing reachable."""
+    return {
+        "key": object_key,
+        "already_removed": [],
+        "live_rows": [],
+        "owed_keys": sorted(owed),
+        "derived_left": [],
+    }
+
+
+# ----- durable backends -----
+
+
+def _postgres_url_or_skip() -> str:
+    url = (os.environ.get(POSTGRES_URL_ENV) or "").strip()
+    if not url:
+        pytest.skip(
+            "FIN_CHECKPOINT_URL is not set; the durable half of the "
+            "attachment delete order and its races is untested here"
+        )
+    return url
+
+
+def _postgres_backend(url: str) -> dict[str, Any]:
+    """A real thread row plus a factory of independent attachment sessions.
+
+    Each store built here opens its own connection per call, so two of them
+    are two server sessions: what one commits is what the other can read, and
+    nothing else. The byte layer stays in-process, as it does in the durable
+    Postgres suite — the S3 adapter's own contract lives in ``tests/corpus``.
+    """
+    threads = PostgresThreadStore(url)
+    thread = threads.create_thread(title="attachment race")
+    return {
+        "backend": "postgres",
+        "url": url,
+        "threads": threads,
+        "objects": InMemoryObjectStore(),
+        "thread_id": thread.id,
+        "new_store": lambda: PostgresAttachmentStore(url),
+    }
+
+
+def _drop_thread(url: str, thread_id: str) -> None:
+    """Remove one test's thread row; its attachments cascade away with it.
+
+    WHY not the whole table: several suites share this server, and a global
+    delete would let one run decide another's row counts.
+    """
+    import psycopg
+
+    with psycopg.connect(url) as conn:
+        conn.execute("DELETE FROM fin_thread WHERE id = %s", (thread_id,))
+        conn.commit()
+
+
+def _blocked_writer_sessions(url: str, *, holder_pid: int) -> int:
+    """How many sessions are waiting for a lock this very session is holding.
+
+    WHY the wait chain instead of a lock-wait alone: the claim under test is
+    that the delete running on one connection is the one parked behind the
+    row this test holds on another, so the two ends of the wait have to be
+    identified. A count of sessions named ``Lock`` could be answered by any
+    other work sharing the server.
+    """
+    import psycopg
+
+    with psycopg.connect(url) as conn:
+        row = conn.execute(
+            "SELECT count(*) FROM pg_stat_activity waiting "
+            "JOIN pg_locks wanted "
+            "ON wanted.pid = waiting.pid AND NOT wanted.granted "
+            "JOIN pg_locks held "
+            "ON held.pid = %s AND held.granted "
+            "AND held.locktype = wanted.locktype "
+            "AND held.database IS NOT DISTINCT FROM wanted.database "
+            "AND held.relation IS NOT DISTINCT FROM wanted.relation "
+            "AND held.page IS NOT DISTINCT FROM wanted.page "
+            "AND held.tuple IS NOT DISTINCT FROM wanted.tuple "
+            "WHERE waiting.datname = current_database() "
+            "AND waiting.pid <> pg_backend_pid() AND waiting.pid <> %s",
+            (holder_pid, holder_pid),
+        ).fetchone()
+    return int(row[0])
+
+
+def _wait_until_blocked(
+    url: str, *, holder_pid: int, timeout: float = 10.0
+) -> bool:
+    """Poll :func:`_blocked_writer_sessions` until it names a blocked writer."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _blocked_writer_sessions(url, holder_pid=holder_pid) >= 1:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+_BLOCKED_WRITER_PID_SQL = (
+    "SELECT waiting.pid FROM pg_stat_activity waiting "
+    "JOIN pg_locks wanted "
+    "ON wanted.pid = waiting.pid AND NOT wanted.granted "
+    "JOIN pg_locks held "
+    "ON held.pid = %s AND held.granted "
+    "AND held.locktype = wanted.locktype "
+    "AND held.database IS NOT DISTINCT FROM wanted.database "
+    "AND held.relation IS NOT DISTINCT FROM wanted.relation "
+    "AND held.page IS NOT DISTINCT FROM wanted.page "
+    "AND held.tuple IS NOT DISTINCT FROM wanted.tuple "
+    "WHERE waiting.datname = current_database() "
+    "AND waiting.pid <> pg_backend_pid() AND waiting.pid <> %s "
+    "LIMIT 1"
+)
+
+
+def _blocked_writer_pid(
+    url: str, *, holder_pid: int, timeout: float = 10.0
+) -> int | None:
+    """The pid of the session waiting on a lock this session holds.
+
+    WHY the count alone is not enough: it says something waits, not which
+    statement the waiter had reached. The claim under test is about a
+    specific session's tombstone write, and that observation needs the
+    waiter named.
+    """
+    import psycopg
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with psycopg.connect(url) as conn:
+            row = conn.execute(
+                _BLOCKED_WRITER_PID_SQL, (holder_pid, holder_pid)
+            ).fetchone()
+        if row is not None:
+            return int(row[0])
+        time.sleep(0.05)
+    return None
+
+
+def _tombstone_write_started(url: str, *, pid: int) -> bool:
+    """Whether that session has begun writing tombstone rows at all.
+
+    WHY a lock and not a row read: an uncommitted INSERT is invisible to
+    every other session's SELECT, so row visibility cannot falsify "the
+    tombstone write had not been reached" — a void that wrote first and
+    parked afterwards would hide its write completely. An INSERT takes a
+    granted relation lock on the tombstone table for the life of its
+    transaction, so the write shows as started the moment it starts,
+    committed or not.
+    """
+    import psycopg
+
+    with psycopg.connect(url) as conn:
+        row = conn.execute(
+            "SELECT count(*) FROM pg_locks "
+            "WHERE pid = %s AND granted AND locktype = 'relation' "
+            "AND relation = 'fin_thread_attachment_tombstone'::regclass",
+            (pid,),
+        ).fetchone()
+    return int(row[0]) > 0
+
+
+@pytest.fixture
+def postgres_url() -> str:
+    """The DSN the Postgres-backed cases in this file share."""
+    return _postgres_url_or_skip()
+
+
+@pytest.fixture(params=["memory", "postgres"])
+def race_stack(request) -> Iterator[dict[str, Any]]:
+    """One live thread and one byte store, per durable attachment backend.
+
+    The races and the void-before-any-byte order are the part of the contract
+    a single process's dictionary cannot show, so the ``postgres`` parameter
+    hands every caller its own store — its own connection and its own
+    committed view. Opt-in by the repo's convention: with no reachable
+    ``FIN_CHECKPOINT_URL`` that parameter skips and only the in-memory shape
+    runs, which is exactly the evidence the durable half would be missing.
+    """
+    if request.param == "memory":
+        threads = InMemoryThreadStore()
+        thread = threads.create_thread(title="attachment race")
+        shared = InMemoryAttachmentStore(threads)
+        yield {
+            "backend": "memory",
+            "url": "",
+            "threads": threads,
+            "objects": InMemoryObjectStore(),
+            "thread_id": thread.id,
+            # In-memory durable state IS one dict, so every caller and every
+            # reader of it is the same object by construction.
+            "new_store": lambda: shared,
+        }
+        return
+
+    url = _postgres_url_or_skip()
+    stack = _postgres_backend(url)
+    try:
+        yield stack
+    finally:
+        _drop_thread(url, stack["thread_id"])
 
 
 # ----- fixtures -----
@@ -433,25 +715,758 @@ def test_deleted_attachment_id_yields_unknown_locator_on_a_new_thread(
     assert response.json() == {"error": "attachment_not_found"}
 
 
-def test_cleanup_failure_is_typed_observable_and_retriable(
+def test_thread_deletion_tombstones_before_cleanup_and_stays_retriable(
     client: TestClient,
     wired: dict[str, Any],
     gate: GateObjectStore,
+    objects: InMemoryObjectStore,
 ) -> None:
+    """A thread delete blocks access first, so a failed cleanup is retryable.
+
+    Replaces the earlier assertion that a failed cleanup left the attachment
+    readable: the tombstone rule applies to thread deletion too, so access is
+    voided before any byte removal is attempted while the obligation to
+    finish the cleanup is retained.
+    """
     body = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
     aid = body["attachment_id"]
+    _prepare_through_door(client, wired["thread_id"], aid)
+    object_key = wired["service"].status(aid).object_key
     gate.delete_fails = True
 
     blocked = client.delete(f"/api/threads/{wired['thread_id']}")
+
     assert blocked.status_code == 500
     assert blocked.json() == {"error": "attachment_cleanup_failed"}
-    assert wired["service"].status(aid) is not None
+    assert wired["service"].status(aid) is None
+    assert wired["service"].units(aid) == ()
+    assert wired["service"].store.indexed_versions(aid) == ()
     assert wired["threads"].get_thread(wired["thread_id"]) is not None
+    assert objects.get(object_key) == REVENUE_TEXT.encode("utf-8")
+    assert wired["service"].store.pending_cleanup(wired["thread_id"]) == [object_key]
 
     gate.delete_fails = False
     retried = client.delete(f"/api/threads/{wired['thread_id']}")
+
     assert retried.status_code == 200, retried.text
+    assert wired["threads"].get_thread(wired["thread_id"]) is None
+    with pytest.raises(UnknownObjectKeyError):
+        objects.get(object_key)
+    assert wired["service"].store.pending_cleanup(wired["thread_id"]) == []
+
+
+# ----- single-attachment deletion -----
+
+
+def _delete_one(
+    client: TestClient, thread_id: str, attachment_id: str
+) -> Any:
+    from fin.host.workspace_http import _attachment_delete_path
+
+    return client.request("DELETE", _attachment_delete_path(thread_id, attachment_id))
+
+
+def test_deleting_one_attachment_voids_access_then_removes_its_layers(
+    client: TestClient,
+    wired: dict[str, Any],
+    objects: InMemoryObjectStore,
+) -> None:
+    body = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
+    aid = body["attachment_id"]
+    _prepare_through_door(client, wired["thread_id"], aid)
+    sibling = _attach(client, wired["thread_id"], "sibling notes".encode("utf-8"))
+    object_key = wired["service"].status(aid).object_key
+
+    deleted = _delete_one(client, wired["thread_id"], aid)
+
+    assert deleted.status_code == 200, deleted.text
     assert wired["service"].status(aid) is None
+    assert _status(client, wired["thread_id"], aid).status_code == 400
+    assert wired["service"].units(aid) == ()
+    assert wired["service"].store.index_postings(aid, 1) == {}
+    assert wired["service"].store.indexed_versions(aid) == ()
+    assert wired["service"].store.pending_cleanup(wired["thread_id"]) == []
+    with pytest.raises(UnknownObjectKeyError):
+        objects.get(object_key)
+    # Only the named attachment is voided.
+    assert [
+        record.attachment_id for record in wired["service"].list_for_thread(
+            wired["thread_id"]
+        )
+    ] == [sibling["attachment_id"]]
+
+
+# ----- the promised order, read while the byte store is being touched -----
+
+
+def test_the_delete_door_touches_no_byte_before_the_void_is_durable(
+    client: TestClient,
+    http_app: FastAPI,
+    wired: dict[str, Any],
+    objects: InMemoryObjectStore,
+) -> None:
+    """The door's own success path is the one that has to keep the order.
+
+    A read taken after the response cannot tell void-then-delete from
+    delete-then-void: both leave no row, no units, no postings, and no bytes.
+    So the byte store reports what the durable record said at the instant it
+    was asked to remove the key — access unreadable and the obligation already
+    written — and that report, not the aftermath, is the proof.
+    """
+    body = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
+    aid = body["attachment_id"]
+    _prepare_through_door(client, wired["thread_id"], aid)
+    store = wired["service"].store
+    published = wired["service"].status(aid)
+    spy = ByteTouchSpy(objects)
+    spy.report = _void_report(
+        store,
+        thread_id=wired["thread_id"],
+        attachments=((aid, published.object_key, published.version),),
+    )
+    http_app.dependency_overrides[get_attachment_service] = lambda: (
+        AttachmentPreparationService(store=store, objects=spy)
+    )
+
+    deleted = _delete_one(client, wired["thread_id"], aid)
+
+    assert spy.snapshots == [
+        _voided_once(published.object_key, owed=(published.object_key,))
+    ], spy.snapshots
+    assert deleted.status_code == 200, deleted.text
+    assert spy.touched == [published.object_key]
+
+
+def test_the_byte_delete_finds_the_attachment_already_voided(
+    race_stack: dict[str, Any],
+) -> None:
+    """The same order, on each durable backend, read through a second view.
+
+    The reporter gets its own attachment store, which against Postgres is its
+    own connection: what it can see while the byte delete is in flight is a
+    committed tombstone, never the deleting transaction's own uncommitted view
+    of the row it is about to remove.
+    """
+    thread_id = race_stack["thread_id"]
+    store = race_stack["new_store"]()
+    spy = ByteTouchSpy(race_stack["objects"])
+    service = AttachmentPreparationService(store=store, objects=spy)
+    record = service.accept(
+        thread_id=thread_id, filename="once.txt", payload=REVENUE_TEXT.encode("utf-8")
+    )
+    published = service.prepare(record.attachment_id)
+    assert published.status == "ready"
+    spy.report = _void_report(
+        race_stack["new_store"](),
+        thread_id=thread_id,
+        attachments=((record.attachment_id, published.object_key, published.version),),
+    )
+
+    service.delete_attachment(thread_id=thread_id, attachment_id=record.attachment_id)
+
+    assert spy.snapshots == [
+        _voided_once(published.object_key, owed=(published.object_key,))
+    ], spy.snapshots
+    assert spy.touched == [published.object_key]
+    assert store.get(record.attachment_id) is None
+    assert store.pending_cleanup(thread_id) == []
+
+
+def test_a_thread_delete_voids_every_attachment_before_the_first_byte(
+    race_stack: dict[str, Any],
+) -> None:
+    """A thread's rows all go before any of its bytes is touched.
+
+    Two attachments make this more than a restatement of the single delete: a
+    door that voided one attachment, removed its bytes, then repeated that per
+    file would leave the second attachment fully readable while the first file
+    was already gone — the state the thread door promises never to show.
+    """
+    thread_id = race_stack["thread_id"]
+    store = race_stack["new_store"]()
+    spy = ByteTouchSpy(race_stack["objects"])
+    service = AttachmentPreparationService(store=store, objects=spy)
+    published = []
+    for name in ("first.txt", "second.txt"):
+        record = service.accept(
+            thread_id=thread_id, filename=name, payload=REVENUE_TEXT.encode("utf-8")
+        )
+        published.append(service.prepare(record.attachment_id))
+    owed = sorted(row.object_key for row in published)
+    spy.report = _void_report(
+        race_stack["new_store"](),
+        thread_id=thread_id,
+        attachments=tuple(
+            (row.attachment_id, row.object_key, row.version) for row in published
+        ),
+    )
+
+    service.delete_thread(thread_id)
+
+    assert sorted(spy.touched) == owed
+    assert sorted(row["key"] for row in spy.snapshots) == owed
+    for row in spy.snapshots:
+        # At the moment each byte is removed, every attachment of the thread is
+        # already voided and every one of its keys is already owed.
+        assert row["live_rows"] == [], row
+        assert row["derived_left"] == [], row
+        assert row["owed_keys"] == owed, row
+    assert store.pending_cleanup(thread_id) == []
+    for key in owed:
+        with pytest.raises(UnknownObjectKeyError):
+            spy.get(key)
+
+
+def test_the_void_waits_for_a_row_another_session_holds(postgres_url: str) -> None:
+    """The Postgres half of the order is a lock, and the lock is load-bearing.
+
+    While a second connection holds the attachment row, the deletion must be
+    parked before its first byte touch: a byte removed over an uncommitted
+    void is exactly the state the door promises it cannot produce. Once that
+    session lets the row go, the same delete finishes in the promised order.
+    """
+    import psycopg
+
+    stack = _postgres_backend(postgres_url)
+    thread_id = stack["thread_id"]
+    holder = psycopg.connect(postgres_url)
+    try:
+        spy = ByteTouchSpy(stack["objects"])
+        service = AttachmentPreparationService(
+            store=stack["new_store"](), objects=spy
+        )
+        record = service.accept(
+            thread_id=thread_id,
+            filename="held.txt",
+            payload=REVENUE_TEXT.encode("utf-8"),
+        )
+        published = service.prepare(record.attachment_id)
+        spy.report = _void_report(
+            stack["new_store"](),
+            thread_id=thread_id,
+            attachments=(
+                (record.attachment_id, published.object_key, published.version),
+            ),
+        )
+        # Another session takes the row the void is about to write: the same
+        # lock ``tombstone`` asks for.
+        holder_pid = int(holder.execute("SELECT pg_backend_pid()").fetchone()[0])
+        holder.execute(
+            "SELECT attachment_id FROM fin_thread_attachment "
+            "WHERE attachment_id = %s FOR UPDATE",
+            (record.attachment_id,),
+        )
+        outcomes: list[Any] = []
+
+        def parked_delete() -> None:
+            try:
+                service.delete_attachment(
+                    thread_id=thread_id, attachment_id=record.attachment_id
+                )
+                outcomes.append("ok")
+            except Exception as exc:  # noqa: BLE001 - the parked outcome is the point
+                outcomes.append(exc)
+
+        worker = threading.Thread(target=parked_delete, daemon=True)
+        worker.start()
+        assert _wait_until_blocked(postgres_url, holder_pid=holder_pid), (
+            "the void did not wait for the other session's row lock"
+        )
+        assert outcomes == []
+        assert spy.touched == [], "a byte was removed while the void was not durable"
+        assert service.status(record.attachment_id) is not None
+
+        holder.commit()  # the other session lets the row go
+        worker.join(timeout=10)
+
+        assert outcomes == ["ok"], outcomes
+        assert spy.snapshots == [
+            _voided_once(published.object_key, owed=(published.object_key,))
+        ], spy.snapshots
+        assert service.status(record.attachment_id) is None
+    finally:
+        holder.rollback()
+        holder.close()
+        _drop_thread(postgres_url, thread_id)
+
+
+def test_the_parked_void_has_not_reached_its_tombstone_write(postgres_url: str) -> None:
+    """The row lock, not the statement order, is what parks the tombstone write.
+
+    The byte-waiting claim holds without this lock by itself: a void that
+    skipped the row lock would still wait at its later row removal, and the
+    door touches no byte until ``tombstone`` returns. What only ``FOR UPDATE``
+    enforces is narrower and is the actual claim: while another session holds
+    the attachment row the way a derived write holds it, the parked void must
+    not even have begun its tombstone write. A void that wrote first and
+    parked afterwards is invisible through row reads — its write is
+    uncommitted — so the proof is read where an in-flight INSERT leaves a
+    trace no MVCC read can hide: the writer's granted lock on the tombstone
+    table.
+    """
+    import psycopg
+
+    stack = _postgres_backend(postgres_url)
+    thread_id = stack["thread_id"]
+    holder = psycopg.connect(postgres_url)
+    try:
+        spy = ByteTouchSpy(stack["objects"])
+        service = AttachmentPreparationService(
+            store=stack["new_store"](), objects=spy
+        )
+        record = service.accept(
+            thread_id=thread_id,
+            filename="held.txt",
+            payload=REVENUE_TEXT.encode("utf-8"),
+        )
+        published = service.prepare(record.attachment_id)
+        assert published.status == "ready"
+        spy.report = _void_report(
+            stack["new_store"](),
+            thread_id=thread_id,
+            attachments=(
+                (record.attachment_id, published.object_key, published.version),
+            ),
+        )
+        holder_pid = int(holder.execute("SELECT pg_backend_pid()").fetchone()[0])
+        # A publishing writer's footprint on the row: taken for the life of
+        # an open derived-write transaction.
+        holder.execute(
+            "SELECT attachment_id FROM fin_thread_attachment "
+            "WHERE attachment_id = %s FOR UPDATE",
+            (record.attachment_id,),
+        )
+        outcomes: list[Any] = []
+
+        def parked_delete() -> None:
+            try:
+                service.delete_attachment(
+                    thread_id=thread_id, attachment_id=record.attachment_id
+                )
+                outcomes.append("ok")
+            except Exception as exc:  # noqa: BLE001 - the parked outcome is the point
+                outcomes.append(exc)
+
+        worker = threading.Thread(target=parked_delete, daemon=True)
+        worker.start()
+        void_pid = _blocked_writer_pid(postgres_url, holder_pid=holder_pid)
+        assert void_pid is not None, (
+            "the void did not wait for the other session's row lock"
+        )
+        assert not _tombstone_write_started(postgres_url, pid=void_pid), (
+            "the void wrote its tombstone before waiting for the row: the "
+            "wait it is credited with was for the row removal, not for the "
+            "tombstone write"
+        )
+        assert stack["new_store"]().pending_cleanup(thread_id) == []
+        assert outcomes == []
+        assert spy.touched == []
+
+        holder.commit()  # the publisher's transaction lets the row go
+        worker.join(timeout=10)
+        assert outcomes == ["ok"], outcomes
+        assert spy.snapshots == [
+            _voided_once(published.object_key, owed=(published.object_key,))
+        ], spy.snapshots
+        assert service.status(record.attachment_id) is None
+    finally:
+        holder.rollback()
+        holder.close()
+        _drop_thread(postgres_url, thread_id)
+
+
+class _LivenessGate:
+    """A thread store that freezes its Nth liveness answer until released.
+
+    WHY block there: asking whether the thread is live is the only external
+    call the in-memory void makes inside the critical section that must make
+    the decision, the row removal, and the obligation record one atomic step
+    — once from the sweep, again from the void's own row lookup. Freezing one
+    numbered answer parks the void exactly where it has decided everything
+    and published nothing, the one instant a test can open without touching
+    the store.
+    """
+
+    def __init__(self, inner: InMemoryThreadStore, *, block_at: int) -> None:
+        self.inner = inner
+        self._block_at = block_at
+        self._calls = 0
+        self._armed = False
+        self._released = False
+        self.entered = threading.Event()
+        self._release = threading.Event()
+
+    def arm(self) -> None:
+        self._armed = True
+
+    def release(self) -> None:
+        self._armed = False
+        self._released = True
+        self._release.set()
+
+    def create_thread(self, *, title: str) -> Any:
+        return self.inner.create_thread(title=title)
+
+    def get_thread(self, thread_id: str) -> Any:
+        if self._armed and not self._released:
+            self._calls += 1
+            if self._calls == self._block_at:
+                self.entered.set()
+                assert self._release.wait(10.0), "the liveness gate was never released"
+        return self.inner.get_thread(thread_id)
+
+
+def test_a_derived_write_racing_a_parked_void_meets_the_lock_not_the_window() -> None:
+    """Mid-void, what a preparation can read is the lock, never a live row.
+
+    A void parked between its liveness sweep and its tombstone write has
+    removed no row and recorded no obligation, so the state it is holding
+    open is fully publishable: a preparation allowed to read it would freeze
+    units and readiness onto an attachment a deletion has already taken
+    over, and nothing it reads could tell it otherwise. The store's lock is
+    the entire defense, and the observable promise is the deletion contract
+    itself — late work cannot publish — so the test asks for the ordering
+    only while the void is provably parked, then for the loss the completed
+    tombstone must hand back.
+    """
+    threads = InMemoryThreadStore()
+    gate = _LivenessGate(threads, block_at=2)
+    thread = threads.create_thread(title="void window")
+    thread_id = thread.id
+    store = InMemoryAttachmentStore(gate)
+    service = AttachmentPreparationService(
+        store=store, objects=InMemoryObjectStore()
+    )
+    record = service.accept(
+        thread_id=thread_id,
+        filename="late.txt",
+        payload=REVENUE_TEXT.encode("utf-8"),
+    )
+    outcomes: list[Any] = []
+    published: list[Any] = []
+    publication_done = threading.Event()
+
+    def parked_void() -> None:
+        try:
+            service.delete_attachment(
+                thread_id=thread_id, attachment_id=record.attachment_id
+            )
+            outcomes.append("void-ok")
+        except Exception as exc:  # noqa: BLE001 - the outcome is the point
+            outcomes.append(exc)
+
+    def racing_publication() -> None:
+        try:
+            published.append(service.prepare(record.attachment_id))
+        except Exception as exc:  # noqa: BLE001 - losing the race is one outcome
+            outcomes.append(exc)
+        finally:
+            publication_done.set()
+
+    gate.arm()
+    void = threading.Thread(target=parked_void, daemon=True)
+    void.start()
+    assert gate.entered.wait(5.0), (
+        "the void never reached its row lookup inside the void step"
+    )
+    publication = threading.Thread(target=racing_publication, daemon=True)
+    publication.start()
+    try:
+        assert not publication_done.wait(0.5), (
+            "a derived write completed while the void sat between its "
+            "liveness sweep and its tombstone write: nothing was locking "
+            "the tombstone write against it"
+        )
+    finally:
+        gate.release()
+    void.join(timeout=10)
+    publication.join(timeout=10)
+
+    assert published == [], published
+    assert "void-ok" in outcomes, outcomes
+    assert any(
+        isinstance(outcome, (AttachmentThreadGoneError, AttachmentNotFoundError))
+        for outcome in outcomes
+    ), outcomes
+    assert store.get(record.attachment_id) is None
+    assert store.pending_cleanup(thread_id) == []
+
+
+def test_deleting_one_attachment_refuses_a_late_preparation(
+    race_stack: dict[str, Any],
+) -> None:
+    """A preparation in flight when the tombstone lands publishes nothing.
+
+    Runs on both durable backends: the racing preparation and the deleting
+    door hold separate attachment stores, which against Postgres means
+    separate connections, so the derived write loses to a void another
+    session has already committed rather than to a dictionary entry.
+    """
+    objects = race_stack["objects"]
+    thread_id = race_stack["thread_id"]
+    release = threading.Event()
+    entered = threading.Event()
+
+    class BlockingGet(GateObjectStore):
+        def get(self, key: str) -> bytes:
+            entered.set()
+            assert release.wait(timeout=5)
+            return self.inner.get(key)
+
+    byte_store = BlockingGet(objects)
+    store = race_stack["new_store"]()
+    racer = AttachmentPreparationService(store=store, objects=byte_store)
+    deleter = AttachmentPreparationService(
+        store=race_stack["new_store"](), objects=byte_store
+    )
+    record = racer.accept(
+        thread_id=thread_id, filename="race.txt", payload=REVENUE_TEXT.encode("utf-8")
+    )
+
+    outcome: list[Any] = []
+    worker = threading.Thread(
+        target=lambda: outcome.append(_attempt(racer.prepare, record.attachment_id)),
+        daemon=True,
+    )
+    worker.start()
+    assert entered.wait(timeout=5)
+    deleter.delete_attachment(thread_id=thread_id, attachment_id=record.attachment_id)
+    release.set()
+    worker.join(timeout=5)
+
+    assert outcome and isinstance(outcome[0], AttachmentThreadGoneError)
+    assert racer.status(record.attachment_id) is None
+    assert store.units(record.attachment_id, 1) == ()
+    assert store.indexed_versions(record.attachment_id) == ()
+    assert store.get(record.attachment_id) is None
+    assert store.pending_cleanup(thread_id) == []
+    with pytest.raises(UnknownObjectKeyError):
+        objects.get(record.object_key)
+
+
+def test_deleting_one_attachment_keeps_the_tombstone_when_cleanup_fails(
+    client: TestClient,
+    wired: dict[str, Any],
+    gate: GateObjectStore,
+    objects: InMemoryObjectStore,
+) -> None:
+    """Cleanup failure is typed, observable, and retriable — never complete."""
+    body = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
+    aid = body["attachment_id"]
+    _prepare_through_door(client, wired["thread_id"], aid)
+    object_key = wired["service"].status(aid).object_key
+    gate.delete_fails = True
+
+    blocked = _delete_one(client, wired["thread_id"], aid)
+
+    assert blocked.status_code == 500
+    assert blocked.json() == {"error": "attachment_cleanup_failed"}
+    assert wired["service"].status(aid) is None
+    assert wired["service"].units(aid) == ()
+    assert objects.get(object_key) == REVENUE_TEXT.encode("utf-8")
+    assert wired["service"].store.pending_cleanup(wired["thread_id"]) == [object_key]
+
+    gate.delete_fails = False
+    retried = _delete_one(client, wired["thread_id"], aid)
+
+    assert retried.status_code == 200, retried.text
+    with pytest.raises(UnknownObjectKeyError):
+        objects.get(object_key)
+    assert wired["service"].store.pending_cleanup(wired["thread_id"]) == []
+    # The retry closed the obligation; the id is now simply unknown.
+    assert _delete_one(client, wired["thread_id"], aid).status_code == 400
+
+
+def test_repeated_and_foreign_deletion_of_one_attachment_names_the_identity(
+    client: TestClient, wired: dict[str, Any]
+) -> None:
+    """Cross-thread, unknown, and stale ids share one named refusal."""
+    aid = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))[
+        "attachment_id"
+    ]
+    other = wired["threads"].create_thread(title="other thread")
+
+    assert _delete_one(client, wired["thread_id"], "never-uploaded").status_code == 400
+    assert _delete_one(client, other.id, aid).json() == {"error": "unknown_locator"}
+    assert wired["service"].status(aid) is not None
+
+    assert _delete_one(client, wired["thread_id"], aid).status_code == 200
+    stale = _delete_one(client, wired["thread_id"], aid)
+    assert stale.status_code == 400
+    assert stale.json() == {"error": "unknown_locator"}
+    assert _delete_one(client, other.id, aid).json() == {"error": "unknown_locator"}
+
+
+def test_a_deleted_attachment_is_not_referenceable_by_a_later_turn(
+    client: TestClient, wired: dict[str, Any]
+) -> None:
+    aid = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))[
+        "attachment_id"
+    ]
+    _prepare_through_door(client, wired["thread_id"], aid)
+    assert _delete_one(client, wired["thread_id"], aid).status_code == 200
+
+    response = client.post(
+        f"/api/threads/{wired['thread_id']}/messages",
+        json={"question": "hi", "attachment_ids": [aid]},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "attachment_not_found"}
+
+
+def _matching_units(wired: dict[str, Any], attachment_id: str, version: int) -> list[int]:
+    """What one query can reach through the identity's own postings."""
+    postings = wired["service"].store.index_postings(attachment_id, version)
+    return [hit.unit for hit in search(postings, "revenue")]
+
+
+def test_a_voided_attachment_matches_no_query_while_its_sibling_still_does(
+    client: TestClient, wired: dict[str, Any]
+) -> None:
+    """Retrieval reaches only what the tombstone left standing.
+
+    The postings of a voided identity read as empty, so no turn can be
+    answered out of a file the operator deleted, while a sibling prepared at
+    the same version keeps matching.
+    """
+    aid = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))[
+        "attachment_id"
+    ]
+    _prepare_through_door(client, wired["thread_id"], aid)
+    sibling = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))[
+        "attachment_id"
+    ]
+    _prepare_through_door(client, wired["thread_id"], sibling)
+    version = wired["service"].status(aid).version
+    assert _matching_units(wired, aid, version)
+    assert _matching_units(wired, sibling, version)
+
+    assert _delete_one(client, wired["thread_id"], aid).status_code == 200
+
+    assert _matching_units(wired, aid, version) == []
+    assert _matching_units(wired, sibling, version)
+
+
+def test_a_refused_cleanup_names_the_owed_bytes_in_the_log(
+    client: TestClient,
+    wired: dict[str, Any],
+    gate: GateObjectStore,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Observable means an operator can see WHICH bytes are still owed.
+
+    The 500 names the failure class; only the log carries the thread and key
+    the retry has to be pointed at, so a silent refusal would leave the
+    obligation unreadable even though the tombstone is held.
+    """
+    aid = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))[
+        "attachment_id"
+    ]
+    _prepare_through_door(client, wired["thread_id"], aid)
+    object_key = wired["service"].status(aid).object_key
+    gate.delete_fails = True
+
+    with caplog.at_level(logging.WARNING, logger="fin.host.attachment_prepare"):
+        assert _delete_one(client, wired["thread_id"], aid).status_code == 500
+
+    named = [record.getMessage() for record in caplog.records]
+    assert any(
+        object_key in message and wired["thread_id"] in message
+        for message in named
+    ), named
+
+    refused = [
+        record
+        for record in caplog.records
+        if record.name == "fin.host.attachment_prepare"
+        and object_key in record.getMessage()
+    ]
+    # WHY a count: one refused key is one fact about one leftover. The same
+    # key named twice, once per layer that happened to notice it, is how an
+    # operator learns to skim the line and miss the third one.
+    assert len(refused) == 1, [record.getMessage() for record in refused]
+    line = refused[0].getMessage()
+    # WHY the verdict in the line: a record still owns this key, so the same
+    # door can finish the job on retry. That is the whole difference between a
+    # blocked cleanup and an orphan, and the reader has to see it here.
+    assert "still owed" in line, line
+    # WHY the traceback: the byte store's own reason is the actionable half of
+    # a refusal, and a message that only formats the exception drops it.
+    assert refused[0].exc_info, line
+
+
+def test_concurrent_deletes_of_one_attachment_expose_nothing(
+    race_stack: dict[str, Any],
+) -> None:
+    """Two deletes of the same id cannot resurrect it or strand a record.
+
+    Each racer holds its own attachment store, so on the Postgres parameter
+    the second void decides against the first one's committed rows and its
+    obligation record, the way two doors in two processes would.
+    """
+    objects = race_stack["objects"]
+    thread_id = race_stack["thread_id"]
+    release = threading.Event()
+    started = threading.Event()
+
+    class SlowDelete(GateObjectStore):
+        def delete(self, key: str) -> None:
+            started.set()
+            assert release.wait(timeout=5)
+            self.inner.delete(key)
+
+    byte_store = SlowDelete(objects)
+    store = race_stack["new_store"]()
+    service = AttachmentPreparationService(store=store, objects=byte_store)
+    other = AttachmentPreparationService(
+        store=race_stack["new_store"](), objects=byte_store
+    )
+    record = service.accept(
+        thread_id=thread_id,
+        filename="twice.txt",
+        payload=REVENUE_TEXT.encode("utf-8"),
+    )
+    outcomes: list[Any] = []
+    guard = threading.Lock()
+
+    def worker(racer: AttachmentPreparationService) -> None:
+        try:
+            racer.delete_attachment(thread_id=thread_id, attachment_id=record.attachment_id)
+            outcome: Any = "ok"
+        except Exception as exc:  # noqa: BLE001 - the race outcome is the assertion
+            outcome = exc
+        with guard:
+            outcomes.append(outcome)
+
+    first = threading.Thread(target=worker, args=(service,), daemon=True)
+    first.start()
+    assert started.wait(timeout=5)
+    second = threading.Thread(target=worker, args=(other,), daemon=True)
+    second.start()
+    release.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert len(outcomes) == 2
+    assert not any(
+        isinstance(outcome, (AttachmentCleanupError, AttachmentStoreError))
+        for outcome in outcomes
+    )
+    assert service.status(record.attachment_id) is None
+    # The loser of the race reached the same answer through the obligation the
+    # winner left behind, and neither door stranded a byte or a row.
+    assert other.status(record.attachment_id) is None
+    assert store.pending_cleanup(thread_id) == []
+    with pytest.raises(UnknownObjectKeyError):
+        objects.get(record.object_key)
+
+
+def _attempt(call: Any, argument: str) -> Any:
+    try:
+        return call(argument)
+    except Exception as exc:  # noqa: BLE001 - records the typed race outcome
+        return exc
 
 
 # ----- delete racing preparation -----
@@ -492,13 +1507,6 @@ def test_delete_during_preparation_cannot_resurrect_the_index(
     assert store.get(record.attachment_id) is None
     with pytest.raises(UnknownObjectKeyError):
         objects.get(record.object_key)
-
-
-def _attempt(call: Any, argument: str) -> Any:
-    try:
-        return call(argument)
-    except Exception as exc:  # noqa: BLE001 - records the typed race outcome
-        return exc
 
 
 # ----- input classes at the public door -----

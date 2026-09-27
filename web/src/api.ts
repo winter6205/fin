@@ -844,8 +844,19 @@ export async function listThreadAttachments(
  * Re-run preparation for one failed attachment. Preparation runs INSIDE
  * this request, so the 200 is the settled single record — ``"ready"``
  * when the re-drive worked, ``"failed"`` with its named reason when it
- * did not; this door never answers ``"parsing"``. Unknown or foreign
- * attachment ids answer the named 400 ``attachment_not_found``.
+ * did not; this door never answers ``"parsing"``. Its named refusals:
+ *
+ * * 400 ``invalid_locator`` — a malformed path identity is refused before any
+ *   lookup or preparation, so garbage text never reaches the store as a query.
+ * * 404 ``thread_not_found`` — no such thread, so nothing was re-driven.
+ * * 400 ``attachment_not_found`` — an unknown or foreign attachment id, or a
+ *   thread that went away while the re-drive ran. One code for all of them,
+ *   so this door cannot probe what another thread holds.
+ * * 500 ``attachment_store_failed`` — the durable store refused the write.
+ *
+ * ``invalid_locator`` is the shared locator guard of the host's three
+ * single-attachment doors: its status door answers it the same way, and the
+ * DELETE below answers it instead of ``attachment_not_found``.
  */
 export async function retryThreadAttachment(
   threadId: string,
@@ -860,4 +871,47 @@ export async function retryThreadAttachment(
     throw new AttachFailedError(await namedErrorCode(res), res.status);
   }
   return (await res.json()) as ThreadAttachment;
+}
+
+/** The host's acknowledgement of a completed single-attachment deletion. */
+export interface AttachmentDeleteReceipt {
+  ok: true;
+  attachment_id: string;
+}
+
+/**
+ * Remove ONE attachment from a thread: DELETE
+ * /api/threads/{thread_id}/attachments/{attachment_id}. The host voids the
+ * attachment's access before it touches any byte, so each named refusal says
+ * something the operator acts on differently:
+ *
+ * * 400 ``invalid_locator`` — a malformed path identity, refused before any
+ *   lookup, as the host's status and retry doors both do; nothing was voided
+ *   and nothing is owed.
+ * * 404 ``thread_not_found`` — the call never named a real thread; likewise
+ *   nothing was voided and nothing is owed.
+ * * 400 ``unknown_locator`` — nothing left to delete here: the id was never
+ *   this thread's, or its deletion already finished. This door's own miss;
+ *   the host's status and retry doors say ``attachment_not_found`` instead.
+ * * 500 ``attachment_cleanup_failed`` — access IS voided, the raw bytes are
+ *   still owed, and retrying this same door is what finishes it.
+ * * 500 ``attachment_store_failed`` — the host could not even record the
+ *   void.
+ *
+ * The caller must not treat a refusal as "deleted": only the 200 receipt is
+ * confirmation.
+ */
+export async function deleteThreadAttachment(
+  threadId: string,
+  attachmentId: string,
+): Promise<AttachmentDeleteReceipt> {
+  const res = await fetch(
+    `/api/threads/${encodeURIComponent(threadId)}/attachments/` +
+      encodeURIComponent(attachmentId),
+    { method: "DELETE" },
+  );
+  if (!res.ok) {
+    throw new AttachFailedError(await namedErrorCode(res), res.status);
+  }
+  return (await res.json()) as AttachmentDeleteReceipt;
 }
