@@ -182,6 +182,14 @@ interface WorkspaceState {
   // the settled record (``ready`` / ``failed``); rejects with the named
   // ``AttachFailedError`` so the control can render the reason.
   retryAttachment: (threadId: string, attachmentId: string) => Promise<void>;
+  // Remove one attachment from the thread. Response-driven like every other
+  // attachment door: the record leaves the slice only once the host has
+  // acknowledged the deletion, because a named refusal means either nothing
+  // happened (``unknown_locator``) or the attachment is voided with its bytes
+  // still owed (``attachment_cleanup_failed``) — and in both cases the chip
+  // must stay where the operator can act on it. Rejects with the host's
+  // ``AttachFailedError`` so the control can render the reason.
+  deleteAttachment: (threadId: string, attachmentId: string) => Promise<void>;
   // T8: record (or flip) the operator's thumb for one run. Response-
   // driven (matching ``dismissNotice``'s convention): the turn row is
   // patched only after the host confirms the persisted value, so the
@@ -1080,6 +1088,19 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     set((s) => ({
       attachments: s.attachments.map((a) =>
         a.attachment_id === attachmentId ? updated : a,
+      ),
+    }));
+  },
+
+  async deleteAttachment(threadId, attachmentId) {
+    // Await the receipt before dropping the chip: a refusal is a fact about
+    // this attachment's state (still owed, or not this thread's) that the
+    // slice has to keep visible.
+    await api.deleteThreadAttachment(threadId, attachmentId);
+    if (get().activeThread?.id !== threadId) return;
+    set((s) => ({
+      attachments: s.attachments.filter(
+        (a) => a.attachment_id !== attachmentId,
       ),
     }));
   },

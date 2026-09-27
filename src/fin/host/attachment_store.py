@@ -13,6 +13,14 @@ delete: the deletion is the arbitration point for a preparation that is
 still running, which loses the race with :class:`AttachmentThreadGoneError`
 instead of resurrecting its derived data.
 
+A voided attachment leaves a **tombstone**: one row recording that its raw
+bytes are still owed a delete. The tombstone is written before any byte or
+derivative cleanup runs, so access stays blocked while cleanup is retried,
+and it is dropped only once the cleanup is confirmed. An obligation is
+thread-scoped and lives no longer than the thread that owes it: the
+Postgres rows cascade with ``fin_thread``, and the in-memory store runs the
+same retirement against the thread store it already asks for liveness.
+
 Two implementations satisfy :class:`AttachmentStore`:
 
 * :class:`InMemoryAttachmentStore` — dicts behind one lock, checked against a
@@ -126,6 +134,12 @@ class AttachmentStore(Protocol):
         :class:`AttachmentThreadGoneError` when ``thread_id`` is not a live
         thread, so an upload racing a delete cannot leave an orphan row
         behind its thread.
+
+        Raises :class:`AttachmentStoreError` while ``attachment_id`` still
+        owes a byte cleanup. One record can carry one debt, so an identity is
+        not reusable until its bytes are confirmed gone: accepting the pairing
+        instead would strand the older key, because the void that later claims
+        the new row records no second debt.
         """
         ...
 
@@ -217,12 +231,60 @@ class AttachmentStore(Protocol):
         ...
 
     def delete_for_thread(self, thread_id: str) -> list[str]:
-        """Remove an entire thread's metadata, units, and postings.
+        """Void an entire thread's attachments and record the byte cleanup.
 
-        Returns the object keys whose raw bytes the caller must still
-        remove. Idempotent: an unknown or already-removed thread yields an
-        empty list and removes nothing.
+        Every attachment row goes with its units and postings, each one
+        through the same void :meth:`tombstone` performs, and the returned
+        keys are what those voids recorded: the caller must still delete
+        exactly them, and :meth:`pending_cleanup` re-reads the same values
+        until the cleanup is confirmed. A row whose thread row went first
+        without ever being voided is named here too, on its way out of the
+        store: no byte leaves this store unnameable by the door that removes
+        it. Idempotent — an unknown or already-voided thread yields an empty
+        list and removes nothing.
         """
+        ...
+
+    def tombstone(self, *, attachment_id: str, thread_id: str) -> str | None:
+        """Void one attachment's access and record its byte cleanup obligation.
+
+        Removes the metadata row with its units and postings, and returns the
+        object key the caller must still delete. Repeating the call while the
+        bytes are still owed returns that same key, which is what makes a
+        failed cleanup retryable through the public door: one record per id is
+        the reason :meth:`create` refuses an id that still owes one.
+
+        Returns ``None`` — and writes nothing — when the attachment is
+        unknown, already fully deleted, owned by another thread, or owed by a
+        thread that no longer exists. Those cases share one answer so a delete
+        cannot probe what a different thread holds. Raises
+        :class:`AttachmentThreadGoneError` if the owning thread disappears
+        mid-transaction.
+        """
+        ...
+
+    def pending_cleanup(self, thread_id: str) -> list[str]:
+        """Object keys still owed a byte delete for one thread.
+
+        An obligation exists only while its thread does, and the records are
+        retired with it rather than filtered out of sight: the Postgres
+        foreign key cascades with ``fin_thread``, and the in-memory store
+        sweeps against the same thread store every other read uses. So a
+        thread that no longer exists leaves no cleanup debt behind, and no
+        later probe can revive one.
+        """
+        ...
+
+    def confirm_cleanup(self, *, attachment_id: str) -> None:
+        """Drop one tombstone once its bytes are known to be gone.
+
+        Confirming an obligation that is already gone is a no-op: the second
+        successful cleanup of an id says the same thing as the first.
+        """
+        ...
+
+    def confirm_thread_cleanup(self, thread_id: str) -> None:
+        """Drop every tombstone of one thread after a confirmed cleanup."""
         ...
 
 
@@ -378,6 +440,14 @@ class _MutableAttachment:
         self.postings: dict[int, dict[str, tuple[int, ...]]] = {}
 
 
+@dataclass(frozen=True)
+class _CleanupObligation:
+    """A voided attachment whose raw bytes are still owed a delete."""
+
+    thread_id: str
+    object_key: str
+
+
 class InMemoryAttachmentStore:
     """Dict-backed attachment store guarded by a single ``threading.Lock``.
 
@@ -385,52 +455,49 @@ class InMemoryAttachmentStore:
     implementation is measured against. Thread liveness is delegated to a
     :class:`~fin.host.thread_store.ThreadStore`, so "the thread is gone" has
     one authority in both implementations instead of two dictionaries that
-    can disagree.
+    can disagree. That authority decides two things, each in one place: a
+    record whose thread row is gone is invisible to every read and write
+    (``_owned``), and it is removed only by the cleanup doors
+    (``_retire_gone_locked``) — the retirement the ``ON DELETE CASCADE``
+    foreign keys perform for the durable store.
     """
 
     def __init__(self, threads: ThreadStore) -> None:
         self._threads = threads
         self._lock = threading.Lock()
         self._attachments: dict[str, _MutableAttachment] = {}
+        self._tombstones: dict[str, _CleanupObligation] = {}
 
     # -- race arbitration --
 
-    def _live_cell(self, attachment_id: str) -> _MutableAttachment:
-        """The cell for ``attachment_id``, or a typed loss of the race.
+    def _owned(self, attachment_id: str) -> _MutableAttachment | None:
+        """The cell ``attachment_id`` may be read or written, else ``None``.
 
-        WHY it also drops the cell: dropping the attachment rows when their
-        thread row is already gone is the in-memory analogue of the Postgres
-        ``ON DELETE CASCADE``, and it is the only place the orphan can be
-        collected — a preparation that resumes against a dead thread must
-        discard its derived data rather than re-attach it.
-
-        Callers hold ``self._lock``, which is what makes the liveness check
-        and the following mutation one atomic decision.
+        THE one liveness question of this store, asked by every read and every
+        derived write: a record whose thread row is gone answers as if it were
+        gone, which is what the ``ON DELETE CASCADE`` foreign keys guarantee
+        the durable store. It is a hide, not a removal — only
+        :meth:`_retire_gone_locked` removes, so an invisible row is still
+        there for a cleanup door to name on its way out.
         """
         cell = self._attachments.get(attachment_id)
+        if cell is None:
+            return None  # EXIT: voided, or never created.
+        if self._threads.get_thread(cell.record.thread_id) is None:
+            return None  # EXIT: its thread row went first; retirement's turn.
+        return cell
+
+    def _live_cell(self, attachment_id: str) -> _MutableAttachment:
+        """The cell a derived write may land on, or a typed loss of the race.
+
+        Callers hold ``self._lock``, which is what makes the liveness decision
+        and the following mutation one atomic step.
+        """
+        cell = self._owned(attachment_id)
         if cell is None:
             raise AttachmentThreadGoneError(
                 f"attachment {attachment_id!r} is gone; discarding derived write"
             )
-        if self._threads.get_thread(cell.record.thread_id) is None:
-            del self._attachments[attachment_id]
-            raise AttachmentThreadGoneError(
-                f"thread {cell.record.thread_id!r} is gone for attachment "
-                f"{attachment_id!r}; discarding derived write"
-            )
-        return cell
-
-    def _owned(self, attachment_id: str) -> _MutableAttachment | None:
-        """Read-path lookup: hidden when the thread row is gone.
-
-        WHY reads filter too: a metadata row that outlived its thread would
-        make ``get()`` disagree with what the Postgres cascade guarantees.
-        """
-        cell = self._attachments.get(attachment_id)
-        if cell is None:
-            return None
-        if self._threads.get_thread(cell.record.thread_id) is None:
-            return None
         return cell
 
     # -- metadata rows --
@@ -453,9 +520,10 @@ class InMemoryAttachmentStore:
             sha256=sha256,
             object_key=object_key,
         )
-        # WHY liveness, duplicate check, and insert share one critical
-        # section: releasing the lock between them lets a thread delete land
-        # in the gap and leave an attachment row no thread owns anymore.
+        # WHY liveness, duplicate check, owed check, and insert share one
+        # critical section: releasing the lock between them lets a thread
+        # delete land in the gap and leave an attachment row no thread owns
+        # anymore, or a second row beside a cleanup nobody has paid.
         with self._lock:
             if self._threads.get_thread(thread_id) is None:
                 raise AttachmentThreadGoneError(
@@ -465,6 +533,12 @@ class InMemoryAttachmentStore:
             if attachment_id in self._attachments:
                 raise AttachmentStoreError(
                     f"attachment {attachment_id!r} already exists"
+                )
+            if attachment_id in self._tombstones:
+                raise AttachmentStoreError(
+                    f"attachment {attachment_id!r} still owes a byte cleanup; "
+                    "its identity is not reusable until the bytes are confirmed "
+                    "gone"
                 )
             self._attachments[attachment_id] = _MutableAttachment(record)
             return _attachment(record)
@@ -492,16 +566,12 @@ class InMemoryAttachmentStore:
         """Rows to resume: ``parsing``, or ``ready`` with derived data lost."""
         with self._lock:
             rows: list[AttachmentRecord] = []
-            live: dict[str, bool] = {}
-            for cell in self._attachments.values():
+            for attachment_id, cell in self._attachments.items():
                 record = cell.record
-                thread_id = record.thread_id
-                if thread_id not in live:
-                    live[thread_id] = self._threads.get_thread(thread_id) is not None
-                # WHY the liveness filter: an attachment whose thread row went
-                # first is the Postgres cascade's job to remove, so it is
-                # neither a resume candidate nor a listing.
-                if not live[thread_id]:
+                # WHY through ``_owned``: a row whose thread row went first is
+                # the cascade's to remove, so it is neither a resume candidate
+                # nor a listing — and ``_owned`` is where that is decided.
+                if self._owned(attachment_id) is None:
                     continue
                 if record.status == "parsing":
                     rows.append(_attachment(record))
@@ -672,23 +742,133 @@ class InMemoryAttachmentStore:
 
     # -- deletion --
 
+    def _retire_gone_locked(self, *, name_for: str | None = None) -> list[str]:
+        """Retire every record whose thread row is gone; return the named keys.
+
+        THE one place this store removes a record of a dead thread, entered by
+        every cleanup door, so "gone ⇒ retired" is stated once: the in-memory
+        analogue of the ``ON DELETE CASCADE`` the durable store gets from its
+        foreign keys. Removal rather than hiding matters for the obligations —
+        one its thread can no longer name is never finishable, so it would sit
+        in the map until a later probe of that same id collected it. One thread
+        row is asked once per sweep, against the injected thread store.
+
+        ``name_for`` is the thread the calling door acts for. Rows of that
+        thread which no void ever claimed are handed back as object keys on
+        their way out: an obligation cannot outlive the thread that owes it,
+        but a door that dropped such a row in silence would strand a byte
+        nothing can name again. Every other door passes nothing, because it has
+        no channel to hand a key over.
+        """
+        live: dict[str, bool] = {}
+
+        def gone(thread_id: str) -> bool:
+            if thread_id not in live:
+                live[thread_id] = self._threads.get_thread(thread_id) is None
+            return live[thread_id]
+
+        named: list[str] = []
+        for attachment_id, cell in list(self._attachments.items()):
+            if not gone(cell.record.thread_id):
+                continue
+            if name_for is not None and cell.record.thread_id == name_for:
+                named.append(cell.record.object_key)
+            del self._attachments[attachment_id]
+        for attachment_id, obligation in list(self._tombstones.items()):
+            if gone(obligation.thread_id):
+                del self._tombstones[attachment_id]
+        return named
+
+    def _void_locked(self, attachment_id: str, thread_id: str) -> str | None:
+        """Void one attachment and return the key its obligation holds.
+
+        THE one tombstone write of this store: both deletion doors route
+        through here, so what a void returns and what ``pending_cleanup()``
+        reads back cannot drift apart. Callers hold ``self._lock``, which makes
+        the liveness decision, the row removal, and the record of the debt one
+        atomic step.
+
+        A live row never meets an existing obligation: one record per id
+        carries one debt, and :meth:`create` refuses an id whose bytes are
+        still owed. So a void of a row records that row's key, and a repeat
+        void answers from the obligation already on record — which is what
+        keeps a failed cleanup retryable — while another thread's obligation
+        is answered as a miss with nothing written, because a door must not
+        name bytes a different thread owes.
+        """
+        cell = self._owned(attachment_id)
+        if cell is not None and cell.record.thread_id == thread_id:
+            object_key = cell.record.object_key
+            del self._attachments[attachment_id]
+            self._tombstones[attachment_id] = _CleanupObligation(
+                thread_id, object_key
+            )
+            return object_key
+        obligation = self._tombstones.get(attachment_id)
+        if obligation is None or obligation.thread_id != thread_id:
+            return None  # EXIT: unknown, another thread's, or fully deleted.
+        # EXIT: the void already landed and its bytes are still owed, so the
+        # retry is handed the same key rather than a fresh miss.
+        return obligation.object_key
+
+    def _thread_obligations_locked(
+        self, thread_id: str
+    ) -> list[tuple[str, _CleanupObligation]]:
+        """One thread's owed cleanups, in arrival order. Callers hold the lock."""
+        return [
+            (attachment_id, obligation)
+            for attachment_id, obligation in self._tombstones.items()
+            if obligation.thread_id == thread_id
+        ]
+
     def delete_for_thread(self, thread_id: str) -> list[str]:
-        # WHY one lock spans the collect-and-drop: units and postings live on
-        # the cell, so removing the cell removes every derived layer in the
-        # same step, and a preparation that arrives afterwards loses the
-        # race in ``_live_cell``.
+        # WHY one lock spans the whole thread: units and postings live on the
+        # cell, so each void removes every derived layer in the same step, and
+        # a preparation that arrives afterwards loses the race in
+        # ``_live_cell``.
         with self._lock:
-            keys = [
-                cell.record.object_key
-                for cell in self._attachments.values()
-                if cell.record.thread_id == thread_id
+            # The acting thread's un-voided rows are named before they are
+            # retired, so no row can leave this door without a key.
+            orphaned = self._retire_gone_locked(name_for=thread_id)
+            voided = [
+                key
+                for key in (
+                    self._void_locked(attachment_id, thread_id)
+                    for attachment_id, cell in list(self._attachments.items())
+                    if cell.record.thread_id == thread_id
+                )
+                if key is not None
             ]
-            for attachment_id in list(self._attachments):
-                if self._attachments[attachment_id].record.thread_id == thread_id:
-                    del self._attachments[attachment_id]
-            # EXIT: an unknown or already-removed thread has no rows to
-            # return, which is what makes this call idempotent.
-            return keys
+            return orphaned + voided
+
+    def tombstone(self, *, attachment_id: str, thread_id: str) -> str | None:
+        _require_text("attachment_id", attachment_id)
+        _require_text("thread_id", thread_id)
+        with self._lock:
+            self._retire_gone_locked()
+            return self._void_locked(attachment_id, thread_id)
+
+    def pending_cleanup(self, thread_id: str) -> list[str]:
+        _require_text("thread_id", thread_id)
+        with self._lock:
+            self._retire_gone_locked()
+            return [
+                obligation.object_key
+                for _, obligation in self._thread_obligations_locked(thread_id)
+            ]
+
+    def confirm_cleanup(self, *, attachment_id: str) -> None:
+        _require_text("attachment_id", attachment_id)
+        with self._lock:
+            self._retire_gone_locked()
+            self._tombstones.pop(attachment_id, None)
+
+    def confirm_thread_cleanup(self, thread_id: str) -> None:
+        _require_text("thread_id", thread_id)
+        with self._lock:
+            self._retire_gone_locked()
+            for attachment_id, _ in self._thread_obligations_locked(thread_id):
+                del self._tombstones[attachment_id]
 
 
 _SCHEMA_SQL = """
@@ -733,16 +913,33 @@ CREATE TABLE IF NOT EXISTS fin_thread_attachment_index (
 
 CREATE INDEX IF NOT EXISTS fin_thread_attachment_index_lookup_idx
     ON fin_thread_attachment_index (attachment_id, version);
+
+CREATE TABLE IF NOT EXISTS fin_thread_attachment_tombstone (
+    attachment_id   TEXT PRIMARY KEY,
+    thread_id       TEXT NOT NULL REFERENCES fin_thread(id) ON DELETE CASCADE,
+    object_key      TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS fin_thread_attachment_tombstone_thread_idx
+    ON fin_thread_attachment_tombstone (thread_id, attachment_id);
 """
 
 
 class PostgresAttachmentStore:
     """psycopg-backed attachment store on the shared ``FIN_CHECKPOINT_URL``.
 
-    Three tables, each carrying ``thread_id`` as an ``ON DELETE CASCADE``
-    foreign key to ``fin_thread``: the cascade is what makes a thread delete
-    atomic across metadata, parsed units, and postings, and it is the reason
-    a late derived write can be detected instead of silently persisted.
+    Three attachment tables plus the tombstone record, each carrying
+    ``thread_id`` as an ``ON DELETE CASCADE`` foreign key to ``fin_thread``:
+    the cascade is what makes a thread delete atomic across metadata, parsed
+    units, and postings, and it is the reason a late derived write can be
+    detected instead of silently persisted. The tombstone row is what a
+    voided attachment leaves behind while its bytes are still owed, and it
+    cascades away with the thread so a deleted thread keeps no cleanup debt —
+    the guarantee the in-memory store matches by retiring records against the
+    same thread rows. Both deletion doors write that row through ``_void`` and
+    answer from it, so a thread-wide void is N single voids, not a second
+    statement of the same rule.
 
     Each public call opens its own short-lived connection, matching
     :class:`~fin.host.thread_store.PostgresThreadStore`: the workspace is a
@@ -767,6 +964,32 @@ class PostgresAttachmentStore:
         "WHERE attachment_id = %s "
         "AND thread_id IN (SELECT id FROM fin_thread) "
         "RETURNING thread_id"
+    )
+    # WHY ``FOR UPDATE``: it puts the void and a preparation's ``_touch`` in one
+    # order, so a derived write either lands before the tombstone or loses the
+    # race after it — never between the tombstone and the row delete.
+    _VOID_TARGET_SQL = (
+        "SELECT thread_id, object_key FROM fin_thread_attachment "
+        "WHERE attachment_id = %s FOR UPDATE"
+    )
+    # THE tombstone write, reached only through ``_void``. ``DO NOTHING``
+    # because the id is the primary key: a second debt cannot be recorded
+    # beside the first, and the cleanup a caller is already retrying must not
+    # be dropped for a newer key. ``RETURNING`` lets the void answer with the
+    # key it actually recorded instead of enumerating the obligation again.
+    # ``create()`` is what keeps a live row off an owed id, so the one record
+    # per id never has to choose between two keys.
+    _VOID_SQL = (
+        "INSERT INTO fin_thread_attachment_tombstone "
+        "(attachment_id, thread_id, object_key) "
+        "VALUES (%s, %s, %s) "
+        "ON CONFLICT (attachment_id) DO NOTHING RETURNING object_key"
+    )
+    # One obligation, one owner: the thread filter is what keeps a delete from
+    # probing what a different thread holds.
+    _OWED_KEY_SQL = (
+        "SELECT object_key FROM fin_thread_attachment_tombstone "
+        "WHERE attachment_id = %s AND thread_id = %s"
     )
 
     def __init__(self, connection_url: str) -> None:
@@ -861,6 +1084,22 @@ class PostgresAttachmentStore:
         )
         try:
             with self._connect() as conn:
+                # WHY one transaction for the owed check and the insert: an id
+                # whose bytes are still owed has one record that cannot carry
+                # a second debt, so the pairing is refused here rather than
+                # resolved later by a void that could name only one of them.
+                owed = conn.execute(
+                    "SELECT 1 FROM fin_thread_attachment_tombstone "
+                    "WHERE attachment_id = %s",
+                    (record.attachment_id,),
+                ).fetchone()
+                if owed is not None:
+                    conn.rollback()
+                    raise AttachmentStoreError(
+                        f"attachment {attachment_id!r} still owes a byte "
+                        "cleanup; its identity is not reusable until the bytes "
+                        "are confirmed gone"
+                    )
                 row = conn.execute(
                     f"INSERT INTO fin_thread_attachment ({self._COLUMNS}) "
                     "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
@@ -1145,24 +1384,121 @@ class PostgresAttachmentStore:
 
     # -- deletion --
 
+    def _owed_key(self, conn: Any, attachment_id: str, thread_id: str) -> str | None:
+        """The key one thread still owes for one attachment id."""
+        row = conn.execute(self._OWED_KEY_SQL, (attachment_id, thread_id)).fetchone()
+        return None if row is None else str(row[0])
+
+    def _void(self, conn: Any, attachment_id: str, thread_id: str) -> str | None:
+        """Void one attachment on ``conn`` and return its owed object key.
+
+        THE one tombstone write for this adapter: :meth:`tombstone` performs it
+        once and :meth:`delete_for_thread` performs it once per attachment of
+        the thread, so a thread-wide delete cannot drift from a
+        single-attachment one and the keys a caller is handed are the
+        obligations it can read back. Callers own the transaction.
+
+        A row of the acting thread always goes with it: the promise of a thread
+        delete is that no attachment row survives it. The answer is the key the
+        record holds, because :meth:`create` refuses an owed id and a live row
+        therefore meets no older debt.
+        """
+        row = conn.execute(self._VOID_TARGET_SQL, (attachment_id,)).fetchone()
+        if row is None:
+            # EXIT: the row is already gone, so this is the retry path — the
+            # obligation on record, or nothing.
+            return self._owed_key(conn, attachment_id, thread_id)
+        if str(row[0]) != thread_id:
+            return None  # EXIT: another thread's attachment reveals nothing.
+        object_key = str(row[1])
+        written = conn.execute(
+            self._VOID_SQL, (attachment_id, thread_id, object_key)
+        ).fetchone()
+        conn.execute(
+            "DELETE FROM fin_thread_attachment WHERE attachment_id = %s",
+            (attachment_id,),
+        )
+        # A ``DO NOTHING`` here means the id's one record belongs to a
+        # different thread -- the window between ``create()``'s check and a
+        # concurrent void. Their debt stays on record and this row's own key
+        # goes to the caller, because the row must not outlive its thread.
+        return object_key if written is None else str(written[0])
+
     def delete_for_thread(self, thread_id: str) -> list[str]:
-        # WHY the keys are read before the delete in the same transaction:
-        # the caller still has to remove the raw bytes, and the cascade below
-        # is the only place that knows every attachment this thread owned.
+        # WHY the ids are read once and each voided in the same transaction:
+        # the caller still has to remove the raw bytes, and the keys it is
+        # handed are exactly the obligations those voids recorded.
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT object_key FROM fin_thread_attachment "
+                "SELECT attachment_id FROM fin_thread_attachment "
                 "WHERE thread_id = %s ORDER BY created_at ASC, attachment_id ASC",
                 (thread_id,),
             ).fetchall()
+            keys = [
+                key
+                for key in (
+                    self._void(conn, str(row[0]), thread_id) for row in rows
+                )
+                if key is not None
+            ]
+            conn.commit()
+            # EXIT: an unknown or already-voided thread has no row to void,
+            # which is what makes this call idempotent.
+            return keys
+
+    def tombstone(self, *, attachment_id: str, thread_id: str) -> str | None:
+        _require_text("attachment_id", attachment_id)
+        _require_text("thread_id", thread_id)
+        with self._connect() as conn:
+            try:
+                object_key = self._void(conn, attachment_id, thread_id)
+                if object_key is None:
+                    # EXIT: an unknown id, another thread's id, an id whose
+                    # cleanup is already confirmed, and an id another thread
+                    # owes all share one answer, so the door cannot be used to
+                    # find out which thread holds an attachment. Nothing is
+                    # written: the transaction is rolled back.
+                    conn.rollback()
+                    return None
+                conn.commit()
+                return object_key
+            except psycopg.errors.ForeignKeyViolation as exc:
+                conn.rollback()
+                raise AttachmentThreadGoneError(
+                    f"thread for attachment {attachment_id!r} is gone; "
+                    "nothing left to void"
+                ) from exc
+
+    def pending_cleanup(self, thread_id: str) -> list[str]:
+        _require_text("thread_id", thread_id)
+        with self._connect() as conn:
+            # The ``thread_id`` foreign key cascades with ``fin_thread``, so
+            # a deleted thread leaves no obligation behind.
+            rows = conn.execute(
+                "SELECT object_key FROM fin_thread_attachment_tombstone "
+                "WHERE thread_id = %s ORDER BY created_at ASC, attachment_id ASC",
+                (thread_id,),
+            ).fetchall()
+            return [str(row[0]) for row in rows]
+
+    def confirm_cleanup(self, *, attachment_id: str) -> None:
+        _require_text("attachment_id", attachment_id)
+        with self._connect() as conn:
             conn.execute(
-                "DELETE FROM fin_thread_attachment WHERE thread_id = %s",
+                "DELETE FROM fin_thread_attachment_tombstone "
+                "WHERE attachment_id = %s",
+                (attachment_id,),
+            )
+            conn.commit()
+
+    def confirm_thread_cleanup(self, thread_id: str) -> None:
+        _require_text("thread_id", thread_id)
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM fin_thread_attachment_tombstone WHERE thread_id = %s",
                 (thread_id,),
             )
             conn.commit()
-            # EXIT: an unknown or already-removed thread has no rows, which is
-            # what makes this call idempotent.
-            return [str(row[0]) for row in rows]
 
 
 __all__ = [

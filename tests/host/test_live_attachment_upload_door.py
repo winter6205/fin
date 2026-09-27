@@ -226,6 +226,79 @@ def _attachment_count(url: str, thread_id: str) -> int:
     )
 
 
+def _tombstone_row(url: str, attachment_id: str) -> dict[str, Any] | None:
+    """The surviving cleanup obligation for one voided attachment, if any."""
+    rows = _sql_rows(
+        url,
+        "SELECT thread_id, object_key FROM fin_thread_attachment_tombstone "
+        "WHERE attachment_id = %s",
+        (attachment_id,),
+    )
+    if not rows:
+        return None
+    return {"thread_id": str(rows[0][0]), "object_key": str(rows[0][1])}
+
+
+def _tombstone_count(url: str, thread_id: str) -> int:
+    """How many byte deletions one thread still owes."""
+    return int(
+        _sql_rows(
+            url,
+            "SELECT count(*) FROM fin_thread_attachment_tombstone "
+            "WHERE thread_id = %s",
+            (thread_id,),
+        )[0][0]
+    )
+
+
+def _thread_row(url: str, thread_id: str) -> bool:
+    return bool(
+        _sql_rows(url, "SELECT 1 FROM fin_thread WHERE id = %s", (thread_id,))
+    )
+
+
+def _fresh_object_read(key: str) -> tuple[bytes | None, str | None]:
+    """Read one key through a NEW object-store client in this process.
+
+    Returns ``(payload, outcome)`` where ``outcome`` is ``"present"``,
+    ``"absent"`` — the adapter's own missing-key failure — or the name of
+    whatever else the store answered. A service that is down and a key that
+    is gone are read off the same adapter, and only one of them is evidence
+    about a delete, so the caller gets to name which it is treating as
+    which instead of collapsing both into "gone".
+    """
+    from fin.corpus.object_store import create_object_store
+    from fin.corpus.object_store_errors import UnknownObjectKeyError
+
+    try:
+        return create_object_store().get(key), "present"
+    except UnknownObjectKeyError:
+        # EXIT: the store answered — the key is simply not in it, which is
+        # what a completed cleanup looks like from a second client.
+        return None, "absent"
+    except Exception as error:  # noqa: BLE001 - the type name IS the result
+        return None, type(error).__name__
+
+
+def _delete_object_now(key: str) -> tuple[bool, str | None]:
+    """Remove one live-test object through a fresh client.
+
+    Returns whether it is gone and, when it is not, what the store answered.
+    Never raises: this runs in ``finally`` blocks, where an exception would
+    replace the failure a test is trying to report.
+    """
+    from fin.corpus.object_store import create_object_store
+
+    try:
+        create_object_store().delete(key)
+    except Exception as error:  # noqa: BLE001 - reported to the caller
+        return False, type(error).__name__
+    _, outcome = _fresh_object_read(key)
+    if outcome != "absent":
+        return False, outcome if outcome != "present" else "still-present"
+    return True, None
+
+
 def _drop_threads(url: str, thread_ids: list[str]) -> None:
     """Remove every thread a test created; the rows and postings cascade."""
     if not thread_ids:
@@ -248,7 +321,16 @@ def _s3_object_store_configured() -> bool:
 
 
 def _cleanup_live_threads(url: str, thread_ids: list[str]) -> None:
-    """Delete live-test objects before their rows, even on assertion failure."""
+    """Delete live-test objects before their rows, even on assertion failure.
+
+    The live path must actually remove its data. ``_drop_threads`` is a
+    cascade, so it silently hides an attachment whose object delete failed:
+    the row goes and the bytes stay. Deleting every key first, then
+    demanding it be gone through a second client, is what makes the
+    difference visible. Tombstone rows are swept too, because an
+    attachment row that was voided before a failed cleanup is no longer
+    there to name its bytes.
+    """
     if not thread_ids:
         return
 
@@ -256,8 +338,10 @@ def _cleanup_live_threads(url: str, thread_ids: list[str]) -> None:
     rows = _sql_rows(
         url,
         "SELECT object_key FROM fin_thread_attachment "
+        "WHERE thread_id = ANY(%s) "
+        "UNION SELECT object_key FROM fin_thread_attachment_tombstone "
         "WHERE thread_id = ANY(%s)",
-        (thread_ids,),
+        (thread_ids, thread_ids),
     )
     if rows and _s3_object_store_configured():
         from fin.corpus.object_store import create_object_store
@@ -776,6 +860,7 @@ def uuid4_hex() -> str:
 # =========================================================================
 
 _CHILD_SOURCE = """
+import os
 import sys
 
 import uvicorn
@@ -794,6 +879,19 @@ class _NullGraph:
 # byte cap under test is the one `get_attachment_budgets()` resolved from
 # the deployed keys rather than an object this harness handed it.
 http_module.app.dependency_overrides[http_module.get_graph] = lambda: _NullGraph()
+
+# One injected fault, at one seam: the deployed attachment service's own
+# byte-store client refuses deletes. Everything above it — this process,
+# uvicorn, the HTTP door, Postgres, the tombstone record — is the product,
+# and the retry leg runs in a SECOND process where the client is whole
+# again, so "a failed cleanup retains the tombstone and stays retriable" is
+# crossed over a real restart rather than asserted.
+if os.environ.get("FIN_LIVE_FAIL_OBJECT_DELETE") == "1":
+    def _refuse_delete(key):
+        raise RuntimeError("injected object-store delete refusal for " + str(key))
+
+    http_module.default_attachment_service().objects.delete = _refuse_delete
+
 uvicorn.run(
     http_module.app,
     host="127.0.0.1",
@@ -881,6 +979,34 @@ class _LiveServer:
             content_type="application/octet-stream",
         )
 
+    def prepare(self, thread_id: str, attachment_id: str) -> tuple[int, Any]:
+        return self.request(
+            "POST",
+            f"/api/threads/{thread_id}/attachments/{attachment_id}/retry",
+            body=b"",
+            content_type="application/json",
+        )
+
+    def attachment_status(
+        self, thread_id: str, attachment_id: str
+    ) -> tuple[int, Any]:
+        return self.request(
+            "GET", f"/api/threads/{thread_id}/attachments/{attachment_id}"
+        )
+
+    def delete_attachment(
+        self, thread_id: str, attachment_id: str
+    ) -> tuple[int, Any]:
+        """The one shipped path, addressed as a client addresses it."""
+        from fin.host.workspace_http import _attachment_delete_path
+
+        return self.request(
+            "DELETE", _attachment_delete_path(thread_id, attachment_id)
+        )
+
+    def delete_thread(self, thread_id: str) -> tuple[int, Any]:
+        return self.request("DELETE", f"/api/threads/{thread_id}")
+
     def stop(self) -> None:
         if self.process.poll() is not None:
             return
@@ -918,12 +1044,15 @@ def live_server(
 
 
 def _start_live_server(
-    postgres_url: str, deployed_bounds: dict[str, str]
+    postgres_url: str,
+    deployed_bounds: dict[str, str],
+    extra_env: dict[str, str] | None = None,
 ) -> _LiveServer:
     """Start an independent real Uvicorn child with the deployed bounds."""
     environ = dict(os.environ)
     environ["FIN_CHECKPOINT_URL"] = postgres_url
     environ.update(deployed_bounds)
+    environ.update(extra_env or {})
 
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -1164,6 +1293,158 @@ def test_live_server_uploaded_row_is_not_a_recovery_candidate(
         _cleanup_live_threads(postgres_url, [uploaded_thread, control_thread])
 
 
+def test_live_single_attachment_delete_voids_the_real_bytes(
+    postgres_url: str, live_server: _LiveServer
+) -> None:
+    """A completed deletion is confirmed at the real store, not in a fake.
+
+    Everything on this path is deployed: real Uvicorn, real ``fetch``-shaped
+    HTTP, the object-store adapter
+    :func:`fin.corpus.object_store.create_object_store` selects from the
+    environment, and the tombstone table on the live Postgres. The read-back
+    goes through a SECOND store client this process never used for the
+    request, so "the bytes are gone" is the store's answer rather than the
+    in-memory stand-in's bookkeeping.
+    """
+    from fin.corpus.object_store import create_object_store
+
+    payload = b"Q3 revenue rose eleven percent on renewals\n"
+    thread_id = live_server.create_thread()
+    object_key = ""
+    try:
+        status, uploaded = live_server.attach(thread_id, payload, "voided.txt")
+        assert status == 200, (status, uploaded)
+        assert isinstance(uploaded, dict) and uploaded["status"] == "uploaded"
+        attachment_id = str(uploaded["attachment_id"])
+        row = _attachment_row(postgres_url, attachment_id)
+        assert row is not None, attachment_id
+        object_key = str(row["object_key"])
+        # The bytes are in the real bucket before anything deletes them.
+        assert create_object_store().get(object_key) == payload
+
+        status, prepared = live_server.prepare(thread_id, attachment_id)
+        assert status == 200, (status, prepared)
+        assert isinstance(prepared, dict) and prepared["status"] == "ready"
+        assert _derived_counts(postgres_url, attachment_id)[0] > 0
+
+        status, voided = live_server.delete_attachment(thread_id, attachment_id)
+        assert status == 200, (status, voided)
+        assert voided == {"ok": True, "attachment_id": attachment_id}
+
+        # A second client, in a process that never served the request, is
+        # the one that says the raw bytes are gone.
+        assert _fresh_object_read(object_key) == (None, "absent")
+        assert _attachment_row(postgres_url, attachment_id) is None
+        assert _derived_counts(postgres_url, attachment_id) == (0, 0)
+        assert _tombstone_row(postgres_url, attachment_id) is None
+        assert _tombstone_count(postgres_url, thread_id) == 0
+
+        # The void holds for the doors that would have published or read it.
+        assert live_server.attachment_status(thread_id, attachment_id)[1] == {
+            "error": "attachment_not_found"
+        }
+        assert live_server.prepare(thread_id, attachment_id)[1] == {
+            "error": "attachment_not_found"
+        }
+        assert _derived_counts(postgres_url, attachment_id) == (0, 0)
+
+        # A retry of a finished deletion cannot report the bytes as still owed.
+        assert live_server.delete_attachment(thread_id, attachment_id) == (
+            400,
+            {"error": "unknown_locator"},
+        )
+        object_key = ""
+    finally:
+        if object_key:
+            removed, why = _delete_object_now(object_key)
+            assert removed, why
+        _cleanup_live_threads(postgres_url, [thread_id])
+
+
+def test_live_cleanup_failure_keeps_the_tombstone_across_a_real_restart(
+    postgres_url: str,
+    deployed_bounds: dict[str, str],
+    real_s3_object_store: None,
+) -> None:
+    """A refused byte delete stays observable, blocked, and retryable.
+
+    The fault lives in the first server process: the deployed attachment
+    service's own byte client refuses deletes. That process is then stopped
+    and a SECOND process, with intact wiring, is what finishes the job — so
+    the retained tombstone and its outstanding obligation are carried by the
+    real tables and the real bucket, not by an object in a test process.
+    """
+    payload = b"Q4 margin held because support headcount did not grow\n"
+    blocking = _start_live_server(
+        postgres_url, deployed_bounds, {"FIN_LIVE_FAIL_OBJECT_DELETE": "1"}
+    )
+    thread_id = ""
+    attachment_id = ""
+    object_key = ""
+    try:
+        thread_id = blocking.create_thread()
+        status, uploaded = blocking.attach(thread_id, payload, "owed.txt")
+        assert status == 200, (status, uploaded)
+        assert isinstance(uploaded, dict)
+        attachment_id = str(uploaded["attachment_id"])
+        row = _attachment_row(postgres_url, attachment_id)
+        assert row is not None, attachment_id
+        object_key = str(row["object_key"])
+
+        status, failed = blocking.delete_attachment(thread_id, attachment_id)
+        assert status == 500, (status, failed)
+        assert failed == {"error": "attachment_cleanup_failed"}
+
+        # Access is voided even though the bytes are still there: the row is
+        # gone, its derived layers are gone, and the obligation is named.
+        assert _attachment_row(postgres_url, attachment_id) is None
+        assert _derived_counts(postgres_url, attachment_id) == (0, 0)
+        obligation = _tombstone_row(postgres_url, attachment_id)
+        assert obligation is not None
+        assert obligation["thread_id"] == thread_id
+        assert obligation["object_key"] == object_key
+        assert _fresh_object_read(object_key)[1] == "present"
+
+        # A different request, same broken process, still cannot publish.
+        assert blocking.prepare(thread_id, attachment_id)[1] == {
+            "error": "attachment_not_found"
+        }
+        assert _tombstone_count(postgres_url, thread_id) == 1
+    finally:
+        blocking.stop()
+
+    if not object_key:
+        pytest.fail("the refused cleanup named no object key to retry against")
+
+    # The restart: a fresh process with the deployed wiring and a byte client
+    # that works again, deleting the same identity through the same door.
+    restarted = _start_live_server(postgres_url, deployed_bounds)
+    thread_done = ""
+    try:
+        assert restarted.delete_attachment(thread_id, attachment_id) == (
+            200,
+            {"ok": True, "attachment_id": attachment_id},
+        )
+        assert _fresh_object_read(object_key) == (None, "absent")
+        assert _tombstone_row(postgres_url, attachment_id) is None
+        assert _tombstone_count(postgres_url, thread_id) == 0
+        object_key = ""
+
+        # Thread deletion afterwards keeps the same rule with nothing owed.
+        status, body = restarted.delete_thread(thread_id)
+        assert status == 200, (status, body)
+        assert _thread_row(postgres_url, thread_id) is False
+        thread_done = thread_id
+        thread_id = ""
+    finally:
+        restarted.stop()
+        if object_key:
+            removed, why = _delete_object_now(object_key)
+            assert removed, why
+        _cleanup_live_threads(postgres_url, [thread_id or thread_done])
+    assert _tombstone_count(postgres_url, thread_done) == 0
+
+
 def test_module_leaves_the_real_tables_as_it_found_them(
     postgres_url: str
 ) -> None:
@@ -1171,16 +1452,17 @@ def test_module_leaves_the_real_tables_as_it_found_them(
 
     A real-storage suite that leaves rows behind changes what the next
     run's ``incomplete()`` sees, which is exactly the assertion the
-    recovery case depends on. Every thread this module created is gone,
-    so every attachment row, frozen unit, and posting it owned is gone
-    with the cascade.
+    recovery case depends on. Every thread this module created is gone, so
+    every attachment row, frozen unit, posting, and byte-cleanup obligation
+    it owned is gone with the cascade.
     """
     rows = _sql_rows(
         postgres_url,
         "SELECT count(*) FROM fin_thread_attachment WHERE filename IN "
         "('g4-mixed-chart-001.pdf', 'g4-scanned-001.pdf', "
         "'g4-image-chart-001.png', '2023_Q1_MSFT.pdf', 'at-cap.pdf', "
-        "'one-over.pdf', 'streamed-over.pdf', 'x.txt')",
+        "'one-over.pdf', 'streamed-over.pdf', 'x.txt', 'voided.txt', "
+        "'owed.txt')",
     )[0][0]
     assert int(rows) == 0, rows
     orphans = _sql_rows(
@@ -1199,3 +1481,11 @@ def test_module_leaves_the_real_tables_as_it_found_them(
         "WHERE a.attachment_id = i.attachment_id))",
     )[0][0]
     assert int(derived_orphans) == 0, derived_orphans
+    # The deletion cases keep their raw bytes until the door confirms the
+    # cleanup, so a stranded obligation is exactly what this guard is for:
+    # no thread survived, so no tombstone row and no owed object may either.
+    obligations = _sql_rows(
+        postgres_url, "SELECT count(*) FROM fin_thread_attachment_tombstone"
+    )[0][0]
+    assert int(obligations) == 0, obligations
+
