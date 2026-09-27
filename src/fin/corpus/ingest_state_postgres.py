@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any, Final, NoReturn
 
@@ -35,6 +35,7 @@ from fin.corpus.ingest_state_model import (
     TransitionRequest,
     coerce_request,
     coerce_state,
+    coerce_state_filter,
     failure_guard,
     job_created_audit,
     job_superseded_audit,
@@ -211,13 +212,31 @@ class PostgresIngestStateStore:
         except psycopg.Error as exc:
             self._unavailable(document_id, "read", exc)
 
-    def list_jobs(self) -> tuple[IngestJob, ...]:
-        """Return a deterministic snapshot of all persisted jobs."""
+    def list_jobs(
+        self,
+        *,
+        states: Collection[IngestState | str] | None = None,
+    ) -> tuple[IngestJob, ...]:
+        """Return a deterministic snapshot, optionally state-filtered.
+
+        The filter is resolved and validated in SQL parameters, so a
+        worker discovers exactly the states its resume edge can act on.
+        """
+        wanted = coerce_state_filter(states)
+        if wanted is not None and not wanted:
+            return ()
+        statement = (
+            f"SELECT document_id, {_JOB_COLUMNS} FROM fin_ingest_job"
+        )
+        params: tuple[Any, ...] = ()
+        if wanted is not None:
+            statement += " WHERE state = ANY(%s)"
+            params = ([state.value for state in sorted(wanted)],)
+        statement += " ORDER BY document_id"
         try:
             with self._transaction() as connection:
                 rows = connection.execute(
-                    f"SELECT document_id, {_JOB_COLUMNS} FROM fin_ingest_job "
-                    "ORDER BY document_id"
+                    statement, params
                 ).fetchall()
         except psycopg.Error as exc:
             raise IngestStateStoreUnavailableError(

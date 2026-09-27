@@ -24,7 +24,11 @@ rule version, params-table version); the construction point
 Granularity (plan T6 "已决"): PDF and PPT per physical page / slide;
 Excel per consecutive row block within a worksheet; HTML / Markdown /
 Word per structure block (heading split + deterministic cap merge);
-plain text per blank-line paragraph.
+plain text per blank-line paragraph. PDF extraction goes through the
+shared page/region core (:class:`PageRegionParser`,
+``fin.corpus.parsers._pages``) — one page/region authority for the
+corpus and the thread-attachment lane; the per-format unit shape above
+is unchanged.
 
 Determinism (SC12, function level): the same source bytes and the
 same rule version always produce equal ``ParseResult`` values — all
@@ -54,16 +58,21 @@ silent empty success.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 from pathlib import Path
+from typing import NoReturn
 
 from fin.corpus.errors import (
     EmptySourceParseError,
     EncryptedSourceParseError,
     FormatMismatchParseError,
+    MalformedSourceParseError,
     NoUnitsParseError,
+    ParseError,
     UnsupportedFormatParseError,
 )
+from fin.corpus.ocr import OCRError
 from fin.corpus.parsers._common import (
     FAMILY_CFB,
     FAMILY_PDF,
@@ -98,7 +107,10 @@ from fin.corpus.parsers._pages import (
     RasterOcrPort,
     Region,
 )
-from fin.corpus.parsers._pdf import parse_pdf
+from fin.corpus.parsers._pdf import (
+    OcrParsedUnit,
+    _is_encryption_failure,
+)
 from fin.corpus.parsers._pptx import parse_pptx
 from fin.corpus.parsers._text import parse_plain_text
 from fin.corpus.parsers._xlsx import parse_xlsx
@@ -122,6 +134,163 @@ def _family_accepts(fmt: str, family: str) -> bool:
     return False
 
 
+@functools.lru_cache(maxsize=1)
+def _placeholder_raster() -> PageRaster:
+    """A fixed 1 x 1 raster, built once, for the no-OCR corpus call.
+
+    WHY it is safe: on the core, page pixels are consumed only through
+    :meth:`PageRegionParser._recognize` (the page rule or a figure
+    crop), and that method raises ``OcrRequiredUnavailableError`` the
+    moment it is asked to work with ``ocr=None`` — before any png
+    bytes are read. A corpus call with no OCR capability therefore
+    never looks at a raster, and paying ~1 s/page of 200 dpi render +
+    PNG encode for bytes that are discarded would be a pure regression
+    against the retired ``parse_pdf`` path. With an OCR port wired,
+    the adapter hands the core its real renderer instead.
+
+    ``lru_cache`` replaces the old lazily-filled module global: the
+    one build is memoized without any unlocked shared mutable state
+    across the HTTP and worker threads (the cache itself is
+    thread-safe; a racing miss may at worst rebuild a 1 x 1 PNG).
+    """
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (1, 1), "white").save(buffer, format="PNG")
+    return PageRaster.of(buffer.getvalue(), width_px=1, height_px=1)
+
+
+class _PlaceholderPageRenderer:
+    """``PageRenderPort`` answering every call with the fixed placeholder.
+
+    The spelling of "no pixels will be read on this call" for the PDF
+    dispatch; :func:`_placeholder_raster` states why the answer is
+    never consumed.
+    """
+
+    def render_page(self, *, page_no: int) -> PageRaster:
+        return _placeholder_raster()
+
+
+def _encrypted_error(
+    exc: BaseException, document_id: str
+) -> EncryptedSourceParseError:
+    """The one corpus spelling of "encrypted PDF, no credentials"."""
+    return EncryptedSourceParseError(
+        f"PDF source for {document_id!r} is encrypted and no "
+        f"credentials were supplied: {exc}"
+    )
+
+
+def _classify_core_failure(
+    exc: Exception, document_id: str
+) -> NoReturn:
+    """Map one core failure onto its corpus name and raise it.
+
+    The core reports every open failure as malformed, while the corpus
+    dispatch distinguishes encrypted from corrupt via the shared
+    cause-chain classifier; named OCR outcomes and the core's own
+    already-corpus-named ``ParseError``s are re-raised as themselves
+    (same object, no re-wrapping, no bare failure escaping untyped).
+    """
+    if isinstance(exc, OCRError):
+        # Named OCR outcomes reach the caller as themselves.
+        raise exc
+    if _is_encryption_failure(exc):
+        # An encrypted PDF is structurally intact — it is named
+        # encrypted, not corrupt, because the remediation is
+        # credentials, not repair. The cause chain survives the core's
+        # wrapping, so the shared classifier still sees pdfminer.
+        raise _encrypted_error(exc, document_id) from exc
+    if isinstance(exc, ParseError):
+        raise exc
+    raise MalformedSourceParseError(
+        f"PDF source for {document_id!r} cannot be parsed: {exc}"
+    ) from exc
+
+
+def _freeze_page_unit(page: ParsedPage) -> ParsedUnit | None:
+    """One core page -> its corpus unit (``None`` = contribute nothing).
+
+    Native text (or an unscanned page) keeps the unit exactly as the
+    core built it. A unit whose text came from the OCR lane is
+    re-stamped as :class:`OcrParsedUnit` so ``ocr_applied`` reaches
+    chunking and push exactly as it did on the retired ``parse_pdf``
+    path.
+    """
+    if page.unit is None:
+        return None
+    if page.native_text.strip() or not page.scanned_text.strip():
+        return page.unit
+    # Unit text came from the OCR lane — carry the ocr_applied flag
+    # the ingest write-back convention reads.
+    return OcrParsedUnit.from_unit(page.unit)
+
+
+def _parse_pdf_via_page_core(
+    *,
+    source_bytes: bytes,
+    source_sha256: str,
+    document_id: str,
+    version: str,
+    max_units: int | None = None,
+    ocr: RasterOcrPort | None = None,
+    layout: PageLayoutPort | None = None,
+    renderer: PageRenderPort | None = None,
+) -> tuple[ParsedUnit, ...]:
+    """PDF frozen units from the shared page/region core.
+
+    One unit per physical page, built from the page's own frozen units
+    (:meth:`PageParseResult.frozen_units`' selection, in page order);
+    the per-page unit shape, including the OCR-lane re-stamp, lives in
+    :func:`_freeze_page_unit`.
+
+    Failure naming stays the corpus contract, not the core's — see
+    :func:`_classify_core_failure`; ``max_units < 1`` keeps its typed
+    ``NoUnitsParseError`` shape rather than the core's ``ValueError``;
+    and a document with no frozen unit at all is the named
+    ``NoUnitsParseError``, never an empty success.
+    """
+    if max_units is not None and max_units < 1:
+        raise NoUnitsParseError(
+            f"max_units must be >= 1 or None, got {max_units}"
+        )
+    if renderer is None and ocr is None:
+        # No OCR capability on this call: no page's pixels can be read
+        # (see _placeholder_raster), so the corpus path skips the
+        # rasterization the old parse_pdf never paid for.
+        renderer = _PlaceholderPageRenderer()
+    parser = PageRegionParser(
+        layout=layout if layout is not None else NullLayout(),
+        renderer=renderer,
+        ocr=ocr,
+    )
+    try:
+        result = parser.extract_pdf(
+            source_bytes=source_bytes,
+            source_sha256=source_sha256,
+            document_id=document_id,
+            version=version,
+            max_pages=max_units,
+        )
+    except Exception as exc:
+        _classify_core_failure(exc, document_id)
+
+    units: list[ParsedUnit] = []
+    for page in result.pages:
+        unit = _freeze_page_unit(page)
+        if unit is not None:
+            units.append(unit)
+    if not units:
+        raise NoUnitsParseError(
+            f"PDF source for {document_id!r} produced no non-empty "
+            "frozen units"
+        )
+    return tuple(units)
+
+
 def parse_document(
     source: Path | bytes,
     *,
@@ -129,6 +298,9 @@ def parse_document(
     document_id: str,
     version: str,
     max_units: int | None = None,
+    ocr: RasterOcrPort | None = None,
+    layout: PageLayoutPort | None = None,
+    renderer: PageRenderPort | None = None,
 ) -> ParseResult:
     """Parse one document into frozen units with structured metadata.
 
@@ -152,6 +324,24 @@ def parse_document(
         cap work on the frozen 10-Qs; ``None`` (default) parses
         everything. Only PDF honors it today; the other formats are
         already whole-document passes over in-memory bytes.
+    ocr:
+        PDF-only. Optional :class:`RasterOcrPort` for the scanned-page
+        lane of the shared page/region core: a page whose text layer
+        collapsed is frozen from its pixels. ``None`` (default) is no
+        OCR capability — such a page then ends the parse with the named
+        ``OcrRequiredUnavailableError``, the same outcome shape the
+        retired ``parse_pdf`` produced without an engine. Ignored by
+        the other formats.
+    layout:
+        PDF-only. Optional region port for the core; ``None`` (default)
+        is :class:`NullLayout` — the corpus path records no regions and
+        runs no figure crops, keeping the frozen units page-level.
+    renderer:
+        PDF-only. Optional render port handed to the core; ``None``
+        (default) lets the core build and release its own pypdfium2
+        rasterizer per call. Tests inject a fake to stay fast/hermetic.
+        These three ports are the corpus OCR seam, wired by a later
+        ticket; no production caller passes them yet.
 
     Returns
     -------
@@ -218,7 +408,16 @@ def parse_document(
         "version": version,
     }
     if fmt == "pdf":
-        units = parse_pdf(**parser_kwargs, max_units=max_units)
+        units = _parse_pdf_via_page_core(
+            source_bytes=source_bytes,
+            source_sha256=source_sha256,
+            document_id=document_id,
+            version=version,
+            max_units=max_units,
+            ocr=ocr,
+            layout=layout,
+            renderer=renderer,
+        )
     elif fmt == "docx":
         units = parse_docx(**parser_kwargs)
     elif fmt == "xlsx":

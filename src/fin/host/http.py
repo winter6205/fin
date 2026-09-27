@@ -330,6 +330,8 @@ from fin.host.workspace_http import (  # noqa: E402
     default_attachment_service,
     get_workspace_root,
     mount as _mount_workspace_routes,
+    start_ingest_worker,
+    stop_ingest_worker,
 )
 
 _get_workspace_root = get_workspace_root
@@ -659,9 +661,18 @@ def serve() -> None:
     # ``publish_knowledge_mcp``) — never a boot failure.
     publish_knowledge_mcp()
     compile_for_http()
+    # The durable ingest queue's execution side starts here, once per
+    # process: the drain does a startup sweep (queued/failed/interrupted
+    # jobs resume from durable state, no re-upload) and then re-checks
+    # on a bounded interval. Lazy by construction — importing this
+    # module for tests or ``--help`` never acquires the thread.
+    start_ingest_worker()
     import uvicorn
 
-    uvicorn.run("fin.host.http:app", host="0.0.0.0", port=8000, log_level="info")
+    try:
+        uvicorn.run("fin.host.http:app", host="0.0.0.0", port=8000, log_level="info")
+    finally:
+        stop_ingest_worker()
 
 
 __all__ = [

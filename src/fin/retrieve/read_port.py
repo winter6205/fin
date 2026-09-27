@@ -14,6 +14,9 @@ port** — the same port idea as :mod:`fin.retrieve.port`:
 * :func:`read_from_pages` — the shared boundary logic (page bounds,
   ADR 0009 ``page_limit`` clamp, version match, ``\\n\\n`` join) every
   pages-backed implementation reuses.
+* :data:`PAGE_LIMIT_CAP` / :func:`clamp_page_limit` — the one source of
+  the ADR 0009 bound (value and rule), shared by
+  :func:`read_from_pages` and ``MCPRetrieveAdapter._read_locators``.
 * :class:`ExtractedTreeReadPort` — the legacy tree-backed adapter over
   :func:`fin.corpus.extracted.load_extracted_tree`. Retained for
   offline / committed-corpus tests; **no product compile path builds
@@ -55,7 +58,17 @@ _UNKNOWN_LOCATOR: dict[str, str] = {"error": "unknown_locator"}
 
 # ADR 0009 cap on ``page_limit`` (preserved from the original
 # ``read_file``).
-_PAGE_LIMIT_CAP = 3
+PAGE_LIMIT_CAP = 3
+
+
+def clamp_page_limit(page_limit: int) -> int:
+    """Bound ``page_limit`` at :data:`PAGE_LIMIT_CAP` (ADR 0009).
+
+    Single source of the clamp rule for every read path. Callers reject
+    ``page_limit < 1`` as a miss BEFORE clamping; this helper only
+    enforces the upper bound.
+    """
+    return min(page_limit, PAGE_LIMIT_CAP)
 
 
 @runtime_checkable
@@ -112,8 +125,7 @@ def read_from_pages(
     # cap on ``page_limit`` clamps silently per ADR 0009.
     if page < 1 or page_limit < 1:
         return dict(_UNKNOWN_LOCATOR)
-    if page_limit > _PAGE_LIMIT_CAP:
-        page_limit = _PAGE_LIMIT_CAP
+    page_limit = clamp_page_limit(page_limit)
 
     pages = pages_by_doc.get(document_id)
     if not pages:
@@ -205,8 +217,10 @@ class MissReadPort:
 
 __all__ = [
     "READ_UNAVAILABLE",
+    "PAGE_LIMIT_CAP",
     "ExtractedTreeReadPort",
     "MissReadPort",
     "ReadPort",
+    "clamp_page_limit",
     "read_from_pages",
 ]

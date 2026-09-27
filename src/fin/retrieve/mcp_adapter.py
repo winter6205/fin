@@ -125,6 +125,7 @@ from fin.retrieve.port import (
     TierUnavailableError,
     resolve_search_mode,
 )
+from fin.retrieve.read_port import clamp_page_limit
 from fin.retrieve.tiers import COMMUNITY_SUMMARY_INDEX_FAILURE
 
 
@@ -704,9 +705,10 @@ class MCPRetrieveAdapter:
         unit granularity of the pushed envelope while keeping the
         model's read shape unchanged.
         """
-        locators = self._read_locators(document_id, version, page, page_limit)
-        if locators is None:
+        located = self._read_locators(document_id, version, page, page_limit)
+        if located is None:
             return {"error": "unknown_locator"}
+        locators, page_limit = located
         end = min(page + page_limit - 1, len(locators))
         units: list[str] = []
         for locator in locators[page - 1:end]:
@@ -731,8 +733,14 @@ class MCPRetrieveAdapter:
         version: str,
         page: int,
         page_limit: int,
-    ) -> list[Locator] | None:
-        """Resolve the ordered unit locators one ``read`` page covers.
+    ) -> tuple[list[Locator], int] | None:
+        """Resolve the unit locators and the clamped page bound.
+
+        Returns ``(locators, page_limit)`` with ``page_limit`` clamped
+        via :func:`fin.retrieve.read_port.clamp_page_limit` (cap
+        :data:`fin.retrieve.read_port.PAGE_LIMIT_CAP`) so the caller's
+        fetch window honors the same bounded read the locator rule
+        promises.
 
         Returns ``None`` for every shape that maps to the named
         ``unknown_locator`` miss: a non-positive page / page_limit, a
@@ -741,8 +749,7 @@ class MCPRetrieveAdapter:
         """
         if page < 1 or page_limit < 1:
             return None
-        if page_limit > 3:
-            page_limit = 3
+        page_limit = clamp_page_limit(page_limit)
         if (
             self._known_doc_ids is not None
             and document_id not in self._known_doc_ids
@@ -759,7 +766,7 @@ class MCPRetrieveAdapter:
         )
         if not locators or page > len(locators):
             return None
-        return locators
+        return locators, page_limit
 
     def _fetch_unit_body(
         self,
