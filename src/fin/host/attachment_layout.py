@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import math
 import os
 import shutil
@@ -76,6 +77,8 @@ __all__ = [
     "MeasuredHarnessRunner",
     "Spawn",
 ]
+
+logger = logging.getLogger(__name__)
 
 # Kinds the record carries coordinates for. It counts text regions too, but a
 # text region arrives as a count with no box, so it cannot become a Region.
@@ -514,8 +517,11 @@ def _reap(process: subprocess.Popen[str]) -> None:
     # not block forever on a pass that was already declared capped.
     try:
         process.communicate(timeout=_REAP_GRACE_S)
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        pass
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        # EXIT: the pass is already declared capped, so a drain that fails
+        # cannot be the pass's answer. The child is struck again below
+        # regardless; this only records that its pipes were never read.
+        logger.debug("harness child pipes not drained: %s", exc)
     if process.poll() is None:
         _signal_group(process, signal.SIGKILL)
 
@@ -589,10 +595,10 @@ class MeasuredHarnessRunner:
                 # engine", and the document's real failure would be gone.
                 try:
                     staged.unlink(missing_ok=True)
-                except OSError:
+                except OSError as cleanup_exc:
                     # EXIT: a copy this process could not remove is still reported
                     # by the pass that made it, never by this cleanup.
-                    pass
+                    logger.debug("staged copy %s not removed: %s", staged, cleanup_exc)
                 self._prune(config)
         return self._record_of(completed)
 
@@ -631,8 +637,14 @@ class MeasuredHarnessRunner:
             # than as the leak it is.
             try:
                 target.unlink(missing_ok=True)
-            except OSError:
-                pass  # EXIT: a copy this process could not destroy is still reported
+            except OSError as cleanup_exc:
+                # EXIT: a copy this process could not destroy is still reported
+                # by the staging failure about to be raised, not by this cleanup.
+                # Bound to ``cleanup_exc``, not ``exc``: an ``except ... as`` name
+                # is unbound at handler end, so reusing ``exc`` here would shadow
+                # the outer binding and turn the typed re-raise below into
+                # ``UnboundLocalError``.
+                logger.debug("staging copy %s not destroyed: %s", target, cleanup_exc)
             raise HeronStagingRefusedError(
                 f"could not stage {resolved.name} for the layout pass: "
                 f"{type(exc).__name__}",
@@ -644,8 +656,9 @@ class MeasuredHarnessRunner:
     def _prune(config: HeronLayoutConfig) -> None:
         try:
             config.staging_dir.rmdir()
-        except OSError:
-            pass  # EXIT: another document is still staged, or the dir was not ours
+        except OSError as exc:
+            # EXIT: another document is still staged, or the dir was not ours.
+            logger.debug("staging dir %s kept: %s", config.staging_dir, exc)
 
     @staticmethod
     def _child_env(config: HeronLayoutConfig) -> dict[str, str] | None:

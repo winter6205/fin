@@ -82,8 +82,16 @@ FIN_MEMORY_PREFETCH_MARKER: str = "[FIN_MEMORY_PREFETCH]"
 # wording, never ``you must`` / ``always recall`` / ``always save`` /
 # ``must cite`` (the forbid-list the existing advisory-wording tests
 # enforce on the whole prompt).
+#
+# The kind is stated in English only. Its Chinese gloss (知识问答助手, ADR 0090
+# / CONTEXT *product identity*) is NOT spelled here because 知识问答 is also the
+# operator label of the ``graph`` 检索档 (``fin.retrieve.tiers.TIER_LABELS``),
+# and a mode copy rides in this same payload: the bare term appearing twice
+# leaves the model reading a 档 label as the product's kind, which is the
+# conflation ADR 0090 rules out. The gloss stays where it is authoritative
+# (CONTEXT, ADR 0090); the prompt states the same kind in a word no 档 claims.
 AGENT_IDENTITY: str = (
-    "fin — enterprise knowledge-QA agent (知识问答助手) on the operator "
+    "fin — enterprise knowledge-QA agent on the operator "
     "工作台: the 入口, not the 库. "
     "Each turn is a track (dialogue / clarify / off_topic / grounded); "
     "tools and the citation verifier bind only to the grounded track. "
