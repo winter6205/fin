@@ -22,6 +22,9 @@ Boundary classes exercised (defensive-contract-validator):
 * exception  — failures are typed JSON errors, never silent 200s; a
                durable write failure is the named 500
                ``attachment_store_failed`` (and nothing half-stores).
+* malformed identity — every ``{attachment_id}`` door (status, retry, delete)
+               answers the named 400 ``invalid_locator`` before the segment
+               can reach the durable store as a query.
 
 Citation discipline (ADR 0046): the attachment text is injected
 call-scoped at model time and NEVER into the ``evidence`` channel, so an
@@ -36,6 +39,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import quote
 
 import pytest
 from fastapi import FastAPI
@@ -1135,3 +1139,301 @@ def test_reset_input_state_defaults_to_no_attachments_and_accepts_them() -> None
     ]
 
     assert reset_input_state("again")["attachments"] == []
+
+
+# ----- single-attachment delete door: named boundaries -----
+
+
+def _attachment_resource_path(thread_id: str, attachment_id: str) -> str:
+    """One attachment's shipped URL, with the identity percent-encoded.
+
+    The status door reads this path, the delete door voids it, and the retry
+    door hangs ``/retry`` off it, so all three are asked about the same URL a
+    client builds. Encoding keeps the test's judgement the route's: the
+    identity arrives decoded, exactly as a browser sends it.
+    """
+    from fin.host.workspace_http import _attachment_delete_path
+
+    return _attachment_delete_path(thread_id, quote(attachment_id, safe=""))
+
+
+def _delete_attachment(
+    client: TestClient, thread_id: str, attachment_id: str, **transport: Any
+) -> Any:
+    """``DELETE`` the shipped path for one attachment.
+
+    Any extra keyword goes to the transport, so a test of malformed text or
+    garbage bytes proves the route's judgement and not the HTTP client's.
+    """
+    return client.request(
+        "DELETE", _attachment_resource_path(thread_id, attachment_id), **transport
+    )
+
+
+def _attachment_status(
+    client: TestClient, thread_id: str, attachment_id: str
+) -> Any:
+    """``GET`` one attachment's status through the shipped door."""
+    return client.get(_attachment_resource_path(thread_id, attachment_id))
+
+
+def _retry_attachment(client: TestClient, thread_id: str, attachment_id: str) -> Any:
+    """``POST`` the shipped retry path for one attachment."""
+    return client.request(
+        "POST", f"{_attachment_resource_path(thread_id, attachment_id)}/retry"
+    )
+
+
+# The malformed path identities every ``{attachment_id}`` door must refuse.
+# One list and one set of case names, so the three doors are provably judged
+# on identical input.
+_MALFORMED_LOCATORS = ["   ", "a\tb", "line\nbreak", "x" * 5001]
+_MALFORMED_LOCATOR_IDS = ["blank", "tab", "newline", "oversized"]
+
+
+def _record_store_lookups(
+    fresh_store, monkeypatch: pytest.MonkeyPatch
+) -> list[str]:
+    """Every attachment id a door was allowed to hand the durable store.
+
+    The guard promises a malformed segment never becomes a query, so the
+    returned list must stay empty. This spies rather than stubs: the store's
+    own answer still comes back, so the same test can also prove the thread's
+    real attachment was left alone.
+    """
+    seen: list[str] = []
+    real_get = fresh_store["attachments"].store.get
+
+    def _spy(attachment_id: str) -> Any:
+        seen.append(attachment_id)
+        return real_get(attachment_id)
+
+    monkeypatch.setattr(fresh_store["attachments"].store, "get", _spy)
+    return seen
+
+
+@pytest.mark.parametrize(
+    "attachment_id", _MALFORMED_LOCATORS, ids=_MALFORMED_LOCATOR_IDS
+)
+def test_delete_door_refuses_a_malformed_attachment_id_as_a_typed_validation_error(
+    client: TestClient, fresh_store, attachment_id: str
+) -> None:
+    """A malformed path identity is a named 400, never a 500 and never a void.
+
+    The value reaches the route decoded, so the route must judge it before
+    touching any state — and must leave the thread's real attachment alone.
+    """
+    thread_id = _new_thread(client)
+    stored = _attach(client, thread_id, ATTACH_SENTINEL.encode("utf-8")).json()
+
+    response = _delete_attachment(client, thread_id, attachment_id)
+
+    assert response.status_code == 400, response.text
+    assert response.json() == {"error": "invalid_locator"}
+    assert fresh_store["attachments"].status(stored["attachment_id"]) is not None
+
+
+def test_delete_door_names_an_unknown_thread_and_touches_nothing(
+    client: TestClient, fresh_store
+) -> None:
+    thread_id = _new_thread(client)
+    stored = _attach(client, thread_id, ATTACH_SENTINEL.encode("utf-8")).json()
+
+    response = _delete_attachment(
+        client, f"no-such-thread-{thread_id}", stored["attachment_id"]
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "thread_not_found"}
+    assert fresh_store["attachments"].status(stored["attachment_id"]) is not None
+
+
+def test_delete_door_takes_no_request_body(client: TestClient, fresh_store) -> None:
+    """A DELETE with a malformed body is the same call as one with no body.
+
+    The route's whole input is the two path identities, so garbage bytes
+    cannot change the outcome and cannot reach the stores. Two attachments,
+    one deleted with each transport shape, proves the two calls agree without
+    making the second one a repeat of the first.
+    """
+    thread_id = _new_thread(client)
+    garbage = _attach(client, thread_id, ATTACH_SENTINEL.encode("utf-8")).json()[
+        "attachment_id"
+    ]
+    plain = _attach(client, thread_id, "second file".encode("utf-8")).json()[
+        "attachment_id"
+    ]
+
+    with_body = _delete_attachment(
+        client,
+        thread_id,
+        garbage,
+        content=b'{"not": "part of the contract"',
+        headers={"content-type": "application/json"},
+    )
+    without_body = _delete_attachment(client, thread_id, plain)
+
+    assert (with_body.status_code, without_body.status_code) == (200, 200)
+    assert fresh_store["attachments"].status(garbage) is None
+    assert fresh_store["attachments"].status(plain) is None
+
+
+def test_delete_door_names_an_unknown_locator(client: TestClient, fresh_store) -> None:
+    thread_id = _new_thread(client)
+
+    response = _delete_attachment(client, thread_id, "att-never-uploaded")
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "unknown_locator"}
+
+
+def test_delete_door_maps_a_store_rejection_to_a_named_exit(
+    client: TestClient, http_app: FastAPI, fresh_store
+) -> None:
+    """A void that the durable store refuses is 500 ``attachment_store_failed``.
+
+    The door must not answer success for an attachment whose cleanup
+    obligation could not be recorded, and must not answer a bare 500.
+    """
+    from fin.host.attachment_prepare import AttachmentPreparationService
+    from fin.host.attachment_store import (
+        AttachmentStoreError,
+        InMemoryAttachmentStore,
+    )
+    from fin.host.http import get_attachment_service
+
+    thread_id = _new_thread(client)
+    stored = _attach(client, thread_id, ATTACH_SENTINEL.encode("utf-8")).json()
+    aid = stored["attachment_id"]
+
+    class _RejectingStore(InMemoryAttachmentStore):
+        def tombstone(self, *, attachment_id: str, thread_id: str) -> str | None:
+            raise AttachmentStoreError("durable store unavailable")
+
+    rejecting = AttachmentPreparationService(
+        store=_RejectingStore(fresh_store["store"]),
+        objects=fresh_store["objects"],
+    )
+    http_app.dependency_overrides[get_attachment_service] = lambda: rejecting
+
+    response = _delete_attachment(client, thread_id, aid)
+
+    assert response.status_code == 500
+    assert response.json() == {"error": "attachment_store_failed"}
+
+
+# ----- the same locator guard on the other two {attachment_id} doors -----
+
+
+@pytest.mark.parametrize(
+    "attachment_id", _MALFORMED_LOCATORS, ids=_MALFORMED_LOCATOR_IDS
+)
+def test_status_door_refuses_a_malformed_attachment_id_as_a_typed_validation_error(
+    client: TestClient,
+    fresh_store,
+    monkeypatch: pytest.MonkeyPatch,
+    attachment_id: str,
+) -> None:
+    """The status door refuses garbage before the store sees it, as DELETE does.
+
+    A malformed path segment is a client mistake, not an identity miss, so it
+    must not become a query and must not borrow ``attachment_not_found`` — the
+    answer the same door gives a well-formed id that no thread owns.
+    """
+    thread_id = _new_thread(client)
+    stored = _attach(client, thread_id, ATTACH_SENTINEL.encode("utf-8")).json()
+    handed_to_store = _record_store_lookups(fresh_store, monkeypatch)
+
+    response = _attachment_status(client, thread_id, attachment_id)
+
+    assert response.status_code == 400, response.text
+    assert response.json() == {"error": "invalid_locator"}
+    assert handed_to_store == []
+    assert fresh_store["attachments"].store.get(stored["attachment_id"]) is not None
+
+
+@pytest.mark.parametrize(
+    "attachment_id", _MALFORMED_LOCATORS, ids=_MALFORMED_LOCATOR_IDS
+)
+def test_retry_door_refuses_a_malformed_attachment_id_as_a_typed_validation_error(
+    client: TestClient,
+    fresh_store,
+    monkeypatch: pytest.MonkeyPatch,
+    attachment_id: str,
+) -> None:
+    """The retry door refuses garbage before the store sees it, as DELETE does.
+
+    Retry drives preparation, so a segment the store can never match must be
+    refused at the door — not looked up, not prepared, and not answered with
+    the store-level code an identity miss earns.
+    """
+    thread_id = _new_thread(client)
+    stored = _attach(client, thread_id, ATTACH_SENTINEL.encode("utf-8")).json()
+    handed_to_store = _record_store_lookups(fresh_store, monkeypatch)
+
+    response = _retry_attachment(client, thread_id, attachment_id)
+
+    assert response.status_code == 400, response.text
+    assert response.json() == {"error": "invalid_locator"}
+    assert handed_to_store == []
+    untouched = fresh_store["attachments"].store.get(stored["attachment_id"])
+    assert untouched is not None
+    assert untouched.status == "uploaded"
+
+
+def test_the_two_lookup_doors_still_name_a_wellformed_identity_miss(
+    client: TestClient, fresh_store
+) -> None:
+    """The guard must not steal the identity miss's own named answer.
+
+    A plausible id that no thread owns is a different mistake from garbage
+    text, and both doors keep the code they had before the guard spread: 400
+    ``attachment_not_found`` for an unknown id, 404 ``thread_not_found`` for an
+    unknown thread.
+    """
+    thread_id = _new_thread(client)
+    unknown_id = _attachment_status(client, thread_id, "att-never-uploaded")
+    unknown_thread = _attachment_status(client, f"no-such-{thread_id}", "att-0k")
+
+    assert (unknown_id.status_code, unknown_id.json()) == (
+        400,
+        {"error": "attachment_not_found"},
+    )
+    assert (unknown_thread.status_code, unknown_thread.json()) == (
+        404,
+        {"error": "thread_not_found"},
+    )
+
+
+def test_the_shipped_attachment_delete_path_is_the_one_the_chip_calls(
+    client: TestClient,
+) -> None:
+    """Host route and web request must name one URL.
+
+    ``web/src/api.ts`` builds its own path string and has no router to consult,
+    so this is where the two halves of the same door are pinned together: a
+    template change on either side would otherwise leave the chip's delete
+    calling a path that answers 404.
+    """
+    from fin.host.workspace_http import _attachment_delete_path
+
+    api_source = (
+        Path(__file__).resolve().parents[2]
+        / "web"
+        / "src"
+        / "api.ts"
+    ).read_text(encoding="utf-8")
+    request = api_source.split(
+        "export async function deleteThreadAttachment", 1
+    )[1].split("\nexport ", 1)[0]
+    assert "/api/threads/${encodeURIComponent(threadId)}/attachments/" in request
+    assert "encodeURIComponent(attachmentId)" in request
+    assert 'method: "DELETE"' in request
+    assert "/retry" not in request
+
+    shipped = "/api/threads/no-such-thread/attachments/no-such-attachment"
+    assert _attachment_delete_path("no-such-thread", "no-such-attachment") == shipped
+
+    missing_thread = client.request("DELETE", shipped)
+    assert missing_thread.status_code == 404
+    assert missing_thread.json() == {"error": "thread_not_found"}

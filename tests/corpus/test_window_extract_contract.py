@@ -558,6 +558,11 @@ _POISON_OCR_SNIPPET = """
         "detect_ocr_required",
     ):
         setattr(poison, name, _boom)
+    # The page/region core imports the shared collapse threshold at module
+    # load, and parsers/__init__ pulls that core in on every path. It is a
+    # number, not a seam, so it is pre-supplied like the error names; the
+    # lock still fires on any call into an OCR seam.
+    poison.PAGE_COLLAPSE_TEXT_CHARS = 100
 
     class _PoisonError(Exception):
         code = "ocr_required_unavailable"

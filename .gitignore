@@ -101,6 +101,18 @@ docs/会话备份.txt
 # never committed.
 .fin/
 
+# Documents staged for the pinned layout container: the harness mounts this
+# checkout read-only, so a filing from outside it has to be copied in first.
+# Those copies are one thread's private filing content, and the repository is
+# auto-committed, so the directory is ignored rather than trusted to a cleanup
+# path that can fail.
+.fin-heron-staging/
+
 # Scratch harnesses written while exercising the launcher's kill/stop paths
 # against a live pid. Throwaway by construction — never a product artifact.
 .fin-selftest/
+
+# Copies of uploaded attachments, staged so the read-only /worktree mount can
+# open them. Thread-private user bytes: this project auto-commits, so a staged
+# upload would otherwise land in the repository history.
+.fin-heron-staging/

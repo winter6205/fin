@@ -204,6 +204,34 @@ class ParseMetadataIncompleteError(ParseError):
     code = "metadata_incomplete"
 
 
+class PageRenderError(ParseError):
+    """A physical page could not be rasterized at the requested scale.
+
+    Distinct from a malformed source: the document opened, the page index
+    is valid, and only the pixel pass failed (bitmap allocation, encoder,
+    or a page whose geometry cannot be drawn). The rendered page image is
+    a required product of the page/region core — a page without it cannot
+    reach the vision stage — so the failure is named, never a page unit
+    emitted with an empty image.
+    """
+
+    code = "render_failed"
+
+
+class PageLayoutError(ParseError):
+    """The injected layout port failed to describe one page's regions.
+
+    Either the engine could not run at all, or it returned a region the
+    page cannot hold (an inverted box, or one reaching outside the media
+    box). The second shape is a broken claim rather than a property of the
+    document, so it terminates the parse instead of being dropped —
+    a silently missing region would make figure-scoped OCR quietly stop
+    running.
+    """
+
+    code = "layout_unavailable"
+
+
 class ParseHeadingSpanError(ParseError):
     """A parser's claimed heading lines are not a valid, locatable
     claim about the text it produced.
@@ -237,6 +265,8 @@ __all__ = [
     "EncryptedSourceParseError",
     "FormatMismatchParseError",
     "NoUnitsParseError",
+    "PageLayoutError",
+    "PageRenderError",
     "ParseHeadingSpanError",
     "ParseMetadataIncompleteError",
 ]

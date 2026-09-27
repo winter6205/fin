@@ -2,8 +2,10 @@
 
 These cases pin ``fin.host.attachment_store.AttachmentStore`` semantics:
 liveness arbitration, derived-data-gated ``ready``, restart visibility, and
-thread-cascade deletion. Both implementations must answer the same
-assertions, so every in-memory contract has a Postgres twin.
+thread-cascade deletion. The deletion obligation is one contract with two
+implementations, so the ``store_pair`` fixture runs those cases against both
+instead of keeping a copied ``test_postgres_*`` twin for each; the remaining
+Postgres cases are the shapes only that adapter has.
 
 Validation basis: specs/thread-attachment-source-read.md Boundaries item 1
 and Success Criteria 2/3. The Postgres half follows the existing repo
@@ -51,7 +53,7 @@ def _threads_and_store() -> tuple[InMemoryThreadStore, InMemoryAttachmentStore, 
 
 
 def _create(
-    store: InMemoryAttachmentStore,
+    store: Any,
     thread_id: str,
     *,
     attachment_id: str | None = None,
@@ -69,7 +71,7 @@ def _create(
 
 
 def _prepare(
-    store: InMemoryAttachmentStore, thread_id: str, *, version: int = 1
+    store: Any, thread_id: str, *, version: int = 1
 ) -> AttachmentRecord:
     """An accepted row with BOTH derived layers written for ``version``."""
     record = _create(store, thread_id)
@@ -89,6 +91,76 @@ def _force_parsing(store: InMemoryAttachmentStore, attachment_id: str) -> None:
     """
     cell = store._attachments[attachment_id]
     cell.record = replace(cell.record, status="parsing")
+
+
+# ----- backends -----
+
+
+@pytest.fixture
+def postgres_store_url() -> str:
+    url = os.environ.get(POSTGRES_URL_ENV, "").strip()
+    if not url:
+        pytest.skip(
+            "FIN_CHECKPOINT_URL is not set; PostgresAttachmentStore is "
+            "untested in this environment"
+        )
+    return url
+
+
+@pytest.fixture
+def pg(postgres_store_url: str) -> Iterator[tuple[Any, Any]]:
+    """Thread store + attachment store on one URL, with row cleanup."""
+    import psycopg
+
+    from fin.host.attachment_store import PostgresAttachmentStore
+    from fin.host.thread_store import PostgresThreadStore
+
+    threads = PostgresThreadStore(postgres_store_url)
+    store = PostgresAttachmentStore(postgres_store_url)
+    yield threads, store
+    with psycopg.connect(postgres_store_url) as conn:
+        conn.execute("DELETE FROM fin_thread")
+        conn.commit()
+
+
+@pytest.fixture(params=["memory", "postgres"])
+def store_pair(request) -> Iterator[tuple[Any, Any, str]]:
+    """One thread store and one attachment store, per durable backend.
+
+    WHY parameterized: the deletion obligation is one contract with two
+    implementations, and a hand-copied ``test_postgres_*`` twin drifts from the
+    assertion it is supposed to share. Opt-in by the repo's convention: with no
+    reachable ``FIN_CHECKPOINT_URL`` the ``postgres`` parameter skips and only
+    the in-memory leg runs — the evidence the durable half would be missing,
+    not a substitute for it.
+    """
+    if request.param == "memory":
+        threads = InMemoryThreadStore()
+        yield threads, InMemoryAttachmentStore(threads), "memory"
+        return
+    threads, store = request.getfixturevalue("pg")
+    yield threads, store, "postgres"
+
+
+def _retained_obligations(backend: str, store: Any, thread_id: str) -> int:
+    """How many obligation records a backend still holds for one thread.
+
+    WHY per backend: "retired, not hidden" is only visible in the storage each
+    implementation uses — a dict in memory, a row the foreign key cascaded
+    away in Postgres. ``pending_cleanup()`` cannot show it: both answer the
+    same empty list once the thread is gone.
+    """
+    if backend == "memory":
+        return len(store._tombstones)
+    import psycopg
+
+    with psycopg.connect(os.environ[POSTGRES_URL_ENV]) as conn:
+        row = conn.execute(
+            "SELECT count(*) FROM fin_thread_attachment_tombstone "
+            "WHERE thread_id = %s",
+            (thread_id,),
+        ).fetchone()
+    return int(row[0])
 
 
 # ----- create / get / list -----
@@ -606,6 +678,308 @@ def test_delete_outranks_a_late_writer_under_real_concurrency() -> None:
     assert threads.get_thread(thread_id) is not None
 
 
+# ----- tombstone: access is voided before any byte cleanup -----
+
+
+def test_tombstone_voids_access_and_returns_the_byte_obligation() -> None:
+    _, store, thread_id = _threads_and_store()
+    record = _prepare(store, thread_id)
+    store.mark_ready(attachment_id=record.attachment_id, version=1, unit_count=2)
+    aid = record.attachment_id
+
+    key = store.tombstone(attachment_id=aid, thread_id=thread_id)
+
+    assert key == f"threads/{thread_id}/{aid}"
+    assert store.get(aid) is None
+    assert store.list_for_thread(thread_id) == []
+    assert store.units(aid, 1) == ()
+    assert store.index_postings(aid, 1) == {}
+    assert store.indexed_versions(aid) == ()
+    assert store.incomplete() == []
+
+
+def test_tombstone_blocks_every_late_derived_write() -> None:
+    """The void is the arbitration point for a preparation that is still running."""
+    _, store, thread_id = _threads_and_store()
+    aid = _create(store, thread_id).attachment_id
+    assert store.tombstone(attachment_id=aid, thread_id=thread_id) is not None
+
+    with pytest.raises(AttachmentThreadGoneError):
+        store.record_units(attachment_id=aid, version=1, units=UNITS)
+    with pytest.raises(AttachmentThreadGoneError):
+        store.put_index(attachment_id=aid, version=1, postings=POSTINGS)
+    with pytest.raises(AttachmentThreadGoneError):
+        store.mark_ready(attachment_id=aid, version=1, unit_count=2)
+    with pytest.raises(AttachmentThreadGoneError):
+        store.mark_failed(attachment_id=aid, version=1, reason="render_failed")
+
+    assert store.units(aid, 1) == ()
+    assert store.indexed_versions(aid) == ()
+
+
+def test_tombstone_holds_the_obligation_until_cleanup_is_confirmed() -> None:
+    """An unconfirmed deletion stays retryable, and never re-voids silently."""
+    _, store, thread_id = _threads_and_store()
+    aid = _create(store, thread_id).attachment_id
+    key = f"threads/{thread_id}/{aid}"
+
+    assert store.tombstone(attachment_id=aid, thread_id=thread_id) == key
+    assert store.pending_cleanup(thread_id) == [key]
+    # The retry path reaches the same obligation while the bytes are owed.
+    assert store.tombstone(attachment_id=aid, thread_id=thread_id) == key
+
+    store.confirm_cleanup(attachment_id=aid)
+
+    assert store.pending_cleanup(thread_id) == []
+    assert store.tombstone(attachment_id=aid, thread_id=thread_id) is None
+
+
+def test_tombstone_of_another_threads_attachment_reveals_nothing(
+    store_pair: tuple[Any, Any, str],
+) -> None:
+    """A refused void writes no obligation and touches no row.
+
+    The claim the scripted statement-shape case used to pin — a miss leaves
+    the tables untouched — is observable here instead: the other thread's row
+    keeps every layer and neither thread gains a debt.
+    """
+    threads, store, backend = store_pair
+    mine = threads.create_thread(title=f"{backend} mine")
+    theirs = threads.create_thread(title=f"{backend} theirs")
+    record = _prepare(store, theirs.id)
+
+    assert store.tombstone(attachment_id=record.attachment_id, thread_id=mine.id) is None
+
+    assert store.get(record.attachment_id) is not None
+    assert store.units(record.attachment_id, 1) == UNITS
+    assert store.indexed_versions(record.attachment_id) == (1,)
+    assert store.pending_cleanup(mine.id) == []
+    assert store.pending_cleanup(theirs.id) == []
+
+
+def test_tombstone_of_an_unknown_attachment_is_a_miss_not_an_error() -> None:
+    _, store, thread_id = _threads_and_store()
+
+    assert store.tombstone(attachment_id="never-uploaded", thread_id=thread_id) is None
+    assert store.pending_cleanup(thread_id) == []
+
+
+def test_tombstone_refuses_a_blank_identity() -> None:
+    _, store, thread_id = _threads_and_store()
+
+    with pytest.raises(AttachmentStoreError):
+        store.tombstone(attachment_id="   ", thread_id=thread_id)
+    with pytest.raises(AttachmentStoreError):
+        store.tombstone(attachment_id="att-1", thread_id="")
+
+
+def test_thread_delete_tombstones_every_attachment_before_cleanup(
+    store_pair: tuple[Any, Any, str],
+) -> None:
+    threads, store, backend = store_pair
+    thread = threads.create_thread(title=f"{backend} thread tombstone")
+    first = _prepare(store, thread.id)
+    second = _create(store, thread.id)
+    keys = sorted([first.object_key, second.object_key])
+
+    assert sorted(store.delete_for_thread(thread.id)) == keys
+    assert sorted(store.pending_cleanup(thread.id)) == keys
+    assert store.get(first.attachment_id) is None
+    assert store.list_for_thread(thread.id) == []
+
+    # A retry while cleanup is outstanding reaches the same obligations, even
+    # though no attachment row is left to void.
+    assert store.delete_for_thread(thread.id) == []
+    assert sorted(store.pending_cleanup(thread.id)) == keys
+
+    store.confirm_thread_cleanup(thread.id)
+
+    assert store.pending_cleanup(thread.id) == []
+    assert store.tombstone(
+        attachment_id=first.attachment_id, thread_id=thread.id
+    ) is None
+
+
+def test_thread_voiding_returns_the_obligation_it_recorded(
+    store_pair: tuple[Any, Any, str],
+) -> None:
+    """One write answers both "what did I void" and "what is still owed".
+
+    The thread-wide door used to enumerate the keys it was voiding and record
+    the debt beside it, so the returned list and ``pending_cleanup()`` could
+    name different bytes. Both now come from the same void, and a debt the
+    single door already handed over is still readable beside the new one.
+    """
+    threads, store, backend = store_pair
+    thread = threads.create_thread(title=f"{backend} thread void")
+    owed = _create(store, thread.id, attachment_id=f"{backend}-owed")
+    fresh = _create(store, thread.id, attachment_id=f"{backend}-fresh")
+
+    assert store.tombstone(attachment_id=owed.attachment_id, thread_id=thread.id) == (
+        owed.object_key
+    )
+
+    # Only the row still on record is voided here; the owed key stays owed.
+    assert store.delete_for_thread(thread.id) == [fresh.object_key]
+    assert sorted(store.pending_cleanup(thread.id)) == sorted(
+        [owed.object_key, fresh.object_key]
+    )
+
+    # Both doors retry against the same records: nothing re-voids in silence
+    # and one id never ends up with two debts.
+    assert store.delete_for_thread(thread.id) == []
+    assert store.tombstone(attachment_id=fresh.attachment_id, thread_id=thread.id) == (
+        fresh.object_key
+    )
+    assert sorted(store.pending_cleanup(thread.id)) == sorted(
+        [owed.object_key, fresh.object_key]
+    )
+
+
+def test_create_refuses_an_id_that_still_owes_a_cleanup(
+    store_pair: tuple[Any, Any, str],
+) -> None:
+    """An attachment identity is not reusable until its bytes are confirmed.
+
+    One obligation record per id cannot carry a second debt, so accepting the
+    pairing stranded a key: the void that later claimed the new row recorded
+    nothing for it and the retry kept answering with the older one. ``create()``
+    is where that is decided, and the refusal lifts with the confirmation.
+    """
+    threads, store, backend = store_pair
+    thread = threads.create_thread(title=f"{backend} recycle")
+    other = threads.create_thread(title=f"{backend} other")
+    first = _create(store, thread.id, attachment_id=f"{backend}-owed")
+
+    assert store.tombstone(attachment_id=first.attachment_id, thread_id=thread.id) == (
+        first.object_key
+    )
+
+    with pytest.raises(AttachmentStoreError):
+        _create(store, thread.id, attachment_id=first.attachment_id)
+    with pytest.raises(AttachmentStoreError):
+        _create(store, other.id, attachment_id=first.attachment_id)
+
+    # A refused attempt writes nothing: the debt and its answer are untouched.
+    assert store.pending_cleanup(thread.id) == [first.object_key]
+    assert store.pending_cleanup(other.id) == []
+    assert store.get(first.attachment_id) is None
+    assert store.tombstone(attachment_id=first.attachment_id, thread_id=thread.id) == (
+        first.object_key
+    )
+
+    store.confirm_cleanup(attachment_id=first.attachment_id)
+
+    assert store.pending_cleanup(thread.id) == []
+    replayed = _create(store, other.id, attachment_id=first.attachment_id)
+    assert replayed.thread_id == other.id
+    assert store.get(first.attachment_id) == replayed
+
+
+def test_thread_removal_retires_obligations_instead_of_hiding_them(
+    store_pair: tuple[Any, Any, str],
+) -> None:
+    """The records go with the thread, not just their readability.
+
+    ``pending_cleanup()`` used to answer ``[]`` from a filter while the
+    obligation stayed in the map until some later probe of THAT id collected
+    it, so the in-memory store retained a debt no thread could ever pay. The
+    retirement step drops it where the Postgres cascade drops it.
+    """
+    threads, store, backend = store_pair
+    thread = threads.create_thread(title=f"{backend} retire debt")
+    record = _create(store, thread.id, attachment_id=f"{backend}-debt")
+
+    assert store.tombstone(attachment_id=record.attachment_id, thread_id=thread.id) == (
+        record.object_key
+    )
+    assert store.pending_cleanup(thread.id) == [record.object_key]
+
+    assert threads.delete_thread(thread.id) is True
+
+    assert store.pending_cleanup(thread.id) == []
+    assert _retained_obligations(backend, store, thread.id) == 0
+    assert store.tombstone(
+        attachment_id=record.attachment_id, thread_id=thread.id
+    ) is None
+
+
+def test_the_cleanup_door_names_a_row_whose_thread_row_is_already_gone(
+    store_pair: tuple[Any, Any, str],
+) -> None:
+    """No row leaves this store without a door having named its bytes.
+
+    The two backends cannot answer identically and both answers are the
+    contract: ``ON DELETE CASCADE`` removes the durable row in the same
+    statement that removes the thread, so nothing is left to name, while the
+    in-memory retirement is lazy and leaves a row that outlived its thread —
+    which the thread-wide door hands over, because it is the one door with a
+    channel for a key. Reads hide such a row rather than removing it, so a
+    lookup or a lost derived write cannot pre-empt that naming.
+    """
+    threads, store, backend = store_pair
+    thread = threads.create_thread(title=f"{backend} orphan row")
+    record = _create(store, thread.id, attachment_id=f"{backend}-orphan")
+
+    assert threads.delete_thread(thread.id) is True
+
+    assert store.get(record.attachment_id) is None
+    assert store.list_for_thread(thread.id) == []
+    assert store.incomplete() == []
+    with pytest.raises(AttachmentThreadGoneError):
+        store.record_units(
+            attachment_id=record.attachment_id, version=1, units=UNITS
+        )
+
+    keys = store.delete_for_thread(thread.id)
+    if backend == "memory":
+        assert keys == [record.object_key]
+        assert store._attachments == {}
+    else:
+        assert keys == []
+
+    # A debt cannot outlive the thread that owes it, and the door stays
+    # idempotent once its rows are retired.
+    assert store.pending_cleanup(thread.id) == []
+    assert store.delete_for_thread(thread.id) == []
+
+
+def test_confirm_cleanup_enters_the_same_retirement_step() -> None:
+    """The fifth door retires like the other four.
+
+    Confirming one id used to pop only that record, so a thread whose row was
+    already gone kept its other rows and the rest of its obligations until some
+    later door happened to sweep them.
+    """
+    threads, store, thread_id = _threads_and_store()
+    owed = _create(store, thread_id, attachment_id="att-1")
+    _create(store, thread_id, attachment_id="att-2")
+
+    assert store.tombstone(attachment_id=owed.attachment_id, thread_id=thread_id) == (
+        owed.object_key
+    )
+    assert threads.delete_thread(thread_id) is True
+
+    store.confirm_cleanup(attachment_id=owed.attachment_id)
+
+    assert store._tombstones == {}
+    assert store._attachments == {}
+    assert store.pending_cleanup(thread_id) == []
+
+
+def test_thread_delete_obligations_are_scoped_to_their_thread() -> None:
+    threads, store, thread_id = _threads_and_store()
+    other = threads.create_thread(title="other")
+    other_aid = _prepare(store, other.id).attachment_id
+    _prepare(store, thread_id)
+
+    store.delete_for_thread(thread_id)
+
+    assert store.pending_cleanup(other.id) == []
+    assert store.get(other_aid) is not None
+    assert store.units(other_aid, 1) == UNITS
+
+
 # ----- protocol surface -----
 
 
@@ -624,11 +998,35 @@ _PROTOCOL_METHODS = (
     "mark_failed",
     "incomplete",
     "delete_for_thread",
+    "tombstone",
+    "pending_cleanup",
+    "confirm_cleanup",
+    "confirm_thread_cleanup",
 )
 
 
 def test_in_memory_store_satisfies_the_protocol_surface() -> None:
     store = InMemoryAttachmentStore(InMemoryThreadStore())
+    missing = [name for name in _PROTOCOL_METHODS if not callable(getattr(store, name, None))]
+    assert missing == []
+
+
+def test_postgres_store_satisfies_the_protocol_surface(
+    postgres_store_url: str,
+) -> None:
+    """The durable store offers the same void-and-obligation surface.
+
+    WHY a separate guard: the deletion door is one contract, and a method
+    only the in-memory implementation carries would let a real deployment
+    answer a delete while leaving bytes owed with no way to finish them.
+    """
+    from fin.host.attachment_store import PostgresAttachmentStore
+    from fin.host.thread_store import PostgresThreadStore
+
+    # The thread schema precedes the attachment schema, exactly as the
+    # product's own builder orders it.
+    PostgresThreadStore(postgres_store_url)
+    store = PostgresAttachmentStore(postgres_store_url)
     missing = [name for name in _PROTOCOL_METHODS if not callable(getattr(store, name, None))]
     assert missing == []
 
@@ -661,37 +1059,57 @@ def test_in_memory_store_only_asks_the_thread_store_for_liveness() -> None:
 
 
 # ----- Postgres (env-gated on FIN_CHECKPOINT_URL) -----
-
-
-@pytest.fixture
-def postgres_store_url() -> str:
-    url = os.environ.get(POSTGRES_URL_ENV, "").strip()
-    if not url:
-        pytest.skip(
-            "FIN_CHECKPOINT_URL is not set; PostgresAttachmentStore is "
-            "untested in this environment"
-        )
-    return url
-
-
-@pytest.fixture
-def pg(postgres_store_url: str) -> Iterator[tuple[Any, Any]]:
-    """Thread store + attachment store on one URL, with row cleanup."""
-    import psycopg
-
-    from fin.host.attachment_store import PostgresAttachmentStore
-    from fin.host.thread_store import PostgresThreadStore
-
-    threads = PostgresThreadStore(postgres_store_url)
-    store = PostgresAttachmentStore(postgres_store_url)
-    yield threads, store
-    with psycopg.connect(postgres_store_url) as conn:
-        conn.execute("DELETE FROM fin_thread")
-        conn.commit()
+#
+# The fixtures above are what reach a real server. Statement identity is not
+# pinned anywhere: the same claim — that both deletion doors write one
+# obligation and a refused void writes none — is observable through the adapter
+# and is exercised against the server in the cases below and in the
+# parameterized pair above.
 
 
 def _pg_create(store: Any, thread_id: str, *, attachment_id: str | None = None) -> Any:
     return _create(store, thread_id, attachment_id=attachment_id)
+
+
+def test_postgres_a_row_shadowed_by_another_threads_debt_still_goes_with_its_thread(
+    pg: tuple[Any, Any],
+) -> None:
+    """A thread delete leaves no row behind, even one no void can record.
+
+    ``create()`` refuses an owed id, so only the window between that check and
+    a concurrent void can leave a live row whose id's single record belongs to
+    another thread. The seed writes the shape directly, because no door is
+    allowed to build it: retaining the row would contradict the promise that
+    every attachment row goes with its thread, and silently dropping it would
+    lose the key.
+    """
+    import psycopg
+
+    threads, store = pg
+    mine = threads.create_thread(title="pg shadow mine")
+    theirs = threads.create_thread(title="pg shadow theirs")
+    aid = f"pg-shadow-{uuid.uuid4().hex[:8]}"
+    _pg_create(store, theirs.id, attachment_id=aid)
+    theirs_key = f"threads/{theirs.id}/{aid}"
+    assert store.tombstone(attachment_id=aid, thread_id=theirs.id) == theirs_key
+
+    my_key = f"threads/{mine.id}/{aid}"
+    with psycopg.connect(os.environ[POSTGRES_URL_ENV]) as conn:
+        conn.execute(
+            "INSERT INTO fin_thread_attachment (attachment_id, thread_id, "
+            "filename, size_bytes, sha256, object_key, status) "
+            "VALUES (%s, %s, 'notes.txt', 1024, 'ab', %s, 'uploaded')",
+            (aid, mine.id, my_key),
+        )
+        conn.commit()
+
+    assert store.delete_for_thread(mine.id) == [my_key]
+    assert store.get(aid) is None
+    assert store.pending_cleanup(mine.id) == []
+
+    # The other thread's debt is untouched: one record, one debt, retryable.
+    assert store.pending_cleanup(theirs.id) == [theirs_key]
+    assert store.tombstone(attachment_id=aid, thread_id=theirs.id) == theirs_key
 
 
 def test_postgres_round_trip_uploaded_to_ready(pg: tuple[Any, Any]) -> None:
@@ -818,3 +1236,82 @@ def test_postgres_incomplete_does_not_list_uploaded_rows(pg: tuple[Any, Any]) ->
     _pg_create(store, thread.id, attachment_id=f"pg-{uuid.uuid4().hex[:8]}")
 
     assert store.incomplete() == []
+
+
+def test_postgres_tombstone_voids_access_and_returns_the_byte_obligation(
+    pg: tuple[Any, Any],
+) -> None:
+    threads, store = pg
+    thread = threads.create_thread(title="pg tombstone")
+    aid = f"pg-{uuid.uuid4().hex[:8]}"
+    _pg_create(store, thread.id, attachment_id=aid)
+    store.record_units(attachment_id=aid, version=1, units=UNITS)
+    store.put_index(attachment_id=aid, version=1, postings=POSTINGS)
+    store.mark_ready(attachment_id=aid, version=1, unit_count=2)
+
+    assert store.tombstone(attachment_id=aid, thread_id=thread.id) == (
+        f"threads/{thread.id}/{aid}"
+    )
+
+    assert store.get(aid) is None
+    assert store.list_for_thread(thread.id) == []
+    assert store.units(aid, 1) == ()
+    assert store.index_postings(aid, 1) == {}
+    assert store.indexed_versions(aid) == ()
+    assert store.incomplete() == []
+    with pytest.raises(AttachmentThreadGoneError):
+        store.record_units(attachment_id=aid, version=1, units=UNITS)
+    with pytest.raises(AttachmentThreadGoneError):
+        store.put_index(attachment_id=aid, version=1, postings=POSTINGS)
+    with pytest.raises(AttachmentThreadGoneError):
+        store.mark_ready(attachment_id=aid, version=1, unit_count=2)
+
+
+def test_postgres_tombstone_obligation_survives_a_new_store_instance(
+    pg: tuple[Any, Any], postgres_store_url: str
+) -> None:
+    """A restart reaches the same pending cleanup and can finish it."""
+    from fin.host.attachment_store import PostgresAttachmentStore
+
+    threads, store = pg
+    thread = threads.create_thread(title="pg tombstone restart")
+    aid = f"pg-{uuid.uuid4().hex[:8]}"
+    _pg_create(store, thread.id, attachment_id=aid)
+    key = store.tombstone(attachment_id=aid, thread_id=thread.id)
+
+    reopened = PostgresAttachmentStore(postgres_store_url)
+
+    assert reopened.pending_cleanup(thread.id) == [key]
+    assert reopened.tombstone(attachment_id=aid, thread_id=thread.id) == key
+    assert reopened.incomplete() == []
+
+    reopened.confirm_cleanup(attachment_id=aid)
+
+    assert reopened.pending_cleanup(thread.id) == []
+    assert reopened.tombstone(attachment_id=aid, thread_id=thread.id) is None
+
+
+def test_postgres_thread_delete_cascades_the_cleanup_obligation(
+    pg: tuple[Any, Any],
+) -> None:
+    """The schema-level half of the retirement the doors express.
+
+    ``fin_thread_attachment_tombstone.thread_id`` is the foreign key that
+    retires an unpaid cleanup when its thread row goes, so a deleted thread
+    keeps no debt no door can finish. The parameterized pair pins the same
+    answer through the doors; this pins the constraint that makes it hold for a
+    row no door will ever be called on again.
+    """
+    threads, store = pg
+    thread = threads.create_thread(title="pg cascade debt")
+    aid = f"pg-{uuid.uuid4().hex[:8]}"
+    _pg_create(store, thread.id, attachment_id=aid)
+
+    assert store.tombstone(attachment_id=aid, thread_id=thread.id) is not None
+    assert store.pending_cleanup(thread.id) == [f"threads/{thread.id}/{aid}"]
+
+    assert threads.delete_thread(thread.id) is True
+
+    assert store.pending_cleanup(thread.id) == []
+    assert _retained_obligations("postgres", store, thread.id) == 0
+    assert store.tombstone(attachment_id=aid, thread_id=thread.id) is None

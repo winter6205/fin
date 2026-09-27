@@ -623,6 +623,41 @@ def _attachment_wire_record(record: AttachmentRecord) -> dict[str, Any]:
     }
 
 
+# A locator is one opaque path segment: bounded, and free of the whitespace
+# and control characters a client can only have produced by accident. The
+# bound is generous next to a uuid, tight enough that a garbage path cannot
+# reach a database query carrying megabytes it will never match.
+_MAX_LOCATOR_CHARS: Final[int] = 512
+_LOCATOR_SHAPE_RE: Final[re.Pattern[str]] = re.compile(r"[\s\x00-\x1f\x7f]")
+
+
+def _locator_is_wellformed(value: str) -> bool:
+    """Whether a path segment can name an attachment at all."""
+    return (
+        bool(value.strip())
+        and len(value) <= _MAX_LOCATOR_CHARS
+        and _LOCATOR_SHAPE_RE.search(value) is None
+    )
+
+
+def _locator_refusal(*locators: str) -> JSONResponse | None:
+    """The refusal every ``{attachment_id}`` door shares for a bad identity.
+
+    A malformed path identity is a client mistake, not an identity miss, so
+    every door judges it the same way and before any lookup or write: 400
+    ``invalid_locator``, never a query the durable store can never match.
+    ``None`` means the segments are well formed and the door may continue.
+    """
+    if all(_locator_is_wellformed(locator) for locator in locators):
+        return None
+    return JSONResponse(status_code=400, content={"error": "invalid_locator"})
+
+
+def _attachment_delete_path(thread_id: str, attachment_id: str) -> str:
+    """The one URL of a single attachment's delete door."""
+    return f"/api/threads/{thread_id}/attachments/{attachment_id}"
+
+
 # ----- request / response schemas -----
 
 
@@ -2145,6 +2180,17 @@ def _build_default_attachment_service() -> AttachmentPreparationService:
     says so — the same logged degradation the unconfigured checkpointer
     uses — because attachment rows outlive the blobs then, and recovery
     reports them as ``source_unavailable`` rather than as empty text.
+
+    This root wires no page lane: it passes no page budget and no
+    extraction ports, so a document whose name declares the multi-page lane
+    (``.pdf``) is stored and answered with the failed reason
+    :data:`~fin.host.attachment_prepare.ATTACHMENT_PAGE_LANE_UNWIRED` on the
+    same ladder as any document this service cannot read, while a standalone
+    image (``.png`` / ``.jpg`` / ``.jpeg``) is answered by this door's own
+    content judgement — ``attachment_not_text`` for bytes that do not decode
+    as UTF-8. Wiring the lane is a deployment decision about per-document
+    container renders and per-run vision pricing, and neither is settled
+    here; until it is, no attachment door raises past its own typed answers.
     """
     import os
 
@@ -2370,7 +2416,8 @@ def build_router(
             return JSONResponse(
                 status_code=404, content={"error": "thread_not_found"}
             )
-        # Attachment data goes first. An attachment that outlives its
+        # The thread's attachments are voided first, and their bytes are
+        # removed only behind that tombstone. An attachment that outlived its
         # thread would keep searchable text a deleted research thread owned,
         # so a cleanup failure stops the delete here — named, logged, and
         # retryable — instead of acknowledging a thread whose bytes remain.
@@ -3031,8 +3078,15 @@ def build_router(
         """Status of one attachment on a later turn.
 
         An unknown id and another thread's id share ``attachment_not_found``
-        so this read cannot probe what a different thread holds.
+        so this read cannot probe what a different thread holds. A malformed
+        path identity is refused earlier and separately, as the delete door
+        does, so garbage text never reaches the store as a query:
+
+        * malformed path identity  -> 400 ``invalid_locator``
         """
+        refusal = _locator_refusal(thread_id, attachment_id)
+        if refusal is not None:
+            return refusal
         if store.get_thread(thread_id) is None:
             return JSONResponse(
                 status_code=404, content={"error": "thread_not_found"}
@@ -3053,7 +3107,21 @@ def build_router(
             get_attachment_service
         ),
     ) -> dict:
-        """Re-drive a failed attachment; success makes it ``ready``."""
+        """Re-drive a failed attachment; success makes it ``ready``.
+
+        Retry writes state, so a malformed path identity is refused before any
+        lookup or preparation, exactly as the delete door refuses it:
+
+        * malformed path identity  -> 400 ``invalid_locator``
+
+        A document this deployment cannot read is a 200 carrying its failed
+        reason, never a 500: the preparation service owns the whole refusal
+        ladder, including a page document arriving at a deployment with no
+        page lane.
+        """
+        refusal = _locator_refusal(thread_id, attachment_id)
+        if refusal is not None:
+            return refusal
         if store.get_thread(thread_id) is None:
             return JSONResponse(
                 status_code=404, content={"error": "thread_not_found"}
@@ -3079,6 +3147,76 @@ def build_router(
             return JSONResponse(
                 status_code=500, content={"error": "attachment_store_failed"}
             )
+
+    @router.delete("/threads/{thread_id}/attachments/{attachment_id}")
+    def delete_thread_attachment(
+        thread_id: str,
+        attachment_id: str,
+        store: ThreadStore = Depends(get_thread_store),
+        attachments: AttachmentPreparationService = Depends(
+            get_attachment_service
+        ),
+    ) -> dict:
+        """Remove one attachment through the door that voids it first.
+
+        :meth:`AttachmentPreparationService.delete_attachment` owns why the
+        order is the guarantee; this door owns the named answers:
+
+        * malformed path identity  -> 400 ``invalid_locator``
+        * unknown thread           -> 404 ``thread_not_found``
+        * unknown, other thread's,
+          or already-deleted id    -> 400 ``unknown_locator``
+        * bytes not removable      -> 500 ``attachment_cleanup_failed``
+          (logged with the owed key; tombstone and obligation retained)
+        * the durable store refuses
+          the void                 -> 500 ``attachment_store_failed``
+
+        A DELETE carries no input but these two path identities, so a request
+        body — well formed or not — is ignored rather than parsed.
+        """
+        refusal = _locator_refusal(thread_id, attachment_id)
+        if refusal is not None:
+            return refusal
+        if store.get_thread(thread_id) is None:
+            return JSONResponse(
+                status_code=404, content={"error": "thread_not_found"}
+            )
+        try:
+            attachments.delete_attachment(
+                thread_id=thread_id, attachment_id=attachment_id
+            )
+        except (AttachmentNotFoundError, AttachmentThreadGoneError) as exc:
+            # EXIT: a missing thread took its attachments with it, which is
+            # the same answer as an id that never existed — and the same one
+            # another thread's id gets, so this door cannot be used to probe
+            # who holds a given attachment.
+            logger.info(
+                "delete_thread_attachment: nothing to void: %s", exc
+            )
+            return JSONResponse(
+                status_code=400, content={"error": "unknown_locator"}
+            )
+        except AttachmentCleanupError:
+            logger.exception(
+                "delete_thread_attachment: cleanup failed for thread_id=%s "
+                "attachment_id=%s",
+                thread_id,
+                attachment_id,
+            )
+            return JSONResponse(
+                status_code=500, content={"error": "attachment_cleanup_failed"}
+            )
+        except AttachmentStoreError:
+            logger.exception(
+                "delete_thread_attachment: state write failed for "
+                "thread_id=%s attachment_id=%s",
+                thread_id,
+                attachment_id,
+            )
+            return JSONResponse(
+                status_code=500, content={"error": "attachment_store_failed"}
+            )
+        return {"ok": True, "attachment_id": attachment_id}
 
     @router.post("/threads/{thread_id}/resume")
     def resume_thread(

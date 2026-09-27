@@ -164,12 +164,14 @@ def test_ocr_engine_protocol_is_structural() -> None:
 
 def test_detect_ocr_required_short_text_with_images() -> None:
     """Empty/short text + images present => OCR required."""
-    assert detect_ocr_required(text="", image_count=3) is True
+    assert detect_ocr_required(text="", image_count=3, min_text_chars=100) is True
 
 
 def test_detect_ocr_required_long_text_no_ocr() -> None:
     """Long text-layer extraction suppresses the OCR requirement."""
-    assert detect_ocr_required(text="x" * 200, image_count=3) is False
+    assert detect_ocr_required(
+        text="x" * 200, image_count=3, min_text_chars=100
+    ) is False
 
 
 def test_detect_ocr_required_no_images_no_ocr() -> None:
@@ -178,13 +180,27 @@ def test_detect_ocr_required_no_images_no_ocr() -> None:
     A pure blank-text page with no embedded image is the operator's
     problem (e.g., an empty cover sheet), not an OCR target.
     """
-    assert detect_ocr_required(text="", image_count=0) is False
+    assert detect_ocr_required(text="", image_count=0, min_text_chars=100) is False
 
 
 def test_detect_ocr_required_short_text_no_images() -> None:
-    """The default ``min_text_chars`` is 100; boundary check."""
-    assert detect_ocr_required(text="x" * 99, image_count=0) is False
-    assert detect_ocr_required(text="x" * 100, image_count=0) is False
+    """Both terms must hold: a short text layer alone is not enough."""
+    assert detect_ocr_required(
+        text="x" * 99, image_count=0, min_text_chars=100
+    ) is False
+    assert detect_ocr_required(
+        text="x" * 100, image_count=0, min_text_chars=100
+    ) is False
+
+
+def test_detect_ocr_required_boundary_at_the_named_threshold() -> None:
+    """The boundary is exclusive: under the threshold fires, at it does not."""
+    assert detect_ocr_required(
+        text="x" * 99, image_count=1, min_text_chars=100
+    ) is True
+    assert detect_ocr_required(
+        text="x" * 100, image_count=1, min_text_chars=100
+    ) is False
 
 
 def test_detect_ocr_required_custom_min_text_chars() -> None:
@@ -195,6 +211,22 @@ def test_detect_ocr_required_custom_min_text_chars() -> None:
     assert detect_ocr_required(
         text="x" * 50, image_count=1, min_text_chars=60
     ) is True
+
+
+def test_detect_ocr_required_threshold_has_no_default() -> None:
+    """A caller that does not name the threshold is refused, not defaulted.
+
+    The lanes price this number differently (a paragraph for the page rule,
+    "no text layer at all" for the scanned-page rule), so a default here
+    would be a second home for a threshold the caller already owns — and it
+    would be the quieter of the two when they disagreed.
+    """
+    with pytest.raises(TypeError):
+        detect_ocr_required(text="", image_count=1)
+    signature = inspect.signature(detect_ocr_required)
+    parameter = signature.parameters["min_text_chars"]
+    assert parameter.default is inspect.Parameter.empty
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
 
 
 # ---------- mock engine ----------

@@ -805,13 +805,13 @@ def test_deployed_upload_cap_admits_the_measured_corpus() -> None:
 
 
 def test_gold_manifest_describes_the_committed_fixtures() -> None:
-    """The three gold cases the caps must fit are the bytes on disk.
+    """The four gold cases the caps must fit are the bytes on disk.
 
     The manifest is also the file that states each case's page count, which is
     what the single-run preflight below charges against the vision budget.
     """
     cases = json.loads(GOLD_MANIFEST_PATH.read_text())["cases"]
-    assert len(cases) == 3
+    assert len(cases) == 4
     for case in cases:
         _assert_describes_committed_bytes(
             PROJECT_ROOT / case["path"], case["bytes"], case["sha256"]
@@ -872,7 +872,7 @@ def test_deployed_bounds_admit_every_file_in_the_measured_distribution() -> None
 
 
 def test_deployed_bounds_prepare_every_gold_case_in_one_run() -> None:
-    """All three committed gold cases fit one preflight, pages plus crops.
+    """All four committed gold cases fit one preflight, pages plus crops.
 
     This is the acceptance clause "every gold file fits" checked through the
     same door preparation uses, so a cap that fits each file alone but not the

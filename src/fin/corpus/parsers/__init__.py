@@ -70,15 +70,34 @@ from fin.corpus.parsers._common import (
     FAMILY_ZIP,
     PARAMS_TABLE_VERSION,
     PARSE_RULE_VERSION,
+    PDF_MAGIC,
     SUPPORTED_FORMATS,
     ParseResult,
     ParsedUnit,
     UnitLocator,
     content_family,
+    has_pdf_signature,
 )
 from fin.corpus.parsers._docx import parse_docx
 from fin.corpus.parsers._html import parse_html
 from fin.corpus.parsers._markdown import parse_markdown
+from fin.corpus.parsers._pages import (
+    MIN_OCR_REGION_EDGE_PX,
+    PAGE_RENDER_DPI,
+    REGION_KINDS,
+    NullLayout,
+    PageLayoutPort,
+    PageParseResult,
+    PageRaster,
+    PageRegionParser,
+    PageRenderPort,
+    PageSourcePort,
+    ParsedPage,
+    PdfplumberPageSource,
+    Pypdfium2PageRenderer,
+    RasterOcrPort,
+    Region,
+)
 from fin.corpus.parsers._pdf import parse_pdf
 from fin.corpus.parsers._pptx import parse_pptx
 from fin.corpus.parsers._text import parse_plain_text
@@ -225,11 +244,28 @@ def parse_document(
 
 
 __all__ = [
+    "MIN_OCR_REGION_EDGE_PX",
+    "PAGE_RENDER_DPI",
     "PARAMS_TABLE_VERSION",
     "PARSE_RULE_VERSION",
+    "PDF_MAGIC",
+    "REGION_KINDS",
     "SUPPORTED_FORMATS",
+    "NullLayout",
+    "PageLayoutPort",
+    "PageParseResult",
+    "PageRaster",
+    "PageRegionParser",
+    "PageRenderPort",
+    "PageSourcePort",
     "ParseResult",
+    "ParsedPage",
     "ParsedUnit",
+    "PdfplumberPageSource",
+    "Pypdfium2PageRenderer",
+    "RasterOcrPort",
+    "Region",
     "UnitLocator",
+    "has_pdf_signature",
     "parse_document",
 ]

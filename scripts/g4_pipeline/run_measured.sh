@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# T2a measured run: execute driver.py in the pinned image UNDER the hard 4 GiB
+# Measured run: execute driver.py in the pinned image UNDER the hard 4 GiB
 # ceiling and tee the machine-readable result into results/.
 #
 # The ceiling is literal and load-bearing:
 #     docker run --memory=4g --memory-swap=4g --cpus=4
 # It is never raised, and the driver is never run on the host as a substitute,
-# because a pass outside the ceiling is not the 4 GB measurement the ticket
-# asks for. If a step fails under the ceiling, that failure IS the result and
+# because a pass outside the ceiling is not the measurement this harness exists
+# to take. If a step fails under the ceiling, that failure IS the result and
 # is recorded verbatim.
 #
 # Usage:
@@ -54,7 +54,38 @@ BASE="$(basename "${PDF_HOST}" .pdf)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_DIR="${RESULTS}/${BASE}_${STAMP}"
 CTR="fin-g4-t2a-${BASE}-$$"
+CTR_REAPED=0
 mkdir -p "${RUN_DIR}/pages" "${MODEL_CACHE}/hf" "${MODEL_CACHE}/torch" "${RESULTS}"
+
+# A container outlives the client that started it: a caller that caps this
+# script's wall clock kills the shell, and a shell dying between `docker run`
+# and the linear reap below leaves the run holding its full 4 GiB and 4 CPU
+# ceiling. Reap by name on every exit path, once.
+#
+# The linear call and the trapped call are different functions on purpose: the
+# script keeps working after the first, while the second must leave with the
+# status the caller parses. A trap that let the shell fall through to exit 0
+# would turn a failed measurement into a pass, so the status is captured before
+# anything can overwrite it and re-raised verbatim.
+reap_container() {
+    if [[ "${CTR_REAPED}" != "1" ]]; then
+        CTR_REAPED=1
+        docker rm -f "${CTR}" >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+reap_and_leave() {
+    local status="${?}"
+    trap - EXIT INT TERM
+    reap_container
+    exit "${status}"
+}
+
+# A trapped signal is deferred until the foreground child returns, so the run is
+# started as a job and waited: without that, a TERM arriving mid-run could only
+# be answered after the run it is trying to stop.
+trap reap_and_leave EXIT INT TERM
 
 # Single schema for both the measured and the failed record: values the harness
 # never read are emitted as JSON null by the serializer, never as "" or "false",
@@ -222,9 +253,22 @@ echo "[run] verbatim command:"
 printf '  %q' "${DOCKER_CMD[@]}"
 printf '\n\n'
 
-# Foreground run; stdout is the single JSON line, stderr the human log.
+# The trap cannot answer SIGKILL to this shell (proved: kill -9 leaves the
+# container up, and the fixed ${CTR} name then blocks every later run), so
+# sweep the name before launching: pre-launch reap plus the trap cover both
+# paths.
+docker rm -f "${CTR}" >/dev/null 2>&1 || true
+
+# stdout is the single JSON line, stderr the human log.
+# The CLI is started as a job and waited on rather than run inline: bash defers
+# an INT/TERM trap until a foreground child returns, so a caller that signals
+# during the run would otherwise never reach the reap. `wait` answers with the
+# job's own status, so RUN_EXIT keeps the value the caller parses on both the
+# clean and the failing path.
 RUN_EXIT=0
-"${DOCKER_CMD[@]}" >"${RUN_DIR}/stdout.jsonl" 2>"${RUN_DIR}/stderr.log" || RUN_EXIT=$?
+"${DOCKER_CMD[@]}" >"${RUN_DIR}/stdout.jsonl" 2>"${RUN_DIR}/stderr.log" &
+RUN_PID="$!"
+wait "${RUN_PID}" || RUN_EXIT="${?}"
 cat "${RUN_DIR}/stderr.log"
 
 CID="$(docker inspect --format '{{.Id}}' "${CTR}" 2>/dev/null || true)"
@@ -261,7 +305,7 @@ if [[ -n "${CID}" ]]; then
         fi
     done
 fi
-docker rm -f "${CTR}" >/dev/null 2>&1 || true
+reap_container
 
 grep -E '^\{"schema":"fin\.g4' "${RUN_DIR}/stdout.jsonl" >"${RUN_DIR}/${BASE}.raw.jsonl" || true
 N="$(wc -l <"${RUN_DIR}/${BASE}.raw.jsonl")"

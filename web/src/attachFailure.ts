@@ -35,51 +35,50 @@ function genericCopy(error: unknown): string {
   return `附件没有上传${detail ? `（${detail}）` : ""}。请重试。`;
 }
 
+/** The host's named attach-door codes and the one sentence each deserves.
+ * A code this table does not know still renders generic retry copy, so a
+ * newer host can never produce a blank notice. */
+const FAILURE_COPY: Readonly<Record<string, string>> = {
+  thread_not_found: "这个对话不存在或已被删除，附件没有上传。",
+  empty_attachment: "这份文件是空的，没有上传。",
+  attachment_too_large:
+    "这份文件超过附件大小上限，没有上传。大文件请在入库流程里处理。",
+  // The upload door no longer rejects non-text bytes, so this code can only
+  // come from preparation. Kept mapped so an older host's upload-time 400
+  // still renders — as a stored file whose content cannot be parsed here,
+  // never as "not uploaded".
+  attachment_not_text: "这份文件已收下，但它的内容在这里解析不了，无法引用。",
+  // Decided before the run: an upload is still writing its bytes.
+  attachment_upload_in_progress: ATTACHMENT_UPLOAD_IN_PROGRESS_COPY,
+  attachment_store_failed: "附件保存失败，请重试。",
+  // The id is gone or was never this thread's. Three doors answer it:
+  // a send that cites a dead id is refused before the run, and the read /
+  // retry doors miss the same way. Only the upload door can never hit it —
+  // it mints the id itself — so this is never a re-upload of the same file.
+  attachment_not_found: "这个附件已经不在此对话中，无法继续引用。",
+  // A send refused because it referenced a still-parsing attachment
+  // (ADR 0086): the question is retryable once the chip turns ready.
+  attachment_not_ready: "引用的附件还在解析中，本轮没有发问，等它就绪后再试。",
+  // The delete door's miss: the id is not this thread's, or its deletion
+  // already finished. ``attachment_not_found`` above tells the operator to
+  // stop citing this one; here there is simply nothing left to delete, and no
+  // retry would change that.
+  unknown_locator: "本对话里没有这个附件，删除没有可执行的内容。",
+  // Malformed path identity: the status, retry and delete doors all refuse it
+  // before any state was read, so nothing ran and the file the operator meant
+  // is untouched.
+  invalid_locator: "附件标识不合法，这次操作没有执行，文件还在本对话里。",
+  // The tombstone landed and the raw bytes are still owed. Access is already
+  // gone, so the attachment cannot be cited again; only the same delete,
+  // retried, closes the obligation.
+  attachment_cleanup_failed:
+    "这个附件已经不可引用，但它的原始文件还没有删干净，请稍后重试删除。",
+};
+
 /** Never returns empty copy — a failed attach must be visible. */
 export function describeAttachFailure(error: unknown): AttachFailureNotice {
   const kind = error instanceof AttachFailedError ? error.code : "unknown";
-  let message: string;
-  switch (kind) {
-    case "thread_not_found":
-      message = "这个对话不存在或已被删除，附件没有上传。";
-      break;
-    case "empty_attachment":
-      message = "这份文件是空的，没有上传。";
-      break;
-    case "attachment_too_large":
-      message =
-        "这份文件超过附件大小上限，没有上传。大文件请在入库流程里处理。";
-      break;
-    case "attachment_not_text":
-      // The upload door no longer rejects non-text bytes, so this code
-      // can only come from preparation. Kept mapped so an older host's
-      // upload-time 400 still renders — as a stored file whose content
-      // cannot be parsed here, never as "not uploaded".
-      message = "这份文件已收下，但它的内容在这里解析不了，无法引用。";
-      break;
-    case "attachment_upload_in_progress":
-      // Decided before the run: an upload is still writing its bytes.
-      message = ATTACHMENT_UPLOAD_IN_PROGRESS_COPY;
-      break;
-    case "attachment_store_failed":
-      message = "附件保存失败，请重试。";
-      break;
-    case "attachment_not_found":
-      // The id is gone (thread deleted / rebuilt): only the retry /
-      // read door can hit this, never a re-upload of the same file.
-      message = "这个附件已经不在此对话中，无法继续引用。";
-      break;
-    case "attachment_not_ready":
-      // A send refused because it referenced a still-parsing
-      // attachment (ADR 0086): the question is retryable once the
-      // chip turns ready.
-      message = "引用的附件还在解析中，本轮没有发问，等它就绪后再试。";
-      break;
-    default:
-      message = genericCopy(error);
-      break;
-  }
-  return { kind, message };
+  return { kind, message: FAILURE_COPY[kind] ?? genericCopy(error) };
 }
 
 // ----- ADR 0089: the readiness chip -----

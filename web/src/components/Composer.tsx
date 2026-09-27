@@ -7,7 +7,9 @@
 // the file to POST /threads/{id}/attachments. Attachments persist for
 // the WHOLE thread (no longer one-use): each send names the READY ones
 // through ``attachmentsForSend``, and whatever that rule leaves out is
-// named on screen instead of vanishing. This door never touches
+// named on screen instead of vanishing. Each chip also carries a ``×``
+// that deletes just that attachment, so "persist for the thread" never
+// becomes "the operator cannot take it back". This door never touches
 // /api/corpus/ingest.
 
 import { useEffect, useRef, useState } from "react";
@@ -21,6 +23,7 @@ import {
 import { AttachFailedError } from "../api";
 import { describeSendFailure, type SendFailureNotice } from "../sendFailure";
 import { attachmentsForSend, hasUploadInFlight, useWorkspaceStore } from "../store";
+import type { ThreadAttachment } from "../types";
 
 interface ComposerProps {
   threadId: string;
@@ -43,6 +46,172 @@ function sendGate(busy: boolean, uploadInFlight: boolean) {
 // tests the same value rather than trusting the picker's.
 function attachHeldWhile(busy: boolean, uploadInFlight: boolean) {
   return busy || uploadInFlight;
+}
+
+interface FailureNoticeProps {
+  testId: string;
+  dismissLabel: string;
+  notice: { kind: string; message: string } | null;
+  /** Names the row the refusal is about, for a per-attachment door. */
+  subject?: string;
+  onDismiss: () => void;
+}
+
+/** One named refusal, rendered until the operator dismisses it. Each door
+ * gets its own instance so a delete refusal can never overwrite an upload
+ * one, and the wire ``kind`` stays on screen as the state that was named. */
+function FailureNotice({
+  testId,
+  dismissLabel,
+  notice,
+  subject,
+  onDismiss,
+}: FailureNoticeProps) {
+  if (!notice) return null;
+  return (
+    <div
+      role="alert"
+      data-testid={testId}
+      data-failure-kind={notice.kind}
+      className="mb-2 flex items-start justify-between gap-3 border border-black bg-tool px-2 py-1.5 text-sm text-gray-800"
+    >
+      <span>{subject ? `${subject}：${notice.message}` : notice.message}</span>
+      <button
+        type="button"
+        aria-label={dismissLabel}
+        onClick={onDismiss}
+        className="shrink-0 text-xs text-gray-500 hover:text-black"
+      >
+        ✕
+      </button>
+    </div>
+  );
+}
+
+interface AttachmentChipProps {
+  attachment: ThreadAttachment;
+  door: AttachmentChipDoor;
+}
+
+/**
+ * Everything one chip's controls need to reach the workspace: the thread the
+ * row lives in, the store's single-attachment delete action, and where the
+ * outcome lands. Named rather than inlined so the ``×``'s own wiring is one
+ * unit the shipped control calls, and a refusal can never be re-labelled as
+ * the upload door's.
+ */
+export interface AttachmentChipDoor {
+  threadId: string;
+  deleteAttachment: (threadId: string, attachmentId: string) => Promise<void>;
+  /** The host confirmed the delete, so any earlier refusal on this door is
+   * stale and stops being shown. */
+  onDeleted: () => void;
+  /** The host refused. The notice names the row it is about, because a
+   * declined delete is a fact about THIS attachment. */
+  onRefused: (notice: AttachFailureNotice & { filename: string }) => void;
+  onRetry: (attachmentId: string) => void;
+}
+
+/**
+ * The ``×`` on one chip: delete exactly that attachment and nothing else.
+ * A refusal is reported, never swallowed — the row stays visible so a
+ * cleanup that is still owed cannot read as a completed deletion.
+ */
+export async function deleteChipAttachment(
+  door: AttachmentChipDoor,
+  attachmentId: string,
+  filename: string,
+): Promise<void> {
+  try {
+    await door.deleteAttachment(door.threadId, attachmentId);
+    door.onDeleted();
+  } catch (error) {
+    door.onRefused({ ...describeAttachFailure(error), filename });
+  }
+}
+
+/** One thread attachment: its readiness label, the retry its failed state
+ * offers, and the ``×`` that deletes just this attachment. Both controls
+ * carry the attachment id so a click can only ever name its own row. */
+function AttachmentChip({ attachment, door }: AttachmentChipProps) {
+  const id = attachment.attachment_id;
+  return (
+    <li
+      data-attachment-status={attachment.status}
+      className="flex items-center gap-1 border border-black bg-tool px-2 py-0.5 text-xs"
+    >
+      <span className="font-mono">{attachment.filename}</span>
+      <span data-testid={`attachment-status-${id}`} className="text-gray-600">
+        {describeAttachmentStatus(attachment)}
+      </span>
+      {attachment.status === "failed" ? (
+        <button
+          type="button"
+          data-testid={`attachment-retry-${id}`}
+          aria-label={`重试解析附件 ${attachment.filename}`}
+          onClick={() => door.onRetry(id)}
+          className="border border-black bg-card px-1 text-gray-700 hover:bg-tool"
+        >
+          重试
+        </button>
+      ) : null}
+      <button
+        type="button"
+        data-testid={`attachment-delete-${id}`}
+        aria-label={`删除附件 ${attachment.filename}`}
+        title="从本对话删除这个附件"
+        onClick={() => void deleteChipAttachment(door, id, attachment.filename)}
+        className="shrink-0 px-1 text-gray-600 hover:text-black"
+      >
+        ×
+      </button>
+    </li>
+  );
+}
+
+/**
+ * The thread's chip list: one row per stored attachment, each row's controls
+ * naming its own identity. Rendered as a named unit so the row wiring has one
+ * source the composer and the tests both read.
+ */
+export function AttachmentChipList({
+  attachments,
+  door,
+}: {
+  attachments: ThreadAttachment[];
+  door: AttachmentChipDoor;
+}) {
+  if (attachments.length === 0) return null;
+  return (
+    <ul data-testid="thread-attachments" className="mb-2 flex flex-wrap gap-1">
+      {attachments.map((a) => (
+        <AttachmentChip key={a.attachment_id} attachment={a} door={door} />
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * The delete door's own refusal slot: the named state the host answered and
+ * the row it is about. It never shares a slot with an upload refusal, because
+ * the two ask the operator for opposite next moves.
+ */
+export function AttachmentDeleteNotice({
+  failure,
+  onDismiss,
+}: {
+  failure: (AttachFailureNotice & { filename: string }) | null;
+  onDismiss: () => void;
+}) {
+  return (
+    <FailureNotice
+      testId="attachment-delete-failure"
+      dismissLabel="关闭附件删除提示"
+      notice={failure}
+      subject={failure?.filename}
+      onDismiss={onDismiss}
+    />
+  );
 }
 
 export default function Composer({ threadId }: ComposerProps) {
@@ -100,6 +269,7 @@ export default function Composer({ threadId }: ComposerProps) {
   const attachFile = useWorkspaceStore((s) => s.attachFile);
   const loadAttachments = useWorkspaceStore((s) => s.loadAttachments);
   const retryAttachment = useWorkspaceStore((s) => s.retryAttachment);
+  const deleteAttachment = useWorkspaceStore((s) => s.deleteAttachment);
   const attachments = useWorkspaceStore((s) => s.attachments);
   // Derived, never stored: the chips the reference rule leaves out are on
   // screen the same moment they stop being left out.
@@ -107,6 +277,11 @@ export default function Composer({ threadId }: ComposerProps) {
   const [attachBusy, setAttachBusy] = useState(false);
   const [attachFailure, setAttachFailure] =
     useState<AttachFailureNotice | null>(null);
+  // Its own slot, not ``attachFailure``: an upload refusal and a delete
+  // refusal ask for opposite next moves, so the two must never overwrite
+  // each other on screen.
+  const [deleteFailure, setDeleteFailure] =
+    useState<(AttachFailureNotice & { filename: string }) | null>(null);
   const [dragOver, setDragOver] = useState(false);
   // One predicate for both doors, so the picker can never be enabled while
   // `attach()` would bail.
@@ -136,6 +311,16 @@ export default function Composer({ threadId }: ComposerProps) {
     } catch (error) {
       setAttachFailure(describeAttachFailure(error));
     }
+  };
+
+  // The one door every chip's ``×`` calls: this thread, the store's
+  // single-attachment delete, and the delete slot's own notice state.
+  const chipDoor: AttachmentChipDoor = {
+    threadId,
+    deleteAttachment,
+    onDeleted: () => setDeleteFailure(null),
+    onRefused: setDeleteFailure,
+    onRetry: (attachmentId) => void retry(attachmentId),
   };
 
   const toggleThinking = () => {
@@ -200,75 +385,23 @@ export default function Composer({ threadId }: ComposerProps) {
         if (file) void attach(file);
       }}
     >
-      {attachFailure ? (
-        <div
-          role="alert"
-          data-testid="attach-failure"
-          data-failure-kind={attachFailure.kind}
-          className="mb-2 flex items-start justify-between gap-3 border border-black bg-tool px-2 py-1.5 text-sm text-gray-800"
-        >
-          <span>{attachFailure.message}</span>
-          <button
-            type="button"
-            aria-label="关闭附件提示"
-            onClick={() => setAttachFailure(null)}
-            className="shrink-0 text-xs text-gray-500 hover:text-black"
-          >
-            ✕
-          </button>
-        </div>
-      ) : null}
-      {failure ? (
-        <div
-          role="alert"
-          data-testid="send-failure"
-          data-failure-kind={failure.kind}
-          className="mb-2 flex items-start justify-between gap-3 border border-black bg-tool px-2 py-1.5 text-sm text-gray-800"
-        >
-          <span>{failure.message}</span>
-          <button
-            type="button"
-            aria-label="关闭提示"
-            onClick={() => setFailure(null)}
-            className="shrink-0 text-xs text-gray-500 hover:text-black"
-          >
-            ✕
-          </button>
-        </div>
-      ) : null}
-      {attachments.length > 0 ? (
-        <ul
-          data-testid="thread-attachments"
-          className="mb-2 flex flex-wrap gap-1"
-        >
-          {attachments.map((a) => (
-            <li
-              key={a.attachment_id}
-              data-attachment-status={a.status}
-              className="flex items-center gap-1 border border-black bg-tool px-2 py-0.5 text-xs"
-            >
-              <span className="font-mono">{a.filename}</span>
-              <span
-                data-testid={`attachment-status-${a.attachment_id}`}
-                className="text-gray-600"
-              >
-                {describeAttachmentStatus(a)}
-              </span>
-              {a.status === "failed" ? (
-                <button
-                  type="button"
-                  data-testid={`attachment-retry-${a.attachment_id}`}
-                  aria-label={`重试解析附件 ${a.filename}`}
-                  onClick={() => void retry(a.attachment_id)}
-                  className="border border-black bg-card px-1 text-gray-700 hover:bg-tool"
-                >
-                  重试
-                </button>
-              ) : null}
-            </li>
-          ))}
-        </ul>
-      ) : null}
+      <FailureNotice
+        testId="attach-failure"
+        dismissLabel="关闭附件提示"
+        notice={attachFailure}
+        onDismiss={() => setAttachFailure(null)}
+      />
+      <FailureNotice
+        testId="send-failure"
+        dismissLabel="关闭提示"
+        notice={failure}
+        onDismiss={() => setFailure(null)}
+      />
+      <AttachmentDeleteNotice
+        failure={deleteFailure}
+        onDismiss={() => setDeleteFailure(null)}
+      />
+      <AttachmentChipList attachments={attachments} door={chipDoor} />
       {withheld.length > 0 ? (
         <p
           data-testid="attachment-withheld"
