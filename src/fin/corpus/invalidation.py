@@ -203,6 +203,41 @@ def _index_by_scope(
     return index
 
 
+def _target_from(
+    record: PushRecord, locator: Mapping[str, Any], reason: str
+) -> InvalidationTarget:
+    """One stale block, read off the record's own locator.
+
+    Shared by both planners so the identity of a target — the T14 key plus
+    the ``{document_id, version, unit}`` triple — is spelled exactly one way.
+    """
+    return InvalidationTarget(
+        source_ref=record.source_ref,
+        content_id=record.content_id,
+        block_id=record.block_id,
+        document_id=str(locator["document_id"]),
+        version=str(locator["version"]),
+        unit=int(locator["unit"]),
+        reason=reason,
+    )
+
+
+def _sorted_targets(
+    targets: Iterable[InvalidationTarget],
+) -> tuple[InvalidationTarget, ...]:
+    """Canonical order (source ref, content id, block id), input-order free."""
+    return tuple(
+        sorted(
+            targets,
+            key=lambda target: (
+                target.source_ref,
+                target.content_id,
+                target.block_id,
+            ),
+        )
+    )
+
+
 def plan_invalidations(
     previous: Sequence[PushRecord],
     current: Sequence[PushRecord],
@@ -229,7 +264,7 @@ def plan_invalidations(
     targets: list[InvalidationTarget] = []
     for record in previous:
         scope = _unit_scope(record)
-        document_id, unit = scope
+        document_id = scope[0]
         if document_id not in current_documents:
             continue
         if record.idempotency_key in current_keys:
@@ -243,27 +278,41 @@ def plan_invalidations(
             reason = REASON_UNIT_VERSION_CHANGED
         else:
             reason = _text_change_reason(version_signal)
+        targets.append(_target_from(record, _locator_of(record), reason))
+    return _sorted_targets(targets)
+
+
+def plan_replacement_invalidations(
+    previous: Sequence[PushRecord],
+    document_id: str,
+    *,
+    version: str,
+) -> tuple[InvalidationTarget, ...]:
+    """The blocks one document pushed under a version it no longer points at.
+
+    A settled replacement moves every ``{document_id, unit}`` scope of that
+    document to a new version, so each previously pushed key is stale with
+    :data:`REASON_UNIT_VERSION_CHANGED` — the same attribution
+    :func:`plan_invalidations` gives a unit that gained a version. Records of
+    other documents and records already carrying the incoming ``version`` are
+    left alone: the first belong to their own document's lifecycle, the
+    second were not made stale by this replacement.
+
+    Unlike :func:`plan_invalidations` this plan needs no *current* record set,
+    because the incoming version has produced no blocks yet — that is exactly
+    what the accept door knows when it settles a replacement.
+    """
+    targets: list[InvalidationTarget] = []
+    for record in previous:
+        locator = _locator_of(record)
+        if str(locator["document_id"]) != document_id:
+            continue
+        if str(locator["version"]) == version:
+            continue
         targets.append(
-            InvalidationTarget(
-                source_ref=record.source_ref,
-                content_id=record.content_id,
-                block_id=record.block_id,
-                document_id=document_id,
-                version=str(_locator_of(record)["version"]),
-                unit=unit,
-                reason=reason,
-            )
+            _target_from(record, locator, REASON_UNIT_VERSION_CHANGED)
         )
-    return tuple(
-        sorted(
-            targets,
-            key=lambda target: (
-                target.source_ref,
-                target.content_id,
-                target.block_id,
-            ),
-        )
-    )
+    return _sorted_targets(targets)
 
 
 def request_key(targets: Sequence[InvalidationTarget]) -> str:
@@ -294,6 +343,7 @@ __all__ = [
     "InvalidationTarget",
     "VersionChange",
     "plan_invalidations",
+    "plan_replacement_invalidations",
     "request_key",
     "version_signal_for_product_area",
 ]

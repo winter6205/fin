@@ -13,7 +13,9 @@ from fin.corpus.ingest_state_errors import (
     AuditOverflowError,
     IllegalTransitionError,
     IngestBusyError,
+    IngestStateError,
     IngestStepError,
+    InvalidStateError,
     UnknownJobError,
 )
 
@@ -141,3 +143,104 @@ def test_failed_job_can_retry_from_fetching() -> None:
 
     store.transition("filing-1", IngestState.FETCHING)
     assert store.get_job("filing-1").state is IngestState.FETCHING
+
+
+@pytest.mark.parametrize(
+    "blank", ["", "   ", "\t"], ids=["empty", "space", "tab"]
+)
+def test_blank_document_id_is_refused_by_every_public_entry(
+    blank: str,
+) -> None:
+    """One identity rule for both stores: a non-blank document id.
+
+    The memory store used to validate only ``create_job`` and let a blank
+    id fall through to ``UnknownJobError`` elsewhere; the durable store
+    refused it by name. Both stores now raise ``ValueError`` from every
+    entry that reads a document id, so a caller never has to branch on
+    which backend answered.
+    """
+    store = InMemoryIngestStateStore()
+
+    entries = [
+        lambda: store.create_job(blank),
+        lambda: store.get_job(blank),
+        lambda: store.supersede_job(blank),
+        lambda: store.fail_step(blank, step="fetch", cause=RuntimeError("x")),
+        lambda: store.list_audit(blank),
+    ]
+    for entry in entries:
+        with pytest.raises(ValueError, match="document_id"):
+            entry()
+
+
+def test_blank_step_is_refused_before_the_job_is_read() -> None:
+    """A missing step name is a caller bug, not a missing job."""
+    store = InMemoryIngestStateStore()
+
+    with pytest.raises(ValueError, match="step"):
+        store.fail_step("filing-1", step="  ", cause=RuntimeError("x"))
+
+    assert store.list_audit() == ()
+
+
+def test_unknown_state_is_refused_before_any_job_lookup() -> None:
+    """Neither store locks or reads a job for a state that cannot exist."""
+    store = InMemoryIngestStateStore()
+    store.create_job("filing-1")
+
+    with pytest.raises(InvalidStateError):
+        store.transition("filing-1", "not-a-state")
+
+    assert store.get_job("filing-1").state is IngestState.PENDING
+    assert [row.action for row in store.list_audit("filing-1")] == [
+        "job_created"
+    ]
+
+
+def test_busy_beats_illegality_for_a_stale_expected_state() -> None:
+    """The shared guard order, identical in both stores.
+
+    A transition whose expected state has moved on is a concurrency loss
+    (busy), even when the requested target also happens to be illegal from
+    the state the job really is in; an operator reading the audit sees the
+    race, not a bogus rule violation.
+    """
+    store = InMemoryIngestStateStore()
+    store.create_job("filing-1")
+    store.transition("filing-1", IngestState.FETCHING)
+
+    with pytest.raises(IngestBusyError):
+        store.transition(
+            "filing-1",
+            IngestState.READY,
+            expected_state=IngestState.PENDING,
+        )
+
+    assert store.get_job("filing-1").state is IngestState.FETCHING
+    rejected = store.list_audit()[-1]
+    assert rejected.action == "transition_rejected"
+    assert rejected.error_type == "IngestBusyError"
+
+
+def test_rejected_fail_step_is_audited_as_a_refused_transition() -> None:
+    """A refused failure shares the one rejection audit shape (READY job)."""
+    store = InMemoryIngestStateStore()
+    store.create_job("filing-1")
+    for state in (
+        IngestState.FETCHING,
+        IngestState.EXTRACTING,
+        IngestState.CATALOGING,
+        IngestState.READY,
+    ):
+        store.transition("filing-1", state)
+
+    with pytest.raises(IngestStateError) as exc_info:
+        store.fail_step("filing-1", step="push", cause=RuntimeError("late"))
+
+    assert type(exc_info.value) is IllegalTransitionError
+    rejected = store.list_audit()[-1]
+    assert rejected.action == "transition_rejected"
+    assert rejected.from_state is IngestState.READY
+    assert rejected.to_state is IngestState.FAILED
+    assert rejected.error_type == "IllegalTransitionError"
+    assert store.get_job("filing-1").state is IngestState.READY

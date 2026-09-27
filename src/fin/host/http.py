@@ -641,6 +641,17 @@ def serve() -> None:
     """
     apply_dotenv()
     get_attachment_budgets()
+    # The corpus ingest door answers ``accepted`` only for bytes, pointers and
+    # job rows that outlive this process, so its storage is resolved here,
+    # before anything is published, compiled, or bound: a deployment that
+    # configured neither a durable store nor an explicit
+    # ``FIN_CORPUS_INGEST_STORE=memory`` is refused instead of serving a door
+    # that forgets uploads on restart.
+    # Lazy so the ingest storage modules (and their database drivers) stay
+    # off this module's import surface for tests and ``--help``.
+    from fin.corpus.ingest_storage import preflight_ingest_storage
+
+    preflight_ingest_storage()
     # T1 (workbench retrieve seam): probe the knowledge MCP with a real
     # ``initialize`` + ``tools/list`` handshake and publish 缺 / 坏 / 可达
     # into the in-process snapshot the status route and the conversation

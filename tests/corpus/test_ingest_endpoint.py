@@ -20,7 +20,10 @@ The endpoint carries two entry points — the durable accept door
   four accept-time items (raw bytes, pointer, ``pending`` job record,
   ``(document_id, version)`` identity) are all durable before an
   accept, a duplicate ``(document_id, version)`` joins the existing
-  job, a different version in flight is a typed conflict, and a failed
+  job, a different version in flight is a typed conflict, a different
+  version of a ``ready`` source is the settled replacement (the stale
+  blocks are closed, one job reopens as a fresh ``pending`` generation,
+  and one logical version remains), and a failed
   commit leaves no accepted job (with a failed compensating delete
   observable rather than swallowed);
 * ``job_status`` reports the persisted job state, never a constant.
@@ -51,7 +54,6 @@ from fin.corpus.ingest_endpoint import (
     IngestFormatUnspecifiedError,
     IngestInvalidDocTypeError,
     IngestObjectCleanupError,
-    IngestReplacementUnsupportedError,
     IngestUploadTooLargeError,
     IngestedDocument,
     resolve_document_id,
@@ -61,6 +63,7 @@ from fin.corpus.ingest_state import InMemoryIngestStateStore, IngestState
 from fin.corpus.ingest_state_errors import UnknownJobError
 from fin.corpus.metadata_store import (
     InMemoryMetadataStore,
+    MetadataPointer,
     MetadataPointerNotFoundError,
     MetadataStoreError,
 )
@@ -153,6 +156,26 @@ class _FailingPointerStore(InMemoryMetadataStore):
         raise MetadataStoreError("pointer table is unavailable")
 
 
+class _HidingPointerStore(InMemoryMetadataStore):
+    """Pointer store that can forget a document's row.
+
+    Simulates the stores disagreeing with themselves — a ``ready`` job
+    whose pointer row is gone — so the endpoint's refusal path can be
+    exercised without corrupting a real database.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hidden: set[str] = set()
+
+    def get_pointer(self, document_id: str) -> MetadataPointer:
+        if document_id in self.hidden:
+            raise MetadataPointerNotFoundError(
+                f"no pointer recorded for {document_id!r}"
+            )
+        return super().get_pointer(document_id)
+
+
 class _FailingCreateStateStore(InMemoryIngestStateStore):
     """State store that cannot record a job (state-table outage).
 
@@ -190,9 +213,13 @@ def _durable_stack(**overrides: Any) -> _DurableStack:
     pointers = overrides.pop("pointers", None) or InMemoryMetadataStore()
     states = overrides.pop("states", None) or InMemoryIngestStateStore()
     push = FakePushPort()
+    # A test can hand in its own invalidation face (``None`` for a backend
+    # with no invalidation service); the default is the same contract fake
+    # that serves push, as in one retrieval backend with both doors.
+    invalidation = overrides.pop("invalidation_port", push)
     endpoint = IngestEndpoint(
         push_port=push,
-        invalidation_port=push,
+        invalidation_port=invalidation,
         object_store=objects,
         metadata_store=pointers,
         state_store=states,
@@ -947,21 +974,149 @@ def test_a_failed_job_reenters_on_the_retry_edge() -> None:
     assert stack.states.get_job("DOC-1").state is IngestState.FETCHING
 
 
-def test_replacing_a_ready_document_is_a_typed_refusal() -> None:
-    # The state machine has no edge out of ``ready`` and no job-reset
-    # port, so replacing a ready document cannot be accepted yet: the
-    # only honest answer is a typed refusal with nothing written. When
-    # the store gains the re-queue edge this becomes an accept.
-    stack = _durable_stack()
+def test_replacing_a_ready_document_invalidates_the_stale_blocks(
+) -> None:
+    # The settled replacement: a different version of a ``ready`` source is
+    # accepted, the blocks the replaced version pushed are closed through the
+    # invalidation port, and the document's one job reopens. ``ready`` is
+    # terminal, so the reopened job is a fresh ``pending`` generation of the
+    # same document job rather than a transition out of ``ready`` — and the
+    # document is left naming exactly one logical version.
+    pushed: list[Any] = []
+    stack = _durable_stack(previous_records=lambda: pushed)
     first = _submit(stack, _V1_TEXT)
+    pushed.extend(
+        stack.endpoint.ingest(
+            _V1_TEXT, declared_format="txt", document_id="DOC-1"
+        ).records
+    )
+    assert pushed
     _advance(stack.states, "DOC-1")
 
-    with pytest.raises(IngestReplacementUnsupportedError) as excinfo:
+    second = _submit(stack, _V2_TEXT)
+
+    assert second.job_id == first.job_id
+    assert second.version == hashlib.sha256(_V2_TEXT).hexdigest()
+    assert second.state is IngestState.PENDING
+    assert stack.states.get_job("DOC-1").state is IngestState.PENDING
+    # one logical version: the durable pointer names the new bytes only
+    assert _pointer_of(stack.pointers, "DOC-1").sha256 == second.version
+    assert len(stack.objects.puts) == 2
+    # every block the replaced version pushed was closed, with the reason
+    # that attributes it to a version move
+    closed = stack.push.invalidation_records()
+    assert sorted(row["block_id"] for row in closed) == sorted(
+        record.block_id for record in pushed
+    )
+    assert {row["reason"] for row in closed} == {"unit_version_changed"}
+    # the superseded generation stays in the audit trail
+    superseded = [
+        row
+        for row in stack.states.list_audit("DOC-1")
+        if row.action == "job_superseded"
+    ]
+    assert [(row.from_state, row.to_state) for row in superseded] == [
+        (IngestState.READY, IngestState.PENDING)
+    ]
+
+
+def test_resubmitting_the_replacement_version_joins_without_a_second_reopen(
+) -> None:
+    # The replacement moves the document's pointer, so the same
+    # ``(document_id, version)`` submitted again is an idempotent join on the
+    # reopened job: no third object, no second generation, no second
+    # invalidation request.
+    pushed: list[Any] = []
+    stack = _durable_stack(previous_records=lambda: pushed)
+    first = _submit(stack, _V1_TEXT)
+    pushed.extend(
+        stack.endpoint.ingest(
+            _V1_TEXT, declared_format="txt", document_id="DOC-1"
+        ).records
+    )
+    _advance(stack.states, "DOC-1")
+    replacement = _submit(stack, _V2_TEXT)
+    closed_after_replacement = stack.push.invalidation_records()
+
+    joined = _submit(stack, _V2_TEXT)
+
+    assert joined.job_id == first.job_id == replacement.job_id
+    assert joined.version == replacement.version
+    assert joined.state is IngestState.PENDING
+    assert len(stack.objects.puts) == 2
+    assert stack.push.invalidation_records() == closed_after_replacement
+    assert len(
+        [
+            row
+            for row in stack.states.list_audit("DOC-1")
+            if row.action == "job_superseded"
+        ]
+    ) == 1
+
+
+def test_a_replacement_that_cannot_close_its_stale_blocks_is_refused() -> None:
+    # Stale blocks with no invalidation service is a typed failure, never a
+    # silent accept of a version whose predecessor is still hittable: the
+    # object written for this attempt goes away and the document keeps the
+    # version, pointer and ``ready`` job it had before.
+    pushed: list[Any] = []
+    stack = _durable_stack(
+        previous_records=lambda: pushed, invalidation_port=None
+    )
+    first = _submit(stack, _V1_TEXT)
+    pushed.extend(
+        stack.endpoint.ingest(
+            _V1_TEXT, declared_format="txt", document_id="DOC-1"
+        ).records
+    )
+    _advance(stack.states, "DOC-1")
+
+    with pytest.raises(InvalidationServiceUnavailableError):
         _submit(stack, _V2_TEXT)
 
-    assert excinfo.value.code == "replacement_unsupported"
-    assert stack.objects.puts == [f"filings/DOC-1/{first.version}"]
     assert _pointer_of(stack.pointers, "DOC-1").sha256 == first.version
+    assert stack.states.get_job("DOC-1").state is IngestState.READY
+    assert stack.objects.deletes == [stack.objects.puts[1]]
+    assert stack.push.invalidation_records() == ()
+
+
+def test_a_replacement_with_nothing_known_still_swaps_the_version() -> None:
+    # No record provider means fin cannot name what is stale — the same
+    # documented no-op the synchronous chain has, never a skipped failure.
+    # The replacement itself is still settled: new version, reopened job.
+    stack = _durable_stack()
+    _submit(stack, _V1_TEXT)
+    _advance(stack.states, "DOC-1")
+
+    second = _submit(stack, _V2_TEXT)
+
+    assert second.state is IngestState.PENDING
+    assert _pointer_of(stack.pointers, "DOC-1").sha256 == second.version
+    assert stack.states.get_job("DOC-1").state is IngestState.PENDING
+
+
+def test_a_ready_job_with_no_pointer_row_refuses_before_any_write() -> None:
+    # ``ready`` is reached only by an accept that made its pointer durable,
+    # so a ready job whose pointer row is missing is the stores disagreeing
+    # with themselves. The replacement accept refuses typed at the pointer
+    # read (stage ``pointer_read``) instead of guessing what was replaced,
+    # and the refusal lands before any write of this attempt.
+    pointers = _HidingPointerStore()
+    stack = _durable_stack(pointers=pointers)
+    _submit(stack, _V1_TEXT)
+    _advance(stack.states, "DOC-1")
+    pointers.hidden.add("DOC-1")
+    puts_before = list(stack.objects.puts)
+
+    with pytest.raises(IngestDurableCommitError) as excinfo:
+        _submit(stack, _V2_TEXT)
+
+    assert excinfo.value.code == "durable_commit_failed"
+    assert excinfo.value.stage == "pointer_read"
+    # nothing of this attempt was written and nothing was compensated away;
+    # the disagreeing stores are left exactly as the refusal found them
+    assert stack.objects.puts == puts_before
+    assert stack.objects.deletes == []
     assert stack.states.get_job("DOC-1").state is IngestState.READY
 
 

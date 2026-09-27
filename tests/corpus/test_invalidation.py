@@ -30,6 +30,7 @@ from fin.corpus.invalidation import (
     InvalidationLocatorMissingError,
     InvalidationTarget,
     plan_invalidations,
+    plan_replacement_invalidations,
     request_key,
     version_signal_for_product_area,
 )
@@ -315,3 +316,62 @@ def test_a_record_without_locator_metadata_fails_by_name() -> None:
         plan_invalidations([crippled], _records(version=VERSION_B))
 
     assert excinfo.value.code == "invalidation_locator_missing"
+
+
+# ---------------------------------------------------------------------------
+# Settled replacement: what a version move makes stale with nothing current
+# ---------------------------------------------------------------------------
+
+
+def test_a_replacement_closes_every_block_of_the_version_being_replaced() -> None:
+    previous = _records(version=VERSION_A)
+    assert len(previous) > 1
+
+    targets = plan_replacement_invalidations(
+        previous, DOCUMENT_ID, version=VERSION_B
+    )
+
+    assert {target.block_id for target in targets} == {
+        record.block_id for record in previous
+    }
+    assert {target.reason for target in targets} == {
+        REASON_UNIT_VERSION_CHANGED
+    }
+    # the target carries the version that was replaced, not the incoming one
+    assert {target.version for target in targets} == {VERSION_A}
+    assert {target.source_ref for target in targets} == {
+        record.source_ref for record in previous
+    }
+
+
+def test_a_replacement_leaves_other_documents_and_the_new_version_alone() -> None:
+    neighbour = _records(document_id="OTHER-2023Q1", version=VERSION_A)
+    replaced = _records(version=VERSION_A)
+    already_new = _records(version=VERSION_B)
+
+    targets = plan_replacement_invalidations(
+        [*neighbour, *replaced, *already_new],
+        DOCUMENT_ID,
+        version=VERSION_B,
+    )
+
+    assert {target.document_id for target in targets} == {DOCUMENT_ID}
+    assert {target.block_id for target in targets} == {
+        record.block_id for record in replaced
+    }
+
+
+def test_a_replacement_plan_is_order_independent() -> None:
+    previous = [
+        *_records(version=VERSION_A, unit=1),
+        *_records(version=VERSION_A, unit=2),
+    ]
+
+    forward = plan_replacement_invalidations(
+        previous, DOCUMENT_ID, version=VERSION_B
+    )
+    backward = plan_replacement_invalidations(
+        tuple(reversed(previous)), DOCUMENT_ID, version=VERSION_B
+    )
+
+    assert forward == backward

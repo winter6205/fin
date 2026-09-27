@@ -16,7 +16,8 @@ persisted state, never a constant. Coverage follows the boundary classes:
   cap is accepted;
 * idempotency/conflict — the same ``(document_id, version)`` joins the job with
   no second write; a different version while in flight is ``concurrent_run``;
-  replacing a ``ready`` document is the typed ``replacement_unsupported``;
+  replacing a ``ready`` document is accepted and reopens the one job as a
+  fresh ``pending`` generation naming only the new version;
 * exception class — an accept-time persistence outage is a typed 5xx with no
   accepted job; a failed compensating delete is observable;
 * status read — GET returns the real persisted state, ``unknown_job`` for an
@@ -380,9 +381,13 @@ def test_different_version_while_in_flight_is_a_typed_conflict(
     assert stack.states.get_job(doc_id).state is IngestState.PENDING
 
 
-def test_replacing_a_ready_document_is_a_typed_refusal(
+def test_replacing_a_ready_document_is_accepted_and_reopens_the_job(
     http_app: FastAPI, client: TestClient
 ) -> None:
+    # The settled replacement: a different version of a ``ready`` source is
+    # accepted, the document's one job reopens as a fresh ``pending``
+    # generation, and the status poll reports the new version — never a
+    # second logical version coexisting with the replaced one.
     stack = _install(http_app)
     accepted = _post(client)
     doc_id = accepted.json()["document_id"]
@@ -393,12 +398,20 @@ def test_replacing_a_ready_document_is_a_typed_refusal(
         IngestState.READY,
     ):
         stack.states.transition(doc_id, state)
-    before = list(stack.objects.puts)
 
     response = _post(client, data=b"a wholly new version of the ready doc\n")
-    assert response.status_code == 409
-    assert response.json()["error"] == "replacement_unsupported"
-    assert stack.objects.puts == before
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job_id"] == accepted.json()["job_id"] == doc_id
+    assert body["state"] == "pending"
+    assert body["version"] != accepted.json()["version"]
+    assert stack.states.get_job(doc_id).state is IngestState.PENDING
+    polled = client.get(f"/api/corpus/ingest/{doc_id}")
+    assert polled.status_code == 200
+    assert polled.json()["version"] == body["version"]
+    assert polled.json()["state"] == "pending"
+    assert polled.json()["text_ready"] is False
 
 
 # ----- accept-time persistence outages -----------------------------------

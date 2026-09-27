@@ -196,7 +196,6 @@ from fin.corpus.ingest_endpoint import (
     IngestFormatUnspecifiedError,
     IngestInvalidDocTypeError,
     IngestObjectCleanupError,
-    IngestReplacementUnsupportedError,
     IngestUploadTooLargeError,
 )
 from fin.corpus.ingest_state_errors import UnknownJobError
@@ -1786,7 +1785,6 @@ _INGEST_ERROR_TABLE: Final[
     # Accept-time conflict families: the upload is refused, nothing was
     # written, and the caller's next move differs (wait vs. give up).
     (IngestConcurrentRunError, 409, False),
-    (IngestReplacementUnsupportedError, 409, False),
     (ParseError, 400, False),
     (InvalidationError, 503, False),
     # A durable item could not be persisted: no job was accepted, so the
@@ -2048,42 +2046,17 @@ def _record_ingested_filing(doc: IngestedDocument) -> None:
 def _ingest_ports_from_env() -> tuple[Any, Any, Any]:
     """The three accept-time ports of the durable ingest door.
 
-    Selected once with the service, lazily so the workspace import surface
-    stays free of the object-store and database drivers until an ingest
-    actually happens. Without a configured object store the accept degrades
-    to process-local bytes and SAYS so — the same logged degradation the
-    attachment door uses, because an upload that looks accepted but is not
-    durable is the failure mode this route exists to rule out.
+    Resolved through :func:`fin.corpus.ingest_storage.preflight_ingest_storage`,
+    which is the process's single answer to "what storage can promise a
+    durable accept". There is no fallback here on purpose: a deployment that
+    cannot store raw bytes, pointers and job rows durably is refused at boot
+    rather than handed a door that answers ``accepted`` and forgets on
+    restart.
     """
-    from fin.corpus.ingest_state import ingest_state_store_from_env
-    from fin.corpus.metadata_store import (
-        InMemoryMetadataStore,
-        metadata_store_from_env,
-    )
-    from fin.corpus.object_store import (
-        InMemoryObjectStore,
-        object_store_from_env,
-    )
-    from fin.corpus.object_store_errors import ObjectStoreNotConfiguredError
+    from fin.corpus.ingest_storage import preflight_ingest_storage
 
-    try:
-        objects: Any = object_store_from_env()
-    except ObjectStoreNotConfiguredError:
-        logger.warning(
-            "FIN_OBJECT_STORE_URL/FIN_OBJECT_STORE_BUCKET are not set; "
-            "corpus uploads keep their raw bytes in process memory and are "
-            "gone after a restart"
-        )
-        objects = InMemoryObjectStore()
-
-    pointers: Any = metadata_store_from_env()
-    if isinstance(pointers, InMemoryMetadataStore):
-        logger.warning(
-            "no FIN_METADATA_DSN/FIN_CHECKPOINT_URL is set; accepted corpus "
-            "uploads keep their object pointer in process memory"
-        )
-
-    return objects, pointers, ingest_state_store_from_env()
+    ports = preflight_ingest_storage()
+    return ports.objects, ports.pointers, ports.states
 
 
 def _build_default_ingest_service() -> IngestEndpoint:
