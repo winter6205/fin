@@ -343,13 +343,30 @@ def test_serve_refuses_boot_when_checkpoint_url_is_unset(monkeypatch) -> None:
     )
     monkeypatch.delenv(SCRIPTED_BOOT_ENV_VAR, raising=False)
     monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)
-    # Test fixtures, not the deployed numbers: any finite set where the run
-    # budget covers pages plus crop headroom gets this boot past its own door.
+    # Test fixtures, not the deployed numbers. The run budget is derived from
+    # the page and crop counts staged below through the module that prices a
+    # run, so this boot gets past its own config door and the refusal asserted
+    # underneath stays the checkpoint URL's.
+    from fin.host.attachment_budgets import AttachmentBudgets, required_run_calls
+
+    fixture_max_bytes = 1_048_576
+    fixture_pages = 8
+    fixture_crop_calls = 8
+    fixture_run_calls = required_run_calls(
+        AttachmentBudgets(
+            max_upload_bytes=fixture_max_bytes,
+            max_pdf_pages=fixture_pages,
+            # Only the page and crop counts price a run, so this total is what
+            # the call returns, never an input to it.
+            max_vision_calls_per_run=fixture_pages + fixture_crop_calls,
+            max_vision_crop_calls_per_run=fixture_crop_calls,
+        )
+    )
     for key, value in {
-        "FIN_ATTACHMENT_MAX_BYTES": "1048576",
-        "FIN_ATTACHMENT_MAX_PDF_PAGES": "8",
-        "FIN_ATTACHMENT_VISION_CALLS_PER_RUN": "16",
-        "FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN": "8",
+        "FIN_ATTACHMENT_MAX_BYTES": str(fixture_max_bytes),
+        "FIN_ATTACHMENT_MAX_PDF_PAGES": str(fixture_pages),
+        "FIN_ATTACHMENT_VISION_CALLS_PER_RUN": str(fixture_run_calls),
+        "FIN_ATTACHMENT_VISION_CROP_CALLS_PER_RUN": str(fixture_crop_calls),
     }.items():
         monkeypatch.setenv(key, value)
 

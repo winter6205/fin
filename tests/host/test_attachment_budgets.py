@@ -20,6 +20,16 @@ What this file pins:
   page list, or a success return for an over-budget run.
 * the budget is per RUN across eligible attachments, not per file, and crops
   share that one budget.
+* the run budget must price one scan per admissible page, the crop headroom
+  and exactly one reserved full-page transport retry, so a total equal to
+  pages plus crops is a mis-deployment that aborts the boot.
+* a spent-call ledger charges every outbound attempt, failed ones included,
+  allows that one retry per run rather than per page, and refuses the call
+  past the allowance with the budget code.
+* ``send_full_page`` is the one charge→inspect→retry-only-if-reserve-free
+  ladder both seams share: it raises the port's typed errors, and a spent
+  reserve with run-total headroom left exits the provider failure — the
+  budget code stays reserved for run-total/crop overflow.
 * the module holds integers only — no provider or model identifier, since
   hardcoding one is out of contract.
 * the composition root reads the four bounds before anything is published or
@@ -49,9 +59,20 @@ from fin.host.attachment_budgets import (
     AttachmentBudgets,
     AttachmentPageLimitExceeded,
     AttachmentVisionBudgetExceeded,
+    FullPageSend,
+    VisionCallLedger,
     from_environ,
     preflight_run,
+    send_full_page,
     validate,
+)
+from fin.host.attachment_vision import (
+    VisionCallFailedError,
+    VisionCallResult,
+    VisionEmptyTextError,
+    VisionErrorClass,
+    VisionTarget,
+    VisionUsage,
 )
 
 # ----- the four configured keys -----
@@ -76,12 +97,13 @@ FIELD_FOR_KEY = {
 }
 
 # One valid, finite, deliberately small configuration.
-# ``max_vision_calls_per_run`` sits exactly at ``pages + crop``, so the
-# accepted side of the relationship (equality is the minimum) is what every
-# non-relationship case runs against.
+# ``max_vision_calls_per_run`` sits exactly at ``pages + crop + 1``, so the
+# accepted side of the relationship (the total must also reserve one
+# full-page retry for the run) is what every non-relationship case runs
+# against.
 MAX_BYTES = 1_048_576
 MAX_PAGES = 8
-MAX_VISION_CALLS = 16
+MAX_VISION_CALLS = 17
 MAX_CROP_CALLS = 8
 VALID_ENVIRON: dict[str, str] = {
     BYTES_KEY: str(MAX_BYTES),
@@ -199,17 +221,18 @@ def test_preflight_accepts_a_run_at_the_page_and_budget_boundaries() -> None:
     """Exactly at the cap is admitted; the cap is not "cap minus one".
 
     One attachment at ``max_pdf_pages`` plus the full crop headroom is the
-    equality point of the run budget, and two attachments summing to the
-    same total with no crops reaches that boundary from the other side. One
+    equality point of the page cap, and two attachments summing to the
+    reserved total with no crops reaches the run-budget boundary from the
+    other side. One
     call past that same total is refused, so the acceptance is a real bound
     and not an unchecked pass-through.
     """
     budgets = _load()
     preflight_run(budgets, [MAX_PAGES], MAX_CROP_CALLS)
-    preflight_run(budgets, [MAX_PAGES, MAX_PAGES], 0)
+    preflight_run(budgets, [MAX_PAGES, MAX_PAGES], 1)
     validate(budgets)
     with pytest.raises(AttachmentVisionBudgetExceeded):
-        preflight_run(budgets, [MAX_PAGES, MAX_PAGES], 1)
+        preflight_run(budgets, [MAX_PAGES, MAX_PAGES], 2)
 
 
 # ----- B: each key missing on its own -----
@@ -341,7 +364,7 @@ def test_non_canonical_or_unbounded_values_fail_config_validation(
     [
         (BYTES_KEY, " 10 ", 10),
         (PAGES_KEY, "\t8\n", 8),
-        (VISION_KEY, " 16 ", 16),
+        (VISION_KEY, " 18 ", 18),
         (CROP_KEY, "8 ", 8),
     ],
     ids=["bytes", "pages", "vision_calls", "crop_calls"],
@@ -433,35 +456,43 @@ def test_page_count_exactly_at_cap_is_admitted_and_one_over_is_rejected() -> Non
 @pytest.mark.parametrize(
     ("pages", "crop", "vision", "admissible"),
     [
-        (8, 8, 16, True),
         (8, 8, 17, True),
-        (8, 1, 9, True),
-        (40, 20, 60, True),
+        (8, 8, 18, True),
+        (8, 1, 10, True),
+        (40, 20, 61, True),
+        (8, 8, 16, False),
         (8, 8, 15, False),
+        (8, 1, 9, False),
         (8, 1, 8, False),
+        (40, 20, 60, False),
         (40, 20, 59, False),
     ],
     ids=[
-        "equality_is_the_minimum",
+        "reserve_is_the_minimum",
         "one_spare_call",
-        "minimal_headroom_equality",
-        "large_equality",
+        "single_crop_reserve",
+        "large_reserve",
+        "equality_is_no_longer_enough",
         "one_short",
+        "reserve_short_by_one",
         "one_crop_unbudgeted",
+        "large_equality",
         "large_one_short",
     ],
 )
-def test_run_budget_must_cover_pages_plus_crop_headroom(
+def test_run_budget_must_cover_pages_plus_crop_headroom_plus_one_retry(
     pages: int, crop: int, vision: int, admissible: bool
 ) -> None:
     """The deployment is self-consistent before any run exists.
 
-    One full-page scan per admitted page plus the measured crop/retry
-    headroom is the minimum a run budget must cover, and it must hold before
-    a run starts; an
+    One full-page scan per admitted page, the crop headroom, and exactly one
+    reserved full-page transport retry is the minimum a run budget must
+    cover, and it must hold before a run starts; an
     under-budgeted config could only ever fail mid-run, which is what this
-    check prevents. The inadmissible rows are probed with a trivially small
-    run request, so the relationship is the only thing that can fail —
+    check prevents. A total that equals pages plus crops spends the last call
+    on the run's own work and leaves nothing for a retried scan, so it is a
+    mis-deployment too. The inadmissible rows are probed with a trivially
+    small run request, so the relationship is the only thing that can fail —
     ``preflight_run`` must validate it before starting work too.
     """
     budgets = _budgets(
@@ -477,6 +508,32 @@ def test_run_budget_must_cover_pages_plus_crop_headroom(
             validate(budgets)
         with pytest.raises(AttachmentBudgetConfigError):
             preflight_run(budgets, [1], 0)
+
+
+def test_the_deployed_policy_allowance_reserves_a_retry_and_the_old_floor_does_not():
+    """``89 = 80 + 8 + 1`` is the deployment target; the exact-sum ``88`` is not.
+
+    The totals are read as both a config and an environ, because the boot door
+    is ``from_environ`` and a value that only passes the dataclass check would
+    still deploy. The refusal is a config error with no outward code: an
+    operator mistake is not a product exit a client may retry.
+    """
+    reserve = _budgets(
+        max_pdf_pages=80, max_vision_calls_per_run=89, max_vision_crop_calls_per_run=8
+    )
+    floor = _budgets(
+        max_pdf_pages=80, max_vision_calls_per_run=88, max_vision_crop_calls_per_run=8
+    )
+    validate(reserve)
+    assert _load(
+        {PAGES_KEY: "80", VISION_KEY: "89", CROP_KEY: "8"}
+    ).max_vision_calls_per_run == 89
+    with pytest.raises(AttachmentBudgetConfigError) as excinfo:
+        validate(floor)
+    assert "88" in str(excinfo.value) and "89" in str(excinfo.value)
+    assert getattr(excinfo.value, "code", None) is None
+    with pytest.raises(AttachmentBudgetConfigError):
+        _load({PAGES_KEY: "80", VISION_KEY: "88", CROP_KEY: "8"})
 
 
 # ----- H, I, J: preflight ordering and per-run accounting -----
@@ -510,7 +567,7 @@ def test_over_budget_run_fails_before_any_page_is_skipped() -> None:
     budgets = _load()
     admitted = [MAX_PAGES, MAX_PAGES]
     with pytest.raises(AttachmentVisionBudgetExceeded) as excinfo:
-        preflight_run(budgets, admitted, 1)
+        preflight_run(budgets, admitted, 2)
     assert admitted == [MAX_PAGES, MAX_PAGES]
     assert not isinstance(excinfo.value, AttachmentPageLimitExceeded)
     assert excinfo.value.code == ATTACHMENT_VISION_BUDGET_EXCEEDED
@@ -520,7 +577,7 @@ def test_run_budget_is_accounted_across_every_eligible_attachment() -> None:
     """Under the page cap per file is not enough; the run sums (spec:57).
 
     Three eligible attachments of five pages each fit the eight-page cap
-    individually, and with the crop headroom the run needs 23 of 16 calls.
+    individually, and with the crop headroom the run needs 23 of 17 calls.
     The same pages admitted for a single attachment stay admissible, which
     is the per-file versus per-run distinction.
     """
@@ -533,15 +590,15 @@ def test_run_budget_is_accounted_across_every_eligible_attachment() -> None:
 def test_crop_calls_consume_the_same_run_budget_as_full_page_scans() -> None:
     """Crops are headroom inside one budget, not a second counter (spec:57).
 
-    Ten page scans plus seven crop calls is exactly one over the 16-call
-    budget, while seven crops would fit a separate eight-crop allowance: a
-    parallel counter would wrongly admit this run. Six crops is the accepted
-    neighbour.
+    Ten page scans plus eight crop calls is exactly one over the 17-call
+    budget, while eight crops would fit the eight-crop sub-cap on its own: a
+    parallel counter would wrongly admit this run. Seven crops is the
+    accepted neighbour.
     """
     budgets = _load()
-    preflight_run(budgets, [5, 5], MAX_CROP_CALLS - 2)
+    preflight_run(budgets, [5, 5], MAX_CROP_CALLS - 1)
     with pytest.raises(AttachmentVisionBudgetExceeded):
-        preflight_run(budgets, [5, 5], MAX_CROP_CALLS - 1)
+        preflight_run(budgets, [5, 5], MAX_CROP_CALLS)
 
 
 # ----- K: the trivial empty run -----
@@ -612,7 +669,7 @@ def test_preflight_is_repeatable_and_never_mutates_the_deployed_bounds() -> None
     preflight_run(budgets, [MAX_PAGES], MAX_CROP_CALLS)
     preflight_run(budgets, [MAX_PAGES], MAX_CROP_CALLS)
     with pytest.raises(AttachmentVisionBudgetExceeded):
-        preflight_run(budgets, [MAX_PAGES, MAX_PAGES], 1)
+        preflight_run(budgets, [MAX_PAGES, MAX_PAGES], 2)
     validate(budgets)
     assert budgets == _load()
 
@@ -702,6 +759,422 @@ def test_crop_request_at_exactly_the_configured_headroom_is_admitted() -> None:
     preflight_run(budgets, [1], MAX_CROP_CALLS)
 
 
+# ----- O: the run's spent-call ledger -----
+
+
+def _ledger(
+    pages: Any = MAX_PAGES,
+    vision: Any = MAX_VISION_CALLS,
+    crop: Any = MAX_CROP_CALLS,
+) -> VisionCallLedger:
+    """A ledger over one small deployment."""
+    return VisionCallLedger(
+        _budgets(
+            max_pdf_pages=pages,
+            max_vision_calls_per_run=vision,
+            max_vision_crop_calls_per_run=crop,
+        )
+    )
+
+
+def test_ledger_starts_unspent_and_accounts_every_attempt_to_one_run_total() -> None:
+    """A fresh run has spent nothing, and both call kinds share one counter.
+
+    Four full-page scans (one of them the retry) and two crops against a
+    ``3 + 2 + 1`` allowance is seven of eight calls: the spent views must add
+    up to the same total the run budget is compared against, or a persisted
+    run record would report a demand the bound did not enforce.
+    """
+    ledger = _ledger(pages=3, vision=8, crop=2)
+    assert ledger.calls_spent == 0
+    assert ledger.full_page_calls_spent == 0
+    assert ledger.crop_calls_spent == 0
+    assert ledger.retries_spent == 0
+    assert ledger.remaining_calls == 8
+    for _ in range(3):
+        ledger.charge_full_page_attempt()
+    for _ in range(2):
+        ledger.charge_crop_attempt()
+    ledger.charge_full_page_attempt(retry=True)
+    ledger.charge_full_page_attempt()
+    assert ledger.full_page_calls_spent == 5
+    assert ledger.crop_calls_spent == 2
+    assert ledger.retries_spent == 1
+    assert ledger.calls_spent == ledger.full_page_calls_spent + ledger.crop_calls_spent
+    assert ledger.calls_spent == 7
+    assert ledger.remaining_calls == 1
+
+
+def test_every_call_the_policy_allowance_admits_is_charged_and_one_more_is_refused():
+    """89 admits 80 pages, 8 crops and the one reserved retry — and nothing else.
+
+    This is the deployment target walked call by call: the 89th charge is
+    admitted, the 90th is refused with the outward budget code, and the page
+    list of the run is unaffected by which side of the line it lands on.
+    """
+    ledger = _ledger(pages=80, vision=89, crop=8)
+    for _ in range(80):
+        ledger.charge_full_page_attempt()
+    for _ in range(8):
+        ledger.charge_crop_attempt()
+    ledger.charge_full_page_attempt(retry=True)
+    assert ledger.calls_spent == 89
+    assert ledger.remaining_calls == 0
+    with pytest.raises(AttachmentVisionBudgetExceeded) as excinfo:
+        ledger.charge_full_page_attempt()
+    assert excinfo.value.code == ATTACHMENT_VISION_BUDGET_EXCEEDED
+    assert ledger.calls_spent == 89
+    with pytest.raises(AttachmentVisionBudgetExceeded):
+        ledger.charge_crop_attempt()
+    assert ledger.calls_spent == 89
+
+
+def test_a_failed_attempt_consumes_budget_so_retries_cannot_run_the_tab() -> None:
+    """Attempts are paid for by the run, whether or not the provider answered.
+
+    A transport failure after the call went out is the same spend as a
+    success: the ledger is charged before the request goes out and has no
+    refund, so a run that keeps failing cannot spend more than the deployed
+    allowance. One page, one crop and the reserve is ``1 + 1 + 1 = 3``.
+    """
+    ledger = _ledger(pages=1, vision=3, crop=1)
+
+    def outbound(*, retry: bool) -> None:
+        """Stand-in for the provider call: it always fails after being charged."""
+        ledger.charge_full_page_attempt(retry=retry)
+        raise RuntimeError("transport closed")
+
+    failures = 0
+    for attempt in (1, 2):
+        with pytest.raises(RuntimeError):
+            outbound(retry=attempt == 2)
+        failures += 1
+        assert ledger.calls_spent == attempt, f"attempt {attempt} was not charged"
+    assert failures == 2
+    assert ledger.retries_spent == 1
+    # Only the one call the allowance still covers is left, and it is not a retry.
+    ledger.charge_full_page_attempt()
+    assert ledger.calls_spent == 3
+    with pytest.raises(AttachmentVisionBudgetExceeded):
+        ledger.charge_full_page_attempt()
+
+
+def test_the_retry_reserve_is_one_per_run_not_one_per_page() -> None:
+    """The single reserve belongs to the run, so a second page gets nothing.
+
+    Three pages, one crop and one retry fit ``3 + 1 + 1 = 5``. The retry after
+    the first page is admitted; the retry asked for the second page is refused
+    even though the page cap, the crop sub-cap and the arithmetic all still
+    allow a call — only the consumed reserve can produce that answer.
+    """
+    ledger = _ledger(pages=3, vision=5, crop=1)
+    ledger.charge_full_page_attempt()
+    ledger.charge_full_page_attempt(retry=True)
+    ledger.charge_full_page_attempt()
+    assert ledger.remaining_calls == 2
+    with pytest.raises(AttachmentVisionBudgetExceeded) as excinfo:
+        ledger.charge_full_page_attempt(retry=True)
+    assert excinfo.value.code == ATTACHMENT_VISION_BUDGET_EXCEEDED
+    assert ledger.retries_spent == 1
+    assert ledger.calls_spent == 3
+    # A plain (non-retry) attempt is still admissible under the run total.
+    ledger.charge_full_page_attempt()
+
+
+def test_the_crop_sub_cap_holds_even_while_the_run_total_has_room() -> None:
+    """The eighth crop is a deployment price, not a discount on the total.
+
+    Twelve calls is well over ``2 + 8 + 1``, so the only bound the ninth crop
+    can be refused by is its own headroom.
+    """
+    ledger = _ledger(pages=2, vision=12, crop=8)
+    for _ in range(8):
+        ledger.charge_crop_attempt()
+    assert ledger.remaining_calls == 4
+    with pytest.raises(AttachmentVisionBudgetExceeded) as excinfo:
+        ledger.charge_crop_attempt()
+    assert excinfo.value.code == ATTACHMENT_VISION_BUDGET_EXCEEDED
+    assert ledger.crop_calls_spent == 8
+    # Pages and the reserve are untouched by the crop refusal.
+    ledger.charge_full_page_attempt()
+    ledger.charge_full_page_attempt(retry=True)
+
+
+def test_ledger_rejects_a_deployment_that_leaves_no_room_for_the_retry() -> None:
+    """An unreserved config cannot spend, not just cannot boot.
+
+    The ledger is the enforcement half of the same rule, so a caller that
+    builds it directly cannot bypass the boot check.
+    """
+    for floor in (88, 87):
+        with pytest.raises(AttachmentBudgetConfigError):
+            VisionCallLedger(
+                _budgets(
+                    max_pdf_pages=80, max_vision_calls_per_run=floor,
+                    max_vision_crop_calls_per_run=8,
+                )
+            )
+
+
+def test_ledger_accounts_are_per_object_and_live_only_in_this_process() -> None:
+    """No shared counter behind a ledger: two runs, two tabulations.
+
+    A module-level accumulator would let one run spend another's budget and
+    would survive a refusal in an unrelated test. This also pins the declared
+    durability boundary — the counts are in memory and a caller must persist
+    them somewhere durable to keep them across processes.
+    """
+    budgets = _budgets(
+        max_pdf_pages=8, max_vision_calls_per_run=17, max_vision_crop_calls_per_run=8
+    )
+    first = VisionCallLedger(budgets)
+    second = VisionCallLedger(budgets)
+    first.charge_full_page_attempt()
+    assert first.calls_spent == 1
+    assert second.calls_spent == 0
+    assert second.remaining_calls == 17
+    assert first.budgets is budgets
+
+
+def test_concurrent_attempts_cannot_double_spend_the_last_call() -> None:
+    """Two pages scanned at once still draw on one run budget.
+
+    Every thread races for the same final call; exactly one may take it. A
+    check-then-add that is not atomic would let the run spend past the bound
+    it exists to enforce, and the ledger would report more calls than were
+    allowed.
+    """
+    import threading
+
+    ledger = _ledger(pages=8, vision=17, crop=8)
+    attempts = 60
+    admitted: list[int] = []
+    start = threading.Barrier(attempts)
+    lock = threading.Lock()
+
+    def race() -> None:
+        start.wait()
+        try:
+            ledger.charge_full_page_attempt()
+        except AttachmentVisionBudgetExceeded:
+            return
+        with lock:
+            admitted.append(1)
+
+    threads = [threading.Thread(target=race) for _ in range(attempts)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert ledger.calls_spent == 17
+    assert len(admitted) == 17
+
+
+@pytest.mark.parametrize(
+    "bad_retry",
+    [1, 0, "yes", None, 1.0, [True]],
+    ids=["int_one", "int_zero", "string", "none", "float", "list"],
+)
+def test_a_malformed_retry_ask_is_a_typed_caller_error_and_spends_nothing(
+    bad_retry: Any,
+) -> None:
+    """A truthy-looking flag is a caller bug, not a silently consumed retry.
+
+    ``1`` would read as ``True`` and ``0`` as ``False``: a run that meant a
+    first scan would have spent its one reserve instead, so the ask must be
+    refused and the budget left whole.
+    """
+    ledger = _ledger()
+    with pytest.raises(AttachmentBudgetConfigError):
+        ledger.charge_full_page_attempt(retry=bad_retry)
+    assert ledger.calls_spent == 0
+    assert ledger.retries_spent == 0
+
+
+# ----- P: send_full_page, the one charge→inspect→retry ladder -----
+
+_TARGET = VisionTarget(attachment_id="a", version="1", page=1, crop=None)
+
+
+class _ScriptedPort:
+    """``VisionPort`` witness: a queued outcome per call, every call kept.
+
+    A string answers with that text; an exception instance is raised. The
+    recorded call dicts let a case assert the exact outbound shape.
+    """
+
+    def __init__(self, outcomes: list[Any]) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self._outcomes = list(outcomes)
+
+    @property
+    def sent_pages(self) -> list[int]:
+        return [call["target"].page for call in self.calls]
+
+    def inspect(
+        self, *, image: bytes, target: Any, media_type: str, question: str
+    ) -> VisionCallResult:
+        self.calls.append(
+            {
+                "image": image,
+                "target": target,
+                "media_type": media_type,
+                "question": question,
+            }
+        )
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return VisionCallResult(
+            text=outcome,
+            target=target,
+            model_id="fake-vision-1",
+            media_type=media_type,
+            usage=VisionUsage(1, 1, 2),
+            cost=None,
+        )
+
+
+def _transport_failure() -> VisionCallFailedError:
+    return VisionCallFailedError("dropped", error_class=VisionErrorClass.TRANSPORT)
+
+
+def _permanent_failure() -> VisionCallFailedError:
+    return VisionCallFailedError("refused", error_class=VisionErrorClass.PERMANENT)
+
+
+def _send(
+    ledger: VisionCallLedger, port: _ScriptedPort
+) -> FullPageSend:
+    return send_full_page(
+        port,
+        ledger,
+        image=b"png-bytes",
+        target=_TARGET,
+        media_type="image/png",
+        question="what does this page show?",
+    )
+
+
+def test_send_full_page_answers_and_charges_exactly_one_attempt() -> None:
+    """The clean path: one charge, one send, the answer and no retry fact."""
+    ledger = _ledger(pages=3, vision=5, crop=1)
+    port = _ScriptedPort(["one chart"])
+
+    send = _send(ledger, port)
+
+    assert send.result.text == "one chart"
+    assert send.retry_used is False
+    assert ledger.calls_spent == 1
+    assert ledger.retries_spent == 0
+    (call,) = port.calls
+    assert call["image"] == b"png-bytes"
+    assert call["target"] is _TARGET
+    assert call["media_type"] == "image/png"
+    assert call["question"] == "what does this page show?"
+
+
+def test_send_full_page_never_retries_a_permanent_refusal() -> None:
+    """A failure the adapter did not classify as transport would answer the
+    same way twice, paid for twice: it exits as raised, one send, one
+    charge, the reserve untouched."""
+    ledger = _ledger(pages=3, vision=5, crop=1)
+    port = _ScriptedPort([_permanent_failure()])
+
+    with pytest.raises(VisionCallFailedError) as excinfo:
+        _send(ledger, port)
+
+    assert excinfo.value.retryable is False
+    assert len(port.calls) == 1
+    assert ledger.calls_spent == 1
+    assert ledger.retries_spent == 0
+
+
+def test_send_full_page_spends_the_run_reserve_once_on_a_transport_failure() -> None:
+    """Retryable transport failure, reserve free: exactly one more attempt,
+    charged before it leaves, and the outcome reports the reserve was used
+    so each seam can record the retried-away attempt in its own envelope."""
+    ledger = _ledger(pages=3, vision=5, crop=1)
+    port = _ScriptedPort([_transport_failure(), "one chart"])
+
+    send = _send(ledger, port)
+
+    assert send.result.text == "one chart"
+    assert send.retry_used is True
+    assert len(port.calls) == 2
+    assert ledger.calls_spent == 2
+    assert ledger.retries_spent == 1
+
+
+def test_send_full_page_a_second_failure_is_final_and_never_retries_twice() -> None:
+    """The reserve buys one attempt, not a ladder: after the retry fails the
+    original fault type propagates, there is no third send, and the run's
+    reserve is gone whatever the total looks like."""
+    ledger = _ledger(pages=3, vision=5, crop=1)
+    port = _ScriptedPort([_transport_failure(), _transport_failure()])
+
+    with pytest.raises(VisionCallFailedError):
+        _send(ledger, port)
+
+    assert len(port.calls) == 2
+    assert ledger.calls_spent == 2
+    assert ledger.retries_spent == 1
+
+
+def test_send_full_page_a_spent_reserve_exits_the_provider_failure() -> None:
+    """The adjudicated exit (spec: an overflow code is only for run-total or
+    crop-cap refusal): with the reserve gone and a run total still several
+    calls from its bound, a retryable failure re-raises the port's own
+    error — the request that failed is the provider's dropped call, not the
+    operator's cap — and nothing further is sent."""
+    ledger = _ledger(pages=8, vision=17, crop=8)
+    ledger.charge_full_page_attempt()
+    ledger.charge_full_page_attempt(retry=True)
+    port = _ScriptedPort([_transport_failure()])
+
+    with pytest.raises(VisionCallFailedError) as excinfo:
+        _send(ledger, port)
+
+    assert excinfo.value.retryable is True
+    assert not isinstance(excinfo.value, AttachmentVisionBudgetExceeded)
+    assert len(port.calls) == 1
+    assert ledger.remaining_calls == 17 - 3
+
+
+def test_send_full_page_run_total_exhaustion_on_the_retry_charge_keeps_the_budget_exit() -> None:
+    """The other side of the same line: the reserve is still free, but the
+    run total has no call left for the retry, so the charge refuses the send
+    with the budget code — a real overflow, before anything goes out."""
+    ledger = _ledger(pages=2, vision=4, crop=1)
+    ledger.charge_full_page_attempt()
+    ledger.charge_full_page_attempt()
+    ledger.charge_crop_attempt()  # 3 of 4 spent, reserve untouched
+    port = _ScriptedPort([_transport_failure()])
+
+    with pytest.raises(AttachmentVisionBudgetExceeded):
+        _send(ledger, port)
+
+    assert len(port.calls) == 1  # the first attempt left; the retry did not
+    assert ledger.retries_spent == 0
+    assert ledger.calls_spent == 4
+
+
+def test_send_full_page_empty_output_is_never_retried() -> None:
+    """Malformed or empty provider output is not a transport fault: the
+    port's own error propagates after one send and one charge, and the
+    reserve stays whole for a real dropped request."""
+    ledger = _ledger(pages=3, vision=5, crop=1)
+    port = _ScriptedPort([VisionEmptyTextError("nothing usable")])
+
+    with pytest.raises(VisionEmptyTextError):
+        _send(ledger, port)
+
+    assert len(port.calls) == 1
+    assert ledger.calls_spent == 1
+    assert ledger.retries_spent == 0
+
+
 # ----- the deployed bounds, bound to their measurement evidence -----
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_EXAMPLE_PATH = PROJECT_ROOT / ".env.example"
@@ -742,6 +1215,23 @@ def test_deployed_bounds_are_literals_with_no_shell_fallback() -> None:
     assert sorted(environ) == sorted(ALL_KEYS)
     assert [key for key, value in environ.items() if "$" in value] == []
     from_environ(environ=environ)
+
+
+def test_deployed_vision_total_is_the_policy_allowance_with_its_reserve() -> None:
+    """The shipped template prices the retry, and the value is the stated one.
+
+    ``89 = 80 + 8 + 1`` is a policy allowance for a deployment target, so it is
+    pinned both as the named number and as the relationship the validator
+    enforces: a template that drifts back to the exact sum boots fine and then
+    cannot retry a failed scan.
+    """
+    budgets = from_environ(environ=_deployed_environ())
+    assert budgets.max_pdf_pages == 80
+    assert budgets.max_vision_crop_calls_per_run == 8
+    assert budgets.max_vision_calls_per_run == 89
+    assert budgets.max_vision_calls_per_run == (
+        budgets.max_pdf_pages + budgets.max_vision_crop_calls_per_run + 1
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -990,6 +1480,29 @@ def test_serve_aborts_boot_on_an_unusable_bound_and_never_serves(
     assert served == []
     assert published == []
     assert key in str(excinfo.value)
+
+
+def test_serve_aborts_boot_on_a_total_that_leaves_no_retry_reserve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run budget at the old exact-sum floor is a mis-deployment, not a boot.
+
+    Every single bound is finite and positive here, so only the relationship
+    between them can abort: this is the proof the reserve is enforced where a
+    server actually starts, not just in a helper nobody calls.
+    """
+    import fin.host.http as http_module
+
+    served, published = _stage_serve(
+        monkeypatch, {**VALID_ENVIRON, VISION_KEY: str(MAX_PAGES + MAX_CROP_CALLS)}
+    )
+
+    with pytest.raises(AttachmentBudgetConfigError) as excinfo:
+        http_module.serve()
+
+    assert served == []
+    assert published == []
+    assert "max_vision_calls_per_run" in str(excinfo.value)
 
 
 def test_serve_boots_and_serves_when_all_four_bounds_are_finite(

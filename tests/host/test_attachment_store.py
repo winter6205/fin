@@ -1315,3 +1315,45 @@ def test_postgres_thread_delete_cascades_the_cleanup_obligation(
     assert store.pending_cleanup(thread.id) == []
     assert _retained_obligations("postgres", store, thread.id) == 0
     assert store.tombstone(attachment_id=aid, thread_id=thread.id) is None
+
+
+# ----- observation answer payload -----
+
+
+def test_observation_answer_text_round_trips_on_both_backends(
+    store_pair,
+) -> None:
+    """A persisted observation must carry the provider's answer, not only its
+    provenance keys, on every backend — equality of the read-back envelope is
+    the check that no layer dropped the payload."""
+    from fin.host.attachment_observations import (
+        COVERAGE_SCHEMA_VERSION,
+        ObservationEnvelope,
+    )
+
+    threads, store, _backend = store_pair
+    thread = threads.create_thread(title="observation answer")
+    record = _create(store, thread.id)
+    answer = "Chart shows Q3 revenue of 89,493 million dollars."
+    observation = ObservationEnvelope(
+        attachment_id=record.attachment_id,
+        coverage_schema_version=COVERAGE_SCHEMA_VERSION,
+        observation_version=1,
+        attachment_version=1,
+        source_unit=1,
+        page=1,
+        page_image_sha256="cd" * 32,
+        provider="openai-compatible",
+        model_version="provider-model-1",
+        answer_text=answer,
+        created_at=datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc),
+    )
+
+    stored = store.record_observation(
+        attachment_id=record.attachment_id, observation=observation
+    )
+    read_back = store.observations(record.attachment_id, 1, 1, 1)
+
+    assert stored == observation
+    assert read_back == (observation,)
+    assert read_back[0].answer_text == answer

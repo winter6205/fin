@@ -23,7 +23,11 @@ For a document that needs pages, this module is the adapter and no more:
 the shared page/region core decides what a page yielded, and only here is
 that outcome turned into an attachment code. A deployment that wired no
 page lane is answered the same way — this door's own code, on the same
-ladder, with the bytes kept. The core keeps no budget, index, or
+ladder, with the bytes kept. Once a document's pages have frozen into
+units, the first preparation sends each physical page to the configured
+vision provider exactly once, charges every outbound attempt against the
+run's ledger, and persists one versioned observation per page; a crop
+inspection is not spent here. The core keeps no budget, index, or
 thread-lifecycle authority, and never names an attachment code, so the same
 extraction can serve a consumer with a different vocabulary.
 """
@@ -34,6 +38,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import ClassVar, Final, Literal, Sequence
 
 from fin.corpus.errors import (
@@ -49,6 +54,7 @@ from fin.corpus.ocr import OCRError, OcrRequiredUnavailableError
 from fin.corpus.parsers import (
     PageParseResult,
     PageRegionParser,
+    ParsedPage,
     PdfplumberPageSource,
     has_pdf_signature,
 )
@@ -57,15 +63,35 @@ from fin.host.attachment_budgets import (
     AttachmentBudgets,
     AttachmentPageLimitExceeded,
     AttachmentVisionBudgetExceeded,
+    FullPageSend,
+    VisionCallLedger,
     preflight_run,
+    send_full_page,
 )
 from fin.host.attachment_index import build_postings, is_usable
+from fin.host.attachment_observations import (
+    CoveredDetail,
+    DetailKey,
+    ObservationAttempt,
+    ObservationEnvelope,
+    observation_from_call_result,
+)
 from fin.host.attachment_store import (
     AttachmentRecord,
     AttachmentStore,
     AttachmentStoreError,
     AttachmentThreadGoneError,
     ParsedAttachmentUnit,
+)
+from fin.host.attachment_vision import (
+    DEFAULT_MEDIA_TYPE,
+    PAGE_SCAN_PROMPT,
+    VISION_CALL_FAILED,
+    VISION_EMPTY_TEXT,
+    VisionCallFailedError,
+    VisionEmptyTextError,
+    VisionPort,
+    VisionTarget,
 )
 
 logger = logging.getLogger(__name__)
@@ -82,6 +108,18 @@ SOURCE_UNAVAILABLE: Final[str] = "source_unavailable"
 # The attachment exit for "a page never became pixels" is the same string
 # the render stage already uses, so one shape keeps one name end to end.
 RENDER_FAILED: Final[str] = PageRenderError.code
+
+# The one structured detail a first-preparation page scan answers: whether
+# the page holds a chart, plot, or table, and what it says. The provider's
+# answer text travels with the call; this key is what a later reuse decision
+# matches an exact question against.
+CHART_PRESENCE_DETAIL: Final[str] = "chart_presence"
+
+# A page document's first scan is the first observation of that content
+# version's page, and the store keeps the sequence monotonic per source, so
+# the version this preparation mints is always 1. Crop inspections — the
+# later versions — are not spent here.
+FIRST_OBSERVATION_VERSION: Final[int] = 1
 
 # The suffix of the upload's display filename decides which lane reads the
 # bytes; the bytes themselves decide whether that claim was true. For the
@@ -196,6 +234,37 @@ class AttachmentPageLaneUnwiredError(AttachmentPreparationError):
     """
 
     code = ATTACHMENT_PAGE_LANE_UNWIRED
+
+
+class AttachmentVisionCallFailedError(AttachmentPreparationError):
+    """A page scan could not be answered by the configured provider.
+
+    ``retryable`` carries the port adapter's own verdict, never a
+    re-reading of the message: the run holds exactly one reserved full-page
+    transport retry, and only a failure the adapter classified as
+    transport may spend it. Construction names it explicitly because a
+    forgotten verdict must fail at the raise site rather than silently buy
+    or lose a retry.
+    """
+
+    code = VISION_CALL_FAILED
+
+    def __init__(
+        self, attachment_id: str, detail: str, *, retryable: bool
+    ) -> None:
+        super().__init__(attachment_id, detail)
+        self.retryable = retryable
+
+
+class AttachmentVisionEmptyTextError(AttachmentPreparationError):
+    """The provider answered with nothing usable for this page.
+
+    Empty, whitespace-only, or a shape the port cannot read as text — a
+    malformed answer is never retried into a pass, so this exit owns its
+    own code apart from an unreachable provider.
+    """
+
+    code = VISION_EMPTY_TEXT
 
 
 class AttachmentNotFoundError(AttachmentError):
@@ -341,21 +410,38 @@ class AttachmentPreparationService:
         objects: ObjectStore,
         budgets: AttachmentBudgets | None = None,
         pages: PageRegionParser | None = None,
+        vision: VisionPort | None = None,
+        call_ledger: VisionCallLedger | None = None,
     ) -> None:
-        """``budgets`` and ``pages`` are the page-lane seams.
+        """``budgets``, ``pages``, and ``vision`` are the page-lane seams.
 
-        Both stay unset for a service that only ever handles text, which is
-        why neither has a value to fall back to: a page document that
-        reaches such a service is answered with
+        ``budgets`` and ``pages`` stay unset for a service that only ever
+        handles text, which is why neither has a value to fall back to: a
+        page document that reaches such a service is answered with
         :attr:`AttachmentPageLaneUnwiredError.code` and never parsed
         against a guessed bound. ``pages`` is injectable so the extraction
         ports (layout, renderer, OCR) belong to whoever wires the run, not
-        to this module.
+        to this module. ``vision`` is the first-preparation scan seam, and
+        it alone defaults open: a deployed page lane with no vision port
+        freezes its units and publishes ``ready`` exactly as it did before
+        the scan stage existed — no page is sent and no call is charged,
+        and the gap is logged at the scan site rather than passing silent.
+
+        ``call_ledger`` is the run-pricing seam. The deployed vision bound
+        is a RUN total (ADR 0089's 80 + 8 + 1 = 89), so a caller that
+        prices a whole run supplies ONE ledger here and shares it across
+        every preparation of that run, which is what makes the reserve
+        run-wide instead of per document. The default is per-preparation:
+        with no ledger injected, each preparation charges a fresh one
+        built from ``budgets``, bounding one document's scans but leaving
+        the run-wide allowance to the caller that owns the run.
         """
         self.store = store
         self.objects = objects
         self.budgets = budgets
         self.pages = pages
+        self.vision = vision
+        self.call_ledger = call_ledger
 
     # -- door: accept --
 
@@ -578,7 +664,170 @@ class AttachmentPreparationService:
             raise AttachmentEmptyTextError(
                 attachment_id, "no page froze a unit"
             )  # EXIT: a document of no text is empty, not ready.
+        # The scan stage runs on a document whose units froze successfully —
+        # a page count the preflight refused or a parse that named a failure
+        # never reaches a provider — and before this door publishes anything:
+        # a page whose scan fails leaves the row ``failed`` with the vision
+        # code, not a ready attachment holding a half-answered page set.
+        self._scan_pages(
+            record, version=version, budgets=budgets, result=result
+        )
         return units
+
+    def _scan_pages(
+        self,
+        record: AttachmentRecord,
+        *,
+        version: int,
+        budgets: AttachmentBudgets,
+        result: PageParseResult,
+    ) -> None:
+        """One configured-provider scan per physical page, one observation.
+
+        Every page the core returned is scanned — a page with no Heron
+        figure box and a page that froze no unit included, because the
+        scan question is not the layout engine's recall to decide. Each
+        answer is persisted as an observation bound to that page's
+        rendered image. The injected run ledger spans a whole run when
+        the caller priced one; otherwise this preparation pays its own.
+        """
+        vision = self.vision
+        if vision is None:
+            # EXIT: the page lane without a scan seam is the shape this door
+            # shipped before the vision stage existed — units freeze, no
+            # page is sent, no call is charged. A deployment fact, so it is
+            # logged, never passed in silence.
+            logger.warning(
+                "attachment %s froze its pages with no vision port wired; "
+                "no page was scanned and no call was charged",
+                record.attachment_id,
+            )
+            return
+        ledger = (
+            self.call_ledger
+            if self.call_ledger is not None
+            else VisionCallLedger(budgets)
+        )
+        # The core renders PDF pages to PNG; a standalone image's raster is
+        # its own source bytes under the media type the core read from them.
+        media_type = DEFAULT_MEDIA_TYPE if result.fmt == _LANE_PDF else result.fmt
+        for page in result.pages:
+            send = self._inspect_full_page(
+                vision,
+                ledger,
+                image=page.raster.png,
+                target=VisionTarget(
+                    attachment_id=record.attachment_id,
+                    version=str(version),
+                    page=page.page_no,
+                    crop=None,
+                ),
+                media_type=media_type,
+            )
+            observation = self._page_observation(
+                record.attachment_id, version, page, send
+            )
+            # Late-write protection is the store's: an attachment deleted
+            # between this page's send and its write answers with
+            # ``AttachmentThreadGoneError``, which is not a preparation exit
+            # and travels to the caller unconverted.
+            self.store.record_observation(
+                attachment_id=record.attachment_id, observation=observation
+            )
+
+    @staticmethod
+    def _page_observation(
+        attachment_id: str,
+        version: int,
+        page: ParsedPage,
+        send: FullPageSend,
+    ) -> ObservationEnvelope:
+        """Assemble one page's finished ladder into its observation.
+
+        The answer arrives with the fact of whether the run's reserved
+        retry went to get it, so the retried-away failure attempt is
+        recorded here, in the envelope that owns this page's attempts.
+        """
+        answer = send.result
+        observation = observation_from_call_result(
+            answer,
+            observation_version=FIRST_OBSERVATION_VERSION,
+            # A page that froze no unit is still addressed where its
+            # unit would have started: the core's unit ordinals are
+            # physical page numbers by construction.
+            source_unit=(
+                page.unit.locator.unit if page.unit is not None else page.page_no
+            ),
+            page_image_sha256=page.raster.sha256,
+            # The port reports only the model that answered, and this
+            # deployment configures one provider through it; inventing a
+            # second name here would hardcode an identity no setting
+            # ever set.
+            provider=answer.model_id,
+            created_at=datetime.now(timezone.utc),
+            covered_details=(
+                CoveredDetail(key=DetailKey(kind=CHART_PRESENCE_DETAIL)),
+            ),
+        )
+        if send.retry_used:
+            # A retried-away failure has no provider numbers, and
+            # recording it usage-none/cost-none keeps the attempt count
+            # honest without inventing zeros — the same convention the
+            # run-side re-inspection envelope uses.
+            observation = replace(
+                observation,
+                attempts=(ObservationAttempt(),) + observation.attempts,
+            )
+        return observation
+
+    @staticmethod
+    def _inspect_full_page(
+        vision: VisionPort,
+        ledger: VisionCallLedger,
+        *,
+        image: bytes,
+        target: VisionTarget,
+        media_type: str,
+    ) -> FullPageSend:
+        """Delegate the ladder; convert only the port's typed errors here.
+
+        The charge → inspect → retry-only-if-reserve-free sequence belongs
+        to :func:`fin.host.attachment_budgets.send_full_page`, the one
+        orchestration source of truth both full-page seams share, so the
+        same spent event can never answer with two different codes: a run
+        whose reserve is already gone exits the provider's dropped request
+        (``vision_call_failed``), and
+        :class:`~fin.host.attachment_budgets.AttachmentVisionBudgetExceeded`
+        surfaces here only when the run total itself refuses a charge. A
+        permanent refusal and unusable output are never retried into a
+        pass; each documented port exit becomes one door code.
+        """
+        try:
+            return send_full_page(
+                vision,
+                ledger,
+                image=image,
+                target=target,
+                media_type=media_type,
+                question=PAGE_SCAN_PROMPT,
+            )
+        except VisionEmptyTextError as exc:
+            # EXIT: an answer with nothing readable in it is provider
+            # output, not transport, and is never retried into a pass.
+            raise AttachmentVisionEmptyTextError(
+                target.attachment_id,
+                f"page {target.page} answered with nothing usable",
+            ) from exc
+        except VisionCallFailedError as exc:
+            # EXIT: the provider's refusal — retried or refused a retry —
+            # is this door's named vision failure. The ``retryable`` verdict
+            # travels on the wrapper as the adapter reported it; the ladder
+            # above has already spent the run's reserve decision.
+            raise AttachmentVisionCallFailedError(
+                target.attachment_id,
+                f"page {target.page} could not be inspected",
+                retryable=exc.retryable,
+            ) from exc
 
     def _preflight_page_source(
         self,
@@ -856,6 +1105,8 @@ __all__ = [
     "ATTACHMENT_NOT_TEXT",
     "ATTACHMENT_PAGE_LANE_UNWIRED",
     "ATTACHMENT_TYPE_UNSUPPORTED",
+    "CHART_PRESENCE_DETAIL",
+    "FIRST_OBSERVATION_VERSION",
     "RENDER_FAILED",
     "SOURCE_UNAVAILABLE",
     "AttachmentCleanupError",
@@ -870,6 +1121,8 @@ __all__ = [
     "AttachmentRenderFailedError",
     "AttachmentSourceRejectedError",
     "AttachmentTypeUnsupportedError",
+    "AttachmentVisionCallFailedError",
+    "AttachmentVisionEmptyTextError",
     "ResolvedAttachment",
     "text_rejection_reason",
 ]

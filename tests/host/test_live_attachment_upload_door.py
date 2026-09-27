@@ -1294,6 +1294,7 @@ def test_live_server_uploaded_row_is_not_a_recovery_candidate(
 
 
 def test_live_single_attachment_delete_voids_the_real_bytes(
+    real_s3_object_store: None,
     postgres_url: str, live_server: _LiveServer
 ) -> None:
     """A completed deletion is confirmed at the real store, not in a fake.

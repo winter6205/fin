@@ -6,7 +6,10 @@ owns three layers of it, all bound to the owning ``thread_id``:
 * the raw bytes, addressed by an :class:`~fin.corpus.object_store.ObjectStore`
   key — the model never sees a path;
 * the parsed frozen units, one text row per ``(attachment_id, version, unit)``;
-* the derived search index, one posting row per ``(attachment_id, version, term)``.
+* the derived search index, one posting row per ``(attachment_id, version, term)``;
+* the versioned visual observations, one envelope row per
+  ``(attachment_id, version, unit, page, observation_version)`` — see
+  :mod:`fin.host.attachment_observations` for what an envelope promises.
 
 Every layer is removed with the thread, and no attachment row survives a
 delete: the deletion is the arbitration point for a preparation that is
@@ -36,10 +39,20 @@ same text the operator attached.
 
 from __future__ import annotations
 
+import json
 import threading
 from dataclasses import dataclass, replace
 from datetime import datetime
+from decimal import Decimal
 from typing import Literal, Protocol, Sequence
+
+from fin.host.attachment_observations import (
+    CoveredDetail,
+    DetailKey,
+    ObservationAttempt,
+    ObservationEnvelope,
+)
+from fin.host.attachment_vision import VisionCrop, VisionUsage, VisionCost
 
 
 # ----- typed errors -----
@@ -201,6 +214,31 @@ class AttachmentStore(Protocol):
 
     def clear_index(self, attachment_id: str) -> None:
         """Drop every posting of an attachment and mark it not indexed."""
+        ...
+
+    def record_observation(
+        self, *, attachment_id: str, observation: ObservationEnvelope
+    ) -> ObservationEnvelope:
+        """Persist one versioned visual observation of a page of ``version``.
+
+        Re-recording an observation version already on record for the same
+        content version, unit, and page replaces it; a lower one is refused
+        as stale, so observation versions stay monotonic per source and a
+        late answer from a superseded attempt cannot erase newer coverage.
+
+        Raises :class:`AttachmentThreadGoneError` when the attachment or its
+        thread was deleted while the inspection was running, and
+        :class:`AttachmentStoreError` when the envelope addresses a
+        different attachment than the row it is being written to.
+        """
+        ...
+
+    def observations(
+        self, attachment_id: str, version: int, unit: int, page: int
+    ) -> tuple[ObservationEnvelope, ...]:
+        """The stored observations of one page of one version, oldest
+        observation version first; empty when there are none or the
+        attachment is gone."""
         ...
 
     def mark_ready(
@@ -429,15 +467,45 @@ def _normalized_postings(
     return normalized
 
 
+def _observation_source(
+    observation: ObservationEnvelope,
+) -> tuple[int, int, int]:
+    """``(content version, unit, page)`` — the sequence an observation
+    version must be monotonic within."""
+    return (
+        observation.attachment_version,
+        observation.source_unit,
+        observation.page,
+    )
+
+
+def _check_observation_binding(
+    attachment_id: str, observation: ObservationEnvelope
+) -> None:
+    """Refuse an envelope that addresses a different attachment row.
+
+    WHY here and not in the envelope: the envelope carries its own identity
+    for reading back provenance, and the store call carries the row being
+    written; only the door where they meet can say whether they agree.
+    """
+    _require_text("attachment_id", attachment_id)
+    if observation.attachment_id != attachment_id:
+        raise AttachmentStoreError(
+            f"observation addresses attachment {observation.attachment_id!r}, "
+            f"not {attachment_id!r}"
+        )
+
+
 class _MutableAttachment:
     """Internal cell: one record plus the derived rows of every version."""
 
-    __slots__ = ("postings", "record", "units")
+    __slots__ = ("observations", "postings", "record", "units")
 
     def __init__(self, record: AttachmentRecord) -> None:
         self.record = record
         self.units: dict[tuple[int, int], str] = {}
         self.postings: dict[int, dict[str, tuple[int, ...]]] = {}
+        self.observations: dict[tuple[int, int, int, int], ObservationEnvelope] = {}
 
 
 @dataclass(frozen=True)
@@ -683,6 +751,58 @@ class InMemoryAttachmentStore:
             cell.postings = {}
             cell.record = _attachment(cell.record, indexed=False, updated_at=_now())
 
+    # -- versioned visual observations --
+
+    def record_observation(
+        self, *, attachment_id: str, observation: ObservationEnvelope
+    ) -> ObservationEnvelope:
+        _check_observation_binding(attachment_id, observation)
+        source = _observation_source(observation)
+        with self._lock:
+            cell = self._live_cell(attachment_id)
+            current = max(
+                (
+                    key[3]
+                    for key in cell.observations
+                    if key[:3] == source
+                ),
+                default=0,
+            )
+            if observation.observation_version < current:
+                raise AttachmentStoreError(
+                    f"observation version {observation.observation_version} is "
+                    f"stale for source {source}: version {current} is already "
+                    "on record"
+                )
+            cell.observations[
+                (
+                    source[0],
+                    source[1],
+                    source[2],
+                    observation.observation_version,
+                )
+            ] = observation
+            cell.record = _attachment(cell.record, updated_at=_now())
+            return observation
+
+    def observations(
+        self, attachment_id: str, version: int, unit: int, page: int
+    ) -> tuple[ObservationEnvelope, ...]:
+        _require_version(version)
+        _require_version(unit)
+        _require_version(page)
+        with self._lock:
+            cell = self._owned(attachment_id)
+            # EXIT: an attachment no live thread owns reads back as no
+            # observations, which is what the Postgres cascade guarantees.
+            if cell is None:
+                return ()
+            return tuple(
+                cell.observations[key]
+                for key in sorted(cell.observations)
+                if key[:3] == (version, unit, page)
+            )
+
     # -- publication --
 
     def mark_ready(
@@ -914,6 +1034,32 @@ CREATE TABLE IF NOT EXISTS fin_thread_attachment_index (
 CREATE INDEX IF NOT EXISTS fin_thread_attachment_index_lookup_idx
     ON fin_thread_attachment_index (attachment_id, version);
 
+CREATE TABLE IF NOT EXISTS fin_thread_attachment_observation (
+    attachment_id   TEXT NOT NULL
+        REFERENCES fin_thread_attachment(attachment_id) ON DELETE CASCADE,
+    thread_id       TEXT NOT NULL REFERENCES fin_thread(id) ON DELETE CASCADE,
+    version         INTEGER NOT NULL,
+    unit            INTEGER NOT NULL,
+    page            INTEGER NOT NULL,
+    observation_version INTEGER NOT NULL,
+    coverage_schema_version TEXT NOT NULL,
+    page_image_sha256 TEXT NOT NULL,
+    provider        TEXT NOT NULL,
+    model_version   TEXT NOT NULL,
+    answer_text     TEXT NOT NULL DEFAULT '',
+    scope           TEXT NOT NULL,
+    covered_details TEXT NOT NULL,
+    attempts        TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (attachment_id, version, unit, page, observation_version)
+);
+
+-- Column migration on existing observation tables: pre-answer rows are
+-- provenance-only records, so the column is NULL-safe via the table
+-- default '' and fresh installs get it from the CREATE TABLE above.
+ALTER TABLE fin_thread_attachment_observation
+    ADD COLUMN IF NOT EXISTS answer_text TEXT NOT NULL DEFAULT '';
+
 CREATE TABLE IF NOT EXISTS fin_thread_attachment_tombstone (
     attachment_id   TEXT PRIMARY KEY,
     thread_id       TEXT NOT NULL REFERENCES fin_thread(id) ON DELETE CASCADE,
@@ -929,7 +1075,7 @@ CREATE INDEX IF NOT EXISTS fin_thread_attachment_tombstone_thread_idx
 class PostgresAttachmentStore:
     """psycopg-backed attachment store on the shared ``FIN_CHECKPOINT_URL``.
 
-    Three attachment tables plus the tombstone record, each carrying
+    Four attachment tables plus the tombstone record, each carrying
     ``thread_id`` as an ``ON DELETE CASCADE`` foreign key to ``fin_thread``:
     the cascade is what makes a thread delete atomic across metadata, parsed
     units, and postings, and it is the reason a late derived write can be
@@ -1302,6 +1448,251 @@ class PostgresAttachmentStore:
                 (attachment_id,),
             )
             conn.commit()
+
+    # -- versioned visual observations --
+
+    # THE one column order for the observation row: the INSERT parameter
+    # tuple, the SELECT list, and the decode below all bind through this
+    # name list, so a positional row can never be read against a drifted
+    # column layout.
+    _OBS_COLUMN_NAMES = (
+        "attachment_id",
+        "thread_id",
+        "version",
+        "unit",
+        "page",
+        "observation_version",
+        "coverage_schema_version",
+        "page_image_sha256",
+        "provider",
+        "model_version",
+        "answer_text",
+        "scope",
+        "covered_details",
+        "attempts",
+        "created_at",
+    )
+    _OBS_COLUMNS = ", ".join(_OBS_COLUMN_NAMES)
+
+    @staticmethod
+    def _encode_scope(scope: VisionCrop | None) -> str:
+        if scope is None:
+            return "null"
+        return json.dumps(
+            {
+                "left": float(scope.left),
+                "top": float(scope.top),
+                "right": float(scope.right),
+                "bottom": float(scope.bottom),
+            }
+        )
+
+    @staticmethod
+    def _decode_scope(raw: Any) -> VisionCrop | None:
+        if raw is None:
+            return None
+        return VisionCrop(
+            left=float(raw["left"]),
+            top=float(raw["top"]),
+            right=float(raw["right"]),
+            bottom=float(raw["bottom"]),
+        )
+
+    @classmethod
+    def _encode_observation_payload(
+        cls, observation: ObservationEnvelope
+    ) -> tuple[str, str, str]:
+        """Envelope value types become the three JSON text columns.
+
+        WHY text: the same shape has to survive the driver with and without
+        JSON codecs, and the observation's meaning is owned by
+        :mod:`fin.host.attachment_observations`, not by a column type.
+        """
+        covered = json.dumps(
+            [
+                {
+                    "kind": detail.key.kind,
+                    "target_key": detail.key.target_key,
+                    "scope": json.loads(cls._encode_scope(detail.scope)),
+                }
+                for detail in observation.covered_details
+            ]
+        )
+        attempts = json.dumps(
+            [
+                {
+                    "usage": (
+                        None
+                        if attempt.usage is None
+                        else {
+                            "input_tokens": attempt.usage.input_tokens,
+                            "output_tokens": attempt.usage.output_tokens,
+                            "total_tokens": attempt.usage.total_tokens,
+                        }
+                    ),
+                    "cost": (
+                        None
+                        if attempt.cost is None
+                        else {
+                            "amount": str(attempt.cost.amount),
+                            "currency": attempt.cost.currency,
+                        }
+                    ),
+                }
+                for attempt in observation.attempts
+            ]
+        )
+        return cls._encode_scope(observation.scope), covered, attempts
+
+    @classmethod
+    def _decode_observation_row(cls, row: Sequence[Any]) -> ObservationEnvelope:
+        # WHY zip against ``_OBS_COLUMN_NAMES``: every SELECT of this table
+        # lists that constant, so the row arrives in its order and each value
+        # is read under its own name — a schema reorder fails loudly on a
+        # missing key instead of silently reading the wrong column.
+        values = dict(zip(cls._OBS_COLUMN_NAMES, row))
+        scope = cls._decode_scope(json.loads(str(values["scope"])))
+        covered_details = tuple(
+            CoveredDetail(
+                key=DetailKey(
+                    kind=item["kind"],
+                    target_key=item["target_key"],
+                ),
+                scope=cls._decode_scope(item["scope"]),
+            )
+            for item in json.loads(str(values["covered_details"]))
+        )
+        attempts = tuple(
+            ObservationAttempt(
+                usage=(
+                    None
+                    if item["usage"] is None
+                    else VisionUsage(
+                        input_tokens=item["usage"]["input_tokens"],
+                        output_tokens=item["usage"]["output_tokens"],
+                        total_tokens=item["usage"]["total_tokens"],
+                    )
+                ),
+                cost=(
+                    None
+                    if item["cost"] is None
+                    else VisionCost(
+                        amount=Decimal(str(item["cost"]["amount"])),
+                        currency=item["cost"]["currency"],
+                    )
+                ),
+            )
+            for item in json.loads(str(values["attempts"]))
+        )
+        return ObservationEnvelope(
+            attachment_id=str(values["attachment_id"]),
+            coverage_schema_version=str(values["coverage_schema_version"]),
+            observation_version=int(values["observation_version"]),
+            attachment_version=int(values["version"]),
+            source_unit=int(values["unit"]),
+            page=int(values["page"]),
+            page_image_sha256=str(values["page_image_sha256"]),
+            provider=str(values["provider"]),
+            model_version=str(values["model_version"]),
+            scope=scope,
+            covered_details=covered_details,
+            attempts=attempts,
+            answer_text=str(values["answer_text"]),
+            created_at=values["created_at"],
+        )
+
+    def record_observation(
+        self, *, attachment_id: str, observation: ObservationEnvelope
+    ) -> ObservationEnvelope:
+        _check_observation_binding(attachment_id, observation)
+        scope_json, covered_json, attempts_json = self._encode_observation_payload(
+            observation
+        )
+        with self._connect() as conn:
+            try:
+                # WHY the touch first, exactly like units and postings: it is
+                # the arbitration point, so an observation from an inspection
+                # that raced the delete is discarded rather than persisted.
+                thread_id = self._touch(conn, attachment_id, indexed=None)
+                current = conn.execute(
+                    "SELECT max(observation_version) FROM fin_thread_attachment_observation "
+                    "WHERE attachment_id = %s AND version = %s AND unit = %s "
+                    "AND page = %s",
+                    (
+                        attachment_id,
+                        observation.attachment_version,
+                        observation.source_unit,
+                        observation.page,
+                    ),
+                ).fetchone()[0]
+                current = 0 if current is None else int(current)
+                if observation.observation_version < current:
+                    conn.rollback()
+                    raise AttachmentStoreError(
+                        f"observation version {observation.observation_version} "
+                        f"is stale for attachment {attachment_id!r}: version "
+                        f"{current} is already on record"
+                    )
+                conn.execute(
+                    "INSERT INTO fin_thread_attachment_observation "
+                    f"({self._OBS_COLUMNS}) "
+                    "VALUES ("
+                    + ", ".join(["%s"] * len(self._OBS_COLUMN_NAMES))
+                    + ") "
+                    "ON CONFLICT (attachment_id, version, unit, page, "
+                    "observation_version) DO UPDATE SET "
+                    "coverage_schema_version = EXCLUDED.coverage_schema_version, "
+                    "page_image_sha256 = EXCLUDED.page_image_sha256, "
+                    "provider = EXCLUDED.provider, "
+                    "model_version = EXCLUDED.model_version, "
+                    "answer_text = EXCLUDED.answer_text, "
+                    "scope = EXCLUDED.scope, "
+                    "covered_details = EXCLUDED.covered_details, "
+                    "attempts = EXCLUDED.attempts, "
+                    "created_at = EXCLUDED.created_at",
+                    # WHY the tuple is ordered by ``_OBS_COLUMN_NAMES``:
+                    # the column list and the placeholders above are derived
+                    # from that one constant, so this is the only place a
+                    # value could drift and it is visible per name.
+                    (
+                        attachment_id,
+                        thread_id,
+                        observation.attachment_version,
+                        observation.source_unit,
+                        observation.page,
+                        observation.observation_version,
+                        observation.coverage_schema_version,
+                        observation.page_image_sha256,
+                        observation.provider,
+                        observation.model_version,
+                        observation.answer_text,
+                        scope_json,
+                        covered_json,
+                        attempts_json,
+                        observation.created_at,
+                    ),
+                )
+                conn.commit()
+            except psycopg.errors.ForeignKeyViolation as exc:
+                raise self._gone(attachment_id) from exc
+        return observation
+
+    def observations(
+        self, attachment_id: str, version: int, unit: int, page: int
+    ) -> tuple[ObservationEnvelope, ...]:
+        _require_version(version)
+        _require_version(unit)
+        _require_version(page)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {self._OBS_COLUMNS} FROM fin_thread_attachment_observation "
+                "WHERE attachment_id = %s AND version = %s AND unit = %s "
+                "AND page = %s ORDER BY observation_version ASC",
+                (attachment_id, version, unit, page),
+            ).fetchall()
+            # EXIT: a source with no observation, or one already cascaded
+            # away with its thread or attachment, reads back empty.
+            return tuple(self._decode_observation_row(row) for row in rows)
 
     # -- publication --
 
