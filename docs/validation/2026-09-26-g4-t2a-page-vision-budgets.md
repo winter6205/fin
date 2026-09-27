@@ -30,6 +30,27 @@ spare call for a retried full-page scan and `88` must rise before T2e can retry
 one (*Leftovers* 9, T2e). Both facts belong to whoever lowers these numbers, so
 they are stated in the `.env.example` block as well as here.
 
+### Decision follow-up — 2026-09-27 ([issue #308](https://github.com/winter6205/fin/issues/308))
+
+This follow-up supersedes the open T2e decisions below; the original `88` value
+and calculations remain the historical T2a record.
+
+- **Observation reuse:** persist structured coverage details and image scope.
+  During the current run, the host reads the stored observation and decides
+  whether known coverage answers the requested detail; unknown or uncovered
+  detail triggers another inspection. T2e implements this host-side predicate.
+- **Retry budget:** allow one retryable full-page transport retry per run. At
+  80 pages plus 8 crop calls, set the policy allowance to `89`; keep the crop
+  sub-cap at `8`. T2e counts retries in the run total and enforces the
+  one-retry limit. `89` is a
+  policy allowance, not measured demand or a shipped setting; it supersedes `88`
+  as the deployment target.
+- **Vision configuration:** reuse `FIN_MODEL`, `FIN_BASE_URL`, and
+  `FIN_API_KEY` through the vision-specific port.
+- **Monetary ceiling:** deferred. T2e records provider usage and any reported
+  cost, marking cost unavailable when omitted, without enforcing a per-turn
+  monetary limit.
+
 **These values are provisional, not a shipped default.** One of the three gold
 cases has no committed pipeline measurement here — the bare PNG, which the
 harness's PDF-only input path refuses (*Gold cases under the pinned

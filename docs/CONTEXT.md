@@ -170,11 +170,15 @@ Durable, idempotent work keyed by attachment content version that begins when an
 _Avoid_: upload-time parse, per-turn duplicate parse, background corpus ingest
 
 **visual observation**:
-A persisted, versioned description or structured result from fin's configured vision model inspecting an original attachment page or crop. It is derived search material tied to the attachment version and original image location, never source text or a verbatim quote (ADR 0089).
+A persisted, versioned description from fin's configured vision model, bound to an original attachment page or crop and carrying structured coverage of inspected scope and visual detail. It is derived search material tied to the attachment version and original image location, never source text or a verbatim quote (ADR 0089).
 _Avoid_: OCR text, source quote, unproven model recollection
 
+**observation coverage**:
+A versioned structured record that binds each covered visual detail to its inspected whole-page or crop scope and complete target; a numeric value's target includes its chart, series, and category identity, or an equivalent complete identity. After the grounded model names a required complete target and region and the current run reads the observation, the host reuses it only on a deterministic coverage match; an unknown or incomplete target or region, or missing coverage, requires inspection of the stored original.
+_Avoid_: whole-page scope as proof every chart is covered, treating only a chart, series, or category as a complete numeric target, treating one value as coverage of an entire chart, inferred coverage, model-declared sufficiency, conversation-memory coverage
+
 **visual evidence**:
-A current-run reference proving that the run explicitly retrieved or read a matching persisted **visual observation**, with provenance to the original attachment version, source unit, physical page, and crop when available. A later run reads and reuses a sufficient stored observation without uploading the attachment again or repeating vision; a question needing detail absent from it triggers inspection of the stored original image and a new observation version (ADR 0089).
+A current-run reference proving that the run explicitly retrieved or read a matching persisted **visual observation**, with provenance to the original attachment version, source unit, physical page, and crop when available. The host checks **observation coverage** against the requested target and region after that read; sufficient coverage can be reused without uploading the attachment again or repeating vision, while unknown or missing coverage triggers inspection of the stored original and a new observation version (ADR 0089).
 _Avoid_: model conversation memory, generated source quote, re-upload as citation, bare vision response without persisted provenance
 
 **corpus ingest**:
