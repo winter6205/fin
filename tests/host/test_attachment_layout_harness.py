@@ -399,7 +399,7 @@ def test_a_staged_copy_is_cleaned_up_even_when_the_pass_is_capped(tmp_path):
 
 @pytest.mark.parametrize(
     "break_at",
-    ["close", "copy"],
+    ["close", "copy", "unlink"],
 )
 def test_a_staged_copy_that_could_not_be_written_leaves_nothing_behind(
     tmp_path, monkeypatch, break_at
@@ -410,9 +410,17 @@ def test_a_staged_copy_that_could_not_be_written_leaves_nothing_behind(
     outside = tmp_path / "attachment.pdf"
     outside.write_bytes(GOLD_MIXED.read_bytes())
     staging = REPO_ROOT / STAGING_NAME
+    # Start from no staged copies: these cases assert on this directory's
+    # contents, and a case that fails before its own cleanup would otherwise
+    # leak a staged copy into the next parametrization. Removing the copies
+    # (not the directory) keeps a later test's "staging dir does not exist"
+    # assertion about the directory itself intact.
+    for leftover in staging.glob("attachment-*.pdf"):
+        leftover.unlink(missing_ok=True)
     calls: list[str] = []
     real_close = os.close
     real_copyfile = shutil.copyfile
+    real_unlink = os.unlink
 
     def spy_close(fd):
         calls.append("close")
@@ -423,12 +431,25 @@ def test_a_staged_copy_that_could_not_be_written_leaves_nothing_behind(
 
     def spy_copyfile(src, dst, **kwargs):
         calls.append("copy")
-        if break_at == "copy":
+        if break_at in ("copy", "unlink"):
+            # "unlink" is the double-failure case: the copy itself is refused,
+            # and the best-effort cleanup inside the ``except BaseException``
+            # arm is refused too, so that inner ``except OSError`` arm runs.
             raise OSError("disk refused the copy")
         return real_copyfile(src, dst, **kwargs)
 
+    def spy_unlink(path, *args, **kwargs):
+        calls.append("unlink")
+        if break_at == "unlink":
+            raise OSError("directory refused the cleanup")
+        return real_unlink(path, *args, **kwargs)
+
     monkeypatch.setattr(os, "close", spy_close)
     monkeypatch.setattr(shutil, "copyfile", spy_copyfile)
+    # ``Path.unlink`` routes through ``os.unlink``; breaking that models a
+    # staging directory that refuses the best-effort cleanup inside the
+    # ``except BaseException`` arm of ``_stage``.
+    monkeypatch.setattr(os, "unlink", spy_unlink)
 
     with pytest.raises(HeronStagingRefusedError):
         MeasuredHarnessRunner(spawn=_StubSpawn(stdout=MEASURED_OK)).read_record(
@@ -437,7 +458,21 @@ def test_a_staged_copy_that_could_not_be_written_leaves_nothing_behind(
         )
 
     assert break_at in calls
-    assert not list(staging.glob("attachment-*.pdf"))
+    if break_at == "unlink":
+        # The double-failure case deliberately leaves the staged copy behind:
+        # the cleanup inside the ``except BaseException`` arm is itself refused,
+        # and the typed staging failure (not a bare OSError) is what surfaces.
+        # The whole point is that the leak is recorded, not silently cleaned.
+        leftover = list(staging.glob("attachment-*.pdf"))
+        assert leftover, "double-failure case must leave the staged copy it could not destroy"
+    else:
+        assert not list(staging.glob("attachment-*.pdf"))
+    # Clean up with the real unlink: this case may have replaced ``os.unlink``
+    # with a spy, and ``shutil.rmtree`` deletes through that same name, so
+    # rmtree would silently fail to remove the copies this test just staged.
+    # Restore only that one name; a blanket monkeypatch.undo() also rolls back
+    # patches the surrounding test session owns.
+    monkeypatch.setattr(os, "unlink", real_unlink)
     shutil.rmtree(staging, ignore_errors=True)
 
 
