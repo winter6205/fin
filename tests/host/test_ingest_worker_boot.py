@@ -21,6 +21,10 @@ that makes it run inside a real boot:
   running (chosen posture: keep the loop, never silent thread death);
 * ``serve()`` starts the drain before it binds and stops it after the
   server returns.
+* the ready landing performs the index-job submit handoff through the
+  process-shared tracker, a boot resume re-submits a ready-but-untracked
+  job without re-pushing, and an un-injected start wires the env-default
+  tracker + path-backed ledger the status route also reads.
 
 Everything runs on the in-memory ports and a tmp journal dir: hermetic,
 and the default suite never spawns the thread except in the tests that
@@ -39,16 +43,19 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from fin.corpus.index_job import IndexJobLedger, IndexJobTracker
 from fin.corpus.ingest_endpoint import IngestEndpoint
 from fin.corpus.ingest_state import InMemoryIngestStateStore, IngestState
 from fin.corpus.metadata_store import InMemoryMetadataStore
 from fin.corpus.object_store import InMemoryObjectStore, ObjectPointer
 from fin.host import workspace_http
 from fin.host.workspace_http import (
+    get_index_job_tracker,
     get_ingest_service,
     start_ingest_worker,
     stop_ingest_worker,
 )
+from fin.retrieve.fake_index_job_port import FakeIndexJobPort
 from fin.retrieve.fake_push_port import FakePushPort
 
 _MD_BYTES = (
@@ -83,10 +90,21 @@ class _RecordingObjectStore(InMemoryObjectStore):
 
 
 class _Stack:
-    def __init__(self, endpoint: IngestEndpoint, objects: Any, states: Any) -> None:
+    def __init__(
+        self,
+        endpoint: IngestEndpoint,
+        objects: Any,
+        states: Any,
+        index_port: FakeIndexJobPort,
+        index_tracker: IndexJobTracker,
+        index_ledger: IndexJobLedger,
+    ) -> None:
         self.endpoint = endpoint
         self.objects = objects
         self.states = states
+        self.index_port = index_port
+        self.index_tracker = index_tracker
+        self.index_ledger = index_ledger
 
 
 def _fresh_endpoint() -> _Stack:
@@ -100,7 +118,15 @@ def _fresh_endpoint() -> _Stack:
         metadata_store=InMemoryMetadataStore(),
         state_store=states,
     )
-    return _Stack(endpoint, objects, states)
+    # The contract fake index-job port over an in-process ledger: the
+    # boot tests pin that the drain performs the submit handoff and the
+    # route reads the same tracker, without reaching a live service.
+    index_port = FakeIndexJobPort()
+    index_ledger = IndexJobLedger()
+    index_tracker = IndexJobTracker(index_port, index_ledger)
+    return _Stack(
+        endpoint, objects, states, index_port, index_tracker, index_ledger
+    )
 
 
 @pytest.fixture
@@ -119,7 +145,21 @@ def client(http_app: FastAPI) -> TestClient:
 def _install(http_app: FastAPI) -> _Stack:
     stack = _fresh_endpoint()
     http_app.dependency_overrides[get_ingest_service] = lambda: stack.endpoint
+    http_app.dependency_overrides[get_index_job_tracker] = (
+        lambda: stack.index_tracker
+    )
     return stack
+
+
+def _start(stack: _Stack, journal_dir: Path, **kwargs: Any) -> Any:
+    """Start the boot worker over the stack's fake index-job wiring."""
+    return start_ingest_worker(
+        endpoint=stack.endpoint,
+        journal_dir=journal_dir,
+        index_job_tracker=stack.index_tracker,
+        index_job_ledger=stack.index_ledger,
+        **kwargs,
+    )
 
 
 def _post(client: TestClient) -> Any:
@@ -179,8 +219,8 @@ def test_start_is_idempotent_and_stop_joins_cleanly(
     stack = _fresh_endpoint()
     journals = tmp_path / "journals"
 
-    first = start_ingest_worker(endpoint=stack.endpoint, journal_dir=journals)
-    second = start_ingest_worker(endpoint=stack.endpoint, journal_dir=journals)
+    first = _start(stack, journals)
+    second = _start(stack, journals)
 
     assert second is first
     assert first.name == WORKER_THREAD_NAME
@@ -189,7 +229,7 @@ def test_start_is_idempotent_and_stop_joins_cleanly(
     assert not first.is_alive()
     # After a stop, starting again is allowed (the restart leg of a
     # long-lived process): a fresh thread, not the dead one.
-    third = start_ingest_worker(endpoint=stack.endpoint, journal_dir=journals)
+    third = _start(stack, journals)
     assert third is not first
     assert third.is_alive()
     stop_ingest_worker(timeout=10.0)
@@ -205,9 +245,9 @@ def test_boot_drain_drives_an_http_queued_job_to_ready(
     submission = _post(client).json()
     assert submission["state"] == "pending"
 
-    start_ingest_worker(
-        endpoint=stack.endpoint,
-        journal_dir=tmp_path / "journals",
+    _start(
+        stack,
+        tmp_path / "journals",
         check_interval_seconds=60.0,
     )
 
@@ -217,6 +257,12 @@ def test_boot_drain_drives_an_http_queued_job_to_ready(
     # The bytes were fetched through the durable pointer, never
     # re-supplied: the object store saw exactly the accept-time write.
     assert len(stack.objects.puts) == 1
+    # The same drain performed the index-job handoff, and the status
+    # route reads it through the one shared tracker: the graph face is
+    # the submitted jobs' polled pass-through, never a fin claim.
+    assert body["graph"] is not None
+    assert body["graph"]["jobs"], body["graph"]
+    assert stack.index_port.submit_calls == len(body["graph"]["jobs"])
 
 
 def test_fresh_worker_resumes_an_interrupted_job_without_reupload(
@@ -229,15 +275,53 @@ def test_fresh_worker_resumes_an_interrupted_job_without_reupload(
     stack.states.transition(JOB, IngestState.FETCHING)
     stack.states.transition(JOB, IngestState.EXTRACTING)
 
-    start_ingest_worker(
-        endpoint=stack.endpoint,
-        journal_dir=tmp_path / "journals",
+    _start(
+        stack,
+        tmp_path / "journals",
         check_interval_seconds=60.0,
     )
 
     body = _wait_for_state(client, "ready")
     assert body["text_ready"] is True
     assert len(stack.objects.puts) == 1
+
+
+def test_boot_resume_submits_a_ready_but_untracked_job_without_repush(
+    http_app: FastAPI, client: TestClient, tmp_path: Path
+) -> None:
+    """The index-job resume edge at the boot level.
+
+    A previous process landed the text but died before the submit (no
+    ledger entries). The boot drain must re-attempt the submit from the
+    durable ready-edge pair map — no re-run, no re-push (object writes
+    and push-port count stay at the accept's) — and the status door
+    then passes the job state through.
+    """
+    stack = _install(http_app)
+    _post(client)
+    untracked = workspace_http.IngestWorker(
+        stack.endpoint, journal_dir=tmp_path / "dead-process-journals"
+    )
+    assert [
+        outcome.state
+        for outcome in untracked.run_pending()
+    ] == [IngestState.READY]
+    assert stack.index_port.submit_calls == 0
+    pushed_before = stack.endpoint._push_port.written_total()
+
+    _start(
+        stack,
+        tmp_path / "journals",
+        check_interval_seconds=60.0,
+    )
+
+    body = _wait_for_state(client, "ready")
+    assert body["text_ready"] is True
+    graph = body["graph"]
+    assert graph is not None and graph["jobs"], body
+    assert stack.index_port.submit_calls == len(graph["jobs"])
+    assert len(stack.objects.puts) == 1
+    assert stack.endpoint._push_port.written_total() == pushed_before
 
 
 # ----- drain-failure posture --------------------------------------------
@@ -294,6 +378,7 @@ class _GatedWorkerFactory:
         self.release = threading.Event()
 
     def __call__(self, endpoint: Any, **kwargs: Any) -> "_GatedWorkerFactory":
+        self.init_kwargs = kwargs
         return self
 
     def run_pending(self) -> None:
@@ -325,14 +410,14 @@ def test_start_after_timed_out_stop_refuses_until_old_thread_dies(
     stack = _fresh_endpoint()
     journals = tmp_path / "journals"
 
-    first = start_ingest_worker(endpoint=stack.endpoint, journal_dir=journals)
+    first = _start(stack, journals)
     assert gated.entered.wait(10.0)
 
     stop_ingest_worker(timeout=0.1)  # thread is gated mid-sweep: join times out
     assert first.is_alive()
 
     with pytest.raises(workspace_http.IngestWorkerStoppingError):
-        start_ingest_worker(endpoint=stack.endpoint, journal_dir=journals)
+        _start(stack, journals)
     assert _live_worker_threads() == [first]
 
     gated.release.set()
@@ -341,7 +426,7 @@ def test_start_after_timed_out_stop_refuses_until_old_thread_dies(
         time.sleep(0.02)
     assert not first.is_alive()
 
-    second = start_ingest_worker(endpoint=stack.endpoint, journal_dir=journals)
+    second = _start(stack, journals)
     assert second is not first
     assert _live_worker_threads() == [second]
     stop_ingest_worker(timeout=10.0)
@@ -357,13 +442,52 @@ def test_clean_stop_still_allows_restart(
     stack = _fresh_endpoint()
     journals = tmp_path / "journals"
 
-    first = start_ingest_worker(endpoint=stack.endpoint, journal_dir=journals)
+    first = _start(stack, journals)
     stop_ingest_worker(timeout=10.0)
     assert not first.is_alive()
 
-    second = start_ingest_worker(endpoint=stack.endpoint, journal_dir=journals)
+    second = _start(stack, journals)
     assert second is not first
     assert second.is_alive()
+    stop_ingest_worker(timeout=10.0)
+
+
+# ----- the boot's index-job wiring ---------------------------------------
+
+
+def test_start_without_injection_takes_the_process_shared_index_job_tracker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Requirement-level pin: worker and route share one tracker.
+
+    A start that injects no tracker resolves the process singleton —
+    the env-selected port (fake boot: the contract fake, no network)
+    and the ledger path-backed beside the other ingest journals — and
+    hands the same pair to the worker that :func:`get_index_job_tracker`
+    answers with, so a submit the worker makes is what the status route
+    reads.
+    """
+    monkeypatch.setattr(workspace_http, "_index_job_singleton", None)
+    monkeypatch.setenv("FIN_RETRIEVE_ADAPTER", "fake")
+    monkeypatch.setenv(
+        "FIN_CORPUS_INDEX_JOB_LEDGER_PATH",
+        str(tmp_path / "index_jobs.jsonl"),
+    )
+    gated = _GatedWorkerFactory()
+    gated.release.set()
+    monkeypatch.setattr(workspace_http, "IngestWorker", gated)
+    stack = _fresh_endpoint()
+
+    start_ingest_worker(
+        endpoint=stack.endpoint, journal_dir=tmp_path / "journals"
+    )
+
+    tracker, ledger = workspace_http._get_index_job_components()
+    assert gated.init_kwargs["index_job_tracker"] is tracker
+    assert gated.init_kwargs["index_job_ledger"] is ledger
+    assert workspace_http.get_index_job_tracker() is tracker
+    assert isinstance(tracker._port, FakeIndexJobPort)  # type: ignore[attr-defined]
+    assert ledger.path == tmp_path / "index_jobs.jsonl"
     stop_ingest_worker(timeout=10.0)
 
 

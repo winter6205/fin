@@ -36,6 +36,7 @@ from fin.host.workspace_http import (
     _build_default_ingest_service,
     _ingest_components,
 )
+from fin.retrieve.fake_index_job_port import FakeIndexJobPort
 from fin.retrieve.fake_push_port import FakePushPort
 
 _V1_TEXT = (
@@ -61,6 +62,10 @@ def _journal_env(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv(
         "FIN_CORPUS_INVALIDATION_LEDGER_PATH",
         str(tmp_path / "invalidation_ledger.jsonl"),
+    )
+    monkeypatch.setenv(
+        "FIN_CORPUS_INDEX_JOB_LEDGER_PATH",
+        str(tmp_path / "index_jobs.jsonl"),
     )
 
 
@@ -139,6 +144,7 @@ def test_components_default_to_the_visible_catalog_dir(
         "FIN_CORPUS_PUSH_JOURNAL_PATH",
         "FIN_CORPUS_INVALIDATION_LEDGER_PATH",
         "FIN_CORPUS_PUSHED_RECORDS_PATH",
+        "FIN_CORPUS_INDEX_JOB_LEDGER_PATH",
     ):
         monkeypatch.delenv(name, raising=False)
     catalog = tmp_path / "catalog.json"
@@ -150,21 +156,29 @@ def test_components_default_to_the_visible_catalog_dir(
         tmp_path / "invalidation_ledger.jsonl"
     )
     assert components["pushed_records_path"] == tmp_path / "pushed_records.jsonl"
+    # The index-job ledger joins the visible data dir: submitted job
+    # ids are restart state like every other ingest journal.
+    assert components["index_job_ledger_path"] == (
+        tmp_path / "index_jobs.jsonl"
+    )
 
 
 def test_components_honor_configured_paths(monkeypatch, tmp_path) -> None:
     journal = tmp_path / "j.jsonl"
     ledger = tmp_path / "l.jsonl"
     records = tmp_path / "r.jsonl"
+    index_jobs = tmp_path / "i.jsonl"
     monkeypatch.setenv("FIN_CORPUS_PUSH_JOURNAL_PATH", str(journal))
     monkeypatch.setenv("FIN_CORPUS_INVALIDATION_LEDGER_PATH", str(ledger))
     monkeypatch.setenv("FIN_CORPUS_PUSHED_RECORDS_PATH", str(records))
+    monkeypatch.setenv("FIN_CORPUS_INDEX_JOB_LEDGER_PATH", str(index_jobs))
 
     components = _ingest_components(catalog_path=tmp_path / "catalog.json")
 
     assert components["push_journal_path"] == journal
     assert components["invalidation_ledger_path"] == ledger
     assert components["pushed_records_path"] == records
+    assert components["index_job_ledger_path"] == index_jobs
 
 
 # ----- service build -------------------------------------------------------
@@ -176,6 +190,45 @@ def test_booting_the_service_writes_nothing(tmp_path, monkeypatch) -> None:
     _build_default_ingest_service()
 
     assert list(tmp_path.iterdir()) == []
+
+
+def test_booting_the_index_job_tracker_writes_nothing(tmp_path, monkeypatch) -> None:
+    _journal_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("FIN_RETRIEVE_ADAPTER", "fake")
+    monkeypatch.setattr(werkplace_http, "_index_job_singleton", None)
+
+    tracker, ledger = werkplace_http._get_index_job_components()
+
+    assert list(tmp_path.iterdir()) == []
+    # One process-wide pair: the worker's hook and the status route's
+    # dependency resolve to the same tracker and the same ledger.
+    assert werkplace_http.get_index_job_tracker() is tracker
+    assert werkplace_http._get_index_job_components() == (tracker, ledger)
+    assert ledger.path == tmp_path / "index_jobs.jsonl"
+
+
+def test_index_job_port_follows_the_adapter_kind_in_both_boots(
+    tmp_path, monkeypatch
+) -> None:
+    """Fake boot gets the contract fake; the product boot gets the MCP
+    stdio adapter on the same default command config as the push port —
+    selected the same way the service selects its push face, and built
+    without ever reaching the service."""
+    from fin.corpus.index_job import IndexJobTracker
+    from fin.retrieve.mcp_index_job_port import MCPIndexJobPort
+
+    _journal_env(monkeypatch, tmp_path)
+
+    monkeypatch.setattr(werkplace_http, "_index_job_singleton", None)
+    monkeypatch.setenv("FIN_RETRIEVE_ADAPTER", "fake")
+    tracker, _ledger = werkplace_http._get_index_job_components()
+    assert isinstance(tracker, IndexJobTracker)
+    assert isinstance(tracker._port, FakeIndexJobPort)  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(werkplace_http, "_index_job_singleton", None)
+    monkeypatch.setenv("FIN_RETRIEVE_ADAPTER", "mcp")
+    tracker, _ledger = werkplace_http._get_index_job_components()
+    assert isinstance(tracker._port, MCPIndexJobPort)  # type: ignore[attr-defined]
 
 
 def test_wired_service_exposes_the_three_seams(tmp_path, monkeypatch) -> None:

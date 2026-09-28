@@ -213,8 +213,10 @@ from fin.corpus.ingest_endpoint import (
     IngestObjectCleanupError,
     IngestUploadTooLargeError,
 )
+from fin.corpus.ingest_state import IngestState
 from fin.corpus.ingest_state_errors import UnknownJobError
 from fin.corpus.ingest_worker import IngestWorker
+from fin.corpus.index_job import INDEX_JOBS_FILE, IndexJobLedger, IndexJobTracker
 from fin.corpus.ocr import TesseractEngine
 from fin.corpus.parsers import (
     NullLayout,
@@ -2279,10 +2281,12 @@ def _record_ingested_filing(doc: IngestedDocument) -> None:
         )
 
 
-# The three durable append-only journals the ingest service owns between
+# The durable append-only journals the ingest service owns between
 # pushes: the push batch journal (resume across processes), the
-# invalidation ledger (settled closures), and the pushed-record journal
-# (what a replacement upload must close). Each defaults to the catalog's
+# invalidation ledger (settled closures), the pushed-record journal
+# (what a replacement upload must close), and the index-job ledger (the
+# submitted iknow job per pushed pair, the restart handle for polling).
+# Each defaults to the catalog's
 # own data dir — the visible ``data/corpus`` the ``GET /api/corpus``
 # route reads — and each is individually relocatable by env var, so a
 # deployment moves the ingest journals as typed config, never as a
@@ -2291,6 +2295,7 @@ def _record_ingested_filing(doc: IngestedDocument) -> None:
 _PUSH_JOURNAL_PATH_ENV: Final[str] = "FIN_CORPUS_PUSH_JOURNAL_PATH"
 _INVALIDATION_LEDGER_PATH_ENV: Final[str] = "FIN_CORPUS_INVALIDATION_LEDGER_PATH"
 _PUSHED_RECORDS_PATH_ENV: Final[str] = "FIN_CORPUS_PUSHED_RECORDS_PATH"
+_INDEX_JOB_LEDGER_PATH_ENV: Final[str] = "FIN_CORPUS_INDEX_JOB_LEDGER_PATH"
 
 
 def _configured_journal_path(env_var: str, default: Path) -> Path:
@@ -2299,7 +2304,7 @@ def _configured_journal_path(env_var: str, default: Path) -> Path:
 
 
 def _ingest_components(*, catalog_path: Path | None = None) -> dict[str, Path]:
-    """Where the three durable ingest journals live.
+    """Where the four durable ingest journals live.
 
     The default sits beside the catalog (``DEFAULT_CATALOG_PATH``'s
     parent) so one visible data dir holds all ingest state; an env var
@@ -2317,6 +2322,9 @@ def _ingest_components(*, catalog_path: Path | None = None) -> dict[str, Path]:
         ),
         "pushed_records_path": _configured_journal_path(
             _PUSHED_RECORDS_PATH_ENV, data_dir / "pushed_records.jsonl"
+        ),
+        "index_job_ledger_path": _configured_journal_path(
+            _INDEX_JOB_LEDGER_PATH_ENV, data_dir / INDEX_JOBS_FILE
         ),
     }
 
@@ -2401,6 +2409,12 @@ def _build_default_ingest_service() -> IngestEndpoint:
     documented no-op; with it a shipped boot closes the superseded
     version's blocks on every replacement upload.
 
+    The index-job half of the handoff is deliberately NOT built here:
+    the tracker and its ledger are the process singleton behind
+    :func:`get_index_job_tracker`, shared by the boot worker's submit
+    hook and the status route's graph pass-through, so one round of
+    ledger writes answers both doors.
+
     Both kinds wire ``on_ingested`` to :func:`_record_ingested_filing`
     so a pushed filing is registered in the same catalog table the
     ``GET /api/corpus`` route lists — a fake boot is a real product
@@ -2465,6 +2479,63 @@ def get_ingest_service() -> IngestEndpoint:
         if _ingest_service_singleton is None:
             _ingest_service_singleton = _build_default_ingest_service()
         return _ingest_service_singleton
+
+
+# The one index-job tracker per process: the worker's submit hook and
+# the status route's graph pass-through must read and write the same
+# durable ledger, so both doors reach it through this singleton the
+# same way they reach the ingest endpoint service.
+_index_job_singleton: tuple[IndexJobTracker, IndexJobLedger] | None = None
+_index_job_lock = threading.Lock()
+
+
+def _build_default_index_job_components() -> tuple[IndexJobTracker, IndexJobLedger]:
+    """Build the env-selected index-job tracker and its ledger.
+
+    The port selection mirrors both the retrieve adapter's and the
+    ingest service's (fake boot = observable in-process contract fake,
+    product boot = the MCP stdio adapter on the same
+    ``DEFAULT_MCP_COMMAND`` configuration the push and invalidation
+    adapters use). The ledger is path-backed beside the other durable
+    ingest journals — the submitted ``job_id``s are exactly what a
+    restart re-polls instead of re-pushing. The MCP adapter import is
+    lazy for the same reason the push adapters are: the workspace
+    import surface stays free of the stdio transport until an
+    index-job call actually happens. Building writes nothing.
+    """
+    components = _ingest_components()
+    ledger = IndexJobLedger(path=components["index_job_ledger_path"])
+    if resolve_retrieve_adapter_kind() == "fake":
+        from fin.retrieve.fake_index_job_port import FakeIndexJobPort
+
+        port: Any = FakeIndexJobPort()
+    else:
+        from fin.retrieve.mcp_index_job_port import MCPIndexJobPort
+
+        port = MCPIndexJobPort()
+    return IndexJobTracker(port, ledger), ledger
+
+
+def _get_index_job_components() -> tuple[IndexJobTracker, IndexJobLedger]:
+    global _index_job_singleton
+    with _index_job_lock:
+        if _index_job_singleton is None:
+            _index_job_singleton = _build_default_index_job_components()
+        return _index_job_singleton
+
+
+def get_index_job_tracker() -> IndexJobTracker:
+    """FastAPI dependency returning the process's index-job tracker.
+
+    Tests override this via
+    ``app.dependency_overrides[get_index_job_tracker]`` to inject a
+    tracker over ``FakeIndexJobPort``. Production gets the env-selected
+    tracker from ``_build_default_index_job_components``, built once
+    per process and shared with the ingest worker (the tracker is
+    read-only for the route: its poll is the designed pure-read path).
+    """
+    tracker, _ledger = _get_index_job_components()
+    return tracker
 
 
 # The durable ingest queue's execution side: one drain loop per process,
@@ -2540,6 +2611,8 @@ def start_ingest_worker(
     endpoint: IngestEndpoint | None = None,
     journal_dir: Path | None = None,
     check_interval_seconds: float | None = None,
+    index_job_tracker: IndexJobTracker | None = None,
+    index_job_ledger: IndexJobLedger | None = None,
 ) -> threading.Thread:
     """Start the process's single durable ingest drain (idempotent).
 
@@ -2548,7 +2621,11 @@ def start_ingest_worker(
     endpoint is injected)
     discovers every resumable job from the durable state store and
     drives it — queued, failed and interrupted jobs alike, with no
-    re-upload. Calling this again while the loop is alive returns the
+    re-upload. The worker takes the same process-wide index-job tracker
+    the status route reads (unless one is injected), so a submit it
+    makes is immediately observable through ``GET
+    /api/corpus/ingest/{job_id}``. Calling this again while the loop is
+    alive returns the
     existing thread without building a second worker (one executor per
     process; the claim CAS still guards two processes). A live thread
     whose stop_event is already set is a timed-out stop still draining:
@@ -2571,6 +2648,8 @@ def start_ingest_worker(
                     "timed out); start again once its thread exits"
                 )
             return current
+        if index_job_tracker is None and index_job_ledger is None:
+            index_job_tracker, index_job_ledger = _get_index_job_components()
         service = endpoint if endpoint is not None else get_ingest_service()
         worker = IngestWorker(
             service,
@@ -2579,6 +2658,8 @@ def start_ingest_worker(
                 if journal_dir is not None
                 else _ingest_worker_journal_dir()
             ),
+            index_job_tracker=index_job_tracker,
+            index_job_ledger=index_job_ledger,
         )
         stop_event = threading.Event()
         thread = threading.Thread(
@@ -4738,6 +4819,7 @@ def build_router(
     def corpus_ingest_status(
         job_id: str,
         service: IngestEndpoint = Depends(get_ingest_service),
+        index_job_tracker: IndexJobTracker = Depends(get_index_job_tracker),
     ) -> Response:
         """Poll one ingest job: the PERSISTED state, never a constant.
 
@@ -4748,9 +4830,14 @@ def build_router(
 
         ``text_ready`` is the chunk/text side of the pipeline (the job
         reached ``ready``). ``graph`` is the iknow-memory index-job side,
-        which fin never owns: no fin API may claim corpus-wide graph/C
-        readiness from a push, so this stays ``null`` until the index-job
-        orchestration contract gives fin something to pass through.
+        pass-through only: once the job is text-ready it carries the
+        tracker's polled graph (``null`` before the first submit ever
+        ran, a refused poll keeping the last persisted state beside an
+        ``error`` — never a claim of graph/C readiness derived from
+        anything fin computed). Non-ready jobs carry ``graph: null``.
+        The poll is the tracker's designed pure-read path; a poll that
+        fails outright is reported as ``graph_status_failed`` beside an
+        empty job list, it never turns the status read itself into a 500.
         """
         try:
             status = service.job_status(job_id)
@@ -4761,6 +4848,23 @@ def build_router(
             )
         except Exception as exc:
             return _ingest_error_response(exc)
+        graph: Any = None
+        if status.state is IngestState.READY:
+            try:
+                graph = index_job_tracker.graph_status(status.document_id)
+            except Exception as exc:
+                logger.exception(
+                    "ingest status: graph status poll failed for %s",
+                    status.document_id,
+                )
+                graph = {
+                    "jobs": [],
+                    "community_index_state": None,
+                    "error": {
+                        "code": "graph_status_failed",
+                        "message": str(exc),
+                    },
+                }
         return JSONResponse(
             status_code=200,
             content={
@@ -4771,7 +4875,7 @@ def build_router(
                 "error_type": status.error_type,
                 "error_message": status.error_message,
                 "text_ready": status.text_ready,
-                "graph": None,
+                "graph": graph,
             },
         )
 

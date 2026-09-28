@@ -12,11 +12,13 @@ import queue
 import subprocess
 import threading
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 
-_PROTOCOL_VERSION = "2025-06-18"
-_INITIALIZE_REQUEST_ID = 1
+MCP_PROTOCOL_VERSION = "2025-06-18"
+INITIALIZE_REQUEST_ID = 1
+TOOL_REQUEST_ID = 2
+
 _PROCESS_EOF = object()
 
 
@@ -26,6 +28,100 @@ class MCPStdioTransportError(OSError):
 
 class MCPStdioProtocolError(RuntimeError):
     """The shared MCP process answered with an off-contract frame."""
+
+
+# ----- shared wire primitives for the one-shot stdio adapters -----
+#
+# ``mcp_push_port`` and ``mcp_index_job_port`` drive a spawn-per-call
+# JSON-RPC exchange; the handshake frames, the request-id constants, the
+# response-line parse and the initialize validation are the wire
+# contract itself and live exactly once, here. The adapter keeps its own
+# exception type by translating ``MCPStdioProtocolError`` at the seam.
+
+
+def build_initialize_frame(client_name: str) -> dict[str, Any]:
+    """The ``initialize`` request frame; ``client_name`` is the only
+    per-adapter difference on the wire."""
+    return {
+        "jsonrpc": "2.0",
+        "id": INITIALIZE_REQUEST_ID,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": client_name, "version": "0.1.0"},
+        },
+    }
+
+
+def build_initialized_notification() -> dict[str, Any]:
+    """The ``notifications/initialized`` frame (no ``id``, no reply)."""
+    return {"jsonrpc": "2.0", "method": "notifications/initialized"}
+
+
+def build_tools_call_frame(
+    name: str, arguments: Mapping[str, Any]
+) -> dict[str, Any]:
+    """The ``tools/call`` request frame for one tool invocation."""
+    return {
+        "jsonrpc": "2.0",
+        "id": TOOL_REQUEST_ID,
+        "method": "tools/call",
+        "params": {"name": name, "arguments": dict(arguments)},
+    }
+
+
+def build_handshake_wire(
+    payload: dict[str, Any], *, client_name: str
+) -> bytes:
+    """The ordered initialize / initialized / tools-call frames as
+    newline-delimited JSON, ready for the child's stdin."""
+    return (
+        "\n".join(
+            json.dumps(message)
+            for message in (
+                build_initialize_frame(client_name),
+                build_initialized_notification(),
+                payload,
+            )
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def parse_jsonrpc_response_lines(stdout: bytes) -> list[Any]:
+    """Parse the non-empty JSON-RPC response lines of an MCP stdout."""
+    responses: list[Any] = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            responses.append(json.loads(line.decode("utf-8")))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise MCPStdioProtocolError(
+                f"malformed JSON-RPC response: {exc}"
+            ) from exc
+    return responses
+
+
+def validate_initialize_response(response: Any) -> None:
+    """Validate an initialize response before accepting tool output."""
+    if (
+        not isinstance(response, dict)
+        or response.get("id") != INITIALIZE_REQUEST_ID
+    ):
+        raise MCPStdioProtocolError(
+            f"invalid MCP initialize response: {response!r}"
+        )
+    if "error" in response:
+        raise MCPStdioProtocolError(
+            f"MCP initialize returned JSON-RPC error: "
+            f"{response['error']!r}"
+        )
+    if not isinstance(response.get("result"), dict):
+        raise MCPStdioProtocolError(
+            "MCP initialize response has no result object"
+        )
 
 
 class MCPStdioSession:
@@ -160,25 +256,13 @@ class MCPStdioSession:
             daemon=True,
         ).start()
 
-        initialize = {
-            "jsonrpc": "2.0",
-            "id": _INITIALIZE_REQUEST_ID,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": _PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "fin-live-session", "version": "0.1.0"},
-            },
-        }
-        initialized = {
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-        }
+        initialize = build_initialize_frame("fin-live-session")
+        initialized = build_initialized_notification()
         try:
             self._write(initialize)
             self._write(initialized)
             response = self._read_response(timeout)
-            self._validate_initialize_response(response)
+            validate_initialize_response(response)
         except (MCPStdioTransportError, MCPStdioProtocolError):
             self._failed = True
             self._stop_process(force=True)
@@ -221,25 +305,6 @@ class MCPStdioSession:
             raise MCPStdioProtocolError(
                 f"malformed MCP JSON-RPC response: {exc}"
             ) from exc
-
-    @staticmethod
-    def _validate_initialize_response(response: Any) -> None:
-        if (
-            not isinstance(response, dict)
-            or response.get("id") != _INITIALIZE_REQUEST_ID
-        ):
-            raise MCPStdioProtocolError(
-                f"invalid MCP initialize response: {response!r}"
-            )
-        if "error" in response:
-            raise MCPStdioProtocolError(
-                f"MCP initialize returned JSON-RPC error: "
-                f"{response['error']!r}"
-            )
-        if not isinstance(response.get("result"), dict):
-            raise MCPStdioProtocolError(
-                "MCP initialize response has no result object"
-            )
 
     def _read_stdout(self) -> None:
         process = self._process

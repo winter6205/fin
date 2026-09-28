@@ -63,6 +63,10 @@ from fin.retrieve.input_validation import InputValidationLedger
 from fin.retrieve.mcp_session import (
     MCPStdioProtocolError,
     MCPStdioSession,
+    build_handshake_wire,
+    build_tools_call_frame,
+    parse_jsonrpc_response_lines,
+    validate_initialize_response,
 )
 from fin.retrieve.push_port import (
     PushEmptyBatchError,
@@ -84,9 +88,7 @@ from fin.retrieve.push_port import (
 # ``valid_from`` and never collides with a real closing instant.
 _VALID_UNTIL_SENTINEL: str = "9999-12-31T23:59:59.999Z"
 
-_MCP_PROTOCOL_VERSION: str = "2025-06-18"
-_INITIALIZE_REQUEST_ID: int = 1
-_TOOL_REQUEST_ID: int = 2
+_MCP_CLIENT_NAME = "fin-push"
 
 logger = logging.getLogger(__name__)
 
@@ -111,8 +113,12 @@ def _is_blank(value: str | None) -> bool:
     return value is not None and not value.strip()
 
 
-# ----- stdio JSON-RPC transport helpers (copied from mcp_adapter to
-# avoid coupling to its private API) -----
+# ----- stdio JSON-RPC transport helpers -----
+#
+# The handshake frames, response-line parse and initialize validation
+# are the shared primitives in ``fin.retrieve.mcp_session`` (single
+# source of truth with ``mcp_index_job_port``); this module only adapts
+# the protocol error to its own typed failure.
 
 
 async def _launch_mcp_process(
@@ -128,31 +134,6 @@ async def _launch_mcp_process(
         )
     except (OSError, FileNotFoundError) as exc:
         raise OSError(f"failed to launch MCP command: {exc}") from exc
-
-
-def _build_mcp_wire_messages(payload: dict[str, Any]) -> bytes:
-    """Serialize the ordered initialize, notification, and call frames."""
-    initialize = {
-        "jsonrpc": "2.0",
-        "id": _INITIALIZE_REQUEST_ID,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": _MCP_PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": {"name": "fin-push", "version": "0.1.0"},
-        },
-    }
-    initialized = {
-        "jsonrpc": "2.0",
-        "method": "notifications/initialized",
-    }
-    return (
-        "\n".join(
-            json.dumps(message)
-            for message in (initialize, initialized, payload)
-        )
-        + "\n"
-    ).encode("utf-8")
 
 
 async def _exchange_mcp_messages(
@@ -186,37 +167,18 @@ async def _exchange_mcp_messages(
 
 def _parse_mcp_responses(stdout: bytes) -> list[Any]:
     """Parse non-empty JSON-RPC response lines from MCP stdout."""
-    responses: list[Any] = []
-    for line in stdout.splitlines():
-        if not line.strip():
-            continue
-        try:
-            responses.append(json.loads(line.decode("utf-8")))
-        except (ValueError, UnicodeDecodeError) as exc:
-            raise PushProtocolError(
-                f"malformed JSON-RPC response: {exc}"
-            ) from exc
-    return responses
+    try:
+        return parse_jsonrpc_response_lines(stdout)
+    except MCPStdioProtocolError as exc:
+        raise PushProtocolError(str(exc)) from exc
 
 
 def _validate_initialize_response(response: Any) -> None:
     """Validate the initialize response before accepting tool output."""
-    if (
-        not isinstance(response, dict)
-        or response.get("id") != _INITIALIZE_REQUEST_ID
-    ):
-        raise PushProtocolError(
-            f"invalid MCP initialize response: {response!r}"
-        )
-    if "error" in response:
-        raise PushProtocolError(
-            f"MCP initialize returned JSON-RPC error: "
-            f"{response['error']!r}"
-        )
-    if not isinstance(response.get("result"), dict):
-        raise PushProtocolError(
-            "MCP initialize response has no result"
-        )
+    try:
+        validate_initialize_response(response)
+    except MCPStdioProtocolError as exc:
+        raise PushProtocolError(str(exc)) from exc
 
 
 def _validate_tool_response(
@@ -565,15 +527,7 @@ class MCPPushPort:
         position so ``chunk_ids`` from the response is parallel to
         ``items``.
         """
-        return {
-            "jsonrpc": "2.0",
-            "id": _TOOL_REQUEST_ID,
-            "method": "tools/call",
-            "params": {
-                "name": "push",
-                "arguments": {"items": items},
-            },
-        }
+        return build_tools_call_frame("push", {"items": items})
 
     # ----- transport (test seam) -----
 
@@ -615,7 +569,9 @@ class MCPPushPort:
             # the typed failure the caller contracts on.
             raise OSError("no MCP command configured")
         proc = await _launch_mcp_process(self._command)
-        wire_messages = _build_mcp_wire_messages(payload)
+        wire_messages = build_handshake_wire(
+            payload, client_name=_MCP_CLIENT_NAME
+        )
         stdout, _ = await _exchange_mcp_messages(
             proc,
             wire_messages,

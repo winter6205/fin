@@ -33,6 +33,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from fin.corpus.index_job import IndexJobLedger, IndexJobTracker
 from fin.corpus.ingest_endpoint import IngestEndpoint, MAX_INGEST_BYTES
 from fin.corpus.ingest_state import InMemoryIngestStateStore, IngestState
 from fin.corpus.ingest_state_errors import IngestStepError
@@ -45,8 +46,9 @@ from fin.corpus.object_store import (
     ObjectPointer,
     ObjectStoreUnavailableError,
 )
+from fin.retrieve.fake_index_job_port import FakeIndexJobPort
 from fin.retrieve.fake_push_port import FakePushPort
-from fin.host.workspace_http import get_ingest_service
+from fin.host.workspace_http import get_index_job_tracker, get_ingest_service
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -117,12 +119,16 @@ class _Stack:
         pointers: Any,
         states: InMemoryIngestStateStore,
         push: FakePushPort,
+        index_port: FakeIndexJobPort,
+        index_tracker: IndexJobTracker,
     ) -> None:
         self.endpoint = endpoint
         self.objects = objects
         self.pointers = pointers
         self.states = states
         self.push = push
+        self.index_port = index_port
+        self.index_tracker = index_tracker
 
 
 def _install(
@@ -152,8 +158,18 @@ def _install(
         state_store=states,
         **kwargs,
     )
+    # The status route's graph face is the same process singleton the
+    # worker would take; here it is the contract fake over an in-
+    # process ledger, so route tests never reach a live service.
+    index_port = FakeIndexJobPort()
+    index_tracker = IndexJobTracker(index_port, IndexJobLedger())
     http_app.dependency_overrides[get_ingest_service] = lambda: endpoint
-    return _Stack(endpoint, objects, pointers, states, push)
+    http_app.dependency_overrides[get_index_job_tracker] = (
+        lambda: index_tracker
+    )
+    return _Stack(
+        endpoint, objects, pointers, states, push, index_port, index_tracker
+    )
 
 
 def _post(
@@ -500,7 +516,135 @@ def test_status_returns_the_real_persisted_state_not_a_constant(
     ready = client.get(f"/api/corpus/ingest/{doc_id}").json()
     assert ready["state"] == "ready"
     assert ready["text_ready"] is True
+    # Null graph on a ready job with no index job ever submitted: the
+    # pass-through says "nothing claimed", never a graph/C readiness.
     assert ready["graph"] is None
+
+
+def test_status_returns_the_graph_pass_through_once_jobs_exist(
+    http_app: FastAPI, client: TestClient
+) -> None:
+    """After the handoff submitted, the route reports the polled job
+    rows and the separate corpus-wide ``community_index_state`` — pure
+    pass-through, re-polled on every GET, never derived by fin."""
+    stack = _install(http_app)
+    doc_id = _post(client).json()["document_id"]
+
+    # The handoff the worker performs on a ready landing, done directly
+    # here so this test is about the route's read face only.
+    stack.index_tracker.submit_after_push(
+        doc_id, {"src-a": "ident-a", "src-b": "ident-b"}
+    )
+
+    poll = client.get(f"/api/corpus/ingest/{doc_id}").json()
+    assert poll["state"] == "pending"
+    # Non-ready jobs keep graph null even with ledger entries: text
+    # readiness gates the graph face, not the other way around.
+    assert poll["graph"] is None
+
+    for state in (
+        IngestState.FETCHING,
+        IngestState.EXTRACTING,
+        IngestState.CATALOGING,
+        IngestState.READY,
+    ):
+        stack.states.transition(doc_id, state)
+    polls_before = stack.index_port.poll_calls
+
+    body = client.get(f"/api/corpus/ingest/{doc_id}").json()
+    graph = body["graph"]
+    assert graph is not None
+    assert sorted(job["source_ref"] for job in graph["jobs"]) == [
+        "src-a",
+        "src-b",
+    ]
+    assert all(job["job_id"] for job in graph["jobs"])
+    assert graph["community_index_state"] == {
+        "status": "in_progress",
+        "failure_code": None,
+    }
+    assert graph["error"] is None
+    # The GET is the tracker's designed pure-read poll.
+    assert stack.index_port.poll_calls == polls_before + 2
+
+    # Service-side progress rides straight through the next poll.
+    job_id = graph["jobs"][0]["job_id"]
+    stack.index_port.advance_job(job_id, "ready")
+    stack.index_port.set_community_index_state("ready")
+    advanced = client.get(f"/api/corpus/ingest/{doc_id}").json()["graph"]
+    assert advanced["community_index_state"] == {
+        "status": "ready",
+        "failure_code": None,
+    }
+    assert {job["status"] for job in advanced["jobs"]} == {
+        "ready",
+        "in_progress",
+    }
+
+
+def test_status_survives_a_poll_failure_with_stale_state_and_error(
+    http_app: FastAPI, client: TestClient
+) -> None:
+    """An unreachable index-job service never 500s the status door: the
+    persisted (stale) state stays visible beside the named error."""
+    stack = _install(http_app)
+    doc_id = _post(client).json()["document_id"]
+    stack.index_tracker.submit_after_push(doc_id, {"src-a": "ident-a"})
+    for state in (
+        IngestState.FETCHING,
+        IngestState.EXTRACTING,
+        IngestState.CATALOGING,
+        IngestState.READY,
+    ):
+        stack.states.transition(doc_id, state)
+
+    # One successful poll first: the state it confirms is what the
+    # door must keep visible when polling later breaks.
+    client.get(f"/api/corpus/ingest/{doc_id}")
+
+    stack.index_port.inject_poll_failure("index_job_unavailable", sticky=True)
+
+    response = client.get(f"/api/corpus/ingest/{doc_id}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"] == "ready"
+    assert body["text_ready"] is True
+    graph = body["graph"]
+    assert graph["error"]["code"] == "index_job_unavailable"
+    # Stale-visible: the last persisted poll, never an empty dict
+    # presented as ready and never a fin-derived claim.
+    assert graph["community_index_state"] == {
+        "status": "in_progress",
+        "failure_code": None,
+    }
+
+
+def test_status_marks_a_crashing_graph_poll_with_a_named_error(
+    http_app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A graph_status that raises is visible as graph_status_failed —
+    never a silent null that reads like "nothing ever submitted"."""
+    stack = _install(http_app)
+    doc_id = _post(client).json()["document_id"]
+    for state in (
+        IngestState.FETCHING,
+        IngestState.EXTRACTING,
+        IngestState.CATALOGING,
+        IngestState.READY,
+    ):
+        stack.states.transition(doc_id, state)
+
+    def _boom(document_id: str) -> None:
+        raise RuntimeError("ledger unreadable")
+
+    monkeypatch.setattr(stack.index_tracker, "graph_status", _boom)
+
+    response = client.get(f"/api/corpus/ingest/{doc_id}")
+    assert response.status_code == 200
+    graph = response.json()["graph"]
+    assert graph["error"]["code"] == "graph_status_failed"
+    assert graph["jobs"] == []
+    assert graph["community_index_state"] is None
 
 
 def test_status_of_a_failed_job_carries_the_typed_error(
