@@ -399,13 +399,46 @@ export interface IngestResult {
   state: IngestJobState;
 }
 
+// ----- T4: the corpus-wide graph/C report (sibling index job) -----
+
+// One per-source entry of iknow's graph-index job, passed through by
+// fin verbatim. These states belong to the SIBLING job and are not
+// fin's ``IngestJobState``; an entry's ``ready`` is that source's own
+// index state and never the corpus-wide graph/C claim — that is
+// reported only by ``community_index_state`` below (spec
+// corpus-serve-ingest "Graph/C readiness").
+export interface GraphIndexJob {
+  job_id: string;
+  source_ref: string;
+  status: "in_progress" | "ready" | "failed" | "stale";
+  failure_code: string | null;
+}
+
+// The community-level state of the same sibling job. ``status`` is an
+// open string because fin does not define its vocabulary — it only
+// forwards what iknow confirmed. ``null`` means no report yet.
+export interface GraphCommunityIndexState {
+  status: string;
+  failure_code: string | null;
+}
+
+// Body of the ``graph`` field of GET /api/corpus/ingest/{job_id}: the
+// pass-through of the sibling index job's confirmed result, or
+// ``null`` while nothing has been reported. ``error`` is a named read
+// failure and must be rendered, never silently hidden.
+export interface GraphIndexReport {
+  jobs: GraphIndexJob[];
+  community_index_state: GraphCommunityIndexState | null;
+  error: { code: string; message: string } | null;
+}
+
 // Body of GET /api/corpus/ingest/{job_id} — the polled job status.
 // ``text_ready`` is fin's per-source readiness, derived from ``state``
 // being ``ready``; it is a distinct field precisely so the two
 // readiness meanings never merge into one boolean. ``graph`` carries
-// the corpus-wide graph/C sub-object, whose states are defined by the
-// sibling index-job contract, not here: this client renders it as
-// 「未报告」 and never as text readiness.
+// the corpus-wide graph/C report from the sibling index job (see
+// ``GraphIndexReport``); the client never derives graph/C readiness
+// from ``text_ready`` / ``state`` or from ``jobs[].status``.
 export interface JobStatus {
   job_id: string;
   document_id: string;
@@ -414,7 +447,7 @@ export interface JobStatus {
   error_type: string | null;
   error_message: string | null;
   text_ready: boolean;
-  graph: unknown;
+  graph: GraphIndexReport | null;
 }
 
 // ----- Thread attachment: the attachment lifecycle -----

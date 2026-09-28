@@ -39,7 +39,13 @@ import {
   LAST_INGEST_JOB_KEY,
   useWorkspaceStore,
 } from "./store";
-import type { JobStatus, ThreadAttachment, ThreadDetail } from "./types";
+import { describeGraphReadiness } from "./pages/HomePage";
+import type {
+  GraphIndexReport,
+  JobStatus,
+  ThreadAttachment,
+  ThreadDetail,
+} from "./types";
 
 const THREAD_ID = "11111111-1111-4111-8111-111111111111";
 
@@ -85,6 +91,58 @@ function fakeStorage(): Storage {
     setItem: (key: string, value: string) => void map.set(key, value),
   };
 }
+
+// ----- T4: the pass-through graph/C report shapes -----
+
+// Jobs still running but the community state CONFIRMED ready: the only
+// shape whose 图谱索引就绪 line reads 就绪.
+const GRAPH_COMMUNITY_READY: GraphIndexReport = {
+  jobs: [
+    {
+      job_id: "ij-1",
+      source_ref: "AAPL-2022Q3",
+      status: "in_progress",
+      failure_code: null,
+    },
+  ],
+  community_index_state: { status: "ready", failure_code: null },
+  error: null,
+};
+
+// Community build failed with a named code, alongside per-source
+// entries in different states.
+const GRAPH_COMMUNITY_FAILED: GraphIndexReport = {
+  jobs: [
+    {
+      job_id: "ij-1",
+      source_ref: "AAPL-2022Q3",
+      status: "ready",
+      failure_code: null,
+    },
+    {
+      job_id: "ij-2",
+      source_ref: "MSFT-2022Q1",
+      status: "failed",
+      failure_code: "extract_crash",
+    },
+  ],
+  community_index_state: {
+    status: "failed",
+    failure_code: "community_build_failed",
+  },
+  error: null,
+};
+
+// The sibling read itself failed: a named error and no community
+// state — the code must surface, never be silently hidden.
+const GRAPH_ERROR: GraphIndexReport = {
+  jobs: [],
+  community_index_state: null,
+  error: {
+    code: "index_source_unavailable",
+    message: "sibling index job unreachable",
+  },
+};
 
 // The POST 200 of the attach door: raw bytes stored durably, NO
 // preparation started. Every attachment door answers with this same
@@ -562,6 +620,123 @@ describe("ingest job status (store.loadIngestJob)", () => {
     const job = useWorkspaceStore.getState().ingestJob;
     expect(job?.job_id).toBe("MSFT-2022Q1");
     expect(job?.state).toBe("extracting");
+  });
+});
+
+describe("graph/C report (pass-through + the two readiness lines)", () => {
+  /** Poll one status carrying ``graph`` and hand back the stored job. */
+  async function pollOnce(graph: GraphIndexReport | null): Promise<JobStatus> {
+    seedThread();
+    stubFetch((url) => {
+      if (url === STATUS_URL) {
+        return jsonResponse(
+          jobStatus({ state: "ready", text_ready: true, graph }),
+        );
+      }
+      if (url === "/api/corpus") return jsonResponse({ filings: [] });
+      return jsonResponse({}, 404);
+    });
+    await useWorkspaceStore.getState().loadIngestJob("AAPL-2022Q3", 1000);
+    const job = useWorkspaceStore.getState().ingestJob;
+    expect(job).not.toBeNull();
+    return job as JobStatus;
+  }
+
+  it("passes the sibling report through untouched — null and shaped", async () => {
+    // Not reported yet: the graph stays its own null, even though the
+    // TEXT line is ready — the two readinesses never merge.
+    const unreported = await pollOnce(null);
+    expect(unreported.text_ready).toBe(true);
+    expect(unreported.graph).toBeNull();
+
+    const ready = await pollOnce(GRAPH_COMMUNITY_READY);
+    expect(ready.graph).toEqual(GRAPH_COMMUNITY_READY);
+
+    const failed = await pollOnce(GRAPH_COMMUNITY_FAILED);
+    expect(failed.graph).toEqual(GRAPH_COMMUNITY_FAILED);
+
+    const errored = await pollOnce(GRAPH_ERROR);
+    expect(errored.graph).toEqual(GRAPH_ERROR);
+  });
+
+  it("says 未报告 while the door has no sibling report at all", () => {
+    expect(describeGraphReadiness(null)).toEqual({
+      communityLabel: "未报告",
+      jobs: [],
+      errorLabel: null,
+    });
+  });
+
+  it("reads 就绪 ONLY from community_index_state, never from jobs[]", () => {
+    expect(
+      describeGraphReadiness(GRAPH_COMMUNITY_READY).communityLabel,
+    ).toBe("就绪");
+    // The inverse guard: every per-source entry says ready but the
+    // community state is absent — per-source progress must not read as
+    // corpus-wide readiness.
+    const allSourcesReady: GraphIndexReport = {
+      jobs: [
+        {
+          job_id: "ij-1",
+          source_ref: "AAPL-2022Q3",
+          status: "ready",
+          failure_code: null,
+        },
+      ],
+      community_index_state: null,
+      error: null,
+    };
+    expect(describeGraphReadiness(allSourcesReady).communityLabel).toBe(
+      "未确认",
+    );
+    // Unmapped sibling statuses stay 未确认 — fin does not invent the
+    // sibling vocabulary.
+    expect(
+      describeGraphReadiness({
+        ...allSourcesReady,
+        community_index_state: { status: "pending", failure_code: null },
+      }).communityLabel,
+    ).toBe("未确认");
+  });
+
+  it("shows the actual community state: 进行中 / 失败 + code", () => {
+    expect(
+      describeGraphReadiness({
+        jobs: [],
+        community_index_state: { status: "in_progress", failure_code: null },
+        error: null,
+      }).communityLabel,
+    ).toBe("进行中");
+    expect(
+      describeGraphReadiness(GRAPH_COMMUNITY_FAILED).communityLabel,
+    ).toBe("失败：community_build_failed");
+    // A failed state without a code is still named as unnamed, never
+    // hidden behind a generic label.
+    expect(
+      describeGraphReadiness({
+        jobs: [],
+        community_index_state: { status: "failed", failure_code: null },
+        error: null,
+      }).communityLabel,
+    ).toBe("失败：未命名");
+  });
+
+  it("lists per-source entries compactly with their own states", () => {
+    expect(describeGraphReadiness(GRAPH_COMMUNITY_READY).jobs).toEqual([
+      { source_ref: "AAPL-2022Q3", label: "进行中" },
+    ]);
+    expect(describeGraphReadiness(GRAPH_COMMUNITY_FAILED).jobs).toEqual([
+      { source_ref: "AAPL-2022Q3", label: "就绪" },
+      { source_ref: "MSFT-2022Q1", label: "失败：extract_crash" },
+    ]);
+  });
+
+  it("names the error code instead of hiding the failed sibling read", () => {
+    const view = describeGraphReadiness(GRAPH_ERROR);
+    expect(view.errorLabel).toContain("index_source_unavailable");
+    // The error says nothing about readiness: the community line keeps
+    // its own 未确认 answer.
+    expect(view.communityLabel).toBe("未确认");
   });
 });
 
