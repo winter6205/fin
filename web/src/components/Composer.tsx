@@ -5,8 +5,10 @@
 // ADRs 0047/0089: the thread-attach door lives
 // here — a file picker button AND a drop on the composer both upload
 // the file to POST /threads/{id}/attachments. Attachments persist for
-// the WHOLE thread (no longer one-use): each send names the READY ones
-// through ``attachmentsForSend``, and whatever that rule leaves out is
+// the WHOLE thread (no longer one-use): each send names every
+// referenceable one through ``attachmentsForSend`` — READY records plus
+// the durable uploaded/parsing records a grounded run now waits on
+// (T2f) — and whatever that rule leaves out is
 // named on screen instead of vanishing. Each chip also carries a ``×``
 // that deletes just that attachment, so "persist for the thread" never
 // becomes "the operator cannot take it back". This door never touches
@@ -264,8 +266,10 @@ export default function Composer({ threadId }: ComposerProps) {
 
   // ----- ADR 0086: the persistent attachment list -----
   // The thread's records live in the store (they outlive one send and
-  // one mount); the store's readiness poll keeps ``parsing`` chips
-  // moving to ready / failed while this composer is open.
+  // one mount); the store's readiness poll keeps the lifecycle chip
+  // moving (uploaded → parsing → ready / failed, including the T2f
+  // window where a run is suspended waiting on it) while this
+  // composer is open.
   const attachFile = useWorkspaceStore((s) => s.attachFile);
   const loadAttachments = useWorkspaceStore((s) => s.loadAttachments);
   const retryAttachment = useWorkspaceStore((s) => s.retryAttachment);
@@ -344,10 +348,12 @@ export default function Composer({ threadId }: ComposerProps) {
     if (held) return;
     setDraft("");
     setFailure(null);
-    // The store owns the one reference rule. Only a READY attachment is
-    // named, so a question unrelated to an uploaded or still-parsing one
-    // is never refused on its account; what was left out is rendered
-    // below.
+    // The store owns the one reference rule. Every durable record the
+    // host accepts rides the send: READY ones are citable now, and an
+    // uploaded/parsing one makes the grounded run suspend until
+    // preparation completes (T2f) — so the question is never refused
+    // on their account and nothing has to be resent. What stays out
+    // (a failed record) is rendered below.
     const { ids } = attachmentsForSend(attachments);
     try {
       await sendQuestion(threadId, q, thinkingOn, ids);

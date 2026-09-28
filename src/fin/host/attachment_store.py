@@ -258,6 +258,29 @@ class AttachmentStore(Protocol):
         """Record a named preparation failure."""
         ...
 
+    def mark_parsing(
+        self,
+        *,
+        attachment_id: str,
+        from_statuses: Sequence[AttachmentStatus] = ("uploaded",),
+    ) -> AttachmentRecord | None:
+        """Move a still-guarded row into ``parsing``.
+
+        The interim label a job door writes once preparation work is
+        enqueued: a first ask moves ``uploaded -> parsing``, an operator
+        retry also moves its own ``failed -> parsing`` and clears the
+        retired reason, so a retried row never reads as still failed over
+        a freshly queued job.
+
+        ``from_statuses`` is a conditional guard checked against the
+        stored row at write time, so a racing second request writes
+        nothing. A missing, tombstoned, or gone row answers ``None``
+        rather than an error: the enqueued job — not this label — is the
+        promise of the work, and the row's version is untouched because
+        ``parsing`` claims no parsed-content version.
+        """
+        ...
+
     def incomplete(self) -> list[AttachmentRecord]:
         """Attachments that must be resumed or rebuilt before they are usable.
 
@@ -856,6 +879,29 @@ class InMemoryAttachmentStore:
                 cell.record,
                 status="failed",
                 failure_reason=reason,
+                updated_at=_now(),
+            )
+            return _attachment(cell.record)
+
+    def mark_parsing(
+        self,
+        *,
+        attachment_id: str,
+        from_statuses: Sequence[AttachmentStatus] = ("uploaded",),
+    ) -> AttachmentRecord | None:
+        wanted = tuple(_validate_status(status) for status in from_statuses)
+        with self._lock:
+            cell = self._owned(attachment_id)
+            # EXIT: gone, voided, or a concurrent request already moved
+            # it — the guard is checked against the stored row under the
+            # same lock that writes the transition, so the loser of that
+            # race writes nothing and answers the same ``None``.
+            if cell is None or cell.record.status not in wanted:
+                return None
+            cell.record = _attachment(
+                cell.record,
+                status="parsing",
+                failure_reason=None,
                 updated_at=_now(),
             )
             return _attachment(cell.record)
@@ -1772,6 +1818,35 @@ class PostgresAttachmentStore:
             except psycopg.errors.ForeignKeyViolation as exc:
                 raise self._gone(attachment_id) from exc
         return self._row_to_record(row)
+
+    def mark_parsing(
+        self,
+        *,
+        attachment_id: str,
+        from_statuses: Sequence[AttachmentStatus] = ("uploaded",),
+    ) -> AttachmentRecord | None:
+        wanted = [_validate_status(status) for status in from_statuses]
+        with self._connect() as conn:
+            # WHY one guarded UPDATE carries the whole contract: the
+            # status filter is the conditional guard (a row a concurrent
+            # request already moved matches nothing), the liveness
+            # subquery is the store's own delete-race guard, and
+            # ``failure_reason = NULL`` only ever erases the reason of a
+            # row that just left ``failed`` — every other guarded status
+            # carries none.
+            row = conn.execute(
+                "UPDATE fin_thread_attachment SET status = 'parsing', "
+                "failure_reason = NULL, updated_at = now() "
+                "WHERE attachment_id = %s "
+                "AND status = ANY(%s) "
+                "AND thread_id IN (SELECT id FROM fin_thread) "
+                f"RETURNING {self._COLUMNS}",
+                (attachment_id, wanted),
+            ).fetchone()
+            conn.commit()
+        # EXIT: a row the guard refused is a silent no-op, not an error:
+        # the enqueued job still promises the work.
+        return None if row is None else self._row_to_record(row)
 
     # -- deletion --
 

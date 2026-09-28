@@ -17,6 +17,7 @@ two connections when ``FIN_CHECKPOINT_URL`` names a reachable server.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -56,8 +57,10 @@ from fin.host.http import (
     get_graph,
     get_thread_store,
 )
+from fin.host.run_control import RunControl
 from fin.host.scripted_model import ScriptedChatModel
 from fin.host.thread_store import InMemoryThreadStore, PostgresThreadStore
+from fin.host.workspace_http import _resume_one_attachment_wait
 from fin.retrieve import ExtractedTreeReadPort
 
 AAPL_2022Q3 = "AAPL-2022Q3"
@@ -86,6 +89,12 @@ BUDGETS = AttachmentBudgets(
     max_vision_calls_per_run=16,
     max_vision_crop_calls_per_run=8,
 )
+
+# Grounded by the Soft-Track rules tier (mirrors the T2f suites in
+# tests/host/test_attachment_send_wait.py): only a grounded attachment
+# turn reaches the graph's preparation gate, so a send test that must
+# show the durable pause has to ask a grounded question.
+GROUNDED_QUESTION = "retrieve a summary of the attachment"
 
 
 class GateObjectStore:
@@ -379,15 +388,68 @@ def race_stack(request) -> Iterator[dict[str, Any]]:
 # ----- fixtures -----
 
 
-def _compile_graph(model: ScriptedChatModel) -> Any:
+def _compile_graph(
+    model: ScriptedChatModel,
+    *,
+    attachment_service: AttachmentPreparationService | None = None,
+) -> Any:
     from fin.host import compile_graph
 
-    return compile_graph(
-        checkpointer=InMemorySaver(),
-        model=model,
-        known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+    kwargs: dict[str, Any] = {
+        "checkpointer": InMemorySaver(),
+        "model": model,
+        "known_document_ids": KNOWN_IDS,
+        "read_port": _TREE_READ_PORT,
+    }
+    # WHY optional: the gate node only exists in the topology when an
+    # attachment service is injected (the production composition root
+    # always injects one). Durability tests that never pause keep the
+    # plain graph; the T2f pause tests compile through this same seam.
+    if attachment_service is not None:
+        kwargs["attachment_service"] = attachment_service
+    return compile_graph(**kwargs)
+
+
+def _gate_wired_graph(
+    service: AttachmentPreparationService,
+) -> Any:
+    """One compiled gate-wired graph instance.
+
+    WHY a stable instance: the durable pause lives on THIS checkpoint, so
+    every request and the shared resume must drive the same graph; the
+    same shape is what the production app builds once at startup.
+    """
+    return _compile_graph(
+        ScriptedChatModel(script=[AIMessage(content="ok")] * 6),
+        attachment_service=service,
     )
+
+
+def _parse_sse_events(body: str) -> list[tuple[str, Any]]:
+    """SSE frames as ``(event, data)`` pairs, as the T2f suites read them."""
+    events: list[tuple[str, Any]] = []
+    current: dict[str, str] = {}
+    for line in body.splitlines():
+        if not line:
+            if "event" in current and "data" in current:
+                try:
+                    parsed = json.loads(current["data"])
+                except json.JSONDecodeError:
+                    parsed = {"raw": current["data"]}
+                events.append((current["event"], parsed))
+            current = {}
+            continue
+        if line.startswith("event:"):
+            current["event"] = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            current["data"] = line[len("data:"):].strip()
+    if "event" in current and "data" in current:
+        try:
+            parsed = json.loads(current["data"])
+        except json.JSONDecodeError:
+            parsed = {"raw": current["data"]}
+        events.append((current["event"], parsed))
+    return events
 
 
 @pytest.fixture
@@ -453,18 +515,36 @@ def _attach(client: TestClient, thread_id: str, payload: bytes) -> dict:
     return response.json()
 
 
-def _prepare_through_door(
+def _retry(
     client: TestClient, thread_id: str, attachment_id: str
 ) -> dict:
-    """Ask the door to prepare an accepted upload.
-
-    The upload itself only stores bytes; the retry door is the public
-    path to preparation until the graph-triggered job exists, so a test
-    that needs ``ready`` text walks the same door an operator would.
-    """
+    """Post the retry door and hand back its immediate wire record."""
     response = client.post(
         f"/api/threads/{thread_id}/attachments/{attachment_id}/retry"
     )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _prepare_through_door(
+    client: TestClient,
+    service: AttachmentPreparationService,
+    thread_id: str,
+    attachment_id: str,
+) -> dict:
+    """Walk the public door to a SETTLED preparation, as an operator would.
+
+    T2f changed the door's semantics: it only asks. The retry door answers
+    immediately with the queued promise — ``parsing``, nothing searchable —
+    and the work itself runs in the durable job it enqueues, so a test
+    that needs published text drains that job (what the prep worker does)
+    and reads the settled state back through the status door.
+    """
+    asked = _retry(client, thread_id, attachment_id)
+    assert asked["status"] == "parsing", asked
+    assert asked["searchable"] is False, asked
+    service.drain_attachment_jobs()
+    response = _status(client, thread_id, attachment_id)
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -484,10 +564,17 @@ def test_upload_returns_uploaded_and_becomes_ready_with_searchable_index(
     assert body["scope"] == "thread_attach"
     assert body["attachment_id"]
 
-    prepared = _prepare_through_door(
-        client, wired["thread_id"], body["attachment_id"]
-    )
-    assert prepared["status"] == "ready"
+    # T2f pin of the door's async shape: the retry answers immediately
+    # with the queued promise -- parsing, version 0, exactly one durable
+    # job -- and only the drain publishes. The old ready-inside-the-
+    # request is gone and must not come back.
+    asked = _retry(client, wired["thread_id"], body["attachment_id"])
+    assert asked["status"] == "parsing"
+    assert asked["version"] == 0
+    assert asked["searchable"] is False
+    assert len(wired["service"].jobs.incomplete()) == 1
+    assert wired["service"].drain_attachment_jobs() == 1
+    assert wired["service"].jobs.incomplete() == ()
 
     response = _status(client, wired["thread_id"], body["attachment_id"])
     assert response.status_code == 200, response.text
@@ -528,9 +615,9 @@ def test_a_later_turn_can_reference_the_same_attachment_again(
 ) -> None:
     body = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
     aid = body["attachment_id"]
-    assert _prepare_through_door(client, wired["thread_id"], aid)["status"] == (
-        "ready"
-    )
+    assert _prepare_through_door(
+        client, wired["service"], wired["thread_id"], aid
+    )["status"] == "ready"
 
     for turn in range(2):
         response = client.post(
@@ -544,9 +631,16 @@ def test_a_later_turn_can_reference_the_same_attachment_again(
     assert _status(client, wired["thread_id"], aid).json()["status"] == "ready"
 
 
-def test_send_naming_an_unprepared_attachment_is_typed_not_ready(
-    client: TestClient, wired: dict[str, Any]
+def test_send_naming_an_uploaded_attachment_is_accepted_and_pauses(
+    client: TestClient, http_app: FastAPI, wired: dict[str, Any]
 ) -> None:
+    """T2f re-pin of the old 400: a stored ``uploaded`` row named in a
+    grounded send is ACCEPTED, and the run parks on the durable gate —
+    the wire closes on ``attachment_wait``, the row left ``uploaded``
+    for ``parsing``, and exactly one job carries the promise."""
+    graph = _gate_wired_graph(wired["service"])
+    http_app.dependency_overrides[get_graph] = lambda: graph
+
     record = wired["service"].accept(
         thread_id=wired["thread_id"],
         filename="pending.txt",
@@ -554,10 +648,54 @@ def test_send_naming_an_unprepared_attachment_is_typed_not_ready(
     )
     response = client.post(
         f"/api/threads/{wired['thread_id']}/messages",
-        json={"question": "read it", "attachment_ids": [record.attachment_id]},
+        json={
+            "question": GROUNDED_QUESTION,
+            "attachment_ids": [record.attachment_id],
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    events = _parse_sse_events(response.text)
+    waits = [data for name, data in events if name == "attachment_wait"]
+    assert waits, f"no attachment_wait frame on the wire: {[n for n, _ in events]}"
+    assert waits[-1]["kind"] == "attachment_preparation"
+    assert waits[-1]["attachment_ids"] == [record.attachment_id]
+    # The gate asked for the work through the durable job, not in the
+    # request, and a pause persists no turn row: the run waits, it did
+    # not answer.
+    assert wired["service"].status(record.attachment_id).status == "parsing"
+    assert len(wired["service"].jobs.incomplete()) == 1
+    assert wired["threads"].list_runs(wired["thread_id"]) == []
+
+
+def test_send_naming_a_failed_attachment_is_still_typed_not_ready(
+    client: TestClient, http_app: FastAPI, wired: dict[str, Any]
+) -> None:
+    """The half of the old refusal the T2f contract keeps: a named
+    ``failed`` row in a fresh send is still the typed 400 — a repeated
+    turn must not re-spend a named failure; only the retry door re-asks."""
+    graph = _gate_wired_graph(wired["service"])
+    http_app.dependency_overrides[get_graph] = lambda: graph
+
+    record = wired["service"].accept(
+        thread_id=wired["thread_id"], filename="blank.txt", payload=b"   \n "
+    )
+    assert wired["service"].prepare(record.attachment_id).status == "failed"
+
+    response = client.post(
+        f"/api/threads/{wired['thread_id']}/messages",
+        json={
+            "question": GROUNDED_QUESTION,
+            "attachment_ids": [record.attachment_id],
+        },
     )
     assert response.status_code == 400
     assert response.json() == {"error": "attachment_not_ready"}
+    # The refusal consumed nothing: the row keeps its named failure, no
+    # job was queued by the turn, and no run was started.
+    assert wired["service"].status(record.attachment_id).status == "failed"
+    assert wired["service"].jobs.incomplete() == ()
+    assert wired["threads"].list_runs(wired["thread_id"]) == []
 
 
 # ----- thread isolation -----
@@ -685,7 +823,13 @@ def test_deleting_the_thread_removes_metadata_bytes_units_and_index(
 ) -> None:
     body = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
     aid = body["attachment_id"]
-    _prepare_through_door(client, wired["thread_id"], aid)
+    prepared = _prepare_through_door(
+        client, wired["service"], wired["thread_id"], aid
+    )
+    # WHY the re-read: the deletion promise below only means anything if
+    # units and postings actually exist first -- the drain must have
+    # published before the door is asked to remove layers.
+    assert prepared["status"] == "ready" and prepared["searchable"] is True
     object_key = wired["service"].status(aid).object_key
     assert wired["service"].units(aid)
 
@@ -730,7 +874,7 @@ def test_thread_deletion_tombstones_before_cleanup_and_stays_retriable(
     """
     body = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
     aid = body["attachment_id"]
-    _prepare_through_door(client, wired["thread_id"], aid)
+    _prepare_through_door(client, wired["service"], wired["thread_id"], aid)
     object_key = wired["service"].status(aid).object_key
     gate.delete_fails = True
 
@@ -773,7 +917,7 @@ def test_deleting_one_attachment_voids_access_then_removes_its_layers(
 ) -> None:
     body = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
     aid = body["attachment_id"]
-    _prepare_through_door(client, wired["thread_id"], aid)
+    _prepare_through_door(client, wired["service"], wired["thread_id"], aid)
     sibling = _attach(client, wired["thread_id"], "sibling notes".encode("utf-8"))
     object_key = wired["service"].status(aid).object_key
 
@@ -815,7 +959,7 @@ def test_the_delete_door_touches_no_byte_before_the_void_is_durable(
     """
     body = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
     aid = body["attachment_id"]
-    _prepare_through_door(client, wired["thread_id"], aid)
+    _prepare_through_door(client, wired["service"], wired["thread_id"], aid)
     store = wired["service"].store
     published = wired["service"].status(aid)
     spy = ByteTouchSpy(objects)
@@ -1253,7 +1397,7 @@ def test_deleting_one_attachment_keeps_the_tombstone_when_cleanup_fails(
     """Cleanup failure is typed, observable, and retriable — never complete."""
     body = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
     aid = body["attachment_id"]
-    _prepare_through_door(client, wired["thread_id"], aid)
+    _prepare_through_door(client, wired["service"], wired["thread_id"], aid)
     object_key = wired["service"].status(aid).object_key
     gate.delete_fails = True
 
@@ -1303,7 +1447,7 @@ def test_a_deleted_attachment_is_not_referenceable_by_a_later_turn(
     aid = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))[
         "attachment_id"
     ]
-    _prepare_through_door(client, wired["thread_id"], aid)
+    _prepare_through_door(client, wired["service"], wired["thread_id"], aid)
     assert _delete_one(client, wired["thread_id"], aid).status_code == 200
 
     response = client.post(
@@ -1333,11 +1477,16 @@ def test_a_voided_attachment_matches_no_query_while_its_sibling_still_does(
     aid = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))[
         "attachment_id"
     ]
-    _prepare_through_door(client, wired["thread_id"], aid)
+    _prepare_through_door(client, wired["service"], wired["thread_id"], aid)
     sibling = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))[
         "attachment_id"
     ]
-    _prepare_through_door(client, wired["thread_id"], sibling)
+    _prepare_through_door(client, wired["service"], wired["thread_id"], sibling)
+    # The drain must have published both rows: the sibling promise below
+    # (still matching after its twin is voided) is only real over two
+    # built indexes.
+    assert wired["service"].status(aid).status == "ready"
+    assert wired["service"].status(sibling).status == "ready"
     version = wired["service"].status(aid).version
     assert _matching_units(wired, aid, version)
     assert _matching_units(wired, sibling, version)
@@ -1363,7 +1512,7 @@ def test_a_refused_cleanup_names_the_owed_bytes_in_the_log(
     aid = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))[
         "attachment_id"
     ]
-    _prepare_through_door(client, wired["thread_id"], aid)
+    _prepare_through_door(client, wired["service"], wired["thread_id"], aid)
     object_key = wired["service"].status(aid).object_key
     gate.delete_fails = True
 
@@ -1521,11 +1670,16 @@ def test_empty_body_is_rejected(client: TestClient, wired: dict[str, Any]) -> No
 
 
 def test_non_utf8_body_is_rejected(
-    client: TestClient, wired: dict[str, Any]
+    client: TestClient, http_app: FastAPI, wired: dict[str, Any]
 ) -> None:
-    """Raw bytes are the contract: undecodable content still uploads, and
-    the typed rejection is named when preparation reads it back.
+    """Raw bytes are the contract: undecodable content still uploads, the
+    typed rejection lands when the durable job reads it back, and a run
+    that already started on this id takes the refusal on its turn row —
+    never an empty success, never a stale ``ready``.
     """
+    graph = _gate_wired_graph(wired["service"])
+    http_app.dependency_overrides[get_graph] = lambda: graph
+
     response = client.post(
         f"/api/threads/{wired['thread_id']}/attachments",
         content=b"\xff\xfe\x00\x01",
@@ -1535,11 +1689,48 @@ def test_non_utf8_body_is_rejected(
     assert uploaded["status"] == "uploaded"
     assert uploaded["failure_reason"] is None
 
-    rejected = _prepare_through_door(
-        client, wired["thread_id"], uploaded["attachment_id"]
+    # T2f: the upload is referenceable, so a grounded send accepts the
+    # stored row and parks on the gate; the deferred rejection is met by
+    # the job, on the run the turn already started.
+    send = client.post(
+        f"/api/threads/{wired['thread_id']}/messages",
+        json={
+            "question": GROUNDED_QUESTION,
+            "attachment_ids": [uploaded["attachment_id"]],
+        },
     )
-    assert rejected["status"] == "failed"
-    assert rejected["failure_reason"] == "attachment_not_text"
+    assert send.status_code == 200, send.text
+    events = _parse_sse_events(send.text)
+    waits = [data for name, data in events if name == "attachment_wait"]
+    assert waits, f"no attachment_wait frame on the wire: {[n for n, _ in events]}"
+    run_id = str(waits[-1]["run_id"])
+    assert wired["threads"].list_runs(wired["thread_id"]) == []
+
+    assert wired["service"].drain_attachment_jobs() == 1
+    rejected = wired["service"].status(uploaded["attachment_id"])
+    assert rejected.status == "failed"
+    assert rejected.failure_reason == "attachment_not_text"
+    assert rejected.searchable is False
+
+    # The settled pause is driven by the shared resume — the same path
+    # the prep worker takes — and the run answers as the gate's typed
+    # refusal under the run id the pause carried.
+    assert (
+        _resume_one_attachment_wait(
+            graph,
+            wired["threads"],
+            wired["service"],
+            RunControl(),
+            wired["thread_id"],
+        )
+        is True
+    )
+    turns = wired["threads"].list_runs(wired["thread_id"])
+    assert [row.id for row in turns] == [run_id]
+    assert turns[0].status == "refuse"
+    assert turns[0].status_reason == "attachment_not_text"
+    assert turns[0].answer == ""
+    assert turns[0].citations == []
 
 
 def test_unknown_thread_upload_is_404(
@@ -1599,11 +1790,21 @@ def test_failed_preparation_retries_to_ready(
     assert wired["service"].prepare(record.attachment_id).status == "failed"
     gate.get_fails = False
 
-    response = client.post(
-        f"/api/threads/{wired['thread_id']}/attachments/{record.attachment_id}/retry"
-    )
-    assert response.status_code == 200, response.text
-    assert response.json()["status"] == "ready"
+    # T2f shape of the retry door: it re-asks and answers immediately.
+    # The failed row leaves the door ``parsing`` with its retired reason
+    # cleared, exactly one durable job queued, nothing parsed inside the
+    # request.
+    asked = _retry(client, wired["thread_id"], record.attachment_id)
+    assert asked["status"] == "parsing"
+    assert asked["failure_reason"] is None
+    jobs = wired["service"].jobs.incomplete()
+    assert len(jobs) == 1
+    assert jobs[0].state == "pending"
+
+    assert wired["service"].drain_attachment_jobs() == 1
+    settled = _status(client, wired["thread_id"], record.attachment_id).json()
+    assert settled["status"] == "ready"
+    assert settled["searchable"] is True
     assert wired["service"].units(record.attachment_id) == (
         ParsedAttachmentUnit(unit=1, text=REVENUE_TEXT),
     )
@@ -1616,18 +1817,31 @@ def test_redriving_a_lost_index_keeps_the_published_version_addressable(
     # already cited has to survive an attempt that then fails.
     body = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
     attachment_id = body["attachment_id"]
-    _prepare_through_door(client, wired["thread_id"], attachment_id)
+    _prepare_through_door(
+        client, wired["service"], wired["thread_id"], attachment_id
+    )
     published = wired["service"].status(attachment_id)
     assert published.status == "ready"
 
     wired["service"].store.clear_index(attachment_id)
     gate.get_fails = True
-    response = client.post(
-        f"/api/threads/{wired['thread_id']}/attachments/{attachment_id}/retry"
-    )
-    assert response.status_code == 200, response.text
-    assert response.json()["status"] == "failed"
 
+    # T2f shape: a row that lost its index reads ``parsing``, so the
+    # retry door queues the rebuild (reopening the succeeded job) and
+    # answers immediately; the failed verdict arrives on the row only
+    # after the drain ran the preparation.
+    asked = _retry(client, wired["thread_id"], attachment_id)
+    assert asked["status"] == "parsing"
+    assert asked["version"] == published.version
+    assert len(wired["service"].jobs.incomplete()) == 1
+    assert wired["service"].drain_attachment_jobs() == 1
+
+    settled = _status(client, wired["thread_id"], attachment_id).json()
+    assert settled["status"] == "failed"
+    assert settled["failure_reason"] == "source_unavailable"
+    # A failed re-drive stamps no new version: the text published at
+    # ``published.version`` stays exactly where earlier citations left it.
+    assert settled["version"] == published.version
     assert wired["service"].store.units(
         attachment_id, published.version
     ) == (ParsedAttachmentUnit(unit=1, text=REVENUE_TEXT),)
@@ -1670,7 +1884,8 @@ def test_the_list_door_reports_a_row_that_lost_its_index_as_parsing(
     lost = _attach(client, wired["thread_id"], REVENUE_TEXT.encode("utf-8"))
     for attachment in (published, lost):
         _prepare_through_door(
-            client, wired["thread_id"], attachment["attachment_id"]
+            client, wired["service"], wired["thread_id"],
+            attachment["attachment_id"],
         )
     wired["service"].store.clear_index(lost["attachment_id"])
 

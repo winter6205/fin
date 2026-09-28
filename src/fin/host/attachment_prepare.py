@@ -69,6 +69,11 @@ from fin.host.attachment_budgets import (
     send_full_page,
 )
 from fin.host.attachment_index import build_postings, is_usable
+from fin.host.attachment_job_store import (
+    InMemoryThreadAttachmentJobStore,
+    ThreadAttachmentJob,
+    ThreadAttachmentJobStore,
+)
 from fin.host.attachment_observations import (
     CoveredDetail,
     DetailKey,
@@ -78,6 +83,7 @@ from fin.host.attachment_observations import (
 )
 from fin.host.attachment_store import (
     AttachmentRecord,
+    AttachmentStatus,
     AttachmentStore,
     AttachmentStoreError,
     AttachmentThreadGoneError,
@@ -105,6 +111,10 @@ ATTACHMENT_TYPE_UNSUPPORTED: Final[str] = "attachment_type_unsupported"
 ATTACHMENT_PAGE_LANE_UNWIRED: Final[str] = "attachment_page_lane_unwired"
 ATTACHMENT_INDEX_UNAVAILABLE: Final[str] = "attachment_index_unavailable"
 SOURCE_UNAVAILABLE: Final[str] = "source_unavailable"
+# The gate's answer for an unknown, other-thread, or tombstoned locator is
+# the same wire name the read and citation doors already publish for those
+# three shapes: one identity question, one reveal-nothing code.
+UNKNOWN_LOCATOR: Final[str] = "unknown_locator"
 # The attachment exit for "a page never became pixels" is the same string
 # the render stage already uses, so one shape keeps one name end to end.
 RENDER_FAILED: Final[str] = PageRenderError.code
@@ -309,6 +319,23 @@ class ResolvedAttachment:
     text: str
 
 
+@dataclass(frozen=True)
+class PreparationRequest:
+    """The gate's answer to "may this turn read this attachment now?".
+
+    ``state`` is the whole routing decision for ``ensure_attachment_ready``:
+    ``ready`` may proceed, ``pending`` parks the run until the durable job
+    drains, ``failed`` exits with :attr:`code`, and ``unknown`` reveals
+    nothing (unknown, other-thread, and tombstoned locators share it).
+    ``version`` is the attachment row's current parsed-content version —
+    0 when no preparation has ever published one.
+    """
+
+    state: Literal["ready", "pending", "failed", "unknown"]
+    code: str | None
+    version: int
+
+
 def _safe_display_filename(raw: str) -> str:
     """Strip path and control characters; the model gets a name, never a path."""
     name = os.path.basename(raw or "").strip()
@@ -412,6 +439,7 @@ class AttachmentPreparationService:
         pages: PageRegionParser | None = None,
         vision: VisionPort | None = None,
         call_ledger: VisionCallLedger | None = None,
+        jobs: ThreadAttachmentJobStore | None = None,
     ) -> None:
         """``budgets``, ``pages``, and ``vision`` are the page-lane seams.
 
@@ -435,6 +463,12 @@ class AttachmentPreparationService:
         with no ledger injected, each preparation charges a fresh one
         built from ``budgets``, bounding one document's scans but leaving
         the run-wide allowance to the caller that owns the run.
+
+        ``jobs`` is the durable preparation-work seam the graph gate
+        enqueues into; with none injected the service keeps its jobs in
+        one in-memory store, which is the documented no-Postgres twin of
+        the other seams and what every existing construction gets
+        unchanged.
         """
         self.store = store
         self.objects = objects
@@ -442,6 +476,9 @@ class AttachmentPreparationService:
         self.pages = pages
         self.vision = vision
         self.call_ledger = call_ledger
+        self.jobs: ThreadAttachmentJobStore = (
+            jobs if jobs is not None else InMemoryThreadAttachmentJobStore()
+        )
 
     # -- door: accept --
 
@@ -492,9 +529,12 @@ class AttachmentPreparationService:
     def prepare(self, attachment_id: str) -> AttachmentRecord:
         """Freeze parsed units and the derived index, then publish ready.
 
-        This is also the retry path: a record that never reached ``ready`` is
-        driven again from its retained bytes, while a published version is
-        left alone because earlier answers cite its locators.
+        This is the job executor's synchronous step: it drives a record
+        that never reached ``ready`` again from its retained bytes, while a
+        published version is left alone because earlier answers cite its
+        locators. HTTP doors do not call it directly any more — the retry
+        door goes through :meth:`retry_preparation`, which queues durable
+        work instead of parsing in-request.
         """
         record = self._require(attachment_id)
         if record.searchable:
@@ -908,6 +948,244 @@ class AttachmentPreparationService:
             version=str(version),
         )
 
+    # -- job door: start-or-join and drain --
+
+    def request_preparation(
+        self, thread_id: str, attachment_id: str
+    ) -> PreparationRequest:
+        """Ask for a locator's content to become usable: start or join ONE job.
+
+        This is the graph gate's whole question in one atomic call. The
+        row is read through :meth:`status`, not raw: a stored ``ready``
+        whose derived data went unreadable is work that must be asked for
+        again, not a promise to reuse. The four answers are closed:
+
+        * unknown, another thread's, or tombstoned -> ``unknown`` +
+          ``unknown_locator``, reusing the one reveal-nothing identity
+          rule of :meth:`resolve_for_turn` and the delete doors;
+        * searchable (ready and indexed) -> ``ready``, no job;
+        * ``uploaded``/``parsing`` -> enqueue or join the one active job
+          keyed by ``(attachment_id, content sha256)`` and answer
+          ``pending``. A first request for an ``uploaded`` row also moves
+          the stored status to ``parsing`` — preparation has now been
+          asked for, which is the promise ``parsing`` carries;
+        * ``failed`` -> the row's stored reason, no job: retrying a named
+          failure is the ``prepare`` door's (and the operator's) decision,
+          not something a repeated graph turn may re-spend.
+
+        Concurrent duplicate requests cannot mint a second active job:
+        the join is decided by the job store's primary key (or its lock),
+        not by anything read here.
+        """
+        record = self.status(attachment_id)
+        if record is None or record.thread_id != thread_id:
+            # EXIT: the identity question is answered before the content
+            # question, and reveals nothing about which of the shapes it is.
+            return PreparationRequest(state="unknown", code=UNKNOWN_LOCATOR, version=0)
+        if record.searchable:
+            return PreparationRequest(state="ready", code=None, version=record.version)
+        if record.status == "failed" and record.failure_reason is not None:
+            return PreparationRequest(
+                state="failed", code=record.failure_reason, version=record.version
+            )
+        # A failed row with no reason is a broken row, not a named failure:
+        # it falls through to the work-asking branch like the states above.
+        return self._ask_or_join(record)
+
+    def retry_preparation(
+        self, thread_id: str, attachment_id: str
+    ) -> PreparationRequest:
+        """Re-ask preparation for a failed row; join the one job otherwise.
+
+        The retry door's decision. :meth:`request_preparation` deliberately
+        treats a named ``failed`` row as an exit a graph turn may not
+        re-spend; an operator retry IS that decision, so here the failed
+        row re-enqueues (the job store reopens a ``failed`` job on a fresh
+        enqueue) and the row moves ``failed -> parsing`` with its stored
+        reason cleared. Every other state answers exactly what
+        :meth:`request_preparation` answers, so the two doors can never
+        disagree about one row: unknown -> ``unknown``, searchable ->
+        ``ready``, uploaded/parsing -> ``pending`` on the joined job.
+        """
+        record = self.status(attachment_id)
+        if record is None or record.thread_id != thread_id:
+            return PreparationRequest(state="unknown", code=UNKNOWN_LOCATOR, version=0)
+        if record.searchable:
+            return PreparationRequest(state="ready", code=None, version=record.version)
+        if record.status == "failed":
+            # The retry door asks the same work the request door asks,
+            # with one wider guard: its own ``failed -> parsing`` move
+            # and cleared reason, so a retried row never reads as still
+            # failed over a freshly queued job.
+            return self._ask_or_join(
+                record, from_statuses=("uploaded", "failed")
+            )
+        return self.request_preparation(thread_id, attachment_id)
+
+    def _ask_or_join(
+        self,
+        record: AttachmentRecord,
+        *,
+        from_statuses: Sequence[AttachmentStatus] = ("uploaded",),
+    ) -> PreparationRequest:
+        """Enqueue or join the ONE job for this content, answer ``pending``.
+
+        THE work-asking step both job doors share: ``request_preparation``
+        reaches it for an ``uploaded``/``parsing`` row (and for a broken
+        ``failed`` row with no reason), ``retry_preparation`` for the
+        named failure an operator re-spends. The join is decided by the
+        job store's primary key (or its lock), not by anything read here,
+        so concurrent duplicates cannot mint a second active job.
+
+        A join that lands on ``succeeded`` is the repair shape: the job
+        says published while the row no longer carries the derived data
+        (it went missing after that success). Re-running succeeded
+        content is the named decision the job store reserves for
+        ``reopen``, so the answer stays honest instead of a pending that
+        never drains.
+
+        ``from_statuses`` is the store-side guard of the interim label.
+        The transition itself is the store's public ``mark_parsing``:
+        its enum validation, liveness guard, and conditional from-status
+        check run in the store's own critical section, so a racing delete
+        or a two-click retry cannot write a status the store would not
+        have written itself.
+        """
+        job = self.jobs.enqueue(
+            attachment_id=record.attachment_id,
+            content_sha256=record.sha256,
+            target_version=record.version + 1,
+        )
+        if job.state == "succeeded":
+            self.jobs.reopen(
+                attachment_id=record.attachment_id,
+                content_sha256=record.sha256,
+                target_version=record.version + 1,
+            )
+        self.store.mark_parsing(
+            attachment_id=record.attachment_id, from_statuses=from_statuses
+        )
+        return PreparationRequest(
+            state="pending", code=None, version=record.version
+        )
+
+    def drain_attachment_jobs(self, limit: int = 10) -> int:
+        """Claim up to ``limit`` jobs and run each through preparation.
+
+        The executor loop the worker and any synchronous caller share.
+        Returns how many jobs were claimed and finished (whatever the
+        finish was: published, failed, voided). One job's failure never
+        aborts the sweep — the per-job error paths below are what keep
+        that true.
+        """
+        drained = 0
+        for _ in range(max(0, limit)):
+            job = self.jobs.claim_next()
+            if job is None:
+                break
+            drained += 1
+            try:
+                self._run_job(job)
+            except Exception:
+                # EXIT: the last belt. ``_run_job`` types every failure it
+                # can name; reaching here means the job row itself could
+                # not be finished, so log it and let the boot sweep re-adopt
+                # the orphan instead of killing the sweep or the loop.
+                logger.exception(
+                    "attachment job could not be finished: attachment_id=%s "
+                    "sha256=%s; leaving it for the restart sweep",
+                    job.attachment_id,
+                    job.content_sha256,
+                )
+        return drained
+
+    def _run_job(self, job: ThreadAttachmentJob) -> None:
+        """Execute one claimed job; the row and the job always agree.
+
+        The order is the guarantee: re-check liveness before touching the
+        bytes, lean on the store's void-time write guards during the
+        preparation, and re-read the row afterwards so ``succeeded`` is
+        only ever said of a row that is now actually searchable.
+        """
+        if self.store.get(job.attachment_id) is None:
+            # EXIT: tombstoned between the claim and the byte read —
+            # nothing is published and the job retires voided.
+            self.jobs.mark_voided(
+                attachment_id=job.attachment_id, content_sha256=job.content_sha256
+            )
+            return
+        try:
+            self.prepare(job.attachment_id)
+        except (AttachmentNotFoundError, AttachmentThreadGoneError):
+            # EXIT: the delete won mid-flight (its thread went with it).
+            # Late publication is impossible — every derived write in
+            # ``_freeze`` lost the same race — so the job follows the
+            # tombstone without failing a row that no longer exists.
+            self.jobs.mark_voided(
+                attachment_id=job.attachment_id, content_sha256=job.content_sha256
+            )
+            return
+        except Exception as exc:
+            # EXIT: nothing preparation can name escaped ``_freeze`` —
+            # reaching here is a crash (or a mis-deployed bound). The row
+            # must not sit in ``parsing`` over a dead job, so it takes the
+            # typed failure the door can still say: the reader's own code
+            # when it carries one, else the storage-outage exit.
+            reason = str(getattr(exc, "code", "") or "").strip() or SOURCE_UNAVAILABLE
+            self._fail_row(job.attachment_id, reason)
+            self.jobs.mark_failed(
+                attachment_id=job.attachment_id,
+                content_sha256=job.content_sha256,
+                reason_code=reason,
+            )
+            return
+        fresh = self.status(job.attachment_id)
+        if fresh is None:
+            self.jobs.mark_voided(
+                attachment_id=job.attachment_id, content_sha256=job.content_sha256
+            )
+        elif fresh.searchable:
+            self.jobs.mark_succeeded(
+                attachment_id=job.attachment_id, content_sha256=job.content_sha256
+            )
+        elif fresh.status == "failed":
+            # ``prepare`` already recorded the typed reason on the row;
+            # mirror it onto the job so the two never disagree.
+            self.jobs.mark_failed(
+                attachment_id=job.attachment_id,
+                content_sha256=job.content_sha256,
+                reason_code=fresh.failure_reason or ATTACHMENT_INDEX_UNAVAILABLE,
+            )
+        else:
+            # EXIT: preparation returned a row that is neither published,
+            # failed, nor gone — the derived data is not usable, which is
+            # exactly what ``attachment_index_unavailable`` names. Never
+            # an empty success.
+            self.jobs.mark_failed(
+                attachment_id=job.attachment_id,
+                content_sha256=job.content_sha256,
+                reason_code=ATTACHMENT_INDEX_UNAVAILABLE,
+            )
+
+    def _fail_row(self, attachment_id: str, reason: str) -> None:
+        """Mark a still-live row failed; a dead one has nothing to fail."""
+        try:
+            current = self.store.get(attachment_id)
+            if current is not None:
+                self.store.mark_failed(
+                    attachment_id=attachment_id,
+                    version=current.version,
+                    reason=reason,
+                )
+        except AttachmentStoreError:
+            # The row lost the deletion race between the liveness re-read
+            # and this write; discarding it is the store's documented
+            # outcome, and the job is failed either way.
+            logger.warning(
+                "attachment row could not be marked failed: attachment_id=%s",
+                attachment_id,
+            )
+
     # -- reads --
 
     def status(self, attachment_id: str) -> AttachmentRecord | None:
@@ -980,7 +1258,19 @@ class AttachmentPreparationService:
         Returns how many rows needed work. Recovery never advances the
         parsed version of a row that already had one, so the locator the
         operator attached still addresses the same text afterwards.
+
+        The job layer is swept first: a ``running`` job row at boot
+        belongs to an executor that died with the previous process, and
+        re-adopting it to ``pending`` is what lets the restarted worker
+        resume durable work the same door asked for. Plain ``uploaded``
+        rows are still not touched — bytes nobody requested preparation
+        for stay bytes nobody prepares.
         """
+        requeued = self.jobs.requeue_running()
+        if requeued:
+            logger.info(
+                "attachment boot sweep re-adopted %d interrupted job(s)", requeued
+            )
         repaired = 0
         for record in self.store.incomplete():
             repaired += 1
@@ -1034,6 +1324,10 @@ class AttachmentPreparationService:
             # door stays retryable against the same obligation.
             raise AttachmentCleanupError(thread_id, (object_key,))
         self.store.confirm_cleanup(attachment_id=attachment_id)
+        # The deletion is confirmed, so the attachment's durable jobs are
+        # retired with it: a queued job for content that no longer has
+        # bytes has nothing left to void, only rows to stop carrying.
+        self.jobs.forget(attachment_id=attachment_id)
 
     def delete_thread(self, thread_id: str) -> None:
         """Void every attachment of a thread, then remove the bytes.
@@ -1041,8 +1335,16 @@ class AttachmentPreparationService:
         The same tombstone-first order as a single deletion, not a weaker
         copy of it: the rows go first and leave their obligations behind, so
         an interrupted cleanup keeps access blocked and stays retryable
-        through this door.
+        through this door. The thread's durable jobs are retired with the
+        confirmed cleanup: work asked for by a thread that is gone has no
+        waiter left, and the ids have to be read before the void removes
+        them. A row an accept races past the sweep keeps its job only until
+        the drain's liveness re-check voids it — late publication is
+        already impossible either way.
         """
+        job_ids = tuple(
+            record.attachment_id for record in self.store.list_for_thread(thread_id)
+        )
         self.store.delete_for_thread(thread_id)
         failures = self._remove_bytes(
             thread_id, self.store.pending_cleanup(thread_id), verdict=_BYTES_STILL_OWED
@@ -1055,6 +1357,8 @@ class AttachmentPreparationService:
         # their bytes swept best-effort, because the thread row that follows
         # cannot be removed over attachments nobody can name any more.
         self._discard_bytes(thread_id, self.store.delete_for_thread(thread_id))
+        for attachment_id in job_ids:
+            self.jobs.forget(attachment_id=attachment_id)
 
     def _remove_bytes(
         self, thread_id: str, keys: Sequence[str], *, verdict: _ByteDeleteVerdict
@@ -1109,6 +1413,7 @@ __all__ = [
     "FIRST_OBSERVATION_VERSION",
     "RENDER_FAILED",
     "SOURCE_UNAVAILABLE",
+    "UNKNOWN_LOCATOR",
     "AttachmentCleanupError",
     "AttachmentEmptyTextError",
     "AttachmentError",
@@ -1123,6 +1428,7 @@ __all__ = [
     "AttachmentTypeUnsupportedError",
     "AttachmentVisionCallFailedError",
     "AttachmentVisionEmptyTextError",
+    "PreparationRequest",
     "ResolvedAttachment",
     "text_rejection_reason",
 ]
