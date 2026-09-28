@@ -26,6 +26,7 @@ unconstructed object, never invoked.
 from __future__ import annotations
 
 import hashlib
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -413,27 +414,108 @@ def test_a_staged_copy_is_gone_even_when_the_document_cannot_be_read(
     assert list(tmp_path.glob("fin-attachment-*.pdf")) == []
 
 
-def test_a_standalone_image_never_stages_a_heron_document() -> None:
-    """The harness takes PDF input only; a raster's page is its own image.
+def _extract_chart(parser: HeronPageLaneParser) -> Any:
+    return parser.extract_image(
+        source_bytes=CHART_BYTES,
+        source_sha256=hashlib.sha256(CHART_BYTES).hexdigest(),
+        document_id="img-a",
+        version="1",
+    )
 
-    The image lane keeps the base behavior over ``NullLayout``: no pass
-    is crossed and no copy is written for a one-page source. A bare image
-    has no text layer, so the reader that lane reaches is the OCR engine
-    — on a default host without the optional ``[ocr]`` extra that is the
-    typed ``ocr_required_unavailable`` exit, and even that refusal proves
-    no Heron document was staged.
+
+@pytest.fixture(autouse=True)
+def _no_pytesseract_leak() -> None:
+    """Undo any real ``pytesseract`` import this module causes.
+
+    Both construction paths here build the adapter's own
+    ``TesseractEngine`` — ``_parser`` directly, and
+    ``_build_default_attachment_service`` through the composition root —
+    and that engine imports the optional extra for real. Leaving the
+    module in ``sys.modules`` fails the sibling
+    ``test_default_pytest_does_not_import_pytesseract`` in
+    tests/corpus/test_ocr.py whenever this file is collected first; that
+    contract is about ``fin.corpus.ocr`` not importing the extra when
+    *it* is imported, and it cannot account for a sibling file
+    instantiating an engine. Autouse because every test here that builds
+    a parser or the root leaks, not just the image-lane ones.
     """
+    yield
+    for name in [
+        m for m in sys.modules if m == "pytesseract" or m.startswith("pytesseract.")
+    ]:
+        sys.modules.pop(name, None)
+
+
+def test_a_standalone_image_without_ocr_stages_no_heron_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no OCR engine the lane ends at the typed exit, staging nothing.
+
+    ``TesseractEngine`` resolves its ``pytesseract`` import in
+    ``__init__``, so the absent-extra case is pinned by blocking the
+    import BEFORE the adapter builds its engine — the same
+    ``sys.modules`` idiom ``tests/corpus/test_ocr.py`` uses. Driving it
+    from the import, rather than from whatever this host happens to have
+    installed, is what makes the case deterministic: the old form
+    asserted the refusal unconditionally and so failed on any host where
+    the optional ``[ocr]`` extra was present.
+    """
+    monkeypatch.setitem(sys.modules, "pytesseract", None)
+
     runner = RecordingRunner()
     parser = _parser(runner)
 
-    with pytest.raises(OcrRequiredUnavailableError):
-        parser.extract_image(
-            source_bytes=CHART_BYTES,
-            source_sha256=hashlib.sha256(CHART_BYTES).hexdigest(),
-            document_id="img-a",
-            version="1",
-        )
+    with pytest.raises(OcrRequiredUnavailableError) as excinfo:
+        _extract_chart(parser)
 
+    # Bound to the raised instance, not to the class attribute: the class
+    # constant compared against its own definition proves nothing about
+    # which exit this call took.
+    assert excinfo.value.code == "ocr_required_unavailable"
+    assert runner.calls == []
+
+
+def test_a_standalone_image_with_ocr_stages_no_heron_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a readable engine the lane returns the upload itself, still unstaged.
+
+    The other leg of the same invariant, and the one that had no coverage
+    at all: the refusal above proves nothing on a host where OCR works.
+    Here a recording stand-in for the OCR port answers with real text, so
+    the lane builds its one page, the page's raster is byte-identical to
+    the upload (no container PDF was synthesized to hold the image), and
+    the Heron runner is still never called.
+    """
+    class _ReadableOcr:
+        """A recording ``RasterOcrPort``: no binary, no extra, real text."""
+
+        def __init__(self) -> None:
+            self.calls: list[bytes] = []
+
+        def recognize_raster(self, *, png: bytes, reference: str) -> str:
+            self.calls.append(png)
+            return "quarterly revenue rose 12%\n"
+
+    engine = _ReadableOcr()
+    monkeypatch.setattr(
+        "fin.host.workspace_http.TesseractEngine", lambda *a, **k: engine
+    )
+
+    runner = RecordingRunner()
+    parser = _parser(runner)
+
+    result = _extract_chart(parser)
+
+    assert engine.calls == [CHART_BYTES]
+    assert result.source_page_count == 1
+    assert result.truncated is False
+    assert len(result.pages) == 1
+    page = result.pages[0]
+    # The raster IS the upload: this is the "no container synthesized"
+    # claim, and it is the assertion a synthesized-PDF regression breaks.
+    assert page.raster.png == CHART_BYTES
+    assert "12%" in page.scanned_text
     assert runner.calls == []
 
 
