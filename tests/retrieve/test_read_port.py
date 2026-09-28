@@ -343,3 +343,91 @@ def test_miss_port_always_misses() -> None:
     assert port.read("ANY-2024Q2", "b" * 64, page=2, page_limit=3) == {
         "error": "unknown_locator"
     }
+
+
+# ===== validate_company_source_ref: the shared locator gate (T4) =====
+
+
+def test_validator_resolves_a_well_formed_triple() -> None:
+    from fin.retrieve.read_port import validate_company_source_ref
+
+    located = validate_company_source_ref(
+        {"document_id": "TEST-2023Q1", "version": VERSION, "unit": 3}
+    )
+    assert located == ("TEST-2023Q1", VERSION, 3)
+
+
+@pytest.mark.parametrize(
+    ("bad_ref", "reason"),
+    [
+        pytest.param("a serialized string", "locator_not_a_record", id="string"),
+        pytest.param(None, "locator_not_a_record", id="none"),
+        pytest.param([1, 2], "locator_not_a_record", id="list"),
+        pytest.param({}, "locator_keys_malformed", id="empty-record"),
+        pytest.param(
+            {"document_id": "T", "version": VERSION}, "locator_keys_malformed", id="missing-unit"
+        ),
+        pytest.param(
+            {"document_id": "T", "version": VERSION, "unit": 1, "page": 2},
+            "locator_keys_malformed",
+            id="extra-key",
+        ),
+        pytest.param(
+            {"document_id": "", "version": VERSION, "unit": 1},
+            "locator_fields_malformed",
+            id="empty-doc-id",
+        ),
+        pytest.param(
+            {"document_id": "T", "version": 5, "unit": 1},
+            "locator_fields_malformed",
+            id="non-string-version",
+        ),
+        pytest.param(
+            {"document_id": "T", "version": VERSION, "unit": 0},
+            "locator_fields_malformed",
+            id="zero-unit",
+        ),
+        pytest.param(
+            {"document_id": "T", "version": VERSION, "unit": -2},
+            "locator_fields_malformed",
+            id="negative-unit",
+        ),
+        pytest.param(
+            {"document_id": "T", "version": VERSION, "unit": True},
+            "locator_fields_malformed",
+            id="bool-unit",
+        ),
+        pytest.param(
+            {"document_id": "T", "version": VERSION, "unit": "1"},
+            "locator_fields_malformed",
+            id="string-unit",
+        ),
+        pytest.param(
+            {"document_id": "D" * 1100, "version": VERSION, "unit": 1},
+            "request_locator_oversized",
+            id="oversized-serialization",
+        ),
+    ],
+)
+def test_validator_names_every_malformed_shape(bad_ref: object, reason: str) -> None:
+    """The reason tokens are the closed vocabulary both read legs
+    report; ``request_locator_oversized`` reuses the backend's own
+    token so one oversized identity has one name."""
+    from fin.retrieve.read_port import validate_company_source_ref
+
+    assert validate_company_source_ref(bad_ref) == {
+        "error": "invalid_locator",
+        "reason": reason,
+    }
+
+
+@pytest.mark.parametrize(
+    "junk", ["x", 42, None, [], {}, object(), b"bytes", 3.5, True]
+)
+def test_validator_never_raises_on_junk(junk: object) -> None:
+    """The boundary contract: garbage in, a typed failure dict out."""
+    from fin.retrieve.read_port import validate_company_source_ref
+
+    result = validate_company_source_ref(junk)
+    assert isinstance(result, dict)
+    assert result["error"] == "invalid_locator"

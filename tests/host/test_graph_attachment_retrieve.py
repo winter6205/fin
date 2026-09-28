@@ -686,3 +686,87 @@ def test_the_composition_root_threads_the_service_as_the_retriever(
 
     compile_for_runtime(checkpointer_url="postgresql://x")
     assert calls[-1]["attachment_retriever"] is None
+
+
+# ---------------------------------------------------------------------------
+# T3 -> T4 handoff (the tracked change integration gate)
+# ---------------------------------------------------------------------------
+
+
+class _HandoffReader:
+    """Attachment read leg that bounds real text through the T4 contract."""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def read_slice(self, source_ref: Any, position: int = 0) -> dict[str, Any]:
+        from fin.retrieve.source_read import bounded_slice
+
+        return bounded_slice(dict(source_ref), self._text, position)
+
+
+def test_same_thread_retrieve_then_read_source_handoff() -> None:
+    """The locator T3 publishes is the locator T4 reads, in one run.
+
+    One graph wiring BOTH seams (search port + source-reader factory),
+    one thread: ``retrieve`` answers with the typed ``source_ref``, the
+    model copies that exact dict into ``read_source``, the slice comes
+    back bounded, and only the READ text — never the hit text — carries
+    the citation (attachment chunks stay out of the evidence channel).
+    """
+    chunk = _attachment_chunk("MEMO-1", version=2, unit=4)
+    retriever = FakeAttachmentSearchPort({_THREAD_A: [chunk]})
+    handoff_ref = chunk.source_ref.as_source_ref()
+    built: list[str] = []
+
+    def factory(thread_id: str) -> Any:
+        built.append(thread_id)
+        return _HandoffReader(chunk.text)
+
+    model = ScriptedChatModel(
+        script=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "retrieve",
+                        "args": {"query": GROUNDED},
+                        "id": "c-retrieve",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_source",
+                        "args": {"source_ref": handoff_ref, "position": 0},
+                        "id": "c-read",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content=f"Verbatim: {ATTACHMENT_TEXT}"),
+        ]
+    )
+    graph = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        adapter=_company_port(hits=True),
+        known_document_ids=set(KNOWN_IDS),
+        attachment_retriever=retriever,
+        attachment_source_reader_factory=factory,
+    )
+
+    out = graph.invoke(
+        reset_input_state(GROUNDED),
+        config={"configurable": {"thread_id": _THREAD_A}},
+    )
+
+    assert out["status"] == "done"
+    assert built == [_THREAD_A]
+    envelope = _envelope(out)
+    assert envelope["attachment_chunks"][0]["source_ref"] == handoff_ref
+    assert out["citations"]
+    assert out["citations"][0].document_id == "MEMO-1"

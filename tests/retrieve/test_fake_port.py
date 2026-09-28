@@ -618,3 +618,132 @@ def test_the_fast_job_fact_never_masks_invalid_input() -> None:
         port.retrieve("   ")
 
     assert port.calls == []
+
+
+# ----- bounded read_source leg (T4, ADR 0088) -----
+
+VERSION = "a" * 64
+
+
+def _page_text(document_id: str = "TEST-2023Q1", count: int = 3) -> dict:
+    """Manifest fixture whose unit texts the slice leg can walk."""
+    from fin.corpus.extracted import ExtractedPage
+
+    return {
+        document_id: tuple(
+            ExtractedPage(
+                locator=Locator(document_id=document_id, version=VERSION, page=n),
+                text=f"PAGE {n} BODY",
+                passages=(),
+            )
+            for n in range(1, count + 1)
+        )
+    }
+
+
+def _company_ref(document_id: str = "TEST-2023Q1", unit: int = 1) -> dict:
+    return {"document_id": document_id, "version": VERSION, "unit": unit}
+
+
+def test_fake_read_slice_answers_from_the_manifest_unit() -> None:
+    port = FakeRetrievePort(pages_by_doc=_page_text())
+    result = port.read_slice(_company_ref())
+    assert result == {
+        "source_ref": _company_ref(),
+        "text": "PAGE 1 BODY",
+        "next_position": None,
+    }
+
+
+def test_fake_read_slice_walk_reassembles_the_unit_exactly() -> None:
+    """Following the cursor to null concatenates to the stored text,
+    byte for byte — the fake exercises the shared bounds, not a copy."""
+    port = FakeRetrievePort(pages_by_doc=_page_text())
+    parts: list[str] = []
+    position: int | None = 0
+    while position is not None:
+        result = port.read_slice(_company_ref(unit=2), position)
+        parts.append(result["text"])
+        position = result["next_position"]
+    assert "".join(parts) == "PAGE 2 BODY"
+
+
+def test_fake_read_slice_honours_a_mid_unit_cursor() -> None:
+    port = FakeRetrievePort(pages_by_doc=_page_text())
+    result = port.read_slice(_company_ref(), position=5)
+    assert result["text"] == "1 BODY"
+    assert result["next_position"] is None
+
+
+def test_fake_read_slice_empty_terminal_slice_is_success() -> None:
+    """``position == len(text)`` is the legal end of a walk, not an
+    out-of-range error."""
+    port = FakeRetrievePort(pages_by_doc=_page_text())
+    assert port.read_slice(_company_ref(), position=len("PAGE 1 BODY")) == {
+        "source_ref": _company_ref(),
+        "text": "",
+        "next_position": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        pytest.param({"document_id": "NOPE-2099Q9", "version": VERSION, "unit": 1}, id="unknown-doc"),
+        pytest.param({"document_id": "TEST-2023Q1", "version": "b" * 64, "unit": 1}, id="unknown-version"),
+        pytest.param({"document_id": "TEST-2023Q1", "version": VERSION, "unit": 9}, id="unknown-unit"),
+    ],
+)
+def test_fake_read_slice_unknown_locator(ref: dict) -> None:
+    """A triple the manifest does not carry is the named miss, never an
+    empty success that would end a walk early with half a body."""
+    port = FakeRetrievePort(pages_by_doc=_page_text())
+    assert port.read_slice(ref) == {"error": "unknown_locator"}
+
+
+def test_fake_read_slice_without_manifest_is_unknown_locator() -> None:
+    assert FakeRetrievePort().read_slice(_company_ref()) == {
+        "error": "unknown_locator"
+    }
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        pytest.param("not-a-record", id="not-a-record"),
+        pytest.param({"document_id": "X"}, id="missing-keys"),
+        pytest.param(None, id="none"),
+        pytest.param(
+            {"document_id": "D" * 1100, "version": VERSION, "unit": 1},
+            id="oversized",
+        ),
+    ],
+)
+def test_fake_read_slice_malformed_locator_is_invalid_locator(ref: object) -> None:
+    """The shared validator runs before any manifest lookup, so a shape
+    failure reads the same on both legs."""
+    result = FakeRetrievePort(pages_by_doc=_page_text()).read_slice(ref)  # type: ignore[arg-type]
+    assert result["error"] == "invalid_locator"
+
+
+@pytest.mark.parametrize(
+    ("position", "code"),
+    [
+        pytest.param(-3, "invalid_position", id="negative"),
+        pytest.param("0", "invalid_position", id="string-cursor"),
+        pytest.param(True, "invalid_position", id="bool-cursor"),
+        pytest.param(500, "invalid_position", id="beyond-end"),
+    ],
+)
+def test_fake_read_slice_typed_input_failures(position: object, code: str) -> None:
+    result = FakeRetrievePort(pages_by_doc=_page_text()).read_slice(
+        _company_ref(), position  # type: ignore[arg-type]
+    )
+    assert result["error"] == code
+    assert "text" not in result, "a failure never carries text"
+
+
+def test_fake_port_satisfies_the_source_reader_protocol() -> None:
+    from fin.retrieve.source_read import SourceReader
+
+    assert isinstance(FakeRetrievePort(), SourceReader)

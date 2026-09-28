@@ -164,6 +164,7 @@ from fin.host.stream_map import (
 )
 from fin.corpus.catalog import DEFAULT_CATALOG_PATH
 from fin.host.tools import list_files, read_file
+from fin.host.tools.read_source import read_source
 from fin.host.tools.issuer_fanout import (
     ISSUER_FANOUT_TOOL,
     MAX_ISSUERS,
@@ -202,6 +203,13 @@ from fin.retrieve.hit_mapping import MappingFailureLedger, ledger_from_env
 from fin.retrieve.input_validation import InputValidationError
 from fin.retrieve.port import RetrievePort
 from fin.retrieve.read_port import MissReadPort, ReadPort
+from fin.retrieve.source_read import (
+    ATTACHMENT_KIND,
+    UNKNOWN_LOCATOR,
+    is_slice_result,
+    serialize_result,
+    source_error,
+)
 from fin.retrieve.tool import retrieve
 
 
@@ -534,6 +542,164 @@ def _make_read_file_tool(read_port: ReadPort):
         )
 
     return read_file_tool
+
+
+class _MissSourceReader:
+    """A ``read_source`` leg that no adapter backs: every read misses.
+
+    The company-leg twin of ``MissReadPort`` (ADR 0046 / 0047). When the
+    bound retrieve adapter exposes no ``read_slice`` face, the tool
+    answers the typed miss instead of quietly reaching for another body
+    source.
+    """
+
+    def read_slice(
+        self,
+        source_ref: Mapping[str, Any],
+        position: int = 0,
+    ) -> dict[str, Any]:
+        return source_error(UNKNOWN_LOCATOR)
+
+
+def _evidence_from_slice(result: Mapping[str, Any]) -> EvidenceItem:
+    """Map one returned slice to the single ``EvidenceItem`` it earns.
+
+    The slice addresses exactly one frozen unit, so exactly one item
+    enters the channel, and its ``page_text`` is only the text this call
+    returned (ADR 0046 this-run evidence; spec: a quote may rest on
+    nothing the run did not read). ``Locator.page`` carries the unit
+    ordinal until T5 renames the field to ``unit``.
+    """
+    ref = result.get("source_ref") or {}
+    kind = ref.get("kind") if isinstance(ref, Mapping) else None
+    try:
+        unit = int(ref.get("unit", 0))
+    except (TypeError, ValueError):
+        # EXIT: an off-contract ordinal still cannot block admitting
+        # text the model genuinely received; zero matches no locator a
+        # citation could claim.
+        unit = 0
+    identity = (
+        ref.get("attachment_id")
+        if kind == ATTACHMENT_KIND
+        else ref.get("document_id")
+    )
+    return EvidenceItem(
+        locator=Locator(
+            # T5 formalizes attachment citation identity; until then an
+            # attachment's id rides the locator's document slot.
+            document_id=str(identity or ""),
+            version=str(ref.get("version") or ""),
+            page=unit,
+        ),
+        page_text=str(result.get("text") or ""),
+    )
+
+
+def _attachment_source_reader_factory(
+    attachment_service: Any,
+) -> Callable[[str], Any] | None:
+    """Derive per-thread attachment readers from the wired attachment seam.
+
+    Returns ``None`` when nothing is wired, so attachment reads answer
+    the typed miss; the graph never builds an attachment store of its
+    own (same rule as the ``ensure_attachment_ready`` gate). The leg
+    module is imported lazily because the attachment capability sits
+    below this module in the import graph.
+    """
+    store = getattr(attachment_service, "store", None)
+    if store is None:
+        return None
+
+    def build(thread_id: str) -> Any:
+        # WHY still lazy: the leg module sits below this one in the
+        # import graph, so the cycle is dodged at import time; a missing
+        # leg module is a broken build and propagates.
+        module = importlib.import_module("fin.host.attachment_source_read")
+        return module.AttachmentSourceReader(store, thread_id)
+
+    return build
+
+
+def _make_read_source_tool(
+    company_reader: Any,
+    attachment_reader_factory: Callable[[str], Any] | None,
+):
+    """Build the ``read_source`` host tool (ADR 0087 / 0088).
+
+    The tool resolves one frozen unit per call through the
+    :func:`fin.host.tools.read_source.read_source` wrapper and, on a
+    successful slice, contributes exactly one ``EvidenceItem`` for the
+    returned text. Every typed error contributes nothing and reaches the
+    model as the tool result.
+
+    The attachment leg is bound PER CALL to the run's trusted
+    ``configurable.thread_id`` — the same source
+    ``ensure_attachment_ready`` reads — so a model-supplied thread id in
+    ``source_ref`` can never widen the readable scope (spec SC4).
+    ``attachment_reader_factory`` ``None`` (or a run with no thread id)
+    means no attachment leg is wired.
+
+    The tool's registered name is ``read_source``; it coexists with
+    ``read_file`` until T5 removes the latter.
+    """
+
+    def _attachment_reader_for_run(config: Any) -> Any:
+        if attachment_reader_factory is None:
+            return None
+        configurable = dict((config or {}).get("configurable") or {})
+        thread_id = str(configurable.get("thread_id") or "")
+        if not thread_id:
+            return None
+        return attachment_reader_factory(thread_id)
+
+    @tool("read_source")
+    def read_source_tool(
+        source_ref: dict,
+        position: int = 0,
+        tool_call_id: Annotated[str, InjectedToolCallId] = "",
+        config: Annotated[RunnableConfig, InjectedToolArg()] = None,
+    ) -> Command:
+        """Read one bounded slice of a frozen source unit.
+
+        ``source_ref`` is either a company locator
+        ``{document_id, version, unit}`` or an attachment locator
+        ``{kind: "attachment", attachment_id, version, unit}``.
+        ``position`` is a zero-based code-point offset within that unit
+        and defaults to 0. Each slice carries at most 8000 code points
+        and ``next_position`` says where to continue (``null`` at end).
+        Unknown ids, stale versions, and another thread's attachment
+        answer ``{"error": "unknown_locator"}`` and contribute no
+        evidence; so do invalid positions and unavailable sources.
+        """
+        result = read_source(
+            source_ref,
+            position,
+            company_reader=company_reader,
+            attachment_reader=_attachment_reader_for_run(config),
+        )
+        new_evidence: list[EvidenceItem] = []
+        if is_slice_result(result) and result.get("text"):
+            # A slice with no text is the legal terminal read at
+            # ``position == len(unit)``; nothing was returned, so there
+            # is nothing this run can quote (and empty evidence would
+            # trip the gate's malformed-evidence check).
+            new_evidence.append(_evidence_from_slice(result))
+        tool_message = ToolMessage(
+            # WHY the shared serializer: the legs bound the result with
+            # the canonical ``ensure_ascii=False`` bytes, so the content
+            # the model receives must be those same bytes — an
+            # ASCII-escaping default would re-inflate a legal slice past
+            # the cap.
+            content=serialize_result(result),
+            tool_call_id=tool_call_id,
+            name="read_source",
+        )
+        return Command(
+            update={"messages": [tool_message], "evidence": new_evidence}
+        )
+
+    return read_source_tool
 
 
 def _default_empty_hit_rewrite(query: str) -> str:
@@ -2254,6 +2420,7 @@ def compile_graph(
     enable_choice_window: bool = False,
     attachment_service: _AttachmentPreparationService | None = None,
     attachment_retriever: "AttachmentSearchPort | None" = None,
+    attachment_source_reader_factory: Callable[[str], Any] | None = None,
 ) -> "_LockedGraph":
     """Build the v1 host graph (T6).
 
@@ -2482,6 +2649,17 @@ def compile_graph(
         ``fin.host.attachment_retrieval.AttachmentSearchPort`` Protocol
         seam — object identity is part of the graph cache key, because a
         cached unwired compile must never be served to a wired caller.
+    attachment_source_reader_factory
+        ADR 0087 / 0088: builds the attachment leg of ``read_source`` for
+        one run, called with the run's trusted ``configurable.thread_id``
+        and expected to return a
+        :class:`~fin.retrieve.source_read.SourceReader`. ``None`` (the
+        default) derives one from ``attachment_service``'s store when that
+        service exposes one, so an attachment read stays inside the
+        thread the host already bound; with neither, attachment reads
+        answer ``{"error": "unknown_locator"}``. The company leg needs no
+        parameter — it is the bound retrieve adapter's own
+        ``read_slice`` when present, otherwise a typed-miss reader.
 
     Returns
     -------
@@ -2549,6 +2727,26 @@ def compile_graph(
     if read_port is None:
         read_port = MissReadPort()
 
+    # Resolve the read_source legs (ADR 0087 / 0088). The company leg is
+    # the bound adapter's own ``read_slice`` when it has one (the MCP
+    # adapter and the fake port grow into that face); an adapter without
+    # it gets the typed-miss reader, exactly as ``read_file`` gets
+    # ``MissReadPort``. The adapter object itself is the leg (the same
+    # shape ``read_file`` uses for its port), so the wrapper's one
+    # duck-typed ``read_slice`` lookup covers both. The attachment leg
+    # defaults to one derived from the wired attachment service's store,
+    # and an explicit factory (a test or a different composition root)
+    # wins.
+    company_reader: Any = (
+        adapter
+        if callable(getattr(adapter, "read_slice", None))
+        else _MissSourceReader()
+    )
+    if attachment_source_reader_factory is None:
+        attachment_source_reader_factory = _attachment_source_reader_factory(
+            attachment_service
+        )
+
     mpath = _resolve_path(manifest_path, _DEFAULT_MANIFEST_PATH)
     rpath = _resolve_path(extracted_root, _DEFAULT_EXTRACTED_ROOT)
     fpath = _resolve_path(facts_root, _DEFAULT_FACTS_ROOT)
@@ -2574,6 +2772,9 @@ def compile_graph(
     redline_tool = _make_redline_tool(mpath, rpath)
     table_extract_tool = _make_table_extract_tool(mpath, rpath)
     statement_tool = _make_statement_tool(fpath)
+    read_source_tool = _make_read_source_tool(
+        company_reader, attachment_source_reader_factory
+    )
 
     # T6 (spec SC12 / SC13 / map G4): when memory is ON, expose exactly
     # three tools — save / recall / edit_user_profile. OFF keeps the
@@ -2652,6 +2853,13 @@ def compile_graph(
         tool_node_tools.extend(
             [save_memory_tool, recall_memory_tool, edit_user_profile_tool]
         )
+
+    # Bound last on both surfaces: LangChain's tool binding is
+    # order-sensitive and existing tests pin the earlier indices.
+    # ``read_file`` and ``read_source`` deliberately coexist until T5
+    # removes the former.
+    model_bound_tools.append(read_source_tool)
+    tool_node_tools.append(read_source_tool)
 
     bound_model = model.bind_tools(model_bound_tools)
     # Operator thinking off: OpenAI-compatible / 方舟 extra_body
@@ -3864,6 +4072,7 @@ def compile_graph(
         # cached-compile hazard as the preparation seam, one node
         # earlier in the envelope's life.
         attachment_retriever=attachment_retriever,
+        attachment_source_reader_factory=attachment_source_reader_factory,
         # T2 (ADR 0044): the SAME compactor instance the graph gate
         # uses, so ``/compact`` and the >=90% auto path share one
         # eviction unit walker, one summarizer seam, one floor.
@@ -3950,6 +4159,7 @@ def _make_locked_graph(
     enable_choice_window: bool = False,
     attachment_service: Any | None = None,
     attachment_retriever: Any | None = None,
+    attachment_source_reader_factory: Any | None = None,
 ) -> "_LockedGraph":
     key = (
         _IdentityKey(checkpointer),
@@ -3985,6 +4195,12 @@ def _make_locked_graph(
         # a cached compile made without a search port would answer every
         # later wired caller as if the thread had no attachments.
         _IdentityKey(attachment_retriever),
+        # ADR 0087: the attachment leg of ``read_source`` is a distinct
+        # injectable seam; two graphs differing only in it are two
+        # different graphs, and the factory OBJECT rides the key so a
+        # later factory at a recycled address cannot hit a stale
+        # wired compile.
+        _IdentityKey(attachment_source_reader_factory),
     )
     cached = _IDEMPOTENCE_CACHE.get(key)
     if cached is not None:

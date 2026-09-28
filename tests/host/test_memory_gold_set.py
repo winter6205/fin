@@ -904,12 +904,15 @@ def test_default_pytest_builds_off_graph_with_zero_memory_tools(
         assert forbidden not in bound_names
         assert forbidden not in tool_node_names
 
-    # The OFF path uses the existing eight ToolNode tools (no
+    # The OFF path uses the existing nine ToolNode tools (no
     # memory surface). Locked to a set equality so a future
-    # add-the-ninth-tool change is caught.
+    # unplanned add-the-next-tool change is caught; G4 T4 (ADR
+    # 0087) deliberately added ``read_source`` alongside
+    # ``read_file`` (T5 removes the latter).
     assert tool_node_names == {
         "list_files",
         "read_file",
+        "read_source",
         "retrieve",
         "get_xbrl_fact",
         "compare_facts",

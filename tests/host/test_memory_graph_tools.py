@@ -226,7 +226,7 @@ def test_off_graph_does_not_expose_any_memory_tool(tmp_path: Path) -> None:
         assert forbidden not in union
 
 
-def test_off_graph_with_none_port_still_has_eight_tools(tmp_path: Path) -> None:
+def test_off_graph_with_none_port_still_has_nine_tools(tmp_path: Path) -> None:
     """``memory_port=None`` is also OFF (the compile_graph default)."""
     graph = compile_graph(
         checkpointer=InMemorySaver(),
@@ -234,16 +234,17 @@ def test_off_graph_with_none_port_still_has_eight_tools(tmp_path: Path) -> None:
         user_profile_store=_profile_store(tmp_path),
     )
 
-    # The ToolNode's tool list is exactly the existing eight tools. The
-    # model binding adds ``research_issuers`` on top of those nine
+    # The ToolNode's tool list is exactly the existing nine tools. The
+    # model binding adds ``research_issuers`` on top of those ten
     # (research_issuers is bound to the model only, per Focus 4).
     tool_node_names = set(_tool_node_tools(graph))
     bound_names = {t.name for t in _compiled_bound_tools(graph)}
 
-    assert len(tool_node_names) == 8
+    assert len(tool_node_names) == 9
     expected_tool_node = {
         "list_files",
         "read_file",
+        "read_source",
         "retrieve",
         "get_xbrl_fact",
         "compare_facts",

@@ -44,7 +44,8 @@ into the shapes downstream code renders:
   the inline ``<think>`` strip above stays the fallback - thinking
   is surfaced or stripped, never swallowed into the answer.
 * :func:`summarize_list_files` / :func:`summarize_retrieve` /
-  :func:`summarize_read_file` / :func:`summarize_get_xbrl_fact` /
+  :func:`summarize_read_file` / :func:`summarize_read_source` /
+  :func:`summarize_get_xbrl_fact` /
   :func:`format_tool_summary` - the
   human-readable one-liners the SPA renders in the tools region
   (spec line 32). Raw ``ToolMessage`` JSON never reaches the wire;
@@ -905,6 +906,47 @@ def summarize_read_file(
     return head
 
 
+def summarize_read_source(
+    *,
+    result: dict[str, Any] | None = None,
+    args: dict[str, Any] | None = None,
+) -> str:
+    """Human-readable one-liner for ``read_source`` calls.
+
+    Spec ``thread-attachment-source-read``: one bounded slice of one
+    frozen unit, so the row names the source and its unit, plus the
+    continuation offset when the slice did not reach the end. A typed
+    failure (``{"error": ...}``) appends the code so the operator can
+    see why no evidence landed.
+    """
+    src_args = args or {}
+    src_result = result or {}
+    # The result echoes the resolved ref the leg actually read, so it
+    # wins over the model's own argument.
+    ref = src_result.get("source_ref") or src_args.get("source_ref") or {}
+    if not isinstance(ref, Mapping):
+        ref = {}
+    if ref.get("kind") == "attachment":
+        source_id = str(ref.get("attachment_id") or "")
+    else:
+        source_id = str(ref.get("document_id") or "")
+    unit_raw = ref.get("unit")
+    unit = 0
+    if isinstance(unit_raw, int) and not isinstance(unit_raw, bool):
+        unit = unit_raw
+    elif isinstance(unit_raw, str):
+        try:
+            unit = int(unit_raw)
+        except ValueError:
+            unit = 0
+    head = f"{source_id} u.{unit}" if source_id else "read_source"
+    if isinstance(src_result, Mapping) and src_result.get("next_position"):
+        head += f" -> {src_result['next_position']}"
+    if isinstance(src_result, Mapping) and src_result.get("error"):
+        head += f" ({src_result['error']})"
+    return head
+
+
 def _format_fact_value(value: Any) -> str:
     """Render a fact row's value with thousands separators.
 
@@ -1173,6 +1215,8 @@ def format_tool_summary(
         )
     if name == "read_file":
         return summarize_read_file(result=result_dict, args=args)
+    if name == "read_source":
+        return summarize_read_source(result=result_dict, args=args)
     if name == "get_xbrl_fact":
         return summarize_get_xbrl_fact(result=result_dict, args=args)
     if name == "compare_facts":
@@ -1241,6 +1285,7 @@ __all__ = [
     "summarize_table_extract",
     "summarize_list_files",
     "summarize_read_file",
+    "summarize_read_source",
     "summarize_research_issuers",
     "summarize_retrieve",
 ]
