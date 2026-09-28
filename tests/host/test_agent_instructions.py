@@ -120,6 +120,58 @@ def test_attachment_context_message_carries_marker_filename_and_text() -> None:
     assert "b.md" in content and "line two" in content
 
 
+def test_attachment_context_message_names_each_attachment_id() -> None:
+    """G4 T3: the header carries the ``attachment_id`` next to the
+    filename, so a grounded model can NAME one attachment in the
+    ``retrieve`` tool's ``attachment_ids`` argument instead of guessing
+    from a filename two files could share."""
+    from fin.host.agent_instructions import attachment_context_message
+
+    msg = attachment_context_message(
+        [
+            {"attachment_id": "a1", "filename": "note.md", "text": "rev 42.7"},
+            {"attachment_id": "a2", "filename": "b.md", "text": "line two"},
+        ]
+    )
+    assert msg is not None
+    content = str(msg.content)
+    assert "--- attached file: note.md [attachment_id: a1] ---" in content
+    assert "--- attached file: b.md [attachment_id: a2] ---" in content
+
+
+def test_attachment_context_message_keeps_the_block_format() -> None:
+    """The block's shape stays stable: one ``--- attached file:`` header
+    per attachment, the filename still readable inside it (the preparation
+    gate suite reads that substring back), the ids never merged into one
+    line."""
+    from fin.host.agent_instructions import attachment_context_message
+
+    msg = attachment_context_message(
+        [
+            {"attachment_id": "a1", "filename": "n.md", "text": "one"},
+            {"attachment_id": "a2", "filename": "n.md", "text": "two"},
+        ]
+    )
+    assert msg is not None
+    content = str(msg.content)
+    assert content.count("--- attached file: n.md") == 2
+    # Same filename, different ids: the model can still tell them apart.
+    assert "[attachment_id: a1]" in content and "[attachment_id: a2]" in content
+
+
+def test_attachment_context_message_without_an_id_keeps_the_old_header() -> None:
+    """Boundary: an attachment dict with no id (a caller that never went
+    through the ingest route) still gets a block, and its header prints no
+    empty ``attachment_id`` the model could not name."""
+    from fin.host.agent_instructions import attachment_context_message
+
+    msg = attachment_context_message([{"filename": "n.md", "text": "x"}])
+    assert msg is not None
+    content = str(msg.content)
+    assert "--- attached file: n.md ---" in content
+    assert "attachment_id" not in content
+
+
 def test_attachment_context_message_states_not_citable_discipline() -> None:
     """ADR 0046 discipline is stated to the model: attachment text is
     NOT citable corpus; the gate only accepts this-run retrieve /

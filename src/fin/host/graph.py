@@ -143,6 +143,7 @@ from fin.host.agent_instructions import (
     messages_for_model,
 )
 from fin.host.degradation_notice import (
+    ATTACHMENT_PREPARATION_FAILED,
     DEGRADATION_NOTICE_FIELD,
     consume_degradation,
     degradation_notice_entry,
@@ -211,6 +212,13 @@ _LOG = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # ``fin.corpus.facts`` is imported lazily at call time
     from fin.corpus.facts import Fact
+    # T3: the attachment search seam is imported lazily at call time for
+    # the same module-graph reason as ``fin.host.attachment_prepare``
+    # (see ``_attachment_retrieval_error_type``).
+    from fin.host.attachment_retrieval import (
+        AttachmentRetrievalError,
+        AttachmentSearchPort,
+    )
 
 
 # ----- typed errors -----
@@ -305,6 +313,24 @@ def _resolve_workspace_root(config: Mapping[str, Any] | None) -> Path:
     if isinstance(raw, str) and raw == "":
         raise WorkspaceRootMissingError()
     return Path(raw)
+
+
+def _bound_thread_id(config: Mapping[str, Any] | None) -> str:
+    """Return the run's host-bound ``thread_id``, or ``""`` when unbound.
+
+    spec thread-attachment-source-read decision 1 / ADR 0088: the active
+    thread is a HOST fact carried by the run config, never a model
+    argument — a model-supplied ``thread_id`` cannot widen scope. Read
+    with the same shape as ``workspace_root`` (``configurable`` only, no
+    fallback), but an absent value is the ordinary "this call has no
+    thread scope" answer rather than a typed refusal: the attachment
+    branch is optional machinery, so it simply does not run.
+    """
+    if not config:
+        return ""
+    configurable = config.get("configurable") or {}
+    raw = configurable.get("thread_id")
+    return str(raw) if raw is not None and str(raw) != "" else ""
 
 
 _DEFAULT_DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "corpus"
@@ -531,6 +557,7 @@ def _make_retrieve_tool(
     degradation_ledger: DegradationLedger | None = None,
     rewriter: Callable[[str], str] | None = None,
     retry_observer: Callable[[RewriteRetryResult], None] | None = None,
+    attachment_retriever: "AttachmentSearchPort | None" = None,
 ):
     """Build the ``retrieve`` host tool.
 
@@ -593,6 +620,26 @@ def _make_retrieve_tool(
 
     The tool's registered name is ``retrieve`` so the model can
     call it by name.
+
+    Attachment branch (G4 T3 / spec thread-attachment-source-read
+    decisions 1 + 7): when an ``attachment_retriever`` is wired, the same
+    call also searches the ACTIVE thread's ready attachments and publishes
+    the hits on the envelope as ``attachment_chunks``. Three rules hold by
+    construction:
+    * the thread scope is host-bound — it comes from
+      ``configurable.thread_id`` through the injected ``config``, never
+      from a model argument (ADR 0088), so a model cannot widen it;
+    * ``attachment_ids`` narrows ONLY this branch — company filters and
+      company ranking stay behind the existing port, and a comparison
+      question gets both branches in one envelope;
+    * a typed branch failure rides ``attachment_error`` and never an empty
+      ``attachment_chunks``, because the miss shape would tell the model
+      the thread has nothing when the search never answered.
+    The branch runs ONCE per call with the ORIGINAL query — the empty-hit
+    rewrite retry is company-port machinery only. Attachment text never
+    enters the evidence channel: T5 owns attachment citation, so the
+    citation gate keeps ruling on company hits exactly as before. With no
+    retriever wired the envelope is byte-identical to the pre-T3 shape.
     """
     ledger = (
         mapping_ledger if mapping_ledger is not None else ledger_from_env()
@@ -614,8 +661,10 @@ def _make_retrieve_tool(
         form: str | None = None,
         ticker: str | None = None,
         filing_date: str | None = None,
+        attachment_ids: list[str] | None = None,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
         state: Annotated[Any, InjectedState()] = None,
+        config: Annotated[RunnableConfig, InjectedToolArg()] = None,
     ) -> Command:
         """Narrative retrieval over page-passage chunks.
 
@@ -631,6 +680,16 @@ def _make_retrieve_tool(
         argument: the host cascade assigns it and this call carries it
         (spec search-mode SC2), so the model cannot pick or lie about a
         档.
+
+        ``attachment_ids`` optionally names files attached to THIS
+        thread to search among; it narrows only the attachment branch
+        and leaves the company filters untouched. Omit it to search
+        every ready attachment of the current thread. The attachment
+        hits come back as a separate ``attachment_chunks`` list, and
+        the thread is fixed by the conversation this run belongs to —
+        it is not an argument, so another thread's files cannot be
+        reached from here. With no attachment retriever wired the
+        argument is inert: the envelope stays the pre-T3 shape.
         """
         def _port_call(retry_query: str) -> dict[str, Any]:
             """One adapter-bound retrieve call for the retry helper.
@@ -692,6 +751,54 @@ def _make_retrieve_tool(
                 default_collector().record_rewrite_retry(
                     exhausted=outcome.exhausted
                 )
+
+        def _attachment_leg() -> dict[str, Any]:
+            """The envelope keys this call's attachment branch owns.
+
+            ``{}`` when the branch is not eligible to run at all (no
+            retriever wired, no host-bound thread, an un-askable query) —
+            which is what keeps an unwired graph's envelope byte-identical
+            to the pre-T3 shape.
+            """
+            if attachment_retriever is None or not query.strip():
+                # A blank query is un-askable of either leg: the company
+                # leg names it as its own input failure, and re-asking the
+                # thread index for "" would invent a hit set for a call
+                # that was never askable.
+                return {}
+            thread_id = _bound_thread_id(config)
+            if not thread_id:
+                # EXIT: with no host-bound scope there is no eligible
+                # attachment set. Guessing one is the widening ADR 0088
+                # forbids, so the branch stays out and the company hits
+                # answer alone.
+                return {}
+            typed_failure = _attachment_retrieval_error_type()
+            try:
+                hits = attachment_retriever.search(
+                    thread_id=thread_id,
+                    query=query,
+                    attachment_ids=attachment_ids,
+                    limit=limit,
+                )
+            except typed_failure as exc:
+                # EXIT: the typed code rides the envelope, and it is never
+                # collapsed into ``{"attachment_chunks": []}`` — that would
+                # tell the model the thread holds nothing when the index
+                # never answered.
+                return {"attachment_error": exc.as_dict()}
+            # A clean run publishes its own key even when empty: "looked,
+            # found nothing" is a different fact from "did not look".
+            return {
+                "attachment_chunks": [
+                    {
+                        "text": hit.text,
+                        "source_ref": hit.source_ref.as_source_ref(),
+                        "score": hit.score,
+                    }
+                    for hit in hits
+                ]
+            }
 
         # T3 (spec SC4–SC5): the drops this call caused are measured on
         # the ledger's PER-THREAD counter, read before and after the
@@ -770,6 +877,10 @@ def _make_retrieve_tool(
             # here is what puts them in front of the user.
             envelope = dict(result)
             _consume_into_envelope(envelope, result, ledger=degradations)
+            # The attachment branch answers independently of the company
+            # branch's typed exit: a company failure must not hide the
+            # thread's attachments either.
+            envelope.update(_attachment_leg())
             return Command(
                 update={
                     "messages": [
@@ -816,6 +927,7 @@ def _make_retrieve_tool(
         ]
         envelope: dict[str, Any] = {"chunks": serialized_chunks}
         _consume_into_envelope(envelope, result, ledger=degradations)
+        envelope.update(_attachment_leg())
         tool_message = ToolMessage(
             content=json.dumps(envelope, default=str),
             tool_call_id=tool_call_id,
@@ -2036,11 +2148,6 @@ def _evaluate_numeric_gate_in_node(messages: list[BaseMessage]):
     )
 
 
-# T2f EXIT: a preparation the service reports ``failed`` without a code
-# (or an out-of-vocabulary state) is still a typed exit — the reason names
-# the gate's own failure and never degrades to an empty successful turn.
-ATTACHMENT_PREPARATION_FAILED = "attachment_preparation_failed"
-
 # T2f: the interrupt payload's pinned kind — the resumer filters on this
 # exact string, so it is a wire token, not prose.
 ATTACHMENT_PREPARATION_INTERRUPT_KIND = "attachment_preparation"
@@ -2107,6 +2214,20 @@ def _attachment_resolve_race_errors() -> tuple[type[Exception], ...]:
     return (AttachmentNotReadyError, AttachmentNotFoundError)
 
 
+def _attachment_retrieval_error_type() -> type["AttachmentRetrievalError"]:
+    """The attachment branch's typed failure base, caught by TYPE.
+
+    Resolved lazily for the same module-graph reason as
+    ``_attachment_resolve_race_errors``: ``attachment_retrieval`` reaches
+    ``attachment_index`` → ``attachment_store`` → ``attachment_vision`` →
+    ``fin.host.compile``, which imports this module. Any exception the
+    port raises outside this base is a real bug and propagates.
+    """
+    from fin.host.attachment_retrieval import AttachmentRetrievalError
+
+    return AttachmentRetrievalError
+
+
 def compile_graph(
     *,
     checkpointer: Any,
@@ -2132,6 +2253,7 @@ def compile_graph(
     user_profile_store: UserProfileStore | None = None,
     enable_choice_window: bool = False,
     attachment_service: _AttachmentPreparationService | None = None,
+    attachment_retriever: "AttachmentSearchPort | None" = None,
 ) -> "_LockedGraph":
     """Build the v1 host graph (T6).
 
@@ -2345,6 +2467,21 @@ def compile_graph(
         sequencing, the capability owns parse/vision/index
         execution (spec: "the node does not parse... itself"), and the
         real service satisfies the Protocol structurally.
+    attachment_retriever
+        T3 (thread-attachment-source-read decisions 1 + 7): the
+        thread-scoped attachment search seam wired into the ``retrieve``
+        tool. When supplied, a grounded ``retrieve`` call also asks this
+        port ONCE with the ORIGINAL query under the run's host-bound
+        ``thread_id``, and its hits ride the same envelope as a new
+        ``attachment_chunks`` key (typed failures as ``attachment_error``).
+        The model-facing argument set gains only the optional
+        ``attachment_ids`` narrowing — there is NO ``thread_id`` model
+        argument, so a model cannot widen scope. ``None`` (the default)
+        keeps today's ``retrieve`` envelope exactly: no branch, no extra
+        key. Like ``attachment_service``, this is a
+        ``fin.host.attachment_retrieval.AttachmentSearchPort`` Protocol
+        seam — object identity is part of the graph cache key, because a
+        cached unwired compile must never be served to a wired caller.
 
     Returns
     -------
@@ -2423,6 +2560,7 @@ def compile_graph(
         adapter,
         mapping_ledger=mapping_failure_ledger,
         degradation_ledger=degradation_ledger,
+        attachment_retriever=attachment_retriever,
     )
     get_xbrl_fact_tool = _make_get_xbrl_fact_tool(fpath)
     # T3 (spec Focus 1): bound LAST so the four prior tools keep
@@ -2849,7 +2987,13 @@ def compile_graph(
                 # the model answer without a source the operator named.
                 # The service's code rides ``status_reason`` verbatim
                 # (spec: named failure); ``unknown`` with no code is the
-                # unknown/stale-identity exit.
+                # unknown/stale-identity exit. T2f: a preparation the
+                # service reports ``failed`` with no code (or an
+                # out-of-vocabulary state) is still a typed exit —
+                # ``ATTACHMENT_PREPARATION_FAILED`` (imported from the
+                # leaf module shared with the search-surface fallback)
+                # names the gate's own failure and never degrades to an
+                # empty successful turn.
                 if outcome_state == "failed":
                     reason = str(code) if code else ATTACHMENT_PREPARATION_FAILED
                 elif outcome_state == "unknown":
@@ -3714,9 +3858,12 @@ def compile_graph(
         # T2f: the gate node + routing exist only when the seam is
         # wired — an unwired cached compile must never be served to a
         # wired caller (same rule as ``enable_choice_window``).
-        attachment_service_id=(
-            id(attachment_service) if attachment_service is not None else 0
-        ),
+        attachment_service=attachment_service,
+        # T3: the search seam adds the retrieve tool's attachment branch
+        # and its model-facing ``attachment_ids`` argument — the same
+        # cached-compile hazard as the preparation seam, one node
+        # earlier in the envelope's life.
+        attachment_retriever=attachment_retriever,
         # T2 (ADR 0044): the SAME compactor instance the graph gate
         # uses, so ``/compact`` and the >=90% auto path share one
         # eviction unit walker, one summarizer seam, one floor.
@@ -3732,20 +3879,17 @@ def compile_graph(
         # shadows the actual executor in the compiled graph).
         tool_node=tool_dispatcher,
         # T6: memory_port changes the bound tool set (ON adds three
-        # tools; OFF keeps the eight ToolNode tools), so the
-        # idempotence cache must distinguish graphs by memory
-        # surface. ``id(memory_port)`` is stable across two calls with
-        # the same injected port object — keying on the bound tool
-        # LIST directly would create a fresh list per call and break
-        # the OFF/idempotence contract that the existing wiring tests
-        # pin.
+        # tools; OFF keeps the eight ToolNode tools), so the cache must
+        # distinguish graphs by memory surface. Keep the port itself
+        # in the key because a disabled port is not retained by the
+        # compiled graph and its id could otherwise be reused.
         #
         # spec SC8 / ADR 0049 (Wave A): the per-call workspace
         # cache slot is GONE. The per-call 工作区 rides the run's
         # ``configurable.workspace_root``, not the compile-time graph
         # identity — two compiles with identical config but different
         # run-time workspaces must share the same cached proxy.
-        memory_port_id=id(memory_port) if memory_port is not None else 0,
+        memory_port=memory_port,
     )
 
 
@@ -3758,13 +3902,10 @@ def compile_graph(
 # HTTP handler's graph (both share the process-level checkpointer
 # and model).
 #
-# We use a dict keyed on ``(id(checkpointer), id(model),
-# step_cap, recursion_limit)`` because most LangGraph objects
-# (``InMemorySaver``, ``CompiledStateGraph``) do not implement a
-# hash-friendly ``__eq__`` — ``lru_cache`` keyed on the objects
-# directly would create a fresh cache entry per call. Keying on
-# ``id`` is the documented escape hatch for "same object reused"
-# idempotence.
+# Identity dimensions use strong holders that hash by ``id`` and compare
+# with ``is``. This supports unhashable or value-equal dependencies and
+# keeps each object alive for as long as its cache entry can be reused,
+# preventing recycled IDs from aliasing a different graph.
 #
 # spec SC8 / ADR 0049 (Wave A): the key DROPS the per-call
 # workspace cache slot. The per-call 工作区 rides the run's
@@ -3774,6 +3915,22 @@ def compile_graph(
 # against must share one cache entry — there is exactly one graph
 # object per (checkpointer, model) pair.
 _IDEMPOTENCE_CACHE: dict[tuple, "_LockedGraph"] = {}
+
+
+class _IdentityKey:
+    """Hold an object strongly while keying on its identity."""
+
+    __slots__ = ("value",)
+    value: object
+
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    def __hash__(self) -> int:
+        return id(self.value)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _IdentityKey) and self.value is other.value
 
 
 def _make_locked_graph(
@@ -3789,17 +3946,18 @@ def _make_locked_graph(
     compactor: OccupancyCompactor | None = None,
     bound_tools: list[Any] | None = None,
     tool_node: Any | None = None,
-    memory_port_id: int = 0,
+    memory_port: Any | None = None,
     enable_choice_window: bool = False,
-    attachment_service_id: int = 0,
+    attachment_service: Any | None = None,
+    attachment_retriever: Any | None = None,
 ) -> "_LockedGraph":
     key = (
-        id(checkpointer),
-        id(model),
+        _IdentityKey(checkpointer),
+        _IdentityKey(model),
         # The gray-zone judge is part of the compiled graph's behavior:
         # two graphs differing only in their judge are two different
-        # graphs, so the id belongs in the key.
-        id(jev_client) if jev_client is not None else 0,
+        # graphs, so its identity belongs in the key.
+        _IdentityKey(jev_client),
         int(step_cap),
         # T6: two graphs that differ ONLY in the issuer cap are two
         # different graphs; without this the cache would hand a test
@@ -3809,19 +3967,24 @@ def _make_locked_graph(
         # T1 (ADR 0044): the summarizer seam affects the compiled
         # graph's ``compaction_gate`` node, so two graphs that differ
         # only in ``summarizer`` are two different graphs.
-        id(summarizer) if summarizer is not None else 0,
+        _IdentityKey(summarizer),
         # T6: ON vs OFF adds three memory tools to the bound set;
         # without this key the first OFF compile would hand a later
         # ON compile a cached OFF proxy.
-        int(memory_port_id),
+        _IdentityKey(memory_port),
         # search-mode host T2: the HITL flag adds the ``mode_choice``
-        # node + routing — same reasoning as ``memory_port_id``, an OFF
+        # node + routing — same reasoning as the memory port, an OFF
         # compile must never be served to an ON caller from cache.
         int(enable_choice_window),
         # T2f: the attachment seam adds the ``ensure_attachment_ready``
         # node + grounded routing; an unwired cached compile must never
         # be served to a wired caller.
-        int(attachment_service_id),
+        _IdentityKey(attachment_service),
+        # T3: the seam adds the retrieve tool's attachment branch and the
+        # model-facing ``attachment_ids`` argument; the same rule, because
+        # a cached compile made without a search port would answer every
+        # later wired caller as if the thread had no attachments.
+        _IdentityKey(attachment_retriever),
     )
     cached = _IDEMPOTENCE_CACHE.get(key)
     if cached is not None:

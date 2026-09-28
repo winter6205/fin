@@ -137,7 +137,20 @@ OVERALL: PASS
    - **Surface:** fin retrieve capability and grounded host tool.
    - **Acceptance:** on a later turn, an attachment hit carries `{kind:"attachment",attachment_id,version,unit}`; a query in another thread cannot retrieve it; a model-supplied thread ID cannot widen scope; naming one attachment excludes other attachments, and a comparison request can return it alongside company hits. If an eligible required attachment is `uploaded` or `parsing`, the same run waits for preparation and resumes automatically when ready; parse failures exit with their named typed failure. An index outage is typed unavailable rather than an empty success. Company ranking remains behind the existing port.
    - `[blocks: T1, T2f]`
-   - Status: [ ] pending
+   - Status: [x] delivered — 2026-09-28, branch `feat/g4-attachment-t3-thread-retrieval`
+     (base `e60f824`; two review rounds, both `GATE: PASS`; per-clause evidence,
+     the round pins, the repair shas, and the live cross-boundary cases in
+     [`docs/validation/2026-09-28-g4-t3-thread-bound-retrieval.md`](../docs/validation/2026-09-28-g4-t3-thread-bound-retrieval.md)).
+     Residuals pinned before T5 at the attachment search surface: a row in a
+     gate-owned transient state (`uploaded`/`parsing`) exits
+     `attachment_not_ready` — a race a later call can leave ready, since the
+     T2f gate suspends eligible runs before retrieve; a named terminal `failed`
+     row re-publishes its stored spec §67 failure code from the row; a corrupt
+     failed row with no stored reason falls back to the existing wire token
+     `attachment_preparation_failed`, the gate's own no-code exit, so no code
+     outside the spec §67 enumeration was minted. The Middle Man delegation
+     note and the deferred findings live in that record's "Accepted findings
+     that stayed" and "Review rounds" sections.
 
 9. **T4 — Typed bounded source read** — tag: `[implementation]`
    - **Inherits:** ADRs 0087/0088: a known locator can be read directly; one frozen unit per call; `unit` identifies source; `position` is a zero-based Unicode-code-point offset; text ≤8,000 code points and complete serialized response ≤32 KiB. The sibling iknow-memory plan provides bounded company reads before this adapter consumes them.
