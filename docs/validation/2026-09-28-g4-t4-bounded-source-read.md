@@ -76,6 +76,8 @@ Acceptance clauses are the plan's T4 item (`plans/thread-attachment-source-read.
 | `uv run pytest -q tests/host/test_fin_launcher.py::test_shim_drives_a_checkout_from_any_directory` (2026-09-28, at `2755777`, docker up) | **GREEN — 1 passed, 1.35s, exit 0.** Gate (1) satisfied |
 | `uv run pytest -q tests/host tests/retrieve` (2026-09-28, docker down) | 3522 passed, 94 skipped, 315 deselected, 1 failed — the same launcher test; +1 passed vs the `740e3c8` row, so no T4-path regression at this tip |
 | `uv run pytest -q tests/host tests/retrieve` (2026-09-28, at `2755777`, docker up) | **3523 passed, 94 skipped, 315 deselected, 0 failed**, 513s, exit 0 — first fully green run of these two suites on this branch; the previously-failing launcher test is the +1 |
+| host migration 2026-09-29: `ps -p 1 -o comm=` → `systemd`; `systemctl is-system-running` → `running`; `systemctl --failed` → **0 units**; `systemctl status docker` → `active (running)`, `enabled`, Main PID 136; `docker info` → Server 29.1.3, `Cgroup Driver: systemd`, overlayfs, reachable without sudo; `/var/run/docker.sock` = `srw-rw---- root docker`; `bash scripts/fin check` → `dev-up: check ok` | the legacy `[boot] command=/usr/local/bin/wsl-boot.sh` hook is gone; systemd owns the daemon and brings it up at boot, so no manual `cursor-dockerd.sh` is needed any more. Enabling it took three pieces: `[boot] systemd=true` in `/etc/wsl.conf`, the `systemd` package, and the `systemd-sysv` package (without which `/sbin/init` does not exist and WSL has nothing to promote to PID 1). Original config backed up at `/etc/wsl.conf.bak-20260928` |
+| `uv run pytest -q tests/host tests/retrieve` (2026-09-29, at merged `7cb068b`, under systemd) | 3523 passed, 93 skipped, 315 deselected, **1 failed** — `tests/host/test_workspace_http_attachment_lane.py::test_a_standalone_image_never_stages_a_heron_document`, which is NOT a T4 path: that test asserted `pytest.raises(OcrRequiredUnavailableError)` on the premise that the optional `[ocr]` extra is absent, and this host now has `pytesseract` + `tesseract` 5.5.0 installed. Attributed to host state, repaired as a test-only fix (see below) |
 
 ## Limitations / leftovers
 
@@ -101,15 +103,33 @@ Acceptance clauses are the plan's T4 item (`plans/thread-attachment-source-read.
    Note for future runs: this host has `docker.io` only — no Docker Desktop —
    so the `sudo service docker start` line in `scripts/lib/fin-root.sh`'s hint
    does not apply (`docker.io` ships a systemd unit but no `/etc/init.d/docker`,
-   and systemd is off). The durable fix is enabling systemd (`[boot]
-   systemd=true` + `systemctl enable --now docker`), which is a separate host-level
-   change outside this branch; do NOT run `cursor-dockerd.sh` once systemd owns
-   the daemon. The test touches no T4 code path.
+   and systemd was off). The durable fix — enabling systemd — was applied on
+   2026-09-29 (see Commands table): the legacy `[boot] command=` hook is gone,
+   systemd owns the daemon, and no manual `cursor-dockerd.sh` is needed. Do NOT
+   run `cursor-dockerd.sh` now that systemd owns the daemon — it would race a
+   second dockerd for the same socket. That script remains correct for the Cursor
+   Cloud VM, which genuinely has no init system. The test touches no T4 code path.
 3. The `page`→`unit` DTO rename, `read_file` removal, and attachment citation
    identity remain T5's, as the plan assigns.
 4. Web (`npm run typecheck` / `npm test`) was not run: this diff ships no web
    surface — the read_source tool result only reaches the operator trace
    through the existing `format_tool_summary` path.
+5. Two suite failures seen on 2026-09-29 are this host's `.env`, not the diff,
+   and both reproduce on a clean checkout of `7cb068b`.
+   (a) `tests/corpus/test_chunk_and_push.py::test_cli_requires_explicit_opt_in`
+   fails with `Permission denied: 'iknow-memory'` because
+   `tests/conftest.py`'s `apply_dotenv` reads `FIN_RETRIEVE_ADAPTER=mcp` from
+   the operator `.env`; the test asserts the CLI refuses without an explicit
+   opt-in. That conftest strips several operator vars for exactly this reason
+   (`FIN_MEMORY_ENABLED`, the LLM keys) but not this one. A CI runner has no
+   `.env`, so it stays green there.
+   (b) `tests/corpus/test_ocr.py::test_default_pytest_does_not_import_pytesseract`
+   passes alone and fails only in a session where another file built a real
+   `TesseractEngine` first; the leak itself was repaired here (see the
+   `_no_pytesseract_leak` fixture in
+   `tests/host/test_workspace_http_attachment_lane.py`), but the same class of
+   order-dependence remains possible wherever a sibling instantiates the
+   engine without cleaning up.
 
 ## Merge gates (issue #319)
 
@@ -131,8 +151,9 @@ new dependency — only a docker daemon that answers on this host, reached via t
 repo's own `scripts/cursor-dockerd.sh`, after the issue-#320 docker-group fix put
 this user in the socket's group. Root cause of the two earlier reds was entirely
 host configuration (missing group membership, then an unsupervised `exec dockerd`
-under WSL2-without-systemd), not the diff. See Limitations 2, including the
-durable systemd fix that belongs to the host rather than to this branch.
+under WSL2-without-systemd), not the diff. See Limitations 2. The host-side
+systemd fix that makes this durable landed on 2026-09-29 (Commands table) and
+PR #317 merged as `7cb068b`.
 
 Gate (2) stays open until run by whoever has the environment. `read_file` /
 `page`
