@@ -56,8 +56,10 @@ const FAILURE_COPY: Readonly<Record<string, string>> = {
   // retry doors miss the same way. Only the upload door can never hit it —
   // it mints the id itself — so this is never a re-upload of the same file.
   attachment_not_found: "这个附件已经不在此对话中，无法继续引用。",
-  // A send refused because it referenced a still-parsing attachment
-  // (ADR 0086): the question is retryable once the chip turns ready.
+  // A send refused because it referenced a still-parsing attachment —
+  // the pre-T2f door (ADR 0086); a T2f host accepts the reference and
+  // waits inside the graph, so this only comes from an older peer.
+  // The question is retryable once the chip turns ready.
   attachment_not_ready: "引用的附件还在解析中，本轮没有发问，等它就绪后再试。",
   // The delete door's miss: the id is not this thread's, or its deletion
   // already finished. ``attachment_not_found`` above tells the operator to

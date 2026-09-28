@@ -171,8 +171,10 @@ interface WorkspaceState {
   // its POST settles, success or refusal.
   pendingUploads: Record<string, number>;
   // Seed the slice for the thread the Composer opens and keep it
-  // fresh while anything is "parsing". ``intervalMs`` is the poll
-  // cadence, injectable so tests advance the schedule without real
+  // fresh while anything is "parsing" and while a run is suspended
+  // waiting on preparation (``attachmentPreparationWait``).
+  // ``intervalMs`` is the poll cadence, injectable so tests advance
+  // the schedule without real
   // waiting. A failed door read ends the chain and leaves the slice as
   // it is — attachments are auxiliary to the thread view and must not
   // fail navigation. The next open or attach restarts it; a retry
@@ -615,6 +617,13 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // waiting on a pick, so the row must not be finalized (not done,
     // still in_flight).
     let windowPending: ChoiceWindow | null = null;
+    // T2f graph job gate (review C4): the server-minted run id from
+    // an ``attachment_wait`` frame — the EXACT signal that this
+    // stream suspended on the attachment_preparation interrupt.
+    // ``null`` = no frame, no wait. Replaces the old "no terminal
+    // frame + the send named a local uploaded/parsing row" heuristic,
+    // which misread a crashed/truncated stream the same way.
+    let attachmentWaitRunId: string | null = null;
     let answerFold: LiveAnswerState = EMPTY_LIVE_ANSWER;
     // ADR 0086: the ids the attach door minted
     // ride this send — and stay referenceable on every later one.
@@ -736,8 +745,36 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
               choice_window: event.window,
             }));
             break;
+          case "attachment_wait":
+            // T2f: the run suspended on the attachment_preparation
+            // interrupt and the durable job AUTO-resumes it — no
+            // operator action. Record the server-minted run id on the
+            // optimistic row (patch-then-reassign, the same ordering
+            // the status branch uses) so the row is never orphaned
+            // and a reload after the auto-resume reconciles against
+            // the persisted record instead of flashing a duplicate.
+            // The row stays live — see the finalize patch below.
+            attachmentWaitRunId = event.run_id;
+            turnPatches.flushThen((t) => ({
+              ...t,
+              run_id: event.run_id,
+            }));
+            optimisticRunId = event.run_id;
+            break;
         }
       });
+      // T2f (review C4): the wait holds ONLY when the host emitted the
+      // exact ``attachment_wait`` frame on this stream — the run is
+      // alive, suspended on the ``attachment_preparation`` interrupt,
+      // and will auto-resume, so the optimistic row stays live and the
+      // readiness poll follows the chip through the wait. The pre-C4
+      // heuristic (no terminal frame + the send named a local
+      // uploaded/parsing row) is deleted: it also matched a
+      // crashed/truncated stream on a thread holding a stray upload,
+      // leaving the row live and a poll spinning on a dead run. (A
+      // suspended choice window keeps ``windowPending`` instead; a
+      // crash or transport error takes the catch path below.)
+      const preparationWait = attachmentWaitRunId !== null;
       // The SSE stream already delivered terminal status, answer, and
       // citations. Re-GET'ing here used to replace the live turn row
       // and caused a visible retract/repop even when merge logic ran
@@ -751,14 +788,22 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         turnPatches.flushThen((t) => ({
           ...closeOpenBurstsOnTurn(t),
           // A pending window means the stream ended WITHOUT a
-          // terminal frame — the run is suspended, not done.
-          in_flight: windowPending !== null,
+          // terminal frame — the run is suspended, not done. Same
+          // for a preparation wait, which resumes without any
+          // operator action.
+          in_flight: windowPending !== null || preparationWait,
           citations:
             result.citations.length > 0 ? result.citations : t.citations,
           track: result.track ?? t.track,
           track_decision: result.track_decision ?? t.track_decision,
           status_classified: result.status_classified ?? t.status_classified,
         }));
+      }
+      if (preparationWait) {
+        // Cover the whole wait window from the client side too: the
+        // run referenced these records, so uploaded rows are pending
+        // work now, not idle uploads.
+        startAttachmentPolling(threadId, ATTACHMENT_POLL_INTERVAL_MS, true);
       }
       await get().refreshThreads();
       return result;
@@ -770,16 +815,22 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       // row when no frame ever landed on it; keep (but un-live) a
       // row the stream had already started painting, then rethrow so
       // the composer can show the failure.
-      if (statusSeen || windowPending !== null) {
+      if (
+        statusSeen ||
+        windowPending !== null ||
+        attachmentWaitRunId !== null
+      ) {
         // Drain any queued deltas before un-living the row so a late
         // flush cannot patch a row the stream already abandoned; the
         // closeOpenBursts also guarantees a queued delta folded after
         // the terminal status cannot leave a live burst on the row.
-        // A suspended row (window painted, then transport error)
-        // stays in_flight — the pick path can still resume it.
+        // A suspended row (window or preparation wait painted, then
+        // transport error) stays in_flight — the pick path can still
+        // resume a window, and a preparation wait auto-resumes on
+        // its own.
         turnPatches.flushThen((t) => ({
           ...closeOpenBurstsOnTurn(t),
-          in_flight: windowPending !== null,
+          in_flight: windowPending !== null || attachmentWaitRunId !== null,
         }));
       } else {
         dropTurnByRunId(threadId, optimisticRunId);
@@ -1060,20 +1111,29 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 
   async loadAttachments(threadId, intervalMs = ATTACHMENT_POLL_INTERVAL_MS) {
     // Seed the thread's attachment slice (Composer open) and keep it
-    // fresh while anything is ``parsing``. This read OWNS the poll
-    // cadence: the running chain (if any) is replaced so the caller's
-    // ``intervalMs`` cannot be silently ignored. Attachments are
-    // auxiliary to the thread view: a failed door read leaves the
-    // slice as-is and ENDS the chain rather than failing navigation
-    // or spinning on a dead endpoint — the next open or attach
-    // restarts it.
+    // fresh while a preparation can still move a record: anything
+    // ``parsing``, or the whole uploaded → ready window of a run
+    // suspended in the graph (``attachmentPreparationWait``). This
+    // read OWNS the poll cadence: the running chain (if any) is
+    // replaced so the caller's ``intervalMs`` cannot be silently
+    // ignored. Attachments are auxiliary to the thread view: a failed
+    // door read leaves the slice as-is and ENDS the chain rather than
+    // failing navigation or spinning on a dead endpoint — the next
+    // open or attach restarts it; a retry answers a settled record
+    // and therefore never restarts it.
     stopAttachmentPolling();
     const attachments = await readAttachmentList(threadId);
     if (attachments === null) return;
     if (get().activeThread?.id !== threadId) return;
     set({ attachments });
-    if (attachments.some((a) => a.status === "parsing")) {
-      startAttachmentPolling(threadId, intervalMs);
+    const wait = attachmentPreparationWait(get().activeThread);
+    if (wait) {
+      // A suspended preparation is not a crashed run: the wait state
+      // is the chip, never the Resume banner (see the helper).
+      suppressResumePromptForWait();
+    }
+    if (wait || attachments.some((a) => a.status === "parsing")) {
+      startAttachmentPolling(threadId, intervalMs, wait);
     }
   },
 
@@ -1212,18 +1272,21 @@ function patchTurnByRunIdOn(
   });
 }
 
-// ----- ADR 0089: readiness polling -----
+// ----- ADR 0089 / T2f: readiness polling and the preparation wait -----
 //
 // Preparation runs off the request, so the only way the SPA learns
 // parsing → ready / failed is re-reading the thread's list. An
-// ``uploaded`` record is NOT work in progress: preparation begins when a
-// grounded graph turn asks for it, so polling an upload row would spin on
-// a state that cannot change by itself. One poller chain exists at a time,
-// keyed by thread: opening another thread replaces it, and a read that
-// finds nothing ``parsing`` stops the chain (the next open or attach
-// restarts it). ``intervalMs`` threads through the chain as a
-// parameter so tests advance a fake schedule instead of really
-// waiting.
+// ``uploaded`` record with no run waiting on it is NOT work in
+// progress: the graph turn starts preparation, so polling an idle
+// upload row would spin on a state that cannot change by itself.
+// While a run IS waiting (``attachmentPreparationWait``) the poll
+// covers the whole window — the row moves uploaded → parsing →
+// ready/failed and the chain stops cleanly at a terminal status.
+// One poller chain exists at a time, keyed by thread: opening another
+// thread replaces it, and a read that finds nothing left to follow
+// stops the chain (the next open, attach, or waiting send restarts
+// it). ``intervalMs`` threads through the chain as a parameter so
+// tests advance a fake schedule instead of really waiting.
 
 const ATTACHMENT_POLL_INTERVAL_MS = 2000;
 
@@ -1234,6 +1297,53 @@ function isRecordAwaitingServerList(attachment: ThreadAttachment): boolean {
   return (
     attachment.status === "uploaded" || attachment.status === "parsing"
   );
+}
+
+/**
+ * T2f: is a run on this thread suspended inside the graph waiting for
+ * attachment preparation?
+ *
+ * The host contract: a grounded send that references a durable
+ * ``uploaded``/``parsing`` attachment is accepted, the run suspends on
+ * the ``attachment_preparation`` interrupt, the thread lock is
+ * released, and the SAME run auto-resumes when the durable job
+ * finishes — the operator must never be asked to resend or press
+ * Resume. GET /threads/{id} reports the pause as
+ * ``pending_checkpoint: true`` PLUS what it waits for as
+ * ``pending_interrupt_kind`` (SSOT:
+ * src/fin/host/workspace_http.py get_thread — the same key the stream
+ * carries on the ``attachment_wait`` frame). The wait holds for the
+ * preparation kind ONLY: a ``choice_window`` pause or a ``null``
+ * crash checkpoint keeps the Resume banner's behavior untouched, so
+ * the pre-C4 misclassification — a genuine crash on a thread that
+ * happened to hold an unreferenced uploaded/parsing record losing its
+ * Resume prompt — is gone.
+ */
+export function attachmentPreparationWait(
+  detail: ThreadDetail | null,
+): boolean {
+  return (
+    detail?.pending_checkpoint === true &&
+    detail?.pending_interrupt_kind === api.ATTACHMENT_PREPARATION_KIND
+  );
+}
+
+/**
+ * Paint the wait as what it is: a run in progress, not a checkpoint
+ * the operator has to restart. ThreadPage's Resume banner keys off
+ * ``activeThread.pending_checkpoint``, so while
+ * ``attachmentPreparationWait`` holds the flag is cleared on the
+ * stored detail — the chip (解析中…) and the poll are the wait's only
+ * visible state. Re-derived from the server on every open, so a
+ * genuine crash re-arms the banner on the next GET.
+ */
+function suppressResumePromptForWait(): void {
+  const current = useWorkspaceStore.getState().activeThread;
+  if (current && current.pending_checkpoint === true) {
+    useWorkspaceStore.setState({
+      activeThread: { ...current, pending_checkpoint: false },
+    });
+  }
 }
 
 /**
@@ -1255,6 +1365,13 @@ async function readAttachmentList(
 }
 
 let attachmentPollTimer: ReturnType<typeof setTimeout> | null = null;
+// Set when the CURRENT chain was started to follow a suspended run
+// (a waiting send, or a load during the wait): then an ``uploaded``
+// record is pending work too — the durable job has been told to move
+// it and a stale list read may not show ``parsing`` yet. An upload
+// no run references never starts a chain at all, so it still gets no
+// poll.
+let attachmentPollFollowsWait = false;
 
 function stopAttachmentPolling(): void {
   if (attachmentPollTimer !== null) clearTimeout(attachmentPollTimer);
@@ -1273,15 +1390,22 @@ function scheduleAttachmentPollTick(
 
 /**
  * (Re)start the chain for ``threadId``. Replaces any running chain
- * rather than stacking one, so every entry point (open, attach)
- * provably owns the next read.
+ * rather than stacking one, so every entry point (open, attach,
+ * waiting send) provably owns the next read.
  */
 function startAttachmentPolling(
   threadId: string,
   intervalMs = ATTACHMENT_POLL_INTERVAL_MS,
+  followsWait = false,
 ): void {
   stopAttachmentPolling();
+  attachmentPollFollowsWait = followsWait;
   scheduleAttachmentPollTick(threadId, intervalMs);
+}
+
+/** True for a record a running or waiting preparation will move. */
+function hasPreparationWork(attachments: readonly ThreadAttachment[]): boolean {
+  return attachments.some(isRecordAwaitingServerList);
 }
 
 async function attachmentPollTick(
@@ -1320,7 +1444,16 @@ async function attachmentPollTick(
   );
   const merged = [...attachments, ...carried];
   useWorkspaceStore.setState({ attachments: merged });
-  if (merged.some((a) => a.status === "parsing")) {
+  // The flag re-read on every open means a GET landing mid-wait can
+  // re-arm the Resume banner while this chain is still following the
+  // preparation; clear it again for as long as the wait holds.
+  if (attachmentPreparationWait(current.activeThread)) {
+    suppressResumePromptForWait();
+  }
+  if (
+    merged.some((a) => a.status === "parsing") ||
+    (attachmentPollFollowsWait && hasPreparationWork(merged))
+  ) {
     scheduleAttachmentPollTick(threadId, intervalMs);
     return;
   }
@@ -1497,12 +1630,11 @@ function refuseUploadInFlight(
  * The one rule for what a send may reference, and what it deliberately
  * did not.
  *
- * Only a ``ready`` attachment is named: the thread keeps every attachment
- * for its whole life, so a question that never mentioned a not-yet-citable
- * one must not be refused on its account (spec: an unrelated question can
- * still use ready sources). ``uploaded`` is withheld for the same reason
- * ``parsing`` is — its bytes are stored but nothing is parsed or indexed
- * yet. ``withheld`` is the other half of the contract —
+ * Only records the host accepts ride the message (see the rule in the
+ * loop below). The thread keeps every attachment for its whole life,
+ * so a question that never mentioned one must not be refused on its
+ * account either — a referenceable record is named automatically.
+ * ``withheld`` is the other half of the contract —
  * the control renders it, so a record left out of a run is always said out
  * loud rather than silently dropped.
  */
@@ -1513,7 +1645,17 @@ export function attachmentsForSend(attachments: readonly ThreadAttachment[]): {
   const ids: string[] = [];
   const withheld: ThreadAttachment[] = [];
   for (const attachment of attachments) {
-    if (attachment.status === "ready" && attachment.searchable) {
+    // T2f: a grounded send naming a durable ``uploaded``/``parsing``
+    // record is accepted — the graph suspends the run until
+    // preparation completes and resumes it automatically — so those
+    // states ride the message. Only a refused record stays out: a
+    // ``failed`` one, or a ``ready`` one the host does not report
+    // searchable.
+    const referenceable =
+      attachment.status === "uploaded" ||
+      attachment.status === "parsing" ||
+      (attachment.status === "ready" && attachment.searchable);
+    if (referenceable) {
       ids.push(attachment.attachment_id);
     } else {
       withheld.push(attachment);

@@ -14,6 +14,13 @@ pins both sides of that line from the door's point of view:
 * a lane deployed: a claimed page document is read — the gold PDF and the
   gold raster freeze their units and reach ``ready``, the upload/retry/
   status doors agree on one field set, and nothing raises past the door;
+
+Door semantics are T2f's throughout the HTTP pins: the retry door only
+asks, answering 200 immediately with the wire record of the queued job
+(``parsing``), and the preparation settles through the job
+(``service.drain_attachment_jobs()``, what the prep worker runs), so the
+door cases walk ask -> drain -> settled read-back instead of expecting
+the verdict inside the retry request.
 * a lane deployed, and what a page reader now judges: an image name's
   claim is taken at its word, so text bytes under ``.png`` end at the
   type the image reader refused (``attachment_type_unsupported``) rather
@@ -287,14 +294,23 @@ def test_a_deployed_lane_freezes_the_page_document_it_once_refused(
 def test_the_deployed_door_answers_200_and_agrees_with_itself(
     client: TestClient, deployed_door: dict[str, Any]
 ) -> None:
-    """Upload, retry, status, list over a lane-deployed service.
+    """Upload, retry, status, list over a lane-deployed service, two stages.
 
-    ``TestClient`` re-raises an unhandled server exception by default, so
-    this case fails on any escape — the original door promise — and the
-    one-field-set rule now carries a success: the status door cannot
-    disagree with the retry that published the row.
+    T2f moved preparation behind the durable job, so the door's promise
+    is walked as an operator walks it: the retry answers 200 immediately
+    with the queued promise — ``parsing``, one pending job, nothing
+    searchable — and the drain (what the prep worker does) settles the
+    row. The self-agreement rule survives the split intact at both
+    stages: in-request the retry/status/list doors answer one identical
+    field set for the parsing row, and after the drain the status and
+    list doors answer one identical field set for the settled ready row —
+    the "cannot disagree with the preparation that published the row"
+    property, restated over the job. ``TestClient`` re-raises an
+    unhandled server exception by default, so any escape still fails
+    this case, exactly as it did under the synchronous door.
     """
     thread_id = deployed_door["thread_id"]
+    service: AttachmentPreparationService = deployed_door["service"]
 
     uploaded = client.post(
         f"/api/threads/{thread_id}/attachments",
@@ -309,18 +325,51 @@ def test_the_deployed_door_answers_200_and_agrees_with_itself(
     )
 
     assert retried.status_code == 200, retried.text
-    body = retried.json()
-    assert body["status"] == "ready", body
-    assert body["failure_reason"] is None, body
-    assert body["searchable"] is True, body
+    asked = retried.json()
+    # The door only asks: parsing, still no version, nothing searchable.
+    assert asked["status"] == "parsing", asked
+    assert asked["failure_reason"] is None, asked
+    assert asked["searchable"] is False, asked
+    assert asked["version"] == 0, asked
+    # …and the ask enqueued exactly one job for this attachment.
+    jobs = service.jobs.incomplete()
+    assert [job.attachment_id for job in jobs] == [attachment_id], jobs
+    assert len(jobs) == 1 and jobs[0].state == "pending", jobs
+
+    # In-request self-agreement: no door disagrees with the retry answer.
+    shown_now = client.get(
+        f"/api/threads/{thread_id}/attachments/{attachment_id}"
+    )
+    assert shown_now.status_code == 200, shown_now.text
+    assert shown_now.json() == asked, shown_now.json()
+    listed_now = client.get(f"/api/threads/{thread_id}/attachments")
+    assert listed_now.status_code == 200, listed_now.text
+    assert asked in listed_now.json()["attachments"], listed_now.json()
+
+    # The drain settles the promised work: exactly one job, then nothing
+    # left incomplete, and the success the old synchronous door used to
+    # answer in-request.
+    assert service.drain_attachment_jobs() == 1
+    assert service.jobs.incomplete() == ()
+
     shown = client.get(
         f"/api/threads/{thread_id}/attachments/{attachment_id}"
     )
     assert shown.status_code == 200, shown.text
-    assert shown.json() == body, shown.json()
+    settled = shown.json()
+    assert settled["status"] == "ready", settled
+    assert settled["failure_reason"] is None, settled
+    assert settled["searchable"] is True, settled
     listed = client.get(f"/api/threads/{thread_id}/attachments")
     assert listed.status_code == 200, listed.text
-    assert body in listed.json()["attachments"], listed.json()
+    assert [
+        row
+        for row in listed.json()["attachments"]
+        if row["attachment_id"] == attachment_id
+    ] == [settled], listed.json()
+    # One field set across the transition: every door still serializes
+    # the same columns, only their values settled.
+    assert set(settled) == set(asked), (settled, asked)
 
 
 # ----- what the deployed lane now judges that the lane-less door did not -----
@@ -408,11 +457,16 @@ def test_the_lane_less_door_still_names_its_code_instead_of_escaping(
     still owes the same narrow promise: a 200 whose row carries the code
     its family earns — the page cap and wired ports the PDF prices
     against, the content judgement the one-page image gets without them —
-    with the bytes kept for a retry under a wired lane. What changed is
-    only that the shipped root can no longer hand the door such a
-    service.
+    with the bytes kept for a retry under a wired lane. T2f restates the
+    promise in two stages: the retry door answers the ask (``parsing``,
+    one pending job, the stored reason cleared like any retried row), and
+    the drain settles the named failure onto the row — the same typed
+    code the synchronous door used to answer in-request, with nothing
+    published as parsed. What changed is only that the shipped root can
+    no longer hand the door such a service.
     """
     thread_id = laneless_door["thread_id"]
+    service: AttachmentPreparationService = laneless_door["service"]
 
     uploaded = client.post(
         f"/api/threads/{thread_id}/attachments",
@@ -427,15 +481,40 @@ def test_the_lane_less_door_still_names_its_code_instead_of_escaping(
     )
 
     assert retried.status_code == 200, retried.text
-    body = retried.json()
-    assert body["status"] == "failed", body
-    assert body["failure_reason"] == reason, body
-    assert body["searchable"] is False, body
+    asked = retried.json()
+    assert asked["status"] == "parsing", asked
+    assert asked["failure_reason"] is None, asked
+    assert asked["searchable"] is False, asked
+    jobs = service.jobs.incomplete()
+    assert len(jobs) == 1 and jobs[0].state == "pending", jobs
+
+    # In-request self-agreement, same as the old synchronous door's
+    # shown==retried check: the status door reads the ask the retry made.
+    asked_now = client.get(
+        f"/api/threads/{thread_id}/attachments/{attachment_id}"
+    )
+    assert asked_now.status_code == 200, asked_now.text
+    assert asked_now.json() == asked, asked_now.json()
+
+    assert service.drain_attachment_jobs() == 1
+    assert service.jobs.incomplete() == ()
+
     shown = client.get(
         f"/api/threads/{thread_id}/attachments/{attachment_id}"
     )
     assert shown.status_code == 200, shown.text
-    assert shown.json() == body, shown.json()
+    settled = shown.json()
+    assert settled["status"] == "failed", settled
+    assert settled["failure_reason"] == reason, settled
+    assert settled["searchable"] is False, settled
+    # The failure named a code, not a partial parse: nothing was ever
+    # published as units or postings for this row. (A lane-less service
+    # has no page port at all — ``service.pages is None`` is the wiring
+    # fact that makes the PDF's refusal the unwired lane, so no renderer
+    # could have been asked even in principle.)
+    assert service.pages is None
+    assert service.units(attachment_id) == ()
+    assert service.store.indexed_versions(attachment_id) == ()
 
 
 def test_the_lane_less_door_still_reads_an_image_name_by_content(

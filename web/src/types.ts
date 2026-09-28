@@ -262,6 +262,13 @@ export interface ThreadDetail extends ThreadListItem {
   // it is needed). The server derives this from
   // ``pending_nodes(thread_id) and not is_locked``.
   pending_checkpoint?: boolean;
+  // T2f (review C4): WHAT a paused run waits for while
+  // ``pending_checkpoint`` is true — ``"attachment_preparation"``
+  // (the durable prep job owns the auto-resume, no operator action)
+  // or ``"choice_window"`` (the operator's pick owns it); ``null``
+  // for a plain crash checkpoint. Mirrors
+  // ``fin.host.workspace_http.ThreadDetailResponse.pending_interrupt_kind``.
+  pending_interrupt_kind?: string | null;
   // T3 (ADR 0044): token occupancy from the SAME host figure the
   // auto-compact gate computes. Undefined for a thread with no
   // checkpoint — the indicator renders nothing rather than a

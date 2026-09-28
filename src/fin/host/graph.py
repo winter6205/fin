@@ -72,7 +72,17 @@ import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Callable, Iterable, Literal, Mapping, TypedDict
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Callable,
+    Iterable,
+    Literal,
+    Mapping,
+    Protocol,
+    TypedDict,
+)
 
 from langchain_core.messages import (
     AIMessage,
@@ -2026,6 +2036,77 @@ def _evaluate_numeric_gate_in_node(messages: list[BaseMessage]):
     )
 
 
+# T2f EXIT: a preparation the service reports ``failed`` without a code
+# (or an out-of-vocabulary state) is still a typed exit — the reason names
+# the gate's own failure and never degrades to an empty successful turn.
+ATTACHMENT_PREPARATION_FAILED = "attachment_preparation_failed"
+
+# T2f: the interrupt payload's pinned kind — the resumer filters on this
+# exact string, so it is a wire token, not prose.
+ATTACHMENT_PREPARATION_INTERRUPT_KIND = "attachment_preparation"
+
+
+class _PreparationOutcomeView(Protocol):
+    """What the gate reads off ``request_preparation``'s answer.
+
+    The service module's frozen ``PreparationRequest`` dataclass
+    satisfies this structurally; the view exists so the graph's
+    consumption is typed and a violated contract raises ``AttributeError``
+    at the read instead of degrading into the generic fallback refusal.
+    """
+
+    state: str
+    code: str | None
+
+
+class _ResolvedAttachmentView(Protocol):
+    """What the gate reads off ``resolve_for_turn``'s answer.
+
+    Same consumer-side shape as :class:`_PreparationOutcomeView` (the
+    service's ``ResolvedAttachment`` satisfies it structurally).
+    """
+
+    filename: str
+    text: str
+
+
+class _AttachmentPreparationService(Protocol):
+    """Consumer-side seam of the ``ensure_attachment_ready`` gate.
+
+    Declared here (not imported from ``fin.host.attachment_prepare``)
+    on purpose: the graph owns sequencing and must not couple to the
+    capability's implementation. The real service satisfies this shape
+    structurally — its ``request_preparation`` / ``resolve_for_turn``
+    carry exactly these call signatures.
+    """
+
+    def request_preparation(
+        self, thread_id: str, attachment_id: str
+    ) -> _PreparationOutcomeView: ...
+
+    def resolve_for_turn(
+        self, *, thread_id: str, attachment_id: str
+    ) -> _ResolvedAttachmentView: ...
+
+
+def _attachment_resolve_race_errors() -> tuple[type[Exception], ...]:
+    """The capability module's typed not-ready pair, caught by TYPE.
+
+    Resolved lazily because the module graph forbids a top-level import:
+    ``attachment_prepare`` reaches ``fin.host.compile`` (through
+    ``attachment_budgets``/``attachment_vision``), which imports this
+    module. ``resolve_for_turn`` raises the pair when a row's derived
+    data went unreadable after the gate's ready verdict; any other
+    exception is a real bug and propagates.
+    """
+    from fin.host.attachment_prepare import (
+        AttachmentNotFoundError,
+        AttachmentNotReadyError,
+    )
+
+    return (AttachmentNotReadyError, AttachmentNotFoundError)
+
+
 def compile_graph(
     *,
     checkpointer: Any,
@@ -2050,6 +2131,7 @@ def compile_graph(
     memory_port: MemoryPort | None = None,
     user_profile_store: UserProfileStore | None = None,
     enable_choice_window: bool = False,
+    attachment_service: _AttachmentPreparationService | None = None,
 ) -> "_LockedGraph":
     """Build the v1 host graph (T6).
 
@@ -2245,6 +2327,24 @@ def compile_graph(
         are what turn the HITL lane on. Requires a checkpointer (the
         factory always has one; the interrupt's durability IS the
         checkpoint).
+    attachment_service
+        T2f (ADR 0089): the fin-owned attachment capability seam that
+        gates the grounded leaf. When supplied, the grounded route after
+        the compaction gate passes through the ``ensure_attachment_ready``
+        node, which calls ``request_preparation(thread_id,
+        attachment_id)`` (idempotent join keyed by content version) for
+        every attachment the turn names: all ``ready`` proceeds (and rows
+        that arrived without frozen text are (re)hydrated through the
+        service's ``resolve_for_turn``), any ``pending`` pauses the run on
+        ``interrupt({"kind": "attachment_preparation", ...})`` — the same
+        durability shape as the choice window — and any ``failed`` /
+        ``unknown`` exits with the typed ``status_reason``. ``None`` (the
+        default) keeps today's graph exactly: no node, no routing change,
+        no service call. The seam is the consumer-side
+        ``_AttachmentPreparationService`` Protocol — the graph owns
+        sequencing, the capability owns parse/vision/index
+        execution (spec: "the node does not parse... itself"), and the
+        real service satisfies the Protocol structurally.
 
     Returns
     -------
@@ -2694,6 +2794,131 @@ def compile_graph(
                 apply_error=apply_error,
             )
         }
+
+    def ensure_attachment_ready_node(
+        state: AgentState, config: RunnableConfig
+    ) -> dict[str, Any]:
+        """Attachment preparation gate (T2f / ADR 0089).
+
+        Reached on the grounded route between ``compaction_gate`` and
+        the ``model`` leaf whenever an ``attachment_service`` is wired.
+        Orchestration only — the attachment capability owns parse /
+        vision / index execution (spec: "the node does not parse,
+        render, call OCR/vision, or build an index itself").
+
+        Durability shape (same as the choice window): ``interrupt``
+        ends the stream generator, which releases the thread lock and
+        leaves the wait in the checkpointer under the SAME run id;
+        resume replays this node body, and because
+        ``request_preparation`` is an idempotent join keyed by content
+        version the replay starts no duplicate work. The resume VALUE
+        is ignored — the host resumer (or a process restart) drives
+        re-evaluation, not an operator pick.
+        """
+        items = [dict(item) for item in (state.get("attachments") or [])]
+        if not any(str(item.get("attachment_id") or "") for item in items):
+            # EXIT: a turn that names no eligible attachment never
+            # touches the service (spec: preparation starts only for an
+            # attachment eligible to a grounded turn).
+            return {}
+        configurable = dict((config or {}).get("configurable") or {})
+        thread_id = str(configurable.get("thread_id") or "")
+        while True:
+            pending: list[str] = []
+            for item in items:
+                attachment_id = str(item.get("attachment_id") or "")
+                if not attachment_id:
+                    continue
+                outcome = attachment_service.request_preparation(
+                    thread_id, attachment_id
+                )
+                # Direct attribute reads per the consumer-side Protocol:
+                # a service violating the pinned outcome shape raises
+                # ``AttributeError`` loudly instead of degrading into
+                # the generic fallback refusal.
+                outcome_state = str(outcome.state or "")
+                code = outcome.code
+                if outcome_state == "ready":
+                    continue
+                if outcome_state == "pending":
+                    pending.append(attachment_id)
+                    continue
+                # EXIT failed / unknown / any out-of-vocabulary state:
+                # a terminal failure outranks a sibling's pending —
+                # waiting on a partially-failed eligible set would let
+                # the model answer without a source the operator named.
+                # The service's code rides ``status_reason`` verbatim
+                # (spec: named failure); ``unknown`` with no code is the
+                # unknown/stale-identity exit.
+                if outcome_state == "failed":
+                    reason = str(code) if code else ATTACHMENT_PREPARATION_FAILED
+                elif outcome_state == "unknown":
+                    reason = str(code) if code else "unknown_locator"
+                else:
+                    reason = ATTACHMENT_PREPARATION_FAILED
+                return {
+                    "messages": [],
+                    "answer": "",
+                    "citations": (),
+                    "status": "refuse",
+                    "status_reason": reason,
+                }
+            if not pending:
+                # All ready. Rows that were ``uploaded`` at send time
+                # carry ids without frozen text; (re)hydrate each
+                # item's text through the service — the same
+                # ``resolve_for_turn`` mechanism the send door uses
+                # today — before the leaf reads the channel.
+                hydrated: list[dict[str, Any]] = []
+                changed = False
+                for item in items:
+                    attachment_id = str(item.get("attachment_id") or "")
+                    if attachment_id and not str(item.get("text") or ""):
+                        try:
+                            resolved = attachment_service.resolve_for_turn(
+                                thread_id=thread_id,
+                                attachment_id=attachment_id,
+                            )
+                        except Exception as exc:
+                            # The send door's race guard moved into
+                            # the node: derived data can go unreadable
+                            # between the ready verdict and this read,
+                            # and the resolver answers its typed
+                            # not-ready pair. Re-ask and wait (the row
+                            # joins the pending set; the loop head's
+                            # idempotent ``request_preparation`` makes
+                            # the next routing decision on resume) —
+                            # never a bare crash, never an empty
+                            # success. Any other error is a real bug
+                            # and propagates: typed, never swallowed.
+                            if not isinstance(
+                                exc, _attachment_resolve_race_errors()
+                            ):
+                                raise
+                            pending.append(attachment_id)
+                            break
+                        item = {
+                            **item,
+                            "filename": str(
+                                resolved.filename
+                                or item.get("filename")
+                                or ""
+                            ),
+                            "text": str(resolved.text or ""),
+                        }
+                        changed = True
+                    hydrated.append(item)
+                if not pending:
+                    # EXIT passthrough: with every row already carrying
+                    # its text the channel needs no rewrite; omitting
+                    # the key leaves it untouched.
+                    return {"attachments": hydrated} if changed else {}
+            interrupt(
+                {
+                    "kind": ATTACHMENT_PREPARATION_INTERRUPT_KIND,
+                    "attachment_ids": list(pending),
+                }
+            )
 
     def model_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         # Step 1: step-cap fuse. Increment ``step_count`` and check
@@ -3267,7 +3492,9 @@ def compile_graph(
 
     def from_compaction_gate(
         state: AgentState,
-    ) -> Literal["dialogue", "clarify", "off_topic", "model"]:
+    ) -> Literal[
+        "dialogue", "clarify", "off_topic", "model", "ensure_attachment_ready"
+    ]:
         """Apply the Soft-Track track decision after the gate.
 
         Mirrors the residual branch in ``decide_track``: a missing
@@ -3275,6 +3502,10 @@ def compile_graph(
         model (specs/soft-track.md — no single global default track).
         The gray-zone judge itself fail-closes to clarify (ADR 0080),
         so this default only covers pre-classify state.
+
+        T2f: with an ``attachment_service`` wired, the grounded route
+        enters ``ensure_attachment_ready`` (which then routes to
+        ``model``); without one the route is exactly today's.
         """
         track = state.get("track", "dialogue")
         if track == "dialogue":
@@ -3283,6 +3514,17 @@ def compile_graph(
             return "clarify"
         if track == "off_topic":
             return "off_topic"
+        if attachment_service is not None:
+            return "ensure_attachment_ready"
+        return "model"
+
+    def from_ensure_attachment_ready(
+        state: AgentState,
+    ) -> Literal["model", "__end__"]:
+        """The gate's typed refuse exits the run; every other status
+        enters the grounded leaf (T2f)."""
+        if state.get("status") == "refuse":
+            return END
         return "model"
 
     def from_model(
@@ -3400,6 +3642,16 @@ def compile_graph(
     graph.add_node("issuer_research", issuer_research_node, input_schema=IssuerTask)
     graph.add_node("issuer_join", issuer_join_node)
     graph.add_node("citation_gate", citation_gate_node)
+    if attachment_service is not None:
+        # T2f: the preparation gate is a PAUSE/EXIT node between the
+        # compaction gate and the grounded leaf; with the seam unwired
+        # the graph stays exactly today's topology.
+        graph.add_node("ensure_attachment_ready", ensure_attachment_ready_node)
+        graph.add_conditional_edges(
+            "ensure_attachment_ready",
+            from_ensure_attachment_ready,
+            ["model", END],
+        )
 
     graph.add_edge(START, "classify")
     # Explicit path map: with the HITL lane OFF ``mode_choice`` (T2) and
@@ -3432,8 +3684,20 @@ def compile_graph(
     graph.add_edge("issuer_join", "compaction_gate")
     graph.add_conditional_edges("citation_gate", from_gate)
     # The gate applies the track decision AFTER compacting, so the
-    # non-research leaves are also reached post-gate.
-    graph.add_conditional_edges("compaction_gate", from_compaction_gate)
+    # non-research leaves are also reached post-gate. Explicit path
+    # map (T2f): with the attachment seam wired the grounded branch
+    # names ``ensure_attachment_ready``, and LangGraph would reject the
+    # branch return annotation's unknown target at compile time.
+    graph.add_conditional_edges(
+        "compaction_gate",
+        from_compaction_gate,
+        [
+            "dialogue",
+            "clarify",
+            "off_topic",
+            "ensure_attachment_ready" if attachment_service is not None else "model",
+        ],
+    )
 
     compiled = graph.compile(checkpointer=checkpointer)
 
@@ -3447,6 +3711,12 @@ def compile_graph(
         summarizer=summarizer,
         compiled_graph=compiled,
         enable_choice_window=enable_choice_window,
+        # T2f: the gate node + routing exist only when the seam is
+        # wired — an unwired cached compile must never be served to a
+        # wired caller (same rule as ``enable_choice_window``).
+        attachment_service_id=(
+            id(attachment_service) if attachment_service is not None else 0
+        ),
         # T2 (ADR 0044): the SAME compactor instance the graph gate
         # uses, so ``/compact`` and the >=90% auto path share one
         # eviction unit walker, one summarizer seam, one floor.
@@ -3521,6 +3791,7 @@ def _make_locked_graph(
     tool_node: Any | None = None,
     memory_port_id: int = 0,
     enable_choice_window: bool = False,
+    attachment_service_id: int = 0,
 ) -> "_LockedGraph":
     key = (
         id(checkpointer),
@@ -3547,6 +3818,10 @@ def _make_locked_graph(
         # node + routing — same reasoning as ``memory_port_id``, an OFF
         # compile must never be served to an ON caller from cache.
         int(enable_choice_window),
+        # T2f: the attachment seam adds the ``ensure_attachment_ready``
+        # node + grounded routing; an unwired cached compile must never
+        # be served to a wired caller.
+        int(attachment_service_id),
     )
     cached = _IDEMPOTENCE_CACHE.get(key)
     if cached is not None:

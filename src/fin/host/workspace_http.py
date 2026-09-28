@@ -29,7 +29,21 @@ Routes
                                           ``status`` -> ``answer``
                                           -> ``citations`` order
                                           (citations terminal per
-                                          spec line 30).
+                                          spec line 30). T2f graph
+                                          gate: a send whose named
+                                          attachment is not ready yet
+                                          opens the run, the gate
+                                          node starts-or-joins the
+                                          durable job and PAUSES the
+                                          run on an ``interrupt``;
+                                          the wire closes after the
+                                          ``attachment_wait`` frame
+                                          (it carries the run id),
+                                          and the boot auto-resumer
+                                          drives that same checkpoint
+                                          run id when the job
+                                          settles — no operator
+                                          resend.
 * ``POST   /api/threads/{id}/resume``   - crash resume on the SAME
                                           delta wire (T2, #36).
 * ``POST   /api/threads/{id}/stop``     - cooperative stop of the
@@ -214,6 +228,12 @@ from fin.host.attachment_layout import (
     HeronPageLayout,
     LayoutRecordRunner,
 )
+from fin.host.attachment_prep_worker import (
+    ATTACHMENT_PREP_WORKER_CHECK_INTERVAL_SECONDS,
+    AttachmentPrepWorker,
+    PeriodicDrainWorker,
+    drain_periodically,
+)
 from fin.host.attachment_prepare import (
     ATTACHMENT_PAGE_LANE_UNWIRED,
     AttachmentCleanupError,
@@ -243,6 +263,7 @@ from fin.host.feedback import (
 from fin.host.filing_monitor import FilingMonitor, default_filing_monitor
 from fin.host.filing_monitor_errors import FilingSourceUnavailableError
 from fin.host.graph import (
+    ATTACHMENT_PREPARATION_INTERRUPT_KIND,
     ConcurrentRunError,
     KnowledgeMCPFaultError,
     analysis_from_tool_message,
@@ -593,6 +614,14 @@ class RunStreamOutcome:
     # paused run is not a finished turn — the resumed remainder's
     # completion writes the row) and closes the stream.
     choice_window: dict[str, Any] | None = None
+    # T2f durable graph gate: the run PAUSED on the attachment
+    # preparation interrupt (payload kind
+    # ``attachment_preparation``). The engine already emitted the
+    # ``attachment_wait`` SSE frame carrying the run id; the caller
+    # persists NOTHING (same pause posture as ``choice_window``) — the
+    # auto-resumer drives the SAME checkpoint run id to completion once
+    # the durable preparation job settles.
+    attachment_wait: dict[str, Any] | None = None
 
 
 # Graph nodes whose model deltas are the operator-visible reply.
@@ -704,10 +733,14 @@ class SendMessageRequest(BaseModel):
     # ``POST /threads/{id}/attachments``. An id stays referenceable for the
     # whole thread lifetime, so a later turn reuses it; an unknown id or
     # another thread's id is the named 400 ``attachment_not_found`` BEFORE
-    # any graph invoke, and a named id still ``parsing`` is
-    # ``attachment_not_ready``. Attach never pushes: the resolved text rides
-    # ``reset_input_state(attachments=...)`` as turn-scoped context and
-    # never enters the corpus/ingest path.
+    # any graph invoke. A stored ``uploaded`` / ``parsing`` id is accepted
+    # (T2f): it rides the run as an empty-text item and the graph's
+    # preparation gate suspends the run on the durable job and hydrates
+    # the text on resume; a ``failed`` id is the named 400
+    # ``attachment_not_ready`` until the retry door re-spends it. Attach
+    # never pushes: the resolved text rides ``reset_input_state(
+    # attachments=...)`` as turn-scoped context and never enters the
+    # corpus/ingest path.
     attachment_ids: list[str] = Field(default_factory=list)
     # The explicit 检索档 selector. Empty (the default) is the ordinary
     # send — the model resolves the track as it always has. A caller that
@@ -962,6 +995,13 @@ class ThreadDetailResponse(BaseModel):
     # needed). ``pending_checkpoint`` derives from
     # ``pending_nodes(thread_id) and not is_locked``.
     pending_checkpoint: bool = False
+    # T2f: WHAT a paused run waits for while ``pending_checkpoint`` is
+    # true — ``"attachment_preparation"`` (durable prep job owns the
+    # resume) or ``"choice_window"`` (the operator's pick owns it);
+    # ``None`` for a plain crash checkpoint. The route computes it into
+    # the payload dict, so the response model must declare it or
+    # FastAPI filters the key off the wire.
+    pending_interrupt_kind: str | None = None
     # T3 (ADR 0044): token occupancy from the SAME figure the
     # compaction gate computes (``graph.occupancy(thread_id)`` ->
     # ``OccupancyCompactor.occupancy`` over the checkpointed
@@ -1295,6 +1335,8 @@ def _stream_run_frames(
     # search-mode host T2: set when the run paused on a choice window
     # (the final ``values`` frame carries ``__interrupt__``).
     choice_window: dict[str, Any] | None = None
+    # T2f: set when the run paused on the attachment preparation gate.
+    attachment_wait: dict[str, Any] | None = None
     graph_stream = graph.stream(
         input_value,
         config=config,
@@ -1356,14 +1398,25 @@ def _stream_run_frames(
                 # key (LangGraph contract). The choice-window payload is
                 # the frame's data verbatim — the host/HTTP contract the
                 # SPA paints (spec search-mode-host SC2, stub allowed).
+                # T2f: the attachment-preparation pause shares this loop
+                # but not this frame — the SPA does not answer it, so it
+                # rides a distinct ``attachment_wait`` event carrying
+                # the run id the auto-resumer will drive.
                 for pending in payload.get("__interrupt__") or ():
                     value = getattr(pending, "value", None)
-                    if (
-                        isinstance(value, dict)
-                        and value.get("kind") == "choice_window"
-                    ):
+                    if not isinstance(value, dict):
+                        continue
+                    if value.get("kind") == "choice_window":
                         choice_window = value
                         yield _frame("choice_window", value)
+                    elif (
+                        value.get("kind")
+                        == ATTACHMENT_PREPARATION_INTERRUPT_KIND
+                    ):
+                        attachment_wait = value
+                        yield _frame(
+                            "attachment_wait", {"run_id": run_id, **value}
+                        )
 
         # Stream end: release any held-back inline-filter fragment so
         # the live view never silently loses trailing text. Skipped on
@@ -1445,6 +1498,136 @@ def _stream_run_frames(
         answer_reset=pending_answer_reset,
         stopped=stopped,
         choice_window=choice_window,
+        attachment_wait=attachment_wait,
+    )
+
+
+def _resume_run_stream(
+    graph: Any,
+    store: ThreadStore,
+    *,
+    run_control: RunControl,
+    thread_id: str,
+    run_id: str,
+    resume_input: Any,
+    resume_config: dict[str, Any],
+) -> Iterator[str]:
+    """Drive one resumed run on the shared delta wire; persist on finish.
+
+    THE one resume path, extracted from ``POST /threads/{id}/resume`` so
+    an operator resume and the T2f attachment auto-resumer cannot drift:
+    the auto-resumer consumes the generator to exhaustion in the
+    background and DISCARDS the frames — the resumed turn row is the
+    half it needs, the live wire is the half only an HTTP caller reads.
+
+    ``resume_input`` is LangGraph's ``Command(resume=pick)`` for an
+    operator answer, a ``Command(resume=<string>)`` for the
+    auto-resumer (the gate node ignores the value, and
+    ``Command(resume=None)`` trips an ``UnboundLocalError`` in this
+    langgraph version), or ``None`` for the plain crash resume.
+
+    The dedup set is seeded with the pre-resume checkpoint's message
+    ids: the first ``values`` frame replays the checkpointed messages
+    (the crashed run's HumanMessage + complete ``AIMessage``), and
+    re-emitting their frames would duplicate what the pre-crash stream
+    already sent.
+    """
+    seen_message_ids: set[str] = set()
+    if hasattr(graph, "checkpoint_message_ids"):
+        seen_message_ids |= graph.checkpoint_message_ids(thread_id)
+    # A resumed remainder is an in-flight run on this thread too, so
+    # Stop must reach it (the composer is disabled for its whole
+    # duration).
+    stop_token = run_control.begin(thread_id, run_id)
+    try:
+        outcome = yield from _stream_run_frames(
+            graph,
+            run_id=run_id,
+            input_value=resume_input,
+            config=resume_config,
+            seen_message_ids=seen_message_ids,
+            thread_id=thread_id,
+            stop_token=stop_token,
+        )
+    finally:
+        run_control.end(stop_token)
+
+    if outcome.stopped:
+        # No row: the original send's row already tells the story, and
+        # one row per stopped Resume click would spam the turn table
+        # (same policy as this path's mid-flight refuse branch).
+        yield from _stopped_terminal_frames(
+            run_id, thinking_ms=outcome.thinking_ms
+        )
+        return
+
+    if outcome.choice_window is not None:
+        # Re-draw (body-less resume onto a pending window) or an invalid
+        # pick that REOPENED the window: the frame is out, the run is
+        # still paused, so persist nothing and close — the operator
+        # picks again.
+        return
+
+    if outcome.attachment_wait is not None:
+        # T2f: the resumed remainder paused on the attachment gate
+        # AGAIN (e.g. a re-upload changed the content version
+        # mid-resume). Same posture as the send route's pause: persist
+        # nothing and close; the next settled sweep drives this run.
+        return
+
+    if outcome.final_state is None:
+        # Mid-flight raise on a RESUME: unlike the send path, persist
+        # nothing — when the original send row exists it already tells
+        # the story, and appending a refuse row per failed Resume click
+        # would spam the turn table. After process death with no send
+        # row, a resume that also raises still leaves history without a
+        # row (success-path resume below does load the checkpoint
+        # HumanMessage when final_state is present).
+        return
+    payload = _run_to_response_payload(outcome.final_state)
+    resume_question = (
+        graph.checkpoint_last_human_text(thread_id)
+        if hasattr(graph, "checkpoint_last_human_text")
+        else None
+    ) or ""
+    try:
+        store.append_run(
+            RunRecord(
+                id=run_id,
+                thread_id=thread_id,
+                question=resume_question,
+                status=payload["status"],
+                status_reason=payload["reason"],
+                answer=payload["answer"],
+                citations=payload["citations"],
+                thinking_text=payload["thinking_text"],
+                thinking_duration_ms=outcome.thinking_ms,
+                tool_summaries=payload["tool_summaries"],
+                assistant_message=payload["assistant_message"],
+                track_decision=dict(payload.get("track_decision") or {}),
+                comparisons=list(payload.get("comparisons") or []),
+                analysis_results=list(payload.get("analysis_results") or []),
+                # SC8: the RESUMED remainder's locators. The crashed
+                # prefix's row (when one exists) keeps its own.
+                evidence_locators=list(payload["evidence_locators"]),
+            )
+        )
+    except ThreadNotFoundError:
+        yield _format_sse("status", {
+            "run_id": run_id,
+            "status": "refuse",
+            "reason": "thread_not_found",
+            "assistant_message": "Thread was deleted while the run was resuming.",
+        })
+        return
+    # Terminal frames per spec line 30 (shared emitter). The resume's
+    # thinking duration is the REMAINDER's, not the crashed prefix's
+    # (that time is unknowable post-crash).
+    yield from _terminal_sse_frames(
+        run_id=run_id,
+        payload=payload,
+        thinking_ms=outcome.thinking_ms,
+        answer_reset=outcome.answer_reset,
     )
 
 
@@ -2593,6 +2776,10 @@ def _build_default_attachment_service() -> AttachmentPreparationService:
         object_store_from_env,
     )
     from fin.corpus.object_store_errors import ObjectStoreNotConfiguredError
+    from fin.host.attachment_job_store import (
+        InMemoryThreadAttachmentJobStore,
+        PostgresThreadAttachmentJobStore,
+    )
     from fin.host.attachment_store import (
         InMemoryAttachmentStore,
         PostgresAttachmentStore,
@@ -2653,10 +2840,22 @@ def _build_default_attachment_service() -> AttachmentPreparationService:
         # attachment tables are created.
         default_thread_store()
         store: Any = PostgresAttachmentStore(url)
+        # WHY the durable job twin here: the graph gate enqueues
+        # preparation work that must outlive this process (the auto-
+        # resumer and the restart sweep both read it), so a Postgres
+        # attachment store gets the Postgres job store over the SAME
+        # url — one durable database owns the row and its work.
+        jobs: Any = PostgresThreadAttachmentJobStore(url)
     else:
         store = InMemoryAttachmentStore(default_thread_store())
+        jobs = InMemoryThreadAttachmentJobStore()
     service = AttachmentPreparationService(
-        store=store, objects=objects, budgets=budgets, pages=pages, vision=vision
+        store=store,
+        objects=objects,
+        budgets=budgets,
+        pages=pages,
+        vision=vision,
+        jobs=jobs,
     )
     service.recover()
     return service
@@ -2673,6 +2872,323 @@ def default_attachment_service() -> AttachmentPreparationService:
         if _attachment_service_singleton is None:
             _attachment_service_singleton = _build_default_attachment_service()
         return _attachment_service_singleton
+
+
+# The boot-owned execution side of the durable graph gate (T2f): one
+# prep drain that runs the queued preparation jobs, and one auto-resumer
+# that drives runs paused on the preparation interrupt. Both start only
+# from the boot path (``fin.host.http.serve``) — nothing here acquires a
+# thread at import, the same posture as the ingest worker above.
+
+
+_attachment_prep_worker: AttachmentPrepWorker | None = None
+_attachment_prep_worker_lock = threading.Lock()
+
+
+def start_attachment_prep_worker(
+    service: AttachmentPreparationService | None = None,
+    *,
+    interval_s: float = ATTACHMENT_PREP_WORKER_CHECK_INTERVAL_SECONDS,
+) -> threading.Thread:
+    """Start the process's single attachment prep drain (idempotent).
+
+    Boot glue over :class:`AttachmentPrepWorker`, which owns the
+    singleton guard itself: a second call while the loop is alive
+    returns the live thread, and a start over a timed-out stop's dying
+    thread raises ``AttachmentPrepWorkerStoppingError`` rather than
+    sharing the process with two drains. The worker object stays the
+    module global after a confirmed stop (the class is restartable), so
+    a restart re-``start``\\ s the same drain posture over the same
+    service. ``service`` is honored only for the first construction in
+    the process — after that the documented singleton answers, same as
+    the HTTP dependency.
+    """
+    global _attachment_prep_worker
+    with _attachment_prep_worker_lock:
+        if _attachment_prep_worker is None:
+            _attachment_prep_worker = AttachmentPrepWorker(
+                service if service is not None else default_attachment_service(),
+                interval_s=interval_s,
+            )
+        return _attachment_prep_worker.start()
+
+
+def stop_attachment_prep_worker(*, timeout: float = 60.0) -> None:
+    """Stop the process's attachment prep drain. Idempotent.
+
+    Delegates the join to the worker: the in-flight job finishes its
+    current claim first (a half-run job is exactly what the boot sweep
+    re-adopts), and stopping a never-started worker is a no-op.
+    """
+    with _attachment_prep_worker_lock:
+        worker = _attachment_prep_worker
+    if worker is not None:
+        worker.stop(timeout=timeout)
+
+
+# The resume sweep is a PeriodicDrainWorker over the shared guard; it is
+# rebound (honoring freshly passed seams) only once the previous thread's
+# exit is confirmed — see start_attachment_resume_worker.
+_attachment_resume_worker: PeriodicDrainWorker | None = None
+_attachment_resume_worker_lock = threading.Lock()
+
+
+class AttachmentResumeWorkerStoppingError(RuntimeError):
+    """Start refused while a timed-out stop's sweep thread is still alive.
+
+    The singleton guard of :func:`start_attachment_resume_worker`, one
+    per process, mirroring :class:`IngestWorkerStoppingError`: a stop
+    whose join times out keeps the live thread registered, and a start
+    over it would run two resume sweeps in one process.
+    """
+
+    code = "attachment_resume_worker_stopping"
+
+
+#: Seconds between pause sweeps after the startup sweep. Shorter than
+#: the prep drain: the pause is operator-visible (the thread sits
+#: waiting), while a missed prep job re-runs on the next claim anyway.
+ATTACHMENT_RESUME_WORKER_CHECK_INTERVAL_SECONDS: Final[float] = 10.0
+
+ATTACHMENT_RESUME_WORKER_THREAD_NAME: Final[str] = "fin-attachment-resume-worker"
+
+
+def _resume_one_attachment_wait(
+    graph: Any,
+    store: ThreadStore,
+    service: AttachmentPreparationService,
+    run_control: RunControl,
+    thread_id: str,
+    *,
+    workspace_root: Path | None = None,
+) -> bool:
+    """Drive ONE thread's settled attachment pause to its turn row.
+
+    Returns whether a resume was driven. The guards are the contract:
+
+    * only the ``attachment_preparation`` interrupt kind is ever
+      auto-resumed — a ``choice_window`` pause waits on the operator's
+      pick and a plain crash checkpoint waits on the Resume button, so
+      this sweep cannot answer for either (the exact-kind compare, not
+      a deny-list, keeps a future kind from being auto-resumed by
+      default);
+    * the lock and pending-node probes keep a live run and a finalized
+      terminal row out of reach (same read-only seams the routes use);
+    * the work must be SETTLED: ``request_preparation`` is asked through
+      the same idempotent start-or-join the gate node uses, and any
+      ``pending`` answer means job queued or running — wait for the
+      next check. ``ready`` / ``failed`` / ``unknown`` all let the run
+      go: the gate re-evaluates on its own and refuses or hydrates
+      accordingly, so a failed preparation reaches the turn row as the
+      gate's typed refuse instead of hanging the pause forever.
+
+    The resume VALUE is a string sentinel: ``Command(resume=None)``
+    trips an ``UnboundLocalError`` in this langgraph version, and the
+    gate node ignores the value — the re-evaluation is the whole ask.
+    """
+    if not hasattr(graph, "interrupt_pending") or not hasattr(
+        graph, "pending_nodes"
+    ):
+        return False
+    if hasattr(graph, "is_locked") and graph.is_locked(thread_id):
+        return False
+    payload = graph.interrupt_pending(thread_id)
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("kind") != ATTACHMENT_PREPARATION_INTERRUPT_KIND:
+        return False
+    if not graph.pending_nodes(thread_id):
+        return False
+    for attachment_id in payload.get("attachment_ids") or ():
+        request = service.request_preparation(thread_id, str(attachment_id))
+        if request.state == "pending":
+            return False
+    run_id = (
+        graph.checkpoint_run_id(thread_id)
+        if hasattr(graph, "checkpoint_run_id")
+        else None
+    )
+    if not run_id:
+        logger.warning(
+            "attachment auto-resume: thread %s pauses on an attachment gate "
+            "with no checkpoint run_id; leaving it for an operator resume",
+            thread_id,
+        )
+        return False
+    resume_config: dict[str, Any] = {
+        "configurable": {
+            "thread_id": thread_id,
+            "run_id": run_id,
+            "workspace_root": str(
+                workspace_root
+                if workspace_root is not None
+                else default_workspace_root_for_process()
+            ),
+        }
+    }
+    # THE same path POST /resume drives, frames discarded: the resumed
+    # remainder's turn row is written inside the generator, so consuming
+    # it to exhaustion is the whole resume.
+    for _frame in _resume_run_stream(
+        graph,
+        store,
+        run_control=run_control,
+        thread_id=thread_id,
+        run_id=run_id,
+        resume_input=Command(resume="attachment_preparation_settled"),
+        resume_config=resume_config,
+    ):
+        pass
+    return True
+
+
+def _resume_attachment_waits_once(
+    graph: Any,
+    store: ThreadStore,
+    service: AttachmentPreparationService,
+    run_control: RunControl,
+    *,
+    workspace_root: Path | None = None,
+) -> int:
+    """One sweep over every thread; resume each settled attachment pause.
+
+    Returns how many runs were driven. A thread whose resume raises is
+    logged and skipped: one poisoned checkpoint cannot starve the rest
+    of the sweep (the same log-and-continue posture as the drains).
+    """
+    resumed = 0
+    for thread in store.list_threads():
+        try:
+            if _resume_one_attachment_wait(
+                graph,
+                store,
+                service,
+                run_control,
+                thread.id,
+                workspace_root=workspace_root,
+            ):
+                resumed += 1
+        except Exception:
+            # EXIT: one poisoned checkpoint must not starve the rest of
+            # the sweep — the failure exits THIS thread's attempt only;
+            # log with context and continue to the next thread.
+            logger.exception(
+                "attachment resume sweep: thread %s failed; continuing",
+                thread.id,
+            )
+    return resumed
+
+
+def _check_attachment_resume_waits(
+    graph: Any,
+    store: ThreadStore,
+    service: AttachmentPreparationService,
+    run_control: RunControl,
+    workspace_root: Path | None,
+    stop_event: threading.Event,
+    check_interval_seconds: float,
+) -> None:
+    """Startup sweep, then a bounded periodic re-check, until stopped.
+
+    The loop body is kept separate from the thread plumbing (the shared
+    :func:`~fin.host.attachment_prep_worker.drain_periodically`, the
+    same posture as the prep module's ``_drain_attachment_queue'') so a
+    test can drive the exact loop without spawning anything.
+
+    The startup sweep is what makes a process restart resume waiting
+    runs without an operator resend: the pause and its run id live in
+    the durable checkpointer, so the first pass over the thread list
+    finds every settled gate.
+    """
+    drain_periodically(
+        lambda: _resume_attachment_waits_once(
+            graph,
+            store,
+            service,
+            run_control,
+            workspace_root=workspace_root,
+        ),
+        stop_event,
+        check_interval_seconds,
+        worker_logger=logger,
+        log_label="attachment resume worker",
+    )
+
+
+def start_attachment_resume_worker(
+    *,
+    graph: Any,
+    store: ThreadStore,
+    service: AttachmentPreparationService,
+    workspace_root: Path | None = None,
+    run_control: RunControl | None = None,
+    check_interval_seconds: float | None = None,
+) -> threading.Thread:
+    """Start the process's single attachment auto-resumer (idempotent).
+
+    The boot half of the durable gate's resume clause: runs paused on
+    the preparation interrupt are driven by this sweep, never by an
+    operator resend. The singleton guard is the shared
+    :class:`~fin.host.attachment_prep_worker.PeriodicDrainWorker`, the
+    same posture as :func:`start_attachment_prep_worker` above: a live
+    thread is returned as-is, a start over a timed-out stop's dying
+    thread raises :class:`AttachmentResumeWorkerStoppingError`, and the
+    worker is rebound — honoring the freshly passed seams — only once
+    the previous thread's exit is confirmed (the restart-after-clean-
+    stop clause). The thread is a daemon so a host that forgets to stop
+    never blocks interpreter exit; ``stop_attachment_resume_worker`` is
+    the clean shutdown.
+
+    ``run_control`` defaults to a fresh registry: a background resume
+    is not addressable by the HTTP Stop door (that registry belongs to
+    one mounted router), and registering there would claim a stop can
+    reach a run the operator never saw. ``workspace_root`` defaults to
+    resolving the process default at resume time — the same value the
+    HTTP seam injects — so a boot that never pauses never pays the
+    directory resolution.
+    """
+    global _attachment_resume_worker
+    with _attachment_resume_worker_lock:
+        worker = _attachment_resume_worker
+        if worker is None or not worker.is_live():
+            control = run_control if run_control is not None else RunControl()
+            worker = PeriodicDrainWorker(
+                lambda: _resume_attachment_waits_once(
+                    graph,
+                    store,
+                    service,
+                    control,
+                    workspace_root=workspace_root,
+                ),
+                interval_s=(
+                    check_interval_seconds
+                    if check_interval_seconds is not None
+                    else ATTACHMENT_RESUME_WORKER_CHECK_INTERVAL_SECONDS
+                ),
+                thread_name=ATTACHMENT_RESUME_WORKER_THREAD_NAME,
+                stopping_error=AttachmentResumeWorkerStoppingError,
+                log_label="attachment resume worker",
+                worker_logger=logger,
+            )
+            _attachment_resume_worker = worker
+        return worker.start()
+
+
+def stop_attachment_resume_worker(*, timeout: float = 60.0) -> None:
+    """Signal the resume sweep to exit and join it. Idempotent.
+
+    Delegates the join to the shared guard: the in-flight sweep
+    finishes first, stopping a never-started worker is a no-op, and the
+    thread is cleared only after the join confirms the exit — on a join
+    timeout the live thread stays registered (the stopping tombstone),
+    so ``start_attachment_resume_worker`` refuses to rebind over it
+    (:class:`AttachmentResumeWorkerStoppingError`) instead of letting
+    two sweeps share the process.
+    """
+    with _attachment_resume_worker_lock:
+        worker = _attachment_resume_worker
+    if worker is not None:
+        worker.stop(timeout=timeout)
 
 
 def build_router(
@@ -2813,6 +3329,20 @@ def build_router(
             and bool(graph.pending_nodes(thread_id))
         ):
             pending_checkpoint = True
+        # T2f: WHAT a paused run is waiting for, when anything is
+        # pending: ``"attachment_preparation"`` (the durable prep job +
+        # auto-resumer own the resume — no operator action) or
+        # ``"choice_window"`` (the operator's pick resumes). ``null``
+        # when a plain crash checkpoint has no interrupt at all. Read
+        # only while a pause can be observed (same lock probe as the
+        # flag above), through the same defensive ``hasattr`` seam.
+        pending_interrupt_kind: str | None = None
+        if pending_checkpoint and hasattr(graph, "interrupt_pending"):
+            pending_payload = graph.interrupt_pending(thread_id)
+            if isinstance(pending_payload, dict):
+                raw_kind = pending_payload.get("kind")
+                if isinstance(raw_kind, str) and raw_kind:
+                    pending_interrupt_kind = raw_kind
         # T3 (ADR 0044): occupancy from the same compactor figure the
         # gate uses. Defensive ``hasattr`` mirrors the ``is_locked`` /
         # ``pending_nodes`` wiring-bug tolerance for graph stand-ins
@@ -2824,6 +3354,7 @@ def build_router(
             **_serialize_thread(thread),
             "in_flight": is_locked,
             "pending_checkpoint": pending_checkpoint,
+            "pending_interrupt_kind": pending_interrupt_kind,
             "occupancy": occupancy,
             "turns": [
                 _serialize_run(
@@ -3001,44 +3532,54 @@ def build_router(
                 thread_id=thread_id,
             )
 
-        # ADR 0083/0088: referenced attachments are resolved from this
+        # ADR 0083/0088 + T2f: referenced attachments are resolved from this
         # thread's durable store BEFORE the lock probe and BEFORE the title
         # rewrite, so a bad reference is a named 400 with zero side effects.
         # Unknown OR other-thread ids share one error (no existence leak
-        # across threads); a named attachment whose preparation has not
-        # published searchable text yet is ``attachment_not_ready`` rather
-        # than an empty context block.
-        # Refusing is the fail-safe, not the finished contract: spec line 25
-        # asks the host to accept a stored ``uploaded`` attachment without
-        # waiting, which needs the run suspended and resumed around a
-        # preparation the graph starts. Until that trigger exists, the retry
-        # door is the only path from ``uploaded`` to ``ready``, and an answer
-        # built without the named source the operator asked for is the
-        # failure this refusal prevents.
-        # Resolution is read-only — an attachment stays referenceable for the
-        # rest of the thread's life.
+        # across threads). A stored ``uploaded`` / ``parsing`` row is NOT a
+        # refusal any more: the id rides the run state with an empty
+        # ``text`` and the graph's preparation gate starts-or-joins the
+        # durable job, suspends the run (releasing the lock), and hydrates
+        # the text when it resumes (spec: accept a stored uploaded
+        # attachment without waiting). A ``failed`` row keeps the named 400
+        # because a repeated turn must not re-spend a named failure — the
+        # retry door owns that decision — while a failure that lands AFTER
+        # the run started still reaches the turn row as the gate's typed
+        # refusal, never as an empty success.
+        # Resolution is read-only — an attachment stays referenceable for
+        # the rest of the thread's life.
         referenced_ids = list(dict.fromkeys(body.attachment_ids or []))
         resolved_attachments: list[dict[str, str]] = []
         for attachment_id in referenced_ids:
-            try:
-                resolved = attachments.resolve_for_turn(
-                    thread_id=thread_id, attachment_id=attachment_id
-                )
-            except AttachmentNotFoundError:
+            record = attachments.status(attachment_id)
+            if record is None or record.thread_id != thread_id:
                 return JSONResponse(
                     status_code=400,
                     content={"error": "attachment_not_found"},
                 )
-            except AttachmentNotReadyError:
+            if record.status == "failed":
                 return JSONResponse(
                     status_code=400,
                     content={"error": "attachment_not_ready"},
                 )
+            text = ""
+            if record.searchable:
+                try:
+                    resolved = attachments.resolve_for_turn(
+                        thread_id=thread_id, attachment_id=attachment_id
+                    )
+                    text = resolved.text
+                except (AttachmentNotReadyError, AttachmentNotFoundError):
+                    # EXIT: the derived data went unreadable between the
+                    # two reads. Empty text is the not-ready shape the
+                    # gate already handles — ask and wait — so this door
+                    # never guesses a failure the durable job may cure.
+                    text = ""
             resolved_attachments.append(
                 {
-                    "attachment_id": resolved.attachment_id,
-                    "filename": resolved.filename,
-                    "text": resolved.text,
+                    "attachment_id": record.attachment_id,
+                    "filename": record.filename,
+                    "text": text,
                 }
             )
 
@@ -3253,6 +3794,16 @@ def build_router(
                 # completion writes the row under the SAME checkpoint
                 # run_id). The stream close is the SPA's cue to paint
                 # the window.
+                return
+
+            if outcome.attachment_wait is not None:
+                # T2f: the run PAUSED on the attachment preparation gate
+                # — the engine already emitted the ``attachment_wait``
+                # frame with the run id. Same pause posture as the
+                # choice window: persist NOTHING and close; the
+                # auto-resumer drives the SAME checkpoint run_id to
+                # completion once the durable job settles, and that
+                # resumed remainder writes the one turn row.
                 return
 
             if outcome.final_state is None:
@@ -3540,17 +4091,26 @@ def build_router(
             get_attachment_service
         ),
     ) -> dict:
-        """Re-drive a failed attachment; success makes it ``ready``.
+        """Re-drive a failed attachment through the durable job: no in-request parse.
+
+        T2f: preparation is durable background work, so this door only
+        re-asks — :meth:`AttachmentPreparationService.retry_preparation`
+        re-enqueues a failed row's job (the job store reopens ``failed``
+        jobs on a fresh enqueue) and answers with the resulting wire
+        record immediately. A retried row therefore leaves this door as
+        ``parsing`` (work queued), never ``ready``: the prep worker
+        drains the job and the row reaches ``ready`` on a later status
+        read. The door deliberately does NOT wait, and a document this
+        deployment cannot read is still a 200 carrying its failed
+        reason eventually, never a 500: the preparation service owns
+        the whole refusal ladder, including a page document arriving at
+        a deployment with no page lane.
 
         Retry writes state, so a malformed path identity is refused before any
         lookup or preparation, exactly as the delete door refuses it:
 
         * malformed path identity  -> 400 ``invalid_locator``
-
-        A document this deployment cannot read is a 200 carrying its failed
-        reason, never a 500: the preparation service owns the whole refusal
-        ladder, including a page document arriving at a deployment with no
-        page lane.
+        * identity gone mid-flight -> 400 ``attachment_not_found``
         """
         refusal = _locator_refusal(thread_id, attachment_id)
         if refusal is not None:
@@ -3565,7 +4125,20 @@ def build_router(
                 status_code=400, content={"error": "attachment_not_found"}
             )
         try:
-            return _attachment_wire_record(attachments.prepare(attachment_id))
+            request = attachments.retry_preparation(thread_id, attachment_id)
+            if request.state == "unknown":
+                # EXIT: the row lost a deletion race between the guard
+                # above and the ask; the identity answer is the same
+                # one every other door gives.
+                return JSONResponse(
+                    status_code=400, content={"error": "attachment_not_found"}
+                )
+            fresh = attachments.status(attachment_id)
+            if fresh is None:
+                return JSONResponse(
+                    status_code=400, content={"error": "attachment_not_found"}
+                )
+            return _attachment_wire_record(fresh)
         except AttachmentThreadGoneError:
             # EXIT: the thread was deleted between the check above and the
             # write; the attachment is gone, not the store broken.
@@ -3760,120 +4333,27 @@ def build_router(
             }
         }
 
+        # search-mode host T2: with a validated pick the resume INPUT is
+        # LangGraph's ``Command(resume=pick)``; without one it stays the
+        # crash-resume ``None`` (or, against a pending window, redraws
+        # the window frame).
+        resume_input: Any = Command(resume=pick) if pick is not None else None
+
         def event_stream() -> Iterator[str]:
             """Yield the resumed remainder on the SAME delta wire.
 
-            Drives ``graph.stream(None, ...)`` through the shared
-            ``_stream_run_frames`` engine, so the remainder's
-            thinking / answer deltas stream live with the same
-            per-chunk granularity as the send path (T2, #36) — not
-            one dump after the remainder finishes.
-
-            The dedup set is seeded with the pre-resume checkpoint's
-            message ids: the first ``values`` frame replays the
-            checkpointed messages (the crashed run's HumanMessage +
-            complete ``AIMessage``), and re-emitting their frames
-            would duplicate what the pre-crash stream already sent.
+            Delegates to :func:`_resume_run_stream` — the one resume
+            path shared with the T2f auto-resumer, so the two surfaces
+            cannot drift on persistence or terminal frames.
             """
-            seen_message_ids: set[str] = set()
-            if hasattr(graph, "checkpoint_message_ids"):
-                seen_message_ids |= graph.checkpoint_message_ids(thread_id)
-            # A resumed remainder is an in-flight run on this thread
-            # too, so Stop must reach it (the composer is disabled for
-            # its whole duration).
-            stop_token = run_control.begin(thread_id, run_id)
-            # search-mode host T2: with a validated pick the resume
-            # INPUT is LangGraph's ``Command(resume=pick)``; without
-            # one it stays the crash-resume ``None`` (or, against a
-            # pending window, redraws the window frame).
-            resume_input: Any = Command(resume=pick) if pick is not None else None
-            try:
-                outcome = yield from _stream_run_frames(
-                    graph,
-                    run_id=run_id,
-                    input_value=resume_input,
-                    config=resume_config,
-                    seen_message_ids=seen_message_ids,
-                    thread_id=thread_id,
-                    stop_token=stop_token,
-                )
-            finally:
-                run_control.end(stop_token)
-
-            if outcome.stopped:
-                # No row: the original send's row already tells the
-                # story, and one row per stopped Resume click would
-                # spam the turn table (same policy as this route's
-                # mid-flight refuse branch).
-                yield from _stopped_terminal_frames(
-                    run_id, thinking_ms=outcome.thinking_ms
-                )
-                return
-
-            if outcome.choice_window is not None:
-                # Re-draw (body-less resume onto a pending window) or
-                # an invalid pick that REOPENED the window: the frame
-                # is out, the run is still paused, so persist nothing
-                # and close — the operator picks again.
-                return
-
-            if outcome.final_state is None:
-                # Mid-flight raise on a RESUME: unlike the send path,
-                # persist nothing — when the original send row exists
-                # it already tells the story, and appending a refuse
-                # row per failed Resume click would spam the turn
-                # table. After process death with no send row, a resume
-                # that also raises still leaves history without a row
-                # (success-path resume below does load the checkpoint
-                # HumanMessage when final_state is present).
-                return
-            payload = _run_to_response_payload(outcome.final_state)
-            resume_question = (
-                graph.checkpoint_last_human_text(thread_id)
-                if hasattr(graph, "checkpoint_last_human_text")
-                else None
-            ) or ""
-            try:
-                store.append_run(
-                    RunRecord(
-                        id=run_id,
-                        thread_id=thread_id,
-                        question=resume_question,
-                        status=payload["status"],
-                        status_reason=payload["reason"],
-                        answer=payload["answer"],
-                        citations=payload["citations"],
-                        thinking_text=payload["thinking_text"],
-                        thinking_duration_ms=outcome.thinking_ms,
-                        tool_summaries=payload["tool_summaries"],
-                        assistant_message=payload["assistant_message"],
-                        track_decision=dict(payload.get("track_decision") or {}),
-                        comparisons=list(payload.get("comparisons") or []),
-                        analysis_results=list(
-                            payload.get("analysis_results") or []
-                        ),
-                        # SC8: the RESUMED remainder's locators. The
-                        # crashed prefix's row (when one exists) keeps
-                        # its own.
-                        evidence_locators=list(payload["evidence_locators"]),
-                    )
-                )
-            except ThreadNotFoundError:
-                yield _format_sse("status", {
-                    "run_id": run_id,
-                    "status": "refuse",
-                    "reason": "thread_not_found",
-                    "assistant_message": "Thread was deleted while the run was resuming.",
-                })
-                return
-            # Terminal frames per spec line 30 (shared emitter). The
-            # resume's thinking duration is the REMAINDER's, not the
-            # crashed prefix's (that time is unknowable post-crash).
-            yield from _terminal_sse_frames(
+            yield from _resume_run_stream(
+                graph,
+                store,
+                run_control=run_control,
+                thread_id=thread_id,
                 run_id=run_id,
-                payload=payload,
-                thinking_ms=outcome.thinking_ms,
-                answer_reset=outcome.answer_reset,
+                resume_input=resume_input,
+                resume_config=resume_config,
             )
 
         _register_dream_background(background, memory_port, thread_id)
@@ -4358,6 +4838,7 @@ def mount(
 
 
 __all__ = [
+    "AttachmentResumeWorkerStoppingError",
     "IngestWorkerStoppingError",
     "build_router",
     "default_attachment_service",
@@ -4365,6 +4846,10 @@ __all__ = [
     "get_ingest_service",
     "get_workspace_root",
     "mount",
+    "start_attachment_prep_worker",
+    "start_attachment_resume_worker",
     "start_ingest_worker",
+    "stop_attachment_prep_worker",
+    "stop_attachment_resume_worker",
     "stop_ingest_worker",
 ]

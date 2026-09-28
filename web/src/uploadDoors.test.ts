@@ -14,6 +14,10 @@
 // durable (status "uploaded") and starts NO preparation — the graph
 // turn does. The id stays referenceable for the WHOLE thread (no
 // single-use consumption), and a failed preparation is retryable.
+// T2f adds the wait half: a send that names an uploaded/parsing
+// record is accepted, the run suspends inside the graph, the chip and
+// the readiness poll carry the wait, and the run resumes itself — no
+// resend, no operator Resume prompt.
 // These tests live at the store/api seam because the web suite runs
 // in a node environment (no DOM) — the components are thin wrappers
 // over exactly these actions. Timers are faked for the whole file:
@@ -29,6 +33,7 @@ import {
   type SendRequest,
 } from "./api";
 import {
+  attachmentPreparationWait,
   attachmentsForSend,
   hasUploadInFlight,
   LAST_INGEST_JOB_KEY,
@@ -181,12 +186,49 @@ function sseRunResponse(): Response {
   });
 }
 
-function seedThread(): void {
+// The run id the host's ``attachment_wait`` frame mints for the
+// suspended run (host workspace_http: ``{"run_id", "kind",
+// "attachment_ids"}``, kind ``attachment_preparation``). The store
+// records it on the optimistic row so a reload reconciles against the
+// persisted record instead of duplicating the turn.
+const SUSPEND_RUN_ID = "22222222-2222-4222-8222-222222222222";
+
+/** SSE run the graph SUSPENDED on ``attachment_preparation`` (T2f):
+ * the exact ``attachment_wait`` frame arrives, then the stream closes
+ * with NO terminal status frame — the run waits on the durable job
+ * and auto-resumes. */
+function sseSuspendedResponse(): Response {
+  const frames = [
+    `event: attachment_wait\ndata: ${JSON.stringify({
+      run_id: SUSPEND_RUN_ID,
+      kind: "attachment_preparation",
+      attachment_ids: ["att-1"],
+    })}\n\n`,
+  ];
+  let next = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (next >= frames.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(new TextEncoder().encode(frames[next]));
+      next += 1;
+    },
+  });
+  return new Response(body, {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  });
+}
+
+function seedThread(detailOverrides: Partial<ThreadDetail> = {}): void {
   const thread: ThreadDetail = {
     id: THREAD_ID,
     title: "AAPL 10-Q",
     created_at: "2026-01-01T00:00:00.000Z",
     turns: [],
+    ...detailOverrides,
   };
   useWorkspaceStore.setState({
     activeThread: thread,
@@ -648,22 +690,32 @@ describe("two doors never cross (acceptance)", () => {
 });
 
 describe("send gate: what a send may reference", () => {
-  it("references only READY records, so an unrelated question is never refused", () => {
+  it("names READY plus the durable uploaded/parsing records the graph waits on", () => {
+    // T2f: a grounded send referencing a durable ``uploaded`` or
+    // ``parsing`` record is ACCEPTED — the run suspends inside the
+    // graph until preparation completes and resumes itself — so those
+    // states ride the message instead of being withheld.
     const selection = attachmentsForSend([
       { ...ATTACH_READY, attachment_id: "ready-1" },
       { ...ATTACH_UPLOADED, attachment_id: "uploaded-1" },
       { ...ATTACH_PARSING, attachment_id: "parsing-1" },
       { ...ATTACH_FAILED, attachment_id: "failed-1" },
     ]);
-    expect(selection.ids).toEqual(["ready-1"]);
-    // What was left out stays visible with its reason — the rule may never
-    // drop a record silently. An ``uploaded`` record is left out: its
-    // bytes are stored but nothing is parsed or indexed yet, so it is
-    // not citable.
+    expect(selection.ids).toEqual(["ready-1", "uploaded-1", "parsing-1"]);
+    // Only a record whose reference the host would refuse stays out —
+    // and it stays visible: the rule may never drop a record silently.
     expect(selection.withheld.map((a) => a.attachment_id)).toEqual([
-      "uploaded-1",
-      "parsing-1",
       "failed-1",
+    ]);
+  });
+
+  it("withholds a ready record the host does not report searchable", () => {
+    const selection = attachmentsForSend([
+      { ...ATTACH_READY, attachment_id: "ready-1", searchable: false },
+    ]);
+    expect(selection.ids).toEqual([]);
+    expect(selection.withheld.map((a) => a.attachment_id)).toEqual([
+      "ready-1",
     ]);
   });
 
@@ -696,7 +748,9 @@ describe("send gate: what a send may reference", () => {
     const request = JSON.parse(
       calls.find((c) => c.url.endsWith("/messages"))?.body as string,
     ) as SendRequest;
-    expect(request.attachment_ids).toEqual(["att-1"]);
+    // READY and the still-parsing one both ride; only the failed one
+    // is left off (and rendered as withheld).
+    expect(request.attachment_ids).toEqual(["att-1", "att-2"]);
   });
 });
 
@@ -826,7 +880,11 @@ describe("attachment lifecycle (ADR 0086)", () => {
     expect((rejection as AttachFailedError).code).toBe("attachment_not_found");
   });
 
-  it("a send that requires a still-parsing attachment surfaces the named refusal", async () => {
+  it("a pre-T2f host refusal of a parsing reference still surfaces the named error", async () => {
+    // T2f moved this outcome into the graph (the host now ACCEPTS the
+    // reference and waits), so 400 ``attachment_not_ready`` arrives
+    // only from an older peer. The client's typed mapping stays: a
+    // refusal on the wire must never read as a transport failure.
     seedThread();
     stubFetch((url) =>
       url.endsWith("/messages")
@@ -929,9 +987,11 @@ describe("attachment lifecycle (ADR 0086)", () => {
   });
 
   it("an uploaded upload starts no readiness poll", async () => {
-    // Preparation is requested by a graph turn, not by the browser, so
-    // an ``uploaded`` record will not change on its own. Polling it
-    // would spin forever.
+    // Preparation is requested by a graph turn, not by the browser,
+    // so an ``uploaded`` record NO RUN REFERENCES will not change on
+    // its own; polling it would spin forever. The T2f wait poll is
+    // started by the waiting send (or a load seeing the pending
+    // checkpoint), never by the upload itself.
     seedThread();
     let reads = 0;
     stubFetch((url) => {
@@ -954,6 +1014,8 @@ describe("attachment lifecycle (ADR 0086)", () => {
   });
 
   it("a list of only uploaded records does not keep the poll running", async () => {
+    // No pending checkpoint on this thread either: nothing references
+    // the upload, so the one seeding read is all the chain gets.
     seedThread();
     let reads = 0;
     stubFetch((url) => {
@@ -1001,6 +1063,268 @@ describe("attachment lifecycle (ADR 0086)", () => {
       parsing,
       uploaded,
     ]);
+  });
+});
+
+describe("preparation wait (T2f: graph job gate)", () => {
+  /** A thread detail as the GET reports it: pending-checkpoint flag
+   * plus the T2f ``pending_interrupt_kind`` that says WHAT the pause
+   * waits for. */
+  function checkpointDetail(
+    pending?: boolean,
+    kind?: string | null,
+  ): ThreadDetail {
+    return {
+      id: THREAD_ID,
+      title: "AAPL 10-Q",
+      created_at: "2026-01-01T00:00:00.000Z",
+      turns: [],
+      pending_checkpoint: pending,
+      pending_interrupt_kind: kind,
+    };
+  }
+
+  it("the wait signal keys off the server's interrupt kind, not the chip status", () => {
+    // The exact reload-path signal (review C4): the host names the
+    // pause, so no attachment-list reading is involved.
+    expect(
+      attachmentPreparationWait(
+        checkpointDetail(true, "attachment_preparation"),
+      ),
+    ).toBe(true);
+    // A choice window owns its resume through the operator's pick:
+    // the banner behavior is untouched.
+    expect(
+      attachmentPreparationWait(checkpointDetail(true, "choice_window")),
+    ).toBe(false);
+    // A plain crash checkpoint (kind null / absent): the banner stays.
+    expect(attachmentPreparationWait(checkpointDetail(true, null))).toBe(false);
+    expect(
+      attachmentPreparationWait(checkpointDetail(true, undefined)),
+    ).toBe(false);
+    // A kind without the pending flag cannot be a wait either — the
+    // kind only rides a genuinely paused thread.
+    expect(
+      attachmentPreparationWait(
+        checkpointDetail(false, "attachment_preparation"),
+      ),
+    ).toBe(false);
+    expect(
+      attachmentPreparationWait(
+        checkpointDetail(undefined, "attachment_preparation"),
+      ),
+    ).toBe(false);
+    expect(attachmentPreparationWait(null)).toBe(false);
+  });
+
+  it("a send the graph suspends keeps the turn live and follows the chip to ready", async () => {
+    seedThread();
+    useWorkspaceStore.setState({ attachments: [ATTACH_UPLOADED] });
+    let reads = 0;
+    stubFetch((url) => {
+      if (url.endsWith("/messages")) return sseSuspendedResponse();
+      if (url === LIST_URL) {
+        reads += 1;
+        // Tick 1: the durable job has marked the row parsing. Tick 2:
+        // it settled — the poll must stop here, not spin.
+        return jsonResponse({
+          attachments: [reads >= 2 ? ATTACH_READY : ATTACH_PARSING],
+        });
+      }
+      if (url === "/api/threads") return jsonResponse("[]");
+      return jsonResponse({}, 404);
+    });
+
+    await useWorkspaceStore
+      .getState()
+      .sendQuestion(
+        THREAD_ID,
+        "读附件",
+        true,
+        attachmentsForSend(useWorkspaceStore.getState().attachments).ids,
+      );
+
+    // No terminal frame arrived: the run is suspended in the graph,
+    // NOT done — the row stays live while the wait holds.
+    const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+    expect(turns).toHaveLength(1);
+    expect(turns[0].in_flight).toBe(true);
+    // The ``attachment_wait`` frame's server-minted run id is recorded
+    // on the row: after the auto-resume persists the run, a reload
+    // reconciles this row against THAT record instead of flashing a
+    // duplicate (review C4).
+    expect(turns[0].run_id).toBe(SUSPEND_RUN_ID);
+
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(useWorkspaceStore.getState().attachments[0].status).toBe("parsing");
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(useWorkspaceStore.getState().attachments[0].status).toBe("ready");
+    // Settled: the chain stopped on its own.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(reads).toBe(2);
+  });
+
+  it("a stream that ends with NO attachment_wait frame is not a wait", async () => {
+    // Review C4's false-positive fix: the old heuristic read ANY
+    // stream that ended without a terminal frame — a crash, a
+    // transport close — as a preparation wait whenever the send
+    // happened to name an uploaded/parsing record. Only the exact
+    // frame starts the wait now.
+    seedThread();
+    useWorkspaceStore.setState({ attachments: [ATTACH_UPLOADED] });
+    let reads = 0;
+    stubFetch((url) => {
+      if (url.endsWith("/messages")) {
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.close();
+          },
+        }), {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      }
+      if (url === LIST_URL) {
+        reads += 1;
+        return jsonResponse({ attachments: [ATTACH_UPLOADED] });
+      }
+      if (url === "/api/threads") return jsonResponse("[]");
+      return jsonResponse({}, 404);
+    });
+
+    await useWorkspaceStore
+      .getState()
+      .sendQuestion(THREAD_ID, "读附件", true, ["att-1"]);
+
+    const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+    expect(turns).toHaveLength(1);
+    // Without the frame the row is not live and no wait chain starts.
+    expect(turns[0].in_flight).toBe(false);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(reads).toBe(0);
+  });
+
+  it("a completed send that referenced an uploaded record starts no wait poll", async () => {
+    // The terminal status frame answers the run — the stream ending
+    // without one is the ONLY signal of the suspend, so a normal run
+    // over an uploaded reference must not open a poll either.
+    seedThread();
+    useWorkspaceStore.setState({ attachments: [ATTACH_UPLOADED] });
+    let reads = 0;
+    stubFetch((url) => {
+      if (url.endsWith("/messages")) return sseRunResponse();
+      if (url === LIST_URL) {
+        reads += 1;
+        return jsonResponse({ attachments: [ATTACH_UPLOADED] });
+      }
+      if (url === "/api/threads") return jsonResponse("[]");
+      return jsonResponse({}, 404);
+    });
+
+    await useWorkspaceStore
+      .getState()
+      .sendQuestion(
+        THREAD_ID,
+        "读附件",
+        true,
+        attachmentsForSend(useWorkspaceStore.getState().attachments).ids,
+      );
+
+    const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+    expect(turns[0].in_flight).toBe(false);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(reads).toBe(0);
+  });
+
+  it("opening a thread mid-wait hides the Resume prompt and follows the row through", async () => {
+    // GET reports the released lock plus pending nodes exactly like a
+    // crash; the named kind is what keeps the operator from being
+    // asked to press Resume for a preparation.
+    seedThread({
+      pending_checkpoint: true,
+      pending_interrupt_kind: "attachment_preparation",
+    });
+    let reads = 0;
+    stubFetch((url) => {
+      if (url === LIST_URL) {
+        reads += 1;
+        return jsonResponse({
+          attachments: [
+            reads >= 3
+              ? ATTACH_READY
+              : reads >= 2
+                ? ATTACH_PARSING
+                : ATTACH_UPLOADED,
+          ],
+        });
+      }
+      return jsonResponse({}, 404);
+    });
+
+    await useWorkspaceStore.getState().loadAttachments(THREAD_ID, 1000);
+
+    expect(useWorkspaceStore.getState().activeThread?.pending_checkpoint).toBe(
+      false,
+    );
+    // The uploaded row IS work in progress here: a run waits on it,
+    // so the chain follows uploaded → parsing → ready and stops.
+    expect(useWorkspaceStore.getState().attachments[0].status).toBe("uploaded");
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(useWorkspaceStore.getState().attachments[0].status).toBe("parsing");
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(useWorkspaceStore.getState().attachments[0].status).toBe("ready");
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(reads).toBe(3);
+  });
+
+  it("a pending checkpoint over only settled records keeps the Resume prompt", async () => {
+    // The crash case stays the crash case: nothing to prepare, so the
+    // flag the banner keys off is left exactly as the server said,
+    // and no chain starts.
+    seedThread({ pending_checkpoint: true });
+    let reads = 0;
+    stubFetch((url) => {
+      if (url === LIST_URL) {
+        reads += 1;
+        return jsonResponse({ attachments: [ATTACH_READY, ATTACH_FAILED] });
+      }
+      return jsonResponse({}, 404);
+    });
+
+    await useWorkspaceStore.getState().loadAttachments(THREAD_ID, 1000);
+
+    expect(useWorkspaceStore.getState().activeThread?.pending_checkpoint).toBe(
+      true,
+    );
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(reads).toBe(1);
+  });
+
+  it("a crash checkpoint with a stray uploaded record keeps the Resume prompt", async () => {
+    // Review C4's false-suppression fix: the old heuristic read ANY
+    // pending checkpoint plus an uploaded/parsing row as a preparation
+    // wait, so a genuine crash on a thread that happened to hold an
+    // unreferenced record lost its Resume prompt. The named kind says
+    // plainly that this pause is not a preparation wait — the flag
+    // stays exactly as the server said.
+    seedThread({ pending_checkpoint: true, pending_interrupt_kind: null });
+    let reads = 0;
+    stubFetch((url) => {
+      if (url === LIST_URL) {
+        reads += 1;
+        return jsonResponse({ attachments: [ATTACH_UPLOADED] });
+      }
+      return jsonResponse({}, 404);
+    });
+
+    await useWorkspaceStore.getState().loadAttachments(THREAD_ID, 1000);
+
+    expect(useWorkspaceStore.getState().activeThread?.pending_checkpoint).toBe(
+      true,
+    );
+    // An unreferenced upload is idle, not work in progress: no chain.
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(reads).toBe(1);
   });
 });
 

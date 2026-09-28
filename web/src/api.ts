@@ -265,7 +265,25 @@ export type SendEvent =
   // on this stream — the turn resumes on POST /resume with a pick.
   // Dispatch is by the payload's own ``kind`` (carried on the window)
   // so a future Fast-propose window (T4) rides the same frame.
-  | { type: "choice_window"; window: ChoiceWindow };
+  | { type: "choice_window"; window: ChoiceWindow }
+  // T2f graph job gate (review C4): the run suspended on the graph's
+  // ``attachment_preparation`` interrupt. NO terminal frames follow on
+  // this stream either, but unlike a choice window the wait needs no
+  // operator action — the durable prep job auto-resumes the SAME run,
+  // whose server-minted ``run_id`` the frame carries. Wire shape
+  // (host ``workspace_http`` stream): ``{run_id, kind, attachment_ids}``.
+  | {
+      type: "attachment_wait";
+      run_id: string;
+      kind: string;
+      attachment_ids: string[];
+    };
+
+/** The one interrupt kind the host's attachment wait rides — shared by
+ * the SSE ``attachment_wait`` frame and the GET detail's
+ * ``pending_interrupt_kind`` (mirrors
+ * ``fin.host.graph.ATTACHMENT_PREPARATION_INTERRUPT_KIND``). */
+export const ATTACHMENT_PREPARATION_KIND = "attachment_preparation";
 
 export class ConcurrentRunError extends Error {}
 export class IngestMissingError extends Error {}
@@ -328,11 +346,14 @@ async function threadConflictError(res: Response): Promise<Error> {
 export interface SendRequest {
   question: string;
   thinking?: boolean;
-  // ADR 0086: ids minted by the thread-attach
+  // ADR 0086 / T2f: ids minted by the thread-attach
   // door. They are referenceable for the whole thread lifetime, so a
-  // later send reuses the same ids; referencing one whose status is
-  // still "parsing" is refused pre-SSE with 400
-  // ``attachment_not_ready``. This is the attach door's only
+  // later send reuses the same ids. A reference to a durable
+  // ``uploaded``/``parsing`` record is ACCEPTED: the graph suspends
+  // the run on the attachment_preparation interrupt and resumes it
+  // automatically when the durable job settles. The pre-T2f 400
+  // ``attachment_not_ready`` refusal below is kept only for an older
+  // host. This is the attach door's only
   // downstream — the attach path must never touch /api/corpus/ingest.
   attachment_ids?: string[];
 }
@@ -363,9 +384,9 @@ export async function sendMessage(
   // different refusal from a held run and must not read as one.
   if (res.status === 409) throw await sendConflictError(res);
   if (res.status === 503) throw new IngestMissingError("ingest_missing");
-  // Attach door: a run that requires a still-parsing attachment
-  // is this one named pre-SSE refusal; every other 400 keeps the
-  // generic transport error below.
+  // Attach door: the pre-T2f refusal of a run that requires a
+  // still-parsing attachment is this one named pre-SSE refusal; every
+  // other 400 keeps the generic transport error below.
   if (
     res.status === 400 &&
     (await namedErrorCode(res.clone())) === "attachment_not_ready"
@@ -572,6 +593,34 @@ async function consumeSseStream(
           if (window !== null) onEvent?.({ type: "choice_window", window });
           break;
         }
+        case "attachment_wait": {
+          // T2f (review C4): the exact suspend signal. A frame whose
+          // run id or kind is missing/malformed is skipped like any
+          // other unreadable payload — a half-parsed wait would
+          // suppress the crash handling the row still needs. Nothing
+          // touches ``result``: no terminal frame follows while the
+          // run waits on the durable job.
+          const w = payload as {
+            run_id?: unknown;
+            kind?: unknown;
+            attachment_ids?: unknown;
+          };
+          if (
+            typeof w.run_id === "string" &&
+            w.run_id.length > 0 &&
+            w.kind === ATTACHMENT_PREPARATION_KIND
+          ) {
+            onEvent?.({
+              type: "attachment_wait",
+              run_id: w.run_id,
+              kind: ATTACHMENT_PREPARATION_KIND,
+              attachment_ids: Array.isArray(w.attachment_ids)
+                ? w.attachment_ids.map((id) => String(id))
+                : [],
+            });
+          }
+          break;
+        }
         case "answer": {
           const a = payload as { text: string; reset?: boolean };
           result.answerText = foldSendResultAnswer(
@@ -693,9 +742,11 @@ export class AttachFailedError extends Error {
   }
 }
 
-/** The send door refusing a run that requires a still-parsing
+/** A pre-T2f host refusing a run that requires a still-parsing
  * attachment (400 ``attachment_not_ready``, decided before any SSE
- * frame). Subclasses ``AttachFailedError`` so the composer renders it
+ * frame); a T2f host accepts the reference and waits inside the graph
+ * instead, so this arrives only from an older peer. Subclasses
+ * ``AttachFailedError`` so the composer renders it
  * through the attach door's own copy — the failure is about an
  * ATTACHMENT, not about the question. */
 export class AttachmentNotReadyError extends AttachFailedError {

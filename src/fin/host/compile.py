@@ -307,6 +307,7 @@ def compile_for_runtime(
     model_name: str | None = None,
     base_url: str | None = None,
     env: Mapping[str, str] | None = None,
+    attachment_service: Any | None = None,
 ) -> Any:
     """Build the durable v1 host graph for CLI / HTTP boot.
 
@@ -334,6 +335,16 @@ def compile_for_runtime(
         Mapping to read env-style keys from. Defaults to
         ``os.environ``. Tests inject a ``monkeypatch.setenv``
         shim by relying on ``os.environ`` directly.
+    attachment_service
+        Optional attachment preparation service for the T2f durable
+        graph gate: the HTTP composition root passes its service (or a
+        zero-arg resolver for it, so a boot that dies BEFORE compiling
+        never pays the construction) and the grounded route then gains
+        the preparation interrupt. ``None`` (the default, every CLI /
+        test caller today) compiles the graph without the gate. This
+        factory never builds a service of its own — no boot here pays
+        an attachment store or a database connection it did not ask
+        for.
 
     Returns
     -------
@@ -412,6 +423,15 @@ def compile_for_runtime(
     # to its own residual (track ``clarify``, or the 检索档 choice
     # window). One client serves both judges, so no second model seam is
     # threaded.
+    # T2f: a callable ``attachment_service`` is the composition root's
+    # resolver — invoked only now that the compile is actually reached,
+    # so a boot that dies above (missing URL, refused setup) never
+    # constructed the attachment store either.
+    resolved_attachment_service = (
+        attachment_service()
+        if callable(attachment_service)
+        else attachment_service
+    )
     compiled = compile_graph(
         checkpointer=saver,
         model=model,
@@ -424,6 +444,11 @@ def compile_for_runtime(
         # dev / scripted-e2e / eval lanes keep the factory default OFF
         # so their pre-T2 flows are untouched.
         enable_choice_window=True,
+        # T2f durable graph gate: the HTTP composition root injects the
+        # process's attachment service so the grounded route gains the
+        # preparation gate; ``None`` (every direct caller today) keeps
+        # the gate out of the graph entirely.
+        attachment_service=resolved_attachment_service,
     )
 
     # Step 6: keep the stack alive for process lifetime. We do

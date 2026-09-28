@@ -120,7 +120,17 @@ OVERALL: PASS
    - **Surface:** fin attachment capability, host graph/checkpoint, workspace attachment status, and the thread-private index boundary.
    - **Acceptance:** the durable job is keyed by attachment content version, invokes page parsing, vision, and indexing, and reports `ready` only when parsed units, required observations, and the thread-private index are usable. Pending graph work persists the `run_id` and wait state, releases the thread lock, then resumes that run automatically after completion or process restart without asking the operator to resend. Ineligible attachments do not trigger work; concurrent triggers/retries join one active job/version; tombstones prevent late publication. Empty/invalid/stale public attachment references, `attachment_upload_in_progress`, `attachment_page_limit_exceeded`, `attachment_vision_budget_exceeded`, duplicate concurrent starts, restart, and parser/provider/`attachment_index_unavailable`/storage exceptions produce the specified typed result, never an empty-success or stale `ready` state.
    - `[blocks: T2a, T2b, T2c, T2d, T2e]`
-   - Status: [ ] pending
+   - Status: [x] delivered — 2026-09-28, branch `worktree-t2f-graph-job-gate`
+     (content tip `618c039`; two review rounds: round 1 `GATE: BLOCKED` 1 High
+     repaired in `555fdab`, round 2 0 High with the typed-catch repair in
+     `a8f3c76`); per-clause evidence, the six live cross-process cases, and the
+     named environment limits in
+     [`docs/validation/2026-09-28-g4-t2f-graph-job-gate.md`](../docs/validation/2026-09-28-g4-t2f-graph-job-gate.md).
+     The live suite's two disclosed substitutions (scripted model transport,
+     extracted-tree evidence source) stand because this host has no provider
+     credential and no deployed iknow-memory; every gate, store, checkpoint,
+     drain, resumer, and byte-store leg is real. `uploaded` now has its
+     waiter: the gate is the transition nothing else owned since T2b.
 
 8. **T3 — Thread-bound retrieval and mixed source selection** — tag: `[implementation]`
    - **Inherits:** spec: "Ready attachments in the active thread and authorized company material are eligible by default"; naming one narrows the attachment branch while an explicit company request remains eligible.

@@ -169,7 +169,16 @@ def compile_for_http(
                         scripted_boot.compile_for_scripted_e2e()
                     )
                     return _http_graph_singleton
-                _http_graph_singleton = compile_for_runtime()
+                # T2f durable graph gate: the production boot wires the
+                # process's attachment service so the grounded route
+                # gains the preparation interrupt. The RESOLVER is
+                # passed, not the built service: construction waits
+                # until the compile actually happens, so a boot that
+                # raises on a missing URL or a patched factory never
+                # pays an attachment-store or database construction.
+                _http_graph_singleton = compile_for_runtime(
+                    attachment_service=default_attachment_service
+                )
             return _http_graph_singleton
     return compile_graph(
         checkpointer=checkpointer,
@@ -330,7 +339,11 @@ from fin.host.workspace_http import (  # noqa: E402
     default_attachment_service,
     get_workspace_root,
     mount as _mount_workspace_routes,
+    start_attachment_prep_worker,
+    start_attachment_resume_worker,
     start_ingest_worker,
+    stop_attachment_prep_worker,
+    stop_attachment_resume_worker,
     stop_ingest_worker,
 )
 
@@ -660,18 +673,35 @@ def serve() -> None:
     # gate share. A missing / unhealthy MCP is a WARNING (logged inside
     # ``publish_knowledge_mcp``) — never a boot failure.
     publish_knowledge_mcp()
-    compile_for_http()
+    graph = compile_for_http()
     # The durable ingest queue's execution side starts here, once per
     # process: the drain does a startup sweep (queued/failed/interrupted
     # jobs resume from durable state, no re-upload) and then re-checks
     # on a bounded interval. Lazy by construction — importing this
     # module for tests or ``--help`` never acquires the thread.
     start_ingest_worker()
+    # T2f durable graph gate, boot side: the prep drain runs the
+    # preparation jobs the graph gate queues, and the auto-resumer
+    # drives the runs those gates paused — its startup sweep is what
+    # resumes waiting runs after a restart without an operator resend.
+    # Same posture as the ingest drain above: singletons, daemon
+    # threads, started before binding, stopped in ``finally`` (in
+    # reverse: no new resume is driven once the prep drain is gone).
+    attachment_service = default_attachment_service()
+    start_attachment_prep_worker(attachment_service)
+    start_attachment_resume_worker(
+        graph=graph,
+        store=default_thread_store(),
+        service=attachment_service,
+        workspace_root=get_workspace_root(),
+    )
     import uvicorn
 
     try:
         uvicorn.run("fin.host.http:app", host="0.0.0.0", port=8000, log_level="info")
     finally:
+        stop_attachment_resume_worker()
+        stop_attachment_prep_worker()
         stop_ingest_worker()
 
 
