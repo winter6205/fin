@@ -339,14 +339,30 @@ def attachment_context_message(
     attachments are NOT citable corpus. The gate's real protection is
     structural, not prompt-level — attachment text never enters the
     ``evidence`` channel, so an attachment-only span cannot match.
+
+    G4 T3 (thread-attachment-source-read decision 7): the block header
+    also names the file's ``attachment_id`` next to its filename, because
+    the ``retrieve`` tool's ``attachment_ids`` argument accepts ids only —
+    a model that wants to search one specific attachment has to be able to
+    say which one it means, and the filename alone cannot name it
+    deterministically (two files can share a name; an id cannot).
     """
     if not attachments:
         return None
     sections = []
     for attachment in attachments:
         filename = str(attachment.get("filename") or "attachment")
+        attachment_id = str(attachment.get("attachment_id") or "")
         text = str(attachment.get("text") or "")
-        sections.append(f"--- attached file: {filename} ---\n{text}")
+        # The id rides in brackets AFTER the filename so the header's
+        # leading ``attached file: {filename}`` shape — which the
+        # preparation-gate suite reads back — stays intact. An
+        # attachment with no id keeps the old header rather than printing
+        # an empty name the model could not use.
+        label = filename
+        if attachment_id:
+            label = f"{filename} [attachment_id: {attachment_id}]"
+        sections.append(f"--- attached file: {label} ---\n{text}")
     joined = "\n\n".join(sections)
     return SystemMessage(
         content=(

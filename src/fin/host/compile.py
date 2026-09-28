@@ -344,7 +344,10 @@ def compile_for_runtime(
         test caller today) compiles the graph without the gate. This
         factory never builds a service of its own — no boot here pays
         an attachment store or a database connection it did not ask
-        for.
+        for. From T3 the same object is ALSO threaded to ``compile_graph``
+        as the ``retrieve`` tool's attachment search seam (it ships
+        ``search()`` next to the preparation methods), so one injected
+        service serves the preparation gate and the thread-scoped read.
 
     Returns
     -------
@@ -449,6 +452,14 @@ def compile_for_runtime(
         # preparation gate; ``None`` (every direct caller today) keeps
         # the gate out of the graph entirely.
         attachment_service=resolved_attachment_service,
+        # T3 (thread-attachment-source-read): the same service object is
+        # the retrieve tool's attachment search seam — it ships
+        # ``search()`` alongside the preparation methods, so the
+        # composition root threads ONE object into both graph seams
+        # rather than building a second capability. ``None`` (every
+        # caller today that does not inject a service) keeps the
+        # attachment branch out of the ``retrieve`` envelope entirely.
+        attachment_retriever=resolved_attachment_service,
     )
 
     # Step 6: keep the stack alive for process lifetime. We do

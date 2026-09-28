@@ -22,7 +22,7 @@ gate rules on it exactly as it rules on any other evidence.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, Final
 
 from fin.retrieve.degradation import (
     DEGRADATION_STAGE_RETRIEVE,
@@ -43,6 +43,10 @@ DEGRADATION_NOTICE_TOOL: str = "retrieve"
 # verbatim §B3 fields travel on the same envelope untouched, and the
 # renderer falls back to expanding them when this key is absent.
 DEGRADATION_NOTICE_FIELD: str = "degradation_notice"
+
+# The single wire name for "preparation failed with no stored reason",
+# shared by the gate exit and the search-surface fallback.
+ATTACHMENT_PREPARATION_FAILED: Final[str] = "attachment_preparation_failed"
 
 
 def degradation_notice_line(signal: DegradationSignal) -> str:
@@ -104,6 +108,7 @@ def consume_degradation(
 
 
 __all__ = [
+    "ATTACHMENT_PREPARATION_FAILED",
     "DEGRADATION_NOTICE_FIELD",
     "DEGRADATION_NOTICE_TOOL",
     "consume_degradation",

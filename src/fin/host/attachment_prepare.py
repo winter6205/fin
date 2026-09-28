@@ -81,6 +81,10 @@ from fin.host.attachment_observations import (
     ObservationEnvelope,
     observation_from_call_result,
 )
+from fin.host.attachment_retrieval import (
+    AttachmentChunk,
+    ThreadAttachmentRetriever,
+)
 from fin.host.attachment_store import (
     AttachmentRecord,
     AttachmentStatus,
@@ -1226,6 +1230,29 @@ class AttachmentPreparationService:
         if record is None or not record.version:
             return ()
         return self.store.units(attachment_id, record.version)
+
+    def search(
+        self,
+        *,
+        thread_id: str,
+        query: str,
+        attachment_ids: Sequence[str] | None = None,
+        limit: int | None = None,
+    ) -> tuple[AttachmentChunk, ...]:
+        """The attachment branch of the host ``retrieve`` tool.
+
+        Delegates :class:`fin.host.attachment_retrieval.
+        ThreadAttachmentRetriever` over this service's own store, so search
+        reads exactly the rows the preparation doors publish. ``thread_id``
+        arrives from the host-bound run config, never from a tool argument.
+        ``limit=None`` means the retriever's default (8).
+        """
+        return ThreadAttachmentRetriever(self.store).search(
+            thread_id=thread_id,
+            query=query,
+            attachment_ids=attachment_ids,
+            limit=limit,
+        )
 
     def resolve_for_turn(
         self, *, thread_id: str, attachment_id: str

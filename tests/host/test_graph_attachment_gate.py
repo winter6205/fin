@@ -33,7 +33,6 @@ pinned contract; only the gate's race-catch is type-pinned to
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Iterator
 
 from langchain_core.messages import AIMessage, BaseMessage
@@ -49,6 +48,7 @@ from fin.host.attachment_prepare import (
     AttachmentNotReadyError,
 )
 from fin.host.state import reset_input_state
+from attachment_fakes import FakeAttachmentService, _PrepOutcome
 
 KNOWN_IDS = {"AAPL-2022Q3", "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
@@ -64,82 +64,6 @@ EVIDENCE_TEXT = "Microsoft Corporation reported total revenue of 52,857 million 
 QUOTED_ANSWER = f"Per the filing: {EVIDENCE_TEXT[:40]}"
 
 _ANSWER = AIMessage(content=QUOTED_ANSWER)
-
-
-@dataclass
-class _PrepOutcome:
-    """The pinned ``PreparationRequest`` surface: state / code / version."""
-
-    state: str
-    code: str | None = None
-    version: int = 1
-
-
-@dataclass
-class _Resolved:
-    """The pinned ``ResolvedAttachment`` shape used for text hydration."""
-
-    attachment_id: str
-    filename: str
-    text: str
-
-
-class FakeAttachmentService:
-    """Scripted per-attachment preparation states, no attachment-module import.
-
-    ``script`` maps an attachment id to a list of scripted outcomes
-    (``(state, code)`` tuples or bare state strings). Each
-    ``request_preparation`` call pops the first outcome; once exhausted
-    the LAST outcome repeats forever (mirrors ``ScriptedChatModel``
-    replay semantics, so a node replay on resume never runs the test off
-    the end of the script).
-
-    ``resolve_errors`` optionally scripts a per-attachment list of
-    exception classes (name-shaped stand-ins for the service's typed
-    not-ready pair). Each ``resolve_for_turn`` call pops the first
-    error and raises it; once the list is exhausted the call resolves
-    normally — the same ask-and-wait recovery the durable job provides.
-    """
-
-    def __init__(
-        self,
-        script: dict[str, list[Any]],
-        *,
-        texts: dict[str, str] | None = None,
-        filenames: dict[str, str] | None = None,
-        resolve_errors: dict[str, list[type[Exception]]] | None = None,
-    ) -> None:
-        self._script = {aid: list(steps) for aid, steps in script.items()}
-        self._texts = texts or {}
-        self._filenames = filenames or {}
-        self._resolve_errors = {
-            aid: list(errors) for aid, errors in (resolve_errors or {}).items()
-        }
-        self.prep_calls: list[tuple[str, str]] = []
-        self.resolve_calls: list[tuple[str, str]] = []
-
-    def request_preparation(self, thread_id: str, attachment_id: str) -> _PrepOutcome:
-        self.prep_calls.append((thread_id, attachment_id))
-        steps = self._script[attachment_id]
-        step = steps[0] if len(steps) == 1 else steps.pop(0)
-        if isinstance(step, str):
-            return _PrepOutcome(state=step)
-        state, code = step
-        return _PrepOutcome(state=state, code=code)
-
-    def resolve_for_turn(self, *, thread_id: str, attachment_id: str) -> _Resolved:
-        self.resolve_calls.append((thread_id, attachment_id))
-        errors = self._resolve_errors.get(attachment_id)
-        if errors:
-            # Errors are consumed, not repeated: each entry fails one
-            # attempt, and once drained the row resolves (the durable
-            # job's repair shape).
-            raise errors.pop(0)(attachment_id)
-        return _Resolved(
-            attachment_id=attachment_id,
-            filename=self._filenames.get(attachment_id, "doc.pdf"),
-            text=self._texts.get(attachment_id, ""),
-        )
 
 
 class RecordingScriptedChatModel(ScriptedChatModel):
