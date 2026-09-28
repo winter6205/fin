@@ -158,7 +158,17 @@ OVERALL: PASS
    - **Acceptance:** direct company and thread-owned attachment locators return bounded contiguous slices with advancing `next_position`; concatenating slices reproduces source text including supplementary-plane characters. Cross-thread and stale attachment locators reveal no text; malformed/oversized backend results yield `source_backend_contract_error`, transport faults yield `source_unavailable`, and invalid positions/locators are typed. Only returned text enters this-run evidence. No model-facing arbitrary path read is introduced.
    - `[blocks: T1, iknow-memory bounded-source-read T1]`
    - `[parallel]` with T3 after T2f and iknow-memory bounded-source-read T1
-   - Status: [ ] pending
+   - Status: [x] delivered — 2026-09-28, branch `worktree-t4-bounded-source-read`
+     (content tip `740e3c8`, incl. the merge of T3 #316 with both read and
+     retrieve seams kept; one review round: `GATE: BLOCKED` 1 High —
+     measured-vs-emitted serializer divergence on the 32 KiB bound — repaired
+     in `7c2d441` with fail-before-fix evidence); per-clause evidence, the
+     merge gates from issue #319, the six
+     real-MCP cases against the delivered bounded wire, and the named
+     environment limits in
+     [`docs/validation/2026-09-28-g4-t4-bounded-source-read.md`](../docs/validation/2026-09-28-g4-t4-bounded-source-read.md).
+     `read_file` and the generic `page` DTO deliberately remain; T5 owns their
+     removal.
 
 10. **T5 — Unit citations and legacy contract removal** — tag: `[implementation]`
    - **Inherits:** spec: "all generic `page` locator and citation fields become `unit` across the active product path"; only returned text supports a citation, and adjacent slices join only without an unseen gap. No old `page` compatibility layer.

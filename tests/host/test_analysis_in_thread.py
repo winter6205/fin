@@ -73,7 +73,14 @@ def test_compile_graph_registers_t6_analysis_tools() -> None:
     )
 
     names = [getattr(tool, "name", "") for tool in model.bound_tools]
-    assert names[-3:] == ["redline", "extract_tables", "three_year_statement"]
+    # read_source is bound last (ADR 0087) until T5 removes read_file;
+    # the analysis trio keeps its relative order ahead of it.
+    assert names[-4:] == [
+        "redline",
+        "extract_tables",
+        "three_year_statement",
+        "read_source",
+    ]
 
 
 def test_redline_tool_result_lands_on_graph_state() -> None:

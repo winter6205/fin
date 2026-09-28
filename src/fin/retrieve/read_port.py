@@ -36,6 +36,11 @@ Adapters that also implement retrieve carry ``read`` on themselves:
   dict for anything else — it NEVER falls back to the local extracted
   tree, which would reintroduce exactly the second SSOT ADR 0047
   removes.
+* ``MCPRetrieveAdapter.read_slice`` / ``FakeRetrievePort.read_slice`` —
+  the bounded ``read_source`` legs (ADR 0088, spec
+  ``thread-attachment-source-read``): one frozen unit, one slice. Both
+  resolve their locator with :func:`validate_company_source_ref`, the
+  one place the company triple's shape and size are judged.
 """
 
 from __future__ import annotations
@@ -45,6 +50,13 @@ from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from fin.corpus.errors import IngestMissingError
 from fin.corpus.extracted import ExtractedPage, load_extracted_tree
+from fin.corpus.parsers._common import UnitLocator
+from fin.corpus.push import serialize_source_ref
+from fin.retrieve.source_read import (
+    INVALID_LOCATOR,
+    SOURCE_READ_MAX_LOCATOR_CODE_POINTS,
+    source_error,
+)
 
 
 # Named failure the product MCP read returns while the retrieve backend
@@ -69,6 +81,69 @@ def clamp_page_limit(page_limit: int) -> int:
     enforces the upper bound.
     """
     return min(page_limit, PAGE_LIMIT_CAP)
+
+
+# The closed key set of a company locator triple (ADR 0088): an extra
+# ``kind`` / ``page`` / path key would let the same frozen unit acquire
+# a second identity, so the shape is checked against the set, not
+# against a subset.
+_COMPANY_LOCATOR_KEYS = frozenset({"document_id", "version", "unit"})
+
+
+def validate_company_source_ref(
+    source_ref: Any,
+) -> tuple[str, str, int] | dict[str, Any]:
+    """Resolve one company triple, or name why it is not one.
+
+    The company locator is exactly ``{document_id, version, unit}`` with
+    non-empty string ``document_id`` / ``version`` and a one-based
+    integer ``unit`` — the same field rules
+    :func:`fin.corpus.push.deserialize_source_ref` applies to the wire
+    string, so fin never accepts a ref it could not send.
+
+    Returns ``(document_id, version, unit)`` on success, otherwise the
+    typed ``invalid_locator`` failure (a malformed shape or a canonical
+    serialization over :data:`SOURCE_READ_MAX_LOCATOR_CODE_POINTS`,
+    whose ``reason`` reuses the backend's own
+    ``request_locator_oversized`` token so one oversized identity has
+    one name on both legs). Whether the triple addresses a unit that
+    exists is the caller's lookup, and answers ``unknown_locator``.
+
+    Never raises.
+    """
+    if not isinstance(source_ref, Mapping):
+        # EXIT: anything that is not a record (a bare serialized string,
+        # a list, None) carries no typed identity to resolve.
+        return source_error(INVALID_LOCATOR, reason="locator_not_a_record")
+    if frozenset(source_ref) != _COMPANY_LOCATOR_KEYS:
+        return source_error(INVALID_LOCATOR, reason="locator_keys_malformed")
+
+    document_id = source_ref["document_id"]
+    version = source_ref["version"]
+    unit = source_ref["unit"]
+    if (
+        not isinstance(document_id, str)
+        or not document_id
+        or not isinstance(version, str)
+        or not version
+        # ``bool`` is an ``int`` subclass: ``True`` is a malformed
+        # ordinal, never a spelling of unit 1.
+        or isinstance(unit, bool)
+        or not isinstance(unit, int)
+        or unit < 1
+    ):
+        return source_error(INVALID_LOCATOR, reason="locator_fields_malformed")
+
+    if (
+        len(serialize_source_ref(UnitLocator(document_id, version, unit)))
+        > SOURCE_READ_MAX_LOCATOR_CODE_POINTS
+    ):
+        # EXIT: an identity this long leaves the bounded result no room
+        # for any text, so it is refused before a round trip rather than
+        # answered with a shrunken or oversized slice.
+        return source_error(INVALID_LOCATOR, reason="request_locator_oversized")
+    return document_id, version, unit
+
 
 
 @runtime_checkable
@@ -223,4 +298,5 @@ __all__ = [
     "ReadPort",
     "clamp_page_limit",
     "read_from_pages",
+    "validate_company_source_ref",
 ]

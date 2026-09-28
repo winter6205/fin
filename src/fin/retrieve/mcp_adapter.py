@@ -70,6 +70,20 @@ Error contract
 * The adapter NEVER falls back to BM25 on MCP failure (ADR
   0030 / error-handling-enforcer).
 
+Bounded source read
+-------------------
+
+``read_slice`` is the company leg of the shared ``read_source`` contract
+(:mod:`fin.retrieve.source_read`, ADR 0087 / ADR 0088): one round trip
+resolves one frozen unit at a code-point ``position``, passes through the
+backend's slice with the request's own typed ``source_ref``, and answers
+a malformed, non-advancing, or oversized wire with
+``source_backend_contract_error`` and a transport failure with
+``source_unavailable`` — always a typed dict, never an exception, never
+text on a failure. ``read`` keeps the legacy whole-body walk over the
+same bounded wire (it follows ``next_position`` until null) until the
+generic ``page`` contract is removed.
+
 Concurrency
 -----------
 
@@ -125,7 +139,19 @@ from fin.retrieve.port import (
     TierUnavailableError,
     resolve_search_mode,
 )
-from fin.retrieve.read_port import clamp_page_limit
+from fin.retrieve.read_port import clamp_page_limit, validate_company_source_ref
+from fin.retrieve.source_read import (
+    INVALID_LOCATOR,
+    INVALID_POSITION,
+    SOURCE_BACKEND_CONTRACT_ERROR,
+    SOURCE_READ_MAX_RESULT_BYTES,
+    SOURCE_READ_MAX_TEXT_CODE_POINTS,
+    SOURCE_UNAVAILABLE,
+    UNKNOWN_LOCATOR,
+    position_error,
+    serialized_result_bytes,
+    source_error,
+)
 from fin.retrieve.tiers import COMMUNITY_SUMMARY_INDEX_FAILURE
 
 
@@ -134,6 +160,13 @@ _LIMIT_CAP = 20
 _MCP_PROTOCOL_VERSION = "2025-06-18"
 _INITIALIZE_REQUEST_ID = 1
 _TOOL_REQUEST_ID = 2
+
+# The legacy full-body walk (``read`` / ``read_file``) follows
+# ``next_position`` until null. A unit needs at most
+# ``ceil(unit_length / 8000)`` slices, so a walk that outlives this many
+# answers is a backend that is not advancing and must be stopped rather
+# than hammered. T5 removes this path with the ``page`` contract.
+_MAX_SLICES_PER_UNIT = 1000
 
 logger = logging.getLogger(__name__)
 
@@ -727,6 +760,84 @@ class MCPRetrieveAdapter:
             "page_count": len(locators),
         }
 
+    def read_slice(
+        self,
+        source_ref: Mapping[str, Any],
+        position: int = 0,
+    ) -> dict[str, Any]:
+        """Read one bounded slice of one company frozen unit.
+
+        The company leg of :class:`fin.retrieve.source_read.SourceReader`
+        (ADR 0087 / ADR 0088): exactly one ``read_source`` round trip
+        resolves the locator's unit at ``position`` and answers
+        ``{source_ref, text, next_position}`` — the request's own typed
+        ``source_ref`` echoed back, never the backend's serialization —
+        or one typed failure dict. It never raises at the model and
+        never carries text on a failure.
+        """
+        located = validate_company_source_ref(source_ref)
+        if not isinstance(located, tuple):
+            # EXIT: a malformed or oversized identity is a shape failure
+            # fin can name without asking the backend anything.
+            return located
+        document_id, version, unit = located
+        if (
+            self._known_doc_ids is not None
+            and document_id not in self._known_doc_ids
+        ):
+            # EXIT: the adapter's known set is the set ingested on MCP,
+            # so a document outside it is the named miss with no round
+            # trip — the same short-circuit ``retrieve`` applies.
+            return source_error(UNKNOWN_LOCATOR)
+        bad_position = position_error(position)
+        if bad_position is not None:
+            # EXIT: a cursor fin cannot express on the wire is invalid
+            # input named here; a beyond-end position stays the
+            # backend's judgment because only it knows the unit length.
+            return bad_position
+
+        try:
+            response = self._call_read_source(
+                {
+                    "source_ref": serialize_source_ref(
+                        UnitLocator(document_id, version, unit)
+                    ),
+                    "position": position,
+                }
+            )
+        except (
+            RetrieveUnavailableError,
+            OSError,
+            asyncio.TimeoutError,
+            TimeoutError,
+        ) as exc:
+            # EXIT: the machine could not answer at all. Named as an
+            # outage — not as a locator that does not exist, and with no
+            # text to leak.
+            logger.debug("read_source transport failed: %s", exc)
+            return source_error(SOURCE_UNAVAILABLE)
+        return _slice_of_read_response(response, source_ref, position)
+
+    def _call_read_source(self, arguments: Mapping[str, Any]) -> Any:
+        """One ``read_source`` tools/call round trip for the read legs.
+
+        Raises :class:`RetrieveUnavailableError` for a transport failure;
+        the caller decides whether that names an outage (``read_slice``)
+        or propagates (the legacy ``read`` miss contract).
+        """
+        payload = {
+            "jsonrpc": "2.0",
+            "id": _TOOL_REQUEST_ID,
+            "method": "tools/call",
+            "params": {"name": "read_source", "arguments": dict(arguments)},
+        }
+        try:
+            return asyncio.run(self._call_mcp(payload))
+        except (OSError, asyncio.TimeoutError, TimeoutError) as exc:
+            raise RetrieveUnavailableError(
+                f"MCP transport failed: {exc!r}"
+            ) from exc
+
     def _read_locators(
         self,
         document_id: str,
@@ -774,44 +885,59 @@ class MCPRetrieveAdapter:
         version: str,
         unit: int,
     ) -> str | None:
-        """Fetch one unit's body via MCP ``read_source``.
+        """Fetch one unit's whole body by following the bounded cursor.
+
+        The backend caps every ``read_source`` answer, so the full unit
+        arrives in slices: ask again at ``next_position`` until the
+        cursor is null and concatenate. A server that predates the
+        bounded wire answers the whole unit with no cursor and so needs
+        exactly one call — the shape the pre-T4 ``read`` contract was
+        pinned on.
 
         Returns the body string, or ``None`` for every miss shape the
         ``read`` contract folds into ``unknown_locator``: a transport
         answer that is not a success dict, a result without a
-        ``content`` block, and the decoder's named
-        ``read_source_*`` miss sentinel. Transport-level failures
-        (spawn / timeout) still raise :class:`RetrieveUnavailableError`
-        — the machine answering "I cannot read" is a different failure
-        from the locator not being there.
+        ``content`` block, the decoder's named ``read_source_*`` miss
+        sentinel, a cursor that does not advance, and a walk that outlives
+        :data:`_MAX_SLICES_PER_UNIT`. Transport-level failures (spawn /
+        timeout) still raise :class:`RetrieveUnavailableError` — the
+        machine answering "I cannot read" is a different failure from the
+        locator not being there.
         """
         source_ref = serialize_source_ref(
             UnitLocator(document_id, version, unit)
         )
-        payload = {
-            "jsonrpc": "2.0",
-            "id": _TOOL_REQUEST_ID,
-            "method": "tools/call",
-            "params": {
-                "name": "read_source",
-                "arguments": {"source_ref": source_ref},
-            },
-        }
-        try:
-            response = asyncio.run(self._call_mcp(payload))
-        except (OSError, asyncio.TimeoutError, TimeoutError) as exc:
-            raise RetrieveUnavailableError(
-                f"MCP transport failed: {exc!r}"
-            ) from exc
-        if not isinstance(response, dict) or "error" in response:
-            return None
-        result = response.get("result")
-        if not isinstance(result, dict) or "content" not in result:
-            return None
-        body = _read_body_of_content(result)
-        if body is _READ_MISS_SENTINEL:
-            return None
-        return body
+        arguments: dict[str, Any] = {"source_ref": source_ref}
+        parts: list[str] = []
+        position = 0
+        for _ in range(_MAX_SLICES_PER_UNIT):
+            response = self._call_read_source(arguments)
+            if not isinstance(response, dict) or "error" in response:
+                # EXIT: a non-success answer to a body walk is folded to
+                # the miss — this path has no typed codes to report.
+                return None
+            result = response.get("result")
+            if not isinstance(result, dict) or "content" not in result:
+                return None
+            body = _read_body_of_content(result)
+            if body is _READ_MISS_SENTINEL:
+                return None
+            parts.append(body)
+            next_position = _read_next_position_of_content(result)
+            if next_position is None:
+                return "".join(parts)
+            if next_position <= position:
+                # EXIT: a non-advancing cursor cannot complete a body;
+                # stopping beats an infinite fetch loop.
+                return None
+            position = next_position
+            # The first request rides the historical one-key shape (the
+            # backend defaults position to zero); only a continuation has
+            # a cursor to name.
+            arguments = {"source_ref": source_ref, "position": position}
+        # EXIT: the walk exceeded the defensive bound, so the backend is
+        # not terminating; report the miss rather than a partial body.
+        return None
 
     async def aretrieve(
         self,
@@ -1141,9 +1267,12 @@ def _read_body_of_content(result: Mapping[str, Any]) -> Any:
     The real iknow-memory ``read_source`` tool writes the canonical MCP
     tools/call shape — ``{isError?, content: [{type: "text", text: "..."}]}``
     — and the inner ``text`` carries the business envelope
-    ``{id, source_ref, content}`` on success or
+    ``{id, source_ref, content, next_position}`` on success or
     ``{error: "read_source_not_found" | "read_source_invalidated", ...}``
-    on the named miss.
+    on the named miss. ``content`` is one bounded SLICE of the unit, not
+    the whole body, and ``next_position`` is the cursor the caller
+    (:meth:`MCPRetrieveAdapter._fetch_unit_body`) follows; this decoder
+    reads the body only and never the cursor.
 
     This decoder returns the body string when the wire is a success,
     or :data:`_READ_MISS_SENTINEL` when the wire carries the named
@@ -1192,3 +1321,199 @@ def _read_body_of_content(result: Mapping[str, Any]) -> Any:
     if not parts:
         return _READ_MISS_SENTINEL
     return "\n\n".join(parts)
+
+
+def _read_next_position_of_content(result: Mapping[str, Any]) -> int | None:
+    """The continuation cursor of one slice, for the legacy body walk.
+
+    Deliberately tolerant: a server whose envelope predates the bounded
+    wire answers a whole unit with no cursor, and "no cursor" then means
+    "the body arrived complete" — one call, nothing to follow. The
+    strict shape checks belong to :meth:`MCPRetrieveAdapter.read_slice`,
+    which has typed codes to report.
+    """
+    content = result.get("content")
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if not isinstance(block, Mapping) or block.get("type") != "text":
+            continue
+        text = block.get("text")
+        if not isinstance(text, str):
+            return None
+        try:
+            inner = json.loads(text)
+        except ValueError:
+            return None
+        if isinstance(inner, Mapping):
+            next_position = inner.get("next_position")
+            if (
+                isinstance(next_position, int)
+                and not isinstance(next_position, bool)
+            ):
+                return next_position
+        return None
+    return None
+
+
+# ----- bounded read_source slice decoding (read_slice) -----
+
+
+_READ_WIRE_INVALID = object()
+
+
+def _read_slice_envelope_of_result(result: Any) -> Any:
+    """The inner business envelope of one ``read_source`` result.
+
+    Strict where the legacy body decoder is lenient: the bounded wire
+    has exactly one shape (a text block whose JSON is the envelope), and
+    a flat string or undecodable block is a wire breach the caller must
+    name rather than salvage into a body.
+    """
+    if not isinstance(result, Mapping) or "content" not in result:
+        return _READ_WIRE_INVALID
+    content = result["content"]
+    if not isinstance(content, list) or not content:
+        return _READ_WIRE_INVALID
+    for block in content:
+        if not isinstance(block, Mapping) or block.get("type") != "text":
+            continue
+        text = block.get("text")
+        if not isinstance(text, str):
+            return _READ_WIRE_INVALID
+        try:
+            inner = json.loads(text)
+        except ValueError:
+            return _READ_WIRE_INVALID
+        return inner if isinstance(inner, Mapping) else _READ_WIRE_INVALID
+    return _READ_WIRE_INVALID
+
+
+# The closed map of the iknow-memory ``read_source`` refusal codes onto
+# fin's typed read failures (spec thread-attachment-source-read SC9).
+_BACKEND_SLICE_ERRORS: dict[str, str] = {
+    "read_source_not_found": UNKNOWN_LOCATOR,
+    "read_source_invalidated": UNKNOWN_LOCATOR,
+    "read_source_invalid_position": INVALID_POSITION,
+    "read_source_invalid_locator": INVALID_LOCATOR,
+    "read_source_unavailable": SOURCE_UNAVAILABLE,
+}
+
+
+def _slice_error_of_backend_body(
+    code: str, body: Mapping[str, Any], position: int
+) -> dict[str, Any]:
+    """Map one named backend refusal onto fin's typed read failure.
+
+    "Row missing" (``read_source_not_found``) and "validity window
+    closed" (``read_source_invalidated``) are one answer for the model —
+    a locator it cannot read — so ``valid_until`` stays on the backend
+    rather than inviting a retry it cannot act on.
+    """
+    fin_code = _BACKEND_SLICE_ERRORS.get(code)
+    if fin_code is None:
+        # EXIT: an unrecognized code is a wire fin was not taught to
+        # read; folding it into a known miss would hide the drift.
+        return source_error(
+            SOURCE_BACKEND_CONTRACT_ERROR, reason="unrecognized_backend_code"
+        )
+    if fin_code == INVALID_POSITION:
+        # The backend knows the unit length, fin does not: echo the
+        # requested cursor and carry ``code_points`` when it reported one.
+        fields: dict[str, Any] = {"position": position}
+        code_points = body.get("code_points")
+        if isinstance(code_points, int) and not isinstance(code_points, bool):
+            fields["code_points"] = code_points
+        return source_error(INVALID_POSITION, **fields)
+    if fin_code == INVALID_LOCATOR:
+        reason = body.get("reason")
+        # A reason passes through only as the plain token the backend
+        # names it with; anything else keeps the bare code so the failure
+        # shape cannot vary with backend prose.
+        return (
+            source_error(INVALID_LOCATOR, reason=reason)
+            if isinstance(reason, str)
+            else source_error(INVALID_LOCATOR)
+        )
+    # EXIT: the miss and the outage answers carry no text.
+    return source_error(fin_code)
+
+
+def _slice_of_read_response(
+    response: Any, source_ref: Mapping[str, Any], position: int
+) -> dict[str, Any]:
+    """Decode one ``read_source`` response into a slice or a typed failure.
+
+    A success envelope must carry ``content`` as a string, a
+    ``next_position`` that is ``None`` or a strictly advancing integer,
+    and a complete serialized result inside the shared byte cap; any
+    deviation is the backend breaking its own promise, which fin names
+    ``source_backend_contract_error`` rather than pass through.
+    """
+    if not isinstance(response, dict):
+        # EXIT: a non-object answer carries nothing to read at all.
+        return source_error(
+            SOURCE_BACKEND_CONTRACT_ERROR, reason="response_not_an_object"
+        )
+    if "error" in response:
+        # EXIT: a JSON-RPC level error is the machine refusing to answer,
+        # an outage shape, not a locator shape.
+        return source_error(SOURCE_UNAVAILABLE)
+    envelope = _read_slice_envelope_of_result(response.get("result"))
+    if envelope is _READ_WIRE_INVALID:
+        # EXIT: not a JSON text block fin could even attempt to read.
+        return source_error(
+            SOURCE_BACKEND_CONTRACT_ERROR, reason="envelope_undecodable"
+        )
+    named = _named_error_code_of_body(envelope)
+    if named is not None:
+        # EXIT: a named backend refusal maps to its own typed failure.
+        return _slice_error_of_backend_body(named, envelope, position)
+
+    content = envelope.get("content")
+    if not isinstance(content, str):
+        # EXIT: an unrecognised body with no known error code.
+        return source_error(
+            SOURCE_BACKEND_CONTRACT_ERROR, reason="content_not_text"
+        )
+    if len(content) > SOURCE_READ_MAX_TEXT_CODE_POINTS:
+        # EXIT: the backend promised a bounded chunk and broke that
+        # promise; handing it over would move the cap to the model.
+        return source_error(
+            SOURCE_BACKEND_CONTRACT_ERROR, reason="content_over_code_point_cap"
+        )
+    if "next_position" not in envelope:
+        # EXIT: without a cursor a consumer cannot tell a complete read
+        # from a truncated one, so the bound is unverifiable.
+        return source_error(
+            SOURCE_BACKEND_CONTRACT_ERROR, reason="next_position_absent"
+        )
+    next_position = envelope["next_position"]
+    if next_position is not None and (
+        not isinstance(next_position, int) or isinstance(next_position, bool)
+    ):
+        return source_error(
+            SOURCE_BACKEND_CONTRACT_ERROR, reason="next_position_not_an_integer"
+        )
+    if next_position is not None and next_position <= position:
+        # EXIT: ``== position`` is a contract error per the spec: a
+        # non-advancing cursor can never terminate a walk.
+        return source_error(
+            SOURCE_BACKEND_CONTRACT_ERROR, reason="non_advancing_cursor"
+        )
+
+    result: dict[str, Any] = {
+        # The request identity is echoed, never the serialised string: a
+        # consumer must not re-derive which unit the text came from.
+        "source_ref": dict(source_ref),
+        "text": content,
+        "next_position": next_position,
+    }
+    if serialized_result_bytes(result) > SOURCE_READ_MAX_RESULT_BYTES:
+        # EXIT: text that fits its own cap but not the complete
+        # envelope's byte cap is still a broken backend promise.
+        return source_error(
+            SOURCE_BACKEND_CONTRACT_ERROR, reason="result_over_byte_cap"
+        )
+    return result
+

@@ -46,7 +46,12 @@ from fin.retrieve.port import (
     RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY,
     RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY,
 )
-from fin.retrieve.read_port import read_from_pages
+from fin.retrieve.read_port import read_from_pages, validate_company_source_ref
+from fin.retrieve.source_read import (
+    UNKNOWN_LOCATOR,
+    bounded_slice,
+    source_error,
+)
 
 
 _DEFAULT_LIMIT = 8
@@ -91,12 +96,14 @@ class FakeRetrievePort:
     pages_by_doc
         Optional ``{document_id: ExtractedPage pages}`` read
         manifest (ADR 0046 / ADR 0047): the fake answers
-        ``read()`` (the ``read_file`` body fetch) from this
-        table, so a scripted serve test can provide readable
+        ``read()`` (the ``read_file`` body fetch) and
+        ``read_slice()`` (the bounded ``read_source`` leg, ADR 0088)
+        from this table, so a scripted serve test can provide readable
         bodies without any on-disk extracted tree. Omitted (the
         default), the fake corpus has no readable objects and
         every ``read()`` is the typed
-        ``{"error": "unknown_locator"}`` miss.
+        ``{"error": "unknown_locator"}`` miss and every
+        ``read_slice()`` the typed ``unknown_locator`` failure.
     input_validation_ledger
         Optional「输入校验失败」count (T21). Omitted, the port
         keeps an in-memory one — quiet, never blind.
@@ -355,6 +362,39 @@ class FakeRetrievePort:
         return read_from_pages(
             self._pages_by_doc, document_id, version, page, page_limit
         )
+
+    def read_slice(
+        self,
+        source_ref: Mapping[str, Any],
+        position: int = 0,
+    ) -> dict[str, Any]:
+        """Answer one bounded ``read_source`` slice from ``pages_by_doc``.
+
+        The fake company leg (ADR 0088, spec thread-attachment-source-read
+        SC7/SC8/SC9): the hermetic stand-in for
+        :meth:`MCPRetrieveAdapter.read_slice`, resolving one frozen unit
+        from the same manifest and slicing it through the shared
+        :func:`fin.retrieve.source_read.bounded_slice`, so a test drives
+        the identical 8,000-code-point / 32-KiB bounds and the identical
+        error codes without any MCP server. Locator shape failures are
+        the shared ``invalid_locator`` verdict; a document, version, or
+        unit the manifest does not carry is ``unknown_locator``. Never
+        raises, never carries text on a failure.
+        """
+        located = validate_company_source_ref(source_ref)
+        if not isinstance(located, tuple):
+            # EXIT: the shape verdict is named before any lookup, so a
+            # malformed identity never depends on what the manifest holds.
+            return located
+        document_id, version, unit = located
+        unit_read = read_from_pages(
+            self._pages_by_doc, document_id, version, unit, 1
+        )
+        if "error" in unit_read:
+            # EXIT: no such document / version / unit in the manifest —
+            # the same named miss ``read()`` folds, never an empty slice.
+            return source_error(UNKNOWN_LOCATOR)
+        return bounded_slice(dict(source_ref), unit_read["text"], position)
 
 
 __all__ = ["FakeRetrievePort"]
