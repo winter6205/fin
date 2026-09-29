@@ -6,9 +6,8 @@ source unit and text」. The chain exists in production code — the push
 side freezes one envelope per unit (``fin.corpus.push.envelopes_of_document``),
 retrieve maps the wire ``source_ref`` back to a fin locator
 (``fin.retrieve.hit_mapping.map_chunks_to_fin_chunks``), and
-``MCPRetrieveAdapter.read`` fetches each unit through ``read_source``
-(mcp_adapter ``read`` / ``_read_locators`` / ``_fetch_unit_body``) —
-but until now the whole chain was chained only inside scattered live
+``MCPRetrieveAdapter.read_slice`` fetches that unit through ``read_source``
+— but until now the whole chain was chained only inside scattered live
 e2e files. This file pins it hermetically against the scripted
 ``_call_mcp`` seam (the documented transport seam of
 ``test_mcp_adapter.py``), driven by the real product pipeline over a
@@ -29,20 +28,16 @@ committed representative corpus fixture:
    non-sorted-key) reference never becomes a locator or a body: the hit
    is dropped and counted, the read folds to the typed
    ``{"error": "unknown_locator"}``, never an empty or partial success;
-5. ordering / window — units are read in unit order, the page window
-   of a retrieved unit contains that unit's frozen text, and the
-   promised 3-unit ``read_source`` bound is pinned: the clamp lives in
-   ``_read_locators`` and reaches the fetch window via its returned
-   bound (see
-   :func:`test_read_page_limit_is_clamped_to_three_units`).
+5. ordering / bound — units resolve in unit order whatever order the
+   hits arrived in, a read answer carries exactly the slice shape (no
+   window or page fields), and one locator costs exactly one round trip:
+   a read never fans out to a window of neighbouring units.
 
-The host seam the tests build explicitly (``_locator_map_from_hits``):
-retrieve maps a canonical ref WITHOUT the locator map (ADR 0047), but
-``read`` discovers a document's unit locators FROM the locator map.
-So the same-unit hop is only closed when the host carries the retrieved
-chunks' locators into the read adapter's map — these tests pin that
-seam's contract; a host boot that forgets the carry gets
-``unknown_locator`` (named, never silent).
+The hop the tests build explicitly: ``read_slice`` takes the locator the
+caller already holds, so the same-unit promise closes by handing the
+mapped hit's own triple to the read. These tests derive that triple from
+the retrieved hits rather than from the push side, so a read that
+silently re-addressed a different unit still has to prove it.
 """
 
 from __future__ import annotations
@@ -70,9 +65,11 @@ from fin.retrieve.hit_mapping import (
     MappingFailureLedger,
     map_chunks_to_fin_chunks,
 )
-from fin.retrieve import mcp_adapter as mcp_adapter_module
 from fin.retrieve.mcp_adapter import MCPRetrieveAdapter
-from fin.retrieve.read_port import PAGE_LIMIT_CAP, clamp_page_limit
+from fin.retrieve.source_read import (
+    SOURCE_READ_MAX_TEXT_CODE_POINTS,
+    is_slice_result,
+)
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -109,6 +106,30 @@ def _pushed_envelopes() -> tuple[PushEnvelope, str]:
     return envelopes, version
 
 
+def _source_ref_of(chunk: Any) -> dict[str, Any]:
+    """The read request for one retrieved hit: the hit's own locator
+    triple, taken field by field off the mapped ``Chunk``."""
+    locator = chunk.source_ref
+    return {
+        "document_id": locator.document_id,
+        "version": locator.version,
+        "unit": locator.unit,
+    }
+
+
+def _read_unit(adapter: MCPRetrieveAdapter, source_ref: dict[str, Any]) -> str:
+    """One unit's text as the caller reassembles it: follow the cursor
+    to null, each step a bounded slice of the same locator."""
+    collected = ""
+    position: int | None = 0
+    while position is not None:
+        result = adapter.read_slice(source_ref, position)
+        assert is_slice_result(result), result
+        collected += result["text"]
+        position = result["next_position"]
+    return collected
+
+
 # ----- scripted transport: the same-server fake for retrieve + read -----
 
 
@@ -121,21 +142,22 @@ class _SameUnitServerAdapter(MCPRetrieveAdapter):
     ``bodies`` maps the exact pushed ``source_ref`` string to the
     frozen unit text; a locator whose ref is absent gets the named
     ``read_source_not_found`` miss envelope — the real server's wire
-    shape for a unit it never stored.
+    shape for a unit it never stored. A stored unit comes back as one
+    bounded slice at the requested cursor, the way the real backend
+    cuts at the code-point cap.
     """
 
     def __init__(
         self,
         *,
         envelopes: tuple[PushEnvelope, ...],
-        locator_map: dict[str, Locator] | None = None,
         known_document_ids: set[str] | None = None,
         query: str = "operating revenue",
     ) -> None:
         # Skip the parent __init__ seam contract: mirror the fields the
         # parent would set (same documented pattern as test_mcp_adapter).
         self._command = None
-        self._locator_map = dict(locator_map or {})
+        self._locator_map: dict[str, Locator] = {}
         self._known_doc_ids = (
             frozenset(known_document_ids)
             if known_document_ids is not None
@@ -170,7 +192,9 @@ class _SameUnitServerAdapter(MCPRetrieveAdapter):
                 }
             }
         if tool == "read_source":
-            source_ref = payload["params"]["arguments"]["source_ref"]
+            arguments = payload["params"]["arguments"]
+            source_ref = arguments["source_ref"]
+            position = int(arguments.get("position", 0))
             body = self.bodies.get(source_ref)
             if body is None:
                 return {
@@ -189,10 +213,12 @@ class _SameUnitServerAdapter(MCPRetrieveAdapter):
                         ],
                     }
                 }
+            end = min(position + SOURCE_READ_MAX_TEXT_CODE_POINTS, len(body))
             inner = {
-                "id": f"srv-{abs(hash(source_ref))}",
+                "id": source_ref,
                 "source_ref": source_ref,
-                "content": body,
+                "content": body[position:end],
+                "next_position": end if end < len(body) else None,
             }
             return {
                 "result": {
@@ -234,30 +260,6 @@ class _AllUnitsServerAdapter(_SameUnitServerAdapter):
 
     def _wire_hits(self) -> list[tuple[str, str]]:
         return list(self._hits)
-
-
-def _locator_map_from_hits(
-    chunks: Any,
-) -> dict[str, Locator]:
-    """The host seam: carry the retrieved chunks' locators into the
-    read adapter's locator map, keyed by the canonical serialization
-    of each locator triple.
-
-    This is the explicit same-unit hop the plan line promises: the read
-    side may ONLY know the units the retrieve side actually resolved,
-    so the tests derive the map from the hits rather than from the push
-    side.
-    """
-    return {
-        serialize_source_ref(
-            UnitLocator(
-                document_id=chunk.source_ref.document_id,
-                version=chunk.source_ref.version,
-                unit=chunk.source_ref.page,
-            )
-        ): chunk.source_ref
-        for chunk in chunks
-    }
 
 
 @pytest.fixture(scope="module")
@@ -302,7 +304,7 @@ def test_every_retrieved_hit_source_ref_is_a_pushed_canonical_triple(
         triple = UnitLocator(
             document_id=locator.document_id,
             version=locator.version,
-            unit=locator.page,
+            unit=locator.unit,
         )
         assert triple in pushed_triples, (
             f"retrieved hit points at {triple!r}, not a pushed unit"
@@ -342,42 +344,32 @@ def test_read_carries_the_hits_own_source_ref_and_returns_frozen_text(
     wire), and the resolved body is the frozen unit text of exactly
     that unit.
 
-    One unit at a time (window of one): the resolved text must equal
-    that single envelope's body — no folding across units, no
-    re-chunking (ADR 0037).
-
-    NOTE on addressing: ``read``'s ``page`` is a 1-based position in
-    the ORDERED located-unit list, not the unit number — the same-unit
-    promise is that the located set comes from the hits and each
-    window member is fetched under its own unit's canonical ref."""
+    One locator per read: the resolved text is that single envelope's
+    body — no folding across units, no re-chunking (ADR 0037).
+    """
     envelopes = pushed_and_hits["envelopes"]
     hits = pushed_and_hits["hits"]
     body_by_ref = {env.source_ref: env.body for env in envelopes}
 
-    for position, (chunk, env) in enumerate(zip(hits, envelopes), 1):
+    for chunk, env in zip(hits, envelopes):
         locator = chunk.source_ref
         ref = serialize_source_ref(
-            UnitLocator(locator.document_id, locator.version, locator.page)
+            UnitLocator(locator.document_id, locator.version, locator.unit)
         )
         assert ref == env.source_ref  # sanity: hit unit == this envelope
-        read_adapter = _AllUnitsServerAdapter(
+        adapter = _AllUnitsServerAdapter(
             envelopes=envelopes,
-            locator_map=_locator_map_from_hits(hits),
             known_document_ids={_DOC_ID},
         )
-        result = read_adapter.read(
-            locator.document_id, locator.version, page=position, page_limit=1
-        )
-        assert read_adapter.read_payload_refs() == [env.source_ref], (
+        assert _read_unit(adapter, _source_ref_of(chunk)) == env.body
+        assert adapter.read_payload_refs() == [env.source_ref], (
             "the read wire must carry the hit's own pushed source_ref "
-            "string, byte-identical"
+            "string, byte-identical, and read that unit alone"
         )
-        assert result["text"] == body_by_ref[env.source_ref]
-        assert result["text"] == env.body
         # The hit's chunk text is a contiguous substring of the frozen
         # unit body the same locator resolves to (SC11) — the read may
         # not have re-cut the unit.
-        assert chunk.text in env.body
+        assert chunk.text in body_by_ref[env.source_ref]
 
 
 # ----- (d) non-canonical shapes fold to named misses -----
@@ -421,176 +413,84 @@ def test_wire_refs_with_extra_or_off_type_keys_never_become_locators() -> None:
 def test_read_of_a_locator_never_pushed_is_unknown_locator_not_empty_success(
     pushed_and_hits: dict[str, Any],
 ) -> None:
-    """(d, read side) A locator for a unit that was never pushed folds
-    to the typed ``{"error": "unknown_locator"}`` — never an empty text
-    or a success envelope.
+    """(d, read side) A locator for a unit that was never pushed rides
+    the wire, and the server's named ``read_source_not_found`` folds to
+    the typed ``{"error": "unknown_locator"}`` — never an empty text, a
+    partial body, or a success envelope.
 
-    Two shapes, both named:
-    * the located-window walk never reaches past the units the map
-      carries — a page past the count is refused at the seam (and a
-      page window whose LAST unit is not stored still folds the whole
-      read to the miss, never a partial success);
-    * a carried locator whose ref the server never stored rides the
-      wire and the server's named ``read_source_not_found`` miss is
-      folded at the seam.
+    An ordinal the locator gate itself refuses never reaches the wire at
+    all; that shape is pinned where the gate is the unit under test.
     """
     envelopes = pushed_and_hits["envelopes"]
     version = pushed_and_hits["version"]
-    ghost_page = len(envelopes) + 1
+    ghost_unit = len(envelopes) + 1
     ghost_ref = serialize_source_ref(
-        UnitLocator(_DOC_ID, version, unit=ghost_page)
+        UnitLocator(_DOC_ID, version, unit=ghost_unit)
     )
 
-    # A locator the map does not carry: refused at the seam, no round
-    # trip, no empty page.
-    uncarried = _AllUnitsServerAdapter(
+    adapter = _AllUnitsServerAdapter(
         envelopes=envelopes,
-        locator_map=_locator_map_from_hits(pushed_and_hits["hits"]),
         known_document_ids={_DOC_ID},
     )
-    assert uncarried.read(_DOC_ID, version, page=ghost_page, page_limit=1) == {
-        "error": "unknown_locator"
-    }
-    assert uncarried.read_payload_refs() == []
-
-    # A carried ghost extends the located count to itself, so the
-    # window that ENDS on the ghost rides the wire: units
-    # (count-2, count-1, ghost). The two real bodies resolve, the ghost
-    # answers the named miss — and the WHOLE read is the named
-    # unknown_locator, never the two-thirds of it that succeeded.
-    carried = _AllUnitsServerAdapter(
-        envelopes=envelopes,
-        locator_map={
-            **_locator_map_from_hits(pushed_and_hits["hits"]),
-            ghost_ref: Locator(_DOC_ID, version, ghost_page),
-        },
-        known_document_ids={_DOC_ID},
+    result = adapter.read_slice(
+        {"document_id": _DOC_ID, "version": version, "unit": ghost_unit}
     )
-    assert carried.read(
-        _DOC_ID, version, page=ghost_page - 2, page_limit=1
-    ) != {"error": "unknown_locator"}  # sanity: the real window resolves
-    assert carried.read(
-        _DOC_ID, version, page=ghost_page, page_limit=3
-    ) == {"error": "unknown_locator"}
-    assert carried.read_payload_refs()[-1] == ghost_ref
+    assert result == {"error": "unknown_locator"}
+    assert "text" not in result, "a named miss must never hand back a body"
+    assert adapter.read_payload_refs() == [ghost_ref]
 
 
-# ----- (e) unit ordering and page-window clamp -----
+# ----- (e) unit ordering and the one-call bound -----
 
 
-def test_read_window_is_unit_ordered(
+def test_each_unit_reads_under_its_own_ref_in_unit_order(
     pushed_and_hits: dict[str, Any],
 ) -> None:
-    """(e, ordering) ``read`` walks units in unit order regardless of
-    the locator map's insertion order (deliberately reversed here),
-    the resolved text is the unit-ordered join of those units' frozen
-    bodies, and ``page_count`` reports the full located count."""
+    """(e, ordering) A read addresses a unit by its own locator, so the
+    units resolve in unit order whatever order the hits arrived in (the
+    hit list is deliberately reversed here), each round trip carries that
+    unit's canonical ref, and the reassembled text is that unit's frozen
+    body — never a join across units."""
     envelopes = pushed_and_hits["envelopes"]
-    version = pushed_and_hits["version"]
     assert len(envelopes) >= 4
 
-    hits = pushed_and_hits["hits"]
-    shuffled = list(reversed(hits))
-    adapter = _AllUnitsServerAdapter(
-        envelopes=envelopes,
-        locator_map=_locator_map_from_hits(shuffled),
-        known_document_ids={_DOC_ID},
+    shuffled = list(reversed(pushed_and_hits["hits"]))
+    ordered = sorted(shuffled, key=lambda chunk: chunk.source_ref.unit)
+    assert [chunk.source_ref for chunk in ordered] != shuffled, (
+        "fixture guard: the reversed hit list really differs from unit order"
     )
-    page = 2
-    result = adapter.read(_DOC_ID, version, page=page, page_limit=3)
-    refs = adapter.read_payload_refs()
-    assert refs == [env.source_ref for env in envelopes[page - 1 : page + 2]], (
-        "the window must be the 3-unit slice in unit order"
-    )
-    assert result["text"] == "\n\n".join(
-        env.body for env in envelopes[page - 1 : page + 2]
-    )
-    assert result["page_count"] == len(envelopes)
-    assert result["page"] == page
 
-    # A full-document walk with the in-contract window reads every
-    # unit exactly once, in unit order.
     walk = _AllUnitsServerAdapter(
         envelopes=envelopes,
-        locator_map=_locator_map_from_hits(shuffled),
         known_document_ids={_DOC_ID},
     )
-    walked_refs: list[str] = []
-    cursor = 1
-    while cursor <= len(envelopes):
-        page_result = walk.read(_DOC_ID, version, page=cursor, page_limit=3)
-        assert "error" not in page_result, page_result
-        batch = walk.read_payload_refs()[len(walked_refs):]
-        walked_refs.extend(batch)
-        cursor += 3
-    assert walked_refs == [env.source_ref for env in envelopes]
+    bodies = [_read_unit(walk, _source_ref_of(chunk)) for chunk in ordered]
+    assert bodies == [env.body for env in envelopes]
+    assert walk.read_payload_refs() == [env.source_ref for env in envelopes]
 
 
-def test_read_page_limit_is_clamped_to_three_units(
+def test_one_read_never_fans_out_to_a_window_of_units(
     pushed_and_hits: dict[str, Any],
 ) -> None:
-    """(e, clamp) An over-sized ``page_limit`` must fetch at most the
-    three-unit bounded window the read contract promises."""
+    """(e, bound) The bound that replaced the page window: one read of
+    one locator touches that unit alone, so a neighbour's text cannot
+    ride into the answer unasked and a document walk costs exactly one
+    round trip per unit rather than an open-ended window."""
     envelopes = pushed_and_hits["envelopes"]
-    version = pushed_and_hits["version"]
-    assert len(envelopes) > 3
+    hits = pushed_and_hits["hits"]
+    assert all(
+        len(env.body) <= SOURCE_READ_MAX_TEXT_CODE_POINTS for env in envelopes
+    ), "fixture guard: each unit of the corpus fits one bounded slice"
 
     adapter = _AllUnitsServerAdapter(
         envelopes=envelopes,
-        locator_map=_locator_map_from_hits(pushed_and_hits["hits"]),
         known_document_ids={_DOC_ID},
     )
-    adapter.read(_DOC_ID, version, page=1, page_limit=99)
-    assert len(adapter.read_payload_refs()) <= 3, (
-        "read_source fan-out exceeded the bounded 3-unit window"
-    )
-
-
-def test_page_limit_cap_value_is_three() -> None:
-    """The ADR 0009 bound's VALUE is pinned via the public symbol."""
-    assert PAGE_LIMIT_CAP == 3
-
-
-@pytest.mark.parametrize(
-    ("page_limit", "expected"),
-    [(1, 1), (2, 2), (3, 3), (4, 3), (99, 3)],
-)
-def test_clamp_page_limit_bounds_only_the_upper_edge(
-    page_limit: int, expected: int
-) -> None:
-    """The clamp RULE (not just its value) is the shared helper:
-    at/below the cap passes through, above it is bounded. Lower-bound
-    rejection stays at the callers, so the helper never invents a
-    limit from an invalid one."""
-    assert clamp_page_limit(page_limit) == expected
-
-
-def test_read_paths_share_the_one_clamp_helper() -> None:
-    """Both bounded-read call sites use the public helper; the private
-    symbol the adapter used to import is gone (single source of the
-    rule, no private-name coupling)."""
-    assert "clamp_page_limit" in mcp_adapter_module.__dict__
-    assert not hasattr(mcp_adapter_module, "_PAGE_LIMIT_CAP")
-
-
-def test_read_page_beyond_the_units_is_unknown_locator(
-    pushed_and_hits: dict[str, Any],
-) -> None:
-    """(e boundary) A page past the last unit is the named miss, not
-    an empty page."""
-    envelopes = pushed_and_hits["envelopes"]
-    version = pushed_and_hits["version"]
-    adapter = _AllUnitsServerAdapter(
-        envelopes=envelopes,
-        locator_map=_locator_map_from_hits(pushed_and_hits["hits"]),
-        known_document_ids={_DOC_ID},
-    )
-    assert adapter.read(
-        _DOC_ID, version, page=len(envelopes) + 1, page_limit=1
-    ) == {"error": "unknown_locator"}
-    assert adapter.read(_DOC_ID, version, page=1, page_limit=0) == {
-        "error": "unknown_locator"
-    }
+    result = adapter.read_slice(_source_ref_of(hits[0]))
+    assert is_slice_result(result), result
+    assert set(result) == {"source_ref", "text", "next_position"}
+    assert result["text"] == envelopes[0].body
+    assert adapter.read_payload_refs() == [envelopes[0].source_ref]
 
 
 # ----- opt-in live alignment (real iknow-memory MCP) -----
@@ -674,7 +574,9 @@ def test_live_hit_and_read_source_resolve_the_same_unit(
         for chunk in hits:
             locator = chunk.source_ref
             assert (
-                UnitLocator(locator.document_id, locator.version, locator.page)
+                UnitLocator(
+                    locator.document_id, locator.version, locator.unit
+                )
                 in pushed_triples
             ), locator
 
@@ -682,51 +584,28 @@ def test_live_hit_and_read_source_resolve_the_same_unit(
         chunk = hits[0]
         locator = chunk.source_ref
         hit_ref = serialize_source_ref(
-            UnitLocator(
-                locator.document_id, locator.version, locator.page
-            )
+            UnitLocator(locator.document_id, locator.version, locator.unit)
         )
         assert hit_ref in body_by_ref, hit_ref
         read_adapter = MCPRetrieveAdapter(
             session=live.session,
             timeout_seconds=20.0,
-            locator_map={
-                hit_ref: Locator(
-                    locator.document_id, locator.version, locator.page
-                )
-            },
         )
-        result = read_adapter.read(
-            locator.document_id,
-            locator.version,
-            page=locator.page,
-            page_limit=1,
-        )
-        assert result["text"] == body_by_ref[hit_ref]
+        assert _read_unit(read_adapter, _source_ref_of(chunk)) == body_by_ref[
+            hit_ref
+        ]
 
-        # (d) a page whose unit the real server never stored is the
-        # named miss — folded to unknown_locator, never an empty page.
-        # The ghost unit sits INSIDE the carried locator count so the
-        # window's last page rides the real read_source wire.
-        ghost_page = len(envelopes) + 1
-        ghost_ref = serialize_source_ref(
-            UnitLocator(document_id, version, unit=ghost_page)
-        )
+        # (d) a unit the real server never stored is the named miss —
+        # folded to unknown_locator, never an empty success and never the
+        # partial body of an earlier slice.
         ghost_adapter = MCPRetrieveAdapter(
             session=live.session,
             timeout_seconds=20.0,
-            locator_map={
-                **{
-                    env.source_ref: Locator(
-                        unit["locator"].document_id,
-                        unit["locator"].version,
-                        unit["locator"].unit,
-                    )
-                    for unit, env in zip(units, envelopes)
-                },
-                ghost_ref: Locator(document_id, version, ghost_page),
-            },
         )
-        assert ghost_adapter.read(
-            document_id, version, page=ghost_page, page_limit=3
+        assert ghost_adapter.read_slice(
+            {
+                "document_id": document_id,
+                "version": version,
+                "unit": len(envelopes) + 1,
+            }
         ) == {"error": "unknown_locator"}

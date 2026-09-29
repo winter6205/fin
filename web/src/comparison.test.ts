@@ -18,11 +18,13 @@ import {
   deltaForRow,
   directionClass,
   directionMark,
+  locatorLabel,
   parseComparison,
   parseComparisons,
   turnComparisons,
 } from "./comparison";
-import type { Comparison } from "./types";
+import { citationSourceId } from "./sourceLocator";
+import type { Citation, Comparison, ComparisonLocator } from "./types";
 
 function makeComparison(overrides: Partial<Comparison> = {}): Comparison {
   return {
@@ -53,7 +55,8 @@ function makeComparison(overrides: Partial<Comparison> = {}): Comparison {
             locator: {
               document_id: "AAPL-2022Q3",
               version: "a".repeat(64),
-              page: 4,
+              unit: 4,
+              display: "page",
             },
           },
           {
@@ -67,7 +70,8 @@ function makeComparison(overrides: Partial<Comparison> = {}): Comparison {
             locator: {
               document_id: "AAPL-2023Q3",
               version: "b".repeat(64),
-              page: 4,
+              unit: 4,
+              display: "page",
             },
           },
         ],
@@ -87,8 +91,18 @@ function makeComparison(overrides: Partial<Comparison> = {}): Comparison {
     hit_count: 2,
     cell_count: 2,
     locators: [
-      { document_id: "AAPL-2022Q3", version: "a".repeat(64), page: 4 },
-      { document_id: "AAPL-2023Q3", version: "b".repeat(64), page: 4 },
+      {
+        document_id: "AAPL-2022Q3",
+        version: "a".repeat(64),
+        unit: 4,
+        display: "page",
+      },
+      {
+        document_id: "AAPL-2023Q3",
+        version: "b".repeat(64),
+        unit: 4,
+        display: "page",
+      },
     ],
     ...overrides,
   };
@@ -219,10 +233,130 @@ describe("direction rendering", () => {
   });
 });
 
+describe("locatorLabel", () => {
+  it("keeps the page wording for a physical PDF unit", () => {
+    expect(
+      locatorLabel({
+        document_id: "AAPL-2022Q3",
+        version: "a".repeat(64),
+        unit: 4,
+        display: "page",
+      }),
+    ).toBe("AAPL-2022Q3 p.4");
+  });
+
+  it("labels a non-PDF unit as a unit, never as a page", () => {
+    expect(
+      locatorLabel({
+        document_id: "AAPL-2022Q3",
+        version: "a".repeat(64),
+        unit: 7,
+        display: "unit",
+      }),
+    ).toBe("AAPL-2022Q3 u.7");
+  });
+
+  it("defaults to the unit wording when a peer sends no display", () => {
+    expect(
+      locatorLabel({
+        document_id: "AAPL-2022Q3",
+        version: "a".repeat(64),
+        unit: 7,
+      }),
+    ).toBe("AAPL-2022Q3 u.7");
+  });
+
+  it("resolves an attachment row by its attachment_id", () => {
+    // ``citationSourceId`` in sourceLocator.ts is the single identity
+    // authority (spec thread-attachment-source-read). The table used to
+    // carry its own ``document_id || attachment_id`` chain, so a table
+    // row and a citation chip over the same source could be named
+    // differently — which is what the shared rule exists to prevent.
+    expect(
+      locatorLabel({
+        kind: "attachment",
+        document_id: "",
+        attachment_id: "ATT-1",
+        version: "a".repeat(64),
+        unit: 7,
+        display: "unit",
+      }),
+    ).toBe("ATT-1 u.7");
+  });
+
+  it("never lets a company row borrow a sibling attachment_id", () => {
+    // An ``||`` over the ids cannot tell these two rows apart: an empty
+    // document_id on a company row is a missing identity, not an
+    // attachment. Guessing one would trace a table number to a source
+    // the fact row never came from.
+    const label = locatorLabel({
+      kind: "company",
+      document_id: "",
+      attachment_id: "ATT-1",
+      version: "a".repeat(64),
+      unit: 7,
+      display: "unit",
+    });
+    expect(label).not.toContain("ATT-1");
+    expect(label).toBe(" u.7");
+  });
+
+  it("names the same source identity the citation chips group by", () => {
+    // The invariant behind the two rules: one identity, two renderings.
+    // Asserted against the shared authority rather than a literal so a
+    // future re-fork inside the table shows up as a mismatch instead of
+    // passing a hard-coded string.
+    const locator: ComparisonLocator = {
+      kind: "attachment",
+      document_id: "",
+      attachment_id: "ATT-1",
+      version: "a".repeat(64),
+      unit: 7,
+      display: "unit",
+    };
+    const citation: Citation = {
+      kind: "attachment",
+      document_id: "",
+      attachment_id: "ATT-1",
+      version: "a".repeat(64),
+      unit: 7,
+      display: "unit",
+      filename: "q3-notes.pdf",
+      quote: "Revenue grew",
+    };
+    const [identity] = locatorLabel(locator).split(" ");
+    expect(identity).toBe(citationSourceId(citation));
+  });
+});
+
 describe("cellTitle", () => {
   it("names the filing page a hit came from", () => {
     const cell = makeComparison().rows[0].cells[0];
     expect(cellTitle(cell)).toBe("AAPL-2022Q3 p.4");
+  });
+
+  it("names the source unit when the hit is not a physical page", () => {
+    const cell = {
+      row: "AAPL",
+      column: "2022-Q3-YTD",
+      status: "hit" as const,
+      value: 194140,
+      display: "194,140",
+      unit: "USD",
+      scale: "millions",
+      // The attachment row states its discriminator: identity comes
+      // from the shared rule, which keys on ``kind`` and never guesses
+      // it from which id is filled.
+      locator: {
+        kind: "attachment" as const,
+        document_id: "",
+        attachment_id: "att-1",
+        version: "a".repeat(64),
+        unit: 7,
+        display: "unit" as const,
+      },
+    };
+    expect(cellTitle(cell)).toBe("att-1 u.7");
   });
 
   it("says not-reported for a missing cell", () => {

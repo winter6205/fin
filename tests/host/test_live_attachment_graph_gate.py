@@ -46,14 +46,15 @@ credential and no knowledge MCP deployed (the ticket's own instruction):
   Every gate decision is taken BEFORE the model leaf, and the scripted server
   records the calls it received, so "the paused run never reached the model"
   and "no operator resend was needed" are measured, not asserted.
-* **evidence source** — the grounded leaf's ``read_file`` bodies come from the
-  committed extracted tree through the factory's own documented seams
-  (``known_document_ids`` + ``ExtractedTreeReadPort``), because the product MCP
-  retrieve (``iknow-memory``, ADR 0030) is not deployed on this host and
-  ``compile_for_runtime`` cannot be handed a read port. This is what lets the
-  success leg reach a citation-gate-passing ``done`` instead of a refusal
-  about infrastructure. The citation gate, the evidence channel, and the
-  attachment-hydration path it guards are all the real ones.
+* **evidence source** — the grounded leaf's ``read_source`` bodies come from
+  the committed extracted tree through the factory's own documented seams
+  (``known_document_ids`` + a retrieve adapter carrying ``pages_by_doc``),
+  because the product MCP retrieve (``iknow-memory``, ADR 0030) is not
+  deployed on this host and ``compile_for_runtime`` cannot be handed a
+  retrieve adapter. This is what lets the success leg reach a
+  citation-gate-passing ``done`` instead of a refusal about infrastructure.
+  The citation gate, the evidence channel, and the attachment-hydration path
+  it guards are all the real ones.
 
 The page lane is deliberately untouched: every case here is a text-lane
 payload, so no Heron harness or docker image is required.
@@ -397,10 +398,11 @@ class _ScriptedModelServer:
 
     The script is the smallest thing that can produce a citation-gate-passing
     grounded answer: while no tool result is in the prompt it asks for one
-    ``read_file`` hop, and once a tool result is present it answers extractively
-    from the committed page text. Every request body is recorded, which is how
-    the suite measures (a) that a paused run never reached the model leaf and
-    (b) that a resumed run reached it without an operator resend.
+    ``read_source`` hop, and once a tool result is present it answers
+    extractively from the committed unit text. Every request body is recorded,
+    which is how the suite measures (a) that a paused run never reached the
+    model leaf and (b) that a resumed run reached it without an operator
+    resend.
     """
 
     def __init__(self, *, tool_args: dict[str, Any], answer: str) -> None:
@@ -450,7 +452,7 @@ class _ScriptedModelServer:
                                 "id": "call-live-1",
                                 "type": "function",
                                 "function": {
-                                    "name": "read_file",
+                                    "name": "read_source",
                                     "arguments": json.dumps(harness._tool_args),
                                 },
                             }
@@ -545,10 +547,10 @@ class _ScriptedModelServer:
 
 
 @pytest.fixture
-def scripted_model(corpus_page: dict[str, Any]) -> Iterator[_ScriptedModelServer]:
+def scripted_model(corpus_unit: dict[str, Any]) -> Iterator[_ScriptedModelServer]:
     """One scripted transport per test, so its call log counts one story."""
     server = _ScriptedModelServer(
-        tool_args=corpus_page["tool_args"], answer=corpus_page["answer"]
+        tool_args=corpus_unit["tool_args"], answer=corpus_unit["answer"]
     )
     server.start()
     try:
@@ -558,12 +560,12 @@ def scripted_model(corpus_page: dict[str, Any]) -> Iterator[_ScriptedModelServer
 
 
 @pytest.fixture(scope="module")
-def corpus_page() -> dict[str, Any]:
+def corpus_unit() -> dict[str, Any]:
     """The committed evidence the scripted leaf quotes.
 
     Read off the extracted tree rather than restated here, so the answer span
-    the citation gate must match is the corpus's own text and the ``read_file``
-    version is the manifest's own sha256.
+    the citation gate must match is the corpus's own text and the
+    ``read_source`` locator carries the manifest's own sha256.
     """
     from fin.corpus.extracted import load_extracted_tree
 
@@ -579,13 +581,10 @@ def corpus_page() -> dict[str, Any]:
     assert version == versions[AAPL_2022Q3], (version, versions[AAPL_2022Q3])
     span = pages[0].text[:80]
     assert len(span) >= 32, len(span)
+    source_ref = {"document_id": AAPL_2022Q3, "version": version, "unit": 1}
     return {
-        "tool_args": {
-            "document_id": AAPL_2022Q3,
-            "version": version,
-            "page": 1,
-            "page_limit": 1,
-        },
+        "source_ref": source_ref,
+        "tool_args": {"source_ref": source_ref, "position": 0},
         "answer": f"Per the filing: {span}",
         "known_document_ids": sorted(versions),
     }
@@ -603,6 +602,7 @@ from pathlib import Path
 import uvicorn
 from langgraph.checkpoint.postgres import PostgresSaver
 
+from fin.corpus.extracted import load_extracted_tree
 from fin.host import http as http_module
 from fin.host.compile import _build_default_model
 from fin.host.graph import compile_graph
@@ -612,7 +612,7 @@ from fin.host.workspace_http import (
     start_attachment_prep_worker,
     start_attachment_resume_worker,
 )
-from fin.retrieve import ExtractedTreeReadPort
+from fin.retrieve import FakeRetrievePort
 
 CHECKPOINT_URL = os.environ["FIN_CHECKPOINT_URL"]
 MODEL_BASE_URL = os.environ["FIN_LIVE_MODEL_BASE_URL"]
@@ -650,7 +650,12 @@ graph = compile_graph(
         str(document["document_id"])
         for document in json.loads(MANIFEST.read_text())["documents"]
     },
-    read_port=ExtractedTreeReadPort(MANIFEST, EXTRACTED),
+    # The committed corpus units serve the company leg of ``read_source``:
+    # the bound retrieve adapter's own ``read_slice``, so the graph still
+    # never walks the tree on its own (ADR 0046 / 0047).
+    adapter=FakeRetrievePort(
+        pages_by_doc=load_extracted_tree(MANIFEST, EXTRACTED)
+    ),
     # The production boot ships the HITL lane; the pinned 档 keeps it closed,
     # so the only pause this suite can observe is the attachment gate's.
     enable_choice_window=True,
@@ -1120,7 +1125,7 @@ def test_a_run_suspended_on_the_gate_completes_under_a_fresh_process(
     live_home: Path,
     registry: dict[str, list[Any]],
     scripted_model: _ScriptedModelServer,
-    corpus_page: dict[str, Any],
+    corpus_unit: dict[str, Any],
 ) -> None:
     """Case 1 + 2: the pause survives the death and the restart finishes it.
 
@@ -1205,9 +1210,16 @@ def test_a_run_suspended_on_the_gate_completes_under_a_fresh_process(
         assert turn["answer"].strip(), turn
         assert turn["question"] == GROUNDED_QUESTION, turn
         # The answer is the extractive span the scripted leaf quoted from the
-        # committed page, so the resumed remainder really ran the research
+        # committed unit, so the resumed remainder really ran the research
         # leaf and cleared the citation gate — not a filler success.
-        assert corpus_page["answer"] in turn["answer"], turn
+        assert corpus_unit["answer"] in turn["answer"], turn
+        # The turn row's own audit column carries the locator the run read
+        # with: the frozen company triple keyed by ``unit``, and no generic
+        # ``page`` key anywhere on the persisted evidence (spec SC11).
+        assert corpus_unit["source_ref"] in turn["evidence_locators"], turn
+        assert all(
+            "page" not in locator for locator in turn["evidence_locators"]
+        ), turn
 
         row = _wait_until(
             lambda: _attachment_row(postgres_url, attachment_id),
@@ -1229,8 +1241,8 @@ def test_a_run_suspended_on_the_gate_completes_under_a_fresh_process(
         assert jobs[0]["failure_reason"] is None, jobs[0]
 
         # No operator resend: one turn row on the thread, and exactly the two
-        # model calls the resumed remainder needed (the read_file hop, then the
-        # answer). A second send would have minted a second run id.
+        # model calls the resumed remainder needed (the read_source hop, then
+        # the answer). A second send would have minted a second run id.
         assert _run_rows_for_thread(postgres_url, thread_id) == [turn], thread_id
         assert scripted_model.call_count == 2, scripted_model.seen
 

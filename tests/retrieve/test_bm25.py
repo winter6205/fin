@@ -275,7 +275,7 @@ def test_retrieve_returns_chunks_with_locator_and_score(
 
     Each ``Chunk.source_ref`` MUST round-trip through the
     ``Locator`` dataclass — the citation gate (T5) reads
-    ``chunk.source_ref.document_id / .page`` directly. ``score`` is the
+    ``chunk.source_ref.document_id / .unit`` directly. ``score`` is the
     BM25 raw score; ordering is descending (higher is better for hits).
     """
     manifest_path, _, _ = _real_manifest()
@@ -295,7 +295,7 @@ def test_retrieve_returns_chunks_with_locator_and_score(
         assert isinstance(chunk.source_ref, Locator)
         assert chunk.source_ref.document_id
         assert chunk.source_ref.version
-        assert isinstance(chunk.source_ref.page, int) and chunk.source_ref.page >= 1
+        assert isinstance(chunk.source_ref.unit, int) and chunk.source_ref.unit >= 1
         assert isinstance(chunk.score, float)
 
     # Descending by score: hits must rank higher than non-matches.
@@ -722,7 +722,7 @@ def test_small_tree_source_ref_is_locator_with_three_fields(
     small_tree: tuple[Path, Path],
 ) -> None:
     """Each chunk's ``source_ref`` carries ``document_id``, ``version``,
-    ``page`` — the locator shape the citation gate reads."""
+    ``unit`` — the locator shape the citation gate reads."""
     manifest_path, extracted_root = small_tree
     tree = load_extracted_tree(
         manifest_path=manifest_path,
@@ -737,8 +737,8 @@ def test_small_tree_source_ref_is_locator_with_three_fields(
         assert isinstance(chunk.source_ref, Locator)
         assert chunk.source_ref.document_id
         assert chunk.source_ref.version.startswith("v")
-        assert isinstance(chunk.source_ref.page, int)
-        assert chunk.source_ref.page >= 1
+        assert isinstance(chunk.source_ref.unit, int)
+        assert chunk.source_ref.unit >= 1
         seen_docs.add(chunk.source_ref.document_id)
     # We hit at least one of our two documents.
     assert seen_docs <= {"DOC-2023Q1", "DOC-2023Q2"}

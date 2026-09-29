@@ -123,9 +123,18 @@ _FIXTURE_BOUNDS = {
 class RecordingRunner:
     """``LayoutRecordRunner`` witnessing the path each document was staged at."""
 
-    def __init__(self, *, fail_with: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail_with: Exception | None = None,
+        record: Mapping[str, object] | None = None,
+    ) -> None:
         self.calls: list[tuple[Path, bool, str]] = []
         self._fail_with = fail_with
+        # The record a successful pass answers with; ``None`` keeps the
+        # original empty answer, which the region tests replace with the
+        # one page's boxes the geometry under test needs.
+        self._record = record
 
     def read_record(
         self, *, pdf_path: Path, config: HeronLayoutConfig
@@ -139,7 +148,7 @@ class RecordingRunner:
         self.calls.append((pdf_path, exists, digest))
         if self._fail_with is not None:
             raise self._fail_with
-        return {}
+        return dict(self._record) if self._record is not None else {}
 
 
 @pytest.fixture
@@ -387,6 +396,116 @@ def test_a_host_without_the_harness_still_serves_the_page_lane() -> None:
     assert [call[1] for call in runner.calls] == [True]
     assert result.pages
     assert not any(page.regions for page in result.pages)
+
+
+# ----- the boxes a pass finds are left where the crop lane reads them ----
+
+
+def test_a_pass_leaves_its_page_boxes_in_the_bound_sink() -> None:
+    """Without this write there is no crop to take, only the whole page.
+
+    The layout already produced the geometry; persisting it is what makes a
+    later question's crop inspection possible at all. The box below is the
+    chart the committed gold manifest records on page 3 of the mixed-chart
+    case — 528 x 328 pt at x=42, top y=100 on a 612 x 792 pt media box —
+    expressed in the record's own bottom-left space the adapter flips back
+    to top-left.
+    """
+    runner = RecordingRunner(
+        record={
+            "pages": [
+                {
+                    # The native-text gold fixture is one page, 612 x 792 pt.
+                    "page_no": 1,
+                    "figure_boxes": [
+                        # 792 - 100 = 692 and 792 - 428 = 364, the flip of
+                        # the mixed-chart manifest's page-3 chart box.
+                        {"l": 42.0, "t": 692.0, "r": 570.0, "b": 364.0}
+                    ],
+                }
+            ]
+        }
+    )
+    stored: dict[str, Any] = {}
+    parser = _parser(runner)
+    parser.region_sink = lambda **kwargs: (
+        stored.update(kwargs) or len(kwargs["regions"])
+    )
+
+    parser.extract_pdf(
+        source_bytes=NATIVE_BYTES,
+        source_sha256=hashlib.sha256(NATIVE_BYTES).hexdigest(),
+        document_id="doc-chart",
+        version="3",
+    )
+
+    # The sink received the same version the extract ran under, and one box
+    # in the core's own top-left PDF-point space, not the record's flipped
+    # coordinates — so a crop taken from it lands where Heron said.
+    assert stored["attachment_id"] == "doc-chart"
+    assert stored["version"] == 3  # the version the extract ran under
+    boxes = stored["regions"]
+    assert len(boxes) == 1
+    assert (boxes[0].page, boxes[0].kind) == (1, "figure")
+    assert (boxes[0].left_pt, boxes[0].right_pt) == (42.0, 570.0)
+    assert (boxes[0].top_pt, boxes[0].bottom_pt) == (100.0, 428.0)
+
+
+def test_a_lane_with_no_sink_still_parses_and_keeps_no_boxes() -> None:
+    """A sink is additive metadata, never a preparation precondition.
+
+    With no store bound there is nowhere to leave a box, and the parse still
+    has to return its pages, text, and rasters — the crop lane then reads
+    the absence as the whole-page fallback.
+    """
+    parser = _parser(RecordingRunner())
+
+    result = parser.extract_pdf(
+        source_bytes=NATIVE_BYTES,
+        source_sha256=hashlib.sha256(NATIVE_BYTES).hexdigest(),
+        document_id="doc-a",
+        version="1",
+    )
+
+    assert parser.region_sink is None
+    assert result.pages
+
+
+def test_a_sink_that_refuses_does_not_fail_the_preparation() -> None:
+    """Regions are additive: a store fault loses boxes, not a document.
+
+    The text, units, and rasters the same pass produced are still good, and
+    the row's typed failure has not been earned by a missing box.
+    """
+
+    def refusing(**_kwargs: Any) -> int:
+        raise RuntimeError("region table gone")
+
+    parser = _parser(RecordingRunner())
+    parser.region_sink = refusing
+
+    result = parser.extract_pdf(
+        source_bytes=NATIVE_BYTES,
+        source_sha256=hashlib.sha256(NATIVE_BYTES).hexdigest(),
+        document_id="doc-a",
+        version="1",
+    )
+
+    assert result.pages
+
+
+def test_the_wired_root_binds_its_store_as_the_region_sink(
+    clean_root_env: None,
+) -> None:
+    """The deployed lane and the store that owns the rows are one wiring.
+
+    Without this binding the page lane would parse and then throw its boxes
+    away, leaving every later question with the whole page.
+    """
+    service = _build_default_attachment_service()
+
+    assert isinstance(service.pages, HeronPageLaneParser)
+    assert service.pages.region_sink == service.store.record_regions
 
 
 def test_a_staged_copy_is_gone_even_when_the_document_cannot_be_read(

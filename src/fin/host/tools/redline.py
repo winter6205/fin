@@ -40,7 +40,7 @@ def _locator_dict(locator: Locator) -> dict[str, Any]:
     return {
         "document_id": locator.document_id,
         "version": locator.version,
-        "page": locator.page,
+        "unit": locator.unit,
     }
 
 
@@ -92,7 +92,7 @@ def _build_redline(
         if entry is None:
             return
         locator = entry[1]
-        key = (locator.document_id, locator.version, locator.page)
+        key = (locator.document_id, locator.version, locator.unit)
         if key not in seen_locators:
             seen_locators.add(key)
             locators.append(_locator_dict(locator))

@@ -55,7 +55,7 @@ describe("foldTraceFrame", () => {
     });
     items = foldTraceFrame(items, {
       type: "tool_call",
-      name: "read_file",
+      name: "read_source",
       tool_call_id: "c2",
     });
     expect(items).toHaveLength(1);

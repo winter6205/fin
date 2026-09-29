@@ -46,7 +46,10 @@ from fin.retrieve.port import (
     RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY,
     RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY,
 )
-from fin.retrieve.read_port import read_from_pages, validate_company_source_ref
+from fin.retrieve.read_port import (
+    unit_text_from_pages,
+    validate_company_source_ref,
+)
 from fin.retrieve.source_read import (
     UNKNOWN_LOCATOR,
     bounded_slice,
@@ -96,14 +99,11 @@ class FakeRetrievePort:
     pages_by_doc
         Optional ``{document_id: ExtractedPage pages}`` read
         manifest (ADR 0046 / ADR 0047): the fake answers
-        ``read()`` (the ``read_file`` body fetch) and
         ``read_slice()`` (the bounded ``read_source`` leg, ADR 0088)
         from this table, so a scripted serve test can provide readable
         bodies without any on-disk extracted tree. Omitted (the
-        default), the fake corpus has no readable objects and
-        every ``read()`` is the typed
-        ``{"error": "unknown_locator"}`` miss and every
-        ``read_slice()`` the typed ``unknown_locator`` failure.
+        default), the fake corpus has no readable objects and every
+        ``read_slice()`` answers the typed ``unknown_locator`` failure.
     input_validation_ledger
         Optional「输入校验失败」count (T21). Omitted, the port
         keeps an in-memory one — quiet, never blind.
@@ -154,7 +154,7 @@ class FakeRetrievePort:
             dict(manifest_docs) if manifest_docs is not None else None
         )
         # Defensive copy so a caller mutating the source mapping after
-        # construction cannot change what ``read()`` serves.
+        # construction cannot change what ``read_slice`` serves.
         self._pages_by_doc: dict[str, Sequence[ExtractedPage]] = (
             dict(pages_by_doc) if pages_by_doc is not None else {}
         )
@@ -342,27 +342,6 @@ class FakeRetrievePort:
         # is not mutated so the next call sees the same corpus.
         return {"chunks": list(chunks[:effective_limit])}
 
-    def read(
-        self,
-        document_id: str,
-        version: str,
-        page: int = 1,
-        page_limit: int = 1,
-    ) -> dict[str, Any]:
-        """Answer a ``read_file`` body fetch from ``pages_by_doc``.
-
-        Mirrors the ``ReadPort`` contract (ADR 0046 / ADR 0047): the
-        happy dict ``{document_id, version, page, text, page_count}``
-        or the ``{"error": "unknown_locator"}`` miss. Without a
-        ``pages_by_doc`` manifest every read misses — the fake corpus
-        has no readable objects, which is a named answer, never a
-        fallback to a local tree. Concurrent calls share the read-only
-        page table and are safe.
-        """
-        return read_from_pages(
-            self._pages_by_doc, document_id, version, page, page_limit
-        )
-
     def read_slice(
         self,
         source_ref: Mapping[str, Any],
@@ -387,14 +366,14 @@ class FakeRetrievePort:
             # malformed identity never depends on what the manifest holds.
             return located
         document_id, version, unit = located
-        unit_read = read_from_pages(
-            self._pages_by_doc, document_id, version, unit, 1
+        text = unit_text_from_pages(
+            self._pages_by_doc, document_id, version, unit
         )
-        if "error" in unit_read:
+        if text is None:
             # EXIT: no such document / version / unit in the manifest —
-            # the same named miss ``read()`` folds, never an empty slice.
+            # the named miss, never an empty slice.
             return source_error(UNKNOWN_LOCATOR)
-        return bounded_slice(dict(source_ref), unit_read["text"], position)
+        return bounded_slice(dict(source_ref), text, position)
 
 
 __all__ = ["FakeRetrievePort"]

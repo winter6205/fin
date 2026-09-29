@@ -543,7 +543,7 @@ def test_real_ingest_writes_locator_and_passages(
     assert isinstance(first_page.locator, Locator)
     assert first_page.locator.document_id == sample_doc_id
     assert first_page.locator.version == expected[sample_doc_id]
-    assert first_page.locator.page == 1
+    assert first_page.locator.unit == 1
     assert first_page.text  # non-empty
     assert first_page.passages  # at least one passage
     # Passage offsets are half-open into the page text.

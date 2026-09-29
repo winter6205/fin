@@ -82,15 +82,26 @@ class AskRequest(BaseModel):
 class CitationSchema(BaseModel):
     """One code-filled citation in the response.
 
-    ``document_id`` / ``version`` / ``page`` always come from the
-    matched evidence item's locator — never from the model's claim
-    (ADR 0021). ``quote`` is the ≥32-char substring the gate
-    matched.
+    ``kind`` / ``document_id`` / ``attachment_id`` / ``version`` /
+    ``unit`` / ``display`` / ``filename`` always come from the matched
+    evidence item — never from the model's claim (ADR 0021). Exactly one
+    source id is set: ``document_id`` for a company citation,
+    ``attachment_id`` for an attachment one, whose ``filename`` is the
+    safe display name. ``display`` says how ``unit`` is presented
+    (``"page"`` for a physical PDF unit). ``quote`` is the ≥32-char
+    substring the gate matched.
     """
 
+    # ``kind`` / ``display`` carry no default: an incomplete row must fail
+    # here rather than surface as a company citation presenting a non-PDF
+    # unit as a physical page.
+    kind: str
     document_id: str
+    attachment_id: str = ""
     version: str
-    page: int
+    unit: int
+    display: str
+    filename: str = ""
     quote: str
 
 
@@ -100,6 +111,13 @@ class AskResponse(BaseModel):
     ``citations`` is always present (empty list when ``status`` is
     not ``done``). ``reason`` is populated only on ``refuse`` or
     ``step_cap``. ``answer`` is empty on ``refuse`` / ``step_cap``.
+
+    ``visual_claims`` is the run's visual-claim rows (ADR 0089): a separate
+    typed channel from ``citations`` — a generated visual observation is
+    never a source quote — so the non-streaming door exposes the same
+    provenance rows the streaming door and GET history carry. Always
+    present (``[]`` when the run produced none) so a caller never branches
+    on absence.
     """
 
     status: Literal["done", "refuse", "step_cap"]
@@ -107,6 +125,7 @@ class AskResponse(BaseModel):
     citations: list[CitationSchema] = Field(default_factory=list)
     thread_id: str
     reason: str | None = None
+    visual_claims: list[dict[str, Any]] = Field(default_factory=list)
 
 
 # ----- factory -----
@@ -336,6 +355,7 @@ def get_observability_collector() -> ObservabilityCollector:
 # (``app.dependency_overrides[get_workspace_root]``) for both the
 # ``/ask`` route and the workspace send / resume routes.
 from fin.host.workspace_http import (  # noqa: E402
+    _visual_claims_wire_payload,
     default_attachment_service,
     get_workspace_root,
     mount as _mount_workspace_routes,
@@ -499,6 +519,12 @@ def ask(
     # stripping / citation shaping. See ``fin.host.run_payload``.
     payload = _run_to_response_payload(raw)
 
+    # ADR 0089: the visual-claim channel is NOT part of the citation
+    # payload (run_payload is quote-channel only), so the non-streaming
+    # door reads it straight off the final state and normalises it with the
+    # SAME projector the streaming door uses — the two surfaces cannot
+    # drift, and the rows never ride ``citations``. ``[]`` when the run
+    # produced none, matching the persisted column and the SSE default.
     return AskResponse(
         status=payload["status"],
         answer=payload["answer"],
@@ -507,6 +533,7 @@ def ask(
         ],
         thread_id=thread_id,
         reason=payload["reason"] or None,
+        visual_claims=_visual_claims_wire_payload(raw.get("visual_claims")),
     )
 
 

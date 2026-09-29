@@ -146,7 +146,7 @@ The tagged-numbers format inside official 10-Q/10-K iXBRL. Not a website; SEC.go
 _Avoid_: using XBRL as a product or hostname, conflating it with iknow-memory retrieve
 
 **read_source**:
-The selected model-facing name for a known-locator source read, currently exposed in code as `read_file`: it resolves one authorized source unit from the company corpus or active-thread attachment without requiring a `retrieve` hit in the same run. Each read returns at most 8,000 Unicode code points and a complete serialized response of at most 32 KiB, including on the backend wire; continuation uses a zero-based code-point `next_position`, and only text returned in this run may become quoted-text citation evidence (ADRs 0046 and 0088); visual claims use the separate **visual evidence** path (ADR 0089).
+The model-facing name for a known-locator source read: it resolves one authorized source unit from the company corpus or active-thread attachment without requiring a `retrieve` hit in the same run. Each read returns at most 8,000 Unicode code points and a complete serialized response of at most 32 KiB, including on the backend wire; continuation uses a zero-based code-point `next_position`, and only text returned in this run may become quoted-text citation evidence (ADRs 0046 and 0088); visual claims use the separate **visual evidence** path (ADR 0089).
 _Avoid_: read_file as the future tool name, read_locator, read_page, read_chunk, treating read as retrieve, reading embeddings
 
 **ingest endpoint**:

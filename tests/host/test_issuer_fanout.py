@@ -21,8 +21,8 @@ from fin.host.tools.issuer_fanout import (
 )
 
 
-def _locator(document_id: str, page: int = 1) -> dict:
-    return {"document_id": document_id, "version": "v" * 64, "page": page}
+def _locator(document_id: str, unit: int = 1) -> dict:
+    return {"document_id": document_id, "version": "v" * 64, "unit": unit}
 
 
 # ----- the cap itself -----

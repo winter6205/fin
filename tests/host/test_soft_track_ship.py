@@ -20,11 +20,13 @@ from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+from fin.corpus.extracted import ExtractedPage, load_extracted_tree
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER
 from fin.host.jev_choice import JEV_CHOICE_EXIT_SCHEMA, JevChoiceError
 from fin.host.state import REPAIR_CAP, reset_input_state
 from fin.host.track_decision import decide_track
+from fin.retrieve import FakeRetrievePort
 from jev_fake import FakeJevChoice
 
 pytestmark = [pytest.mark.soft_track]
@@ -35,26 +37,75 @@ AAPL_2022Q3_VERSION = (
 )
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
-# Legacy tree-backed read adapter over the committed corpus. Only the
-# scripted ``read_file`` transcripts need it; the default graph no
-# longer reads the tree on its own (ADR 0046 / 0047).
-from fin.retrieve import ExtractedTreeReadPort
+MANIFEST_PATH = Path("data/corpus/manifest.json")
+EXTRACTED_ROOT = Path("data/corpus/extracted")
 
-_TREE_READ_PORT = ExtractedTreeReadPort(
-    Path("data/corpus/manifest.json"),
-    Path("data/corpus/extracted"),
-)
+_READ_MANIFEST: dict[str, tuple[ExtractedPage, ...]] | None = None
+
+
+def _read_manifest() -> dict[str, tuple[ExtractedPage, ...]]:
+    """The committed extracted tree as a ``{document_id: pages}`` read
+    manifest.
+
+    Only the scripted ``read_source`` transcripts need bodies: the graph
+    never reads the tree on its own (ADR 0046 / 0047), so the test hands
+    it in through the bound adapter's ``pages_by_doc``. Cached per
+    module: ``ExtractedPage`` is frozen and ``FakeRetrievePort`` copies
+    what it is handed, so no graph build disturbs another case's bodies.
+    """
+    global _READ_MANIFEST
+    if _READ_MANIFEST is None:
+        _READ_MANIFEST = load_extracted_tree(MANIFEST_PATH, EXTRACTED_ROOT)
+    return _READ_MANIFEST
+
+
+def _tree_read_adapter() -> FakeRetrievePort:
+    """A fake retrieve port whose company read leg serves the committed
+    corpus, so scripted ``read_source`` calls land on real filing text."""
+    return FakeRetrievePort(pages_by_doc=_read_manifest())
+
+
+def _read_source_call(unit: int, call_id: str) -> AIMessage:
+    """One ``read_source`` hop for one frozen unit, read from its start."""
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "read_source",
+                "args": {
+                    "source_ref": {
+                        "document_id": AAPL_2022Q3,
+                        "version": AAPL_2022Q3_VERSION,
+                        "unit": unit,
+                    },
+                    "position": 0,
+                },
+                "id": call_id,
+                "type": "tool_call",
+            }
+        ],
+    )
+
+
+def _tool_message_names(messages: list[Any]) -> set[str]:
+    return {
+        name
+        for name in (getattr(message, "name", None) for message in messages)
+        if name
+    }
+
+
+def _tool_call_names(messages: list[Any]) -> set[str]:
+    return {
+        call["name"]
+        for message in messages
+        for call in (getattr(message, "tool_calls", None) or [])
+    }
 
 
 @pytest.fixture(scope="module")
 def aapl_page1_text() -> str:
-    from fin.corpus.extracted import load_extracted_tree
-
-    tree = load_extracted_tree(
-        Path("data/corpus/manifest.json"),
-        Path("data/corpus/extracted"),
-    )
-    return tree[AAPL_2022Q3][0].text
+    return _read_manifest()[AAPL_2022Q3][0].text
 
 
 def _cfg(thread_id: str) -> dict:
@@ -119,7 +170,7 @@ def test_must_greeting_dialogue_no_tools_no_gate_done_empty_cites() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     out = g.invoke(
         {**reset_input_state("Hi!"), "evidence": []},
@@ -140,7 +191,7 @@ def test_must_greeting_boundary_thanks_is_dialogue() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     out = g.invoke(
         {**reset_input_state("Thanks!"), "evidence": []},
@@ -160,7 +211,7 @@ def test_must_greeting_boundary_no_durable_dialogue_system() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     g.invoke(
         {**reset_input_state("Hello"), "evidence": []},
@@ -195,7 +246,7 @@ def test_must_underspec_clarify_no_tools_done_empty_cites() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     out = g.invoke(
         {**reset_input_state("What was revenue?"), "evidence": []},
@@ -218,7 +269,7 @@ def test_must_clarify_boundary_metric_only_stays_clarify() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     out = g.invoke(
         {**reset_input_state("What was operating income?"), "evidence": []},
@@ -235,7 +286,7 @@ def test_must_clarify_boundary_never_enters_citation_gate() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     out = g.invoke(
         {**reset_input_state("net sales?"), "evidence": []},
@@ -266,7 +317,7 @@ def test_must_off_topic_soft_done_not_refuse() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     out = g.invoke(
         {
@@ -291,7 +342,7 @@ def test_must_off_topic_boundary_recipe_soft_done() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     out = g.invoke(
         {
@@ -312,7 +363,7 @@ def test_must_off_topic_boundary_empty_cites_and_answer() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     out = g.invoke(
         {**reset_input_state("Tell me a joke about cats"), "evidence": []},
@@ -332,22 +383,7 @@ def test_must_research_tools_span_done_with_citation(aapl_page1_text: str) -> No
     span = aapl_page1_text[:80]
     model = ScriptedChatModel(
         script=[
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "read_file",
-                        "args": {
-                            "document_id": AAPL_2022Q3,
-                            "version": AAPL_2022Q3_VERSION,
-                            "page": 1,
-                            "page_limit": 1,
-                        },
-                        "id": "c-read-ship",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
+            _read_source_call(1, "c-read-ship"),
             AIMessage(content=f"Per the filing: {span}"),
         ]
     )
@@ -355,7 +391,7 @@ def test_must_research_tools_span_done_with_citation(aapl_page1_text: str) -> No
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     out = g.invoke(
         {
@@ -368,6 +404,20 @@ def test_must_research_tools_span_done_with_citation(aapl_page1_text: str) -> No
     assert out["status"] == "done"
     assert len(out["citations"]) >= 1
     _assert_track_decision(out["track_decision"], track="grounded")
+    # The citation names the frozen unit this run read — ``unit``, never
+    # the retired whole-page ``page`` ordinal (spec decision 5).
+    citation = out["citations"][0]
+    assert citation.kind == "company"
+    assert citation.document_id == AAPL_2022Q3
+    assert citation.version == AAPL_2022Q3_VERSION
+    assert citation.unit == 1
+    assert citation.quote == span
+    # The retired whole-page seam is gone with no compatibility path: the
+    # research leaf called ``read_source`` and nothing named ``read_file``
+    # entered the transcript (spec thread-attachment-source-read SC11).
+    assert _tool_call_names(out["messages"]) == {"read_source"}
+    assert "read_source" in _tool_message_names(out["messages"])
+    assert "read_file" not in _tool_message_names(out["messages"])
 
 
 def test_must_gray_zone_bare_q_follows_judged_dialogue() -> None:
@@ -383,7 +433,7 @@ def test_must_gray_zone_bare_q_follows_judged_dialogue() -> None:
         model=model,
         jev_client=fake,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     out = g.invoke(
         {**reset_input_state("q"), "evidence": []},
@@ -406,22 +456,7 @@ def test_must_research_boundary_workspace_sse_track_and_history(
     span = aapl_page1_text[:80]
     model = ScriptedChatModel(
         script=[
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "read_file",
-                        "args": {
-                            "document_id": AAPL_2022Q3,
-                            "version": AAPL_2022Q3_VERSION,
-                            "page": 1,
-                            "page_limit": 1,
-                        },
-                        "id": "c-read-wire",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
+            _read_source_call(1, "c-read-wire"),
             AIMessage(content=f"Per the filing: {span}"),
         ]
     )
@@ -429,7 +464,7 @@ def test_must_research_boundary_workspace_sse_track_and_history(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     store = InMemoryThreadStore()
     app.dependency_overrides[get_graph] = lambda: g
@@ -452,10 +487,50 @@ def test_must_research_boundary_workspace_sse_track_and_history(
         assert terminal.get("track") == "grounded"
         assert terminal.get("status") == "done"
 
+        # The retired whole-page seam is gone with no compatibility path:
+        # the only source-read hop on this wire is ``read_source``, and its
+        # locator is the frozen company triple — neither ``read_file`` nor
+        # its ``page`` / ``page_limit`` keys may resurface here
+        # (spec thread-attachment-source-read SC11).
+        tool_call_frames = [d for e, d in events if e == "tool_call"]
+        assert [d["name"] for d in tool_call_frames] == ["read_source"]
+        read_args = tool_call_frames[0]["args"]
+        assert set(read_args) == {"source_ref", "position"}
+        assert set(read_args["source_ref"]) == {"document_id", "version", "unit"}
+        assert read_args["source_ref"]["document_id"] == AAPL_2022Q3
+        assert read_args["source_ref"]["version"] == AAPL_2022Q3_VERSION
+        assert read_args["source_ref"]["unit"] == 1
+        assert "read_file" not in {
+            d["name"] for e, d in events if e in ("tool_call", "tool_result")
+        }
+
+        # The passed citation is the unit the run read, on the wire and in
+        # the stored turn row: ``unit`` carries the ordinal, ``display:
+        # "page"`` only says that unit is presented as a physical page.
+        wire_citation = next(d for e, d in events if e == "citations")[0]
+        assert set(wire_citation) == {
+            "kind",
+            "document_id",
+            "attachment_id",
+            "version",
+            "unit",
+            "display",
+            "filename",
+            "quote",
+        }
+        assert wire_citation["document_id"] == AAPL_2022Q3
+        assert wire_citation["version"] == AAPL_2022Q3_VERSION
+        assert wire_citation["unit"] == 1
+        assert wire_citation["display"] == "page"
+        assert wire_citation["quote"] == span
+
         detail = client.get(f"/api/threads/{created['id']}").json()
         assert detail["turns"]
         td = detail["turns"][-1].get("track_decision") or {}
         _assert_track_decision(td, track="grounded")
+        stored_citation = detail["turns"][-1]["citations"][0]
+        assert stored_citation["unit"] == 1
+        assert "page" not in stored_citation
         runs = store.list_runs(created["id"])
         assert runs
         _assert_track_decision(runs[-1].track_decision, track="grounded")
@@ -479,7 +554,7 @@ def test_must_prior_snapshot_short_followup_inherits_research() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     tid = "ship-inherit"
     g.invoke(
@@ -536,7 +611,7 @@ def test_matrix_empty_blank_underspec_or_empty_snapshot() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     out = g.invoke(
         {**reset_input_state("revenue"), "evidence": []},
@@ -557,7 +632,7 @@ def test_matrix_negative_off_domain_wrong_track() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     out = g.invoke(
         {**reset_input_state("What's the weather in Seattle today?"), "evidence": []},
@@ -583,7 +658,7 @@ def test_matrix_overflow_caps_research_only_snapshots_retained(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     tid = "ship-overflow-repair"
     out = g.invoke(
@@ -613,7 +688,7 @@ def test_matrix_overflow_caps_research_only_snapshots_retained(
         checkpointer=InMemorySaver(),
         model=model2,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     tid2 = "ship-overflow-snap"
     g2.invoke(
@@ -656,7 +731,7 @@ def test_matrix_concurrent_soft_track_send_409() -> None:
         checkpointer=InMemorySaver(),
         model=blocking,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     store = InMemoryThreadStore()
     app.dependency_overrides[get_graph] = lambda: g
@@ -717,7 +792,7 @@ def test_matrix_exception_judge_exit_defined_track() -> None:
         model=model,
         jev_client=fake_graph,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     out = g.invoke(
         {

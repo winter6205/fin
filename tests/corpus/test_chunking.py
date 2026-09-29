@@ -257,9 +257,9 @@ def test_citation_gate_matches_span_of_child_payload_text() -> None:
             locator=Locator(
                 document_id=uc.locator.document_id,
                 version=uc.locator.version,
-                page=uc.locator.unit,
+                unit=uc.locator.unit,
             ),
-            page_text=block.text,
+            unit_text=block.text,
         )
         for block in uc.hittable_blocks()
     ]
@@ -302,9 +302,9 @@ def test_span_across_child_cut_is_not_matched() -> None:
             locator=Locator(
                 document_id=uc.locator.document_id,
                 version=uc.locator.version,
-                page=uc.locator.unit,
+                unit=uc.locator.unit,
             ),
-            page_text=block.text,
+            unit_text=block.text,
         )
         for block in uc.hittable_blocks()
     ]

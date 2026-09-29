@@ -27,7 +27,7 @@ The on-disk shape is a JSON object with a ``facts`` list:
           "source_locator": {
             "document_id": "AAPL-2023Q3",
             "version": "[private source excerpt removed]",
-            "page": 4
+            "unit": 4
           }
         }
       ]
@@ -177,7 +177,7 @@ def read_facts(
             locator = Locator(
                 document_id=locator_payload["document_id"],
                 version=locator_payload["version"],
-                page=int(locator_payload["page"]),
+                unit=int(locator_payload["unit"]),
             )
         except (KeyError, TypeError, ValueError):
             continue

@@ -34,6 +34,7 @@ from typing import Any
 
 from fin.corpus.determinism import canonical_json_bytes
 from fin.host.attachment_store import (
+    AttachmentRecord,
     AttachmentStore,
     AttachmentThreadGoneError,
 )
@@ -179,6 +180,48 @@ class AttachmentSourceReader:
             raise ValueError("thread_id must be a non-empty string")
         self._store = store
         self._thread_id = thread_id
+
+    def owned_record(self, attachment_id: str) -> AttachmentRecord | None:
+        """The thread-owned, readable record behind one id, or ``None``.
+
+        The host graph's typed-citation builder asks this to carry the
+        trusted ``filename`` and version onto an evidence item, so it is
+        the one place display metadata is granted — and it grants them
+        only for an attachment this thread actually owns.
+
+        EXIT: unknown, foreign-thread, tombstoned, and unready rows all
+        answer ``None`` — the same fail-closed shape as the read leg's
+        ``unknown_locator``, so the answer cannot reveal which of them a
+        thread holds. A store fault is ``None`` too: identity for a
+        citation is only granted from a record we could actually read.
+        """
+        try:
+            record = self._store.get(attachment_id)
+        except Exception as exc:
+            logger.debug("attachment identity store fault: %s", exc)
+            return None
+        if (
+            record is None
+            or record.thread_id != self._thread_id
+            or not record.searchable
+        ):
+            return None
+        return record
+
+    def identity_is_current(
+        self, attachment_id: str, version_int: int | None
+    ) -> bool:
+        """True only while the id is still this thread's AND the record's
+        parsed-content version still equals ``version_int``.
+
+        The citation gate calls this as its trust re-check: an id voided,
+        re-owned, or re-prepared to a newer version since the read no
+        longer grounds a citation, even when the quoted text matches.
+        """
+        if version_int is None:
+            return False
+        record = self.owned_record(attachment_id)
+        return record is not None and record.version == version_int
 
     def read_slice(
         self,

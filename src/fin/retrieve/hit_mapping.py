@@ -2,7 +2,7 @@
 
 A retrieval hit carries the *retrieval service's* own identifier. Only
 fin can map that identifier back to a **locator**
-(``{document_id, version, page}``), and only a locator may appear as
+(``{document_id, version, unit}``), and only a locator may appear as
 citation evidence: passing a retrieval-side id to the citation gate
 would put a foreign identity in front of the user (ADR 0030).
 
@@ -489,7 +489,7 @@ def _locator_of_hit(
             locator = Locator(
                 document_id=canonical_locator.document_id,
                 version=canonical_locator.version,
-                page=canonical_locator.unit,
+                unit=canonical_locator.unit,
             )
     if not isinstance(locator, Locator):
         ledger.record(
@@ -612,7 +612,7 @@ def _locator_of_chunk(
     return Locator(
         document_id=canonical.document_id,
         version=canonical.version,
-        page=canonical.unit,
+        unit=canonical.unit,
     )
 
 

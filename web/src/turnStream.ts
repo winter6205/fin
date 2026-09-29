@@ -87,6 +87,18 @@ export function foldSendResultAnswer(
   return currentAnswer + text;
 }
 
+/** The server row's table wins once it has rows; the streamed one is the
+ * fallback for a mid-run reopen, where the ``RunRecord`` is appended only
+ * when the stream completes and a blank server array would erase a grid the
+ * operator is already reading. */
+function preferServerRows<T>(
+  persisted: T[] | undefined,
+  streamed: T[] | undefined,
+): T[] | undefined {
+  if (persisted === undefined || persisted.length === 0) return streamed;
+  return persisted;
+}
+
 /** After GET reconcile, prefer the streamed row's visible prose when
  * the operator already watched it arrive token-by-token. Persisted
  * fields (citations with quotes, ids) still come from the server row.
@@ -114,10 +126,11 @@ export function mergeReconciledTurn(streamed: Turn, persisted: Turn): Turn {
     // RunRecord does not exist yet (it is appended once the stream
     // completes) and dropping the table would blank a grid the
     // operator is already reading.
-    comparisons:
-      (persisted.comparisons?.length ?? 0) > 0
-        ? persisted.comparisons
-        : streamed.comparisons,
+    comparisons: preferServerRows(persisted.comparisons, streamed.comparisons),
+    visual_claims: preferServerRows(
+      persisted.visual_claims,
+      streamed.visual_claims,
+    ),
     // search-mode-host T2: a suspended run's painted window must
     // survive a reconcile — the server row carries no field for it
     // (the window is live-only; the body-less resume re-emits it).

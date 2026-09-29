@@ -180,7 +180,7 @@ def test_setting_and_flipping_feedback_never_mutates_citations(
         {
             "document_id": "AAPL-2022Q3",
             "version": "a" * 64,
-            "page": 4,
+            "unit": 4,
             "quote": "revenue was up five percent year over year",
         }
     ]

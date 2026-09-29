@@ -3,7 +3,7 @@
 ``specs/cross-session-operator-memory.md`` SC25-SC28 (gating bullet):
 "Gold (scripted): greeting → 0 prefetch; assembled payload has no
 full-store catalog / promote; extract deny classes do not persist;
-research turn with a number has a retrieve (or ``read_file``) tool
+research turn with a number has a retrieve (or ``read_source``) tool
 call; a fact whose title matches a corpus company still uses retrieve
 for filing claims; explicit save is recallable on a new ``thread_id``."
 
@@ -325,7 +325,7 @@ def test_greeting_payload_has_no_full_store_catalog(tmp_path: Path) -> None:
 
 
 # ===========================================================================
-# SC26 — Research number → retrieve or read_file recorded.
+# SC26 — Research number → retrieve or read_source recorded.
 # ===========================================================================
 
 
@@ -334,13 +334,13 @@ def test_research_turn_with_number_records_retrieve_tool_call(
     tmp_path: Path,
 ) -> None:
     """SC26: a research ask that states a number records a retrieve or
-    ``read_file`` tool call before the run reaches ``done``.
+    ``read_source`` tool call before the run reaches ``done``.
 
     The scripted model performs a retrieve call first (research
     track turns must read a real source for citation), then answers
     with a verifiable prose line. The post-run state captures the
     tool calls; we assert at least one of ``retrieve`` /
-    ``read_file`` is in the run's messages, regardless of final
+    ``read_source`` is in the run's messages, regardless of final
     status (the run may bounce or refuse depending on the
     citation-gate span; the spec pins the TOOL CALL, not the gate).
     """
@@ -397,7 +397,7 @@ def test_research_turn_with_number_records_retrieve_tool_call(
         config={"configurable": {"thread_id": "t-gold-sc26", "workspace_root": workspace}},
     )
 
-    # The critical property: at least one retrieve or read_file tool
+    # The critical property: at least one retrieve or read_source tool
     # call appears in the run's messages. We inspect every message
     # because the ToolNode emits both the AIMessage that requested
     # the tool and the ToolMessage that answered it; the
@@ -408,9 +408,9 @@ def test_research_turn_with_number_records_retrieve_tool_call(
         if isinstance(message, AIMessage):
             for tc in message.tool_calls or []:
                 seen_tool_calls.append(str(tc.get("name", "")))
-    assert "retrieve" in seen_tool_calls or "read_file" in seen_tool_calls, (
+    assert "retrieve" in seen_tool_calls or "read_source" in seen_tool_calls, (
         f"SC26 violated: research turn with a number produced no "
-        f"retrieve/read_file tool calls; saw {seen_tool_calls!r}"
+        f"retrieve/read_source tool calls; saw {seen_tool_calls!r}"
     )
 
 
@@ -433,7 +433,7 @@ def test_company_named_fact_still_uses_retrieve_for_filing_claim(
     company's filing numbers; the scripted model performs a
     ``retrieve`` call. We then assert:
 
-    * the run recorded a ``retrieve`` / ``read_file`` tool call
+    * the run recorded a ``retrieve`` / ``read_source`` tool call
       (memory did not short-circuit);
     * the fact body did NOT satisfy the citation verifier — the
       evidence channel stays empty even though memory text was
@@ -500,7 +500,7 @@ def test_company_named_fact_still_uses_retrieve_for_filing_claim(
         config={"configurable": {"thread_id": "t-gold-sc27", "workspace_root": workspace}},
     )
 
-    # (a) The model still hit retrieve / read_file even though the
+    # (a) The model still hit retrieve / read_source even though the
     # memory fact's title matched the company name — memory did not
     # short-circuit.
     messages = list(out.get("messages", []))
@@ -509,13 +509,13 @@ def test_company_named_fact_still_uses_retrieve_for_filing_claim(
         if isinstance(message, AIMessage):
             for tc in message.tool_calls or []:
                 seen_tool_calls.append(str(tc.get("name", "")))
-    assert "retrieve" in seen_tool_calls or "read_file" in seen_tool_calls, (
+    assert "retrieve" in seen_tool_calls or "read_source" in seen_tool_calls, (
         f"SC27 violated: company-named fact short-circuited the "
         f"research turn; saw {seen_tool_calls!r}"
     )
 
     # (b) The fact body is NOT citation evidence. The evidence
-    # channel is fed only by retrieve / read_file ``Command.update``
+    # channel is fed only by retrieve / read_source ``Command.update``
     # payloads (test_memory_not_citation structural proof), and
     # here the FakeRetrievePort did not actually return any chunk
     # for the scripted query — so the evidence list stays empty.
@@ -525,7 +525,7 @@ def test_company_named_fact_still_uses_retrieve_for_filing_claim(
     evidence = list(out.get("evidence", []))
     fact_body = "0000320193-23-000106"
     for evidence_item in evidence:
-        assert fact_body not in str(evidence_item.page_text), (
+        assert fact_body not in str(evidence_item.unit_text), (
             "SC27 violated: the fact body leaked into the evidence "
             "channel and could be cited as if it were corpus text"
         )
@@ -872,9 +872,9 @@ def test_default_pytest_builds_off_graph_with_zero_memory_tools(
 ) -> None:
     """Plan-acceptance last bullet: default pytest builds OFF even
     if the operator ``.env`` is ON. The compiled graph exposes
-    exactly the existing eight tools — no save_memory,
-    recall_memory, or edit_user_profile in either the bound model
-    or the ToolNode.
+    exactly the closed eight ToolNode tools plus ``research_issuers``
+    on the model side — no save_memory, recall_memory, or
+    edit_user_profile in either the bound model or the ToolNode.
 
     This test is intentionally UNMARKED: the default suite must
     observe the OFF contract, not opt back into ON via the marker.
@@ -904,19 +904,24 @@ def test_default_pytest_builds_off_graph_with_zero_memory_tools(
         assert forbidden not in bound_names
         assert forbidden not in tool_node_names
 
-    # The OFF path uses the existing nine ToolNode tools (no
-    # memory surface). Locked to a set equality so a future
-    # unplanned add-the-next-tool change is caught; G4 T4 (ADR
-    # 0087) deliberately added ``read_source`` alongside
-    # ``read_file`` (T5 removes the latter).
-    assert tool_node_names == {
+    # The OFF path exposes the closed eight-tool ToolNode set (no
+    # memory surface); the model side adds only ``research_issuers``.
+    # Locked to set equality so a future unplanned add-the-next-tool
+    # change is caught, and the retired ``read_file`` is pinned absent
+    # on both surfaces (spec thread-attachment-source-read SC11: the
+    # model-visible tool list contains ``read_source`` and no
+    # ``read_file``).
+    _TOOL_NODE_NAMES = {
         "list_files",
-        "read_file",
-        "read_source",
         "retrieve",
         "get_xbrl_fact",
         "compare_facts",
         "redline",
         "extract_tables",
         "three_year_statement",
+        "read_source",
     }
+    assert tool_node_names == _TOOL_NODE_NAMES
+    assert bound_names == _TOOL_NODE_NAMES | {"research_issuers"}
+    assert "read_file" not in tool_node_names
+    assert "read_file" not in bound_names

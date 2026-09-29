@@ -205,7 +205,7 @@ def test_live_corpus_ingest_then_retrieve_returns_byte_identical_chunks(
             UnitLocator(
                 document_id=locator.document_id,
                 version=locator.version,
-                unit=locator.page,
+                unit=locator.unit,
             )
             in pushed_locators
         ), f"retrieved chunk points at {locator!r}, not a pushed 资料"

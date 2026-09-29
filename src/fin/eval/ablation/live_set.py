@@ -264,7 +264,7 @@ def _build_live_queries(
     """Construct :class:`EvalQuery` objects off T1 queries + frozen text.
 
     T1 samples are single-page markdown; the wrapper treats each file
-    as one ``unit`` (page=1). The citation gate's 32-character minimum
+    as one ``unit`` (unit=1). The citation gate's 32-character minimum
     is met by extending the ``evidence_span`` inside the same frozen
     unit text (same rule ``citable_answer`` applies for the dataset
     set).

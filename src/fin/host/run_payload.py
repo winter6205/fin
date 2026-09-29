@@ -106,7 +106,7 @@ ORDINARY_PERSON_COPY: Final[dict[str, str]] = {
     ),
     # Gate bounced REPAIR_CAP times without grounding the answer.
     "citation_repair_cap": (
-        "I couldn't match the answer to the cited pages after a "
+        "I couldn't match the answer to the cited sources after a "
         "few tries - try rephrasing or narrower scope."
     ),
     # Numeric gate (ADR 0031): the answer's figure did not match
@@ -189,8 +189,8 @@ def _evidence_locators(raw: dict[str, Any]) -> list[dict[str, Any]]:
     Reads ``AgentState["evidence"]`` — the run-scoped list the tool
     node appends to and ``reset_input_state`` clears between runs
     (ADR 0016) — so the value is always THIS run's, never the
-    thread's history. Retrieve contributes several chunks per page,
-    so identical ``{document_id, version, page}`` triples collapse
+    thread's history. Retrieve contributes several chunks per unit,
+    so identical ``{document_id, version, unit}`` triples collapse
     to one entry in first-touch order.
 
     An entry without a well-formed ``locator`` is skipped rather
@@ -207,13 +207,13 @@ def _evidence_locators(raw: dict[str, Any]) -> list[dict[str, Any]]:
         key = (
             str(getattr(locator, "document_id", "")),
             str(getattr(locator, "version", "")),
-            int(getattr(locator, "page", 0) or 0),
+            int(getattr(locator, "unit", 0) or 0),
         )
         if key in seen:
             continue
         seen.add(key)
         out.append(
-            {"document_id": key[0], "version": key[1], "page": key[2]}
+            {"document_id": key[0], "version": key[1], "unit": key[2]}
         )
     return out
 
@@ -308,11 +308,19 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
     )
 
     if status_value == "done":
+        # The full citation contract goes on the wire, not just the
+        # company triple: an attachment citation carries no
+        # ``document_id`` and is only openable from its identity plus
+        # ``display`` / ``filename``.
         citations_payload: list[dict[str, Any]] = [
             {
+                "kind": cit.kind,
                 "document_id": cit.document_id,
+                "attachment_id": cit.attachment_id,
                 "version": cit.version,
-                "page": cit.page,
+                "unit": cit.unit,
+                "display": cit.display,
+                "filename": cit.filename,
                 "quote": cit.quote,
             }
             for cit in raw_citations

@@ -177,7 +177,7 @@ _RESEARCH_SIGNAL_RE = re.compile(
     r"AAPL|MSFT|AMZN|Apple|Microsoft|Amazon|"
     r"10-?Q|filing|filings|SEC|"
     r"revenue|net\s+sales|operating\s+income|EPS|"
-    r"document_id|retrieve|read_file|list_files|"
+    r"document_id|retrieve|read_source|list_files|"
     r"2022|2023|Q[1-4]"
     r")\b",
     re.IGNORECASE,
@@ -358,7 +358,7 @@ def _rules_decision(text: str, signals: dict[str, Any]) -> TrackDecision | None:
                 signals=signals,
             )
         if re.search(
-            r"\b(document_id|retrieve|read_file|list_files)\b",
+            r"\b(document_id|retrieve|read_source|list_files)\b",
             text or "",
             re.IGNORECASE,
         ):

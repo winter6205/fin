@@ -26,6 +26,7 @@ tool is testable before either leg's real implementation is wired.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any, Mapping
 
 import pytest
@@ -33,7 +34,13 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.extracted import Locator
+from fin.host.citation_gate import (
+    EvidenceItem,
+    MalformedEvidenceError,
+    verify_citations,
+)
 from fin.host.graph import (
+    _evidence_from_slice,
     _make_read_source_tool,
     _MissSourceReader,
     compile_graph,
@@ -41,6 +48,7 @@ from fin.host.graph import (
 from fin.host.stream_map import format_tool_summary
 from fin.host.tools.read_source import read_source
 from fin.retrieve.source_read import (
+    ATTACHMENT_KIND,
     INVALID_LOCATOR,
     SOURCE_BACKEND_CONTRACT_ERROR,
     SOURCE_READ_MAX_RESULT_BYTES,
@@ -108,6 +116,65 @@ class _SlicingReader:
     ) -> dict[str, Any]:
         self.calls.append((dict(source_ref), position))
         return bounded_slice(dict(source_ref), self.text, position)
+
+
+@dataclass(frozen=True)
+class _AttachmentRecordView:
+    """What the host reads off a trusted record to cite one attachment.
+
+    Only ``filename`` and ``version`` reach the citation identity, and the
+    production mapping is what turns them into a display name plus a
+    ``page`` / ``unit`` presentation — so the fake stays a value holder.
+    """
+
+    attachment_id: str
+    thread_id: str
+    filename: str
+    version: int
+
+
+class _AttachmentLeg:
+    """Attachment leg carrying the identity faces the host trusts.
+
+    A returned slice alone earns no citation: the host asks the run's own
+    leg for the record the slice was admitted under (safe filename +
+    version), and the citation gate re-asks that same leg whether the
+    identity is still current for the run's thread.
+    """
+
+    def __init__(
+        self,
+        thread_id: str,
+        text: str = UNIT_TEXT,
+        *,
+        filename: str = "memo.txt",
+    ) -> None:
+        self.thread_id = thread_id
+        self.text = text
+        self.filename = filename
+        self.calls: list[tuple[dict[str, Any], int]] = []
+
+    def read_slice(
+        self, source_ref: Mapping[str, Any], position: int = 0
+    ) -> dict[str, Any]:
+        self.calls.append((dict(source_ref), position))
+        return bounded_slice(dict(source_ref), self.text, position)
+
+    def owned_record(self, attachment_id: str) -> _AttachmentRecordView:
+        return _AttachmentRecordView(
+            attachment_id=attachment_id,
+            thread_id=self.thread_id,
+            filename=self.filename,
+            version=ATTACHMENT_VERSION,
+        )
+
+    def identity_is_current(
+        self, attachment_id: str, version_int: int | None
+    ) -> bool:
+        return (
+            attachment_id == ATTACHMENT_ID
+            and version_int == ATTACHMENT_VERSION
+        )
 
 
 class _NoLegAdapter:
@@ -315,10 +382,17 @@ def test_success_slice_yields_exactly_one_mapped_evidence_item() -> None:
     assert len(update["evidence"]) == 1
     item = update["evidence"][0]
     assert item.locator == Locator(
-        document_id=COMPANY_ID, version=COMPANY_VERSION, page=3
+        document_id=COMPANY_ID, version=COMPANY_VERSION, unit=3
     )
     # The unit is shorter than one slice, so the whole text was returned.
-    assert item.page_text == UNIT_TEXT
+    assert item.unit_text == UNIT_TEXT
+    # What the model is handed back names the unit with exactly the
+    # company triple — no generic page ordinal rides along.
+    assert set(_tool_payload(command)["source_ref"]) == {
+        "document_id",
+        "version",
+        "unit",
+    }
 
 
 def test_slice_text_shorter_than_the_unit_is_what_evidence_carries() -> None:
@@ -331,20 +405,47 @@ def test_slice_text_shorter_than_the_unit_is_what_evidence_carries() -> None:
     command = _invoke_tool(tool, source_ref=_company_ref())
     item = _command_update(command)["evidence"][0]
 
-    assert 0 < len(item.page_text) <= 8000
-    assert item.page_text == text[: len(item.page_text)]
+    assert 0 < len(item.unit_text) <= 8000
+    assert item.unit_text == text[: len(item.unit_text)]
 
 
 def test_attachment_slice_maps_the_attachment_identity() -> None:
-    leg = _SlicingReader(UNIT_TEXT)
+    """An attachment slice carries its own identity: the company
+    ``document_id`` slot stays empty and the attachment id, version and
+    unit are what a citation will repeat."""
+    leg = _AttachmentLeg("t-run")
     tool = _make_read_source_tool(None, lambda thread_id: leg)
 
     command = _invoke_tool(tool, source_ref=_attachment_ref())
     item = _command_update(command)["evidence"][0]
 
+    assert item.kind == ATTACHMENT_KIND
+    assert item.attachment_id == ATTACHMENT_ID
     assert item.locator == Locator(
-        document_id=ATTACHMENT_ID, version=str(ATTACHMENT_VERSION), page=2
+        document_id="", version=str(ATTACHMENT_VERSION), unit=2
     )
+    assert item.unit_text == UNIT_TEXT
+
+
+@pytest.mark.parametrize(
+    "filename, display",
+    [("quarterly-brief.pdf", "page"), ("memo.txt", "unit")],
+    ids=["pdf_presents_as_page", "text_presents_as_unit"],
+)
+def test_attachment_citation_presentation_comes_from_the_record_filename(
+    filename: str, display: str
+) -> None:
+    """A PDF's frozen units are presented as physical pages and every
+    other kind as units; the presentation is derived from the trusted
+    record's safe name, never from the model's wording."""
+    leg = _AttachmentLeg("t-run", filename=filename)
+    tool = _make_read_source_tool(None, lambda thread_id: leg)
+
+    command = _invoke_tool(tool, source_ref=_attachment_ref())
+    item = _command_update(command)["evidence"][0]
+
+    assert item.filename == filename
+    assert item.display == display
 
 
 @pytest.mark.parametrize(
@@ -390,6 +491,58 @@ def test_terminal_empty_slice_admits_no_evidence() -> None:
         "text": "",
         "next_position": None,
     }
+
+
+@pytest.mark.parametrize(
+    "source_ref",
+    [
+        {"document_id": COMPANY_ID, "version": COMPANY_VERSION},
+        {"document_id": COMPANY_ID, "version": COMPANY_VERSION, "unit": 0},
+        {"document_id": COMPANY_ID, "version": COMPANY_VERSION, "unit": "3a"},
+        {"document_id": COMPANY_ID, "version": COMPANY_VERSION, "unit": None},
+        {"document_id": COMPANY_ID, "version": COMPANY_VERSION, "unit": True},
+        {"document_id": COMPANY_ID, "version": COMPANY_VERSION, "unit": "4"},
+    ],
+    ids=["absent", "zero", "non-numeric", "null", "boolean", "coercible-string"],
+)
+def test_a_slice_without_an_attributable_ordinal_admits_no_evidence(
+    source_ref: dict[str, Any],
+) -> None:
+    """A returned slice the gate cannot attribute earns no evidence item.
+
+    The gate validates its evidence eagerly and raises, so admitting one
+    of these would fail the whole run over one unreadable ordinal; the
+    model still received its text, and the citation simply has nothing
+    to rest on.
+    """
+    assert _evidence_from_slice(
+        {"source_ref": source_ref, "text": UNIT_TEXT[:120], "next_position": None}
+    ) is None
+
+
+def test_the_gate_rejects_the_ordinal_the_admission_refused() -> None:
+    """The refusal is load-bearing: that same slice, if admitted, raises
+    ``MalformedEvidenceError`` out of ``verify_citations`` rather than
+    being skipped."""
+    orphan = {"document_id": COMPANY_ID, "version": COMPANY_VERSION, "unit": 0}
+    admitted = _evidence_from_slice(
+        {"source_ref": orphan, "text": UNIT_TEXT[:120], "next_position": None}
+    )
+    assert admitted is None
+    with pytest.raises(MalformedEvidenceError):
+        verify_citations(
+            UNIT_TEXT[:120],
+            [
+                EvidenceItem(
+                    locator=Locator(
+                        document_id=COMPANY_ID, version=COMPANY_VERSION, unit=0
+                    ),
+                    unit_text=UNIT_TEXT[:120],
+                )
+            ],
+            0,
+            known_document_ids={COMPANY_ID},
+        )
 
 
 def test_unwired_leg_reports_the_miss_through_the_tool() -> None:
@@ -518,9 +671,9 @@ def test_tool_arguments_expose_only_source_ref_and_position() -> None:
 # ----- graph wiring -----
 
 
-def test_read_source_is_bound_next_to_read_file() -> None:
-    """Both tools coexist until T5 removes ``read_file``; ``read_source``
-    is bound last so no existing tool shifts position."""
+def test_the_model_sees_read_source_and_never_read_file() -> None:
+    """``read_source`` is the only source-read tool the model can call,
+    and it is bound last so no existing tool shifts position."""
     model = _RecordingModel()
     g = compile_graph(
         checkpointer=InMemorySaver(),
@@ -529,7 +682,8 @@ def test_read_source_is_bound_next_to_read_file() -> None:
     )
 
     names = [tool.name for tool in g._bound_tools]
-    assert "read_file" in names
+    assert "read_source" in names
+    assert "read_file" not in names
     assert names[-1] == "read_source"
 
 
@@ -601,7 +755,7 @@ def test_direct_read_without_retrieve_passes_the_gate() -> None:
     citation = out["citations"][0]
     assert citation.document_id == COMPANY_ID
     assert citation.version == COMPANY_VERSION
-    assert citation.page == 3
+    assert citation.unit == 3
 
 
 def test_continuation_read_accumulates_both_slices() -> None:
@@ -645,17 +799,101 @@ def test_continuation_read_accumulates_both_slices() -> None:
     out = g.invoke(_fresh_state(), config=_thread_config("t-continuation"))
 
     assert out["status"] == "done"
-    assert [len(item.page_text) for item in out["evidence"]] == [8000, 8000]
+    assert [len(item.unit_text) for item in out["evidence"]] == [8000, 8000]
+
+
+def _two_read_script(answer: str, second_position: int) -> list[AIMessage]:
+    """Script: read the unit from 0, continue at ``second_position``, answer."""
+    return [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "read_source",
+                    "args": {"source_ref": _company_ref(), "position": 0},
+                    "id": "c-1",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "read_source",
+                    "args": {
+                        "source_ref": _company_ref(),
+                        "position": second_position,
+                    },
+                    "id": "c-2",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        AIMessage(content=answer),
+    ]
+
+
+@pytest.mark.parametrize(
+    "second_position, grounded",
+    [(8000, True), (9000, False)],
+    ids=["adjacent_slices_join", "unseen_gap_stays_ungrounded"],
+)
+def test_a_quote_across_the_slice_boundary_depends_on_continuity(
+    second_position: int, grounded: bool
+) -> None:
+    """The same copied span is admissible only when the two returned
+    slices touch.
+
+    The span is 20 code points of ``M`` plus 20 of ``N``, laid out so the
+    first slice (code points 0..8000) ends inside it: neither returned
+    slice alone holds a ≥32-character run of it, so only a continuation
+    that starts exactly where the first slice stopped can ground the
+    quote. Continuing at 9000 instead leaves a thousand code points this
+    run never saw — including the ``N`` half — and the quote stays
+    ungrounded.
+    """
+    from fin.host.scripted_model import ScriptedChatModel
+
+    span = "M" * 20 + "N" * 20
+    text = "u" * (8000 - 20) + span + "v" * 7980
+    model = ScriptedChatModel(
+        script=_two_read_script(f"Across the boundary: {span} end.", second_position)
+    )
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=model,
+        adapter=_FakeCompanyAdapter(text=text),
+    )
+
+    out = g.invoke(
+        _fresh_state(), config=_thread_config(f"t-spanning-{second_position}")
+    )
+
+    assert (out["status"] == "done") is grounded, out["status"]
+    quotes = [citation.quote for citation in out.get("citations", ())]
+    assert (span in quotes) is grounded
 
 
 def test_attachment_read_goes_through_the_injected_factory() -> None:
+    """The attachment leg is resolved per call against the run's thread.
+
+    Two consumers ask the factory for a leg in one run — the read itself
+    and the citation gate's identity re-check — so the interesting
+    invariant is not how often it is called but WHERE the binding comes
+    from: every leg is built with the thread of the run that asked, and
+    a second run on the same compiled graph in a different thread gets
+    its own leg instead of a reader cached on the shared graph object
+    (which would freeze the first thread's scope open).
+    """
     from fin.host.scripted_model import ScriptedChatModel
 
-    calls: list[str] = []
+    built: list[_AttachmentLeg] = []
 
-    def factory(thread_id: str) -> Any:
-        calls.append(thread_id)
-        return _SlicingReader(UNIT_TEXT)
+    def factory(thread_id: str) -> _AttachmentLeg:
+        leg = _AttachmentLeg(thread_id)
+        built.append(leg)
+        return leg
 
     quoted = UNIT_TEXT[:60]
     model = ScriptedChatModel(
@@ -675,9 +913,29 @@ def test_attachment_read_goes_through_the_injected_factory() -> None:
         config=_thread_config("t-attach-read"),
     )
 
-    assert calls == ["t-attach-read"]
     assert out["status"] == "done"
-    assert out["citations"][0].document_id == ATTACHMENT_ID
+    assert out["citations"][0].attachment_id == ATTACHMENT_ID
+    first_run_legs = list(built)
+    # Read leg + gate re-check: both resolve one, and both resolve it for
+    # the thread this run is bound to.
+    assert len(first_run_legs) >= 2
+    assert all(leg.thread_id == "t-attach-read" for leg in first_run_legs)
+
+    other_thread = "t-attach-other"
+    model._index = 0
+    model.script = _scripted_read_source_run(
+        f"The memo says: {quoted}", _attachment_ref()
+    )
+    second = g.invoke(
+        _fresh_state("What was AAPL net sales in 2023 Q3 in the memo?"),
+        config=_thread_config(other_thread),
+    )
+
+    assert second["status"] == "done"
+    second_run_legs = built[len(first_run_legs):]
+    assert second_run_legs
+    assert all(leg.thread_id == other_thread for leg in second_run_legs)
+    assert not any(leg in first_run_legs for leg in second_run_legs)
 
 
 def test_idempotence_cache_holds_the_reader_factory_object_itself() -> None:
@@ -733,7 +991,7 @@ def test_idempotence_cache_holds_the_reader_factory_object_itself() -> None:
 
 def test_company_read_with_no_attachment_leg_still_routes_company() -> None:
     """A graph with neither leg wired answers the typed miss rather
-    than crashing (mirrors ``MissReadPort`` for read_file)."""
+    than crashing — the same ``unknown_locator`` an unwired leg gives."""
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=_RecordingModel(),

@@ -126,7 +126,7 @@ def _write_statement_facts(tmp_path: Path) -> Path:
                     unit="USD",
                     scale="millions",
                     source_locator=Locator(
-                        document_id=document_id, version="d" * 64, page=4
+                        document_id=document_id, version="d" * 64, unit=4
                     ),
                 ),
                 Fact(
@@ -136,7 +136,7 @@ def _write_statement_facts(tmp_path: Path) -> Path:
                     unit="USD",
                     scale="millions",
                     source_locator=Locator(
-                        document_id=document_id, version="d" * 64, page=4
+                        document_id=document_id, version="d" * 64, unit=4
                     ),
                 ),
             ],
@@ -170,7 +170,7 @@ def test_redline_returns_paragraph_changes_with_source_locators(tmp_path: Path) 
     assert payload["changes"][0]["before_locator"] == {
         "document_id": "ACME-2022Q3",
         "version": "a" * 64,
-        "page": 1,
+        "unit": 1,
     }
     assert payload["changes"][-1]["after_locator"]["document_id"] == "ACME-2023Q3"
     assert json.loads(json.dumps(result)) == result
@@ -209,13 +209,13 @@ def test_redline_malformed_tree_is_typed_exception_exit(tmp_path: Path) -> None:
     assert result["redline"]["changes"] == []
 
 
-def test_table_extract_is_bound_to_fixture_page_locator(tmp_path: Path) -> None:
+def test_table_extract_is_bound_to_fixture_unit_locator(tmp_path: Path) -> None:
     fixture = _write_extracted_fixture(tmp_path)
 
     result = extract_tables(
         document_id="ACME-TABLE-2023Q3",
         version=fixture["table_version"],
-        page=1,
+        unit=1,
         manifest_path=fixture["manifest"],
         extracted_root=fixture["extracted"],
     )
@@ -225,7 +225,7 @@ def test_table_extract_is_bound_to_fixture_page_locator(tmp_path: Path) -> None:
     assert payload["locator"] == {
         "document_id": "ACME-TABLE-2023Q3",
         "version": "c" * 64,
-        "page": 1,
+        "unit": 1,
     }
     assert payload["tables"][0]["headers"] == ["Metric", "2023", "2022"]
     assert payload["tables"][0]["rows"] == [
@@ -240,14 +240,28 @@ def test_table_extract_missing_table_and_bad_locator_are_typed(tmp_path: Path) -
     no_table = extract_tables(
         document_id="ACME-2022Q3",
         version=fixture["before_version"],
-        page=1,
+        unit=1,
         manifest_path=fixture["manifest"],
         extracted_root=fixture["extracted"],
     )
     bad_locator = extract_tables(
         document_id="ACME-TABLE-2023Q3",
         version="0" * 64,
-        page=1,
+        unit=1,
+        manifest_path=fixture["manifest"],
+        extracted_root=fixture["extracted"],
+    )
+    zero_unit = extract_tables(
+        document_id="ACME-TABLE-2023Q3",
+        version=fixture["table_version"],
+        unit=0,
+        manifest_path=fixture["manifest"],
+        extracted_root=fixture["extracted"],
+    )
+    unit_past_tree = extract_tables(
+        document_id="ACME-TABLE-2023Q3",
+        version=fixture["table_version"],
+        unit=2,
         manifest_path=fixture["manifest"],
         extracted_root=fixture["extracted"],
     )
@@ -255,6 +269,12 @@ def test_table_extract_missing_table_and_bad_locator_are_typed(tmp_path: Path) -
     assert no_table["error"] == "table_not_found"
     assert bad_locator["error"] == "unknown_locator"
     assert bad_locator["table_extract"]["tables"] == []
+    # A zero ordinal and one past the frozen tree are locator misses,
+    # never a table miss: an out-of-range read must not look like a
+    # unit that exists but has no table.
+    assert zero_unit["error"] == "unknown_locator"
+    assert unit_past_tree["error"] == "unknown_locator"
+    assert unit_past_tree["table_extract"]["locator"]["unit"] == 2
 
 
 def test_table_extract_concurrent_reads_are_identical(tmp_path: Path) -> None:
@@ -265,7 +285,7 @@ def test_table_extract_concurrent_reads_are_identical(tmp_path: Path) -> None:
             extract_tables(
                 document_id="ACME-TABLE-2023Q3",
                 version=fixture["table_version"],
-                page=1,
+                unit=1,
                 manifest_path=fixture["manifest"],
                 extracted_root=fixture["extracted"],
             ),
@@ -296,6 +316,7 @@ def test_three_year_statement_renders_fact_values_and_locators(tmp_path: Path) -
         150,
     ]
     assert payload["rows"][0]["cells"][2]["locator"]["document_id"] == "ACME-2023FY"
+    assert payload["rows"][0]["cells"][2]["locator"]["unit"] == 4
     assert "deltas" not in payload
     assert json.loads(json.dumps(result)) == result
 

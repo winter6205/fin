@@ -149,6 +149,38 @@ def _evidence_reducer(
     return list(left or []) + list(right)
 
 
+@dataclass(frozen=True)
+class VisualClaimsReset:
+    """Sentinel value: replace ``AgentState["visual_claims"]`` with ``[]``.
+
+    Same shape and the same reason as :class:`EvidenceReset` — including why
+    an empty frozen dataclass and not a ``__slots__`` class, which is that the
+    checkpointer serializes it through the dataclass branch: the visual-claim
+    channel is additive so several reads of one run accumulate, and an
+    additive channel cannot be cleared by writing ``[]``.
+    """
+
+
+VISUAL_CLAIMS_RESET: Final[VisualClaimsReset] = VisualClaimsReset()
+
+
+def _visual_claims_reducer(
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]] | VisualClaimsReset,
+) -> list[dict[str, Any]]:
+    """Reducer for ``AgentState["visual_claims"]`` (ADR 0089, spec T5).
+
+    Mirrors :func:`_evidence_reducer`: the sentinel clears, an empty list is
+    a no-op, and a non-empty list concats — several visual reads in one run
+    keep several tokens. The reducer MUST NOT mutate either operand.
+    """
+    if isinstance(right, VisualClaimsReset):
+        return []
+    if not right:
+        return list(left or [])
+    return list(left or []) + list(right)
+
+
 # ----- closed run-status enum -----
 
 # Allowed values of ``AgentState["status"]``. The graph factory and the
@@ -245,7 +277,7 @@ class AgentState(TypedDict, total=False):
         survive across model_node cycles.
     evidence
         Cumulative list of ``EvidenceItem`` objects produced by this
-        run's tool calls (``read_file`` page texts and ``retrieve``
+        run's tool calls (``read_source`` unit slices and ``retrieve``
         chunk texts). Reduced by ``_evidence_reducer``: nodes return
         ONLY the new items they produced this turn; passing the
         ``EVIDENCE_RESET`` sentinel clears the list (the only way
@@ -387,6 +419,20 @@ class AgentState(TypedDict, total=False):
         folds prior + new itself), so ``reset_input_state``'s ``[]``
         genuinely clears it and a follow-up send cannot inherit the
         previous run's verdict.
+    visual_claims
+        ADR 0089 / spec T5: one provenance row per visual observation this
+        run read (shape SSOT:
+        :data:`fin.host.visual_evidence.VISUAL_CLAIM_FIELDS`). A
+        generated observation is DERIVED material, never a source
+        quote, so it keeps its own channel rather than joining
+        ``citations`` — the citation gate never sees these rows and
+        cannot accidentally demand a verbatim span from them. Additive
+        via :func:`_visual_claims_reducer` because several reads in one
+        run keep several tokens; nodes return ONLY the rows they
+        produced, and clearing needs the ``VISUAL_CLAIMS_RESET``
+        sentinel (``prior + [] == prior``), so
+        ``reset_input_state`` passes the sentinel and a follow-up send
+        cannot cite the previous turn's page.
     """
 
     messages: Annotated[list[BaseMessage], add_messages]
@@ -459,6 +505,12 @@ class AgentState(TypedDict, total=False):
     # and a follow-up send would inherit the previous run's outcome —
     # the exact stale verdict the run-scoped reset exists to prevent.
     retrieve_outcomes: list[dict[str, int]]
+    # ADR 0089 / spec T5: the visual-claim rows this run read, on their OWN
+    # channel (never ``citations``). Additive — several reads in one run keep
+    # several tokens — which is why it takes a reducer and a reset sentinel
+    # rather than ``[]``: the writer (``tool_node_with_summaries``) returns
+    # ONLY the new rows, exactly like ``evidence``.
+    visual_claims: Annotated[list[dict[str, Any]], _visual_claims_reducer]
 
 
 def reset_input_state(
@@ -539,6 +591,12 @@ def reset_input_state(
         # retrieve calls — a stale ``corpus_not_ready`` cannot outlive
         # its run.
         "retrieve_outcomes": [],
+        # ADR 0089: a visual claim belongs to the run that proved the
+        # raster it names, so a follow-up send starts with none — the
+        # page may have been re-uploaded under a new version and the
+        # stored observation no longer describes these pixels. The
+        # channel is additive, so clearing it takes the sentinel.
+        "visual_claims": VISUAL_CLAIMS_RESET,
     }
 
 
@@ -556,7 +614,10 @@ __all__ = [
     "StatusSnapshot",
     "TERMINAL_STATUSES",
     "Track",
+    "VISUAL_CLAIMS_RESET",
+    "VisualClaimsReset",
     "_evidence_reducer",
     "_issuer_findings_reducer",
+    "_visual_claims_reducer",
     "reset_input_state",
 ]

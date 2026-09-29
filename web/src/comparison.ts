@@ -14,6 +14,7 @@
 //    a payload that does not carry the v1 schema tag and a
 //    non-empty grid renders nothing rather than crashing the turn.
 
+import { citationSourceId, formatUnitLocator } from "./sourceLocator";
 import type {
   Comparison,
   ComparisonCell,
@@ -125,11 +126,30 @@ export function directionClass(
   return "text-gray-500";
 }
 
-/** ``document_id p.N`` for a hit — the same locator shape the
- * citation chips use, so a number in the table can be traced to a
- * page without leaving the turn. */
+/** ``document_id p.N`` (or ``u.N`` for a non-physical unit) for a hit —
+ * the same locator shape the citation chips use, so a number in the
+ * table can be traced to a source unit without leaving the turn. */
 export function locatorLabel(locator: ComparisonLocator): string {
-  return `${locator.document_id} p.${locator.page}`;
+  // Identity comes from ``citationSourceId`` — the one rule the chips
+  // and the sources list group by — keyed on the row's own ``kind``. The
+  // old ``document_id || attachment_id`` chain was a second rule for one
+  // concept: a table row and a chip could end up naming different sources
+  // for the same figure, and a company row whose document_id was empty
+  // read as an attachment. An absent ``kind`` is the v1 envelope, which
+  // carries only document_id. ``quote`` / ``filename`` are inert to the
+  // rule — a comparison locator has neither, and "" is what a company
+  // citation sends for both.
+  const source = citationSourceId({
+    kind: locator.kind ?? "company",
+    document_id: locator.document_id,
+    attachment_id: locator.attachment_id ?? "",
+    version: locator.version,
+    unit: locator.unit,
+    display: locator.display ?? "unit",
+    filename: "",
+    quote: "",
+  });
+  return `${source} ${formatUnitLocator(locator.display, locator.unit)}`;
 }
 
 /** Hover text for one cell. A missing cell says so in words: the

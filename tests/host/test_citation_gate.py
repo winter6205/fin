@@ -14,11 +14,15 @@ The suite covers:
   ``specs/v1-host-agent.md`` success criteria 4-6 (the three
   scripted runs that define v1 ship / no-ship);
 - a few targeted regression tests for citation dedup, evidence-
-  list iteration order, and the hidden-template contract.
+  list iteration order, and the hidden-template contract;
+- the slice-continuity rule: two ADJACENT returned slices of one
+  frozen unit join into matchable text, an unseen gap never does;
+- the closed quotable-kind set and the attachment trust re-check
+  (an attachment item nobody attests cannot carry a quote).
 
 The gate accepts evidence as ``list[EvidenceItem]`` whose
-``page_text`` is whatever the upstream tool produced for that page
-(or passage slice). The committed extracted tree at
+``unit_text`` is whatever the upstream tool produced for that frozen
+unit (or passage slice). The committed extracted tree at
 ``data/corpus/extracted/`` (T2) is **not** required for most tests;
 synthetic evidence is the boundary-friendly fixture.
 """
@@ -33,17 +37,21 @@ from pathlib import Path
 import pytest
 
 from fin.corpus.extracted import Locator
+from fin.host.attachment_observations import PLOTTED_VALUE_KIND
 from fin.host.citation_gate import (
     BounceResult,
+    COMPANY_KIND,
     Citation,
     CitationGateError,
     DoneResult,
     EvidenceItem,
     GateResult,
     MalformedEvidenceError,
+    QUOTABLE_EVIDENCE_KINDS,
     RefuseResult,
     verify_citations,
 )
+from fin.retrieve.source_read import ATTACHMENT_KIND
 
 
 # ----- fixtures -----
@@ -65,22 +73,66 @@ _SHA = "a7a0d8261a0923404fc45446afd71b9965bd2b4064772df0287e761bb68ba9f2"
 def _locator(
     document_id: str = "AAPL-2022Q3",
     version: str = _SHA,
-    page: int = 1,
+    unit: int = 1,
 ) -> Locator:
     """Build a Locator with sensible defaults."""
-    return Locator(document_id=document_id, version=version, page=page)
+    return Locator(document_id=document_id, version=version, unit=unit)
 
 
 def _evidence(
-    page_text: str,
+    unit_text: str,
     document_id: str = "AAPL-2022Q3",
     version: str = _SHA,
-    page: int = 1,
+    unit: int = 1,
 ) -> EvidenceItem:
     """Build a single EvidenceItem with sensible defaults."""
     return EvidenceItem(
-        locator=_locator(document_id, version, page),
-        page_text=page_text,
+        locator=_locator(document_id, version, unit),
+        unit_text=unit_text,
+    )
+
+
+def _slice_evidence(
+    unit_text: str,
+    *,
+    position: int,
+    next_position: int | None,
+    unit: int = 7,
+) -> EvidenceItem:
+    """One returned slice of one frozen unit, at its read offsets.
+
+    ``position`` / ``next_position`` are the code-point offsets the
+    read contract handed back, which is what lets the gate tell an
+    ADJACENT slice from one with an unseen hole between them.
+    """
+    return EvidenceItem(
+        locator=_locator(unit=unit),
+        unit_text=unit_text,
+        position=position,
+        next_position=next_position,
+    )
+
+
+def _attachment_evidence(
+    unit_text: str,
+    *,
+    attachment_id: str = "att-1",
+    version: str = "3",
+    unit: int = 2,
+    filename: str = "memo.txt",
+    display: str = "unit",
+) -> EvidenceItem:
+    """One returned attachment slice with its trusted identity."""
+    return EvidenceItem(
+        # An attachment's identity rides ``attachment_id``; the company
+        # document slot stays empty.
+        locator=Locator(document_id="", version=version, unit=unit),
+        unit_text=unit_text,
+        kind=ATTACHMENT_KIND,
+        attachment_id=attachment_id,
+        version_int=int(version),
+        filename=filename,
+        display=display,
     )
 
 
@@ -250,7 +302,7 @@ def test_overflow_10k_answer_50_evidence_completes_under_one_second() -> None:
     # gate can only match whole spans — no shared substrings get
     # inflated into extra citations.
     match_spans: list[str] = []
-    page_texts: list[str] = []
+    unit_texts: list[str] = []
     unique_keys = ["QQQ", "RRR", "SSS", "TTT", "UUU"]
     suffix_keys = ["AAAAA", "BBBBB", "CCCCC", "DDDDD", "EEEEE"]
     for i in range(5):
@@ -270,12 +322,12 @@ def test_overflow_10k_answer_50_evidence_completes_under_one_second() -> None:
         # surrounding context.
         prefix = "x" * 100
         suffix_padded = "y" * (1000 - len(prefix) - len(span))
-        page_texts.append(prefix + span + suffix_padded)
-    assert all(len(pt) == 1000 for pt in page_texts)
+        unit_texts.append(prefix + span + suffix_padded)
+    assert all(len(pt) == 1000 for pt in unit_texts)
 
     # Fill the rest of the 50 evidence items with unrelated content.
-    while len(page_texts) < 50:
-        page_texts.append("z" * 1000)
+    while len(unit_texts) < 50:
+        unit_texts.append("z" * 1000)
 
     # Construct the answer: contains all 5 matching spans (so Done),
     # plus 10K chars of filler to hit the overflow target. The
@@ -287,7 +339,7 @@ def test_overflow_10k_answer_50_evidence_completes_under_one_second() -> None:
     assert len(answer) == 10_000
 
     evidence = [
-        _evidence(pt, page=(i % 28) + 1) for i, pt in enumerate(page_texts)
+        _evidence(pt, unit=(i % 28) + 1) for i, pt in enumerate(unit_texts)
     ]
 
     t0 = time.perf_counter()
@@ -369,15 +421,15 @@ def test_concurrent_bounce_path_is_deterministic_across_threads() -> None:
 # ===== boundary 5: exception =====
 
 
-def test_empty_page_text_raises_malformed_evidence_error() -> None:
-    """Evidence with ``page_text == ""`` raises a typed error,
+def test_empty_unit_text_raises_malformed_evidence_error() -> None:
+    """Evidence with ``unit_text == ""`` raises a typed error,
     not a silent skip (ADR 0021)."""
     with pytest.raises(MalformedEvidenceError) as excinfo:
         verify_citations(
             answer="Some answer.",
             evidence=[
-                _evidence("legitimate page text"),
-                _evidence("", page=2),  # malformed
+                _evidence("legitimate unit text"),
+                _evidence("", unit=2),  # malformed
             ],
             repair_count=0,
             known_document_ids=KNOWN_IDS_DEFAULT,
@@ -385,24 +437,24 @@ def test_empty_page_text_raises_malformed_evidence_error() -> None:
     assert excinfo.value.index == 1
 
 
-def test_zero_page_in_locator_raises_malformed_evidence_error() -> None:
-    """``locator.page == 0`` raises a typed error."""
+def test_zero_unit_in_locator_raises_malformed_evidence_error() -> None:
+    """``locator.unit == 0`` raises a typed error."""
     with pytest.raises(MalformedEvidenceError) as excinfo:
         verify_citations(
             answer="Some answer.",
-            evidence=[_evidence("text", page=0)],
+            evidence=[_evidence("text", unit=0)],
             repair_count=0,
             known_document_ids=KNOWN_IDS_DEFAULT,
         )
     assert excinfo.value.index == 0
 
 
-def test_negative_page_in_locator_raises_malformed_evidence_error() -> None:
-    """``locator.page < 0`` raises a typed error."""
+def test_negative_unit_in_locator_raises_malformed_evidence_error() -> None:
+    """``locator.unit < 0`` raises a typed error."""
     with pytest.raises(MalformedEvidenceError):
         verify_citations(
             answer="Some answer.",
-            evidence=[_evidence("text", page=-3)],
+            evidence=[_evidence("text", unit=-3)],
             repair_count=0,
             known_document_ids=KNOWN_IDS_DEFAULT,
         )
@@ -428,6 +480,54 @@ def test_empty_version_raises_malformed_evidence_error() -> None:
             repair_count=0,
             known_document_ids=KNOWN_IDS_DEFAULT,
         )
+
+
+# A model-written description of a chart: derived prose, never text a
+# read or retrieve call returned, so it must not ride the quote channel.
+_VISUAL_OBSERVATION = (
+    "The chart shows net sales climbing through the fiscal quarter."
+)
+
+
+@pytest.mark.parametrize(
+    "bad_item",
+    [
+        # A generated visual observation is not a verbatim source quote.
+        EvidenceItem(
+            locator=_locator(),
+            unit_text=_VISUAL_OBSERVATION,
+            kind=PLOTTED_VALUE_KIND,
+        ),
+        EvidenceItem(locator=_locator(), unit_text=""),
+        EvidenceItem(locator=_locator(unit=0), unit_text="legitimate text"),
+        EvidenceItem(locator=_locator(unit=-3), unit_text="legitimate text"),
+        # ``bool`` is an ``int`` subclass: True is a malformed ordinal,
+        # never a spelling of unit 1.
+        EvidenceItem(locator=_locator(unit=True), unit_text="legitimate text"),
+        EvidenceItem(locator=_locator(version=""), unit_text="legitimate text"),
+    ],
+    ids=[
+        "visual_observation_kind",
+        "empty_unit_text",
+        "zero_unit",
+        "negative_unit",
+        "bool_unit",
+        "empty_version",
+    ],
+)
+def test_malformed_evidence_names_the_offending_index(
+    bad_item: EvidenceItem,
+) -> None:
+    """Every malformed shape is a typed error carrying ITS index, so a
+    run log points at the broken evidence row instead of hiding it."""
+    with pytest.raises(MalformedEvidenceError) as excinfo:
+        verify_citations(
+            answer="Some answer.",
+            evidence=[_evidence("legitimate unit text"), bad_item],
+            repair_count=0,
+            known_document_ids=KNOWN_IDS_DEFAULT,
+        )
+    assert excinfo.value.index == 1
 
 
 def test_malformed_evidence_error_is_a_citation_gate_error() -> None:
@@ -495,7 +595,7 @@ def test_no_evidence_non_refuse_answer_bounces_then_refuses() -> None:
 
 def test_evidenced_span_ends_done_with_matching_citations() -> None:
     """Spec scenario: an answer containing a verbatim ≥32-char span
-    from an evidence page ends ``done`` with citations equal to
+    from an evidence unit ends ``done`` with citations equal to
     exactly that span + locator.
 
     Mirrors ``specs/v1-host-agent.md`` success criteria 5.
@@ -527,9 +627,10 @@ def test_evidenced_span_ends_done_with_matching_citations() -> None:
     assert result.answer == answer
     assert len(result.citations) == 1
     c = result.citations[0]
+    assert c.kind == COMPANY_KIND
     assert c.document_id == "AAPL-2022Q3"
     assert c.version == _SHA
-    assert c.page == 1
+    assert c.unit == 1
     assert c.quote == span
 
 
@@ -634,9 +735,13 @@ def test_bounce_template_is_hidden_string() -> None:
 def test_citation_dataclass_is_frozen_and_hashable() -> None:
     """``Citation`` is a frozen dataclass (host graph may use as dict key)."""
     c = Citation(
+        kind=COMPANY_KIND,
         document_id="AAPL-2022Q3",
+        attachment_id="",
         version=_SHA,
-        page=1,
+        unit=1,
+        display="page",
+        filename="",
         quote="verbatim span of at least thirty-two characters here",
     )
     with pytest.raises(Exception):
@@ -666,10 +771,10 @@ def test_duplicate_citations_across_evidence_items_are_deduplicated() -> None:
 
     Note: two different evidence items have different locators, so
     dedup happens by ``quote`` only when the locator is also equal
-    (e.g., the same page retrieved twice)."""
+    (e.g., the same unit retrieved twice)."""
     span = _FIFTY_CHAR_SPAN
     answer = "Header: " + span + "."
-    # Two evidence items with the SAME locator (e.g., the same page
+    # Two evidence items with the SAME locator (e.g., the same unit
     # retrieved via two tool calls).
     evidence = [
         _evidence(span + " rest A"),
@@ -690,7 +795,7 @@ def test_duplicate_citations_across_evidence_items_are_deduplicated() -> None:
 
 
 def test_different_quotes_from_same_locator_are_separate_citations() -> None:
-    """Two distinct matching spans from the same page = two citations."""
+    """Two distinct matching spans from the same unit = two citations."""
     span_a = "ALPHANUMERIC_HEADER_OF_AT_LEAST_THIRTYTWO_CHARS_AAAAA"
     span_b = "ALPHANUMERIC_HEADER_OF_AT_LEAST_THIRTYTWO_CHARS_BBBBB"
     assert len(span_a) >= 50
@@ -769,6 +874,237 @@ def test_min_span_len_kwarg_is_honored() -> None:
         min_span_len=34,
     )
     assert isinstance(r_strict, BounceResult)
+
+
+# ===== returned-slice continuity: adjacent joins, a gap never does =====
+
+
+def test_quote_spanning_two_adjacent_returned_slices_passes() -> None:
+    """One unit read in two calls whose offsets touch is ONE matchable
+    text: a span copied verbatim across the boundary is grounded.
+
+    Neither returned slice alone contains the span (20 characters of
+    each), so this can only pass by joining on
+    ``prev.next_position == next.position``.
+    """
+    first, second = "A" * 40, "B" * 40
+    span = "A" * 20 + "B" * 20
+    assert len(span) == 40
+    answer = f"Across the boundary: {span} end."
+    evidence = [
+        _slice_evidence(first, position=0, next_position=40),
+        _slice_evidence(second, position=40, next_position=None),
+    ]
+
+    result = verify_citations(
+        answer=answer,
+        evidence=evidence,
+        repair_count=0,
+        known_document_ids=KNOWN_IDS_DEFAULT,
+    )
+
+    assert isinstance(result, DoneResult), result
+    assert len(result.citations) == 1
+    citation = result.citations[0]
+    assert citation.quote == span
+    assert citation.unit == 7
+    assert citation.version == _SHA
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        # The run read 0..40 and 60..100: code points 40..59 are a hole
+        # no returned slice covers, so the two texts must not be joined.
+        [
+            _slice_evidence("A" * 40, position=0, next_position=40),
+            _slice_evidence("B" * 40, position=60, next_position=None),
+        ],
+        # The first slice declares no continuation point, so even a
+        # touching offset proves nothing.
+        [
+            _slice_evidence("A" * 40, position=0, next_position=None),
+            _slice_evidence("B" * 40, position=40, next_position=None),
+        ],
+    ],
+    ids=["unseen_gap", "no_continuation_offset"],
+)
+def test_quote_spanning_an_unseen_gap_never_cites(
+    evidence: list[EvidenceItem],
+) -> None:
+    """A quote that bridges text this run never received is not grounded:
+    the answer bounces, and at the repair cap it refuses — the same
+    repair rules every ungrounded answer gets."""
+    span = "A" * 20 + "B" * 20
+    answer = f"Across the boundary: {span} end."
+
+    result = verify_citations(
+        answer=answer,
+        evidence=evidence,
+        repair_count=0,
+        known_document_ids=KNOWN_IDS_DEFAULT,
+    )
+    assert isinstance(result, BounceResult), result
+    assert result.repair_count == 1
+
+    capped = verify_citations(
+        answer=answer,
+        evidence=evidence,
+        repair_count=3,
+        known_document_ids=KNOWN_IDS_DEFAULT,
+    )
+    assert isinstance(capped, RefuseResult), capped
+    assert capped.reason == "citation_repair_cap"
+
+
+def test_retrieve_chunks_never_bridge_into_a_longer_span() -> None:
+    """Two passage chunks of the SAME unit are not read offsets.
+
+    A retrieve chunk carries no continuation point, so it can never join
+    with its neighbour: a span stitched across two chunks the run only
+    saw separately stays ungrounded, while a chunk that really contains
+    the span still cites.
+    """
+    stitched = "A" * 20 + "B" * 20
+    chunks = [_evidence("A" * 20), _evidence("B" * 20)]
+
+    ungrounded = verify_citations(
+        answer=f"Across the passages: {stitched} end.",
+        evidence=chunks,
+        repair_count=0,
+        known_document_ids=KNOWN_IDS_DEFAULT,
+    )
+    assert isinstance(ungrounded, BounceResult), ungrounded
+
+    grounded = verify_citations(
+        answer=f"Across the passages: {stitched} end.",
+        evidence=[_evidence(stitched)],
+        repair_count=0,
+        known_document_ids=KNOWN_IDS_DEFAULT,
+    )
+    assert isinstance(grounded, DoneResult), grounded
+
+
+def test_quote_that_lives_only_in_never_returned_text_never_cites() -> None:
+    """The gate matches what the tool RETURNED this run, not what the
+    answer claims to have read: the unread half of the same unit cannot
+    ground a span, while the returned half still can."""
+    returned, unread = "A" * 40, "B" * 40
+    evidence = [_slice_evidence(returned, position=0, next_position=40)]
+
+    ungrounded = verify_citations(
+        answer=f"Later in the unit: {unread} end.",
+        evidence=evidence,
+        repair_count=0,
+        known_document_ids=KNOWN_IDS_DEFAULT,
+    )
+    assert isinstance(ungrounded, BounceResult), ungrounded
+
+    grounded = verify_citations(
+        answer=f"Earlier in the unit: {returned} end.",
+        evidence=evidence,
+        repair_count=0,
+        known_document_ids=KNOWN_IDS_DEFAULT,
+    )
+    assert isinstance(grounded, DoneResult), grounded
+    assert [c.quote for c in grounded.citations] == [returned]
+
+
+# ===== the closed quotable kinds and the attachment trust re-check =====
+
+
+def test_quotable_evidence_kinds_are_closed() -> None:
+    """Only the two read legs feed the quote channel. A generated visual
+    observation is derived prose, never a verbatim source quote, so its
+    kind is outside the set by construction."""
+    assert QUOTABLE_EVIDENCE_KINDS == frozenset({COMPANY_KIND, ATTACHMENT_KIND})
+    assert PLOTTED_VALUE_KIND not in QUOTABLE_EVIDENCE_KINDS
+
+
+_MEMO_SPAN = "the purchase price in the attached memo is twelve million"
+assert len(_MEMO_SPAN) >= 32
+
+
+def _memo_evidence(**kwargs: object) -> EvidenceItem:
+    """Attachment evidence whose text contains ``_MEMO_SPAN`` verbatim."""
+    return _attachment_evidence(
+        "PREAMBLE_" + _MEMO_SPAN + "_POSTAMBLE", **kwargs  # type: ignore[arg-type]
+    )
+
+
+def test_attachment_quote_cites_when_the_identity_is_attested() -> None:
+    """With the caller's trust re-check satisfied, the attachment slice
+    grounds the span exactly like a company slice does."""
+    result = verify_citations(
+        answer=f"Per the memo: {_MEMO_SPAN} end.",
+        evidence=[_memo_evidence()],
+        repair_count=0,
+        known_document_ids=set(),
+        attachment_identity_current=lambda item: True,
+    )
+
+    assert isinstance(result, DoneResult), result
+    assert [c.attachment_id for c in result.citations] == ["att-1"]
+
+
+@pytest.mark.parametrize(
+    "attest",
+    [lambda item: False, None],
+    ids=["identity_rejected", "no_callback_fail_closed"],
+)
+def test_unattested_attachment_quote_never_cites(
+    attest: object,
+) -> None:
+    """An attachment item nobody attests cannot carry a quote even when
+    its text matches verbatim: a stale / foreign identity, and a run with
+    no attester at all, both stay uncitable (fail-closed)."""
+    result = verify_citations(
+        answer=f"Per the memo: {_MEMO_SPAN} end.",
+        evidence=[_memo_evidence()],
+        repair_count=0,
+        known_document_ids=set(),
+        attachment_identity_current=attest,  # type: ignore[arg-type]
+    )
+
+    assert isinstance(result, BounceResult), result
+
+
+@pytest.mark.parametrize(
+    "filename, display",
+    [("brief.pdf", "page"), ("notes.txt", "unit")],
+    ids=["pdf_presents_as_page", "text_presents_as_unit"],
+)
+def test_attachment_citation_carries_identity_filename_and_display(
+    filename: str, display: str
+) -> None:
+    """The citation the user sees is the matched item's identity —
+    attachment id, version, unit, the safe display name, and how that
+    unit is presented — never the model's claim and never a company
+    ``document_id``."""
+    item = _memo_evidence(
+        attachment_id="att-9", version="3", unit=2, filename=filename,
+        display=display,
+    )
+
+    result = verify_citations(
+        answer=f"Per the memo: {_MEMO_SPAN} end.",
+        evidence=[item],
+        repair_count=0,
+        known_document_ids=set(),
+        attachment_identity_current=lambda every: True,
+    )
+
+    assert isinstance(result, DoneResult), result
+    assert len(result.citations) == 1
+    citation = result.citations[0]
+    assert citation.kind == ATTACHMENT_KIND
+    assert citation.document_id == ""
+    assert citation.attachment_id == "att-9"
+    assert citation.version == "3"
+    assert citation.unit == 2
+    assert citation.filename == filename
+    assert citation.display == display
+    assert citation.quote == _MEMO_SPAN
 
 
 # ===== citation gate module: purity / no-pdfplumber guards =====

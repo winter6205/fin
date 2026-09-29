@@ -36,13 +36,13 @@ from fin.retrieve import (
 )
 
 
-def _chunk(text: str, document_id: str = "DOC-2023Q1", page: int = 1) -> Chunk:
+def _chunk(text: str, document_id: str = "DOC-2023Q1", unit: int = 1) -> Chunk:
     return Chunk(
         text=text,
         source_ref=Locator(
             document_id=document_id,
             version="v-" + "a" * 60,
-            page=page,
+            unit=unit,
         ),
         score=1.0,
     )
@@ -169,14 +169,14 @@ def test_fake_port_satisfies_retrieve_port() -> None:
 
 def test_chunks_carry_locator_as_source_ref() -> None:
     """Every chunk's ``source_ref`` is a ``Locator`` (ADR 0006) —
-    the citation gate reads ``source_ref.document_id / .page``."""
+    the citation gate reads ``source_ref.document_id / .unit``."""
     chunks = [
         Chunk(
             text="hit text",
             source_ref=Locator(
                 document_id="DOC-2023Q1",
                 version="v-" + "a" * 60,
-                page=3,
+                unit=3,
             ),
             score=2.5,
         ),
@@ -190,7 +190,7 @@ def test_chunks_carry_locator_as_source_ref() -> None:
     for chunk in out["chunks"]:
         assert isinstance(chunk.source_ref, Locator)
         assert chunk.source_ref.document_id == "DOC-2023Q1"
-        assert chunk.source_ref.page == 3
+        assert chunk.source_ref.unit == 3
         assert chunk.score == 2.5
 
 # ----- EDGAR-shaped filter parity (T2 / T3 hand-off) -----
@@ -236,14 +236,14 @@ def test_nonempty_edgar_filters_are_noops_on_fake() -> None:
     assert out == {"chunks": chunks}
 
 
-def _mk_chunk(document_id: str, page: int, text: str):
+def _mk_chunk(document_id: str, unit: int, text: str):
     from fin.retrieve.port import Chunk
     return Chunk(
         text=text,
         source_ref=Locator(
             document_id=document_id,
             version="v-" + "a" * 60,
-            page=page,
+            unit=unit,
         ),
         score=1.0,
     )
@@ -307,7 +307,7 @@ def test_fake_retrieve_with_hits_has_no_full_body_field_per_chunk() -> None:
     (``text`` / ``source_ref`` / ``score``) so the citation gate can
     quote a slice without leaking the whole 资料.
     """
-    chunks = [_chunk("slice-1"), _chunk("slice-2", page=2)]
+    chunks = [_chunk("slice-1"), _chunk("slice-2", unit=2)]
     port = FakeRetrievePort(
         hits_by_query={"alpha": chunks},
         known_document_ids={"DOC-2023Q1"},
@@ -632,7 +632,7 @@ def _page_text(document_id: str = "TEST-2023Q1", count: int = 3) -> dict:
     return {
         document_id: tuple(
             ExtractedPage(
-                locator=Locator(document_id=document_id, version=VERSION, page=n),
+                locator=Locator(document_id=document_id, version=VERSION, unit=n),
                 text=f"PAGE {n} BODY",
                 passages=(),
             )

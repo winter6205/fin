@@ -120,7 +120,7 @@ def test_write_back_text_is_citable_as_a_contiguous_span() -> None:
         [
             EvidenceItem(
                 locator=result.page.locator,
-                page_text=result.page.text,
+                unit_text=result.page.text,
             )
         ],
         repair_count=0,

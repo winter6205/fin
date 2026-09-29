@@ -71,7 +71,7 @@ def _hit() -> Chunk:
     return Chunk(
         text="Apple net sales for fiscal 2023 third quarter grew.",
         source_ref=Locator(
-            document_id="AAPL-2022Q3", version="a" * 64, page=1
+            document_id="AAPL-2022Q3", version="a" * 64, unit=1
         ),
         score=1.0,
     )

@@ -58,8 +58,8 @@ UNGROUNDED = (
 QUESTION = "What was AAPL revenue in 2023 Q1?"
 
 
-def _locator(page: int = 1) -> Locator:
-    return Locator(document_id=DOCUMENT_ID, version=VERSION, page=page)
+def _locator(unit: int = 1) -> Locator:
+    return Locator(document_id=DOCUMENT_ID, version=VERSION, unit=unit)
 
 
 def _chunk() -> Chunk:

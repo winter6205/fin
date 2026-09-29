@@ -244,7 +244,7 @@ def test_live_wrapper_preserves_degraded_signal_with_legitimate_reasons() -> Non
                         "source_ref": {
                             "document_id": "t1-onboarding-001",
                             "version": "v" * 64,
-                            "page": 1,
+                            "unit": 1,
                         },
                         "score": 0.9,
                     }
@@ -298,7 +298,7 @@ def test_live_wrapper_attributes_arms_per_query_class() -> None:
                 "source_ref": {
                     "document_id": "t1-onboarding-001",
                     "version": "v" * 64,
-                    "page": 1,
+                    "unit": 1,
                 },
                 "score": 0.9,
             }
@@ -342,7 +342,7 @@ def test_live_wrapper_returns_arms_union_with_enabled_capabilities() -> None:
                         "source_ref": {
                             "document_id": "t1-onboarding-001",
                             "version": "v" * 64,
-                            "page": 1,
+                            "unit": 1,
                         },
                         "score": 0.9,
                     }
@@ -377,7 +377,7 @@ def test_live_seam_wrapper_drives_run_ablation_end_to_end() -> None:
     locator = {
         "document_id": q.expected_document_id,
         "version": q.expected_version,
-        "page": q.expected_unit,
+        "unit": q.expected_unit,
     }
     responses: dict[str, dict[str, Any]] = {
         q.question: {
@@ -414,7 +414,7 @@ def test_live_seam_wrapper_drives_run_ablation_end_to_end() -> None:
                     source_ref=Locator(
                         document_id=ref["document_id"],
                         version=ref["version"],
-                        page=ref["page"],
+                        unit=ref["unit"],
                     ),
                     score=float(raw_chunk["score"]),
                 )
@@ -571,7 +571,7 @@ def live_eval_set_for_fake_seam():
             source_ref=Locator(
                 document_id=q.expected_document_id,
                 version=q.expected_version,
-                page=q.expected_unit,
+                unit=q.expected_unit,
             ),
             score=0.9,
         )

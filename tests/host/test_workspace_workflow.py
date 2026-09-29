@@ -22,10 +22,12 @@ from __future__ import annotations
 
 from fin.corpus._private_fixtures import load_private_fixture
 
+import csv
 import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +37,8 @@ from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-from fin.host import ScriptedChatModel, compile_graph
+from fin.host import Citation, ScriptedChatModel, compile_graph
+from fin.host.citation_gate import COMPANY_KIND
 from fin.host.thread_store import InMemoryThreadStore, RunRecord
 from fin.host.tools.compare_facts import COMPARISON_SCHEMA
 from fin.host.watchlist import JsonFileWatchlistStore
@@ -243,12 +246,14 @@ def _blocking_graph(http_app: FastAPI) -> tuple[Any, threading.Event, threading.
                 content="",
                 tool_calls=[
                     {
-                        "name": "read_file",
+                        "name": "read_source",
                         "args": {
-                            "document_id": AAPL_2022Q3,
-                            "version": AAPL_2022Q3_VERSION,
-                            "page": 1,
-                            "page_limit": 1,
+                            "source_ref": {
+                                "document_id": AAPL_2022Q3,
+                                "version": AAPL_2022Q3_VERSION,
+                                "unit": 1,
+                            },
+                            "position": 0,
                         },
                         "id": "c-read",
                         "type": "tool_call",
@@ -271,6 +276,12 @@ def test_stop_ends_the_in_flight_run_without_a_new_human_message(
     client: TestClient, http_app: FastAPI, stores
 ) -> None:
     graph, entered, release = _blocking_graph(http_app)
+    # The in-flight leg this graph drives is the bounded one: the deleted
+    # whole-page tool is not bindable at all.
+    tool_names = [tool.name for tool in graph._bound_tools]
+    assert "read_source" in tool_names
+    assert "read_file" not in tool_names
+
     tid = client.post("/api/threads", json={"first_message": "q"}).json()["id"]
     frames: dict[str, Any] = {}
 
@@ -400,6 +411,15 @@ def test_stop_on_an_unknown_thread_is_a_typed_404(
 # ----- export (SC6) -----
 
 
+def _fact_locator() -> dict[str, Any]:
+    """One company locator triple: the frozen-unit ordinal is ``unit``."""
+    return {
+        "document_id": AAPL_2022Q3,
+        "version": AAPL_2022Q3_VERSION,
+        "unit": 4,
+    }
+
+
 def _comparison_envelope(concept: str = "us-gaap:Revenues") -> dict:
     return {
         "schema": COMPARISON_SCHEMA,
@@ -426,11 +446,7 @@ def _comparison_envelope(concept: str = "us-gaap:Revenues") -> dict:
                         "display": "194,140",
                         "unit": "USD",
                         "scale": "millions",
-                        "locator": {
-                            "document_id": AAPL_2022Q3,
-                            "version": AAPL_2022Q3_VERSION,
-                            "page": 4,
-                        },
+                        "locator": _fact_locator(),
                     },
                     {
                         "row": "AAPL",
@@ -440,11 +456,7 @@ def _comparison_envelope(concept: str = "us-gaap:Revenues") -> dict:
                         "display": load_private_fixture("c18591bcf0070a92596e8fa66285e8cb7eafe482710c7f278506d2292ef3c207"),
                         "unit": "USD",
                         "scale": "millions",
-                        "locator": {
-                            "document_id": AAPL_2022Q3,
-                            "version": AAPL_2022Q3_VERSION,
-                            "page": 4,
-                        },
+                        "locator": _fact_locator(),
                     },
                 ],
             }
@@ -462,13 +474,7 @@ def _comparison_envelope(concept: str = "us-gaap:Revenues") -> dict:
         "missing": [],
         "hit_count": 2,
         "cell_count": 2,
-        "locators": [
-            {
-                "document_id": AAPL_2022Q3,
-                "version": AAPL_2022Q3_VERSION,
-                "page": 4,
-            }
-        ],
+        "locators": [_fact_locator()],
     }
 
 
@@ -505,6 +511,10 @@ def test_export_comparison_returns_a_csv_file_body(
     assert load_private_fixture("c18591bcf0070a92596e8fa66285e8cb7eafe482710c7f278506d2292ef3c207") in body
     assert "+99,647 (+51.33%)" in body
     assert AAPL_2022Q3 in body
+    # The locator trail section is keyed by the frozen-unit ordinal; the
+    # removed generic ``page`` column must not come back.
+    assert "document_id,version,unit" in body
+    assert "document_id,version,page" not in body
 
 
 def test_export_comparison_as_json_is_the_envelope_verbatim(
@@ -525,21 +535,46 @@ def test_export_comparison_as_json_is_the_envelope_verbatim(
 def test_export_citations_returns_a_csv_file_body(
     client: TestClient, stores
 ) -> None:
+    """The citation export speaks the gate's own unit identity: the CSV
+    trail is ``kind,source_id,version,unit,quote`` — ``source_id`` being
+    whichever id that kind opens with — and a locator payload never
+    carries the removed generic ``page`` ordinal."""
     citations = [
-        {
-            "document_id": AAPL_2022Q3,
-            "version": AAPL_2022Q3_VERSION,
-            "page": 1,
-            "quote": "Total net sales increased during the third quarter",
-        }
+        asdict(
+            Citation(
+                kind=COMPANY_KIND,
+                document_id=AAPL_2022Q3,
+                attachment_id="",
+                version=AAPL_2022Q3_VERSION,
+                unit=1,
+                display="page",
+                filename="",
+                quote="Total net sales increased during the third quarter",
+            )
+        )
     ]
     tid = _thread_with_run(client, stores, citations=citations)
 
     r = client.get(f"/api/threads/{tid}/export", params={"kind": "citations"})
 
     assert r.status_code == 200
-    assert r.text.splitlines()[0] == "document_id,version,page,quote"
+    header = r.text.splitlines()[0]
+    assert header == "kind,source_id,version,unit,quote"
+    assert "page" not in header.split(",")
     assert citations[0]["quote"] in r.text
+    # The row is the gate's unit identity, not a page ordinal: one row
+    # per citation, in the header's column order, led by the kind whose
+    # ``source_id`` the reader opens.
+    rows = list(csv.reader(r.text.splitlines()))
+    assert rows[1:] == [
+        [
+            COMPANY_KIND,
+            AAPL_2022Q3,
+            AAPL_2022Q3_VERSION,
+            "1",
+            citations[0]["quote"],
+        ]
+    ]
 
 
 def test_export_from_a_thread_with_no_run_is_a_typed_404(

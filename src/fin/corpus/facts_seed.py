@@ -35,7 +35,7 @@ def seed_facts_for_document(
                 source_locator=Locator(
                     document_id=document_id,
                     version=version,
-                    page=4,
+                    unit=4,
                 ),
             )
         ]

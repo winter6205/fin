@@ -37,6 +37,7 @@ from fin.host import graph as graph_module
 from fin.host.compile import DEFAULT_RETRIEVE_ADAPTER
 from fin.host.graph import RetrieveAdapterConfigError
 from fin.retrieve import BM25Adapter, FakeRetrievePort, MCPRetrieveAdapter
+from fin.retrieve import read_port as read_port_module
 
 
 # ----- corpus fixture (lightweight — only needed for the
@@ -219,7 +220,7 @@ def test_compile_graph_binds_supplied_fake_port_to_retrieve_tool() -> None:
                     source_ref=Locator(
                         document_id="DOC-2023Q1",
                         version="v-" + "a" * 60,
-                        page=1,
+                        unit=1,
                     ),
                     score=2.5,
                 ),
@@ -401,8 +402,20 @@ def test_mcp_auto_build_does_not_need_the_extracted_tree(
     def _boom(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("mcp auto-build consulted the extracted tree")
 
-    monkeypatch.setattr("fin.retrieve.read_port.load_extracted_tree", _boom)
     monkeypatch.setattr("fin.corpus.extracted.load_extracted_tree", _boom)
+
+    # Stronger than patching a read-seam alias: the company read seam
+    # holds no tree-loading or whole-page pagination name at all, so a
+    # build that consulted the tree would have to re-introduce one.
+    assert not hasattr(read_port_module, "load_extracted_tree")
+    for retired in (
+        "ExtractedTreeReadPort",
+        "MissReadPort",
+        "PAGE_LIMIT",
+        "ReadPort",
+        "read_from_pages",
+    ):
+        assert not hasattr(read_port_module, retired), retired
 
     built = _record_mcp_construction(monkeypatch)
     compile_graph(

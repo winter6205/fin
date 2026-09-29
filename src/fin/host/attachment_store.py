@@ -6,6 +6,8 @@ owns three layers of it, all bound to the owning ``thread_id``:
 * the raw bytes, addressed by an :class:`~fin.corpus.object_store.ObjectStore`
   key — the model never sees a path;
 * the parsed frozen units, one text row per ``(attachment_id, version, unit)``;
+* the page region boxes, one row per ``(attachment_id, version, page, ordinal)``
+  — the PDF-point geometry a crop inspection is taken from;
 * the derived search index, one posting row per ``(attachment_id, version, term)``;
 * the versioned visual observations, one envelope row per
   ``(attachment_id, version, unit, page, observation_version)`` — see
@@ -46,6 +48,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Literal, Protocol, Sequence
 
+from fin.corpus.parsers._pages import REGION_KINDS
 from fin.host.attachment_observations import (
     CoveredDetail,
     DetailKey,
@@ -53,6 +56,12 @@ from fin.host.attachment_observations import (
     ObservationEnvelope,
 )
 from fin.host.attachment_vision import VisionCrop, VisionUsage, VisionCost
+
+
+# The layout kinds a stored box may name. Read from the extraction core
+# rather than restated, so a row can never hold a kind the core would
+# refuse to produce and this store would then have to interpret.
+PAGE_REGION_KINDS: tuple[str, ...] = REGION_KINDS
 
 
 # ----- typed errors -----
@@ -91,6 +100,54 @@ class ParsedAttachmentUnit:
 
     unit: int
     text: str
+
+
+@dataclass(frozen=True, slots=True)
+class StoredPageRegion:
+    """One layout region of one page, as this store keeps it.
+
+    Four PDF-point edges, top-left origin, the same space
+    :class:`~fin.corpus.parsers._pages.Region` publishes — so a box survives
+    preparation without being re-derived, and the crop lane converts it
+    against the page's own media box rather than inventing normalized bounds.
+
+    Only the geometry is kept. Whether a box is *reliable enough* to be
+    cropped is a rule the crop lane owns
+    (:func:`~fin.corpus.parsers._pages.crop_is_legible`), because legibility
+    is stated in the render scale of the page being cut; storing a verdict
+    here would freeze one build's render scale into the durable row.
+
+    An inverted or degenerate box is refused at construction, which is the
+    same rule the extraction core applies to a layout's own boxes: a row that
+    cannot be cropped must not be persisted in the first place.
+    """
+
+    page: int
+    kind: str
+    left_pt: float
+    top_pt: float
+    right_pt: float
+    bottom_pt: float
+
+    def __post_init__(self) -> None:
+        _require_version(self.page)
+        kind = _require_text("region kind", self.kind)
+        if kind not in PAGE_REGION_KINDS:
+            raise AttachmentStoreError(
+                f"StoredPageRegion.kind must be one of "
+                f"{', '.join(PAGE_REGION_KINDS)}, got {self.kind!r}"
+            )
+        for name in ("left_pt", "top_pt", "right_pt", "bottom_pt"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise AttachmentStoreError(
+                    f"StoredPageRegion.{name} must be a number, got {value!r}"
+                )
+        if self.right_pt <= self.left_pt or self.bottom_pt <= self.top_pt:
+            raise AttachmentStoreError(
+                f"StoredPageRegion bounds must increase, got "
+                f"[{self.left_pt}, {self.top_pt}, {self.right_pt}, {self.bottom_pt}]"
+            )
 
 
 @dataclass(frozen=True)
@@ -186,6 +243,37 @@ class AttachmentStore(Protocol):
 
     def clear_units(self, attachment_id: str) -> None:
         """Drop every parsed unit of an attachment (re-preparation, delete)."""
+        ...
+
+    def record_regions(
+        self,
+        *,
+        attachment_id: str,
+        version: int,
+        regions: Sequence[StoredPageRegion],
+    ) -> int:
+        """Replace the page region boxes of ``version``; return the count.
+
+        Region boxes are additive metadata (spec item 10: table and figure
+        regions stay anchored under their page unit), so an empty sequence is
+        a recorded *absence* — this lane located nothing — and not an error.
+        Re-recording replaces that version's boxes rather than accumulating
+        them, so a re-run layout pass can never leave a superseded box
+        croppable.
+
+        Raises :class:`AttachmentThreadGoneError` when the attachment or its
+        thread was deleted while the parse was running.
+        """
+        ...
+
+    def regions(
+        self, attachment_id: str, version: int, *, page: int | None = None
+    ) -> tuple[StoredPageRegion, ...]:
+        """The stored boxes of one version, by page order; empty when none.
+
+        ``page`` narrows the read to one physical page, which is the shape a
+        crop takes: a box is only ever cut from the page the run named.
+        """
         ...
 
     def put_index(
@@ -462,6 +550,27 @@ def _normalized_units(
     return rows
 
 
+def _normalized_regions(
+    regions: Sequence[StoredPageRegion],
+) -> dict[int, StoredPageRegion]:
+    """Coerce a region batch to ``ordinal -> box``, in the order given.
+
+    WHY an ordinal rather than the box's own edges: several boxes of one
+    page may be identical in geometry, and a crop lane needs them
+    addressable and stably ordered the way the layout reported them. The
+    validation is the value type's own, so a box that could not be cropped
+    was refused before it reached this function.
+    """
+    rows: dict[int, StoredPageRegion] = {}
+    for item in regions:
+        if not isinstance(item, StoredPageRegion):
+            raise AttachmentStoreError(
+                f"record_regions expects StoredPageRegion values, got {item!r}"
+            )
+        rows[len(rows)] = item
+    return rows
+
+
 def _normalized_postings(
     postings: dict[str, Sequence[int]],
 ) -> dict[str, tuple[int, ...]]:
@@ -522,13 +631,16 @@ def _check_observation_binding(
 class _MutableAttachment:
     """Internal cell: one record plus the derived rows of every version."""
 
-    __slots__ = ("observations", "postings", "record", "units")
+    __slots__ = ("observations", "postings", "record", "regions", "units")
 
     def __init__(self, record: AttachmentRecord) -> None:
         self.record = record
         self.units: dict[tuple[int, int], str] = {}
         self.postings: dict[int, dict[str, tuple[int, ...]]] = {}
         self.observations: dict[tuple[int, int, int, int], ObservationEnvelope] = {}
+        # (version, page, ordinal) -> box, so a page's boxes keep both their
+        # layout order and their identity under re-recording.
+        self.regions: dict[tuple[int, int, int], StoredPageRegion] = {}
 
 
 @dataclass(frozen=True)
@@ -723,6 +835,45 @@ class InMemoryAttachmentStore:
                 return  # EXIT: nothing to drop; cleanup is idempotent.
             cell.units = {}
             cell.record = _attachment(cell.record, updated_at=_now())
+
+    # -- page region boxes --
+
+    def record_regions(
+        self,
+        *,
+        attachment_id: str,
+        version: int,
+        regions: Sequence[StoredPageRegion],
+    ) -> int:
+        _require_version(version)
+        rows = _normalized_regions(regions)
+        with self._lock:
+            cell = self._live_cell(attachment_id)
+            cell.regions = {
+                key: box for key, box in cell.regions.items() if key[0] != version
+            }
+            for ordinal, box in rows.items():
+                cell.regions[(version, box.page, ordinal)] = box
+            cell.record = _attachment(cell.record, updated_at=_now())
+            return len(rows)
+
+    def regions(
+        self, attachment_id: str, version: int, *, page: int | None = None
+    ) -> tuple[StoredPageRegion, ...]:
+        _require_version(version)
+        if page is not None:
+            _require_version(page)
+        with self._lock:
+            cell = self._owned(attachment_id)
+            # EXIT: an attachment no live thread owns reads back as no
+            # regions, which is what the Postgres cascade guarantees.
+            if cell is None:
+                return ()
+            return tuple(
+                cell.regions[key]
+                for key in sorted(cell.regions)
+                if key[0] == version and (page is None or key[1] == page)
+            )
 
     # -- derived search index --
 
@@ -1080,6 +1231,27 @@ CREATE TABLE IF NOT EXISTS fin_thread_attachment_index (
 CREATE INDEX IF NOT EXISTS fin_thread_attachment_index_lookup_idx
     ON fin_thread_attachment_index (attachment_id, version);
 
+-- The page/region boxes of one version. Anchored under the page, not under
+-- a generic locator (spec item 10): a table or figure region stays with its
+-- page unit, and the crop lane reads exactly one page's boxes.
+CREATE TABLE IF NOT EXISTS fin_thread_attachment_region (
+    attachment_id   TEXT NOT NULL
+        REFERENCES fin_thread_attachment(attachment_id) ON DELETE CASCADE,
+    thread_id       TEXT NOT NULL REFERENCES fin_thread(id) ON DELETE CASCADE,
+    version         INTEGER NOT NULL,
+    page            INTEGER NOT NULL,
+    ordinal         INTEGER NOT NULL,
+    kind            TEXT NOT NULL,
+    left_pt         DOUBLE PRECISION NOT NULL,
+    top_pt          DOUBLE PRECISION NOT NULL,
+    right_pt        DOUBLE PRECISION NOT NULL,
+    bottom_pt       DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (attachment_id, version, page, ordinal)
+);
+
+CREATE INDEX IF NOT EXISTS fin_thread_attachment_region_lookup_idx
+    ON fin_thread_attachment_region (attachment_id, version, page);
+
 CREATE TABLE IF NOT EXISTS fin_thread_attachment_observation (
     attachment_id   TEXT NOT NULL
         REFERENCES fin_thread_attachment(attachment_id) ON DELETE CASCADE,
@@ -1421,6 +1593,112 @@ class PostgresAttachmentStore:
                 (attachment_id,),
             )
             conn.commit()
+
+    # -- page region boxes --
+
+    # WHY one column list: the INSERT parameters and the SELECT below bind
+    # through this one name tuple, so a positional row can never be read
+    # against a drifted column layout — the same rule the observation table
+    # follows.
+    _REGION_COLUMN_NAMES = (
+        "attachment_id",
+        "thread_id",
+        "version",
+        "page",
+        "ordinal",
+        "kind",
+        "left_pt",
+        "top_pt",
+        "right_pt",
+        "bottom_pt",
+    )
+    _REGION_COLUMNS = ", ".join(_REGION_COLUMN_NAMES)
+
+    def record_regions(
+        self,
+        *,
+        attachment_id: str,
+        version: int,
+        regions: Sequence[StoredPageRegion],
+    ) -> int:
+        _require_version(version)
+        rows = _normalized_regions(regions)
+        with self._connect() as conn:
+            try:
+                # WHY the touch first, exactly like units and postings: it is
+                # the arbitration point, so boxes from a parse that raced the
+                # delete are discarded rather than persisted.
+                thread_id = self._touch(conn, attachment_id, indexed=None)
+                conn.execute(
+                    "DELETE FROM fin_thread_attachment_region "
+                    "WHERE attachment_id = %s AND version = %s",
+                    (attachment_id, version),
+                )
+                for ordinal, box in rows.items():
+                    conn.execute(
+                        f"INSERT INTO fin_thread_attachment_region "
+                        f"({self._REGION_COLUMNS}) "
+                        "VALUES (" + ", ".join(["%s"] * len(self._REGION_COLUMN_NAMES))
+                        + ") ON CONFLICT (attachment_id, version, page, ordinal) "
+                        "DO UPDATE SET kind = EXCLUDED.kind, "
+                        "left_pt = EXCLUDED.left_pt, top_pt = EXCLUDED.top_pt, "
+                        "right_pt = EXCLUDED.right_pt, bottom_pt = EXCLUDED.bottom_pt",
+                        (
+                            attachment_id,
+                            thread_id,
+                            version,
+                            box.page,
+                            ordinal,
+                            box.kind,
+                            float(box.left_pt),
+                            float(box.top_pt),
+                            float(box.right_pt),
+                            float(box.bottom_pt),
+                        ),
+                    )
+                conn.commit()
+            except psycopg.errors.ForeignKeyViolation as exc:
+                raise self._gone(attachment_id) from exc
+        return len(rows)
+
+    def regions(
+        self, attachment_id: str, version: int, *, page: int | None = None
+    ) -> tuple[StoredPageRegion, ...]:
+        _require_version(version)
+        if page is not None:
+            _require_version(page)
+        with self._connect() as conn:
+            if page is None:
+                rows = conn.execute(
+                    f"SELECT {self._REGION_COLUMNS} "
+                    "FROM fin_thread_attachment_region "
+                    "WHERE attachment_id = %s AND version = %s "
+                    "ORDER BY page ASC, ordinal ASC",
+                    (attachment_id, version),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"SELECT {self._REGION_COLUMNS} "
+                    "FROM fin_thread_attachment_region "
+                    "WHERE attachment_id = %s AND version = %s AND page = %s "
+                    "ORDER BY ordinal ASC",
+                    (attachment_id, version, page),
+                ).fetchall()
+            # EXIT: a version that was never written, or already cascaded
+            # away with its thread or attachment, reads back as no boxes.
+            return tuple(
+                StoredPageRegion(
+                    page=int(values["page"]),
+                    kind=str(values["kind"]),
+                    left_pt=float(values["left_pt"]),
+                    top_pt=float(values["top_pt"]),
+                    right_pt=float(values["right_pt"]),
+                    bottom_pt=float(values["bottom_pt"]),
+                )
+                for values in (
+                    dict(zip(self._REGION_COLUMN_NAMES, row)) for row in rows
+                )
+            )
 
     # -- derived search index --
 
@@ -1976,4 +2254,5 @@ __all__ = [
     "InMemoryAttachmentStore",
     "ParsedAttachmentUnit",
     "PostgresAttachmentStore",
+    "StoredPageRegion",
 ]

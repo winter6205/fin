@@ -386,16 +386,16 @@ def test_sc10_citation_gate_still_fills_only_verified_spans_on_done_result() -> 
     # Use a deterministic 40+ char span so the gate's min_span_len=32
     # rule is met with a non-alnum-prefix/suffix envelope.
     span = "T1ONBOARDINGPAGEHINT" * 3  # 60 chars
-    answer = "Per the T1 onboarding page: " + span + "."
+    answer = "Per the T1 onboarding unit: " + span + "."
     evidence_text = "PREAMBLE_" + span + "_POSTAMBLE"
-    page_text = evidence_text + " " + ("x" * 1000)
+    unit_text = evidence_text + " " + ("x" * 1000)
 
-    locator = Locator(document_id="t1-onboarding-001", version="a" * 64, page=1)
+    locator = Locator(document_id="t1-onboarding-001", version="a" * 64, unit=1)
     known = {"t1-onboarding-001"}
 
     result = verify_citations(
         answer=answer,
-        evidence=[EvidenceItem(locator=locator, page_text=page_text)],
+        evidence=[EvidenceItem(locator=locator, unit_text=unit_text)],
         repair_count=0,
         known_document_ids=known,
     )
@@ -423,7 +423,7 @@ def test_sc10_citation_gate_still_fills_only_verified_spans_on_done_result() -> 
     # spans ever become user-visible citations.
     bounce_result = verify_citations(
         answer="no span to verify here at all",
-        evidence=[EvidenceItem(locator=locator, page_text=page_text)],
+        evidence=[EvidenceItem(locator=locator, unit_text=unit_text)],
         repair_count=0,
         known_document_ids=known,
     )
@@ -464,7 +464,7 @@ def test_live_report_carries_finite_citation_gate_field_on_every_config(
             source_ref=Locator(
                 document_id=q.expected_document_id,
                 version=q.expected_version,
-                page=q.expected_unit,
+                unit=q.expected_unit,
             ),
             score=0.9,
         )

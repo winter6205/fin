@@ -47,8 +47,9 @@ import pytest
 from langchain_core.messages import BaseMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+from fin.corpus.extracted import ExtractedPage, load_extracted_tree
 from fin.host import ScriptedChatModel, compile_graph
-from fin.retrieve import ExtractedTreeReadPort
+from fin.retrieve import FakeRetrievePort
 
 
 def _eval_counts_module() -> ModuleType:
@@ -69,6 +70,31 @@ def _eval_counts_module() -> ModuleType:
 # Terminal statuses observed this session, in invoke order. Module
 # scope matches the session: the eval lane runs in one process.
 _OBSERVED_STATUSES: list[str] = []
+
+# The committed corpus this worktree's gold transcripts quote from.
+# Absolute so the lane does not depend on the invoking cwd.
+_CORPUS_ROOT = Path(__file__).resolve().parents[2] / "data" / "corpus"
+
+_READ_MANIFEST: dict[str, tuple[ExtractedPage, ...]] | None = None
+
+
+def _company_read_manifest() -> dict[str, tuple[ExtractedPage, ...]]:
+    """The committed extracted tree as the fake port's read manifest.
+
+    Loaded once per session and shared: ``ExtractedPage`` is frozen and
+    ``FakeRetrievePort`` copies the mapping it is handed, so a graph
+    build cannot disturb another case's bodies. The gold transcripts
+    quote real filing text, so the hermetic company read leg has to be
+    backed by that tree — the graph itself never reads it (ADR 0046 /
+    0047), the test wires it in.
+    """
+    global _READ_MANIFEST
+    if _READ_MANIFEST is None:
+        _READ_MANIFEST = load_extracted_tree(
+            _CORPUS_ROOT / "manifest.json",
+            _CORPUS_ROOT / "extracted",
+        )
+    return _READ_MANIFEST
 
 
 class _StatusRecordingGraph:
@@ -122,21 +148,20 @@ def scripted_graph_factory():
         # tuple / generator; we accept any iterable to match the
         # ticket's loose phrasing ("a script").
         model = ScriptedChatModel(script=list(script))
-        # No ``adapter``: ``compile_graph`` auto-builds the hermetic
-        # FakeRetrievePort. The gold transcripts quote the frozen
-        # corpus, so the tree-backed read port is injected explicitly
-        # for their scripted ``read_file`` calls (ADR 0046 / 0047: the
-        # default graph no longer reads the tree on its own).
+        # The gold transcripts quote the frozen corpus, so the company
+        # ``read_source`` leg is wired explicitly: a FakeRetrievePort
+        # whose ``pages_by_doc`` manifest IS the committed extracted
+        # tree. ``compile_graph`` never reads that tree on its own
+        # (ADR 0046 / 0047), and the auto-built default fake carries no
+        # bodies, so without this injection every scripted read would
+        # answer the typed ``unknown_locator`` miss.
         # Locator claims: FOO-2023Q1-style unknowns trip the gate's
         # ``unknown_locator`` path (not in this run's evidence); the
         # frozen docs the transcripts actually read do not.
         graph = compile_graph(
             checkpointer=InMemorySaver(),
             model=model,
-            read_port=ExtractedTreeReadPort(
-                Path("data/corpus/manifest.json"),
-                Path("data/corpus/extracted"),
-            ),
+            adapter=FakeRetrievePort(pages_by_doc=_company_read_manifest()),
         )
         return _StatusRecordingGraph(graph, _OBSERVED_STATUSES)
 

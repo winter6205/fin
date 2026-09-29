@@ -6,7 +6,11 @@ The CLI is ``python -m fin``: a positional question, an optional
     status: <status>
     answer: <answer text>
     citations:
-      - <document_id> v<version> p<page>: <quote>
+      - <document_id> v<version> <p|u><unit>: <quote>
+
+``<p|u>`` is chosen by the citation's ``display`` discriminator: a unit
+presented as a physical page renders ``p``, anything else ``u`` — both
+numbered by ``unit``, never by a separate page field.
 
 Hard contracts under test here:
 
@@ -72,14 +76,17 @@ AAPL_2022Q3_VERSION = (
 
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
-# Legacy tree-backed read adapter over the committed corpus. Only the
-# scripted ``read_file`` transcripts need it; the default graph no
+# The ``read_source`` company leg over the committed corpus units. Only
+# the scripted ``read_source`` transcripts need it; the default graph no
 # longer reads the tree on its own (ADR 0046 / 0047).
-from fin.retrieve import ExtractedTreeReadPort
+from fin.retrieve import FakeRetrievePort
 
-_TREE_READ_PORT = ExtractedTreeReadPort(
-    Path("data/corpus/manifest.json"),
-    Path("data/corpus/extracted"),
+_READ_ADAPTER = FakeRetrievePort(
+    pages_by_doc={
+        AAPL_2022Q3: load_extracted_tree(
+            Path("data/corpus/manifest.json"), Path("data/corpus/extracted")
+        )[AAPL_2022Q3]
+    }
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -87,7 +94,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.fixture(scope="session")
 def aapl_page1_text():
-    """Real page-1 text from AAPL-2022Q3, loaded from the committed tree."""
+    """Real first-unit text from AAPL-2022Q3, loaded from the committed tree."""
     manifest = REPO_ROOT / "data" / "corpus" / "manifest.json"
     extracted = REPO_ROOT / "data" / "corpus" / "extracted"
     tree = load_extracted_tree(manifest, extracted)
@@ -97,19 +104,20 @@ def aapl_page1_text():
 # ----- helpers -----
 
 
-def _scripted_read_file_then_answer(answer: str) -> list[AIMessage]:
-    """Script: one ``read_file`` tool call, then the answer AIMessage."""
+def _scripted_read_then_answer(answer: str) -> list[AIMessage]:
+    """Script: one ``read_source`` tool call, then the answer AIMessage."""
     return [
         AIMessage(
             content="",
             tool_calls=[
                 {
-                    "name": "read_file",
+                    "name": "read_source",
                     "args": {
-                        "document_id": AAPL_2022Q3,
-                        "version": AAPL_2022Q3_VERSION,
-                        "page": 1,
-                        "page_limit": 1,
+                        "source_ref": {
+                            "document_id": AAPL_2022Q3,
+                            "version": AAPL_2022Q3_VERSION,
+                            "unit": 1,
+                        }
                     },
                     "id": "c-read",
                     "type": "tool_call",
@@ -187,15 +195,15 @@ def test_help_path_never_builds_a_graph():
 
 
 def test_done_run_prints_status_answer_citations_in_order(aapl_page1_text, capsys):
-    """Scripted read_file → answer-with-span driven through ``main``
+    """Scripted read_source → answer-with-span driven through ``main``
     prints the three sections in order with ≥1 formatted citation."""
     quoted = f"Per the filing: {aapl_page1_text[:80]}"
-    model = ScriptedChatModel(script=_scripted_read_file_then_answer(quoted))
+    model = ScriptedChatModel(script=_scripted_read_then_answer(quoted))
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
     )
     rc = main(
         ["What was AAPL net sales in 2023 Q3?", "--thread-id", "t-cli-done"],
@@ -208,9 +216,15 @@ def test_done_run_prints_status_answer_citations_in_order(aapl_page1_text, capsy
     # Order: status, then answer, then citations.
     assert out.index("status: done") < out.index("answer:") < out.index("citations:")
     # Citation line format: two-space indent, locator fields, quote.
-    expected_prefix = f"  - {AAPL_2022Q3} v{AAPL_2022Q3_VERSION} p1:"
-    assert expected_prefix in out
-    assert aapl_page1_text[:80] in out
+    # ``p1`` because a company unit read through ``read_source``
+    # presents as a page; the number itself is the locator's ``unit``.
+    citation_lines = [line for line in out.splitlines() if line.startswith("  - ")]
+    assert len(citation_lines) == 1
+    line = citation_lines[0]
+    assert line.startswith(f"  - {AAPL_2022Q3} v{AAPL_2022Q3_VERSION} p1: ")
+    # One citation per line: the verbatim span carries the source line
+    # breaks, and the renderer collapses them instead of wrapping.
+    assert line.split(": ", 1)[1] == " ".join(aapl_page1_text[:80].splitlines())
 
 
 # ----- step cap -----
@@ -239,7 +253,7 @@ def test_step_cap_run_prints_status_and_answer_without_citations(capsys):
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
     )
     rc = main(["What was AAPL net sales in 2023 Q3?"], graph_factory=lambda: g)
     assert rc == 0
@@ -276,7 +290,7 @@ def test_refuse_unknown_locator_prints_reason_on_stderr(capsys):
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
     )
     rc = main(["What was AAPL net sales in 2023 Q3?"], graph_factory=lambda: g)
     assert rc == 0
@@ -296,14 +310,14 @@ def test_refuse_unknown_locator_prints_reason_on_stderr(capsys):
 
 
 def test_two_runs_on_same_thread_real_spans(aapl_page1_text, capsys):
-    """The concrete accumulation run: both runs quote the real page
+    """The concrete accumulation run: both runs quote the real first-unit
     span; message counts strictly increase across the two invokes."""
     model = _RecordingModel(script=[])
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
     )
     span = aapl_page1_text[:80]
 
@@ -312,11 +326,11 @@ def test_two_runs_on_same_thread_real_spans(aapl_page1_text, capsys):
     # last message of the previous script forever (no tool call → no
     # evidence → refuse).
     model._index = 0
-    model.script = _scripted_read_file_then_answer("First: " + span)
+    model.script = _scripted_read_then_answer("First: " + span)
     run("q1", graph=g, thread_id="t-acc")
 
     model._index = 0
-    model.script = _scripted_read_file_then_answer("Second: " + span)
+    model.script = _scripted_read_then_answer("Second: " + span)
     run("q2", graph=g, thread_id="t-acc")
 
     captured = capsys.readouterr()
@@ -378,7 +392,7 @@ def test_concurrent_runs_on_same_thread_report_error_via_main(capsys):
         checkpointer=InMemorySaver(),
         model=blocking,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
     )
 
     results: dict[str, int] = {}
@@ -501,6 +515,77 @@ def test_render_result_strips_marker_and_keeps_schema_stable():
     assert "[FIN_HIDDEN_BOUNCE]" not in text
     assert lines[2] == "citations:"
     assert len(lines) == 3
+
+
+def test_render_result_citation_label_reads_display_and_unit():
+    """Unit: the locator segment is ``<p|u><unit>`` chosen by the
+    citation's ``display`` discriminator, and it reads NOTHING else.
+
+    The removed contract numbered citations by a generic ``page`` field
+    on the locator; a renderer that kept a ``page`` fallback would print
+    a different number than the citation identity the gate verified.
+    """
+    from fin.host.citation_gate import Citation
+
+    as_page = Citation(
+        kind="company",
+        document_id=AAPL_2022Q3,
+        attachment_id="",
+        version="1",
+        unit=7,
+        display="page",
+        filename="",
+        quote="a span long enough to be quoted verbatim",
+    )
+    as_unit = Citation(
+        kind="company",
+        document_id=AAPL_2022Q3,
+        attachment_id="",
+        version="1",
+        unit=7,
+        display="unit",
+        filename="",
+        quote=as_page.quote,
+    )
+
+    text = render_result(
+        {
+            "status": "done",
+            "answer": "a",
+            "citations": (as_page, as_unit),
+            "messages": [],
+        }
+    )
+    lines = [line for line in text.splitlines() if line.startswith("  - ")]
+    assert lines == [
+        f"  - {AAPL_2022Q3} v1 p7: {as_page.quote}",
+        f"  - {AAPL_2022Q3} v1 u7: {as_unit.quote}",
+    ]
+
+
+def test_render_result_ignores_a_legacy_page_attribute():
+    """A stale citation object still carrying a ``page`` attribute cannot
+    steer the printed number: a unit-8 citation whose ``page`` says 99
+    renders ``u8``."""
+
+    class _Stale:
+        kind = "company"
+        document_id = AAPL_2022Q3
+        attachment_id = ""
+        version = "1"
+        unit = 8
+        display = "unit"
+        filename = ""
+        page = 99
+        quote = "a span long enough to be quoted verbatim"
+
+    text = render_result(
+        {"status": "done", "answer": "a", "citations": (_Stale(),), "messages": []}
+    )
+
+    assert "  - AAPL-2022Q3 v1 u8: " in text
+    assert "99" not in text
+    assert " p8" not in text
 
 
 # ----- interrupt (choice_window) pause surface -----
@@ -652,12 +737,12 @@ def test_cli_sources_import_no_pdfplumber_or_provider_deps() -> None:
 
 def test_cli_follow_up_resets_evidence(aapl_page1_text, capsys):
     """Binding SC62 mirror for the CLI runner: two ``run`` calls on
-    the same ``--thread-id``. Run 1 reads the page and ends done;
+    the same ``--thread-id``. Run 1 reads the first unit and ends done;
     run 2 quotes the same span without re-fetching. With the
     ``EVIDENCE_RESET`` sentinel the second run's gate has no
     evidence to match -> refuse citation_repair_cap. The old
     ``evidence: []`` literal was a no-op under operator.add, so
-    this exact scenario used to end ``done`` on stale pages.
+    this exact scenario used to end ``done`` on stale evidence.
 
     Also asserts the ordinary-person suggestion rides stderr on
     the refusal (T2 copy contract) while stdout keeps the frozen
@@ -669,12 +754,12 @@ def test_cli_follow_up_resets_evidence(aapl_page1_text, capsys):
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
     )
 
-    # Run 1: read_file + grounded answer -> done.
+    # Run 1: read_source + grounded answer -> done.
     model._index = 0
-    model.script = _scripted_read_file_then_answer("First: " + span)
+    model.script = _scripted_read_then_answer("First: " + span)
     rc1 = main(["q1", "--thread-id", "t-cli-t2"], graph_factory=lambda: g)
     assert rc1 == 0
     captured1 = capsys.readouterr()

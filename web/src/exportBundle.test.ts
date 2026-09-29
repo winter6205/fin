@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { exportAvailability, exportUrl } from "./exportBundle";
-import type { Comparison, Turn } from "./types";
+import type { Citation, Comparison, Turn } from "./types";
 
 const COMPARISON: Comparison = {
   schema: "fin.comparison.v1",
@@ -59,10 +59,14 @@ describe("exportAvailability", () => {
   });
 
   it("offers the citation export once a turn has verified spans", () => {
-    const citation = {
+    const citation: Citation = {
+      kind: "company",
       document_id: "AAPL-2022Q3",
+      attachment_id: "",
       version: "a7a0",
-      page: 4,
+      unit: 4,
+      display: "page",
+      filename: "",
       quote: "x".repeat(40),
     };
     expect(exportAvailability([turn({ citations: [citation] })])).toEqual({

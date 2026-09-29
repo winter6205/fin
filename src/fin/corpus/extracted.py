@@ -25,16 +25,18 @@ from fin.corpus.structure_units import StructureLocator, StructureUnit
 
 @dataclass(frozen=True)
 class Locator:
-    """v1 locator: ``{document_id, version, page}`` (ADR 0006).
+    """Locator ``{document_id, version, unit}`` (spec thread-attachment-source-read).
 
     Frozen so an extracted artifact cannot drift its identity after
     ingest; ``version`` is the manifest sha256 of the source PDF, NOT
-    a content hash.
+    a content hash. ``unit`` is the 1-based frozen-unit ordinal; for
+    the company corpus each unit is one physical PDF page, which is
+    the presentation a ``display: "page"`` citation renders.
     """
 
     document_id: str
     version: str
-    page: int
+    unit: int
 
 
 @dataclass(frozen=True)
@@ -250,7 +252,7 @@ def load_extracted_tree(
                     locator=Locator(
                         document_id=document_id,
                         version=expected_version,
-                        page=page_num,
+                        unit=page_num,
                     ),
                     text=text,
                     passages=passages,
