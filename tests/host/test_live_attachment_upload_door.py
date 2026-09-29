@@ -757,11 +757,18 @@ def test_unsupported_bytes_upload_and_only_preparation_names_them(
         attachment_id = str(body["attachment_id"])
         assert _derived_counts(url, attachment_id) == (0, 0), body
 
-        prepared = client.post(
+        # T2f: the door queues the durable job and answers before the bytes
+        # are read back, so a retried row leaves it as work pending — the
+        # naming happens in the drain, on a later status read.
+        queued = client.post(
             f"/api/threads/{thread_id}/attachments/{attachment_id}/retry"
         )
-        assert prepared.status_code == 200, prepared.text
-        failure = prepared.json()
+        assert queued.status_code == 200, queued.text
+        assert queued.json()["status"] == "parsing", queued.json()
+        assert door["service"].drain_attachment_jobs() >= 1
+        failure = client.get(
+            f"/api/threads/{thread_id}/attachments/{attachment_id}"
+        ).json()
         assert failure["status"] == "failed", failure
         assert failure["failure_reason"] == "attachment_not_text", failure
         # Naming the content derived nothing either: no units, no postings.
@@ -892,6 +899,11 @@ if os.environ.get("FIN_LIVE_FAIL_OBJECT_DELETE") == "1":
 
     http_module.default_attachment_service().objects.delete = _refuse_delete
 
+# The product's own execution side, started the way ``serve()`` starts it
+# before binding: the preparation doors only queue durable jobs, so a
+# process without this drain leaves every queued row at ``parsing`` forever.
+http_module.start_attachment_prep_worker(http_module.default_attachment_service())
+
 uvicorn.run(
     http_module.app,
     host="127.0.0.1",
@@ -1016,6 +1028,32 @@ class _LiveServer:
         except subprocess.TimeoutExpired:  # pragma: no cover - child misbehaving
             self.process.kill()
             self.process.wait(timeout=30)
+
+
+#: The states a preparation job can finish in; anything else is still owed.
+_TERMINAL_STATUSES = ("ready", "failed")
+
+
+def _await_terminal_status(
+    live_server: _LiveServer, thread_id: str, attachment_id: str
+) -> dict[str, Any]:
+    """Read the status door until the child's own drain lands a terminal state.
+
+    The retry door only queues (T2f), so the state this lane is really
+    proving arrives from the other process's prep worker. A fixed sleep would
+    either race that thread or over-wait it, so the door is polled and the
+    failure names what was last seen.
+    """
+    deadline = time.monotonic() + 120.0
+    last: Any = None
+    while time.monotonic() < deadline:
+        status, last = live_server.attachment_status(thread_id, attachment_id)
+        assert status == 200, last
+        assert isinstance(last, dict), last
+        if last["status"] in _TERMINAL_STATUSES:
+            return last
+        time.sleep(0.2)
+    raise AssertionError(f"attachment never settled: {last!r} (after 120s)")
 
 
 def _load(raw: bytes) -> Any:
@@ -1323,9 +1361,13 @@ def test_live_single_attachment_delete_voids_the_real_bytes(
         # The bytes are in the real bucket before anything deletes them.
         assert create_object_store().get(object_key) == payload
 
-        status, prepared = live_server.prepare(thread_id, attachment_id)
-        assert status == 200, (status, prepared)
-        assert isinstance(prepared, dict) and prepared["status"] == "ready"
+        status, queued = live_server.prepare(thread_id, attachment_id)
+        assert status == 200, (status, queued)
+        # The door promises queued work and nothing more; publishing the
+        # bytes is the child process's own prep drain, across the socket.
+        assert isinstance(queued, dict) and queued["status"] == "parsing", queued
+        prepared = _await_terminal_status(live_server, thread_id, attachment_id)
+        assert prepared["status"] == "ready", prepared
         assert _derived_counts(postgres_url, attachment_id)[0] > 0
 
         status, voided = live_server.delete_attachment(thread_id, attachment_id)

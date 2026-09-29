@@ -9,9 +9,11 @@ The public API is the pure function ``verify_citations``. It returns one
 of three typed outcomes:
 
 - ``DoneResult`` — the answer contains at least one ≥``min_span_len``
-  extractive span that is a contiguous substring of an evidence
-  item's ``page_text``. ``citations`` is the deduplicated list of
-  ``(locator, quote)`` pairs the user-visible citation list contains.
+  extractive span that is a contiguous substring of this run's evidence
+  (a single returned slice, or two or more ADJACENT returned slices of
+  the same frozen unit — see ``_match_spans``). ``citations`` is the
+  deduplicated list of ``(identity, quote)`` pairs the user-visible
+  citation list contains.
 
 - ``BounceResult`` — the answer did not pass; the bounce path
   increments ``repair_count`` and returns a hidden template that T6
@@ -30,16 +32,25 @@ The repair counter and the step cap are independent fuses.
 Citations come from the gate's matched evidence items, never from the
 model's claim. This prevents model-invented ``version`` strings
 (ADR 0021).
+
+Evidence kinds are closed (spec ``thread-attachment-source-read``): only text the ``read_source`` / ``retrieve``
+legs returned is quotable.
+A generated visual observation is never evidence for a quote, and an
+item carrying any other kind is a typed ``MalformedEvidenceError``, not
+a silent drop. Attachment evidence additionally re-passes a trust
+re-check supplied by the caller (ownership + version currency) before
+it can produce a citation; the gate itself holds no store.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final, Iterable
 
 from fin.corpus.extracted import Locator
-
+from fin.retrieve.source_read import ATTACHMENT_KIND
 
 # ----- shared hidden-bounce marker (SSOT, ADR 0021) -----
 #
@@ -67,6 +78,15 @@ def strip_hidden_bounce_marker(text: str) -> str:
     return _HIDDEN_BOUNCE_RE.sub("", text)
 
 
+# The closed set of evidence kinds the quote channel accepts: the
+# company corpus leg and the thread-attachment leg. A generated visual
+# observation — or anything else — is not quotable and raises at
+# validation; it must never ride this channel into a citation.
+COMPANY_KIND: Final[str] = "company"
+QUOTABLE_EVIDENCE_KINDS: Final[frozenset[str]] = frozenset(
+    {COMPANY_KIND, ATTACHMENT_KIND}
+)
+
 # v1 document-id locator pattern (ADR 0006 / CONTEXT.md vocabulary).
 # Matches the manifest ``document_id`` shape (e.g. ``AAPL-2022Q3``):
 # 2-5 uppercase letters, a dash, four digits, then ``Q1``/``Q2``/
@@ -82,8 +102,8 @@ _LOCATOR_REGEX: Final[re.Pattern[str]] = re.compile(
 # Neutral instruction language — no "error" / "failed" framing.
 _HIDDEN_BOUNCE_TEMPLATE: Final[str] = (
     "your answer did not cite evidence; re-answer with at least one "
-    "≥32-character span copied verbatim from a page you retrieved "
-    "or read this run."
+    "≥32-character span copied verbatim from a passage or unit you "
+    "retrieved or read this run."
 )
 
 
@@ -91,34 +111,70 @@ _HIDDEN_BOUNCE_TEMPLATE: Final[str] = (
 class EvidenceItem:
     """One evidence item the gate may match against.
 
-    ``page_text`` is whatever the upstream tool produced for that page
-    (or, for retrieve chunks, the passage slice — both are slices of
-    the committed extracted tree). The gate matches
-    ``≥min_span_len`` substrings of ``answer`` against
-    ``page_text`` only; it does NOT reconstruct whole pages on the
-    fly (the gate's evidence list already has the right granularity).
+    ``unit_text`` is whatever the upstream tool returned for one frozen
+    unit (or, for retrieve chunks, the passage slice — both are slices
+    of the committed extracted tree or stored attachment text). The
+    gate matches ``≥min_span_len`` substrings of ``answer`` against
+    ``unit_text`` only; it does NOT reconstruct whole units on the fly
+    (the gate's evidence list already has the right granularity).
+
+    ``kind`` is the closed quotable kind (``"company"`` or
+    ``ATTACHMENT_KIND``). Attachment items carry their identity in
+    ``attachment_id`` (``locator.document_id`` stays empty); company
+    items carry it in ``locator.document_id``. ``version_int`` is the
+    trusted record's integer version an attachment item was admitted
+    under — what the caller's re-check compares currency against;
+    ``None`` for company items. ``filename`` is display-only metadata
+    and never part of the citation identity; ``display`` says how the
+    unit is presented (``"page"`` for a physical PDF page, ``"unit"``
+    otherwise).
+
+    ``position`` / ``next_position`` are the slice's code-point offsets
+    within the full frozen unit, taken from the read contract: two
+    items join into one matchable text only when one run's
+    ``next_position`` equals the next run's ``position``. Retrieve
+    chunks keep the defaults (``0`` / ``None``) because a passage slice
+    is not a unit-aligned offset and must never bridge.
     """
 
     locator: Locator
-    page_text: str
+    unit_text: str
+    kind: str = COMPANY_KIND
+    attachment_id: str = ""
+    version_int: int | None = None
+    filename: str = ""
+    display: str = "page"
+    position: int = 0
+    next_position: int | None = None
 
 
 @dataclass(frozen=True)
 class Citation:
     """A passed citation.
 
-    ``document_id`` / ``version`` / ``page`` always come from the
-    matched evidence item's locator — never from the model's claim.
-    This prevents model-invented ``version`` strings (ADR 0021).
+    ``kind`` / ``document_id`` / ``attachment_id`` / ``version`` /
+    ``unit`` / ``display`` / ``filename`` always come from the matched
+    evidence item — never from the model's claim. This prevents
+    model-invented ``version`` strings (ADR 0021).
+
+    Exactly one source id is set: ``document_id`` for a company
+    citation (``attachment_id`` empty), ``attachment_id`` for an
+    attachment citation (``document_id`` empty, ``filename`` the safe
+    display name). ``display`` is ``"page"`` when the cited unit is
+    presented as a physical page and ``"unit"`` otherwise.
 
     ``quote`` is the ≥``min_span_len`` substring of the answer that
     matched; the gate keeps the verbatim span so downstream rendering
     can echo it as a quoted excerpt.
     """
 
+    kind: str
     document_id: str
+    attachment_id: str
     version: str
-    page: int
+    unit: int
+    display: str
+    filename: str
     quote: str
 
 
@@ -129,10 +185,10 @@ class Citation:
 class DoneResult:
     """Gate accepted: ≥1 ≥``min_span_len`` span is grounded in evidence.
 
-    ``citations`` is the deduplicated list of
-    ``(locator, quote)`` pairs (a unique ``(document_id, version,
-    page, quote)`` tuple is at most one ``Citation``). The host graph
-    forwards ``answer`` and ``citations`` to the CLI/HTTP surface.
+    ``citations`` is the deduplicated list of ``(identity, quote)``
+    pairs (a unique evidence identity plus quote is at most one
+    ``Citation``). The host graph forwards ``answer`` and ``citations``
+    to the CLI/HTTP surface.
     """
 
     outcome: str  # always "done"
@@ -183,9 +239,9 @@ class CitationGateError(Exception):
 
 
 class MalformedEvidenceError(CitationGateError):
-    """An evidence item has an empty ``page_text`` or an invalid
-    locator (``page < 1`` / empty ``document_id`` / empty
-    ``version``).
+    """An evidence item has an empty ``unit_text``, an invalid locator
+    (``unit < 1`` / missing source id / empty ``version``), or a kind
+    outside the closed quotable set.
 
     The ``index`` attribute carries the position of the offending item
     in the caller's evidence iterable (useful for run logs; matches the
@@ -208,6 +264,7 @@ def verify_citations(
     known_document_ids: set[str],
     repair_cap: int = 3,
     min_span_len: int = 32,
+    attachment_identity_current: Callable[[EvidenceItem], bool] | None = None,
 ) -> GateResult:
     """Verify the model's answer is grounded in this run's evidence.
 
@@ -217,11 +274,11 @@ def verify_citations(
         The model's final answer prose. Treated as an opaque UTF-8
         string; the gate never decodes / re-encodes it.
     evidence
-        The union of this run's ``read_file`` page texts and
-        ``retrieve`` chunk texts, each carrying its
-        ``{document_id, version, page}`` locator. Empty evidence is
-        allowed; the gate then falls through to the bounce path
-        (or refuse, if ``repair_count`` already hit ``repair_cap``).
+        The union of this run's ``read_source`` returned slices and
+        ``retrieve`` chunk texts, each carrying its locator and offsets.
+        Empty evidence is allowed; the gate then falls through to the
+        bounce path (or refuse, if ``repair_count`` already hit
+        ``repair_cap``).
     repair_count
         The number of recoverable citation failures already
         accumulated on this run. Negative values are treated as 0
@@ -239,6 +296,14 @@ def verify_citations(
     min_span_len
         Minimum length of an extractive span, in characters. Default
         32 (ADR 0021).
+    attachment_identity_current
+        Trust re-check for attachment evidence, supplied by the caller
+        which alone can see the trusted store: it must return True only
+        when the item's ``attachment_id`` is still owned by the current
+        thread and ``version_int`` still matches the record. An
+        attachment item the check rejects — or any attachment item
+        when no check is supplied — never yields a citation, even when
+        its text matches. Company items are unaffected.
 
     Returns
     -------
@@ -250,10 +315,10 @@ def verify_citations(
     Raises
     ------
     MalformedEvidenceError
-        If any item in ``evidence`` has ``page_text == ""``,
-        ``locator.page < 1``, or empty ``document_id`` / ``version``.
-        The gate does NOT silently skip malformed items — ADR 0021
-        forbids hidden drops.
+        If any item in ``evidence`` has ``unit_text == ""``,
+        ``locator.unit < 1``, an empty source id / ``version``, or a
+        ``kind`` outside ``QUOTABLE_EVIDENCE_KINDS``. The gate does NOT
+        silently skip malformed items — ADR 0021 forbids hidden drops.
     """
     # Repair counter is clamped to 0 (defensive: a negative value from
     # a caller bug should not accidentally cap the bounce path).
@@ -267,6 +332,20 @@ def verify_citations(
     for idx, item in enumerate(evidence_tuple):
         _validate_evidence(item, index=idx)
 
+    # Attachment trust re-check: refuse (silently, per spec: this is
+    # not a malformed-input case, it is an untrusted-identity case)
+    # any attachment item whose identity is stale, foreign, or
+    # unverifiable before it can carry a quote.
+    eligible = tuple(
+        item
+        for item in evidence_tuple
+        if item.kind != ATTACHMENT_KIND
+        or (
+            attachment_identity_current is not None
+            and attachment_identity_current(item)
+        )
+    )
+
     # Step 1: unknown-locator heuristic. Refuses immediately on the
     # first failure (no repair) — ADR 0008 + ADR 0021. The regex is
     # intentionally narrow (matches the manifest document_id shape
@@ -279,7 +358,7 @@ def verify_citations(
 
     # Step 2: span matching against evidence.
     citations = _match_spans(
-        answer, evidence_tuple, min_span_len=min_span_len
+        answer, eligible, min_span_len=min_span_len
     )
 
     if citations:
@@ -311,15 +390,22 @@ def _validate_evidence(item: EvidenceItem, *, index: int) -> None:
     run logs can point at the specific evidence entry that broke the
     contract.
     """
-    if not isinstance(item.page_text, str):
+    if item.kind not in QUOTABLE_EVIDENCE_KINDS:
         raise MalformedEvidenceError(
-            f"evidence[{index}].page_text must be str, "
-            f"got {type(item.page_text).__name__}",
+            f"evidence[{index}].kind {item.kind!r} is not quotable; only "
+            f"{sorted(QUOTABLE_EVIDENCE_KINDS)} text may enter the quote "
+            f"channel",
             index=index,
         )
-    if item.page_text == "":
+    if not isinstance(item.unit_text, str):
         raise MalformedEvidenceError(
-            f"evidence[{index}].page_text is empty",
+            f"evidence[{index}].unit_text must be str, "
+            f"got {type(item.unit_text).__name__}",
+            index=index,
+        )
+    if item.unit_text == "":
+        raise MalformedEvidenceError(
+            f"evidence[{index}].unit_text is empty",
             index=index,
         )
     locator = item.locator
@@ -329,15 +415,14 @@ def _validate_evidence(item: EvidenceItem, *, index: int) -> None:
             f"got {type(locator).__name__}",
             index=index,
         )
-    if not isinstance(locator.page, int) or locator.page < 1:
+    if (
+        not isinstance(locator.unit, int)
+        or isinstance(locator.unit, bool)
+        or locator.unit < 1
+    ):
         raise MalformedEvidenceError(
-            f"evidence[{index}].locator.page must be int ≥ 1, "
-            f"got {locator.page!r}",
-            index=index,
-        )
-    if not locator.document_id:
-        raise MalformedEvidenceError(
-            f"evidence[{index}].locator.document_id is empty",
+            f"evidence[{index}].locator.unit must be int ≥ 1, "
+            f"got {locator.unit!r}",
             index=index,
         )
     if not locator.version:
@@ -345,6 +430,139 @@ def _validate_evidence(item: EvidenceItem, *, index: int) -> None:
             f"evidence[{index}].locator.version is empty",
             index=index,
         )
+    if item.kind == ATTACHMENT_KIND:
+        if not item.attachment_id:
+            raise MalformedEvidenceError(
+                f"evidence[{index}].attachment_id is empty for an "
+                f"attachment item",
+                index=index,
+            )
+        if locator.document_id:
+            raise MalformedEvidenceError(
+                f"evidence[{index}].locator.document_id must be empty "
+                f"for an attachment item, got {locator.document_id!r}",
+                index=index,
+            )
+    else:
+        if not locator.document_id:
+            raise MalformedEvidenceError(
+                f"evidence[{index}].locator.document_id is empty",
+                index=index,
+            )
+
+
+def _unit_identity(
+    item: EvidenceItem,
+) -> tuple[str, str, str, int]:
+    """The identity two evidence items share exactly when they are
+    slices of the same frozen unit: kind, source id, version, ordinal.
+    """
+    source_id = (
+        item.attachment_id if item.kind == ATTACHMENT_KIND else item.locator.document_id
+    )
+    return (item.kind, source_id, item.locator.version, item.locator.unit)
+
+
+def _citation_from(item: EvidenceItem, quote: str) -> Citation:
+    """Render one matched evidence item as a ``Citation``."""
+    return Citation(
+        kind=item.kind,
+        document_id="" if item.kind == ATTACHMENT_KIND else item.locator.document_id,
+        attachment_id=item.attachment_id,
+        version=item.locator.version,
+        unit=item.locator.unit,
+        display=item.display,
+        filename=item.filename,
+        quote=quote,
+    )
+
+
+def _contiguous_runs(
+    evidence: tuple[EvidenceItem, ...],
+) -> list[list[EvidenceItem]]:
+    """Maximal ADJACENT slice runs (length ≥ 2) of the same unit.
+
+    Items are grouped by unit identity, ordered by ``position`` inside
+    each group, and split wherever continuity breaks — an item with no
+    ``next_position`` (a retrieve chunk, or an unread tail slice) or a
+    nonzero gap between ``prev.next_position`` and ``next.position``.
+    A run never bridges a gap: quote text spanning an unseen hole stays
+    unmatched (spec thread-attachment-source-read SC10). Group order
+    follows first-seen caller order; deterministic, no set iteration.
+    """
+    groups: dict[tuple[str, str, str, int], list[EvidenceItem]] = {}
+    for item in evidence:
+        groups.setdefault(_unit_identity(item), []).append(item)
+
+    runs: list[list[EvidenceItem]] = []
+    for group in groups.values():
+        ordered = sorted(group, key=lambda it: it.position)
+        current = [ordered[0]]
+        for nxt in ordered[1:]:
+            prev = current[-1]
+            if prev.next_position is not None and prev.next_position == nxt.position:
+                current.append(nxt)
+            else:
+                if len(current) >= 2:
+                    runs.append(current)
+                current = [nxt]
+        if len(current) >= 2:
+            runs.append(current)
+    return runs
+
+
+def _harvest_spans(
+    answer: str,
+    ev_text: str,
+    anchor: EvidenceItem,
+    *,
+    min_span_len: int,
+    seen: set[tuple[tuple[str, str, str, int], str]],
+    citations: list[Citation],
+) -> None:
+    """Record every maximal grounded span of ``answer`` inside
+    ``ev_text`` onto ``citations`` (dedup via ``seen``).
+
+    Algorithm: walk ``answer`` left-to-right. At each starting
+    position ``i``, greedily extend the match (``answer[i:j] in
+    ev_text``) until the next character would fail. The longest match
+    starting at ``i`` is recorded (if it meets ``min_span_len`` and
+    contains an alphanumeric token) and we skip past it; otherwise we
+    advance one position. The greedy rule guarantees the longest match
+    per starting position; the "skip past the match" rule prevents
+    nested-match explosions without losing non-overlapping spans.
+    """
+    n = len(answer)
+    ev_len = len(ev_text)
+    i = 0
+    while i <= n - min_span_len:
+        # Greedy longest match starting at i. Cap the extension by
+        # both the answer length and the evidence length:
+        # ``answer[i:j]`` cannot be a substring of ``ev_text`` if its
+        # length exceeds ``ev_len``.
+        j = i + min_span_len
+        max_j = min(n + 1, i + ev_len + 1)
+        while j < max_j and answer[i:j] in ev_text:
+            j += 1
+        match_len = j - 1 - i
+
+        if match_len >= min_span_len:
+            quote = answer[i : i + match_len]
+            # A span must contain at least one alphanumeric
+            # token — whitespace-only / punctuation-only spans
+            # are ignored (ADR 0021).
+            if any(ch.isalnum() for ch in quote):
+                key = (_unit_identity(anchor), quote)
+                if key not in seen:
+                    seen.add(key)
+                    citations.append(_citation_from(anchor, quote))
+            # Skip past this match (whether or not we recorded
+            # it — any shorter substring at the same start is
+            # either no-alnum or non-matching, by definition of
+            # the greedy longest-match).
+            i += match_len
+        else:
+            i += 1
 
 
 def _match_spans(
@@ -354,83 +572,47 @@ def _match_spans(
     min_span_len: int,
 ) -> tuple[Citation, ...]:
     """Find all maximal ≥``min_span_len`` substrings of ``answer``
-    that appear in any evidence item's ``page_text``.
+    that are grounded in this run's evidence.
+
+    Grounded means: a contiguous substring of ONE returned slice, or
+    of two or more ADJACENT returned slices of the same frozen unit —
+    joined only where the offsets are contiguous. A quote that spans a
+    gap no slice covered stays unmatched.
 
     Returns ``Citation`` objects deduplicated by
-    ``(locator, quote)``, in deterministic order: by evidence order
-    (caller's order), then by left-to-right position in the answer.
-    The order is the order ``(locator, quote)`` was first discovered;
-    repeats are dropped silently.
-
-    Algorithm: for each evidence item, walk ``answer`` left-to-right.
-    At each starting position ``i``, greedily extend the match
-    (``answer[i:j] in evidence_text``) until the next character would
-    fail. The longest match starting at ``i`` is recorded (if it
-    meets ``min_span_len`` and contains an alphanumeric token) and
-    we skip past it; otherwise we advance one position. The greedy
-    rule guarantees the longest match per starting position; the
-    "skip past the match" rule prevents nested-match explosions
-    without losing non-overlapping spans.
+    ``(unit identity, quote)``, in deterministic order: every single
+    item first in caller order (left-to-right within the answer), then
+    every maximal contiguous run in first-item order. Repeats are
+    dropped silently.
     """
     n = len(answer)
     if n < min_span_len:
         return ()
 
-    seen: set[tuple[Locator, str]] = set()
+    seen: set[tuple[tuple[str, str, str, int], str]] = set()
     citations: list[Citation] = []
 
     for ev in evidence:
-        ev_text = ev.page_text
-        ev_len = len(ev_text)
-        if ev_len == 0:
-            # Already validated to be non-empty, but guard anyway so
-            # an empty ``page_text`` (which would mean every
-            # substring search returns False immediately) cannot
-            # loop pointlessly. This is a defensive branch that
-            # should be unreachable after ``_validate_evidence``.
-            continue
+        _harvest_spans(
+            answer, ev.unit_text, ev, min_span_len=min_span_len, seen=seen, citations=citations
+        )
 
-        i = 0
-        while i <= n - min_span_len:
-            # Greedy longest match starting at i.
-            j = i + min_span_len
-            # Cap the extension by both the answer length and the
-            # evidence length: ``answer[i:j]`` cannot be a substring
-            # of ``ev_text`` if its length exceeds ``ev_len``.
-            max_j = min(n + 1, i + ev_len + 1)
-            while j < max_j and answer[i:j] in ev_text:
-                j += 1
-            match_len = j - 1 - i
-
-            if match_len >= min_span_len:
-                quote = answer[i : i + match_len]
-                # A span must contain at least one alphanumeric
-                # token — whitespace-only / punctuation-only spans
-                # are ignored (ADR 0021).
-                if any(ch.isalnum() for ch in quote):
-                    key = (ev.locator, quote)
-                    if key not in seen:
-                        seen.add(key)
-                        citations.append(
-                            Citation(
-                                document_id=ev.locator.document_id,
-                                version=ev.locator.version,
-                                page=ev.locator.page,
-                                quote=quote,
-                            )
-                        )
-                # Skip past this match (whether or not we recorded
-                # it — any shorter substring at the same start is
-                # either no-alnum or non-matching, by definition of
-                # the greedy longest-match).
-                i += match_len
-            else:
-                i += 1
+    for run in _contiguous_runs(evidence):
+        joined = "".join(ev.unit_text for ev in run)
+        _harvest_spans(
+            answer,
+            joined,
+            run[0],
+            min_span_len=min_span_len,
+            seen=seen,
+            citations=citations,
+        )
 
     return tuple(citations)
 
 
 __all__ = [
+    "COMPANY_KIND",
     "BounceResult",
     "Citation",
     "CitationGateError",
@@ -438,6 +620,7 @@ __all__ = [
     "EvidenceItem",
     "GateResult",
     "MalformedEvidenceError",
+    "QUOTABLE_EVIDENCE_KINDS",
     "RefuseResult",
     "verify_citations",
 ]

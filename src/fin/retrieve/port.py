@@ -27,8 +27,8 @@ Two answers, never conflated (T21 / SC42 / SC43 / §B2 第 5 条):
   ``form`` / ``filing_date``, and a valid query with no hits.
 
 ``limit`` defaults to 8 and is hard-capped at 20. ``source_ref`` is a
-``fin.corpus.Locator`` instance so the citation gate (T5) can read
-``.document_id`` / ``.version`` / ``.page`` directly.
+``fin.corpus.Locator`` instance so the citation gate can read
+``.document_id`` / ``.version`` / ``.unit`` directly.
 """
 
 from __future__ import annotations
@@ -156,7 +156,7 @@ def resolve_search_mode(search_mode: str | None) -> str | None:
 class Chunk:
     """One retrieved passage.
 
-    ``source_ref`` IS a ``Locator`` (ADR 0006): ``{document_id, version, page}``.
+    ``source_ref`` IS a ``Locator`` (ADR 0006): ``{document_id, version, unit}``.
     The BM25 ``score`` is the raw ``rank_bm25`` score — higher is
     better for hits, zero-or-negative for non-matches. The adapter
     returns chunks ordered descending by ``score``.

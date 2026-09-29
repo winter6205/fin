@@ -44,7 +44,7 @@ into the shapes downstream code renders:
   the inline ``<think>`` strip above stays the fallback - thinking
   is surfaced or stripped, never swallowed into the answer.
 * :func:`summarize_list_files` / :func:`summarize_retrieve` /
-  :func:`summarize_read_file` / :func:`summarize_read_source` /
+  :func:`summarize_read_source` /
   :func:`summarize_get_xbrl_fact` /
   :func:`format_tool_summary` - the
   human-readable one-liners the SPA renders in the tools region
@@ -759,12 +759,18 @@ _RETRIEVE_ERROR_COPY: dict[str, str] = {
 
 
 def _locator_fields(chunk: Any) -> tuple[str, int] | None:
-    """Pull ``(document_id, page)`` off a retrieved chunk's ``source_ref``.
+    """Pull ``(document_id, unit)`` off a retrieved chunk's ``source_ref``.
 
     Both shapes occur: the live adapter returns ``Locator`` objects, the
     serialized ToolMessage JSON carries dicts. A chunk missing either
-    field yields ``None`` so the caller can skip it rather than render a
-    half locator the operator cannot open.
+    identity field yields ``None`` so the caller can skip it rather than
+    render a half locator the operator cannot open.
+
+    A tool row renders the ordinal as a unit, never as a page: the read
+    and retrieve envelopes carry no presentation discriminator, so a
+    ``p.`` here would claim a physical page the seam cannot observe, and
+    it would mislabel every non-PDF unit. Only a citation, which the
+    trusted record grants a ``display`` for, may present as ``p.N``.
     """
     ref = getattr(chunk, "source_ref", None)
     if ref is None and isinstance(chunk, dict):
@@ -772,26 +778,27 @@ def _locator_fields(chunk: Any) -> tuple[str, int] | None:
     if ref is None:
         return None
     doc_id = getattr(ref, "document_id", None)
-    page = getattr(ref, "page", None)
+    unit = getattr(ref, "unit", None)
     if doc_id is None and isinstance(ref, dict):
         doc_id = ref.get("document_id")
-        page = ref.get("page")
-    if doc_id is None or page is None:
+        unit = ref.get("unit")
+    if doc_id is None or unit is None:
         return None
-    return str(doc_id), int(page)
+    return str(doc_id), int(unit)
 
 
 def _retrieve_locator_suffix(chunks: list[Any] | None) -> str:
-    """Render ``" -> doc p.N, doc p.M"`` for up to three retrieved chunks.
+    """Render ``" -> doc u.N, doc u.M"`` for up to three retrieved chunks.
 
-    Three is the scan budget: enough for the operator to see which pages
+    Three is the scan budget: enough for the operator to see which units
     were touched, short enough to stay on one line.
     """
     locators: list[str] = []
     for chunk in (chunks or [])[:3]:
         fields = _locator_fields(chunk)
         if fields is not None:
-            locators.append(f"{fields[0]} p.{fields[1]}")
+            source_id, unit = fields
+            locators.append(f"{source_id} u.{unit}")
     return " -> " + ", ".join(locators) if locators else ""
 
 
@@ -868,42 +875,6 @@ def summarize_retrieve(
     hits_noun = "hit" if hits == 1 else "hits"
     head = f"{query!r}: {hits} {hits_noun}" if query else f"{hits} {hits_noun}"
     return f"{head}{doc_filter}{locator_suffix}{degradation}"
-
-
-def summarize_read_file(
-    *,
-    result: dict[str, Any] | None = None,
-    args: dict[str, Any] | None = None,
-) -> str:
-    """Human-readable one-liner for ``read_file`` calls.
-
-    Spec line 32: ``read_file`` -> ``document_id p.N`` plus the
-    page range when ``page_limit > 1``. A miss
-    (``{"error": "unknown_locator"}``) appends the error token so
-    the operator can see why no evidence landed.
-    """
-    src_args = args or {}
-    src_result = result or {}
-    doc_id = (
-        src_args.get("document_id") or src_result.get("document_id") or ""
-    )
-    page_raw = src_args.get("page") or src_result.get("page") or 1
-    limit_raw = src_args.get("page_limit") or src_result.get("page_limit") or 1
-
-    def _as_int(value: Any) -> int:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 0
-
-    page = _as_int(page_raw) or 1
-    page_limit = _as_int(limit_raw) or 1
-    head = f"{doc_id} p.{page}"
-    if page_limit > 1:
-        head += f"-{page + page_limit - 1}"
-    if isinstance(src_result, dict) and src_result.get("error"):
-        head += f" ({src_result['error']})"
-    return head
 
 
 def summarize_read_source(
@@ -986,17 +957,19 @@ def _fact_qualifiers(result: dict[str, Any]) -> str:
 
 
 def _fact_locator_suffix(result: dict[str, Any]) -> str:
-    """Render ``" -> document_id p.N"`` for a hit's ``source_locator``.
+    """Render ``" -> document_id u.N"`` for a hit's ``source_locator``.
 
     A locator without a ``document_id`` cannot be opened, so it renders
-    as nothing; a page-less locator still names the document.
+    as nothing; a unit-less locator still names the document. The label
+    matches the ``read_source`` and ``retrieve`` rows: a fact row carries
+    the same company triple and earns the same unit ordinal.
     """
     locator = result.get("source_locator")
     if not isinstance(locator, dict) or not locator.get("document_id"):
         return ""
     suffix = f" -> {locator['document_id']}"
-    page = locator.get("page")
-    return f"{suffix} p.{page}" if page is not None else suffix
+    unit = locator.get("unit")
+    return f"{suffix} u.{unit}" if unit is not None else suffix
 
 
 def summarize_get_xbrl_fact(
@@ -1011,7 +984,7 @@ def summarize_get_xbrl_fact(
     carries ``{"error": "fact_not_found", ...}``. The hit renders as
     ``concept period = value (unit, scale) -> document_id p.N``; the
     miss appends the error token the same way
-    :func:`summarize_read_file` does, so the operator can see why the
+    :func:`summarize_read_source` does, so the operator can see why the
     numeric gate had nothing to verify against.
     """
     src_args = args or {}
@@ -1043,7 +1016,7 @@ def summarize_compare_facts(
     renders as structure on the turn, never as JSON in this string
     (spec line 32). A typed EXIT (``empty_comparison`` /
     ``comparison_overflow``) appends its token the same way
-    :func:`summarize_read_file` does.
+    :func:`summarize_read_source` does.
     """
     src_args = args or {}
     src_result = result if isinstance(result, dict) else {}
@@ -1135,7 +1108,7 @@ def summarize_research_issuers(
     and its locators render as structure, never as JSON in this string
     (spec line 32). A typed EXIT (``empty_fanout`` /
     ``issuer_overflow``) appends its token the same way
-    :func:`summarize_read_file` does, so an operator whose ask was over
+    :func:`summarize_read_source` does, so an operator whose ask was over
     the cap can see why nothing was researched.
     """
     src_args = args or {}
@@ -1213,8 +1186,6 @@ def format_tool_summary(
             error=error,
             degradation=_degradation_clause(result_dict),
         )
-    if name == "read_file":
-        return summarize_read_file(result=result_dict, args=args)
     if name == "read_source":
         return summarize_read_source(result=result_dict, args=args)
     if name == "get_xbrl_fact":
@@ -1284,7 +1255,6 @@ __all__ = [
     "summarize_statement",
     "summarize_table_extract",
     "summarize_list_files",
-    "summarize_read_file",
     "summarize_read_source",
     "summarize_research_issuers",
     "summarize_retrieve",

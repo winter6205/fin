@@ -208,9 +208,9 @@ def _citation_evidence() -> tuple[str, list[EvidenceItem]]:
                 locator=Locator(
                     document_id="AAPL-2022Q3",
                     version="a" * 64,
-                    page=1,
+                    unit=1,
                 ),
-                page_text=span,
+                unit_text=span,
             )
         ],
     )

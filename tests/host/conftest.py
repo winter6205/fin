@@ -27,6 +27,13 @@ containment semantics cannot drift apart.
 And the ``deployed_attachment_bounds`` boot fixture: ``serve()`` refuses a
 deployment that cannot state its four attachment bounds, so every boot test
 about something else needs that bound from one place.
+
+It also owns the live-SQL row/write probes (``live_sql_rows`` /
+``live_sql_write``). The four live attachment modules each open a SECOND
+connection to the real ``FIN_CHECKPOINT_URL``, bypassing the store's own API
+on purpose, and each used to carry its own private copy of that helper — four
+spellings of one probe, any of which could drift into reading through the
+store instead. A fixture is the one copy a live module can ask for.
 """
 
 from __future__ import annotations
@@ -35,7 +42,7 @@ from fin.corpus._private_fixtures import load_private_fixture
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
@@ -166,6 +173,49 @@ def deployed_attachment_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(key, deployed[key])
 
 
+# ----- real-storage probes (a second SQL connection, never the app's) -----
+
+
+@pytest.fixture
+def live_sql_rows() -> Callable[..., list[Any]]:
+    """Read rows over a SECOND connection, never the store's own.
+
+    The live attachment modules assert against real Postgres through this, so
+    a read proves what the LANE wrote rather than what the store reports back
+    to itself. ``psycopg`` is imported inside the call because the default
+    hermetic run must not require the live driver's stack.
+    """
+    import psycopg
+
+    def rows(
+        url: str, statement: str, params: tuple[Any, ...] = ()
+    ) -> list[Any]:
+        with psycopg.connect(url) as conn:
+            return conn.execute(statement, params).fetchall()
+
+    return rows
+
+
+@pytest.fixture
+def live_sql_write() -> Callable[..., int]:
+    """Write over a SECOND connection and report the affected row count.
+
+    A separate connection on purpose: tampering with a stored row has to
+    bypass the store's own API, because the point is what the LANE does when
+    it finds a row it did not mint — not what the store does when asked
+    nicely.
+    """
+    import psycopg
+
+    def write(url: str, statement: str, params: tuple[Any, ...] = ()) -> int:
+        with psycopg.connect(url) as conn:
+            count = conn.execute(statement, params).rowcount
+            conn.commit()
+        return int(count)
+
+    return write
+
+
 # ----- mis-wired-criteria containment: one shared never-sent client -----
 
 
@@ -268,7 +318,7 @@ def compare_seed(tmp_path: Path) -> CompareSeed:
             5,
         ),
     )
-    for document_id, period, value, version, page in rows:
+    for document_id, period, value, version, source_unit in rows:
         write_facts(
             document_id=document_id,
             facts=[
@@ -279,7 +329,9 @@ def compare_seed(tmp_path: Path) -> CompareSeed:
                     unit="USD",
                     scale="millions",
                     source_locator=Locator(
-                        document_id=document_id, version=version, page=page
+                        document_id=document_id,
+                        version=version,
+                        unit=source_unit,
                     ),
                 )
             ],

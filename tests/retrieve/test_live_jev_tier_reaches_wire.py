@@ -295,7 +295,7 @@ def test_the_judged_档_reaches_the_real_server_which_answers(
     # The real server ANSWERED this run's 档-bearing call with the chunk this
     # run pushed: ``{"hits": []}``, a transport error, or another corpus
     # cannot satisfy any of the three asserts below.
-    passages = [item.page_text for item in out["evidence"]]
+    passages = [item.unit_text for item in out["evidence"]]
     assert passages, out
     assert any(_TOKEN in passage for passage in passages), passages
     assert {

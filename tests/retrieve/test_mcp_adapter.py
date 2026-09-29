@@ -12,6 +12,10 @@ contract (per spec success criteria):
 * limit cap = 20 (ADR 0009, parity with port semantics)
 * two overlapping retrieve calls each return chunks-or-
   ``retrieve_unavailable`` without raising
+* the read seam is ``read_slice({document_id, version, unit}, position)``:
+  exactly one bounded slice per round trip, answered as
+  ``{source_ref, text, next_position}`` or one typed failure — never a
+  raise and never a page window
 
 The default transport (``_call_mcp``) launches a subprocess.
 Tests override ``_call_mcp`` to inject scripted responses or
@@ -41,25 +45,36 @@ from fin.retrieve.mcp_adapter import (
     MCPRetrieveAdapter,
     RetrieveUnavailableError,
 )
+from fin.retrieve.source_read import (
+    INVALID_LOCATOR,
+    INVALID_POSITION,
+    SOURCE_BACKEND_CONTRACT_ERROR,
+    SOURCE_READ_MAX_RESULT_BYTES,
+    SOURCE_READ_MAX_TEXT_CODE_POINTS,
+    SOURCE_UNAVAILABLE,
+    UNKNOWN_LOCATOR,
+    is_slice_result,
+    serialized_result_bytes,
+)
 
 
-def _loc(document_id: str, page: int = 1) -> Locator:
+def _loc(document_id: str, unit: int = 1) -> Locator:
     return Locator(
         document_id=document_id,
         version="v-" + "a" * 60,
-        page=page,
+        unit=unit,
     )
 
 
-def _chunk(text: str, document_id: str, page: int = 1, score: float = 1.0) -> Chunk:
+def _chunk(text: str, document_id: str, unit: int = 1, score: float = 1.0) -> Chunk:
     return Chunk(
         text=text,
-        source_ref=_loc(document_id, page=page),
+        source_ref=_loc(document_id, unit=unit),
         score=score,
     )
 
 
-def _canonical_source_ref(document_id: str, page: int = 1) -> str:
+def _canonical_source_ref(document_id: str, unit: int = 1) -> str:
     """The B4 canonical fin ``source_ref`` for a (document_id, unit) pair.
 
     Plan D0 I-T2: the wire envelope sends ``source_ref`` as the fin
@@ -70,9 +85,47 @@ def _canonical_source_ref(document_id: str, page: int = 1) -> str:
         UnitLocator(
             document_id=document_id,
             version="v-" + "a" * 60,
-            unit=page,
+            unit=unit,
         )
     )
+
+
+# ----- wire envelope builders: the shape the real server drives -----
+
+
+def _wire_slice(
+    source_ref: str, content: str, next_position: int | None
+) -> dict:
+    """One ``read_source`` success envelope: a text block whose JSON is
+    ``{id, source_ref, content, next_position}``."""
+    inner = {
+        "id": source_ref,
+        "source_ref": source_ref,
+        "content": content,
+        "next_position": next_position,
+    }
+    return {"result": {"content": [{"type": "text", "text": json.dumps(inner)}]}}
+
+
+def _wire_refusal(
+    code: str, source_ref: str, *, flag_error: bool = True, **fields: object
+) -> dict:
+    """One named backend refusal, sent the way the real server sends it:
+    an ``isError`` result whose text block carries ``{error, source_ref}``.
+    """
+    result: dict = {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {"error": code, "source_ref": source_ref, **fields}
+                ),
+            }
+        ]
+    }
+    if flag_error:
+        result["isError"] = True
+    return {"result": result}
 
 
 # ----- test seam: subclass override of _call_mcp -----
@@ -117,13 +170,17 @@ class _ScriptedAdapter(MCPRetrieveAdapter):
 
 
 class _ReadCapturingAdapter(_ScriptedAdapter):
-    """Scripted ``_call_mcp`` for ``read()``.
+    """Scripted ``_call_mcp`` for ``read_slice()``.
 
-    The fake returns the **real** MCP wire shape — a list of text content
-    blocks carrying a JSON envelope — so the scripted suite exercises the
-    same decode path the real iknow-memory server drives. Bodies map
-    ``source_ref`` → body text; ``errors`` inject JSON-RPC error envelopes
-    for the named-miss path.
+    The fake returns the **real** MCP wire shape — a text content block
+    carrying a JSON envelope with ``content`` and ``next_position`` — so
+    the scripted suite exercises the same decode path the real
+    iknow-memory server drives. ``bodies`` maps the canonical
+    ``source_ref`` → the FULL stored text of that frozen unit, and the
+    fake slices it at the requested cursor the way the bounded wire
+    does. A ``source_ref`` with no stored unit answers the same named
+    ``read_source_not_found`` refusal the real server sends. ``errors``
+    injects scripted envelopes ahead of that lookup.
     """
 
     def __init__(self, *, bodies: dict[str, str], errors: list[dict] | None = None, **kwargs: object) -> None:
@@ -136,64 +193,127 @@ class _ReadCapturingAdapter(_ScriptedAdapter):
         self.payloads.append(payload)
         if self.errors:
             return self.errors.pop(0)
-        source_ref = payload["params"]["arguments"]["source_ref"]
-        body = self.bodies.get(source_ref, "")
-        inner = {
-            "id": source_ref,
-            "source_ref": source_ref,
-            "content": body,
-        }
-        return {
-            "result": {
-                "content": [
-                    {"type": "text", "text": json.dumps(inner)}
-                ]
-            }
-        }
+        arguments = payload["params"]["arguments"]
+        source_ref = arguments["source_ref"]
+        position = arguments["position"]
+        text = self.bodies.get(source_ref)
+        if text is None:
+            return _wire_refusal("read_source_not_found", source_ref)
+        if position > len(text):
+            return _wire_refusal(
+                "read_source_invalid_position",
+                source_ref,
+                code_points=len(text),
+            )
+        end = min(position + SOURCE_READ_MAX_TEXT_CODE_POINTS, len(text))
+        return _wire_slice(source_ref, text[position:end], end if end < len(text) else None)
 
 
-def test_mcp_read_ingested_document_calls_read_source_per_unit() -> None:
+def test_mcp_read_slice_addresses_exactly_the_locator_it_is_given() -> None:
+    """One read resolves exactly the unit its locator names.
+
+    The read never fans out to a neighbouring unit and never merges two
+    units into one body: each call carries its own canonical
+    ``source_ref``, answers with the request identity echoed back, and
+    returns only that unit's text.
+    """
     document_id, version = "DOC-2023Q1", "v-" + "a" * 60
-    locators = (Locator(document_id, version, 2), Locator(document_id, version, 1))
-    source_refs = [serialize_source_ref(UnitLocator(document_id, version, locator.page)) for locator in locators]
+    first_ref = _canonical_source_ref(document_id, unit=1)
+    second_ref = _canonical_source_ref(document_id, unit=2)
     adapter = _ReadCapturingAdapter(
-        bodies={source_refs[0]: "SECOND PARAGRAPH", source_refs[1]: "FIRST PARAGRAPH"},
-        locator_map={"hit-2": locators[0], "hit-1": locators[1]},
+        bodies={first_ref: "FIRST PARAGRAPH", second_ref: "SECOND PARAGRAPH"},
         known_document_ids={document_id},
     )
-    result = adapter.read(document_id, version, page=1, page_limit=2)
+    second = {"document_id": document_id, "version": version, "unit": 2}
+    first = {"document_id": document_id, "version": version, "unit": 1}
+    assert adapter.read_slice(second) == {
+        "source_ref": second,
+        "text": "SECOND PARAGRAPH",
+        "next_position": None,
+    }
+    assert adapter.read_slice(first) == {
+        "source_ref": first,
+        "text": "FIRST PARAGRAPH",
+        "next_position": None,
+    }
     assert [payload["params"]["arguments"] for payload in adapter.payloads] == [
-        {"source_ref": source_refs[1]}, {"source_ref": source_refs[0]}
+        {"source_ref": second_ref, "position": 0},
+        {"source_ref": first_ref, "position": 0},
     ]
-    assert result == {"document_id": document_id, "version": version, "page": 1, "text": "FIRST PARAGRAPH\n\nSECOND PARAGRAPH", "page_count": 2}
 
 
-def test_mcp_read_clamps_window_and_unit_order() -> None:
+def test_mcp_read_slice_cursor_walk_is_bounded_and_terminates() -> None:
+    """The cursor walk replaces the old page window: every slice is
+    within the code-point cap, every cursor strictly advances, the walk
+    reassembles exactly the stored unit text, and it stops — no extra
+    round trip can happen once the cursor is ``None``.
+    """
     document_id, version = "DOC-2023Q1", "v-" + "a" * 60
-    locators = tuple(Locator(document_id, version, page) for page in range(1, 5))
-    refs = {locator.page: serialize_source_ref(UnitLocator(document_id, version, locator.page)) for locator in locators}
+    stored = "A" * SOURCE_READ_MAX_TEXT_CODE_POINTS + "TAIL OF THE UNIT"
     adapter = _ReadCapturingAdapter(
-        bodies={refs[2]: "PAGE TWO", refs[3]: "PAGE THREE", refs[4]: "PAGE FOUR"},
-        locator_map={f"hit-{page}": locator for page, locator in enumerate(locators, 1)},
+        bodies={_canonical_source_ref(document_id, unit=1): stored},
         known_document_ids={document_id},
     )
-    result = adapter.read(document_id, version, page=2, page_limit=99)
-    assert [payload["params"]["arguments"] for payload in adapter.payloads] == [{"source_ref": refs[2]}, {"source_ref": refs[3]}, {"source_ref": refs[4]}]
-    assert result["text"] == "PAGE TWO\n\nPAGE THREE\n\nPAGE FOUR"
-    assert result["page"] == 2 and result["page_count"] == 4
+    source_ref = {"document_id": document_id, "version": version, "unit": 1}
+    position: int | None = 0
+    collected = ""
+    slices = 0
+    while position is not None:
+        result = adapter.read_slice(source_ref, position)
+        assert is_slice_result(result), result
+        assert len(result["text"]) <= SOURCE_READ_MAX_TEXT_CODE_POINTS
+        assert serialized_result_bytes(result) <= SOURCE_READ_MAX_RESULT_BYTES
+        assert result["next_position"] is None or (
+            result["next_position"] > position
+        ), result
+        collected += result["text"]
+        position = result["next_position"]
+        slices += 1
+    assert collected == stored
+    assert slices == 2
+    assert [
+        payload["params"]["arguments"]["position"] for payload in adapter.payloads
+    ] == [0, SOURCE_READ_MAX_TEXT_CODE_POINTS]
+
 
 
 def test_mcp_read_miss_and_unknown_document_are_unknown_locator() -> None:
+    """A locator the backend cannot find and a document outside the
+    ingested set are the one named miss — never an empty success, never
+    a body."""
     document_id, version = "DOC-2023Q1", "v-" + "a" * 60
-    locator = Locator(document_id, version, 1)
     adapter = _ReadCapturingAdapter(
-        bodies={}, locator_map={"hit": locator}, known_document_ids={document_id},
-        errors=[{"error": {"code": -32001, "message": "read_source_not_found"}}],
+        bodies={}, known_document_ids={document_id}
     )
-    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
-    unknown = _ReadCapturingAdapter(bodies={}, locator_map={"hit": locator}, known_document_ids={document_id})
-    assert unknown.read("UNKNOWN-2099Q9", version) == {"error": "unknown_locator"}
+    unread = {"document_id": document_id, "version": version, "unit": 7}
+    miss = adapter.read_slice(unread)
+    assert miss == {"error": UNKNOWN_LOCATOR}
+    assert "text" not in miss
+    unknown = _ReadCapturingAdapter(
+        bodies={}, known_document_ids={document_id}
+    )
+    assert unknown.read_slice(
+        {"document_id": "UNKNOWN-2099Q9", "version": version, "unit": 1}
+    ) == {"error": UNKNOWN_LOCATOR}
     assert unknown.payloads == []
+
+
+def test_mcp_read_jsonrpc_error_is_an_outage_not_a_miss() -> None:
+    """A machine that refuses to answer at the JSON-RPC level is the
+    outage, not a locator that does not exist — the distinction the old
+    read contract already drew and the typed read keeps.
+    """
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    adapter = _ReadCapturingAdapter(
+        bodies={_canonical_source_ref(document_id): "BODY"},
+        known_document_ids={document_id},
+        errors=[{"error": {"code": -32001, "message": "internal error"}}],
+    )
+    outage = adapter.read_slice(
+        {"document_id": document_id, "version": version, "unit": 1}
+    )
+    assert outage == {"error": SOURCE_UNAVAILABLE}
+    assert "text" not in outage
 
 
 def test_mcp_read_iserror_content_block_is_unknown_locator() -> None:
@@ -201,42 +321,24 @@ def test_mcp_read_iserror_content_block_is_unknown_locator() -> None:
     block whose text is a JSON envelope carrying the named code.
 
     The adapter must surface that as ``unknown_locator`` — the same
-    miss shape the JSON-RPC error path uses — never as an empty
-    success and never as the raw block list.
+    miss shape a locator lookup uses — never as an empty success and
+    never as the raw block list.
     """
     document_id, version = "DOC-2023Q1", "v-" + "a" * 60
-    locator = Locator(document_id, version, 1)
-    source_ref = serialize_source_ref(
-        UnitLocator(document_id, version, unit=locator.page)
-    )
-    miss_envelope = {
-        "error": "read_source_not_found",
-        "source_ref": source_ref,
-    }
+    canonical = _canonical_source_ref(document_id)
     adapter = _ReadCapturingAdapter(
         bodies={},
-        locator_map={"hit": locator},
         known_document_ids={document_id},
-        errors=[
-            {
-                "result": {
-                    "isError": True,
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": json.dumps(miss_envelope),
-                        }
-                    ],
-                }
-            }
-        ],
+        errors=[_wire_refusal("read_source_not_found", canonical)],
     )
-    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
+    assert adapter.read_slice(
+        {"document_id": document_id, "version": version, "unit": 1}
+    ) == {"error": UNKNOWN_LOCATOR}
 
 
 def test_mcp_read_invalidated_content_block_is_unknown_locator() -> None:
-    """A ``read_source_invalidated`` content block — the T5
-    operator-console miss — is also surfaced as ``unknown_locator``.
+    """A ``read_source_invalidated`` content block — the operator-console
+    miss — is also surfaced as ``unknown_locator``.
 
     The receiving service distinguishes "row exists but window is
     closed" from "row missing", but fin's read contract collapses
@@ -245,49 +347,139 @@ def test_mcp_read_invalidated_content_block_is_unknown_locator() -> None:
     not slip through as a successful empty body.
     """
     document_id, version = "DOC-2023Q1", "v-" + "a" * 60
-    locator = Locator(document_id, version, 1)
-    source_ref = serialize_source_ref(
-        UnitLocator(document_id, version, unit=locator.page)
-    )
-    miss_envelope = {
-        "error": "read_source_invalidated",
-        "source_ref": source_ref,
-        "valid_until": "2026-01-01T00:00:00.000Z",
-    }
+    canonical = _canonical_source_ref(document_id)
     adapter = _ReadCapturingAdapter(
         bodies={},
-        locator_map={"hit": locator},
         known_document_ids={document_id},
         errors=[
-            {
-                "result": {
-                    "isError": True,
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": json.dumps(miss_envelope),
-                        }
-                    ],
-                }
-            }
+            _wire_refusal(
+                "read_source_invalidated",
+                canonical,
+                valid_until="2026-01-01T00:00:00.000Z",
+            )
         ],
     )
-    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
+    result = adapter.read_slice(
+        {"document_id": document_id, "version": version, "unit": 1}
+    )
+    assert result == {"error": UNKNOWN_LOCATOR}
 
 
-def test_mcp_read_version_mismatch_rejects_before_transport() -> None:
-    locator = Locator("DOC-2023Q1", "v-" + "b" * 60, 1)
-    adapter = _ReadCapturingAdapter(bodies={}, locator_map={"hit": locator}, known_document_ids={"DOC-2023Q1"})
-    assert adapter.read("DOC-2023Q1", "v-" + "a" * 60) == {"error": "unknown_locator"}
+def test_mcp_read_stale_version_is_the_named_miss_without_text() -> None:
+    """A ``version`` the backend does not hold for that document is the
+    miss named by the wire, and the failure never carries text — the
+    invariant the old pre-transport version check guarded, now enforced
+    by the one authority that knows which versions exist.
+    """
+    document_id = "DOC-2023Q1"
+    stored = _canonical_source_ref(document_id)
+    adapter = _ReadCapturingAdapter(
+        bodies={stored: "REVENUE ROSE"}, known_document_ids={document_id}
+    )
+    result = adapter.read_slice(
+        {"document_id": document_id, "version": "v-" + "b" * 60, "unit": 1}
+    )
+    assert result == {"error": UNKNOWN_LOCATOR}
+    assert "text" not in result
+    assert adapter.payloads[0]["params"]["arguments"]["source_ref"] != stored
+
+
+@pytest.mark.parametrize(
+    ("bad_ref", "expected"),
+    [
+        pytest.param(
+            {"document_id": "DOC-2023Q1", "version": "v-" + "a" * 60, "unit": 0},
+            {"error": INVALID_LOCATOR, "reason": "locator_fields_malformed"},
+            id="unit-below-one",
+        ),
+        pytest.param(
+            {
+                "document_id": "DOC-2023Q1",
+                "version": "v-" + "a" * 60,
+                "unit": True,
+            },
+            {"error": INVALID_LOCATOR, "reason": "locator_fields_malformed"},
+            id="bool-unit",
+        ),
+        pytest.param(
+            {
+                "document_id": "DOC-2023Q1",
+                "version": "v-" + "a" * 60,
+                "unit": 1,
+                "page": 1,
+            },
+            {"error": INVALID_LOCATOR, "reason": "locator_keys_malformed"},
+            id="extra-legacy-page-key",
+        ),
+        pytest.param(
+            {
+                "document_id": "DOC-2023Q1",
+                "version": "v-" + "a" * 60,
+            },
+            {"error": INVALID_LOCATOR, "reason": "locator_keys_malformed"},
+            id="missing-unit",
+        ),
+    ],
+)
+def test_mcp_read_invalid_locator_rejects_before_transport(
+    bad_ref: dict, expected: dict
+) -> None:
+    """A locator that is not a typed triple is refused without asking the
+    backend anything — the old window validation's short circuit, now on
+    the locator shape itself.
+    """
+    adapter = _ReadCapturingAdapter(bodies={}, known_document_ids={"DOC-2023Q1"})
+    assert adapter.read_slice(bad_ref) == expected
     assert adapter.payloads == []
 
 
-@pytest.mark.parametrize(("page", "page_limit"), [(0, 1), (1, 0), (4, 3)])
-def test_mcp_read_invalid_window_rejects_before_transport(page: int, page_limit: int) -> None:
-    locator = Locator("DOC-2023Q1", "v-" + "a" * 60, 3)
-    adapter = _ReadCapturingAdapter(bodies={}, locator_map={"hit": locator}, known_document_ids={"DOC-2023Q1"})
-    assert adapter.read("DOC-2023Q1", "v-" + "a" * 60, page, page_limit) == {"error": "unknown_locator"}
+@pytest.mark.parametrize(
+    ("position", "expected"),
+    [
+        pytest.param(-1, {"error": INVALID_POSITION, "position": -1}, id="negative"),
+        pytest.param(
+            "0",
+            {"error": INVALID_POSITION, "reason": "position_not_an_integer"},
+            id="string-cursor",
+        ),
+    ],
+)
+def test_mcp_read_invalid_cursor_rejects_before_transport(
+    position: object, expected: dict
+) -> None:
+    adapter = _ReadCapturingAdapter(
+        bodies={}, known_document_ids={"DOC-2023Q1"}
+    )
+    assert (
+        adapter.read_slice(
+            {"document_id": "DOC-2023Q1", "version": "v-" + "a" * 60, "unit": 3},
+            position,  # type: ignore[arg-type]
+        )
+        == expected
+    )
     assert adapter.payloads == []
+
+
+def test_mcp_read_cursor_past_the_unit_is_the_named_position_error() -> None:
+    """The overflow boundary a page window used to clamp: a cursor past
+    the end of the stored unit is answered by the one party that knows
+    the unit's length, and the adapter passes that named position error
+    through instead of inventing an empty slice."""
+    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
+    stored = "A" * 300
+    adapter = _ReadCapturingAdapter(
+        bodies={_canonical_source_ref(document_id): stored},
+        known_document_ids={document_id},
+    )
+    assert adapter.read_slice(
+        {"document_id": document_id, "version": version, "unit": 1},
+        position=len(stored) + 1,
+    ) == {
+        "error": INVALID_POSITION,
+        "position": len(stored) + 1,
+        "code_points": len(stored),
+    }
+
 
 
 # ----- read_source content-block decode: boundary shapes -----
@@ -295,8 +487,8 @@ def test_mcp_read_invalid_window_rejects_before_transport(page: int, page_limit:
 
 class _FixedResponseAdapter(_ScriptedAdapter):
     """Scripted ``_call_mcp`` returning one fixed wire response for
-    ``read()`` — same decode path as ``_ReadCapturingAdapter`` but with
-    full control over the response envelope."""
+    ``read_slice()`` — same decode path as ``_ReadCapturingAdapter`` but
+    with full control over the response envelope."""
 
     def __init__(self, response: dict, **kwargs: object) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
@@ -310,182 +502,211 @@ def _success_content_block(*blocks: dict) -> dict:
     return {"result": {"content": list(blocks)}}
 
 
-def test_read_mixed_content_blocks_concatenate_only_text_bodies() -> None:
-    """A content list mixing text blocks with non-text blocks (e.g.
-    resource / image blocks) still reads: every text block carrying a
-    body envelope contributes, the non-text ones are skipped — the
-    decode is per-block, not all-or-nothing."""
-    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
-    locator = Locator(document_id, version, 1)
-    source_ref = serialize_source_ref(UnitLocator(document_id, version, unit=1))
-    adapter = _FixedResponseAdapter(
-        _success_content_block(
-            {"type": "text", "text": json.dumps({"id": source_ref, "content": "BODY TEXT"})},
-            {"type": "resource", "resource": {"uri": "x"}},
-            {"type": "text", "text": json.dumps({"id": source_ref, "content": "MORE"})},
-        ),
-        locator_map={"hit": locator},
-        known_document_ids={document_id},
+def _decoding_adapter(response: dict) -> _FixedResponseAdapter:
+    """A ``_FixedResponseAdapter`` for the company unit every decode test
+    reads: same document, version, and unit, so only the wire shape
+    varies between cases."""
+    return _FixedResponseAdapter(
+        response, known_document_ids={"DOC-2023Q1"}
     )
-    result = adapter.read(document_id, version)
-    assert result["text"] == "BODY TEXT\n\nMORE"
 
 
-def test_read_content_block_with_unknown_error_code_is_not_a_body() -> None:
-    """An inner JSON envelope whose ``error`` code does NOT start with
-    ``read_source_`` carries no ``content`` body — the fallback keeps
-    the raw text, so the read surfaces the envelope as page text rather
-    than silently answering ``unknown_locator``. Pinned so a future
-    tightening of the decoder is a deliberate contract change."""
+def _company_ref(unit: int = 1) -> dict:
     document_id, version = "DOC-2023Q1", "v-" + "a" * 60
-    locator = Locator(document_id, version, 1)
-    adapter = _FixedResponseAdapter(
+    return {"document_id": document_id, "version": version, "unit": unit}
+
+
+def test_read_skips_non_text_blocks_and_reads_one_body() -> None:
+    """A content list mixing text blocks with non-text blocks (e.g.
+    resource / image blocks) still reads: the non-text ones are skipped
+    and the first decodable text block is the answer — one bounded slice
+    per call, so a second body block is never stitched onto it."""
+    canonical = _canonical_source_ref("DOC-2023Q1")
+    adapter = _decoding_adapter(
+        _success_content_block(
+            {"type": "resource", "resource": {"uri": "x"}},
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "id": canonical,
+                        "content": "BODY TEXT",
+                        "next_position": None,
+                    }
+                ),
+            },
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {"id": canonical, "content": "MORE", "next_position": None}
+                ),
+            },
+        )
+    )
+    result = adapter.read_slice(_company_ref())
+    assert result == {
+        "source_ref": _company_ref(),
+        "text": "BODY TEXT",
+        "next_position": None,
+    }
+
+
+def test_read_content_block_with_unrecognized_error_code_is_a_contract_error() -> None:
+    """An inner JSON envelope carrying an ``error`` code fin was not
+    taught is a wire breach named as ``source_backend_contract_error``:
+    the decoder no longer falls back to handing the raw envelope to the
+    model as text, so an unreadable refusal can never masquerade as a
+    body."""
+    adapter = _decoding_adapter(
         _success_content_block(
             {"type": "text", "text": json.dumps({"error": "internal_boom"})}
-        ),
-        locator_map={"hit": locator},
-        known_document_ids={document_id},
+        )
     )
-    result = adapter.read(document_id, version)
-    assert result["text"] == json.dumps({"error": "internal_boom"})
+    result = adapter.read_slice(_company_ref())
+    assert result == {
+        "error": SOURCE_BACKEND_CONTRACT_ERROR,
+        "reason": "unrecognized_backend_code",
+    }
+    assert "text" not in result
 
 
 def test_read_content_block_with_read_source_error_without_iserror_misses() -> None:
     """The invalidated miss can arrive WITHOUT an ``isError`` flag — a
     success envelope whose inner JSON carries the ``read_source_*``
     code. The decoder still treats it as the named miss (the code
-    prefix is the contract, not the ``isError`` flag)."""
-    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
-    locator = Locator(document_id, version, 1)
-    source_ref = serialize_source_ref(UnitLocator(document_id, version, unit=1))
-    adapter = _FixedResponseAdapter(
+    itself is the contract, not the ``isError`` flag)."""
+    canonical = _canonical_source_ref("DOC-2023Q1")
+    adapter = _decoding_adapter(
+        _wire_refusal(
+            "read_source_invalidated",
+            canonical,
+            flag_error=False,
+            valid_until="2026-01-01T00:00:00.000Z",
+        )
+    )
+    assert adapter.read_slice(_company_ref()) == {"error": UNKNOWN_LOCATOR}
+
+
+def test_read_content_without_a_cursor_is_a_contract_error() -> None:
+    """A body the wire never gave a cursor for cannot be told apart from
+    a truncated one, so the bounded promise is unverifiable — named as a
+    contract error rather than answered as a complete read."""
+    canonical = _canonical_source_ref("DOC-2023Q1")
+    adapter = _decoding_adapter(
         _success_content_block(
-            {
-                "type": "text",
-                "text": json.dumps(
-                    {
-                        "error": "read_source_invalidated",
-                        "source_ref": source_ref,
-                        "valid_until": "2026-01-01T00:00:00.000Z",
-                    }
-                ),
-            }
-        ),
-        locator_map={"hit": locator},
-        known_document_ids={document_id},
+            {"type": "text", "text": json.dumps({"id": canonical, "content": "BODY"})}
+        )
     )
-    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
+    assert adapter.read_slice(_company_ref()) == {
+        "error": SOURCE_BACKEND_CONTRACT_ERROR,
+        "reason": "next_position_absent",
+    }
 
 
-def test_read_empty_content_list_is_unknown_locator() -> None:
+def test_read_non_advancing_cursor_is_a_contract_error() -> None:
+    """A cursor that repeats the requested position can never terminate a
+    walk, so it is refused instead of handed over as a loop the model
+    would have to break itself."""
+    canonical = _canonical_source_ref("DOC-2023Q1")
+    adapter = _decoding_adapter(_wire_slice(canonical, "BODY", 0))
+    assert adapter.read_slice(_company_ref()) == {
+        "error": SOURCE_BACKEND_CONTRACT_ERROR,
+        "reason": "non_advancing_cursor",
+    }
+
+
+def test_read_empty_content_list_is_a_contract_error() -> None:
     """A success envelope with an EMPTY content list has no body on the
-    wire — folded into the ``unknown_locator`` miss, never answered as
-    an empty page text."""
-    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
-    locator = Locator(document_id, version, 1)
-    adapter = _FixedResponseAdapter(
-        _success_content_block(),
-        locator_map={"hit": locator},
-        known_document_ids={document_id},
-    )
-    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
+    wire — named as an undecodable envelope, never answered as an empty
+    slice that a caller would read as a complete unit."""
+    adapter = _decoding_adapter(_success_content_block())
+    assert adapter.read_slice(_company_ref()) == {
+        "error": SOURCE_BACKEND_CONTRACT_ERROR,
+        "reason": "envelope_undecodable",
+    }
 
 
-def test_read_non_json_inner_text_is_unknown_locator() -> None:
+def test_read_non_json_inner_text_is_a_contract_error() -> None:
     """A text block that is not valid JSON is garbage on the wire —
-    folded into the miss, never surfaced as page text."""
-    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
-    locator = Locator(document_id, version, 1)
-    adapter = _FixedResponseAdapter(
-        _success_content_block({"type": "text", "text": "plain garbage, not json"}),
-        locator_map={"hit": locator},
-        known_document_ids={document_id},
+    named, never surfaced as unit text."""
+    adapter = _decoding_adapter(
+        _success_content_block({"type": "text", "text": "plain garbage, not json"})
     )
-    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
+    result = adapter.read_slice(_company_ref())
+    assert result == {
+        "error": SOURCE_BACKEND_CONTRACT_ERROR,
+        "reason": "envelope_undecodable",
+    }
+    assert "text" not in result
 
 
-def test_read_flat_string_content_is_a_usable_body() -> None:
+def test_read_flat_string_content_is_a_contract_error() -> None:
     """A hand-rolled adapter that projects the body as a flat string
-    ``content`` still reads — the forward-compat fallback is pinned."""
-    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
-    locator = Locator(document_id, version, 1)
-    adapter = _FixedResponseAdapter(
-        {"result": {"content": "FLAT BODY"}},
-        locator_map={"hit": locator},
-        known_document_ids={document_id},
-    )
-    result = adapter.read(document_id, version)
-    assert result["text"] == "FLAT BODY"
+    ``content`` is not the bounded wire: the strict decoder names the
+    breach instead of reading an unvalidated body."""
+    adapter = _decoding_adapter({"result": {"content": "FLAT BODY"}})
+    assert adapter.read_slice(_company_ref()) == {
+        "error": SOURCE_BACKEND_CONTRACT_ERROR,
+        "reason": "envelope_undecodable",
+    }
 
 
-def test_read_iserror_block_with_plain_text_misses() -> None:
+def test_read_iserror_block_with_plain_text_is_a_contract_error() -> None:
     """An ``isError`` content block whose text is not even the named
-    ``read_source_*`` JSON still misses — ``isError`` itself means the
-    tool refused, whatever the text says."""
-    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
-    locator = Locator(document_id, version, 1)
-    adapter = _FixedResponseAdapter(
-        {"result": {"isError": True, "content": [{"type": "text", "text": "boom"}]}},
-        locator_map={"hit": locator},
-        known_document_ids={document_id},
+    ``read_source_*`` JSON carries no code to map, so it is the wire
+    breach it reads as — the refusal is named, never turned into a
+    body."""
+    adapter = _decoding_adapter(
+        {"result": {"isError": True, "content": [{"type": "text", "text": "boom"}]}}
     )
-    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
+    assert adapter.read_slice(_company_ref()) == {
+        "error": SOURCE_BACKEND_CONTRACT_ERROR,
+        "reason": "envelope_undecodable",
+    }
 
 
 def test_read_transport_timeout_is_a_typed_error_not_a_miss() -> None:
-    """A transport-level failure (timeout) during ``read`` raises the
-    typed ``RetrieveUnavailableError`` — the machine saying "I cannot
-    ask" is a DIFFERENT failure from the locator not being there (the
-    miss shape). The host tool never sees it through ``read_file``'s
-    miss contract, so this stays a raised, typed EXIT."""
-    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
-    locator = Locator(document_id, version, 1)
+    """A transport-level failure (timeout) during a read answers the
+    outage code — the machine saying "I cannot ask" is a DIFFERENT
+    failure from the locator not being there (the miss shape), and
+    neither one raises at the model or carries text."""
+    document_id = "DOC-2023Q1"
+    canonical = _canonical_source_ref(document_id)
 
     class _TimeoutAdapter(_ScriptedAdapter):
         async def _call_mcp(self, payload: dict) -> dict:  # type: ignore[override]
             raise asyncio.TimeoutError()
 
-    adapter = _TimeoutAdapter(
-        locator_map={"hit": locator},
-        known_document_ids={document_id},
+    adapter = _TimeoutAdapter(known_document_ids={document_id})
+    outage = adapter.read_slice(_company_ref())
+    assert outage == {"error": SOURCE_UNAVAILABLE}
+
+    missing = _ReadCapturingAdapter(
+        bodies={}, known_document_ids={document_id}
     )
-    with pytest.raises(RetrieveUnavailableError) as excinfo:
-        adapter.read(document_id, version)
-    assert "MCP transport failed" in str(excinfo.value)
+    assert missing.read_slice(_company_ref()) == {"error": UNKNOWN_LOCATOR}
+    assert missing.payloads[0]["params"]["arguments"] == {
+        "source_ref": canonical,
+        "position": 0,
+    }
 
 
 def test_read_ingested_locator_invalidated_on_memory_side_is_unknown_locator() -> None:
-    """Cross-repo semantic (T5): a locator fin ingested but the memory
-    side later invalidated answers the ``unknown_locator`` miss — the
-    invalidated row is not readable through ``read_file``, and the
+    """Cross-repo semantic: a locator fin ingested but the memory side
+    later invalidated answers the ``unknown_locator`` miss — the
+    invalidated row is not readable through ``read_source``, and the
     distinction "exists but window closed" is deliberately collapsed
     into the existing miss shape fin's read contract already has."""
-    document_id, version = "DOC-2023Q1", "v-" + "a" * 60
-    locator = Locator(document_id, version, 1)
-    source_ref = serialize_source_ref(UnitLocator(document_id, version, unit=1))
+    canonical = _canonical_source_ref("DOC-2023Q1")
     adapter = _ReadCapturingAdapter(
         bodies={},
-        locator_map={"hit": locator},
-        known_document_ids={document_id},
+        known_document_ids={"DOC-2023Q1"},
         errors=[
-            {
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": json.dumps(
-                                {
-                                    "error": "read_source_invalidated",
-                                    "source_ref": source_ref,
-                                }
-                            ),
-                        }
-                    ]
-                }
-            }
+            _wire_refusal("read_source_invalidated", canonical, flag_error=False)
         ],
     )
-    assert adapter.read(document_id, version) == {"error": "unknown_locator"}
+    assert adapter.read_slice(_company_ref()) == {"error": UNKNOWN_LOCATOR}
+
 
 
 # ----- boundary 1: empty -----
@@ -594,7 +815,7 @@ def test_mapper_drop_omits_unmapped_hits() -> None:
     ]
     locator_map = {
         "id-A": _loc("DOC-2023Q1"),
-        "id-B": _loc("DOC-2023Q2", page=2),
+        "id-B": _loc("DOC-2023Q2", unit=2),
     }
     adapter = _ScriptedAdapter(
         scripted_response={"hits": hits},
@@ -1327,7 +1548,7 @@ def test_concurrent_tiered_calls_answer_per_call() -> None:
         {
             "id": "chunk-1",
             "content": "hit",
-            "source_ref": _canonical_source_ref("DOC-2023Q1", page=1),
+            "source_ref": _canonical_source_ref("DOC-2023Q1", unit=1),
             "valid_window": ["2023-01-01T00:00:00Z", None],
             "score": 1.0,
         }
@@ -1791,14 +2012,14 @@ def test_chunks_envelope_maps_each_chunk_source_ref_to_locator() -> None:
         {
             "id": "chunk-1",
             "content": "first hit",
-            "source_ref": _canonical_source_ref("DOC-2023Q1", page=1),
+            "source_ref": _canonical_source_ref("DOC-2023Q1", unit=1),
             "valid_window": ["2023-01-01T00:00:00Z", None],
             "score": 2.5,
         },
         {
             "id": "chunk-2",
             "content": "second hit",
-            "source_ref": _canonical_source_ref("DOC-2023Q1", page=2),
+            "source_ref": _canonical_source_ref("DOC-2023Q1", unit=2),
             "valid_window": ["2023-01-01T00:00:00Z", None],
             "score": 1.0,
         },
@@ -1814,8 +2035,8 @@ def test_chunks_envelope_maps_each_chunk_source_ref_to_locator() -> None:
     assert [
         (c.text, c.source_ref, c.score) for c in result["chunks"]
     ] == [
-        ("first hit", _loc("DOC-2023Q1", page=1), 2.5),
-        ("second hit", _loc("DOC-2023Q1", page=2), 1.0),
+        ("first hit", _loc("DOC-2023Q1", unit=1), 2.5),
+        ("second hit", _loc("DOC-2023Q1", unit=2), 1.0),
     ]
 
 
@@ -1834,7 +2055,7 @@ def test_chunk_missing_source_ref_is_counted_not_silently_dropped() -> None:
             "id": "chunk-1",
             "content": "kept",
             # canonical source_ref present, lands a chunk
-            "source_ref": _canonical_source_ref("DOC-2023Q1", page=1),
+            "source_ref": _canonical_source_ref("DOC-2023Q1", unit=1),
             "valid_window": ["2023-01-01T00:00:00Z", None],
             "score": 2.0,
         },

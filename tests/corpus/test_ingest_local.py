@@ -175,7 +175,7 @@ def test_seed_facts_for_aapl_2023q3_is_emitted() -> None:
     assert seed is not None and len(seed) >= 1
     fact = seed[0]
     assert fact.source_locator.document_id == "AAPL-2023Q3"
-    assert fact.source_locator.page == 4
+    assert fact.source_locator.unit == 4
     assert fact.concept == "us-gaap:Revenues"
 
 

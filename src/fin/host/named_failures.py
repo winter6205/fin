@@ -275,7 +275,7 @@ def named_refusal_reason(
     already made, never a replacement for the verifier: it applies only
     when the run ended with no citable evidence at all, and only when
     retrieve is the reason nothing could be cited. A run that brought
-    evidence by any other route (``read_file`` included) keeps the
+    evidence by any other route (``read_source`` included) keeps the
     verifier's own verdict, because the 具名失败 would then be describing
     a collection the run did not actually depend on.
     """

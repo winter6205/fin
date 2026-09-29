@@ -46,7 +46,7 @@ trace::
         "issuers": [
           {"issuer": "AAPL", "status": "hit"|"empty"|"unavailable",
            "chunk_count": 2, "error": "",
-           "locators": [{"document_id","version","page"}]}
+           "locators": [{"document_id","version","unit"}]}
         ],
         "contributing": ["AAPL"],
         "empty": ["MSFT"],

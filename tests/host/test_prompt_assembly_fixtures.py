@@ -170,22 +170,35 @@ def test_identity_is_not_a_research_agent() -> None:
 # tool MAP for ingested vs local text, never a body carrier -----
 
 
-def test_research_prompt_maps_read_file_to_read_source_for_ingested() -> None:
-    """Spec Focus 4: 读入库整篇 → `read_source`. The research prompt's
-    ``read_file`` line must say that an ingested-filing read dispatches
-    to the memory service's ``read_source`` — the map names the seam,
-    the dispatch itself lives in code (T2)."""
+def test_research_prompt_names_read_source_without_read_file() -> None:
+    """Spec thread-attachment-source-read decision 5: ``read_source``
+    replaces the model-facing ``read_file`` — the prompt names the
+    bounded unit read and never the retired tool."""
     assert "read_source" in HOST_SYSTEM_PROMPT
+    assert "read_file" not in HOST_SYSTEM_PROMPT
 
 
-def test_research_prompt_maps_local_paths_and_thread_attachments() -> None:
-    """Spec Focus 4: 本地路径 → local read; a thread attachment is
-    neither the ingested corpus nor a local file and its text is not
-    citable (the structural guarantee stays: attachment text never
-    enters the evidence channel)."""
-    assert "local read" in HOST_SYSTEM_PROMPT
-    assert "not citable" in HOST_SYSTEM_PROMPT
+def test_research_prompt_maps_attachment_reads_and_citability() -> None:
+    """Spec Focus 4 / thread-attachment-source-read: an attachment is
+    neither the ingested corpus nor a local path — it is a typed
+    ``read_source`` locator (``kind: 'attachment'``), and only text the
+    run returned is citable. The pre-T5 sentence carrying this rode the
+    removed ``read_file`` line (arbitrary-path reads are out of the
+    spec); the guarantee now has two homes, both asserted here: the
+    prompt's own citability rule, and the call-scoped attachment block
+    that states the corpus exclusion to the model."""
     assert "attachment" in HOST_SYSTEM_PROMPT
+    assert "only text a read returned is citable" in HOST_SYSTEM_PROMPT
+
+    from fin.host.agent_instructions import attachment_context_message
+
+    msg = attachment_context_message(
+        [{"attachment_id": "a1", "filename": "n.md", "text": "t"}]
+    )
+    assert msg is not None
+    content = str(msg.content)
+    assert "NOT part of the citable corpus" in content
+    assert "read_source" in content
 
 
 def test_research_prompt_names_retrieve_as_the_ingested_corpus_lookup() -> None:

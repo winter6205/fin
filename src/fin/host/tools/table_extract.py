@@ -1,4 +1,4 @@
-"""Locator-bound table extraction from frozen page text."""
+"""Locator-bound table extraction from frozen unit text."""
 
 from __future__ import annotations
 
@@ -16,14 +16,14 @@ _DEFAULT_EXTRACTED = _DATA_DIR / "extracted"
 _SEPARATOR = re.compile(r"^:?-{2,}:?$")
 
 
-def _empty_payload(document_id: str, version: str, page: int) -> dict[str, Any]:
+def _empty_payload(document_id: str, version: str, unit: int) -> dict[str, Any]:
     return {
         "schema": "fin.table_extract.v1",
         "kind": "table",
         "locator": {
             "document_id": document_id,
             "version": version,
-            "page": page,
+            "unit": unit,
         },
         "tables": [],
     }
@@ -66,18 +66,18 @@ def _parse_tables(text: str) -> list[dict[str, Any]]:
 def extract_tables(
     document_id: str,
     version: str,
-    page: int = 1,
+    unit: int = 1,
     *,
     manifest_path: Path | None = None,
     extracted_root: Path | None = None,
 ) -> dict[str, Any]:
-    """Extract pipe-delimited tables from one frozen locator page.
+    """Extract pipe-delimited tables from one frozen locator unit.
 
-    The returned artifact always carries the exact page locator. A
-    page without a table is distinct from an unknown locator.
+    The returned artifact always carries the exact unit locator. A
+    unit without a table is distinct from an unknown locator.
     """
-    payload = _empty_payload(document_id, version, page)
-    if page < 1:
+    payload = _empty_payload(document_id, version, unit)
+    if unit < 1:
         return {"error": "unknown_locator", "table_extract": payload}
     manifest = manifest_path or _DEFAULT_MANIFEST
     extracted = extracted_root or _DEFAULT_EXTRACTED
@@ -87,19 +87,19 @@ def extract_tables(
         if (
             not pages
             or version != pages[0].locator.version
-            or page > len(pages)
+            or unit > len(pages)
         ):
             return {"error": "unknown_locator", "table_extract": payload}
         locator = Locator(
             document_id=document_id,
             version=version,
-            page=page,
+            unit=unit,
         )
-        tables = _parse_tables(pages[page - 1].text)
+        tables = _parse_tables(pages[unit - 1].text)
         payload["locator"] = {
             "document_id": locator.document_id,
             "version": locator.version,
-            "page": locator.page,
+            "unit": locator.unit,
         }
         payload["tables"] = tables
         if not tables:

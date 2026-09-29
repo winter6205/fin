@@ -214,7 +214,7 @@ def percentile(values: Sequence[float], fraction: float) -> float:
 def _is_relevant(hit: RetrievedHit, query: EvalQuery) -> bool:
     return (
         hit.locator.document_id == query.expected_document_id
-        and hit.locator.page == query.expected_unit
+        and hit.locator.unit == query.expected_unit
     )
 
 
@@ -237,12 +237,12 @@ def citation_gate_passes(
     The gate is unchanged (ADR 0008 / 0021): it either finds a
     >= 32-character span of ``citable_answer`` inside a retrieved
     chunk's text (``DoneResult``) or it does not. Chunks with empty text
-    are not handed to the gate — an empty ``page_text`` is a malformed
+    are not handed to the gate — an empty ``unit_text`` is a malformed
     evidence item, and inventing one would be scoring the gate on input
     this run did not retrieve.
     """
     evidence = [
-        EvidenceItem(locator=hit.locator, page_text=hit.text)
+        EvidenceItem(locator=hit.locator, unit_text=hit.text)
         for hit in hits
         if hit.text
     ]

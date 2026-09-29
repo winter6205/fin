@@ -50,11 +50,11 @@ def test_evidence_reset_has_a_stable_repr() -> None:
 # ----- reducer branches -----
 
 
-def _evidence(text: str, *, page: int = 1) -> EvidenceItem:
-    """Build a minimal EvidenceItem with a single-page text fixture."""
+def _evidence(text: str, *, unit: int = 1) -> EvidenceItem:
+    """Build a minimal EvidenceItem with a single-unit text fixture."""
     return EvidenceItem(
-        locator=Locator(document_id="AAPL-2022Q3", version="v", page=page),
-        page_text=text,
+        locator=Locator(document_id="AAPL-2022Q3", version="v", unit=unit),
+        unit_text=text,
     )
 
 

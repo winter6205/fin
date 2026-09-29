@@ -51,7 +51,7 @@ def _locator() -> Locator:
     return Locator(
         document_id="AAPL-2023Q3",
         version=load_private_fixture("5cae37674ca6bf538f54bca53ca28b15aaf96dd1b7ae386553bd32387f254b73"),
-        page=4,
+        unit=4,
     )
 
 
@@ -220,7 +220,7 @@ def test_list_fact_documents_returns_document_ids(tmp_path: Path) -> None:
                 source_locator=Locator(
                     document_id="MSFT-2023Q3",
                     version=load_private_fixture("5a8558db7c94112d0a7ff48be9f8fcf09d80f8a8f053645952c03d65ed1eb5e2"),
-                    page=4,
+                    unit=4,
                 ),
             )
         ],
@@ -265,7 +265,7 @@ def test_write_facts_payload_shape(tmp_path: Path) -> None:
     assert entry["concept"] == "us-gaap:Revenues"
     assert entry["value"] == load_private_fixture("e8e6fa2502cf2441d4f1862bbbb7d147b7dbd57a3911be363417fe4342e69b94")
     assert entry["source_locator"]["document_id"] == "AAPL-2023Q3"
-    assert entry["source_locator"]["page"] == 4
+    assert entry["source_locator"]["unit"] == 4
 
 
 # ---------- T5: lookup_fact + fact_matches_value (get_xbrl_fact) ----------
@@ -292,7 +292,7 @@ def test_lookup_fact_hit_returns_seeded_fact(tmp_path: Path) -> None:
     assert result.concept == "us-gaap:Revenues"
     assert result.period == "2023-Q3-YTD"
     assert result.value == load_private_fixture("e8e6fa2502cf2441d4f1862bbbb7d147b7dbd57a3911be363417fe4342e69b94")
-    assert result.source_locator.page == 4
+    assert result.source_locator.unit == 4
 
 
 def test_lookup_fact_miss_returns_error_dict(tmp_path: Path) -> None:

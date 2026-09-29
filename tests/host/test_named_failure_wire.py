@@ -27,6 +27,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.named_failures import CORPUS_NOT_READY
 from fin.host.run_payload import ORDINARY_PERSON_COPY
+from fin.retrieve.fake_port import FakeRetrievePort
 
 
 KNOWN_IDS = {"AAPL-2022Q3"}
@@ -188,10 +189,17 @@ def test_all_dropped_hits_name_the_mapping_failure_on_the_wire(
     from fin.host.named_failures import MAPPING_DROP
     from fin.retrieve import Chunk
     from fin.retrieve.hit_mapping import MappingFailureLedger
-    from fin.retrieve.read_port import read_from_pages
 
     class _DroppingPort:
-        """Returns a hit whose ``source_ref`` is not a fin locator."""
+        """Returns a hit whose ``source_ref`` is not a fin locator.
+
+        The read leg is the bounded ``read_slice`` face the graph binds
+        through ``adapter=``: an empty company manifest, so every read
+        answers the typed miss and never a whole-page body.
+        """
+
+        def __init__(self) -> None:
+            self._company_read_manifest = FakeRetrievePort(pages_by_doc={})
 
         def retrieve(self, query: str, **kwargs: Any) -> dict[str, Any]:
             return {
@@ -207,8 +215,10 @@ def test_all_dropped_hits_name_the_mapping_failure_on_the_wire(
                 ]
             }
 
-        def read(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-            return read_from_pages({}, "", 1, 1)
+        def read_slice(
+            self, source_ref: dict[str, Any], position: int = 0
+        ) -> dict[str, Any]:
+            return self._company_read_manifest.read_slice(source_ref, position)
 
     model = ScriptedChatModel(
         script=[
@@ -230,7 +240,6 @@ def test_all_dropped_hits_name_the_mapping_failure_on_the_wire(
         checkpointer=InMemorySaver(),
         model=model,
         adapter=_DroppingPort(),
-        read_port=_DroppingPort(),
         known_document_ids=KNOWN_IDS,
         mapping_failure_ledger=MappingFailureLedger(),
     )
@@ -244,6 +253,18 @@ def test_all_dropped_hits_name_the_mapping_failure_on_the_wire(
     assert status["assistant_message"] == ORDINARY_PERSON_COPY[MAPPING_DROP]
     assert status["assistant_message"] != ORDINARY_PERSON_COPY[CORPUS_NOT_READY]
     assert status["assistant_message"] != ORDINARY_PERSON_COPY["unknown_locator"]
+
+    # The read leg that ran on this graph is the bounded one: the tool
+    # surface is ``read_source``, the deleted whole-page ``read_file`` is
+    # gone, and a unit the manifest does not carry is the typed miss with
+    # no body and no generic ``page`` key riding along.
+    tool_names = [tool.name for tool in built._bound_tools]
+    assert "read_source" in tool_names
+    assert "read_file" not in tool_names
+    miss = _DroppingPort().read_slice(
+        {"document_id": "AAPL-2022Q3", "version": "e" * 64, "unit": 1}, 0
+    )
+    assert miss == {"error": "unknown_locator"}
 
 
 def test_a_run_without_retrieve_keeps_the_verifier_reason_on_the_wire(

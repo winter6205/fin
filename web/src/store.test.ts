@@ -801,9 +801,13 @@ const OPTIMISTIC_RUN_ID = "55555555-5555-4555-8555-555555555555";
 const WATCHED_PROSE = "根据 10-K 原文，营收为 391.0 亿美元。";
 const PERSISTED_PROSE = "服务器重排后的同一段回答。";
 const SERVER_CITATION: Citation = {
+  kind: "company",
   document_id: "0000320193-24-000123",
+  attachment_id: "",
   version: "v1",
-  page: 31,
+  unit: 31,
+  display: "page",
+  filename: "",
   quote: "Total net sales were $391.0 billion.",
 };
 

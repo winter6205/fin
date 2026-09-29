@@ -167,6 +167,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -247,12 +248,20 @@ from fin.host.attachment_store import (
     AttachmentRecord,
     AttachmentStoreError,
     AttachmentThreadGoneError,
+    StoredPageRegion,
 )
 from fin.host.attachment_vision import ChatModelVisionAdapter
-from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER, strip_hidden_bounce_marker
+from fin.host.citation_gate import (
+    COMPANY_KIND,
+    HIDDEN_BOUNCE_MARKER,
+    QUOTABLE_EVIDENCE_KINDS,
+    strip_hidden_bounce_marker,
+)
 from fin.host.collection_bind import resolve_bound_collection_name
 from fin.host.export import (
     ExportError,
+    MalformedCitationRowError,
+    UnsupportedComparisonSchemaError,
     UnsupportedExportError,
     build_export,
 )
@@ -305,6 +314,10 @@ from fin.host.thread_store import (
     ThreadNotFoundError,
     ThreadRecord,
     ThreadStore,
+)
+from fin.host.visual_evidence import (
+    VISUAL_CLAIM_FIELDS,
+    VISUAL_EVIDENCE_KIND,
 )
 from fin.host.watchlist import (
     InvalidWatchError,
@@ -824,9 +837,34 @@ class FeedbackRequest(BaseModel):
 
 
 class CitationPayload(BaseModel):
+    """One citation on the workspace wire.
+
+    Mirrors ``fin.host.http.CitationSchema`` field for field: exactly one
+    source id is set (``document_id`` for a company row, ``attachment_id``
+    for an attachment row whose ``filename`` is the safe display name),
+    and ``display`` says how ``unit`` is presented.
+
+    The ``kind`` / ``display`` defaults serve the turn-table read only
+    (one stored row must not blank the operator's whole history); the
+    SSE wire never leans on them, because
+    :func:`_citations_wire_payload` reads both fields off the row and
+    drops a row that cannot carry them.
+    """
+
+    kind: str = "company"
     document_id: str
+    attachment_id: str = ""
     version: str
-    page: int
+    # WHY 0 and not a required field: ``fin_run.citations`` is JSONB and the
+    # ``page`` -> ``unit`` rename carried no migration, so rows written
+    # before it are still in the database. Requiring ``unit`` would make
+    # every such thread's history GET fail validation and answer 500 — one
+    # stale row blanking every turn in the thread. The history read is the
+    # one place that must tolerate them; the SSE wire does not, because
+    # :func:`_citations_wire_payload` drops a row it cannot project.
+    unit: int = 0
+    display: str = "page"
+    filename: str = ""
     quote: str
 
 
@@ -834,7 +872,7 @@ class ToolSummaryPayload(BaseModel):
     """One human-readable tool-call row for the tools region.
 
     ``summary`` is the formatted one-liner (``"n filings"``,
-    ``"query' -> 8 hits -> AAPL-2022Q3 p.4"``, ``"<doc> p.N"``);
+    ``"query' -> 8 hits -> AAPL-2022Q3 u.4"``, ``"<doc> u.N"``);
     raw ToolMessage JSON never reaches the wire (spec line 32).
     """
 
@@ -896,12 +934,22 @@ class TurnRow(BaseModel):
     # refusal.
     comparisons: list[dict[str, Any]] = Field(default_factory=list)
     # Trust (the tracked change, spec SC8): the locators this run retrieved or
-    # read (``{document_id, version, page}``), copied from the
+    # read (``{document_id, version, unit}``), copied from the
     # run's evidence before the next run resets it. Wider than
     # ``citations``: a refused turn still shows what it looked at.
     evidence_locators: list[dict[str, Any]] = Field(default_factory=list)
     # T6: structured host analysis envelopes persisted for reload.
     analysis_results: list[dict[str, Any]] = Field(default_factory=list)
+    # ADR 0089 / spec thread-attachment-source-read: the visual claims this
+    # run read, one provenance row per observation (key set SSOT:
+    # ``fin.host.visual_evidence.VISUAL_CLAIM_FIELDS``). It is a SEPARATE
+    # channel from ``citations`` — a generated visual observation is never a
+    # source quote — and travels the SSE ``visual_claims`` frame, the
+    # persisted ``RunRecord``, and this row so the live wire, a reload, and
+    # the non-streaming door all show the same link to the original page.
+    # ``[]`` when the run produced none (never absent), mirroring
+    # ``evidence_locators``.
+    visual_claims: list[dict[str, Any]] = Field(default_factory=list)
     # T8: the operator's latest thumb for this run (``"up"`` /
     # ``"down"``). ``None`` when no thumb was ever set — additive and
     # nullable, so pre-T8 clients that ignore the field keep working.
@@ -1091,6 +1139,10 @@ def _serialize_run(
         # list through the serialized view.
         "evidence_locators": [dict(loc) for loc in run.evidence_locators],
         "analysis_results": copy.deepcopy(list(run.analysis_results or [])),
+        # ADR 0089: the run's visual-claim rows (deep-copied — the rows are
+        # flat but the ``scope`` region nests a list, so a shallow copy
+        # would still share it with the store). Kept off ``citations``.
+        "visual_claims": copy.deepcopy(list(run.visual_claims or [])),
         # T8: the latest thumb for this run (``None`` when unset).
         "feedback": feedback,
     }
@@ -1587,6 +1639,12 @@ def _resume_run_stream(
         # HumanMessage when final_state is present).
         return
     payload = _run_to_response_payload(outcome.final_state)
+    # ADR 0089: the resumed remainder's visual claims, read off the final
+    # state (own channel, not the citation payload) and normalised once so
+    # the row and the frame agree.
+    visual_claims = _visual_claims_wire_payload(
+        outcome.final_state.get("visual_claims")
+    )
     resume_question = (
         graph.checkpoint_last_human_text(thread_id)
         if hasattr(graph, "checkpoint_last_human_text")
@@ -1612,6 +1670,8 @@ def _resume_run_stream(
                 # SC8: the RESUMED remainder's locators. The crashed
                 # prefix's row (when one exists) keeps its own.
                 evidence_locators=list(payload["evidence_locators"]),
+                # ADR 0089: the RESUMED remainder's visual claims.
+                visual_claims=visual_claims,
             )
         )
     except ThreadNotFoundError:
@@ -1630,6 +1690,7 @@ def _resume_run_stream(
         payload=payload,
         thinking_ms=outcome.thinking_ms,
         answer_reset=outcome.answer_reset,
+        visual_claims=visual_claims,
     )
 
 
@@ -1641,27 +1702,99 @@ def _citations_wire_payload(citations: list[Any]) -> list[dict[str, Any]]:
     ``CitationPayload`` model-dump shape here so every emitter sends
     one identical shape (Standards: single source of truth for the
     wire).
+
+    A row whose own ``kind``, ``display`` or source id is absent or
+    outside the closed sets is dropped with a WARNING - the same
+    serve-the-rest-and-log posture the turn table uses for an
+    unreadable side record - because guessing would publish an
+    attachment unit as a company ``page`` citation.
     """
     out: list[dict[str, Any]] = []
     for c in citations:
-        if isinstance(c, dict):
-            out.append(
-                CitationPayload(
-                    document_id=c["document_id"],
-                    version=c["version"],
-                    page=c["page"],
-                    quote=c["quote"],
-                ).model_dump()
-            )
+        row = _citation_wire_row(c)
+        if row is None:
+            continue
+        out.append(row.model_dump())
+    return out
+
+
+# The two presentations a frozen unit may claim: a physical PDF page or
+# one opaque unit. No other value is a legitimate wire presentation.
+_CITATION_DISPLAY_VALUES: Final[frozenset[str]] = frozenset({"page", "unit"})
+
+# The wire key set IS the model's field set, so the two cannot drift.
+_CITATION_WIRE_FIELDS: Final[tuple[str, ...]] = tuple(CitationPayload.model_fields)
+
+
+def _citation_wire_row(source: Any) -> CitationPayload | None:
+    """Read one citation row's identity off the row itself.
+
+    Dict and ``Citation`` dataclass answer through the same rule so the
+    two shapes cannot drift; ``None`` means the row cannot carry its own
+    identity and must not be published with a guessed one.
+    """
+    values: dict[str, Any] = {}
+    for name in _CITATION_WIRE_FIELDS:
+        if isinstance(source, dict):
+            value = source.get(name)
         else:
-            out.append(
-                CitationPayload(
-                    document_id=c.document_id,
-                    version=c.version,
-                    page=c.page,
-                    quote=c.quote,
-                ).model_dump()
+            value = getattr(source, name, None)
+        if value is None:
+            logger.warning("citations wire: dropped a row without %s", name)
+            return None
+        values[name] = value
+    kind = values["kind"]
+    if not isinstance(kind, str) or kind not in QUOTABLE_EVIDENCE_KINDS:
+        logger.warning("citations wire: dropped a row of kind %r", kind)
+        return None
+    display = values["display"]
+    if not isinstance(display, str) or display not in _CITATION_DISPLAY_VALUES:
+        logger.warning("citations wire: dropped a row with display %r", display)
+        return None
+    # The source id opens the citation, so it belongs to this row's own
+    # kind; the other id slot staying empty is the company / attachment
+    # pairing, not a missing identity.
+    identity_field = "document_id" if kind == COMPANY_KIND else "attachment_id"
+    if not values[identity_field]:
+        logger.warning(
+            "citations wire: dropped a %s row without its source id", kind
+        )
+        return None
+    return CitationPayload(**values)
+
+
+def _visual_claims_wire_payload(claims: Any) -> list[dict[str, Any]]:
+    """Normalise the run's visual-claim channel into the wire / row shape.
+
+    A visual claim is NOT a citation (ADR 0089): it rides its own
+    ``visual_claims`` frame and its own ``fin_run`` column, never the
+    ``citations`` channel, so the quote the verifier passed and the
+    provenance of a generated observation cannot be confused for each
+    other. The row's key set IS :data:`VISUAL_CLAIM_FIELDS`, projected in
+    that fixed order so neither the live wire nor a reload can drift from
+    the SSOT the evidence token mints.
+
+    A row that is not a dict, whose ``kind`` is not the visual-evidence
+    kind, or that is missing any field is dropped with a WARNING - the
+    same serve-the-rest-and-log posture as the citation wire - because
+    guessing a provenance field would publish a link to a page the run
+    never read. Only the field NAME is logged, never a row's content
+    (filename / image hash are thread-private material).
+    """
+    out: list[dict[str, Any]] = []
+    for row in claims or ():
+        if not isinstance(row, dict):
+            logger.warning("visual_claims wire: dropped a non-dict row")
+            continue  # EXIT: a row that is not a mapping carries no fields.
+        if row.get("kind") != VISUAL_EVIDENCE_KIND:
+            logger.warning("visual_claims wire: dropped a non-visual row")
+            continue  # EXIT: only the visual-evidence kind is a claim.
+        if any(name not in row for name in VISUAL_CLAIM_FIELDS):
+            logger.warning(
+                "visual_claims wire: dropped a row missing a claim field"
             )
+            continue  # EXIT: a partial provenance row would claim an unknown link.
+        out.append({name: row[name] for name in VISUAL_CLAIM_FIELDS})
     return out
 
 
@@ -1672,10 +1805,11 @@ def _terminal_sse_frames(
     thinking_type: str | None = None,
     thinking_ms: int | None = None,
     answer_reset: bool = False,
+    visual_claims: Any = None,
 ) -> Iterator[str]:
     """Yield the fixed-order terminal frames: ``status`` -> ``answer``
-    -> ``citations`` (spec line 30; citations is TERMINAL so the SPA
-    closes its reader).
+    -> ``visual_claims`` (only when non-empty) -> ``citations``
+    (spec line 30; citations is TERMINAL so the SPA closes its reader).
 
     Shared by the send and resume routes so the two surfaces cannot
     drift on order / marker-stripping / citation shaping. Optional
@@ -1688,6 +1822,13 @@ def _terminal_sse_frames(
     with empty text and no retry prose). Mid-run empty
     ``{text:"", reset:true}`` is forbidden; this terminal flush is
     the sole empty+reset exception.
+
+    ``visual_claims`` is the run's visual-claim channel (raw graph state).
+    It is emitted AFTER the answer frames and BEFORE the terminal
+    ``citations`` frame - the SPA closes its reader on ``citations``, so
+    anything after it is unreachable - and ONLY when non-empty: a run with
+    no claim leaves no frame, matching the persisted ``[]`` (consumers never
+    branch on absence).
     """
     safe_answer = strip_thinking_from_answer(
         payload["answer"] if payload["status"] == "done" else ""
@@ -1711,6 +1852,12 @@ def _terminal_sse_frames(
         answer_body["reset"] = True
     yield _format_sse("status", status_body)
     yield _format_sse("answer", answer_body)
+    claim_rows = _visual_claims_wire_payload(visual_claims)
+    if claim_rows:
+        # Emitted between the answer frames and the terminal ``citations``
+        # frame: a visual claim is its own channel, and the citations frame
+        # closes the reader so this is the last point the SPA can still see.
+        yield _format_sse("visual_claims", {"visual_claims": claim_rows})
     yield _format_sse("citations", _citations_wire_payload(payload["citations"]))
 
 
@@ -2715,6 +2862,13 @@ _attachment_service_singleton: AttachmentPreparationService | None = None
 _attachment_service_lock = threading.Lock()
 
 
+# Where a layout pass leaves the boxes it found, so a later question's crop
+# inspection can be taken without re-running Heron. A callable rather than
+# the store itself: the parser is built before the store that owns the row
+# exists in a test, and the sink keeps that order from mattering.
+RegionSink = Callable[..., int]
+
+
 class HeronPageLaneParser(PageRegionParser):
     """The deployed pages port: one pinned Heron pass per PDF document.
 
@@ -2760,11 +2914,34 @@ class HeronPageLaneParser(PageRegionParser):
         # lane's boot tests take so a wiring check never crosses a
         # container.
         self._runner = runner
+        # WHY the sink is not a constructor argument: it is bound
+        # post-construction, because the page lane is built from
+        # environment bounds before the store those boxes belong to is
+        # chosen. A region sink is additive metadata, so a lane deployed
+        # without one still parses, renders, and scans — it simply leaves
+        # no croppable box behind, which the crop lane reads as the
+        # whole-page fallback.
+        self._region_sink: RegionSink | None = None
 
     @property
     def heron_config(self) -> HeronLayoutConfig:
         """The boot-resolved harness knobs every document's pass is taken with."""
         return self._heron_config
+
+    @property
+    def region_sink(self) -> RegionSink | None:
+        return self._region_sink
+
+    @region_sink.setter
+    def region_sink(self, sink: RegionSink | None) -> None:
+        """Bind the store that keeps the boxes this pass found.
+
+        Settable because the composition order is real: the page lane is
+        built from environment bounds before the store those boxes belong to
+        is chosen, and rebinding after the fact is cheaper — and less
+        fragile — than threading a not-yet-built store through the lane.
+        """
+        self._region_sink = sink
 
     def extract_pdf(
         self,
@@ -2790,13 +2967,17 @@ class HeronPageLaneParser(PageRegionParser):
                 ),
                 ocr=self._ocr_engine,
             )
-            return document_parser.extract_pdf(
+            result = document_parser.extract_pdf(
                 source_bytes=source_bytes,
                 source_sha256=source_sha256,
                 document_id=document_id,
                 version=version,
                 max_pages=max_pages,
             )
+            self._persist_regions(
+                document_id=document_id, version=version, result=result
+            )
+            return result
         finally:
             # A copy this process wrote for one preparation is removed even
             # when that preparation failed: the row already carries the
@@ -2805,6 +2986,51 @@ class HeronPageLaneParser(PageRegionParser):
                 staged.unlink(missing_ok=True)
             except OSError as cleanup_exc:
                 logger.debug("staged copy %s not removed: %s", staged, cleanup_exc)
+
+    def _persist_regions(
+        self, *, document_id: str, version: str, result: PageParseResult
+    ) -> None:
+        """Leave one version's page boxes where the crop lane will find them.
+
+        The layout pass already produced this geometry; persisting it is what
+        makes a later question's crop inspection possible at all. The write
+        is best-effort beside the units it describes — a sink failure is
+        logged and the boxes are lost rather than failing a preparation whose
+        text and index are already sound, because regions are additive
+        metadata (the same posture the core takes: an unanswerable page is
+        reported, never fatal).
+        """
+        if self._region_sink is None:
+            return
+        regions = tuple(
+            StoredPageRegion(
+                page=page.page_no,
+                kind=box.kind,
+                left_pt=box.left_pt,
+                top_pt=box.top_pt,
+                right_pt=box.right_pt,
+                bottom_pt=box.bottom_pt,
+            )
+            for page in result.pages
+            for box in page.regions
+        )
+        try:
+            written = self._region_sink(
+                attachment_id=document_id, version=int(version), regions=regions
+            )
+        except Exception as exc:  # noqa: BLE001 - additive metadata, never fatal
+            logger.warning(
+                "attachment region boxes could not be stored: attachment_id=%s (%s)",
+                document_id,
+                exc,
+            )
+            return
+        logger.debug(
+            "stored %d region boxes for attachment_id=%s version=%s",
+            written,
+            document_id,
+            version,
+        )
 
 
 def _build_default_attachment_service() -> AttachmentPreparationService:
@@ -2930,6 +3156,13 @@ def _build_default_attachment_service() -> AttachmentPreparationService:
     else:
         store = InMemoryAttachmentStore(default_thread_store())
         jobs = InMemoryThreadAttachmentJobStore()
+    # The boxes a page lane located belong to the same store that owns the
+    # row they describe; the sink is bound here, once both exist, because
+    # ``pages`` was built from environment bounds before the store was
+    # chosen. A lane with no sink (tests, unwired deployments) leaves no
+    # boxes, which the crop lane reads as the whole-page fallback.
+    if pages is not None:
+        pages.region_sink = store.record_regions
     service = AttachmentPreparationService(
         store=store,
         objects=objects,
@@ -3945,6 +4178,14 @@ def build_router(
                     )
                 return
             payload = _run_to_response_payload(outcome.final_state)
+            # ADR 0089: the visual-claim channel is read straight off the
+            # final state (it is NOT part of the citation payload),
+            # normalised ONCE here so the persisted row and the live frame
+            # carry the identical rows. Run-scoped, copied before the next
+            # send resets the state channel (ADR 0016).
+            visual_claims = _visual_claims_wire_payload(
+                outcome.final_state.get("visual_claims")
+            )
             # T9: the turn's terminal status (done / refuse / step_cap)
             # and wall-clock latency land on the observability collector
             # exactly where the turn row is built.
@@ -3978,6 +4219,9 @@ def build_router(
                         # taken from the final state BEFORE the next
                         # send resets the evidence channel.
                         evidence_locators=list(payload["evidence_locators"]),
+                        # ADR 0089: this run's visual claims, their own
+                        # channel (never merged into ``citations``).
+                        visual_claims=visual_claims,
                     )
                 )
             except ThreadNotFoundError:
@@ -4004,6 +4248,7 @@ def build_router(
                 thinking_type=thinking_type,
                 thinking_ms=outcome.thinking_ms,
                 answer_reset=outcome.answer_reset,
+                visual_claims=visual_claims,
             )
 
         # Dream runs AFTER the stream is exhausted, never inside a graph
@@ -4493,7 +4738,9 @@ def build_router(
         Typed failures, all with a stable ``error`` code:
         ``thread_not_found`` / ``run_not_found`` / ``export_empty``
         (404), ``unsupported_export`` (400),
-        ``unsupported_comparison_schema`` (422).
+        ``unsupported_comparison_schema`` / ``malformed_citation_row``
+        (422 — the data is there and cannot be exported without
+        losing the identity a citation owes).
         """
         if store.get_thread(thread_id) is None:
             return JSONResponse(
@@ -4509,9 +4756,13 @@ def build_router(
             )
         except UnsupportedExportError as exc:
             return JSONResponse(status_code=400, content={"error": exc.code})
+        except (
+            MalformedCitationRowError,
+            UnsupportedComparisonSchemaError,
+        ) as exc:
+            return JSONResponse(status_code=422, content={"error": exc.code})
         except ExportError as exc:
-            status = 422 if exc.code == "unsupported_comparison_schema" else 404
-            return JSONResponse(status_code=status, content={"error": exc.code})
+            return JSONResponse(status_code=404, content={"error": exc.code})
         return Response(
             content=export.body,
             media_type=export.media_type,

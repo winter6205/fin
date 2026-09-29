@@ -62,12 +62,12 @@ def _frozen_unit_text(locator: Locator) -> str:
         _corpus_dir()
         / "extracted"
         / locator.document_id
-        / f"page-{locator.page:03d}.json"
+        / f"page-{locator.unit:03d}.json"
     )
     assert page_path.is_file(), f"cited unit missing on disk: {page_path}"
     payload = json.loads(page_path.read_text())
     assert payload["version"] == locator.version, (
-        f"{locator.document_id} page {locator.page} froze version "
+        f"{locator.document_id} unit {locator.unit} froze version "
         f"{payload['version']!r}, seed cites {locator.version!r}"
     )
     return payload["text"]
@@ -105,8 +105,8 @@ def test_seeded_numeral_is_substring_of_cited_unit_text(fact: Fact) -> None:
     forms = _printed_forms(fact.value)
     assert any(form in text for form in forms), (
         f"{fact.concept} value {fact.value!r} is unevidenced: none of "
-        f"{forms} appears in {fact.source_locator.document_id} page "
-        f"{fact.source_locator.page}"
+        f"{forms} appears in {fact.source_locator.document_id} unit "
+        f"{fact.source_locator.unit}"
     )
 
 
@@ -120,12 +120,12 @@ def test_seeded_scale_matches_cited_unit_header(fact: Fact) -> None:
     text = _frozen_unit_text(fact.source_locator)
     header = _UNIT_HEADER_RE.search(text)
     assert header is not None, (
-        f"page {fact.source_locator.page} declares no unit-of-measure "
+        f"unit {fact.source_locator.unit} declares no unit-of-measure "
         f"header; a scaled seed cannot cite it"
     )
     declared = header.group(1).lower()
     assert fact.scale == declared, (
-        f"page {fact.source_locator.page} is denominated in {declared!r} "
+        f"unit {fact.source_locator.unit} is denominated in {declared!r} "
         f"({header.group(0)!r}), seed claims scale={fact.scale!r}"
     )
 
@@ -178,5 +178,5 @@ def test_committed_fact_file_matches_the_seed() -> None:
         assert entry["source_locator"] == {
             "document_id": fact.source_locator.document_id,
             "version": fact.source_locator.version,
-            "page": fact.source_locator.page,
+            "unit": fact.source_locator.unit,
         }

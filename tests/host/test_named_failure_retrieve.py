@@ -50,14 +50,13 @@ from fin.host.named_failures import (
 )
 from fin.host.run_payload import ORDINARY_PERSON_COPY, _run_to_response_payload
 from fin.host.state import reset_input_state
-from fin.retrieve import Chunk
+from fin.retrieve import Chunk, FakeRetrievePort
 from fin.retrieve.hit_mapping import (
     MAPPING_FAILURE_UNMAPPED_SOURCE_REF,
     MAPPING_STAGE_RETRIEVE,
     MappingFailureLedger,
 )
 from fin.retrieve.mcp_adapter import MCPRetrieveAdapter
-from fin.retrieve.read_port import read_from_pages
 
 
 QUESTION = "What was AAPL revenue in 2023 Q1?"
@@ -84,8 +83,8 @@ _RETRIEVE_CALL: dict[str, Any] = {
 }
 
 
-def _locator(page: int = 1) -> Locator:
-    return Locator(document_id=DOCUMENT_ID, version=VERSION, page=page)
+def _locator(unit: int = 1) -> Locator:
+    return Locator(document_id=DOCUMENT_ID, version=VERSION, unit=unit)
 
 
 # ----- ports: the three retrieve shapes -----
@@ -232,7 +231,7 @@ def test_the_delta_is_measured_against_the_callers_baseline() -> None:
 
 def test_evidence_from_any_route_keeps_the_verifier_reason() -> None:
     """The re-label applies to a run that had NOTHING to cite. Evidence
-    brought by ``read_file`` means the collection was not what failed,
+    brought by ``read_source`` means the collection was not what failed,
     so the verifier's verdict is kept even with a 0-chunk retrieve."""
     assert (
         named_refusal_reason(
@@ -700,37 +699,25 @@ def test_the_verifier_verdict_survives_when_retrieve_did_produce_hits() -> None:
     assert payload["reason"] == "citation_repair_cap"
 
 
-class _PagePort:
-    """A read port over one in-memory page (evidence not from retrieve)."""
-
-    def __init__(self, locator: Locator, text: str) -> None:
-        self._pages = {
+def _readable_port(locator: Locator, text: str) -> FakeRetrievePort:
+    """The fake serve port over one in-memory unit (evidence not from
+    retrieve): its empty hit table answers ``{"chunks": []}`` and its
+    ``read_slice`` face is the run's own ``read_source`` leg."""
+    return FakeRetrievePort(
+        pages_by_doc={
             locator.document_id: (
                 ExtractedPage(locator=locator, text=text, passages=()),
             )
         }
-
-    def read(
-        self,
-        document_id: str,
-        version: str,
-        page: int = 1,
-        page_limit: int = 1,
-    ) -> dict[str, Any]:
-        return read_from_pages(
-            self._pages, document_id, version, page, page_limit
-        )
-
-    def retrieve(self, query: str, **kwargs: Any) -> dict[str, Any]:
-        return {"chunks": []}
+    )
 
 
-def test_read_file_evidence_keeps_a_passing_verification() -> None:
-    """Boundary: a 0-chunk retrieve beside a ``read_file`` page the
+def test_read_source_evidence_keeps_a_passing_verification() -> None:
+    """Boundary: a 0-chunk retrieve beside a ``read_source`` unit the
     answer DOES quote is a ``done`` run — the retrieve-side 具名失败
     must never pre-empt a passing verification, because the run's
     evidence came from somewhere else."""
-    page_text = (
+    unit_text = (
         "Net sales for the quarter increased nine percent compared "
         "with the prior year period."
     )
@@ -740,34 +727,36 @@ def test_read_file_evidence_keeps_a_passing_verification() -> None:
                 content="",
                 tool_calls=[
                     {
-                        "name": "read_file",
+                        "name": "read_source",
                         "args": {
-                            "document_id": DOCUMENT_ID,
-                            "version": VERSION,
-                            "page": 1,
-                            "page_limit": 1,
+                            "source_ref": {
+                                "document_id": DOCUMENT_ID,
+                                "version": VERSION,
+                                "unit": 1,
+                            }
                         },
                         "id": "c-read",
                         "type": "tool_call",
                     }
                 ],
             ),
-            AIMessage(content=f"Per the filing: {page_text}"),
+            AIMessage(content=f"Per the filing: {unit_text}"),
         ]
     )
     graph = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
-        adapter=_PagePort(_locator(), page_text),
-        read_port=_PagePort(_locator(), page_text),
+        adapter=_readable_port(_locator(), unit_text),
         known_document_ids={DOCUMENT_ID},
         mapping_failure_ledger=MappingFailureLedger(),
     )
 
-    payload = _run_to_response_payload(_run(graph, "t-read-file-evidence"))
+    payload = _run_to_response_payload(_run(graph, "t-read-source-evidence"))
 
     assert payload["status"] == "done"
     assert [c["document_id"] for c in payload["citations"]] == [DOCUMENT_ID]
+    assert [c["unit"] for c in payload["citations"]] == [1]
+    assert all("page" not in c for c in payload["citations"])
 
 
 def test_the_empty_bound_fact_outranks_a_hallucinated_locator() -> None:

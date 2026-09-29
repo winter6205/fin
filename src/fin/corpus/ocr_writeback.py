@@ -64,10 +64,10 @@ def selective_ocr_write_back(
     if engine is None:
         raise OCRWriteBackEngineError(
             f"OCR engine is unavailable for "
-            f"{page.locator.document_id} page {page.locator.page}"
+            f"{page.locator.document_id} page {page.locator.unit}"
         )
     try:
-        text = engine.recognize(source=source, page=page.locator.page)
+        text = engine.recognize(source=source, page=page.locator.unit)
     except OcrRequiredUnavailableError:
         raise
     except OCRWriteBackEngineError:
@@ -75,12 +75,12 @@ def selective_ocr_write_back(
     except OCRError as exc:
         raise OCRWriteBackEngineError(
             f"OCR failed for {page.locator.document_id} "
-            f"page {page.locator.page}: {exc}"
+            f"page {page.locator.unit}: {exc}"
         ) from exc
     except Exception as exc:
         raise OCRWriteBackEngineError(
             f"OCR failed for {page.locator.document_id} "
-            f"page {page.locator.page}: {exc}"
+            f"page {page.locator.unit}: {exc}"
         ) from exc
 
     if not isinstance(text, str):
@@ -90,7 +90,7 @@ def selective_ocr_write_back(
     if not text.strip():
         raise OCRWriteBackEmptyTextError(
             f"OCR returned empty text for {page.locator.document_id} "
-            f"page {page.locator.page}"
+            f"page {page.locator.unit}"
         )
 
     written_page = replace(

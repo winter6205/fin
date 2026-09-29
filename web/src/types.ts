@@ -7,11 +7,84 @@ export interface ThreadListItem {
   created_at: string;
 }
 
+// How the UI labels one source unit: "page" only when the unit is a
+// physical PDF page; every other unit reads "unit" (spec
+// thread-attachment-source-read).
+export type SourceDisplay = "page" | "unit";
+
 export interface Citation {
+  kind: "company" | "attachment";
+  // Company filings carry document_id; an attachment citation sends "".
   document_id: string;
+  // Attachment identity; a company citation sends "". The filename is
+  // display-only — grouping and DOM keys use this id.
+  attachment_id: string;
   version: string;
-  page: number;
+  // 1-based source unit (a PDF page for physical filings, a parsed
+  // chunk otherwise).
+  unit: number;
+  display: SourceDisplay;
+  // Safe display name for an attachment; a company citation sends "".
+  filename: string;
   quote: string;
+}
+
+// The attachment leg of a ``source_ref`` — the locator ``read_source``
+// resolves for an attachment source (spec
+// thread-attachment-source-read: ready attachment hits carry
+// ``source_ref={kind:"attachment",attachment_id,version,unit}``).
+export interface AttachmentSourceRef {
+  kind: "attachment";
+  attachment_id: string;
+  version: string;
+  // One-based frozen-unit ordinal.
+  unit: number;
+}
+
+// ----- The visual-observation lane -----
+//
+// One row of the ``visual_claims`` SSE event, repeated verbatim on the
+// history endpoint's turn object. Mirrors
+// ``fin.host.visual_evidence.VisualEvidence.as_claim_row()``: that key
+// set IS the contract (VISUAL_CLAIM_FIELDS), and a consumer reading a
+// field not listed here is guessing.
+//
+// There is deliberately NO answer text in the row. The observation body
+// stays with the model, so this surface shows provenance and can never
+// be rendered as a verbatim source quote (spec
+// thread-attachment-source-read lines 58 and 65).
+
+// The region actually looked at: normalized ``[left, top, right, bottom]``
+// bounds in the page image's own coordinate space. ``null`` = no reliable
+// box existed, so the whole rendered page was inspected.
+export type VisualObservationScope = [number, number, number, number];
+
+export interface VisualClaim {
+  kind: "visual_observation";
+  attachment_id: string;
+  // The parsed-content version the observation was produced from.
+  version: string;
+  // One-based frozen-unit ordinal this page maps to.
+  unit: number;
+  // Physical page of the rendered image the model read.
+  page: number;
+  // Which persisted observation version answered the ask.
+  observation_version: number;
+  scope: VisualObservationScope | null;
+  provider: string;
+  model_version: string;
+  // SHA-256 of the raster the observation was made from — what ties the
+  // claim back to this exact page image.
+  page_image_sha256: string;
+  // The exact chart / series / category target the observation answers.
+  detail: string;
+  // Safe display name; identity stays ``attachment_id``.
+  filename: string;
+  // True = this run read a stored observation instead of asking the
+  // model again; no re-upload and no vision call happened.
+  reused: boolean;
+  // Outbound attempts this read cost the run (0 on a pure reuse).
+  outbound_calls: number;
 }
 
 export type RunStatus = "done" | "refuse" | "step_cap";
@@ -75,9 +148,19 @@ export type TraceItem =
 // Both carry byte-identical entries.
 
 export interface ComparisonLocator {
+  // The row's source discriminator, read by ``citationSourceId`` so the
+  // table and the citation chips never resolve a source differently.
+  // Optional because the v1 producer (``compare_facts._locator_dict``)
+  // sends document_id / version / unit only: an absent ``kind`` is a
+  // company row. An attachment fact row needs the producer to send this
+  // field plus attachment_id before the table can name its source.
+  kind?: "company" | "attachment";
   document_id: string;
+  attachment_id?: string;
   version: string;
-  page: number;
+  // 1-based source unit.
+  unit: number;
+  display?: SourceDisplay;
 }
 
 export interface ComparisonColumn {
@@ -232,6 +315,16 @@ export interface Turn {
   // the numbers the filing actually reported, which is the
   // evidence for the refusal.
   comparisons?: Comparison[];
+  // The run's visual-claim rows (see ``VisualClaim``). Filled by
+  // the ``visual_claims`` SSE frame while the run streams and by the
+  // same array on the GET history row after a reload — one field, both
+  // doors, so a reloaded turn renders identically. A turn that made no
+  // visual claim carries an empty array (never missing on the wire);
+  // optional here only so a peer predating the lane still typechecks.
+  // NEVER part of ``citations``: a generated observation is not a source
+  // quote, so it reaches the operator through its own surface
+  // (components/VisualClaims.tsx) instead of a chip.
+  visual_claims?: VisualClaim[];
   // T8: the operator's latest thumb for this run ("up" / "down").
   // Null / absent when no thumb was ever set. A side record keyed by
   // run_id (mirrors ``fin.host.workspace_http.TurnRow.feedback``) —

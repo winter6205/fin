@@ -29,10 +29,10 @@ from fin.retrieve.tool import retrieve as product_retrieve
 CAPABILITY_KEYS = load_capability_keys()
 
 
-def _chunk(document_id: str, page: int, text: str, score: float) -> Chunk:
+def _chunk(document_id: str, unit: int, text: str, score: float) -> Chunk:
     return Chunk(
         text=text,
-        source_ref=Locator(document_id=document_id, version="v-sha", page=page),
+        source_ref=Locator(document_id=document_id, version="v-sha", unit=unit),
         score=score,
     )
 

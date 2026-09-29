@@ -8,7 +8,7 @@ three nodes the v1 spec requires:
 
 * ``model_node`` — invoke the chat model, increment ``step_count``
   once per entry, route on tool_calls.
-* ``tool_node`` — execute ``list_files`` / ``read_file`` /
+* ``tool_node`` — execute ``list_files`` / ``read_source`` /
   ``retrieve`` via ``langgraph.prebuilt.ToolNode``, append the
   resulting ``ToolMessage``s and the corresponding ``EvidenceItem``s.
 * ``citation_gate_node`` — call ``verify_citations`` and translate
@@ -56,10 +56,10 @@ between the CLI helper's graph and the HTTP handler's graph.
 
 The factory does NOT auto-ingest and does NOT read a local extracted
 tree on the serve path (ADR 0046 / 0047): citation evidence and
-``read_file`` bodies come from this run's retrieve / read port
-payloads, and the ``read_file`` body source is the injected read port
-(``adapter.read`` when the adapter offers one, an explicit
-``read_port=``, otherwise a typed-miss port).
+``read_source`` bodies come from this run's retrieve / read legs, and
+the ``read_source`` body source is the bound adapter's own
+``read_slice`` face (the typed-miss reader when the adapter does not
+offer one) plus the wired attachment service's per-thread reader.
 """
 
 from __future__ import annotations
@@ -70,6 +70,7 @@ import logging
 import os
 import threading
 import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -77,6 +78,7 @@ from typing import (
     Annotated,
     Any,
     Callable,
+    Final,
     Iterable,
     Literal,
     Mapping,
@@ -108,9 +110,12 @@ from fin.host.citation_gate import (
     EvidenceItem,
     verify_citations,
 )
+from fin.host.visual_evidence import VISUAL_LANE_UNWIRED
 from fin.host.evidence_admission import (
     admit_retrieved_chunks,
+    attachment_evidence_from_ref,
     evidence_from_chunks,
+    unit_ordinal,
 )
 from fin.host.memory_port import MemoryPort
 from fin.host.named_failures import (
@@ -163,7 +168,7 @@ from fin.host.stream_map import (
     strip_thinking_from_answer,
 )
 from fin.corpus.catalog import DEFAULT_CATALOG_PATH
-from fin.host.tools import list_files, read_file
+from fin.host.tools import list_files
 from fin.host.tools.read_source import read_source
 from fin.host.tools.issuer_fanout import (
     ISSUER_FANOUT_TOOL,
@@ -202,7 +207,6 @@ from fin.retrieve.degradation import (
 from fin.retrieve.hit_mapping import MappingFailureLedger, ledger_from_env
 from fin.retrieve.input_validation import InputValidationError
 from fin.retrieve.port import RetrievePort
-from fin.retrieve.read_port import MissReadPort, ReadPort
 from fin.retrieve.source_read import (
     ATTACHMENT_KIND,
     UNKNOWN_LOCATOR,
@@ -462,95 +466,12 @@ def _make_list_files_tool(catalog_path: Path):
     return list_files_tool
 
 
-def _make_read_file_tool(read_port: ReadPort):
-    """Build the ``read_file`` host tool.
-
-    The tool wraps T3's ``read_file`` with the factory's injected read
-    port (ADR 0046 / 0047: the body fetch is a port call — MCP when the
-    bytes live there, the fake manifest on the fake path, never a local
-    extracted tree) and, on a successful page read, contributes one
-    ``EvidenceItem`` to ``AgentState`` per page in the joined ``text``
-    slice. A miss dict (``{"error": "unknown_locator"}`` or the named
-    ``read_unavailable`` failure) contributes nothing.
-
-    The tool's registered name is ``read_file`` so the model can call
-    it by name.
-    """
-
-    @tool("read_file")
-    def read_file_tool(
-        document_id: str,
-        version: str,
-        page: int = 1,
-        page_limit: int = 1,
-        tool_call_id: Annotated[str, InjectedToolCallId] = "",
-    ) -> Command:
-        """Read a page from a known locator.
-
-        ``document_id`` matches the manifest's ``document_id``
-        (e.g. ``AAPL-2022Q3``). ``version`` is the manifest
-        sha256. ``page`` is 1-based; ``page_limit`` is clamped to
-        3 (ADR 0009). Misses return ``{"error": "unknown_locator"}``
-        (or ``{"error": "read_unavailable"}`` when the corpus
-        backend exposes no read tool) and contribute no evidence.
-        """
-        result = read_file(
-            document_id=document_id,
-            version=version,
-            page=page,
-            page_limit=page_limit,
-            reader=read_port,
-        )
-        new_evidence: list[EvidenceItem] = []
-        if isinstance(result, dict) and "text" in result:
-            # Successful page read: emit one EvidenceItem per page
-            # in the joined ``text`` slice. ``page_limit`` is
-            # clamped to 3, so the loop is bounded. The gate
-            # matches spans anywhere in ``page_text``; emitting
-            # one item per page keeps each EvidenceItem's locator
-            # faithful to the source page (ADR 0021). We slice the
-            # joined text by the ``\n\n`` separator the tool uses
-            # so the gate cannot over-attribute a span to multiple
-            # pages when ``page_limit > 1``.
-            try:
-                page_count_value = int(result["page_count"])
-            except (KeyError, TypeError, ValueError):
-                page_count_value = page
-            end_page = min(page + page_limit - 1, page_count_value)
-            page_text_parts = result["text"].split("\n\n")
-            for offset, page_num in enumerate(range(page, end_page + 1)):
-                locator = Locator(
-                    document_id=result["document_id"],
-                    version=result["version"],
-                    page=page_num,
-                )
-                page_text = (
-                    page_text_parts[offset]
-                    if offset < len(page_text_parts)
-                    else result["text"]
-                )
-                new_evidence.append(
-                    EvidenceItem(locator=locator, page_text=page_text)
-                )
-        tool_message = ToolMessage(
-            content=json.dumps(result, default=str),
-            tool_call_id=tool_call_id,
-            name="read_file",
-        )
-        return Command(
-            update={"messages": [tool_message], "evidence": new_evidence}
-        )
-
-    return read_file_tool
-
-
 class _MissSourceReader:
     """A ``read_source`` leg that no adapter backs: every read misses.
 
-    The company-leg twin of ``MissReadPort`` (ADR 0046 / 0047). When the
-    bound retrieve adapter exposes no ``read_slice`` face, the tool
-    answers the typed miss instead of quietly reaching for another body
-    source.
+    When the bound retrieve adapter exposes no ``read_slice`` face, the
+    tool answers the typed miss instead of quietly reaching for another
+    body source.
     """
 
     def read_slice(
@@ -561,38 +482,72 @@ class _MissSourceReader:
         return source_error(UNKNOWN_LOCATOR)
 
 
-def _evidence_from_slice(result: Mapping[str, Any]) -> EvidenceItem:
+def _attachment_identity_from_record(
+    record: Any,
+) -> tuple[str, str]:
+    """The display pair a trusted record grants a citation: its safe
+    filename and how its frozen units are presented (physical page for
+    a PDF, unit ordinal otherwise).
+
+    The PDF question is asked through the preparation door's own
+    predicate so citation display and the read lane can never fork two
+    answers; the module is imported lazily because
+    ``attachment_prepare`` reaches ``fin.host.compile``, which imports
+    this module.
+    """
+    module = importlib.import_module("fin.host.attachment_prepare")
+    display = "page" if module.filename_is_pdf(record.filename) else "unit"
+    return record.filename, display
+
+
+def _evidence_from_slice(
+    result: Mapping[str, Any],
+    *,
+    position: int = 0,
+    attachment_display: Callable[[str, int | None], tuple[str, str] | None] | None = None,
+) -> EvidenceItem | None:
     """Map one returned slice to the single ``EvidenceItem`` it earns.
 
     The slice addresses exactly one frozen unit, so exactly one item
-    enters the channel, and its ``page_text`` is only the text this call
+    enters the channel, and its ``unit_text`` is only the text this call
     returned (ADR 0046 this-run evidence; spec: a quote may rest on
-    nothing the run did not read). ``Locator.page`` carries the unit
-    ordinal until T5 renames the field to ``unit``.
+    nothing the run did not read). A company slice carries the
+    ``{document_id, version, unit}`` locator; an attachment slice
+    carries the typed identity instead — the same mapping a retrieved
+    attachment hit goes through, in
+    :func:`fin.host.evidence_admission.attachment_evidence_from_ref`.
+
+    Returns ``None`` when the slice carries no ordinal the gate can
+    attribute, or when an attachment slice cannot reach its trusted
+    record: the identity behind the quote could not be attested, so no
+    citation may rest on it (the model still received the text; the
+    gate simply has nothing to attribute it to).
     """
     ref = result.get("source_ref") or {}
-    kind = ref.get("kind") if isinstance(ref, Mapping) else None
-    try:
-        unit = int(ref.get("unit", 0))
-    except (TypeError, ValueError):
-        # EXIT: an off-contract ordinal still cannot block admitting
-        # text the model genuinely received; zero matches no locator a
-        # citation could claim.
-        unit = 0
-    identity = (
-        ref.get("attachment_id")
-        if kind == ATTACHMENT_KIND
-        else ref.get("document_id")
-    )
+    if isinstance(ref, Mapping) and ref.get("kind") == ATTACHMENT_KIND:
+        return attachment_evidence_from_ref(
+            ref,
+            str(result.get("text") or ""),
+            grant=attachment_display,
+            position=position,
+            next_position=result.get("next_position"),
+        )
+    raw_unit = ref.get("unit") if isinstance(ref, Mapping) else None
+    unit = unit_ordinal(raw_unit)
+    if unit is None:
+        # EXIT: no ordinal means no citable identity; admitting one the
+        # gate must reject would fail the run instead of the citation.
+        return None
+    version = str(ref.get("version") or "")
     return EvidenceItem(
         locator=Locator(
-            # T5 formalizes attachment citation identity; until then an
-            # attachment's id rides the locator's document slot.
-            document_id=str(identity or ""),
-            version=str(ref.get("version") or ""),
-            page=unit,
+            document_id=str(ref.get("document_id") or ""),
+            version=version,
+            unit=unit,
         ),
-        page_text=str(result.get("text") or ""),
+        unit_text=str(result.get("text") or ""),
+        position=position,
+        next_position=result.get("next_position"),
     )
 
 
@@ -621,6 +576,98 @@ def _attachment_source_reader_factory(
     return build
 
 
+def _attachment_identity_current_check(
+    reader_factory: Callable[[str], Any] | None,
+    thread_id: str,
+) -> Callable[[EvidenceItem], bool]:
+    """Build the citation gate's attachment trust re-check for one run.
+
+    An attachment quote grounds a citation only while the record still
+    belongs to the run's HOST-bound thread AND its parsed-content version
+    still equals the version the read was admitted under — the same
+    four-way check the read leg applies, which is why this reuses the
+    wired reader instead of restating it: the gate holds no store (ADR
+    0021 keeps it pure), so the graph is the only place that can answer,
+    and the leg factory already closes over the one store the read used.
+
+    A run with no attachment leg wired (a text-only deployment) or no
+    bound thread has nothing to attest identity against — such a run
+    could not have produced attachment evidence in the first place — so
+    the check rejects every attachment item. A reader without the
+    identity face is rejected the same way rather than trusted blindly.
+    Company items are never asked, so they stay unaffected either way.
+    """
+
+    def reject(_item: EvidenceItem) -> bool:
+        return False
+
+    if reader_factory is None or not thread_id:
+        return reject
+    try:
+        reader = reader_factory(thread_id)
+    except Exception as exc:
+        # EXIT: an unavailable leg is an unverifiable identity, not an
+        # error to raise at the answer path.
+        _LOG.debug("attachment identity reader unavailable: %s", exc)
+        return reject
+    check = getattr(reader, "identity_is_current", None)
+    if not callable(check):
+        return reject
+
+    def is_current(item: EvidenceItem) -> bool:
+        try:
+            return bool(check(item.attachment_id, item.version_int))
+        except Exception as exc:
+            # NEVER raise into the gate: a store fault means the identity
+            # cannot be attested, which is a rejection, not a crash.
+            _LOG.debug("attachment identity check fault: %s", exc)
+            return False
+
+    return is_current
+
+
+def _attachment_reader_for_run(
+    attachment_reader_factory: Callable[[str], Any] | None,
+    config: Any,
+) -> Any:
+    """The run's thread-bound attachment leg, or ``None`` when unwired.
+
+    Both tools that can surface attachment text resolve it the same way:
+    the thread comes from ``configurable``, never from a model argument.
+    """
+    if attachment_reader_factory is None:
+        return None
+    configurable = dict((config or {}).get("configurable") or {})
+    thread_id = str(configurable.get("thread_id") or "")
+    if not thread_id:
+        return None
+    return attachment_reader_factory(thread_id)
+
+
+def _display_lookup_for(reader: Any) -> Callable[[str, int | None], tuple[str, str] | None] | None:
+    """Trust the run's own leg for citation identity.
+
+    The reader resolves the record under the thread-bound store
+    already validated by the read; a reader without the identity
+    face grants no display pair, so the slice earns no evidence.
+    """
+    owned = getattr(reader, "owned_record", None)
+    if not callable(owned):
+        return None
+
+    def lookup(
+        attachment_id: str, version_int: int | None
+    ) -> tuple[str, str] | None:
+        record: Any = owned(attachment_id)
+        if record is None:
+            return None
+        if version_int is not None and record.version != version_int:
+            return None
+        return _attachment_identity_from_record(record)
+
+    return lookup
+
+
 def _make_read_source_tool(
     company_reader: Any,
     attachment_reader_factory: Callable[[str], Any] | None,
@@ -638,20 +685,11 @@ def _make_read_source_tool(
     ``ensure_attachment_ready`` reads — so a model-supplied thread id in
     ``source_ref`` can never widen the readable scope (spec SC4).
     ``attachment_reader_factory`` ``None`` (or a run with no thread id)
-    means no attachment leg is wired.
+    means no attachment leg is wired, and an attachment slice whose
+    trusted record cannot be reached contributes no evidence.
 
-    The tool's registered name is ``read_source``; it coexists with
-    ``read_file`` until T5 removes the latter.
+    The tool's registered name is ``read_source``.
     """
-
-    def _attachment_reader_for_run(config: Any) -> Any:
-        if attachment_reader_factory is None:
-            return None
-        configurable = dict((config or {}).get("configurable") or {})
-        thread_id = str(configurable.get("thread_id") or "")
-        if not thread_id:
-            return None
-        return attachment_reader_factory(thread_id)
 
     @tool("read_source")
     def read_source_tool(
@@ -672,11 +710,14 @@ def _make_read_source_tool(
         answer ``{"error": "unknown_locator"}`` and contribute no
         evidence; so do invalid positions and unavailable sources.
         """
+        attachment_reader = _attachment_reader_for_run(
+            attachment_reader_factory, config
+        )
         result = read_source(
             source_ref,
             position,
             company_reader=company_reader,
-            attachment_reader=_attachment_reader_for_run(config),
+            attachment_reader=attachment_reader,
         )
         new_evidence: list[EvidenceItem] = []
         if is_slice_result(result) and result.get("text"):
@@ -684,7 +725,15 @@ def _make_read_source_tool(
             # ``position == len(unit)``; nothing was returned, so there
             # is nothing this run can quote (and empty evidence would
             # trip the gate's malformed-evidence check).
-            new_evidence.append(_evidence_from_slice(result))
+            item = _evidence_from_slice(
+                result,
+                position=position,
+                attachment_display=_display_lookup_for(attachment_reader)
+                if attachment_reader is not None
+                else None,
+            )
+            if item is not None:
+                new_evidence.append(item)
         tool_message = ToolMessage(
             # WHY the shared serializer: the legs bound the result with
             # the canonical ``ensure_ascii=False`` bytes, so the content
@@ -700,6 +749,211 @@ def _make_read_source_tool(
         )
 
     return read_source_tool
+
+
+# The run-config key the visual lane spends its calls through. Minted once
+# per graph entry by ``_LockedGraph`` and read by ``read_visual_detail``:
+# the deployed ceiling is per run, so a ledger handed out at boot would let
+# one busy thread spend every later run's calls.
+_VISION_LEDGER_CONFIG_KEY: Final[str] = "vision_call_ledger"
+
+
+def _visual_page_raster(payload: bytes, page: int) -> Any:
+    """Draw one page of an attachment's stored bytes as a raster.
+
+    Opened and released per call: :class:`Pypdfium2PageRenderer` owns a
+    native document, and a visual ask touches one page at a time, so the
+    resource never outlives the draw it exists for.
+    """
+    module = importlib.import_module("fin.corpus.parsers._pages")
+    with module.Pypdfium2PageRenderer(payload) as renderer:
+        return renderer.render_page(page_no=page)
+
+
+def _make_visual_faces_factory(
+    attachment_service: Any,
+    reader_factory: Callable[[str], Any] | None,
+) -> Callable[[str, Any], Any] | None:
+    """Build one run's visual-read faces, or report that the lane is absent.
+
+    Every face a real inspection needs must be present on the wired
+    service: the attachment store, a vision port, the deployed budget that
+    prices its calls, and the byte store the original page is re-read from
+    to prove the stored raster hash. Anything short of that is a text-only
+    deployment, and returning ``None`` here means the tool is never bound —
+    the model is not offered a question this process could only refuse.
+
+    The faces are built PER RUN because the reader is host-bound to the
+    run's ``thread_id`` (ADR 0088): the model names an attachment, never a
+    thread.
+    """
+    if reader_factory is None:
+        return None
+    store = getattr(attachment_service, "store", None)
+    vision = getattr(attachment_service, "vision", None)
+    budgets = getattr(attachment_service, "budgets", None)
+    objects = getattr(attachment_service, "objects", None)
+    if not (store and vision and budgets and objects):
+        return None
+
+    def build(thread_id: str, ledger: Any) -> Any:
+        # WHY lazy: the visual leg sits below this module in the import
+        # graph, exactly like the attachment source-read leg above.
+        module = importlib.import_module("fin.host.attachment_visual_read")
+        return module.VisualReadFaces(
+            reader=reader_factory(thread_id),
+            store=store,
+            vision=vision,
+            ledger=ledger,
+            payload=objects.get,
+            render=_visual_page_raster,
+            now=_visual_clock,
+        )
+
+    return build
+
+
+def _visual_clock() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _make_visual_ledger_factory(
+    budgets: Any,
+) -> Callable[[], Any] | None:
+    """A fresh per-run call ledger, or ``None`` with no page lane.
+
+    The ledger is minted per graph entry rather than held by the service
+    because its whole purpose is to bound ONE run: a service-wide ledger
+    would let one thread's visual questions spend every later thread's
+    calls, and a per-document ledger would bound one attachment instead of
+    the run that reads several.
+    """
+    if budgets is None:
+        return None
+
+    def build() -> Any:
+        module = importlib.import_module("fin.host.attachment_budgets")
+        return module.VisionCallLedger(budgets)
+
+    return build
+
+
+def _run_vision_ledger(config: Mapping[str, Any] | None) -> Any | None:
+    """This run's own visual-call ledger, from the run config.
+
+    Read from ``configurable`` only, the same shape ``thread_id`` uses. An
+    absent ledger is not an unlimited one: the caller refuses the ask with
+    the unwired-lane code rather than spending against no ceiling.
+    """
+    if not config:
+        return None
+    configurable = config.get("configurable") or {}
+    ledger = configurable.get(_VISION_LEDGER_CONFIG_KEY)
+    if ledger is None:
+        return None
+    # WHY lazy: ``attachment_budgets`` reaches the vision port and the
+    # composition root, which imports this module back — the same cycle
+    # every other attachment seam here dodges.
+    budgets = importlib.import_module("fin.host.attachment_budgets")
+    return ledger if isinstance(ledger, budgets.VisionCallLedger) else None
+
+
+def _make_read_visual_detail_tool(
+    faces_factory: Callable[[str, Any], Any] | None,
+):
+    """Build the ``read_visual_detail`` host tool (ADR 0089).
+
+    One call answers one plotted value on one page of one attachment this
+    thread owns, and contributes the run's visual-claim ROWS — never
+    ``EvidenceItem``s. That is the whole design: the citation gate admits a
+    claim only over a verbatim span of read text, and a generated
+    observation has no such span, so routing it through ``evidence`` would
+    either fabricate a quote or refuse an honest answer. It travels its own
+    channel instead.
+
+    The tool's registered name is ``read_visual_detail``.
+    """
+
+    @tool("read_visual_detail")
+    def read_visual_detail_tool(
+        attachment_id: str,
+        page: int,
+        chart: str,
+        series: str,
+        category: str,
+        scope: list[float] | None = None,
+        tool_call_id: Annotated[str, InjectedToolCallId] = "",
+        config: Annotated[RunnableConfig, InjectedToolArg()] = None,
+    ) -> Command:
+        """What one chart on an attachment's PDF page plots.
+
+        For a value drawn as pixels, not for document text — text goes
+        through ``retrieve`` and ``read_source``. ``attachment_id`` and
+        ``page`` come from tool output this run (``page`` is the 1-based
+        physical page); ``chart`` / ``series`` / ``category`` name the
+        plotted target. ``scope`` is an optional normalized
+        ``[left, top, right, bottom]`` region within the page.
+
+        A page already observed for this exact target answers from the
+        stored observation and charges nothing; anything else inspects the
+        page once. The answer is derived, not a quote, so it can never be
+        cited as source text. Unknown or another thread's attachment
+        answers ``{"error": "attachment_unavailable"}``; refusals are
+        ``page_unavailable``, ``detail_target_invalid``,
+        ``crop_scope_invalid``, ``vision_budget_exceeded``,
+        ``vision_call_failed``, ``observation_stale``,
+        ``visual_lane_unwired``.
+        """
+        payload, claim_rows = _visual_read_result(
+            faces_factory, attachment_id, page, chart, series, category, scope, config
+        )
+        tool_message = ToolMessage(
+            content=serialize_result(payload),
+            tool_call_id=tool_call_id,
+            name="read_visual_detail",
+        )
+        return Command(
+            update={"messages": [tool_message], "visual_claims": claim_rows}
+        )
+
+    return read_visual_detail_tool
+
+
+def _visual_read_result(
+    faces_factory: Callable[[str, Any], Any] | None,
+    attachment_id: str,
+    page: int,
+    chart: str,
+    series: str,
+    category: str,
+    scope: list[float] | None,
+    config: Any,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """The model-facing answer and the run's claim rows for one visual ask.
+
+    Split out of the tool so the shape is testable without a model turn:
+    the second element is what the wire and the turn row persist, and the
+    first is what the model is allowed to see of it. The body/page
+    serialization itself lives in :mod:`fin.host.tools.read_visual_detail`
+    — this function only supplies the two faces the lane needs: the run's
+    host-bound thread and the run's own call ceiling.
+    """
+    thread_id = _bound_thread_id(config)
+    ledger = _run_vision_ledger(config)
+    if faces_factory is None or ledger is None or not thread_id:
+        # EXIT: no lane, no bound thread, or no run ceiling — the ask is
+        # refused before a page is drawn, never answered from a guess.
+        return {"error": VISUAL_LANE_UNWIRED}, []
+    wrapper = importlib.import_module("fin.host.tools.read_visual_detail")
+    return wrapper.visual_read_result(
+        faces_factory(thread_id, ledger),
+        attachment_id=attachment_id,
+        page=page,
+        chart=chart,
+        series=series,
+        category=category,
+        scope=scope,
+    )
 
 
 def _default_empty_hit_rewrite(query: str) -> str:
@@ -724,6 +978,7 @@ def _make_retrieve_tool(
     rewriter: Callable[[str], str] | None = None,
     retry_observer: Callable[[RewriteRetryResult], None] | None = None,
     attachment_retriever: "AttachmentSearchPort | None" = None,
+    attachment_reader_factory: Callable[[str], Any] | None = None,
 ):
     """Build the ``retrieve`` host tool.
 
@@ -802,9 +1057,11 @@ def _make_retrieve_tool(
       ``attachment_chunks``, because the miss shape would tell the model
       the thread has nothing when the search never answered.
     The branch runs ONCE per call with the ORIGINAL query — the empty-hit
-    rewrite retry is company-port machinery only. Attachment text never
-    enters the evidence channel: T5 owns attachment citation, so the
-    citation gate keeps ruling on company hits exactly as before. With no
+    rewrite retry is company-port machinery only. A hit earns evidence
+    under the same identity rule a ``read_source`` slice does: only text
+    this call returned, and only while a trusted record still stands
+    behind the id, so a hit whose attachment the thread no longer owns at
+    that version publishes display text but never a citation. With no
     retriever wired the envelope is byte-identical to the pre-T3 shape.
     """
     ledger = (
@@ -918,27 +1175,27 @@ def _make_retrieve_tool(
                     exhausted=outcome.exhausted
                 )
 
-        def _attachment_leg() -> dict[str, Any]:
-            """The envelope keys this call's attachment branch owns.
+        def _attachment_leg() -> tuple[dict[str, Any], list[EvidenceItem]]:
+            """The envelope keys and evidence this call's branch owns.
 
-            ``{}`` when the branch is not eligible to run at all (no
-            retriever wired, no host-bound thread, an un-askable query) —
-            which is what keeps an unwired graph's envelope byte-identical
-            to the pre-T3 shape.
+            ``({}, [])`` when the branch is not eligible to run at all
+            (no retriever wired, no host-bound thread, an un-askable
+            query) — which is what keeps an unwired graph's envelope
+            byte-identical to the pre-T3 shape.
             """
             if attachment_retriever is None or not query.strip():
                 # A blank query is un-askable of either leg: the company
                 # leg names it as its own input failure, and re-asking the
                 # thread index for "" would invent a hit set for a call
                 # that was never askable.
-                return {}
+                return {}, []
             thread_id = _bound_thread_id(config)
             if not thread_id:
                 # EXIT: with no host-bound scope there is no eligible
                 # attachment set. Guessing one is the widening ADR 0088
                 # forbids, so the branch stays out and the company hits
                 # answer alone.
-                return {}
+                return {}, []
             typed_failure = _attachment_retrieval_error_type()
             try:
                 hits = attachment_retriever.search(
@@ -952,19 +1209,32 @@ def _make_retrieve_tool(
                 # collapsed into ``{"attachment_chunks": []}`` — that would
                 # tell the model the thread holds nothing when the index
                 # never answered.
-                return {"attachment_error": exc.as_dict()}
+                return {"attachment_error": exc.as_dict()}, []
             # A clean run publishes its own key even when empty: "looked,
             # found nothing" is a different fact from "did not look".
-            return {
-                "attachment_chunks": [
+            #
+            # The identity grant is the run's own thread-bound leg, looked
+            # up per hit: a hit the store no longer answers for at that
+            # version still reaches the model as text but earns no
+            # evidence, so no citation can rest on it.
+            grant = _display_lookup_for(
+                _attachment_reader_for_run(attachment_reader_factory, config)
+            )
+            envelope_chunks: list[dict[str, Any]] = []
+            evidence: list[EvidenceItem] = []
+            for hit in hits:
+                source_ref = hit.source_ref.as_source_ref()
+                envelope_chunks.append(
                     {
                         "text": hit.text,
-                        "source_ref": hit.source_ref.as_source_ref(),
+                        "source_ref": source_ref,
                         "score": hit.score,
                     }
-                    for hit in hits
-                ]
-            }
+                )
+                item = attachment_evidence_from_ref(source_ref, hit.text, grant=grant)
+                if item is not None:
+                    evidence.append(item)
+            return {"attachment_chunks": envelope_chunks}, evidence
 
         # T3 (spec SC4–SC5): the drops this call caused are measured on
         # the ledger's PER-THREAD counter, read before and after the
@@ -1045,8 +1315,10 @@ def _make_retrieve_tool(
             _consume_into_envelope(envelope, result, ledger=degradations)
             # The attachment branch answers independently of the company
             # branch's typed exit: a company failure must not hide the
-            # thread's attachments either.
-            envelope.update(_attachment_leg())
+            # thread's attachments either — and the text it published is
+            # the text the model may quote, so its evidence travels too.
+            attachment_envelope, attachment_evidence = _attachment_leg()
+            envelope.update(attachment_envelope)
             return Command(
                 update={
                     "messages": [
@@ -1055,7 +1327,8 @@ def _make_retrieve_tool(
                             tool_call_id=tool_call_id,
                             name="retrieve",
                         )
-                    ]
+                    ],
+                    "evidence": attachment_evidence,
                 }
             )
         raw_chunks = result.get("chunks", []) if isinstance(result, dict) else []
@@ -1077,7 +1350,7 @@ def _make_retrieve_tool(
         new_evidence: list[EvidenceItem] = evidence_from_chunks(chunks)
         # Serialize the chunks with their Locator as a dict so the
         # ToolMessage is JSON-friendly. The original ``Chunk`` value
-        # objects live on ``page_text`` (string) for evidence;
+        # objects live on ``unit_text`` (string) for evidence;
         # ToolMessage content is the contract-shape dict.
         serialized_chunks = [
             {
@@ -1085,7 +1358,7 @@ def _make_retrieve_tool(
                 "source_ref": {
                     "document_id": chunk.source_ref.document_id,
                     "version": chunk.source_ref.version,
-                    "page": chunk.source_ref.page,
+                    "unit": chunk.source_ref.unit,
                 },
                 "score": chunk.score,
             }
@@ -1093,7 +1366,9 @@ def _make_retrieve_tool(
         ]
         envelope: dict[str, Any] = {"chunks": serialized_chunks}
         _consume_into_envelope(envelope, result, ledger=degradations)
-        envelope.update(_attachment_leg())
+        attachment_envelope, attachment_evidence = _attachment_leg()
+        envelope.update(attachment_envelope)
+        new_evidence.extend(attachment_evidence)
         tool_message = ToolMessage(
             content=json.dumps(envelope, default=str),
             tool_call_id=tool_call_id,
@@ -1209,8 +1484,8 @@ def _make_get_xbrl_fact_tool(facts_root: Path):
         # claimed (concept, period) -> fact-value mapping on the
         # ``done`` path. No ``EvidenceItem`` is contributed because
         # the fact row is NOT page text — the citation gate's
-        # evidence shape is reserved for ``read_file`` /
-        # ``retrieve`` page / chunk content.
+        # evidence shape is reserved for ``read_source`` /
+        # ``retrieve`` unit / chunk content.
         return Command(update={"messages": [tool_message]})
 
     return get_xbrl_fact_tool
@@ -1509,7 +1784,7 @@ _COMPARE_FACTS_DESCRIPTION = (
 _REDLINE_DESCRIPTION = "Compare paragraph text between two frozen filings."
 
 _EXTRACT_TABLES_DESCRIPTION = (
-    "Extract pipe-delimited tables from one frozen page."
+    "Extract pipe-delimited tables from one frozen unit."
 )
 
 _STATEMENT_DESCRIPTION = (
@@ -1575,7 +1850,7 @@ def _make_redline_tool(manifest_path: Path, extracted_root: Path):
 
 
 def _make_table_extract_tool(manifest_path: Path, extracted_root: Path):
-    """Build the locator-bound page table extraction tool."""
+    """Build the locator-bound unit table extraction tool."""
     return _make_locator_tool(
         _LocatorToolSpec(
             name="extract_tables",
@@ -1583,7 +1858,7 @@ def _make_table_extract_tool(manifest_path: Path, extracted_root: Path):
             signature=(
                 "document_id: str, "
                 "version: str, "
-                "page: int = 1"
+                "unit: int = 1"
             ),
             impl_module="fin.host.tools.table_extract",
             impl_attr="extract_tables",
@@ -1726,7 +2001,7 @@ def _issuer_evidence(
     """The retrieve result's chunks as ordinary ``EvidenceItem``s.
 
     Fan-out evidence is deliberately indistinguishable from a
-    ``read_file`` page here, so the ONE citation verifier after the
+    ``read_source`` unit here, so the ONE citation verifier after the
     join treats both alike (ADR 0034). Text-less chunks are dropped:
     they can carry no citable span. Mapping-failed chunks go through
     the same admission as the single-issuer path (T17 / SC22), so a
@@ -1756,7 +2031,7 @@ def _issuer_hit_update(
                     {
                         "document_id": item.locator.document_id,
                         "version": item.locator.version,
-                        "page": item.locator.page,
+                        "unit": item.locator.unit,
                     }
                     for item in evidence
                 ],
@@ -1961,9 +2236,10 @@ def _fold_tool_update(raw_update: Any) -> dict[str, list[Any]]:
     returns it verbatim; the summarising wrapper must merge it manually
     and must keep every channel the tools wrote.
 
-    Only ``messages`` / ``evidence`` / ``retrieve_outcomes`` are copied,
-    which is exactly the set the wrapped tools (``read_file``,
-    ``retrieve``) write and the wrapper re-emits. An unknown key would
+    Only ``messages`` / ``evidence`` / ``retrieve_outcomes`` /
+    ``visual_claims`` are copied, which is exactly the set the wrapped
+    tools (``read_source``, ``retrieve``, ``read_visual_detail``) write and
+    the wrapper re-emits. An unknown key would
     be silently dropped, so a tool that grows a new state channel must
     be added here too — the fold is the single place that knows the
     ToolNode return shape, so the node body does not restate it per
@@ -1973,6 +2249,7 @@ def _fold_tool_update(raw_update: Any) -> dict[str, list[Any]]:
         "messages": [],
         "evidence": [],
         "retrieve_outcomes": [],
+        "visual_claims": [],
     }
     if isinstance(raw_update, dict):
         merged["messages"].extend(raw_update.get("messages", []))
@@ -1989,6 +2266,7 @@ def _fold_tool_update(raw_update: Any) -> dict[str, list[Any]]:
                 merged["retrieve_outcomes"].extend(
                     payload.get("retrieve_outcomes", [])
                 )
+                merged["visual_claims"].extend(payload.get("visual_claims", []))
             elif isinstance(item, dict):
                 merged["messages"].extend(item.get("messages", []))
             elif isinstance(item, BaseMessage):
@@ -2058,9 +2336,9 @@ def _locator_from_payload(payload: Any) -> Locator | None:
     Both the ``get_xbrl_fact`` row (``source_locator``) and a
     ``compare_facts`` cell (``locator``) carry the same three-field
     shape. A payload that is not a dict, is missing a field, or
-    carries an unparseable page decodes to ``None`` — the caller
-    drops the row rather than registering a fact the numeric gate
-    could not trace back to a page.
+    carries an unparseable unit ordinal decodes to ``None`` — the
+    caller drops the row rather than registering a fact the numeric
+    gate could not trace back to a unit.
     """
     if not isinstance(payload, dict):
         return None
@@ -2068,7 +2346,7 @@ def _locator_from_payload(payload: Any) -> Locator | None:
         return Locator(
             document_id=payload["document_id"],
             version=payload["version"],
-            page=int(payload["page"]),
+            unit=int(payload["unit"]),
         )
     except (KeyError, TypeError, ValueError):
         return None
@@ -2411,7 +2689,6 @@ def compile_graph(
     retrieve_adapter: str = RETRIEVE_ADAPTER_FAKE,
     mcp_command: list[str] | None = None,
     locator_map: dict[str, "Locator"] | None = None,
-    read_port: ReadPort | None = None,
     mapping_failure_ledger: MappingFailureLedger | None = None,
     degradation_ledger: DegradationLedger | None = None,
     summarizer: Any | None = None,
@@ -2452,15 +2729,14 @@ def compile_graph(
         (ADR 0030); it remains importable for legacy / offline
         tests but the factory does not auto-build it.
 
-        When the adapter offers a ``read`` method (both
+        When the adapter offers a ``read_slice`` method (both
         ``FakeRetrievePort`` and ``MCPRetrieveAdapter`` do, ADR
-        0047), it is the default ``read_file`` body source unless
-        ``read_port`` is supplied explicitly.
+        0088), it is the ``read_source`` company leg.
     manifest_path
         Path to ``data/corpus/manifest.json``. Defaults to the
         repo's canonical location. Used by the ``list_files`` /
         ``redline`` / ``table_extract`` tool wiring only — the
-        retrieve and ``read_file`` evidence paths never touch it
+        retrieve and ``read_source`` evidence paths never touch it
         (ADR 0046 / 0047).
     extracted_root
         Path to ``data/corpus/extracted/``. Defaults to the
@@ -2533,16 +2809,6 @@ def compile_graph(
         map and never reads the extracted tree; hits that cannot
         map are dropped and counted on the mapping ledger —
         visible, never silent.
-    read_port
-        T1 (ADR 0046 / 0047): the ``read_file`` body source.
-        ``None`` (the default) resolves in order: the bound
-        adapter's own ``read`` when it has one (``FakeRetrievePort``
-        serves its ``pages_by_doc`` manifest, ``MCPRetrieveAdapter``
-        answers the named ``read_unavailable`` EXIT until iknow
-        grows a read tool), otherwise a typed-miss port. An
-        explicit port wins over both. The factory never builds a
-        tree-backed read port itself — the local extracted tree is
-        not a serve-path SSOT.
     mapping_failure_ledger
         T17 (SC22): where hits that fail to map back to a locator
         are counted. ``None`` (the default) resolves the ledger
@@ -2716,24 +2982,12 @@ def compile_graph(
                 mapping_ledger=mapping_failure_ledger,
             )
 
-    # Resolve the read_file body source (ADR 0046 / 0047): the most
-    # explicit port wins; otherwise the adapter's own ``read`` (the
-    # fake's pages manifest / the MCP named-exit); otherwise a typed
-    # -miss port for adapters without a read face (legacy BM25). The
-    # factory never reads the extracted tree here — the tree is not a
-    # serve-path SSOT.
-    if read_port is None and hasattr(adapter, "read"):
-        read_port = adapter  # type: ignore[assignment]
-    if read_port is None:
-        read_port = MissReadPort()
-
     # Resolve the read_source legs (ADR 0087 / 0088). The company leg is
     # the bound adapter's own ``read_slice`` when it has one (the MCP
     # adapter and the fake port grow into that face); an adapter without
-    # it gets the typed-miss reader, exactly as ``read_file`` gets
-    # ``MissReadPort``. The adapter object itself is the leg (the same
-    # shape ``read_file`` uses for its port), so the wrapper's one
-    # duck-typed ``read_slice`` lookup covers both. The attachment leg
+    # it gets the typed-miss reader. No second body source is consulted
+    # and the extracted tree is never one, so a read can only ever return
+    # text the run's own port served. The attachment leg
     # defaults to one derived from the wired attachment service's store,
     # and an explicit factory (a test or a different composition root)
     # wins.
@@ -2753,12 +3007,12 @@ def compile_graph(
     cpath = _resolve_path(catalog_path, _DEFAULT_CATALOG_PATH)
 
     list_files_tool = _make_list_files_tool(cpath)
-    read_file_tool = _make_read_file_tool(read_port)
     retrieve_tool = _make_retrieve_tool(
         adapter,
         mapping_ledger=mapping_failure_ledger,
         degradation_ledger=degradation_ledger,
         attachment_retriever=attachment_retriever,
+        attachment_reader_factory=attachment_source_reader_factory,
     )
     get_xbrl_fact_tool = _make_get_xbrl_fact_tool(fpath)
     # T3 (spec Focus 1): bound LAST so the four prior tools keep
@@ -2774,6 +3028,26 @@ def compile_graph(
     statement_tool = _make_statement_tool(fpath)
     read_source_tool = _make_read_source_tool(
         company_reader, attachment_source_reader_factory
+    )
+    # ADR 0089: a visual read is offered only when the wired attachment
+    # service really can inspect a page. An unwired deployment leaves the
+    # tool unbound on both surfaces, so the model never spends a turn on a
+    # question this process could only refuse.
+    visual_faces_factory = _make_visual_faces_factory(
+        attachment_service, attachment_source_reader_factory
+    )
+    read_visual_detail_tool = (
+        None
+        if visual_faces_factory is None
+        else _make_read_visual_detail_tool(visual_faces_factory)
+    )
+    # A ceiling is only worth minting for a run that can spend it: with no
+    # page lane the tool is unbound, so the per-entry ledger would be an
+    # unused object on every config.
+    visual_ledger_factory = (
+        None
+        if visual_faces_factory is None
+        else _make_visual_ledger_factory(attachment_service.budgets)
     )
 
     # T6 (spec SC12 / SC13 / map G4): when memory is ON, expose exactly
@@ -2823,7 +3097,6 @@ def compile_graph(
 
     model_bound_tools: list[Any] = [
         list_files_tool,
-        read_file_tool,
         retrieve_tool,
         get_xbrl_fact_tool,
         compare_facts_tool,
@@ -2834,7 +3107,6 @@ def compile_graph(
     ]
     tool_node_tools: list[Any] = [
         list_files_tool,
-        read_file_tool,
         retrieve_tool,
         get_xbrl_fact_tool,
         compare_facts_tool,
@@ -2856,10 +3128,14 @@ def compile_graph(
 
     # Bound last on both surfaces: LangChain's tool binding is
     # order-sensitive and existing tests pin the earlier indices.
-    # ``read_file`` and ``read_source`` deliberately coexist until T5
-    # removes the former.
     model_bound_tools.append(read_source_tool)
     tool_node_tools.append(read_source_tool)
+    if read_visual_detail_tool is not None:
+        # Appended after ``read_source`` on both surfaces: tool binding is
+        # order-sensitive and the lane is the newest member of the set, so
+        # every earlier index a test pins stays put.
+        model_bound_tools.append(read_visual_detail_tool)
+        tool_node_tools.append(read_visual_detail_tool)
 
     bound_model = model.bind_tools(model_bound_tools)
     # Operator thinking off: OpenAI-compatible / 方舟 extra_body
@@ -3343,6 +3619,10 @@ def compile_graph(
                 state["messages"],
                 track="grounded",
                 memory_on=memory_enabled,
+                # ADR 0089: the copy naming ``read_visual_detail`` rides
+                # only when the tool is bound, so an unwired deployment is
+                # never told about a lane it cannot use.
+                visual_lane_on=visual_faces_factory is not None,
                 user_profile=_read_profile_text(),
                 # The same single owner of「本次跑的是哪个档」the retrieve
                 # hop reads, so the copy and the wire call can never
@@ -3394,7 +3674,7 @@ def compile_graph(
         (spec line 32).
 
         Return-shape note: when ANY wrapped tool returns a
-        ``Command`` (``read_file`` / ``retrieve`` do), the prebuilt
+        ``Command`` (``read_source`` / ``retrieve`` do), the prebuilt
         ``ToolNode._func`` answers a list instead of one flat dict.
         LangGraph merges that list itself when a node returns it
         verbatim, but this wrapper must merge it manually to attach
@@ -3438,6 +3718,14 @@ def compile_graph(
         update["retrieve_outcomes"] = list(
             state.get("retrieve_outcomes") or []
         ) + merged_outcomes
+        # ADR 0089: the visual-claim rows are the OTHER evidence path, and
+        # the channel is additive (see ``AgentState.visual_claims``), so this
+        # node returns ONLY the rows this step read — the same shape
+        # ``evidence`` above keeps. Several visual questions in one run are
+        # several claims; a run that read none omits the key rather than
+        # restating the prior list, which the reducer would concat again.
+        if merged["visual_claims"]:
+            update["visual_claims"] = merged["visual_claims"]
         return update
 
     def _fanout_tool_update(
@@ -3531,7 +3819,7 @@ def compile_graph(
         hybrid / RRF pass in here (ADR 0032 + ADR 0034's rejected
         list). Its chunks become ordinary ``EvidenceItem``s, so the one
         citation verifier after the join treats fan-out evidence
-        exactly like a ``read_file`` page.
+        exactly like a ``read_source`` unit.
         """
         issuer = str(task.get("issuer") or "").strip().upper()
         query = str(task.get("query") or "")
@@ -3624,7 +3912,9 @@ def compile_graph(
             "issuer_fanout": result["fanout"],
         }
 
-    def citation_gate_node(state: AgentState) -> dict[str, Any]:
+    def citation_gate_node(
+        state: AgentState, config: RunnableConfig
+    ) -> dict[str, Any]:
         # Pull the last ``AIMessage``'s text as the candidate
         # answer. Empty content (model returned only tool_calls)
         # falls through to the bounce path so the model can retry
@@ -3651,6 +3941,13 @@ def compile_graph(
             repair_count=repair_count,
             known_document_ids=known_ids,
             repair_cap=REPAIR_CAP,
+            # The thread is read from the run config — never from state
+            # or the model's arguments — so a stale or re-owned
+            # attachment cannot keep grounding a quote after the read
+            # that produced it.
+            attachment_identity_current=_attachment_identity_current_check(
+                attachment_source_reader_factory, _bound_thread_id(config)
+            ),
         )
 
         if gate_result.outcome == "done":
@@ -4087,6 +4384,11 @@ def compile_graph(
         # through ``tool_node_with_summaries`` (a wrapper whose name
         # shadows the actual executor in the compiled graph).
         tool_node=tool_dispatcher,
+        # ADR 0089: the per-run visual ceiling is minted here, at the one
+        # place every run entry passes through. The lane's presence is
+        # already carried by the cache key's ``attachment_service``
+        # identity, so no new key is needed.
+        visual_ledger_factory=visual_ledger_factory,
         # T6: memory_port changes the bound tool set (ON adds three
         # tools; OFF keeps the eight ToolNode tools), so the cache must
         # distinguish graphs by memory surface. Keep the port itself
@@ -4155,6 +4457,7 @@ def _make_locked_graph(
     compactor: OccupancyCompactor | None = None,
     bound_tools: list[Any] | None = None,
     tool_node: Any | None = None,
+    visual_ledger_factory: Callable[[], Any] | None = None,
     memory_port: Any | None = None,
     enable_choice_window: bool = False,
     attachment_service: Any | None = None,
@@ -4211,6 +4514,7 @@ def _make_locked_graph(
         compactor=compactor,
         bound_tools=bound_tools or [],
         tool_node=tool_node,
+        visual_ledger_factory=visual_ledger_factory,
     )
     _IDEMPOTENCE_CACHE[key] = proxy
     return proxy
@@ -4240,6 +4544,7 @@ class _LockedGraph:
         compactor: OccupancyCompactor | None = None,
         bound_tools: list[Any] | None = None,
         tool_node: Any | None = None,
+        visual_ledger_factory: Callable[[], Any] | None = None,
     ) -> None:
         self._graph = compiled_graph
         # ``recursion_limit`` is exposed via the public attribute
@@ -4259,6 +4564,9 @@ class _LockedGraph:
         # wrapper that shadows the registered executor name in the
         # compiled graph.
         self._tool_node = tool_node
+        # ADR 0089: ``None`` in a deployment with no page lane; otherwise the
+        # per-entry mint of that run's visual-call ceiling.
+        self._visual_ledger_factory = visual_ledger_factory
         self._thread_locks: dict[str, threading.Lock] = {}
         self._meta_lock = threading.Lock()
 
@@ -4570,9 +4878,26 @@ class _LockedGraph:
     def _apply_recursion_limit(self, config: dict | None) -> dict:
         """Return ``config`` with ``recursion_limit`` set to the
         factory default if absent. Does not override an explicit
-        caller value."""
+        caller value.
+
+        When a visual lane is deployed, this is also where the run's call
+        ceiling is minted and handed down through ``configurable`` — every
+        entry point (``invoke`` / ``ainvoke`` / ``stream``) passes here, so
+        no door can start a run that spends visual calls against nothing.
+        A fresh ledger per entry matches the ledger's own documented
+        boundary (in-process, one run; nothing durable), and a resumed run
+        gets its own rather than inheriting a spend nobody can prove.
+        ``configurable`` is copied, not mutated: the caller's dict outlives
+        this call and is reused on a resume.
+        """
         merged: dict = dict(config or {})
         merged.setdefault("recursion_limit", self.recursion_limit)
+        if self._visual_ledger_factory is not None:
+            configurable = dict(merged.get("configurable") or {})
+            configurable[_VISION_LEDGER_CONFIG_KEY] = (
+                self._visual_ledger_factory()
+            )
+            merged["configurable"] = configurable
         return merged
 
     def invoke(self, input: Any, config: dict | None = None, **kwargs: Any) -> Any:

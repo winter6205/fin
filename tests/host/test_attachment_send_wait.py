@@ -45,6 +45,7 @@ from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import Field
 
+from fin.corpus.extracted import load_extracted_tree
 from fin.corpus.object_store import InMemoryObjectStore
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.attachment_budgets import AttachmentBudgets
@@ -53,7 +54,7 @@ from fin.host.attachment_store import InMemoryAttachmentStore
 from fin.host.run_control import RunControl
 from fin.host.thread_store import InMemoryThreadStore
 from fin.host.workspace_http import _resume_one_attachment_wait
-from fin.retrieve import ExtractedTreeReadPort
+from fin.retrieve import FakeRetrievePort
 
 
 AAPL_2022Q3 = "AAPL-2022Q3"
@@ -62,9 +63,14 @@ AAPL_2022Q3_VERSION = (
 )
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
-_TREE_READ_PORT = ExtractedTreeReadPort(
-    Path("data/corpus/manifest.json"),
-    Path("data/corpus/extracted"),
+# The committed corpus units behind the graph's ``read_source`` company leg;
+# the serve path itself never walks the tree (ADR 0046 / 0047).
+_READ_ADAPTER = FakeRetrievePort(
+    pages_by_doc={
+        AAPL_2022Q3: load_extracted_tree(
+            Path("data/corpus/manifest.json"), Path("data/corpus/extracted")
+        )[AAPL_2022Q3]
+    }
 )
 
 # A unique sentinel no corpus fixture contains; the recording model
@@ -120,8 +126,6 @@ def client(http_app: FastAPI) -> TestClient:
 
 @pytest.fixture(scope="session")
 def aapl_page1_text() -> str:
-    from fin.corpus.extracted import load_extracted_tree
-
     tree = load_extracted_tree(
         Path("data/corpus/manifest.json"), Path("data/corpus/extracted")
     )
@@ -129,19 +133,21 @@ def aapl_page1_text() -> str:
 
 
 def _read_then_answer_script(answer: str) -> list[AIMessage]:
-    """One ``read_file`` hop, then an extractive answer the citation gate
+    """One ``read_source`` hop, then an extractive answer the citation gate
     admits — the proven done shape at the HTTP surface."""
     return [
         AIMessage(
             content="",
             tool_calls=[
                 {
-                    "name": "read_file",
+                    "name": "read_source",
                     "args": {
-                        "document_id": AAPL_2022Q3,
-                        "version": AAPL_2022Q3_VERSION,
-                        "page": 1,
-                        "page_limit": 1,
+                        "source_ref": {
+                            "document_id": AAPL_2022Q3,
+                            "version": AAPL_2022Q3_VERSION,
+                            "unit": 1,
+                        },
+                        "position": 0,
                     },
                     "id": "c-read",
                     "type": "tool_call",
@@ -183,7 +189,7 @@ def env(http_app: FastAPI, aapl_page1_text: str):
             "checkpointer": InMemorySaver(),
             "model": model,
             "known_document_ids": KNOWN_IDS,
-            "read_port": _TREE_READ_PORT,
+            "adapter": _READ_ADAPTER,
         }
         if wire_gate:
             kwargs["attachment_service"] = service

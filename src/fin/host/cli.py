@@ -19,11 +19,13 @@ The three-section stdout schema is::
     status: <status>
     answer: <answer text>
     citations:
-      - <document_id> v<version> p<page>: <quote>
+      - <source> v<version> <p|u><unit>: <quote>
 
 The ``citations:`` header is ALWAYS printed (stable schema for any
 operator-grade parser). Entries appear only when ``status == "done"``;
-for ``refuse`` / ``step_cap`` the block is empty. The CLI strips the
+for ``refuse`` / ``step_cap`` the block is empty. ``<source>`` is the
+company ``document_id`` or the attachment's filename, and the unit
+prefix follows the citation's ``display``. The CLI strips the
 ``[FIN_HIDDEN_BOUNCE]`` marker (ADR 0021) from any text it prints
 before sending bytes to the user surface.
 
@@ -110,12 +112,31 @@ def _derive_answer(state: dict[str, Any]) -> str:
     return ""
 
 
+def _citation_source_label(citation) -> str:
+    """The label one citation line opens with.
+
+    A company citation names its ``document_id``; an attachment citation
+    has none, so it names the safe filename and falls back to the logical
+    ``attachment_id`` — the identity that stays unique when two uploads
+    share a filename.
+    """
+    if citation.kind == "attachment":
+        return citation.filename or citation.attachment_id
+    return citation.document_id
+
+
+def _citation_unit_label(citation) -> str:
+    """``p<unit>`` for a unit presented as a page, else ``u<unit>``."""
+    prefix = "p" if citation.display == "page" else "u"
+    return f"{prefix}{citation.unit}"
+
+
 def _format_citation_line(citation) -> str:
-    """Render one Citation as ``  - <document_id> v<version> p<page>: <quote>``.
+    """Render one Citation as ``  - <source> v<version> <unit>: <quote>``.
 
     Newlines inside the quote are collapsed to single spaces so the
     "one citation per line" invariant holds even when an extractive
-    span crosses a line break in the source page text. The span is
+    span crosses a line break in the source unit text. The span is
     still findable modulo whitespace; we do not rewrite any other
     characters.
     """
@@ -123,7 +144,10 @@ def _format_citation_line(citation) -> str:
     if "\n" in quote:
         quote = " ".join(quote.splitlines())
     quote = strip_hidden_bounce_marker(quote)
-    return f"  - {citation.document_id} v{citation.version} p{citation.page}: {quote}"
+    return (
+        f"  - {_citation_source_label(citation)}"
+        f" v{citation.version} {_citation_unit_label(citation)}: {quote}"
+    )
 
 
 def _pending_interrupt(state: dict[str, Any]) -> dict[str, Any] | None:

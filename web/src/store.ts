@@ -296,35 +296,8 @@ function foldResumeFrame(
   fold: StreamFold,
   event: api.SendEvent,
 ): void {
+  if (foldStreamTraceFrame(patches, fold, event)) return;
   switch (event.type) {
-    case "thinking":
-      patches.coalesce((t) => ({
-        ...foldTraceFrameOntoTurn(t, event),
-        thinking_text: t.thinking_text + event.text,
-      }));
-      break;
-    case "tool_call": {
-      const placeholder: ToolSummary = {
-        name: event.name,
-        summary: RUNNING_SUMMARY,
-        tool_call_id: event.tool_call_id,
-      };
-      patches.flushThen((t) => ({
-        ...foldTraceFrameOntoTurn(t, event),
-        tool_summaries: [...(t.tool_summaries ?? []), placeholder],
-      }));
-      break;
-    }
-    case "tool_result":
-      patches.flushThen((t) => ({
-        ...foldTraceFrameOntoTurn(t, event),
-        tool_summaries: (t.tool_summaries ?? []).map((s) =>
-          s.tool_call_id === event.tool_call_id
-            ? { ...s, summary: event.summary }
-            : s,
-        ),
-      }));
-      break;
     case "status":
       fold.statusSeen = true;
       fold.windowPending = null;
@@ -345,20 +318,14 @@ function foldResumeFrame(
         thinking_duration_ms: event.thinking_ms ?? t.thinking_duration_ms,
       }));
       break;
-    case "answer":
-      fold.answerFold = foldLiveAnswer(fold.answerFold, {
-        text: event.text,
-        reset: event.reset,
-        statusSeen: fold.statusSeen,
-      });
-      patches.coalesce((t) => ({
-        // Same answer-closes-burst contract as sendQuestion.
-        ...foldTraceFrameOntoTurn(t, { type: "answer" }),
-        answer: fold.answerFold.visible,
-      }));
-      break;
     case "citations":
       patches.flushThen((t) => ({ ...t, citations: event.citations }));
+      break;
+    case "visual_claims":
+      // Same fold, same field, same reason as ``sendQuestion``: the visual
+      // lane is not a citation, so a resumed run lands its rows here
+      // rather than on the quote channel.
+      patches.flushThen((t) => ({ ...t, visual_claims: event.visual_claims }));
       break;
     case "comparison":
       patches.flushThen((t) => ({
@@ -373,6 +340,72 @@ function foldResumeFrame(
       fold.windowPending = event.window;
       patches.flushThen((t) => ({ ...t, choice_window: event.window }));
       break;
+  }
+}
+
+// The four high-frequency trace frames — thinking and answer prose, plus
+// the tool rows — folded onto the optimistic turn. Both streams call this:
+// a send and a crash-resume must not drift on how a frame becomes a row,
+// so the four cases live here once rather than once per path. ``false``
+// means the frame is not a trace frame and the caller handles it. The
+// answer fold mutates ``fold`` in place, so both streams fold answer
+// deltas through the same shape.
+function foldStreamTraceFrame(
+  patches: TurnPatcherQueue,
+  fold: StreamFold,
+  event: api.SendEvent,
+): boolean {
+  switch (event.type) {
+    case "thinking":
+      patches.coalesce((t) => ({
+        ...foldTraceFrameOntoTurn(t, event),
+        thinking_text: t.thinking_text + event.text,
+      }));
+      return true;
+    case "tool_call": {
+      // Append a placeholder row so the operator sees a
+      // running indicator while the tool executes. The
+      // matching ``tool_result`` replaces it with the
+      // server-formatted one-liner.
+      const placeholder: ToolSummary = {
+        name: event.name,
+        summary: RUNNING_SUMMARY,
+        tool_call_id: event.tool_call_id,
+      };
+      patches.flushThen((t) => ({
+        ...foldTraceFrameOntoTurn(t, event),
+        tool_summaries: [...(t.tool_summaries ?? []), placeholder],
+      }));
+      return true;
+    }
+    case "tool_result":
+      // The server already formatted the summary (spec line
+      // 32); replace the "running…" placeholder with it.
+      patches.flushThen((t) => ({
+        ...foldTraceFrameOntoTurn(t, event),
+        tool_summaries: (t.tool_summaries ?? []).map((s) =>
+          s.tool_call_id === event.tool_call_id
+            ? { ...s, summary: event.summary }
+            : s,
+        ),
+      }));
+      return true;
+    case "answer":
+      fold.answerFold = foldLiveAnswer(fold.answerFold, {
+        text: event.text,
+        reset: event.reset,
+        statusSeen: fold.statusSeen,
+      });
+      patches.coalesce((t) => ({
+        // turn-trace-folds spec line 33: the first answer frame
+        // closes the still-live burst — the fold must collapse
+        // when prose starts, not only at terminal status.
+        ...foldTraceFrameOntoTurn(t, { type: "answer" }),
+        answer: fold.answerFold.visible,
+      }));
+      return true;
+    default:
+      return false;
   }
 }
 
@@ -564,6 +597,11 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       // as each ``compare_facts`` call returns, so the table is on
       // screen while the answer is still being authored.
       comparisons: [],
+      // The run's visual-claim rows, filled by the
+      // ``visual_claims`` SSE frame. Empty until that frame lands, and
+      // deliberately NOT part of ``citations`` — a generated visual
+      // observation has no quote to place in the answer.
+      visual_claims: [],
       // T4 (#37): the optimistic turn is LIVE until the terminal
       // status frame — the thinking region line-clamps and the tool
       // rows stay open while the run streams, then collapse.
@@ -610,13 +648,19 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // clears the draft so SC67 copy renders from ``assistant_message``.
     // The fold state lives here rather than on the turn row because a
     // bounce retry accumulates behind the visible draft.
-    let statusSeen = false;
-    // search-mode-host T2: the window a ``choice_window`` frame
+    // The stream fold this send shares with the resume path (see
+    // ``StreamFold``): ``statusSeen`` /
+    // ``answerFold`` drive the answer delta fold, and
+    // ``windowPending`` is the window a ``choice_window`` frame
     // painted on this turn, or null. The host sends NO terminal
-    // frames on a suspended stream — while this is set the run is
+    // frames on a suspended stream — while it is set the run is
     // waiting on a pick, so the row must not be finalized (not done,
     // still in_flight).
-    let windowPending: ChoiceWindow | null = null;
+    const fold: StreamFold = {
+      statusSeen: false,
+      windowPending: null,
+      answerFold: EMPTY_LIVE_ANSWER,
+    };
     // T2f graph job gate (review C4): the server-minted run id from
     // an ``attachment_wait`` frame — the EXACT signal that this
     // stream suspended on the attachment_preparation interrupt.
@@ -624,7 +668,6 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // frame + the send named a local uploaded/parsing row" heuristic,
     // which misread a crashed/truncated stream the same way.
     let attachmentWaitRunId: string | null = null;
-    let answerFold: LiveAnswerState = EMPTY_LIVE_ANSWER;
     // ADR 0086: the ids the attach door minted
     // ride this send — and stay referenceable on every later one.
     // The attach path never touches /api/corpus/ingest.
@@ -634,47 +677,13 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
     try {
       const result = await api.sendMessage(threadId, request, (event) => {
+        if (foldStreamTraceFrame(turnPatches, fold, event)) return;
         switch (event.type) {
-          case "thinking":
-            turnPatches.coalesce((t) => ({
-              ...foldTraceFrameOntoTurn(t, event),
-              thinking_text: t.thinking_text + event.text,
-            }));
-            break;
-          case "tool_call": {
-            // Append a placeholder row so the operator sees a
-            // running indicator while the tool executes. The
-            // matching ``tool_result`` replaces it with the
-            // server-formatted one-liner.
-            const placeholder: ToolSummary = {
-              name: event.name,
-              summary: RUNNING_SUMMARY,
-              tool_call_id: event.tool_call_id,
-            };
-            turnPatches.flushThen((t) => ({
-              ...foldTraceFrameOntoTurn(t, event),
-              tool_summaries: [...(t.tool_summaries ?? []), placeholder],
-            }));
-            break;
-          }
-          case "tool_result": {
-            // The server already formatted the summary (spec line
-            // 32); replace the "running…" placeholder with it.
-            turnPatches.flushThen((t) => ({
-              ...foldTraceFrameOntoTurn(t, event),
-              tool_summaries: (t.tool_summaries ?? []).map((s) =>
-                s.tool_call_id === event.tool_call_id
-                  ? { ...s, summary: event.summary }
-                  : s,
-              ),
-            }));
-            break;
-          }
           case "status": {
-            statusSeen = true;
+            fold.statusSeen = true;
             // A terminal status ends any earlier suspension: the run
             // (possibly after a resume in another stream) is over.
-            windowPending = null;
+            fold.windowPending = null;
             // turn-trace-folds: the run ended — close any still-live
             // burst so the folds auto-collapse (spec line 34).
             // Drain queued deltas first so a pending thinking/answer
@@ -708,24 +717,21 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
             optimisticRunId = event.run_id;
             break;
           }
-          case "answer":
-            answerFold = foldLiveAnswer(answerFold, {
-              text: event.text,
-              reset: event.reset,
-              statusSeen,
-            });
-            turnPatches.coalesce((t) => ({
-              // turn-trace-folds spec line 33: the first answer frame
-              // closes the still-live burst — the fold must collapse
-              // when prose starts, not only at terminal status.
-              ...foldTraceFrameOntoTurn(t, { type: "answer" }),
-              answer: answerFold.visible,
-            }));
-            break;
           case "citations":
             turnPatches.flushThen((t) => ({
               ...t,
               citations: event.citations,
+            }));
+            break;
+          case "visual_claims":
+            // Its own field, never ``citations`` — the chip layer
+            // places a span with ``answer.indexOf(quote)`` and a visual
+            // claim has no quote. A non-delta frame, so it goes through
+            // ``flushThen`` like the terminal one: a queued answer delta
+            // must not overtake it.
+            turnPatches.flushThen((t) => ({
+              ...t,
+              visual_claims: event.visual_claims,
             }));
             break;
           case "comparison":
@@ -739,7 +745,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
             // without terminal frames. The row keeps its live flag
             // (see the finalize patch) and the window renders as the
             // operator's next action.
-            windowPending = event.window;
+            fold.windowPending = event.window;
             turnPatches.flushThen((t) => ({
               ...t,
               choice_window: event.window,
@@ -791,7 +797,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           // terminal frame — the run is suspended, not done. Same
           // for a preparation wait, which resumes without any
           // operator action.
-          in_flight: windowPending !== null || preparationWait,
+          in_flight: fold.windowPending !== null || preparationWait,
           citations:
             result.citations.length > 0 ? result.citations : t.citations,
           track: result.track ?? t.track,
@@ -816,8 +822,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       // row the stream had already started painting, then rethrow so
       // the composer can show the failure.
       if (
-        statusSeen ||
-        windowPending !== null ||
+        fold.statusSeen ||
+        fold.windowPending !== null ||
         attachmentWaitRunId !== null
       ) {
         // Drain any queued deltas before un-living the row so a late
@@ -830,7 +836,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         // its own.
         turnPatches.flushThen((t) => ({
           ...closeOpenBurstsOnTurn(t),
-          in_flight: windowPending !== null || attachmentWaitRunId !== null,
+          in_flight:
+            fold.windowPending !== null || attachmentWaitRunId !== null,
         }));
       } else {
         dropTurnByRunId(threadId, optimisticRunId);

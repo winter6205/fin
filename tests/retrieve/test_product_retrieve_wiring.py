@@ -4,7 +4,9 @@ Spec ``specs/s1-corpus-retrieve.md``:
 
 * line 14 — "**product corpus**: ... ``fin-serve`` retrieve,
   ``read_file``, and the citation verifier read this tree under the
-  live locator contract."
+  live locator contract." That read seam is now the bounded
+  ``read_source`` tool, and the serve path reads the retrieval service,
+  not this tree.
 * line 27 — "Product retrieve = MCP client to **iknow-memory**
   behind the retrieve port (ADR 0030). ... Default pytest uses a
   fake RetrievePort".
@@ -33,6 +35,7 @@ from fin.host.compile import (
     compile_for_runtime_dev,
 )
 from fin.retrieve import MCPRetrieveAdapter
+from fin.retrieve import read_port as read_port_module
 
 
 # ----- stubs -----
@@ -153,8 +156,13 @@ def test_compile_for_runtime_dev_builds_mcp_adapter_without_extracted_tree(
     def _boom(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("runtime compile consulted the extracted tree")
 
-    monkeypatch.setattr("fin.retrieve.read_port.load_extracted_tree", _boom)
     monkeypatch.setattr("fin.corpus.extracted.load_extracted_tree", _boom)
+
+    # The company read seam carries no tree-loading or whole-page
+    # pagination name to patch any more, so reaching the tree at compile
+    # time would require re-introducing one.
+    assert not hasattr(read_port_module, "load_extracted_tree")
+    assert not hasattr(read_port_module, "ExtractedTreeReadPort")
 
     _install_fake_chat_model(monkeypatch)
     monkeypatch.delenv("FIN_CHECKPOINT_URL", raising=False)

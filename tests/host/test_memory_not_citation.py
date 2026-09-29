@@ -4,7 +4,7 @@ Spec cross-session-operator-memory.md / SC23: "Memory text cannot
 satisfy the citation verifier." Spec citation verifier definition
 (ADR 0046): "a supporting span is a contiguous substring of the
 answer (v1 minimum 32 characters) that appears in text this run
-received from **retrieve** / **read_file**".
+received from **retrieve** / **read_source**".
 
 This module is the proof-side of plan T9 ("Memory is not citation
 evidence"). It proves the property holds against the current code,
@@ -16,8 +16,8 @@ Evidence items only enter the citation gate via the ``evidence``
 channel of ``AgentState``. That channel is fed by exactly two host
 tools (``graph.py``):
 
-* ``_make_read_file_tool`` (line ~366-396) — emits one
-  ``EvidenceItem`` per page in the joined ``text`` slice.
+* ``_make_read_source_tool`` — emits one ``EvidenceItem`` for the
+  bounded slice one call returned.
 * ``_make_retrieve_tool`` (line ~653) — emits
   ``evidence_from_chunks(chunks)``.
 
@@ -37,9 +37,9 @@ on the model-facing payload only and is never written back to the
 checkpointed ``state["messages"]``.
 
 The gate (``verify_citations``) matches answer substrings only
-against ``evidence[i].page_text``. Memory payload bytes live in
+against ``evidence[i].unit_text``. Memory payload bytes live in
 ``messages[i].content`` (or in the model-only payload via
-``messages_for_model``), not in any ``evidence[i].page_text``.
+``messages_for_model``), not in any ``evidence[i].unit_text``.
 
 So: even when the model quotes a memory payload verbatim, no
 ``EvidenceItem`` carries that text, so ``_match_spans`` finds no
@@ -89,7 +89,7 @@ from fin.host.agent_instructions import (
 
 _SHA = "a7a0d8261a0923404fc45446afd71b9965bd2b4064772df0287e761bb68ba9f2"
 _AAPL_LOCATOR = Locator(
-    document_id="AAPL-2022Q3", version=_SHA, page=1
+    document_id="AAPL-2022Q3", version=_SHA, unit=1
 )
 
 # A pretend memory fact. ≥32-char unique substring so it could
@@ -107,8 +107,8 @@ _PROFILE_NOTE = (
 )
 assert len(_PROFILE_NOTE) >= 32
 
-# A realistic ≥32-char span that lives on a real corpus page
-# (AAPL-2022Q3 page 1). Used to confirm the gate STILL works
+# A realistic ≥32-char span that lives on a real corpus unit
+# (AAPL-2022Q3 unit 1). Used to confirm the gate STILL works
 # normally when a real evidence item is present (regression guard
 # — the structural exclusion must not break the happy path).
 _LEGIT_SPAN = "ABCDEFGHIJ" * 5  # 50 alphanumeric chars, determinstic
@@ -172,10 +172,10 @@ def _minimal_state(
 
 
 def test_verify_citations_with_only_memory_marker_text_bounces() -> None:
-    """The gate matches answer substrings against ``page_text`` only.
+    """The gate matches answer substrings against ``unit_text`` only.
 
     Memory payload bytes (a prefetch row's title+hook) DO NOT live
-    in any ``page_text`` — the gate sees an empty evidence list and
+    in any ``unit_text`` — the gate sees an empty evidence list and
     bounces. Even if the answer is a verbatim quote of the
     memory block, the gate has nothing to match it against.
     """
@@ -199,11 +199,11 @@ def test_verify_citations_with_only_memory_marker_text_bounces() -> None:
 def test_verify_citations_does_not_consult_message_history() -> None:
     """The gate signature is ``(answer, evidence, ...)`` — there is
     no ``messages`` parameter. Passing memory text via message
-    history cannot reach the matcher: only ``page_text`` is
+    history cannot reach the matcher: only ``unit_text`` is
     consulted.
     """
     # Build a hypothetical evidence item that contains memory text
-    # alongside a legit span. The gate sees only ``page_text``
+    # alongside a legit span. The gate sees only ``unit_text``
     # substrings of the answer — the legit span matches and the
     # run is ``done``. This asserts the gate is functioning
     # (regression guard), and pairs with the graph-level tests
@@ -213,7 +213,7 @@ def test_verify_citations_does_not_consult_message_history() -> None:
     evidence_with_memory = [
         EvidenceItem(
             locator=_AAPL_LOCATOR,
-            page_text=(
+            unit_text=(
                 "PREAMBLE_"
                 + _LEGIT_SPAN
                 + "_POSTAMBLE_"
@@ -239,7 +239,7 @@ def test_verify_citations_does_not_consult_message_history() -> None:
 
 def test_citation_gate_node_bounces_when_answer_quotes_recall_payload_only() -> None:
     """SC23: a research turn that quotes only recall/fact text,
-    with no this-run retrieve/read_file evidence, does NOT ``done``
+    with no this-run retrieve/read_source evidence, does NOT ``done``
     with citations sourced from memory.
 
     This test seeds the input state with a ``recall_memory``
@@ -291,7 +291,7 @@ def test_citation_gate_node_bounces_when_answer_quotes_recall_payload_only() -> 
 
     # Property SC23: the run does NOT end ``done`` with a
     # memory-sourced citation. The answer is a verbatim quote of
-    # a memory hook, but no this-run retrieve/read_file evidence
+    # a memory hook, but no this-run retrieve/read_source evidence
     # supports it, so the gate bounces.
     assert out["status"] != "done", (
         f"SC23 violated: a memory-text-only answer ended done "
@@ -390,19 +390,19 @@ def test_citation_gate_node_bounces_with_prefetch_text_in_call_scoped_payload() 
     # content for evidence, this assertion would fail — the
     # verbatim quote would match and the run would ``done`` with
     # a memory-sourced citation. The structural fix lives in
-    # ``graph.py`` (evidence channel is fed only by read_file /
+    # ``graph.py`` (evidence channel is fed only by read_source /
     # retrieve ``Command.update["evidence"]``); this test pins
     # the property from the outside.
     assert out["status"] != "done"
     assert list(out.get("citations", ())) == []
 
 
-# ===== graph-level: structural guarantee — evidence channel is fed only by read_file / retrieve =====
+# ===== graph-level: structural guarantee — evidence channel is fed only by read_source / retrieve =====
 
 
-def test_only_read_file_and_retrieve_can_grow_evidence_channel() -> None:
+def test_only_read_source_and_retrieve_can_grow_evidence_channel() -> None:
     """The structural guarantee behind SC23: ``state["evidence"]``
-    is populated ONLY by ``read_file`` and ``retrieve`` tool
+    is populated ONLY by ``read_source`` and ``retrieve`` tool
     calls. Memory tools (``save_memory`` / ``recall_memory`` /
     ``edit_user_profile``) contribute zero evidence items.
 
@@ -414,7 +414,7 @@ def test_only_read_file_and_retrieve_can_grow_evidence_channel() -> None:
     """
     # Scripted model: recall_memory -> edit_user_profile -> final
     # answer that quotes the recall hook verbatim. No
-    # read_file / retrieve call → zero evidence at gate.
+    # read_source / retrieve call → zero evidence at gate.
     answer_text = "Recall says: " + _MEMORY_FACT_HOOK + " is the rule."
     model = ScriptedChatModel(
         script=[
@@ -465,21 +465,25 @@ def test_only_read_file_and_retrieve_can_grow_evidence_channel() -> None:
     assert list(out.get("citations", ())) == []
 
 
-# ===== regression guard: a real read_file evidence item still drives done =====
+# ===== regression guard: a real read_source evidence item still drives done =====
 
 
-def test_legitimate_read_file_evidence_still_drives_done() -> None:
+def test_legitimate_read_source_evidence_still_drives_done() -> None:
     """Memory exclusion must not break the happy path. When the
-    state carries a real read_file ``EvidenceItem``, the gate
+    state carries a real read_source ``EvidenceItem``, the gate
     still matches the answer's ≥32-char span and the run ends
     ``done`` with a citation sourced from the evidence item.
+
+    The citation names the unit the slice was read from, so the same run
+    also proves the evidence channel still carries the frozen-unit
+    ordinal — a quote alone is not enough, the locator must come with it.
     """
     state = _minimal_state(
         question=_RESEARCH_QUESTION,
         evidence=[
             EvidenceItem(
                 locator=_AAPL_LOCATOR,
-                page_text="PREAMBLE_" + _LEGIT_SPAN + "_POSTAMBLE_END",
+                unit_text="PREAMBLE_" + _LEGIT_SPAN + "_POSTAMBLE_END",
             )
         ],
     )
@@ -493,4 +497,5 @@ def test_legitimate_read_file_evidence_still_drives_done() -> None:
     assert len(out["citations"]) == 1
     cit = out["citations"][0]
     assert cit.document_id == "AAPL-2022Q3"
+    assert cit.unit == 1
     assert cit.quote == _LEGIT_SPAN

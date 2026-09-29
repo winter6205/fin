@@ -47,8 +47,8 @@ from fin.retrieve.hit_mapping import (
 from fin.retrieve.mcp_adapter import MCPRetrieveAdapter
 
 
-def _loc(document_id: str = "DOC-2023Q1", page: int = 1) -> Locator:
-    return Locator(document_id=document_id, version="v-" + "a" * 60, page=page)
+def _loc(document_id: str = "DOC-2023Q1", unit: int = 1) -> Locator:
+    return Locator(document_id=document_id, version="v-" + "a" * 60, unit=unit)
 
 
 class _ScriptedAdapter(MCPRetrieveAdapter):
@@ -127,14 +127,14 @@ def test_canonical_source_ref_maps_without_a_retrieval_id_map() -> None:
     )
 
     assert len(chunks) == 1
-    assert chunks[0].source_ref == _loc(page=3)
+    assert chunks[0].source_ref == _loc(unit=3)
     assert ledger.count() == 0
 
 
 def test_retrieval_id_maps_without_entering_chunk_or_evidence() -> None:
     """A retrieval-side id has its own field and is replaced by a
     fin locator before the chunk reaches citation-evidence admission."""
-    locator = _loc(page=3)
+    locator = _loc(unit=3)
     ledger = MappingFailureLedger()
 
     chunks = map_hits_to_chunks(
@@ -243,7 +243,7 @@ def test_limit_is_applied_to_the_mapped_subset() -> None:
     ]
     chunks = map_hits_to_chunks(
         hits,
-        locator_map={f"id-{i}": _loc(page=i + 1) for i in range(30)},
+        locator_map={f"id-{i}": _loc(unit=i + 1) for i in range(30)},
         limit=5,
         ledger=ledger,
     )

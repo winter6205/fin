@@ -48,7 +48,8 @@ const COMPARISON: Comparison = {
           locator: {
             document_id: "AAPL-2022Q3",
             version: "a".repeat(64),
-            page: 4,
+            unit: 4,
+            display: "page",
           },
         },
         {
@@ -62,7 +63,8 @@ const COMPARISON: Comparison = {
           locator: {
             document_id: "AAPL-2023Q3",
             version: "b".repeat(64),
-            page: 4,
+            unit: 4,
+            display: "page",
           },
         },
       ],
@@ -82,8 +84,18 @@ const COMPARISON: Comparison = {
   hit_count: 2,
   cell_count: 2,
   locators: [
-    { document_id: "AAPL-2022Q3", version: "a".repeat(64), page: 4 },
-    { document_id: "AAPL-2023Q3", version: "b".repeat(64), page: 4 },
+    {
+      document_id: "AAPL-2022Q3",
+      version: "a".repeat(64),
+      unit: 4,
+      display: "page",
+    },
+    {
+      document_id: "AAPL-2023Q3",
+      version: "b".repeat(64),
+      unit: 4,
+      display: "page",
+    },
   ],
   tool_call_id: "c-compare",
 };
