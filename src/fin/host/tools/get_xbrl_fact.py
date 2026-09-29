@@ -4,7 +4,7 @@ Pure function over the ingest-built fact table (``fin.corpus.facts``).
 Returns the contract dict the research track consumes:
 
 * hit  -> ``{"concept", "value", "period", "unit", "scale",
-  "source_locator": {"document_id", "version", "page"}}``
+  "source_locator": {"document_id", "version", "unit"}}``
   (no ``error`` key).
 * miss -> ``{"error": "fact_not_found", "concept", "period",
   "document_id"}`` (no exception, no raise — the agent loop must
@@ -15,8 +15,8 @@ acceptance ("miss returns error dict without throwing out of the
 loop"), the miss path is a structured dict, never an exception.
 
 The wrapper does NOT contribute ``EvidenceItem`` rows to
-``AgentState`` — that is reserved for ``read_file`` /
-``retrieve``. The numeric gate (T5) consumes the ``ToolMessage``
+``AgentState`` — that is reserved for ``read_source`` /
+``retrieve``. The numeric gate consumes the ``ToolMessage``
 JSON content directly when verifying the model's claimed values.
 """
 
@@ -41,7 +41,7 @@ def get_xbrl_fact(
     Returns one of:
 
     * hit dict ``{"concept", "value", "period", "unit", "scale",
-      "source_locator": {"document_id", "version", "page"}}``;
+      "source_locator": {"document_id", "version", "unit"}}``;
     * miss dict ``{"error": "fact_not_found", "concept", "period",
       "document_id"}``.
 
@@ -65,7 +65,7 @@ def get_xbrl_fact(
             "source_locator": {
                 "document_id": result.source_locator.document_id,
                 "version": result.source_locator.version,
-                "page": result.source_locator.page,
+                "unit": result.source_locator.unit,
             },
         }
     # ``result`` is ``FactLookupError``; the typed-miss shape.

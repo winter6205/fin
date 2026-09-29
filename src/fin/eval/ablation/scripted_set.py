@@ -109,7 +109,7 @@ def scripted_eval_set() -> tuple[
         gold_locator = Locator(
             document_id=entry["document_id"],
             version=entry["version"],
-            page=entry["unit"],
+            unit=entry["unit"],
         )
         distractors = [
             _SCRIPT[(index + offset) % len(_SCRIPT)] for offset in (1, 2)
@@ -123,7 +123,7 @@ def scripted_eval_set() -> tuple[
                         version=distractor["version"],
                         # A neighbouring unit of the same document: a
                         # plausible near-miss, not the gold unit.
-                        page=distractor["unit"] + 100,
+                        unit=distractor["unit"] + 100,
                     ),
                     score=0.4 - 0.1 * offset_index,
                 ),

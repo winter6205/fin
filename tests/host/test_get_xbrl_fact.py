@@ -33,7 +33,7 @@ def _seeded_locator() -> Locator:
     return Locator(
         document_id="AAPL-2023Q3",
         version="7b9b54830f070aab56cd842b391dd81d21613aacda2cb92234f43b997930b0ea",
-        page=4,
+        unit=4,
     )
 
 
@@ -79,7 +79,13 @@ def test_get_xbrl_fact_tool_returns_hit_dict(tmp_path: Path) -> None:
     assert result["value"] == 383285000000
     locator = result["source_locator"]
     assert locator["document_id"] == "AAPL-2023Q3"
-    assert locator["page"] == 4
+    assert locator["unit"] == 4
+    assert locator["version"] == (
+        "7b9b54830f070aab56cd842b391dd81d21613aacda2cb92234f43b997930b0ea"
+    )
+    # The numeric gate decodes the ordinal from exactly this key name; a
+    # row carrying any other shape is dropped rather than trusted.
+    assert set(locator) == {"document_id", "version", "unit"}
 
 
 # ===== boundary 2: negative (unknown concept) =====
@@ -177,4 +183,4 @@ def test_get_xbrl_fact_tool_hit_is_json_serializable(tmp_path: Path) -> None:
     encoded = json.dumps(result, default=str)
     decoded = json.loads(encoded)
     assert decoded["concept"] == "us-gaap:Revenues"
-    assert decoded["source_locator"]["page"] == 4
+    assert decoded["source_locator"]["unit"] == 4

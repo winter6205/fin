@@ -76,7 +76,7 @@ def test_cross_period_issuer_row_resolves_both_periods(compare_seed) -> None:
     assert row["cells"][0]["locator"] == {
         "document_id": compare_seed.aapl_2022_doc,
         "version": compare_seed.aapl_2022_version,
-        "page": 4,
+        "unit": 4,
     }
     assert comparison["hit_count"] == 2
     assert comparison["cell_count"] == 2
@@ -194,17 +194,17 @@ def test_locators_are_deduped_in_first_seen_order(compare_seed) -> None:
         {
             "document_id": compare_seed.aapl_2022_doc,
             "version": compare_seed.aapl_2022_version,
-            "page": 4,
+            "unit": 4,
         },
         {
             "document_id": compare_seed.aapl_2023_doc,
             "version": compare_seed.aapl_2023_version,
-            "page": 4,
+            "unit": 4,
         },
         {
             "document_id": compare_seed.msft_2023_doc,
             "version": compare_seed.msft_2023_version,
-            "page": 5,
+            "unit": 5,
         },
     ]
 
@@ -276,7 +276,7 @@ def test_zero_baseline_delta_has_null_percent(tmp_path: Path) -> None:
                     unit="USD",
                     scale="millions",
                     source_locator=Locator(
-                        document_id=doc, version="d" * 64, page=1
+                        document_id=doc, version="d" * 64, unit=1
                     ),
                 )
             ],
@@ -308,7 +308,7 @@ def test_string_valued_fact_is_not_comparable(tmp_path: Path) -> None:
                 unit="USD",
                 scale="",
                 source_locator=Locator(
-                    document_id="AAPL-2023Q3", version="e" * 64, page=2
+                    document_id="AAPL-2023Q3", version="e" * 64, unit=2
                 ),
             )
         ],

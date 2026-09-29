@@ -3,7 +3,7 @@
 This module is the seam between the **retrieve port**
 (``fin.retrieve.port``) and the host graph's surface. T6 binds
 ``retrieve`` as a third tool alongside ``list_files`` and
-``read_file``; this function is the plain-Python callable the
+``read_source``; this function is the plain-Python callable the
 LangChain ``@tool`` decorator wraps.
 
 The wrapper does NOT re-implement scoring: it delegates to the

@@ -27,10 +27,11 @@ Two rules answer two different questions about what OCR runs:
   It stays page-level because the measured layout recall is far too low to
   carry a scan decision (one figure box across 72 pages of a real filing),
   so a region-shaped rule would silently drop whole scanned pages.
-* the *figure* rule (:func:`_crop_is_legible`) asks whether one region is
+* the *figure* rule (:func:`crop_is_legible`) asks whether one region is
   a figure whose box is big enough to hold text drawn as pixels, which is
   how text inside a chart on a page that also has a text layer is reached
-  at all.
+  at all. It is the same rule the host's crop inspection lane reuses, so a
+  box judged unreliable here is never cropped there.
 
 The questions are independent; the runs are not: once the page rule has
 had the whole raster read, the figure crops are skipped so the same
@@ -856,6 +857,45 @@ def _crop_is_legible(region: Region, *, dpi: int, min_edge_px: int) -> bool:
     return min(width_px, height_px) >= min_edge_px
 
 
+# ----- the crop rules, shared with the host's crop inspection lane -------
+#
+# The figure rule and the cut are the ONE authority for what a region crop
+# is: preparation reads figure regions with them, and a later question's
+# crop inspection crops with them. A second copy in the host would let the
+# two lanes disagree about which box is legible and about where its pixels
+# start, and a claim about a crop would then name bounds the provider was
+# never shown.
+
+
+def crop_is_legible(
+    region: Region,
+    *,
+    dpi: int = PAGE_RENDER_DPI,
+    min_edge_px: int = MIN_OCR_REGION_EDGE_PX,
+) -> bool:
+    """Whether a region's box is reliable enough to crop and inspect.
+
+    The public spelling of the figure rule, for a caller that holds a box
+    from a store rather than from a live layout port. The defaults are the
+    core's own, so "reliable" means the same number preparation used to
+    measure it — the 160 px shorter-edge floor at 200 dpi.
+    """
+    return _crop_is_legible(region, dpi=dpi, min_edge_px=min_edge_px)
+
+
+def crop_png(
+    region: Region, *, raster: PageRaster, dpi: int = PAGE_RENDER_DPI
+) -> bytes:
+    """Cut one region's box out of a page raster, as PNG bytes.
+
+    The public spelling of the cut, so a crop inspection sends the very
+    pixels the legibility rule was measured against. Raises
+    :class:`~fin.corpus.errors.PageRenderError` for a box the raster cannot
+    show, which is the same named failure the OCR figure read reports.
+    """
+    return _crop_png(region, raster=raster, dpi=dpi)
+
+
 def _crop_png(region: Region, *, raster: PageRaster, dpi: int) -> bytes:
     """Cut one region's box out of the page raster at the raster's scale."""
     from PIL import Image
@@ -975,5 +1015,7 @@ __all__ = [
     "Pypdfium2PageRenderer",
     "RasterOcrPort",
     "Region",
+    "crop_is_legible",
+    "crop_png",
     "has_pdf_signature",
 ]

@@ -39,7 +39,7 @@ def _chunk() -> Chunk:
     return Chunk(
         text="revenue rose",
         source_ref=Locator(
-            document_id="DOC-2023Q1", version="v-" + "a" * 60, page=1
+            document_id="DOC-2023Q1", version="v-" + "a" * 60, unit=1
         ),
         score=1.0,
     )

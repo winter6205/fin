@@ -134,12 +134,13 @@ def _tool_pair(ai_text: str, tool_body: str, call_id: str) -> list[BaseMessage]:
             content=ai_text,
             tool_calls=[
                 {
-                    "name": "read_file",
+                    "name": "read_source",
                     "args": {
-                        "document_id": AAPL_2022Q3,
-                        "version": AAPL_2022Q3_VERSION,
-                        "page": 1,
-                        "page_limit": 1,
+                        "source_ref": {
+                            "document_id": AAPL_2022Q3,
+                            "version": AAPL_2022Q3_VERSION,
+                            "unit": 1,
+                        }
                     },
                     "id": call_id,
                     "type": "tool_call",
@@ -156,11 +157,11 @@ def _seed_messages() -> list[BaseMessage]:
     messages: list[BaseMessage] = []
     for index in range(3):
         messages += _tool_pair(
-            f"calling read_file {index}", _TOOL_PAYLOAD, f"c-seed-{index}"
+            f"calling read_source {index}", _TOOL_PAYLOAD, f"c-seed-{index}"
         )
     messages += _tool_pair(
-        "calling read_file 3",
-        '{"document_id": "AAPL-2022Q3", "page": 1}',
+        "calling read_source 3",
+        '{"source_ref": {"document_id": "AAPL-2022Q3", "unit": 1}}',
         "c-seed-3",
     )
     messages.append(AIMessage(content="x" * 300))

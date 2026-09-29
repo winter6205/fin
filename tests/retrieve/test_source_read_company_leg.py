@@ -14,8 +14,9 @@ Boundary classes covered: happy pass-through (incl. the empty
 terminal slice), every backend refusal code mapped, malformed /
 oversized / non-advancing wire → ``source_backend_contract_error``,
 transport raise → ``source_unavailable``, locator and cursor shapes
-named BEFORE any round trip, and the legacy whole-body walk following
-the cursor to a concatenation.
+named BEFORE any round trip, and the one-call-per-slice bound: a
+``read_slice`` issues exactly one round trip and the cursor it returns
+is the only way a walk advances.
 """
 
 from __future__ import annotations
@@ -25,7 +26,6 @@ import json
 
 import pytest
 
-from fin.corpus.extracted import Locator
 from fin.corpus.parsers._common import UnitLocator
 from fin.corpus.push import serialize_source_ref
 from fin.retrieve import MCPRetrieveAdapter
@@ -506,58 +506,48 @@ def test_jsonrpc_level_error_is_an_outage() -> None:
     assert adapter.read_slice(SOURCE_REF) == {"error": SOURCE_UNAVAILABLE}
 
 
-# ----- legacy whole-body walk (read / _fetch_unit_body) -----
+# ----- the one-call-per-slice bound -----
 
 
-def _read_adapter(responses: list[object]) -> _SliceAdapter:
-    return _SliceAdapter(
-        responses,
-        command=["iknow-memory"],
-        locator_map={"hit-1": Locator(DOCUMENT_ID, VERSION, 1)},
-        known_document_ids={DOCUMENT_ID},
-    )
+def test_one_read_slice_is_exactly_one_round_trip() -> None:
+    """A read resolves the one locator it was handed and stops: it never
+    fans out to neighbouring units or fetches a window, so the bound on a
+    call is one backend round trip."""
+    adapter = _adapter([_slice_response("PART", 4)])
+    result = adapter.read_slice(SOURCE_REF, position=0)
+    assert result["text"] == "PART"
+    assert [p["params"]["arguments"] for p in adapter.payloads] == [
+        {"source_ref": CANONICAL, "position": 0}
+    ]
 
 
-def test_read_follows_the_cursor_and_concatenates_the_slices() -> None:
-    adapter = _read_adapter(
+def test_a_cursor_driven_continuation_walk_reassembles_the_unit() -> None:
+    """The backend's ``next_position`` is the only way a walk advances:
+    each step rides the cursor it was given, and following it to null
+    reproduces the unit text the slices were cut from."""
+    adapter = _adapter(
         [_slice_response("FIRST-HALF", 10), _slice_response("-tail", None)]
     )
-    result = adapter.read(DOCUMENT_ID, VERSION, page=1, page_limit=1)
-    assert result["text"] == "FIRST-HALF-tail"
+    collected = ""
+    position: int | None = 0
+    while position is not None:
+        result = adapter.read_slice(SOURCE_REF, position)
+        assert is_slice_result(result), result
+        collected += result["text"]
+        position = result["next_position"]
+    assert collected == "FIRST-HALF-tail"
     assert [p["params"]["arguments"] for p in adapter.payloads] == [
-        {"source_ref": CANONICAL},
+        {"source_ref": CANONICAL, "position": 0},
         {"source_ref": CANONICAL, "position": 10},
     ]
 
 
-def test_read_of_a_server_without_cursors_needs_one_call() -> None:
-    """A pre-bounded server answers the whole unit with no cursor: the
-    walk completes on the first response."""
-    inner = {"id": CANONICAL, "source_ref": CANONICAL, "content": "WHOLE BODY"}
-    adapter = _read_adapter([_breach(inner)])
-    result = adapter.read(DOCUMENT_ID, VERSION)
-    assert result["text"] == "WHOLE BODY"
-    assert len(adapter.payloads) == 1
-
-
-def test_read_of_a_non_advancing_cursor_folds_to_the_named_miss() -> None:
-    adapter = _read_adapter([_slice_response("STUCK", 0)])
-    assert adapter.read(DOCUMENT_ID, VERSION) == {"error": "unknown_locator"}
-
-
-def test_read_walk_stops_at_the_defensive_bound(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A backend that keeps advancing but never terminates must not
-    spin the read: past the bound the walk reports the miss rather than
-    a partial body."""
-    monkeypatch.setattr("fin.retrieve.mcp_adapter._MAX_SLICES_PER_UNIT", 3)
-    responses = [_slice_response("AAAA", start + 4) for start in range(0, 4 * 4, 4)]
-    adapter = _read_adapter(responses)
-    assert adapter.read(DOCUMENT_ID, VERSION) == {"error": "unknown_locator"}
-    assert len(adapter.payloads) == 3
-
-
-def test_read_named_miss_still_folds_to_unknown_locator() -> None:
-    adapter = _read_adapter([_refusal("read_source_not_found")])
-    assert adapter.read(DOCUMENT_ID, VERSION) == {"error": "unknown_locator"}
+def test_a_refusal_part_way_through_a_walk_yields_no_partial_body() -> None:
+    """A named backend miss stays a named miss: the slice already read on
+    an earlier call is never stitched onto it, so the model cannot act on
+    half a unit."""
+    adapter = _adapter([_slice_response("GOOD", 4), _refusal("read_source_not_found")])
+    assert adapter.read_slice(SOURCE_REF, position=0)["text"] == "GOOD"
+    tail = adapter.read_slice(SOURCE_REF, position=4)
+    assert tail == {"error": UNKNOWN_LOCATOR}
+    assert "text" not in tail

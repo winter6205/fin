@@ -192,9 +192,9 @@ def _gate_passes(span: str, unit) -> None:
                 locator=Locator(
                     document_id=unit.locator.document_id,
                     version=unit.locator.version,
-                    page=unit.locator.unit,
+                    unit=unit.locator.unit,
                 ),
-                page_text=unit.text,
+                unit_text=unit.text,
             )
         ],
         repair_count=0,

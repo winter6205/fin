@@ -36,12 +36,14 @@ from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+from fin.corpus.extracted import ExtractedPage, load_extracted_tree
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.collection_bind import (
     BOUND_COLLECTION_NAME,
     BOUND_COLLECTION_UNBOUND,
 )
 from fin.host.state import reset_input_state
+from fin.retrieve import FakeRetrievePort
 
 
 # ----- shared fixtures -----
@@ -55,15 +57,38 @@ KNOWN_IDS = {
     AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1",
 }
 
+MANIFEST_PATH = Path("data/corpus/manifest.json")
+EXTRACTED_ROOT = Path("data/corpus/extracted")
+
+_READ_MANIFEST: dict[str, tuple[ExtractedPage, ...]] | None = None
+
+
+def _read_manifest() -> dict[str, tuple[ExtractedPage, ...]]:
+    """The committed extracted tree as a ``{document_id: pages}`` read
+    manifest.
+
+    The graph never reads the tree (ADR 0046 / 0047), so a scripted
+    ``read_source`` transcript hands its bodies in through the bound
+    adapter's ``pages_by_doc`` — the wiring
+    ``tests/host/test_serve_path_no_tree_ssot.py`` pins. Loaded once per
+    session: ``ExtractedPage`` is frozen and ``FakeRetrievePort`` copies
+    what it is handed, so no graph build disturbs another case's bodies.
+    """
+    global _READ_MANIFEST
+    if _READ_MANIFEST is None:
+        _READ_MANIFEST = load_extracted_tree(MANIFEST_PATH, EXTRACTED_ROOT)
+    return _READ_MANIFEST
+
+
+def _tree_read_adapter() -> FakeRetrievePort:
+    """A fake retrieve port whose company read leg serves the committed
+    corpus, so scripted ``read_source`` calls land on real filing text."""
+    return FakeRetrievePort(pages_by_doc=_read_manifest())
+
 
 @pytest.fixture(scope="session")
 def aapl_page1_text() -> str:
-    from fin.corpus.extracted import load_extracted_tree
-
-    manifest = Path("data/corpus/manifest.json")
-    extracted = Path("data/corpus/extracted")
-    tree = load_extracted_tree(manifest, extracted)
-    return tree[AAPL_2022Q3][0].text
+    return _read_manifest()[AAPL_2022Q3][0].text
 
 
 @pytest.fixture
@@ -99,7 +124,7 @@ def fresh_store(http_app: FastAPI):
         checkpointer=InMemorySaver(),
         model=ScriptedChatModel(script=[AIMessage(content="never reached")]),
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: default_graph
     return store
@@ -123,32 +148,52 @@ def _install_graph(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=known_document_ids or KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
     return g
 
 
-def _read_then_answer_script(answer: str) -> list[AIMessage]:
-    return [
-        AIMessage(
-            content="",
-            tool_calls=[
-                {
-                    "name": "read_file",
-                    "args": {
+def _read_source_call(call_id: str = "c-read") -> AIMessage:
+    """One scripted ``read_source`` call for the first unit of the
+    committed AAPL-2022Q3 page artifact."""
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "read_source",
+                "args": {
+                    "source_ref": {
                         "document_id": AAPL_2022Q3,
                         "version": AAPL_2022Q3_VERSION,
-                        "page": 1,
-                        "page_limit": 1,
+                        "unit": 1,
                     },
-                    "id": "c-read",
-                    "type": "tool_call",
-                }
-            ],
-        ),
-        AIMessage(content=answer),
-    ]
+                    "position": 0,
+                },
+                "id": call_id,
+                "type": "tool_call",
+            }
+        ],
+    )
+
+
+def _read_then_answer_script(answer: str) -> list[AIMessage]:
+    return [_read_source_call(), AIMessage(content=answer)]
+
+
+def _read_source_args_json() -> str:
+    """The AAPL-2022Q3 unit-1 ``read_source`` arguments as one streamed
+    JSON payload."""
+    return json.dumps(
+        {
+            "source_ref": {
+                "document_id": AAPL_2022Q3,
+                "version": AAPL_2022Q3_VERSION,
+                "unit": 1,
+            },
+            "position": 0,
+        }
+    )
 
 
 def _parse_sse_events(body: str) -> list[tuple[str, Any]]:
@@ -281,7 +326,7 @@ def test_delete_thread_calls_saver_delete_thread(
             script=_read_then_answer_script(f"Per the filing: {aapl_page1_text[:80]}")
         ),
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     from fin.host.http import get_graph
 
@@ -349,11 +394,175 @@ def test_send_message_done_emits_status_then_citations_then_answer_events(
     assert isinstance(citations, list)
     assert len(citations) >= 1
     cit = citations[0]
-    assert set(cit.keys()) == {"document_id", "version", "page", "quote"}
+    # The citation identity is the frozen-unit triple plus the kind and
+    # the attachment identity slots: the generic ``page`` locator key was
+    # removed with the legacy whole-page read seam, so the key set below
+    # is closed and carries no ``page``.
+    assert set(cit.keys()) == {
+        "kind",
+        "document_id",
+        "attachment_id",
+        "version",
+        "unit",
+        "display",
+        "filename",
+        "quote",
+    }
+    assert "page" not in cit
+    assert cit["kind"] == "company"
     assert cit["document_id"] == AAPL_2022Q3
+    assert cit["attachment_id"] == ""
+    assert cit["version"] == AAPL_2022Q3_VERSION
+    assert cit["unit"] == 1
+    # A company unit of the PDF corpus presents as a physical page.
+    assert cit["display"] == "page"
+    assert cit["quote"] == aapl_page1_text[:80]
 
     answer_event = events[answer_index][1]
     assert answer_event["text"] == answer
+
+
+# ----- a persisted citation row carries its own identity -----
+
+
+def _company_wire_row(**overrides: Any) -> dict[str, Any]:
+    """A complete persisted company citation, one slot overridable.
+
+    The shape is what ``fin.host.run_payload`` writes, so a case below
+    isolates exactly one missing or malformed field.
+    """
+    row = {
+        "kind": "company",
+        "document_id": AAPL_2022Q3,
+        "attachment_id": "",
+        "version": AAPL_2022Q3_VERSION,
+        "unit": 4,
+        "display": "page",
+        "filename": "",
+        "quote": "Total net sales increased during the third quarter",
+    }
+    row.update(overrides)
+    return row
+
+
+def _attachment_wire_row(**overrides: Any) -> dict[str, Any]:
+    """A complete persisted attachment citation, one slot overridable."""
+    row = {
+        "kind": "attachment",
+        "document_id": "",
+        "attachment_id": "att-7",
+        "version": "3",
+        "unit": 2,
+        "display": "unit",
+        "filename": "contract.txt",
+        "quote": "the attached unit states a payment term of thirty days",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_citations_wire_payload_drops_an_attachment_row_without_display() -> None:
+    """A stored attachment row that lost ``display`` is dropped: it
+    must never be published as a page-labelled attachment citation."""
+    from fin.host.workspace_http import _citations_wire_payload
+
+    row = _attachment_wire_row()
+    del row["display"]
+
+    assert _citations_wire_payload([row]) == []
+
+
+def test_citations_wire_payload_drops_a_row_without_kind() -> None:
+    """A stored row with no ``kind`` is dropped, never silently
+    labelled ``company``."""
+    from fin.host.workspace_http import _citations_wire_payload
+
+    attachment = _attachment_wire_row()
+    del attachment["kind"]
+    company = _company_wire_row()
+    del company["kind"]
+
+    assert _citations_wire_payload([attachment, company]) == []
+
+
+def test_citations_wire_payload_drops_a_malformed_identity() -> None:
+    """An out-of-closed-set ``kind`` or ``display`` is a row that lost
+    its identity, so it is dropped rather than guessed."""
+    from fin.host.workspace_http import _citations_wire_payload
+
+    for row in (
+        _company_wire_row(kind="visual_observation"),
+        _company_wire_row(kind=""),
+        _company_wire_row(kind=["company"]),
+        _company_wire_row(display=""),
+        _company_wire_row(display="paragraph"),
+        _company_wire_row(display=None),
+        _attachment_wire_row(attachment_id=""),
+    ):
+        assert _citations_wire_payload([row]) == []
+
+
+def test_citations_wire_payload_keeps_well_formed_rows() -> None:
+    """The closed eight-key wire shape is unchanged for rows that do
+    carry their identity, with ``display`` read off each row."""
+    from fin.host.workspace_http import _citations_wire_payload
+
+    company, attachment = _company_wire_row(), _attachment_wire_row()
+
+    out = _citations_wire_payload([company, attachment])
+
+    assert len(out) == 2
+    for cit in out:
+        assert set(cit.keys()) == {
+            "kind",
+            "document_id",
+            "attachment_id",
+            "version",
+            "unit",
+            "display",
+            "filename",
+            "quote",
+        }
+    assert out[0] == company
+    assert out[1] == attachment
+    assert out[1]["kind"] == "attachment"
+    assert out[1]["display"] == "unit"
+
+
+def test_citations_wire_payload_dict_and_dataclass_answer_identically() -> None:
+    """One shape, one rule: the same identity read off a stored dict or
+    off a ``Citation`` dataclass gives one wire dict, and a malformed
+    ``display`` drops either of them."""
+    from dataclasses import replace
+
+    from fin.host.citation_gate import Citation
+    from fin.host.workspace_http import _citations_wire_payload
+
+    row = _attachment_wire_row()
+
+    assert _citations_wire_payload([Citation(**row)]) == [row]
+    assert _citations_wire_payload([_attachment_wire_row(display="paragraph")]) == []
+    assert _citations_wire_payload(
+        [replace(Citation(**row), display="paragraph")]
+    ) == []
+
+
+def test_citations_wire_payload_logs_a_drop_without_the_quote(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The drop is visible in the log (silent loss is not) while the
+    quoted answer text stays out of it."""
+    import logging
+
+    from fin.host.workspace_http import _citations_wire_payload
+
+    row = _company_wire_row(display="paragraph")
+    with caplog.at_level(logging.WARNING, logger="fin.host.workspace_http"):
+        assert _citations_wire_payload([row]) == []
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "a dropped citation row must leave a WARNING"
+    assert row["quote"] not in " ".join(r.getMessage() for r in warnings)
 
 
 def test_send_message_refuse_unknown_locator_emits_status_refuse_and_empty_citations(
@@ -484,7 +693,7 @@ def test_send_message_concurrent_returns_409_no_event_stream_body(
         checkpointer=InMemorySaver(),
         model=blocking,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     from fin.host.http import get_graph
 
@@ -600,7 +809,7 @@ def test_send_message_streaming_emits_thinking_and_tool_call_frames(
                     "reasoning_details": [{"text": "let me read the filing"}]
                 },
                 tool_call_chunks=[
-                    {"name": "read_file", "args": "", "id": "c-read", "index": 0}
+                    {"name": "read_source", "args": "", "id": "c-read", "index": 0}
                 ],
             ),
             AIMessageChunk(
@@ -608,8 +817,7 @@ def test_send_message_streaming_emits_thinking_and_tool_call_frames(
                 tool_call_chunks=[
                     {
                         "name": None,
-                        "args": '{"document_id": "AAPL-2022Q3", "version": "%s", "page": 1, "page_limit": 1}'
-                        % AAPL_2022Q3_VERSION,
+                        "args": _read_source_args_json(),
                         "id": None,
                         "index": 0,
                     }
@@ -624,7 +832,7 @@ def test_send_message_streaming_emits_thinking_and_tool_call_frames(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -638,13 +846,28 @@ def test_send_message_streaming_emits_thinking_and_tool_call_frames(
     assert "let me read the filing" in thinking_event["text"]
 
     tool_call_event = next(d for n, d in events if n == "tool_call")
-    assert tool_call_event["name"] == "read_file"
+    assert tool_call_event["name"] == "read_source"
     assert tool_call_event["tool_call_id"] == "c-read"
-    assert tool_call_event["args"]["document_id"] == "AAPL-2022Q3"
+    assert set(tool_call_event["args"]) == {"source_ref", "position"}
+    assert set(tool_call_event["args"]["source_ref"]) == {
+        "document_id",
+        "version",
+        "unit",
+    }
+    assert tool_call_event["args"]["source_ref"]["document_id"] == AAPL_2022Q3
+    assert tool_call_event["args"]["source_ref"]["version"] == AAPL_2022Q3_VERSION
+    assert tool_call_event["args"]["source_ref"]["unit"] == 1
+    # The legacy whole-page read seam is gone with no compatibility path,
+    # so neither its tool name nor its ``page_limit`` argument may resurface
+    # on this wire.
+    assert "read_file" not in {
+        d["name"] for n, d in events if n in ("tool_call", "tool_result")
+    }
+    assert "page_limit" not in json.dumps(tool_call_event["args"])
 
     tool_result_event = next(d for n, d in events if n == "tool_result")
     assert tool_result_event["tool_call_id"] == "c-read"
-    assert tool_result_event["name"] == "read_file"
+    assert tool_result_event["name"] == "read_source"
     # T3 fix (code-review #3): the wire shape is the human-readable
     # summary, NOT the raw ToolMessage JSON. Spec line 32.
     assert "summary" in tool_result_event
@@ -682,7 +905,7 @@ def test_send_message_tool_result_summary_matches_get_history(
                     source_ref=Locator(
                         document_id="AAPL-2022Q3",
                         version="v-" + "a" * 60,
-                        page=1,
+                        unit=1,
                     ),
                     score=1.0,
                 )
@@ -739,22 +962,7 @@ def test_get_history_keeps_row_for_empty_tool_call_id(
 
     model = ScriptedChatModel(
         script=[
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "read_file",
-                        "args": {
-                            "document_id": AAPL_2022Q3,
-                            "version": AAPL_2022Q3_VERSION,
-                            "page": 1,
-                            "page_limit": 1,
-                        },
-                        "id": "",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
+            _read_source_call(""),
             AIMessage(content="Noted."),
         ]
     )
@@ -762,7 +970,7 @@ def test_get_history_keeps_row_for_empty_tool_call_id(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -779,7 +987,7 @@ def test_get_history_keeps_row_for_empty_tool_call_id(
     summaries = detail["turns"][0]["tool_summaries"]
     assert len(summaries) == 1
     assert summaries[0]["tool_call_id"] == ""
-    assert summaries[0]["name"] == "read_file"
+    assert summaries[0]["name"] == "read_source"
 
 
 def test_send_message_turn_row_exposes_tool_summaries_as_dicts(
@@ -803,10 +1011,10 @@ def test_send_message_turn_row_exposes_tool_summaries_as_dicts(
     assert len(summaries) == 1
     entry = summaries[0]
     assert set(entry.keys()) == {"name", "summary", "tool_call_id"}
-    assert entry["name"] == "read_file"
+    assert entry["name"] == "read_source"
     assert entry["tool_call_id"] == "c-read"
     assert "AAPL-2022Q3" in entry["summary"]
-    assert "p.1" in entry["summary"]
+    assert "u.1" in entry["summary"]
 
 
 def test_send_message_thinking_frame_emitted_with_stripped_prose(
@@ -828,22 +1036,7 @@ def test_send_message_thinking_frame_emitted_with_stripped_prose(
     raw_answer = f"<thinking>private scratchpad</thinking>{span}"
     model = ScriptedChatModel(
         script=[
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "read_file",
-                        "args": {
-                            "document_id": AAPL_2022Q3,
-                            "version": AAPL_2022Q3_VERSION,
-                            "page": 1,
-                            "page_limit": 1,
-                        },
-                        "id": "c-read",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
+            _read_source_call(),
             AIMessage(content=raw_answer),
         ]
     )
@@ -851,7 +1044,7 @@ def test_send_message_thinking_frame_emitted_with_stripped_prose(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -906,7 +1099,7 @@ def test_delete_thread_saver_failure_returns_500_not_silent_200(
         checkpointer=ExplodingSaver(),
         model=ScriptedChatModel(script=[AIMessage(content="x")]),
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     from fin.host.http import get_graph
 
@@ -1198,16 +1391,6 @@ SPA_SHELL = (
     '<body><div id="root"></div></body></html>\n'
 )
 
-# Legacy tree-backed read adapter over the committed corpus. Only the
-# scripted ``read_file`` transcripts need it; the default graph no
-# longer reads the tree on its own (ADR 0046 / 0047).
-from fin.retrieve import ExtractedTreeReadPort
-
-_TREE_READ_PORT = ExtractedTreeReadPort(
-    Path("data/corpus/manifest.json"),
-    Path("data/corpus/extracted"),
-)
-
 
 def _build_fake_checkout(root: Path) -> Path:
     """Lay out a throwaway checkout that mirrors the repo shape the
@@ -1378,7 +1561,7 @@ def _install_graph_with_model(
         "checkpointer": InMemorySaver(),
         "model": model,
         "known_document_ids": known_ids or KNOWN_IDS,
-        "read_port": _TREE_READ_PORT,
+        "adapter": _tree_read_adapter(),
     }
     if step_cap is not None:
         kwargs["step_cap"] = step_cap
@@ -1413,13 +1596,13 @@ def test_follow_up_resets_step_count_to_zero(
     ``step_cap`` (bound to 5) on its second model-node entry. A
     clean reset lets run 2 reach ``done`` on the same script.
 
-    The script uses one ``read_file`` tool call followed by the
+    The script uses one ``read_source`` tool call followed by the
     answer-with-span; two model-node entries per run. With
     ``step_cap=5`` (allowed entries: 1..4) and run 1 leaving
     ``step_count=2``, a leaked run 2 would compute
     ``next_step=3``, ``next_step=4`` (both OK), and the run
     would also ``done`` ... so the test uses a three-entry
-    run-2 script (``list_files`` + ``read_file`` + answer) so
+    run-2 script (``list_files`` + ``read_source`` + answer) so
     the leaked budget runs out at entry 3.
     """
     # step_cap=5 -> model_node fires when next_step >= 5, so a
@@ -1431,7 +1614,7 @@ def test_follow_up_resets_step_count_to_zero(
     created = client.post("/api/threads", json={"first_message": "q1"}).json()
     tid = created["id"]
 
-    # Run 1: read_file + answer-with-span -> done (2 entries).
+    # Run 1: read_source + answer-with-span -> done (2 entries).
     answer1 = f"Per the filing: {aapl_page1_text[:80]}"
     model._index = 0
     model.script = _read_then_answer_script(answer1)
@@ -1441,7 +1624,7 @@ def test_follow_up_resets_step_count_to_zero(
     status_events_1 = [d for n, d in events1 if n == "status"]
     assert status_events_1 and status_events_1[0]["status"] == "done"
 
-    # Run 2: 3 entries (list_files, read_file, answer-with-span).
+    # Run 2: 3 entries (list_files, read_source, answer-with-span).
     # With reset: done. Without reset: step_cap on the 3rd entry.
     answer2 = f"Follow-up: {aapl_page1_text[:80]}"
     model._index = 0
@@ -1452,12 +1635,12 @@ def test_follow_up_resets_step_count_to_zero(
                 {"name": "list_files", "args": {}, "id": "c-loop-2", "type": "tool_call"}
             ],
         ),
-        *_read_then_answer_script(answer2)[0:1],  # read_file
-        *_read_then_answer_script(answer2)[1:2],  # answer
+        _read_source_call(),
+        AIMessage(content=answer2),
     ]
     events2 = _post_message(client, tid, "q2")
     # Run 1 had 2 entries (model call_count = 2). Run 2 needs 3
-    # entries (list_files, read_file, answer) and would trip
+    # entries (list_files, read_source, answer) and would trip
     # ``step_cap`` on the 3rd entry WITHOUT the reset (the fuse
     # fires before the model is invoked). The reset path lets
     # the 3rd call happen: call_count == 5.
@@ -1503,23 +1686,8 @@ def test_follow_up_resets_repair_count_to_zero(
     answer2 = f"Second: {aapl_page1_text[:80]}"
     model._index = 0
     model.script = [
-        # entry 1: read_file (the tool call produces evidence)
-        AIMessage(
-            content="",
-            tool_calls=[
-                {
-                    "name": "read_file",
-                    "args": {
-                        "document_id": AAPL_2022Q3,
-                        "version": AAPL_2022Q3_VERSION,
-                        "page": 1,
-                        "page_limit": 1,
-                    },
-                    "id": "c-read2",
-                    "type": "tool_call",
-                }
-            ],
-        ),
+        # entry 1: read_source (the tool call produces evidence)
+        _read_source_call("c-read2"),
         # entry 2: prose that bounces (no extractive span)
         AIMessage(content="second vague answer no evidence"),
         # entry 3: prose with the extractive span -> done
@@ -1547,7 +1715,7 @@ def test_follow_up_resets_evidence(
     created = client.post("/api/threads", json={"first_message": "q1"}).json()
     tid = created["id"]
 
-    # Run 1: read_file + answer-with-span.
+    # Run 1: read_source + answer-with-span.
     answer1 = f"Per the filing: {aapl_page1_text[:80]}"
     model._index = 0
     model.script = _read_then_answer_script(answer1)
@@ -1713,7 +1881,7 @@ def test_send_message_refuse_emits_status_with_ordinary_person_copy(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -1773,7 +1941,7 @@ def test_send_message_step_cap_emits_status_with_ordinary_person_copy(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -1914,7 +2082,7 @@ def _install_crash_graph(
 ) -> tuple[Any, CrashAfterToolCallModel]:
     """Graph + scripted model for the T4 resume path.
 
-    Script: step 1 emits ``AIMessage(tool_calls=[read_file])``;
+    Script: step 1 emits ``AIMessage(tool_calls=[read_source])``;
     step 2 emits a terminal grounded answer quoting ``span`` (the
     AAPL page-1 fixture text, so the post-resume run can reach
     ``done`` through the citation gate). The test drives the run
@@ -1930,7 +2098,7 @@ def _install_crash_graph(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
     return g, model
@@ -1982,7 +2150,7 @@ def test_resume_continues_from_last_complete_node_no_human_message_appended(
     """THE T4 binding acceptance test (spec line 37).
 
     A scripted run reaches the complete
-    ``AIMessage(tool_calls=[read_file])`` checkpoint BEFORE
+    ``AIMessage(tool_calls=[read_source])`` checkpoint BEFORE
     ``tool_node`` runs; the generator is dropped there (simulated
     crash). ``POST /resume`` -> ``stream(None)``:
 
@@ -2177,7 +2345,7 @@ def test_get_thread_in_flight_true_while_lock_held(
         checkpointer=InMemorySaver(),
         model=blocking,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2245,7 +2413,7 @@ def test_resume_concurrent_returns_409_before_stream(
         checkpointer=InMemorySaver(),
         model=blocking,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2314,7 +2482,7 @@ def test_switching_threads_does_not_paint_deltas_to_other_thread(
         checkpointer=InMemorySaver(),
         model=blocking,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2364,7 +2532,7 @@ def _two_step_streaming_model(answer: str) -> "ScriptedChatModel":
     """Script TWO streamed model calls (``stream_responses``):
 
     * call 1: two ``reasoning_details`` thinking deltas + a
-      ``read_file`` tool call split across chunks;
+      ``read_source`` tool call split across chunks;
     * call 2: one thinking delta + the answer split into two
       content chunks.
     """
@@ -2385,7 +2553,7 @@ def _two_step_streaming_model(answer: str) -> "ScriptedChatModel":
                         "reasoning_details": [{"text": "the filing"}]
                     },
                     tool_call_chunks=[
-                        {"name": "read_file", "args": "", "id": "c-read", "index": 0}
+                        {"name": "read_source", "args": "", "id": "c-read", "index": 0}
                     ],
                 ),
                 AIMessageChunk(
@@ -2393,8 +2561,7 @@ def _two_step_streaming_model(answer: str) -> "ScriptedChatModel":
                     tool_call_chunks=[
                         {
                             "name": None,
-                            "args": '{"document_id": "%s", "version": "%s", "page": 1, "page_limit": 1}'
-                            % (AAPL_2022Q3, AAPL_2022Q3_VERSION),
+                            "args": _read_source_args_json(),
                             "id": None,
                             "index": 0,
                         }
@@ -2430,7 +2597,7 @@ def test_send_message_token_deltas_stream_before_node_completion(
         checkpointer=InMemorySaver(),
         model=_two_step_streaming_model(answer),
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2477,8 +2644,17 @@ def test_send_message_token_deltas_stream_before_node_completion(
         m for m in snap.values["messages"] if getattr(m, "tool_calls", None)
     ]
     assert len(ai_tools) == 1
-    assert ai_tools[0].tool_calls[0]["name"] == "read_file"
-    assert ai_tools[0].tool_calls[0]["args"]["document_id"] == AAPL_2022Q3
+    assert ai_tools[0].tool_calls[0]["name"] == "read_source"
+    # The split chunks merge into one nested locator record: a streamed
+    # ``source_ref`` is the identity the read leg resolves, so a flat
+    # top-level ``document_id`` here would mean the wire lost the record.
+    merged_args = ai_tools[0].tool_calls[0]["args"]
+    assert merged_args["source_ref"] == {
+        "document_id": AAPL_2022Q3,
+        "version": AAPL_2022Q3_VERSION,
+        "unit": 1,
+    }
+    assert merged_args["position"] == 0
 
 
 def test_send_message_inline_thinking_stream_never_reaches_answer_frames(
@@ -2503,9 +2679,8 @@ def test_send_message_inline_thinking_stream_never_reaches_answer_frames(
                     content="",
                     tool_call_chunks=[
                         {
-                            "name": "read_file",
-                            "args": '{"document_id": "%s", "version": "%s", "page": 1, "page_limit": 1}'
-                            % (AAPL_2022Q3, AAPL_2022Q3_VERSION),
+                            "name": "read_source",
+                            "args": _read_source_args_json(),
                             "id": "c-read",
                             "index": 0,
                         }
@@ -2524,7 +2699,7 @@ def test_send_message_inline_thinking_stream_never_reaches_answer_frames(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2605,7 +2780,7 @@ def test_research_answer_deltas_match_the_persisted_row(
         checkpointer=InMemorySaver(),
         model=_two_step_streaming_model(answer),
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2641,9 +2816,8 @@ def test_research_answer_with_inline_thinking_matches_persisted_row(
                     content="",
                     tool_call_chunks=[
                         {
-                            "name": "read_file",
-                            "args": '{"document_id": "%s", "version": "%s", "page": 1, "page_limit": 1}'
-                            % (AAPL_2022Q3, AAPL_2022Q3_VERSION),
+                            "name": "read_source",
+                            "args": _read_source_args_json(),
                             "id": "c-read",
                             "index": 0,
                         }
@@ -2657,7 +2831,7 @@ def test_research_answer_with_inline_thinking_matches_persisted_row(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2693,7 +2867,7 @@ def test_soft_track_answer_deltas_match_the_persisted_row(
         checkpointer=InMemorySaver(),
         model=_soft_track_streaming_model(answer),
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2748,9 +2922,8 @@ def test_resume_streams_remainder_deltas_on_same_wire(
                     content="",
                     tool_call_chunks=[
                         {
-                            "name": "read_file",
-                            "args": '{"document_id": "%s", "version": "%s", "page": 1, "page_limit": 1}'
-                            % (AAPL_2022Q3, AAPL_2022Q3_VERSION),
+                            "name": "read_source",
+                            "args": _read_source_args_json(),
                             "id": "c-read",
                             "index": 0,
                         }
@@ -2774,7 +2947,7 @@ def test_resume_streams_remainder_deltas_on_same_wire(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2842,9 +3015,8 @@ def test_resume_does_not_replay_checkpointed_frames(
                     content="",
                     tool_call_chunks=[
                         {
-                            "name": "read_file",
-                            "args": '{"document_id": "%s", "version": "%s", "page": 1, "page_limit": 1}'
-                            % (AAPL_2022Q3, AAPL_2022Q3_VERSION),
+                            "name": "read_source",
+                            "args": _read_source_args_json(),
                             "id": "c-read",
                             "index": 0,
                         }
@@ -2858,7 +3030,7 @@ def test_resume_does_not_replay_checkpointed_frames(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2906,7 +3078,7 @@ def test_send_message_thinking_false_applies_disabled_extra_body(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -2969,9 +3141,8 @@ def test_send_message_persists_thinking_duration_and_echoes_on_status(
                     },
                     tool_call_chunks=[
                         {
-                            "name": "read_file",
-                            "args": '{"document_id": "%s", "version": "%s", "page": 1, "page_limit": 1}'
-                            % (AAPL_2022Q3, AAPL_2022Q3_VERSION),
+                            "name": "read_source",
+                            "args": _read_source_args_json(),
                             "id": "c-read",
                             "index": 0,
                         }
@@ -2985,7 +3156,7 @@ def test_send_message_persists_thinking_duration_and_echoes_on_status(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -3040,9 +3211,8 @@ def test_bounce_retry_emits_answer_reset_between_attempts(
     grounded = f"Per the filing: {aapl_page1_text[:80]}"
     read_call = [
         {
-            "name": "read_file",
-            "args": '{"document_id": "%s", "version": "%s", "page": 1, "page_limit": 1}'
-            % (AAPL_2022Q3, AAPL_2022Q3_VERSION),
+            "name": "read_source",
+            "args": _read_source_args_json(),
             "id": "c-read",
             "index": 0,
         }
@@ -3060,7 +3230,7 @@ def test_bounce_retry_emits_answer_reset_between_attempts(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -3114,9 +3284,8 @@ def test_bounce_then_tools_then_answer_has_no_empty_reset(
     grounded = f"Per the filing: {aapl_page1_text[:80]}"
     read_call = [
         {
-            "name": "read_file",
-            "args": '{"document_id": "%s", "version": "%s", "page": 1, "page_limit": 1}'
-            % (AAPL_2022Q3, AAPL_2022Q3_VERSION),
+            "name": "read_source",
+            "args": _read_source_args_json(),
             "id": "c-read-after-bounce",
             "index": 0,
         }
@@ -3135,7 +3304,7 @@ def test_bounce_then_tools_then_answer_has_no_empty_reset(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -3187,9 +3356,8 @@ def test_multi_bounce_attaches_reset_to_each_retry_first_chunk(
     grounded = f"Per the filing: {aapl_page1_text[:80]}"
     read_call = [
         {
-            "name": "read_file",
-            "args": '{"document_id": "%s", "version": "%s", "page": 1, "page_limit": 1}'
-            % (AAPL_2022Q3, AAPL_2022Q3_VERSION),
+            "name": "read_source",
+            "args": _read_source_args_json(),
             "id": "c-read-multi",
             "index": 0,
         }
@@ -3206,7 +3374,7 @@ def test_multi_bounce_attaches_reset_to_each_retry_first_chunk(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -3251,7 +3419,7 @@ def test_bounce_pending_reset_flushes_on_terminal_empty_refuse(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -3304,7 +3472,7 @@ def test_scripted_model_raises_emits_terminal_status(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -3428,7 +3596,7 @@ def test_send_message_soft_track_reply_streams_deltas_before_status(
         checkpointer=InMemorySaver(),
         model=_soft_track_streaming_model(answer),
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -3475,7 +3643,7 @@ def test_send_message_gray_zone_judge_output_never_reaches_the_wire(
         model=_soft_track_streaming_model(reply),
         jev_client=fake,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     http_app.dependency_overrides[get_graph] = lambda: g
 
@@ -3955,3 +4123,40 @@ def test_resume_injects_workspace_root(
     assert g.configs
     for config in g.configs:
         assert config["configurable"]["workspace_root"] == str(ws_root)
+
+
+def test_a_pre_migration_citation_row_still_reads_in_the_turn_table() -> None:
+    """A stored row written before the locator rename must not blank a history.
+
+    ``fin_run.citations`` is JSONB and the ``page`` -> ``unit`` rename carried
+    no migration, so rows written by an earlier deployment still carry the
+    old shape. The history door validates them through ``TurnRow``, and one
+    row that cannot validate answers the whole thread's history with a 500 —
+    the operator loses every turn in the thread over one stale row. This
+    pins the tolerance the ``kind`` / ``display`` defaults already declare.
+    """
+    from fin.host.workspace_http import CitationPayload, TurnRow
+
+    legacy = {
+        "document_id": "AAPL-2022Q3",
+        "version": "1",
+        "page": 4,
+        "quote": "revenue rose",
+    }
+
+    citation = CitationPayload(**legacy)
+    assert citation.unit == 0, "a legacy row reads unit 0, never a crash"
+    # The display default keeps a legacy company row presented as a page,
+    # which is what it was before the rename.
+    assert citation.display == "page"
+    assert citation.kind == "company"
+
+    row = TurnRow(
+        run_id="r-legacy",
+        question="q",
+        status="done",
+        answer="a",
+        created_at="2026-01-01T00:00:00Z",
+        citations=[legacy],
+    )
+    assert row.citations[0].quote == "revenue rose"

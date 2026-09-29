@@ -95,11 +95,11 @@ def aapl_page1_text() -> str:
 
 def _serving_adapter(aapl_page1_text: str) -> FakeRetrievePort:
     """Fake retrieve port whose ``pages_by_doc`` manifest serves the
-    AAPL-2022Q3 page 1 as THIS-RUN ``read_file`` evidence.
+    AAPL-2022Q3 unit 1 as THIS-RUN ``read_source`` evidence.
 
     ADR 0046 / 0047: no compile path boots a tree-backed read port —
-    the read body comes from the bound adapter's own ``read``. These
-    gate tests target compaction semantics, not the citation
+    the read body comes from the bound adapter's own ``read_slice``.
+    These gate tests target compaction semantics, not the citation
     contract, so the scripted research turn carries its own payload
     source (the same pattern as ``test_serve_path_no_tree_ssot``)
     and the scripted answer cites what the run actually read.
@@ -108,7 +108,7 @@ def _serving_adapter(aapl_page1_text: str) -> FakeRetrievePort:
         locator=Locator(
             document_id=AAPL_2022Q3,
             version=AAPL_2022Q3_VERSION,
-            page=1,
+            unit=1,
         ),
         text=aapl_page1_text,
         passages=(),
@@ -156,12 +156,13 @@ def _tool_pair(
             content=ai_text,
             tool_calls=[
                 {
-                    "name": "read_file",
+                    "name": "read_source",
                     "args": {
-                        "document_id": AAPL_2022Q3,
-                        "version": AAPL_2022Q3_VERSION,
-                        "page": 1,
-                        "page_limit": 1,
+                        "source_ref": {
+                            "document_id": AAPL_2022Q3,
+                            "version": AAPL_2022Q3_VERSION,
+                            "unit": 1,
+                        }
                     },
                     "id": call_id,
                     "type": "tool_call",
@@ -177,21 +178,24 @@ def _seed_messages() -> list[BaseMessage]:
 
     With the 1_600-token override: pairs 1-3 carry 12_000-char
     ToolMessages (3_001 estimated tokens each side counted with the
-    per-message floor), pair 4 is small, the final AIMessage is 300
-    chars and the seeded question 25 chars. Total is roughly 9_200
-    estimated tokens (~575% of budget) — far past the 90% trigger.
+    per-message floor), pair 4 is small, the final AIMessage is 240
+    chars and the seeded question 25 chars. Total is roughly 9_100
+    estimated tokens (~570% of budget) — far past the 90% trigger.
+    The kept tail (summary + pair 4 + the two trailing messages plus
+    the host-prompt overhead) must stay at or under the 40% floor, so
+    the small pair's envelope and the filler length carry that bound.
     """
     messages: list[BaseMessage] = []
     for index in range(3):
         messages += _tool_pair(
-            f"calling read_file {index}", _TOOL_PAYLOAD, f"c-seed-{index}"
+            f"calling read_source {index}", _TOOL_PAYLOAD, f"c-seed-{index}"
         )
     messages += _tool_pair(
-        "calling read_file 3",
-        json.dumps({"document_id": AAPL_2022Q3, "page": 1}),
+        "calling read_source 3",
+        json.dumps({"source_ref": {"document_id": AAPL_2022Q3, "unit": 1}}),
         "c-seed-3",
     )
-    messages.append(AIMessage(content="x" * 300))
+    messages.append(AIMessage(content="x" * 240))
     messages.append(HumanMessage(content="Break down AAPL 2023 Q3 revenue"))
     return messages
 
@@ -501,12 +505,13 @@ def test_gate_compacts_before_next_llm_call(aapl_page1_text: str) -> None:
                 content="",
                 tool_calls=[
                     {
-                        "name": "read_file",
+                        "name": "read_source",
                         "args": {
-                            "document_id": AAPL_2022Q3,
-                            "version": AAPL_2022Q3_VERSION,
-                            "page": 1,
-                            "page_limit": 1,
+                            "source_ref": {
+                                "document_id": AAPL_2022Q3,
+                                "version": AAPL_2022Q3_VERSION,
+                                "unit": 1,
+                            }
                         },
                         "id": "c-live",
                         "type": "tool_call",
@@ -609,12 +614,13 @@ def test_snapshot_slots_survive_for_classify_inherit(
                 content="",
                 tool_calls=[
                     {
-                        "name": "read_file",
+                        "name": "read_source",
                         "args": {
-                            "document_id": AAPL_2022Q3,
-                            "version": AAPL_2022Q3_VERSION,
-                            "page": 1,
-                            "page_limit": 1,
+                            "source_ref": {
+                                "document_id": AAPL_2022Q3,
+                                "version": AAPL_2022Q3_VERSION,
+                                "unit": 1,
+                            }
                         },
                         "id": "c-live",
                         "type": "tool_call",
@@ -708,12 +714,13 @@ def test_summary_failure_leaves_turn_uncompacted_and_continues(
                 content="",
                 tool_calls=[
                     {
-                        "name": "read_file",
+                        "name": "read_source",
                         "args": {
-                            "document_id": AAPL_2022Q3,
-                            "version": AAPL_2022Q3_VERSION,
-                            "page": 1,
-                            "page_limit": 1,
+                            "source_ref": {
+                                "document_id": AAPL_2022Q3,
+                                "version": AAPL_2022Q3_VERSION,
+                                "unit": 1,
+                            }
                         },
                         "id": "c-live",
                         "type": "tool_call",

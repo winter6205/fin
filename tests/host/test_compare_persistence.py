@@ -33,10 +33,12 @@ from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+from fin.corpus.extracted import load_extracted_tree
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.run_payload import _run_to_response_payload
 from fin.host.thread_store import InMemoryThreadStore, RunRecord
 from fin.host.tools.compare_facts import COMPARISON_SCHEMA
+from fin.retrieve import FakeRetrievePort
 
 
 AAPL_2022Q3 = "AAPL-2022Q3"
@@ -45,14 +47,15 @@ AAPL_2022Q3_VERSION = (
 )
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "AAPL-2023Q3", "MSFT-2023Q3"}
 
-# Legacy tree-backed read adapter over the committed corpus. Only the
-# scripted ``read_file`` transcripts need it; the default graph no
+# The ``read_source`` company leg over the committed corpus units. Only
+# the scripted ``read_source`` transcripts need it; the default graph no
 # longer reads the tree on its own (ADR 0046 / 0047).
-from fin.retrieve import ExtractedTreeReadPort
-
-_TREE_READ_PORT = ExtractedTreeReadPort(
-    Path("data/corpus/manifest.json"),
-    Path("data/corpus/extracted"),
+_READ_ADAPTER = FakeRetrievePort(
+    pages_by_doc={
+        AAPL_2022Q3: load_extracted_tree(
+            Path("data/corpus/manifest.json"), Path("data/corpus/extracted")
+        )[AAPL_2022Q3]
+    }
 )
 
 # Digit-free verbatim slice of the committed AAPL-2022Q3 page 1: the
@@ -97,7 +100,7 @@ def _install_graph(
         checkpointer=InMemorySaver(),
         model=ScriptedChatModel(script=script),
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
         facts_root=facts_root,
     )
     http_app.dependency_overrides[get_graph] = lambda: graph
@@ -127,12 +130,14 @@ def _compare_then_answer_script(
             content="",
             tool_calls=[
                 {
-                    "name": "read_file",
+                    "name": "read_source",
                     "args": {
-                        "document_id": AAPL_2022Q3,
-                        "version": AAPL_2022Q3_VERSION,
-                        "page": 1,
-                        "page_limit": 1,
+                        "source_ref": {
+                            "document_id": AAPL_2022Q3,
+                            "version": AAPL_2022Q3_VERSION,
+                            "unit": 1,
+                        },
+                        "position": 0,
                     },
                     "id": "c-read",
                     "type": "tool_call",
@@ -302,6 +307,9 @@ def test_get_thread_turn_row_carries_the_structured_comparison(
     ]
     assert comparison["deltas"][0]["direction"] == "up"
     assert comparison["locators"][0]["document_id"] == compare_seed.aapl_2022_doc
+    # The persisted turn row carries the typed unit ordinal, so the SPA
+    # and the export can cite the row without a legacy page field.
+    assert comparison["locators"][0]["unit"] == 4
 
 
 def test_turn_row_without_a_comparison_serializes_an_empty_list(
@@ -394,12 +402,14 @@ def test_other_tools_emit_no_comparison_frame(
             content="",
             tool_calls=[
                 {
-                    "name": "read_file",
+                    "name": "read_source",
                     "args": {
-                        "document_id": AAPL_2022Q3,
-                        "version": AAPL_2022Q3_VERSION,
-                        "page": 1,
-                        "page_limit": 1,
+                        "source_ref": {
+                            "document_id": AAPL_2022Q3,
+                            "version": AAPL_2022Q3_VERSION,
+                            "unit": 1,
+                        },
+                        "position": 0,
                     },
                     "id": "c-read",
                     "type": "tool_call",

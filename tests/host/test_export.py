@@ -12,12 +12,14 @@ test below asserts the file carries the envelope's OWN strings.
 
 from __future__ import annotations
 
+import csv
 import json
 
 import pytest
 
 from fin.host.export import (
     ExportEmptyError,
+    MalformedCitationRowError,
     RunNotFoundError,
     UnsupportedComparisonSchemaError,
     build_export,
@@ -65,7 +67,7 @@ def _comparison_envelope() -> dict:
                         "locator": {
                             "document_id": "AAPL-2022Q3",
                             "version": "a7a0",
-                            "page": 4,
+                            "unit": 4,
                         },
                     },
                     {
@@ -92,7 +94,7 @@ def _comparison_envelope() -> dict:
             }
         ]
         envelope["locators"] = [
-            {"document_id": "AAPL-2022Q3", "version": "a7a0", "page": 4}
+            {"document_id": "AAPL-2022Q3", "version": "a7a0", "unit": 4}
         ]
         envelope["hit_count"] = 1
         envelope["cell_count"] = 2
@@ -116,14 +118,41 @@ def _run(
     )
 
 
+# The persisted citation is the full wire contract emitted by
+# ``run_payload._run_to_response_payload`` — an attachment citation
+# carries no ``document_id`` and is only openable from ``attachment_id``
+# plus ``display`` / ``filename``, so a fixture that hand-picked three
+# fields would not be the row the export actually reads.
 CITATIONS = [
     {
+        "kind": "company",
         "document_id": "AAPL-2022Q3",
+        "attachment_id": "",
         "version": "a7a0",
-        "page": 4,
+        "unit": 4,
+        # A company unit admitted through ``read_source`` presents as a
+        # page (``citation_gate.EvidenceItem`` default), which is what
+        # the ``display`` discriminator carries.
+        "display": "page",
+        "filename": "",
         "quote": "Total net sales increased during the third quarter",
     }
 ]
+
+# The attachment leg of the same contract: identity lives in
+# ``attachment_id`` and ``document_id`` is EMPTY by design, so the column
+# that opens the unit cannot be a fixed ``document_id``.
+ATTACHMENT_CITATION = {
+    "kind": "attachment",
+    "document_id": "",
+    "attachment_id": "att-3f9c",
+    # The parsed-content version, riding as a string like the company wire.
+    "version": "2",
+    "unit": 1,
+    "display": "unit",
+    "filename": "inspection-sheet.pdf",
+    "quote": "the odometer reading shown on the inspection sheet",
+}
 
 
 # ----- missing run (SC6 negative) -----
@@ -198,10 +227,23 @@ def test_comparison_csv_carries_the_envelope_cells_and_deltas() -> None:
     for delta in envelope["deltas"]:
         assert delta["display"] in body
         assert delta["direction"] in body
-    # The trail back to the filing.
-    for locator in envelope["locators"]:
-        assert locator["document_id"] in body
-        assert str(locator["page"]) in body
+    # The trail back to the filing units: one locator section, its rows
+    # in envelope order. A substring check would survive the writer
+    # dropping the unit column entirely — the "4" it looked for also
+    # occurs inside the cell display "194,140".
+    locator_sections = [
+        section
+        for section in body.split("\n\n")
+        if section.startswith("document_id,version,unit\n")
+    ]
+    assert len(locator_sections) == 1
+    assert locator_sections[0].splitlines() == [
+        "document_id,version,unit",
+        *(
+            f"{locator['document_id']},{locator['version']},{locator['unit']}"
+            for locator in envelope["locators"]
+        ),
+    ]
 
 
 def test_filename_never_ends_on_a_separator() -> None:
@@ -309,7 +351,7 @@ AWKWARD_COMPARISON = {
         },
         {"direction": "flat"},
     ],
-    "locators": [{"document_id": "AAPL-2022Q3", "version": "a7a0", "page": 4}, {}],
+    "locators": [{"document_id": "AAPL-2022Q3", "version": "a7a0", "unit": 4}, {}],
 }
 
 BARE_COMPARISON = {"schema": COMPARISON_SCHEMA, "concept": "us-gaap:GrossProfit"}
@@ -329,7 +371,7 @@ EXPECTED_CSV = (
     'AAPL,2022-Q3,AAPL,2023-Q3,up,"+99,647 (+51.33%)"\n'
     ",,,,flat,\n"
     "\n"
-    "document_id,version,page\n"
+    "document_id,version,unit\n"
     "AAPL-2022Q3,a7a0,4\n"
     ",,\n"
     "\n"
@@ -374,10 +416,34 @@ def test_an_absent_section_costs_no_blank_row() -> None:
     )
 
     assert export.body.endswith(
-        "document_id,version,page\nAAPL-2022Q3,a7a0,4\n,,\n"
+        "document_id,version,unit\nAAPL-2022Q3,a7a0,4\n,,\n"
     )
     assert "from_row" not in export.body
     assert "\n\n\n" not in export.body
+
+
+def test_locator_section_has_no_legacy_page_column() -> None:
+    """Same contract on the comparison side: the locator trail is
+    ``{document_id, version, unit}``. A row that still carries a
+    physical ``page`` gets an empty unit cell — the writer does not
+    reinterpret a removed key."""
+    legacy = dict(
+        AWKWARD_COMPARISON,
+        locators=[{"document_id": "AAPL-2022Q3", "version": "a7a0", "page": 4}],
+    )
+
+    export = build_export(
+        runs=[_run("run-1", comparisons=[legacy])],
+        kind="comparison",
+        thread_id=THREAD_ID,
+    )
+
+    sections = [
+        section
+        for section in export.body.split("\n\n")
+        if section.startswith("document_id,")
+    ]
+    assert sections == ["document_id,version,unit\nAAPL-2022Q3,a7a0,\n"]
 
 
 # ----- citation bundle -----
@@ -391,9 +457,103 @@ def test_citations_csv_has_a_header_and_one_row_per_citation() -> None:
     )
 
     lines = [line for line in export.body.splitlines() if line.strip()]
-    assert lines[0] == "document_id,version,page,quote"
+    assert lines[0] == "kind,source_id,version,unit,quote"
     assert len(lines) == 1 + len(CITATIONS)
     assert CITATIONS[0]["quote"] in export.body
+
+
+def test_citations_csv_names_the_source_that_opens_an_attachment_row() -> None:
+    """An attachment citation carries no ``document_id``; the row must
+    name the id that opens the unit it quotes, or the file cannot do the
+    one job it exists for."""
+    export = build_export(
+        runs=[_run("run-1", citations=[ATTACHMENT_CITATION])],
+        kind="citations",
+        thread_id=THREAD_ID,
+    )
+
+    assert [line for line in export.body.splitlines() if line.strip()] == [
+        "kind,source_id,version,unit,quote",
+        "attachment,att-3f9c,2,1," + ATTACHMENT_CITATION["quote"],
+    ]
+
+
+def test_citations_csv_exports_the_unit_column_not_the_identity_fields() -> None:
+    """The citation file is the quotable trail, not a wire dump.
+
+    The five columns are exactly what a reader needs to OPEN the cited
+    unit: ``kind`` says which identity the row is opened with, and
+    ``source_id`` carries that one id — ``document_id`` for a company
+    row, ``attachment_id`` for an attachment row, whose ``document_id``
+    is empty by design. That fifth column is not extra detail: with the
+    old four, every attachment row exported a blank first cell and the
+    download stopped being actionable.
+
+    What still stays out is the display-only half of the wire row
+    (``display`` / ``filename``) and whichever source id the row's kind
+    does not use; both ride the JSON export verbatim.
+    """
+    export = build_export(
+        runs=[_run("run-1", citations=CITATIONS)],
+        kind="citations",
+        thread_id=THREAD_ID,
+    )
+
+    assert [line for line in export.body.splitlines() if line.strip()] == [
+        "kind,source_id,version,unit,quote",
+        f"company,{CITATIONS[0]['document_id']},{CITATIONS[0]['version']},"
+        f"{CITATIONS[0]['unit']},{CITATIONS[0]['quote']}",
+    ]
+    assert CITATIONS[0]["display"] not in export.body
+
+
+def test_citations_csv_names_the_source_of_both_legs_in_one_file() -> None:
+    """A turn that quoted the corpus AND a thread attachment must
+    produce one file whose every row names an openable source."""
+    export = build_export(
+        runs=[_run("run-1", citations=[CITATIONS[0], ATTACHMENT_CITATION])],
+        kind="citations",
+        thread_id=THREAD_ID,
+    )
+
+    assert [line for line in export.body.splitlines() if line.strip()] == [
+        "kind,source_id,version,unit,quote",
+        f"company,{CITATIONS[0]['document_id']},{CITATIONS[0]['version']},"
+        f"{CITATIONS[0]['unit']},{CITATIONS[0]['quote']}",
+        f"attachment,{ATTACHMENT_CITATION['attachment_id']},"
+        f"{ATTACHMENT_CITATION['version']},{ATTACHMENT_CITATION['unit']},"
+        f"{ATTACHMENT_CITATION['quote']}",
+    ]
+
+
+def test_citations_csv_has_no_legacy_page_column() -> None:
+    """A locator ``page`` key is not part of the contract any more, and
+    the writer keeps no compatibility path for it: a row that still
+    carries one exports an EMPTY unit rather than the stale number."""
+    legacy = [
+        {
+            "kind": "company",
+            "document_id": "AAPL-2022Q3",
+            "attachment_id": "",
+            "version": "a7a0",
+            "page": 4,
+            "display": "page",
+            "filename": "",
+            "quote": "Total net sales increased during the third quarter",
+        }
+    ]
+
+    export = build_export(
+        runs=[_run("run-1", citations=legacy)],
+        kind="citations",
+        thread_id=THREAD_ID,
+    )
+
+    assert "page" not in export.body.splitlines()[0]
+    assert (
+        export.body.splitlines()[1]
+        == f"company,AAPL-2022Q3,a7a0,,{legacy[0]['quote']}"
+    )
 
 
 def test_citations_json_export_carries_the_run_identity() -> None:
@@ -423,4 +583,167 @@ def test_a_quote_with_a_comma_stays_one_csv_field() -> None:
     import io
 
     rows = list(csv.reader(io.StringIO(export.body)))
-    assert rows[1][3] == citation["quote"]
+    assert rows[1][4] == citation["quote"]
+
+
+def test_a_row_of_an_unquoted_kind_is_a_typed_refusal() -> None:
+    """A kind outside the gate's own closed quotable set — a generated
+    visual observation, or a row stored before citations carried ``kind``
+    at all — is refused, never rendered as if it were a quotable trail.
+    The message names the row and what was observed so the operator can
+    find it, and never echoes the quote (user prose)."""
+    alien = dict(CITATIONS[0], kind="generated_image")
+
+    with pytest.raises(MalformedCitationRowError) as exc:
+        build_export(
+            runs=[_run("run-1", citations=[CITATIONS[0], alien])],
+            kind="citations",
+            thread_id=THREAD_ID,
+        )
+
+    assert exc.value.code == "malformed_citation_row"
+    assert "row 1" in str(exc.value)
+    assert "generated_image" in str(exc.value)
+    assert alien["quote"] not in str(exc.value)
+
+
+def test_a_pre_migration_row_still_exports_as_the_company_row_it_was() -> None:
+    """A row written before citations carried ``kind`` must still export.
+
+    ``fin_run.citations`` is JSONB, so rows stored by an earlier deployment
+    are still in the database with the shape they were written in. A row
+    with no ``kind`` but a ``document_id`` is what a company citation
+    always looked like, and it is what this door exported before the
+    locator rename. Refusing it makes the whole citations export
+    unreachable for every thread created before the rename, over rows
+    that are in fact perfectly well-formed.
+
+    The refusal this module owes the operator is for a row that names no
+    quotable source at all — that case is still asserted below, and it is
+    asserted on a row that carries no ``document_id`` either.
+    """
+    legacy = {
+        "document_id": "AAPL-2022Q3",
+        "version": "a7a0",
+        "page": 4,
+        "quote": "Total net sales increased during the third quarter",
+    }
+
+    export = build_export(
+        runs=[_run("run-1", citations=[legacy])],
+        kind="citations",
+        thread_id=THREAD_ID,
+    )
+
+    rows = list(csv.reader(export.body.splitlines()))
+    assert len(rows) == 2  # header + the one stored row
+    assert rows[1][0] == "company", "a pre-migration row reads as what it was"
+    assert rows[1][1] == "AAPL-2022Q3", "never a blank source_id cell"
+    assert legacy["quote"] in rows[1][4]
+
+
+def test_a_row_naming_no_source_for_its_kind_is_a_typed_refusal() -> None:
+    """The silent failure this export must not repeat: an attachment row
+    with no ``attachment_id`` used to download as a clean-looking file
+    whose one key column was blank. A row that opens nothing is refused
+    before a single cell is written."""
+    orphan = dict(ATTACHMENT_CITATION, attachment_id="")
+
+    with pytest.raises(MalformedCitationRowError) as exc:
+        build_export(
+            runs=[_run("run-1", citations=[orphan])],
+            kind="citations",
+            thread_id=THREAD_ID,
+        )
+
+    assert exc.value.code == "malformed_citation_row"
+    assert "row 0" in str(exc.value)
+    assert "attachment" in str(exc.value)
+    assert orphan["quote"] not in str(exc.value)
+
+
+def test_a_company_row_never_borrows_the_attachment_id() -> None:
+    """Each kind is checked against ITS OWN source field: letting an
+    attachment id stand in for a company row with no document would open
+    the wrong source under a plausible-looking row."""
+    swapped = dict(CITATIONS[0], document_id="", attachment_id="att-3f9c")
+
+    with pytest.raises(MalformedCitationRowError) as exc:
+        build_export(
+            runs=[_run("run-1", citations=[swapped])],
+            kind="citations",
+            thread_id=THREAD_ID,
+        )
+
+    assert "document_id" in str(exc.value)
+
+
+def test_a_row_naming_no_version_is_a_typed_refusal() -> None:
+    """``source_id`` plus ``unit`` addresses one frozen version, which is
+    the version the quote was taken from — the gate requires a version
+    for either kind, so an empty one is not an exportable row."""
+    no_version = dict(ATTACHMENT_CITATION, version="")
+
+    with pytest.raises(MalformedCitationRowError) as exc:
+        build_export(
+            runs=[_run("run-1", citations=[no_version])],
+            kind="citations",
+            thread_id=THREAD_ID,
+        )
+
+    assert "row 0" in str(exc.value)
+
+
+def test_a_refused_row_refuses_the_json_export_too() -> None:
+    """The binding is a property of the run's rows, not of the format:
+    a row this export does not speak must not download because the
+    caller asked for the other file extension."""
+    orphan = dict(ATTACHMENT_CITATION, attachment_id="")
+
+    with pytest.raises(MalformedCitationRowError):
+        build_export(
+            runs=[_run("run-1", citations=[orphan])],
+            kind="citations",
+            thread_id=THREAD_ID,
+            fmt="json",
+        )
+
+
+def test_citations_json_export_is_the_stored_rows_byte_for_byte() -> None:
+    """The CSV collapse to one ``source_id`` is the CSV's business only.
+
+    The JSON document keeps all eight wire fields of each stored row —
+    including the empty ``document_id`` of an attachment row — so the
+    leg a row came from stays reconstructible; the export never rewrites
+    a row to look like the narrower file.
+    """
+    citations = [CITATIONS[0], ATTACHMENT_CITATION]
+
+    export = build_export(
+        runs=[_run("run-1", citations=citations)],
+        kind="citations",
+        thread_id=THREAD_ID,
+        fmt="json",
+    )
+
+    assert export.body == json.dumps(
+        {
+            "thread_id": THREAD_ID,
+            "run_id": "run-1",
+            "kind": "citations",
+            "citations": citations,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    assert "source_id" not in export.body
+    assert set(json.loads(export.body)["citations"][1]) == {
+        "kind",
+        "document_id",
+        "attachment_id",
+        "version",
+        "unit",
+        "display",
+        "filename",
+        "quote",
+    }

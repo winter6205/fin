@@ -7,6 +7,13 @@ Success Criteria 4/7/9. Hermetic against
 :class:`fin.host.attachment_store.InMemoryAttachmentStore`, seeded through
 the same doors the preparation tests use (``create`` → ``record_units`` →
 ``put_index`` → ``mark_ready``).
+
+The same store seeds the module's two citation identity faces,
+``owned_record`` and ``identity_is_current`` — the faces the host graph asks
+before it grants a citation its filename, its presentation, or its currency.
+Their fail-closed answers are pinned here against a real record rather than
+a hand-rolled reader, because a citation identity granted for a foreign,
+re-prepared, or tombstoned row is the failure those faces exist to prevent.
 """
 
 from __future__ import annotations
@@ -26,11 +33,13 @@ from fin.host.attachment_source_read import (
 )
 from fin.host.attachment_index import build_postings
 from fin.host.attachment_store import (
+    AttachmentRecord,
     AttachmentStoreError,
     AttachmentThreadGoneError,
     InMemoryAttachmentStore,
     ParsedAttachmentUnit,
 )
+from fin.host.graph import _display_lookup_for
 from fin.host.thread_store import InMemoryThreadStore
 from fin.retrieve.source_read import (
     INVALID_LOCATOR,
@@ -77,13 +86,17 @@ def _threads_and_store() -> tuple[InMemoryThreadStore, InMemoryAttachmentStore, 
 
 
 def _create(
-    store: InMemoryAttachmentStore, thread_id: str, *, text: str = _SHORT_TEXT
+    store: InMemoryAttachmentStore,
+    thread_id: str,
+    *,
+    text: str = _SHORT_TEXT,
+    filename: str = "notes.txt",
 ) -> tuple[str, tuple[ParsedAttachmentUnit, ...]]:
     attachment_id = f"att-{uuid.uuid4().hex[:8]}"
     store.create(
         thread_id=thread_id,
         attachment_id=attachment_id,
-        filename="notes.txt",
+        filename=filename,
         size_bytes=1_024,
         sha256="ab" * 32,
         object_key=f"threads/{thread_id}/{attachment_id}",
@@ -112,9 +125,13 @@ def _prepare(
 
 
 def _ready(
-    store: InMemoryAttachmentStore, thread_id: str, *, text: str = _SHORT_TEXT
+    store: InMemoryAttachmentStore,
+    thread_id: str,
+    *,
+    text: str = _SHORT_TEXT,
+    filename: str = "notes.txt",
 ) -> str:
-    attachment_id, units = _create(store, thread_id, text=text)
+    attachment_id, units = _create(store, thread_id, text=text, filename=filename)
     _prepare(store, attachment_id, units)
     return attachment_id
 
@@ -439,3 +456,263 @@ def test_a_gone_race_surfaces_as_unknown_locator() -> None:
     gone: Any = _FaultyStore(AttachmentThreadGoneError("attachment is gone"))
     reader = AttachmentSourceReader(gone, thread_a)
     assert reader.read_slice(_ref(attachment_id)) == {"error": UNKNOWN_LOCATOR}
+
+
+# ----- trust face: ``owned_record`` (the citation identity grant) -----
+
+
+def test_owned_record_answers_the_thread_s_own_ready_row() -> None:
+    _threads, store, thread_a, _thread_b = _threads_and_store()
+    attachment_id = _ready(store, thread_a)
+    reader = AttachmentSourceReader(store, thread_a)
+    record = reader.owned_record(attachment_id)
+    # WHY the store's own record, not a projection: the graph reads the
+    # filename and version straight off what the face returned, so the
+    # trust is exactly "the row this thread owns and can read".
+    assert isinstance(record, AttachmentRecord)
+    assert record.attachment_id == attachment_id
+    assert record.thread_id == thread_a
+    assert record.filename == "notes.txt"
+    assert record.version == 1
+    assert record.status == "ready" and record.searchable
+
+
+def test_owned_record_refuses_another_thread_s_ready_row() -> None:
+    _threads, store, thread_a, thread_b = _threads_and_store()
+    foreign = _ready(store, thread_b)
+    reader = AttachmentSourceReader(store, thread_a)
+    assert reader.owned_record(foreign) is None
+
+
+def test_owned_record_refuses_an_attachment_that_was_never_created() -> None:
+    _threads, store, thread_a, _thread_b = _threads_and_store()
+    reader = AttachmentSourceReader(store, thread_a)
+    assert reader.owned_record("att-never-created") is None
+
+
+def test_owned_record_refuses_a_row_that_is_ready_no_more() -> None:
+    _threads, store, thread_a, _thread_b = _threads_and_store()
+    attachment_id = _ready(store, thread_a)
+    store.clear_index(attachment_id)
+    reader = AttachmentSourceReader(store, thread_a)
+    assert reader.owned_record(attachment_id) is None
+    # A re-check of the same row that lost its index cannot grant currency
+    # either: the trust faces agree with the read door.
+    assert reader.identity_is_current(attachment_id, 1) is False
+
+
+def test_owned_record_refuses_an_uploaded_row_that_was_never_prepared() -> None:
+    _threads, store, thread_a, _thread_b = _threads_and_store()
+    attachment_id, _units = _create(store, thread_a)
+    reader = AttachmentSourceReader(store, thread_a)
+    assert reader.owned_record(attachment_id) is None
+
+
+def test_owned_record_refuses_a_tombstoned_row_and_a_row_whose_thread_is_gone() -> None:
+    threads, store, thread_a, _thread_b = _threads_and_store()
+    reader = AttachmentSourceReader(store, thread_a)
+    deleted = _ready(store, thread_a)
+    store.tombstone(attachment_id=deleted, thread_id=thread_a)
+    assert reader.owned_record(deleted) is None
+    thread_c = threads.create_thread(title="Thread C").id
+    doomed = _ready(store, thread_c)
+    reader_c = AttachmentSourceReader(store, thread_c)
+    threads.delete_thread(thread_c)
+    assert reader_c.owned_record(doomed) is None
+
+
+def test_a_reprepared_row_grants_identity_only_at_the_version_the_store_now_holds() -> None:
+    """Both halves of the version guard, against the real record.
+
+    ``owned_record`` is deliberately version-blind — it attests that the
+    row belongs to this thread and is readable, and nothing more. The
+    mismatch a citation must not survive is caught one layer up, by the
+    lookup comparing the hit's version with the record's, so the pin has
+    to show both: what the face answers, and what the graph does with it.
+    """
+    _threads, store, thread_a, _thread_b = _threads_and_store()
+    attachment_id, _units = _create(store, thread_a)
+    _prepare(store, attachment_id, (ParsedAttachmentUnit(unit=1, text=_SHORT_TEXT),))
+    reader = AttachmentSourceReader(store, thread_a)
+    lookup = _display_lookup_for(reader)
+    assert lookup is not None
+    assert lookup(attachment_id, 1) == ("notes.txt", "unit")
+
+    _prepare(
+        store,
+        attachment_id,
+        (ParsedAttachmentUnit(unit=1, text="revised text"),),
+        version=2,
+    )
+    stale = reader.owned_record(attachment_id)
+    assert stale is not None and stale.version == 2
+    assert lookup(attachment_id, 1) is None  # the guard rejects the old version
+    assert lookup(attachment_id, 2) == ("notes.txt", "unit")
+    assert reader.identity_is_current(attachment_id, 1) is False
+    assert reader.identity_is_current(attachment_id, 2) is True
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        AttachmentStoreError("disk down"),
+        AttachmentThreadGoneError("attachment is gone"),
+        OSError("transport closed"),
+    ],
+    ids=["store_error", "thread_gone", "unexpected_os_error"],
+)
+def test_the_identity_faces_fail_closed_on_a_store_fault_and_never_raise(
+    fault: Exception,
+) -> None:
+    """A store that cannot answer grants nothing.
+
+    Neither face may propagate: the citation path has no error channel of
+    its own, so a raising identity check would surface in the answer path
+    instead of refusing the citation.
+    """
+    _threads, store, thread_a, _thread_b = _threads_and_store()
+    attachment_id = _ready(store, thread_a)
+    faulty: Any = _FaultyStore(fault)
+    reader = AttachmentSourceReader(faulty, thread_a)
+    assert reader.owned_record(attachment_id) is None
+    assert reader.identity_is_current(attachment_id, 1) is False
+    assert _display_lookup_for(reader)(attachment_id, 1) is None
+
+
+# ----- trust face: ``identity_is_current`` (the citation gate re-check) -----
+
+
+def test_identity_is_current_holds_only_while_the_stored_version_matches() -> None:
+    _threads, store, thread_a, _thread_b = _threads_and_store()
+    attachment_id = _ready(store, thread_a)
+    reader = AttachmentSourceReader(store, thread_a)
+    assert reader.identity_is_current(attachment_id, 1) is True
+    _prepare(
+        store,
+        attachment_id,
+        (ParsedAttachmentUnit(unit=1, text="revised text"),),
+        version=2,
+    )
+    assert reader.identity_is_current(attachment_id, 1) is False
+    assert reader.identity_is_current(attachment_id, 2) is True
+
+
+def test_identity_is_current_is_false_for_another_thread_s_row() -> None:
+    _threads, store, thread_a, thread_b = _threads_and_store()
+    foreign = _ready(store, thread_b)
+    reader = AttachmentSourceReader(store, thread_a)
+    assert reader.identity_is_current(foreign, 1) is False
+    # The owning thread still attests it: the refusal is ownership, not
+    # the row's shape.
+    assert AttachmentSourceReader(store, thread_b).identity_is_current(foreign, 1) is True
+
+
+def test_identity_is_current_is_false_once_the_row_is_tombstoned() -> None:
+    _threads, store, thread_a, _thread_b = _threads_and_store()
+    attachment_id = _ready(store, thread_a)
+    reader = AttachmentSourceReader(store, thread_a)
+    assert reader.identity_is_current(attachment_id, 1) is True
+    store.tombstone(attachment_id=attachment_id, thread_id=thread_a)
+    assert reader.identity_is_current(attachment_id, 1) is False
+
+
+def test_identity_is_current_is_false_without_a_version_to_compare() -> None:
+    """No committed version means nothing to attest currency against.
+
+    The graph hands this face whatever the evidence item carried, so an
+    unparseable locator version arrives as ``None`` and must not be
+    treated as "matches whatever is stored".
+    """
+    _threads, store, thread_a, _thread_b = _threads_and_store()
+    attachment_id = _ready(store, thread_a)
+    reader = AttachmentSourceReader(store, thread_a)
+    assert reader.identity_is_current(attachment_id, None) is False
+    # The record IS owned and readable; the missing version is still a
+    # refusal, not a pass.
+    assert reader.owned_record(attachment_id) is not None
+
+
+@pytest.mark.parametrize(
+    "attachment_id, version_int",
+    [("att-never-created", 1), ("att-never-created", None)],
+    ids=["unknown_id", "unknown_id_no_version"],
+)
+def test_identity_is_current_is_false_for_an_attachment_the_store_does_not_have(
+    attachment_id: str, version_int: Any
+) -> None:
+    _threads, store, thread_a, _thread_b = _threads_and_store()
+    reader = AttachmentSourceReader(store, thread_a)
+    assert reader.identity_is_current(attachment_id, version_int) is False
+
+
+# ----- the two faces agree over every row shape the store can hold -----
+
+
+def test_the_grant_passes_over_every_row_shape_the_store_can_hold() -> None:
+    """One store, one scan of the states a row can actually be in.
+
+    The refusals stay indistinguishable — a foreign id, a tombstoned id,
+    and an id the store never had all answer the same ``None`` / ``False``
+    pair — so neither face can be probed to learn which of the three a
+    thread holds.
+    """
+    _threads, store, thread_a, thread_b = _threads_and_store()
+    foreign = _ready(store, thread_b)
+    tombstoned = _ready(store, thread_a)
+    store.tombstone(attachment_id=tombstoned, thread_id=thread_a)
+    unindexed = _ready(store, thread_a)
+    store.clear_index(unindexed)
+    never_prepared = _create(store, thread_a)[0]
+    states = {
+        "own": _ready(store, thread_a),
+        "foreign": foreign,
+        "tombstoned": tombstoned,
+        "unindexed": unindexed,
+        "never_prepared": never_prepared,
+        "unknown": "att-never-created",
+    }
+    reader = AttachmentSourceReader(store, thread_a)
+    answers = {
+        name: (
+            reader.owned_record(attachment_id) is not None,
+            reader.identity_is_current(attachment_id, 1),
+        )
+        for name, attachment_id in states.items()
+    }
+    assert answers == {
+        "own": (True, True),
+        "foreign": (False, False),
+        "tombstoned": (False, False),
+        "unindexed": (False, False),
+        "never_prepared": (False, False),
+        "unknown": (False, False),
+    }
+
+
+# ----- the display pair comes from the STORED filename -----
+
+
+@pytest.mark.parametrize(
+    "filename,display",
+    [
+        ("quarter-2023.pdf", "page"),
+        ("QUARTER-2023.PDF", "page"),
+        ("notes.txt", "unit"),
+        ("memo.md", "unit"),
+        ("ledger", "unit"),
+    ],
+    ids=["pdf_lower", "pdf_upper", "txt", "md", "no_suffix"],
+)
+def test_the_granted_presentation_follows_the_stored_filename(filename: str, display: str) -> None:
+    """A PDF unit is cited as a page and every other kind as a unit.
+
+    The presentation is read off the record the store holds, so a model
+    cannot choose how its citation is rendered by naming a suffix in the
+    locator, in the tool arguments, or in its own answer.
+    """
+    _threads, store, thread_a, _thread_b = _threads_and_store()
+    attachment_id = _ready(store, thread_a, filename=filename)
+    reader = AttachmentSourceReader(store, thread_a)
+    lookup = _display_lookup_for(reader)
+    assert lookup is not None
+    assert lookup(attachment_id, 1) == (filename, display)

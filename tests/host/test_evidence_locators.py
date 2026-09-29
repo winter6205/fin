@@ -17,7 +17,7 @@ Three seams are covered here:
   ``step_cap`` too.
 * ``fin.host.workspace_http`` — ``GET /api/threads/{id}`` exposes the
   field on the turn row, and run 2 on the same thread carries only
-  its own pages.
+  its own units.
 """
 
 from __future__ import annotations
@@ -41,18 +41,33 @@ AAPL_2022Q3_VERSION = (
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
 
+def _locator(unit: int) -> dict[str, Any]:
+    """The company locator one run touched: the frozen triple, nothing else."""
+    return {
+        "document_id": AAPL_2022Q3,
+        "version": AAPL_2022Q3_VERSION,
+        "unit": unit,
+    }
+
+
 # ----- fixtures -----
 
 
 @pytest.fixture(scope="module")
-def aapl_pages() -> list[str]:
-    """Page texts of the frozen AAPL-2022Q3 filing (no live SEC)."""
+def aapl_tree():
+    """The committed extracted tree, which is what the fake company read
+    leg serves (no live SEC, no second tree copy)."""
     from fin.corpus.extracted import load_extracted_tree
 
-    tree = load_extracted_tree(
+    return load_extracted_tree(
         Path("data/corpus/manifest.json"), Path("data/corpus/extracted")
     )
-    return [page.text for page in tree[AAPL_2022Q3]]
+
+
+@pytest.fixture(scope="module")
+def aapl_pages(aapl_tree) -> list[str]:
+    """Unit texts of the frozen AAPL-2022Q3 filing, one per physical page."""
+    return [page.text for page in aapl_tree[AAPL_2022Q3]]
 
 
 @pytest.fixture
@@ -69,11 +84,11 @@ def client(http_app: FastAPI) -> TestClient:
 
 
 @pytest.fixture
-def wired(http_app: FastAPI):
+def wired(http_app: FastAPI, aapl_tree):
     """In-memory store + a scripted graph whose script tests mutate."""
     from fin.host.http import get_graph, get_thread_store
     from fin.host.thread_store import InMemoryThreadStore
-    from fin.retrieve import ExtractedTreeReadPort
+    from fin.retrieve import FakeRetrievePort
 
     store = InMemoryThreadStore()
     http_app.dependency_overrides[get_thread_store] = lambda: store
@@ -83,31 +98,24 @@ def wired(http_app: FastAPI):
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        # These tests script real ``read_file`` calls against the
-        # committed corpus, so they inject the legacy tree-backed read
-        # port explicitly (the default graph no longer reads the tree:
-        # ADR 0046 / 0047).
-        read_port=ExtractedTreeReadPort(
-            Path("data/corpus/manifest.json"),
-            Path("data/corpus/extracted"),
-        ),
+        # The scripted ``read_source`` calls in these tests read the
+        # committed corpus, so the company leg is the fake served from
+        # that same extracted tree (ADR 0046 / 0047: the serve path holds
+        # no second tree copy of its own).
+        adapter=FakeRetrievePort(pages_by_doc=aapl_tree),
     )
     http_app.dependency_overrides[get_graph] = lambda: graph
     return store, model
 
 
-def _read_call(page: int, call_id: str) -> AIMessage:
+def _read_call(unit: int, call_id: str) -> AIMessage:
+    """One ``read_source`` call for one frozen unit, from its start."""
     return AIMessage(
         content="",
         tool_calls=[
             {
-                "name": "read_file",
-                "args": {
-                    "document_id": AAPL_2022Q3,
-                    "version": AAPL_2022Q3_VERSION,
-                    "page": page,
-                    "page_limit": 1,
-                },
+                "name": "read_source",
+                "args": {"source_ref": _locator(unit), "position": 0},
                 "id": call_id,
                 "type": "tool_call",
             }
@@ -123,14 +131,6 @@ def _send(client: TestClient, thread_id: str, question: str) -> None:
     ) as r:
         assert r.status_code == 200, r.status_code
         "".join(r.iter_text())
-
-
-def _locator(page: int) -> dict[str, Any]:
-    return {
-        "document_id": AAPL_2022Q3,
-        "version": AAPL_2022Q3_VERSION,
-        "page": page,
-    }
 
 
 # ----- thread_store: the persisted column -----
@@ -241,15 +241,15 @@ def test_postgres_insert_and_read_round_trip_evidence_locators(monkeypatch) -> N
 # ----- run_payload: derived from this run's evidence -----
 
 
-def _evidence_item(page: int, text: str) -> Any:
+def _evidence_item(unit: int, text: str) -> Any:
     from fin.corpus.extracted import Locator
     from fin.host.citation_gate import EvidenceItem
 
     return EvidenceItem(
         locator=Locator(
-            document_id=AAPL_2022Q3, version=AAPL_2022Q3_VERSION, page=page
+            document_id=AAPL_2022Q3, version=AAPL_2022Q3_VERSION, unit=unit
         ),
-        page_text=text,
+        unit_text=text,
     )
 
 
@@ -261,7 +261,7 @@ def test_payload_evidence_locators_are_empty_without_evidence() -> None:
 
 
 def test_payload_deduplicates_locators_in_first_seen_order() -> None:
-    """Retrieve emits several chunks per page; the turn row lists each
+    """Retrieve emits several chunks per unit; the turn row lists each
     locator once, in the order the run first touched it."""
     from fin.host.run_payload import _run_to_response_payload
 
@@ -277,6 +277,27 @@ def test_payload_deduplicates_locators_in_first_seen_order() -> None:
         }
     )
     assert payload["evidence_locators"] == [_locator(4), _locator(1)]
+
+
+def test_payload_locator_envelope_keys_are_the_company_triple_exactly() -> None:
+    """No DTO on this path carries a generic ``page`` ordinal: the turn
+    row names a read locator with EXACTLY ``{document_id, version,
+    unit}``, so a stale whole-page spelling cannot ride along next to the
+    frozen-unit identity."""
+    from fin.host.run_payload import _run_to_response_payload
+
+    payload = _run_to_response_payload(
+        {
+            "status": "done",
+            "answer": "a",
+            "evidence": [_evidence_item(3, "unit three")],
+        }
+    )
+
+    assert payload["evidence_locators"] == [_locator(3)]
+    assert [sorted(entry) for entry in payload["evidence_locators"]] == [
+        ["document_id", "unit", "version"]
+    ]
 
 
 def test_payload_keeps_locators_on_refuse_even_though_citations_are_empty() -> None:
@@ -301,7 +322,7 @@ def test_payload_keeps_locators_on_refuse_even_though_citations_are_empty() -> N
 def test_get_history_turn_row_carries_this_run_evidence_locators(
     client: TestClient, wired, aapl_pages: list[str]
 ) -> None:
-    """A ``done`` run that read page 1 exposes that locator on
+    """A ``done`` run that read unit 1 exposes that locator on
     ``GET /api/threads/{id}``."""
     _store, model = wired
     created = client.post("/api/threads", json={"first_message": "q1"}).json()
@@ -319,10 +340,10 @@ def test_get_history_turn_row_carries_this_run_evidence_locators(
     assert turns[0]["evidence_locators"] == [_locator(1)]
 
 
-def test_refused_run_still_records_the_page_it_read(
+def test_refused_run_still_records_the_unit_it_read(
     client: TestClient, wired, aapl_pages: list[str]
 ) -> None:
-    """The run reads page 1 and then answers with a span that is not
+    """The run reads unit 1 and then answers with a span that is not
     on it: citations are empty, ``evidence_locators`` is not."""
     _store, model = wired
     created = client.post("/api/threads", json={"first_message": "q1"}).json()
@@ -343,8 +364,8 @@ def test_refused_run_still_records_the_page_it_read(
 def test_follow_up_run_does_not_inherit_previous_run_locators(
     client: TestClient, wired, aapl_pages: list[str]
 ) -> None:
-    """SC8 second half: run 2 reads page 2 only, so its row must NOT
-    list run 1's page 1 — the run-scoped evidence reset (ADR 0016) is
+    """SC8 second half: run 2 reads unit 2 only, so its row must NOT
+    list run 1's unit 1 — the run-scoped evidence reset (ADR 0016) is
     what the persisted locators reflect."""
     _store, model = wired
     created = client.post("/api/threads", json={"first_message": "q1"}).json()

@@ -12,24 +12,21 @@
 
 import { useId, useState } from "react";
 import {
-  countUniqueSourcePages,
+  countUniqueSourceUnits,
+  groupCitationsBySourceAndUnit,
   shouldCollapseSourcesList,
+  sourceCountWord,
+  type SourceGroup,
+  type UnitGroup,
 } from "../sourcesList";
+import {
+  citationSourceId,
+  citationSourceLabel,
+  formatUnitLocator,
+} from "../sourceLocator";
 import type { Citation } from "../types";
 
 type AnswerPart = string | { quote: string; index: number };
-
-type IndexedCitation = { citation: Citation; globalIndex: number };
-
-type PageGroup = {
-  page: number;
-  citations: IndexedCitation[];
-};
-
-type DocumentGroup = {
-  document_id: string;
-  pages: PageGroup[];
-};
 
 function splitAnswerAtCitations(
   answer: string,
@@ -73,40 +70,15 @@ function splitAnswerAtCitations(
   return out;
 }
 
-function groupCitationsByDocumentAndPage(
-  citations: Citation[],
-): DocumentGroup[] {
-  const docMap = new Map<string, Map<number, IndexedCitation[]>>();
-
-  for (let i = 0; i < citations.length; i += 1) {
-    const citation = citations[i];
-    let pageMap = docMap.get(citation.document_id);
-    if (!pageMap) {
-      pageMap = new Map();
-      docMap.set(citation.document_id, pageMap);
-    }
-    const pageCitations = pageMap.get(citation.page) ?? [];
-    pageCitations.push({ citation, globalIndex: i + 1 });
-    pageMap.set(citation.page, pageCitations);
-  }
-
-  return Array.from(docMap.entries()).map(([document_id, pageMap]) => ({
-    document_id,
-    pages: Array.from(pageMap.entries())
-      .sort(([a], [b]) => a - b)
-      .map(([page, pageCitations]) => ({
-        page,
-        citations: pageCitations,
-      })),
-  }));
-}
-
 const focusRingClass =
   "focus:outline-none focus:ring-2 focus:ring-[#2563EB] focus:ring-offset-1 focus:ring-offset-[#FAFAF7]";
 
 function SourceRow({ citation, index }: { citation: Citation; index: number }) {
   const [open, setOpen] = useState(false);
-  const label = `[${index}] ${citation.document_id} p.${citation.page}`;
+  const label = `[${index}] ${citationSourceLabel(citation)} ${formatUnitLocator(
+    citation.display,
+    citation.unit,
+  )}`;
   return (
     <li className="text-xs font-mono text-gray-700">
       <button
@@ -134,16 +106,16 @@ function SourceRow({ citation, index }: { citation: Citation; index: number }) {
   );
 }
 
-function PageSourcesGroup({
+function UnitSourcesGroup({
   group,
   defaultCollapsed,
 }: {
-  group: PageGroup;
+  group: UnitGroup;
   defaultCollapsed: boolean;
 }) {
   const [open, setOpen] = useState(!defaultCollapsed);
   const spanCount = group.citations.length;
-  const panelId = `source-page-${group.page}-${group.citations[0]?.globalIndex ?? 0}`;
+  const panelId = `source-unit-${group.unit}-${group.citations[0]?.globalIndex ?? 0}`;
 
   return (
     <div className="border-t border-black first:border-t-0">
@@ -154,13 +126,14 @@ function PageSourcesGroup({
         onClick={() => setOpen((v) => !v)}
         className={`w-full text-left px-3 py-1 text-xs font-mono text-gray-700 hover:bg-tool ${focusRingClass}`}
       >
-        p.{group.page} · {spanCount} span{spanCount === 1 ? "" : "s"}
+        {formatUnitLocator(group.display, group.unit)} · {spanCount} span
+        {spanCount === 1 ? "" : "s"}
       </button>
       {open ? (
         <ul id={panelId} className="px-3 pb-2 space-y-1">
           {group.citations.map(({ citation, globalIndex }) => (
             <SourceRow
-              key={`${citation.document_id}-${citation.page}-${globalIndex}`}
+              key={`${citationSourceId(citation)}-${citation.unit}-${globalIndex}`}
               citation={citation}
               index={globalIndex}
             />
@@ -175,16 +148,16 @@ function DocumentSourcesGroup({
   group,
   defaultCollapsed,
 }: {
-  group: DocumentGroup;
+  group: SourceGroup;
   defaultCollapsed: boolean;
 }) {
   const [open, setOpen] = useState(!defaultCollapsed);
-  const pageCount = group.pages.length;
-  const spanCount = group.pages.reduce(
-    (sum, page) => sum + page.citations.length,
+  const unitCount = group.units.length;
+  const spanCount = group.units.reduce(
+    (sum, unitGroup) => sum + unitGroup.citations.length,
     0,
   );
-  const panelId = `source-doc-${group.document_id}`;
+  const panelId = `source-doc-${group.identity}`;
 
   return (
     <div className="border-t border-black first:border-t-0">
@@ -195,14 +168,16 @@ function DocumentSourcesGroup({
         onClick={() => setOpen((v) => !v)}
         className={`w-full text-left px-2 py-1.5 text-xs font-mono font-medium hover:bg-tool ${focusRingClass}`}
       >
-        {group.document_id} · {pageCount} 页 · {spanCount} spans
+        {group.label} · {unitCount}{" "}
+        {sourceCountWord(group.units.map((unitGroup) => unitGroup.display))} ·{" "}
+        {spanCount} spans
       </button>
       {open ? (
         <div id={panelId}>
-          {group.pages.map((pageGroup) => (
-            <PageSourcesGroup
-              key={`${group.document_id}-${pageGroup.page}`}
-              group={pageGroup}
+          {group.units.map((unitGroup) => (
+            <UnitSourcesGroup
+              key={`${group.identity}-${unitGroup.unit}`}
+              group={unitGroup}
               defaultCollapsed={defaultCollapsed}
             />
           ))}
@@ -214,13 +189,13 @@ function DocumentSourcesGroup({
 
 function SourcesList({ citations }: { citations: Citation[] }) {
   const spanCount = citations?.length ?? 0;
-  const pageCount = countUniqueSourcePages(citations ?? []);
+  const unitCount = countUniqueSourceUnits(citations ?? []);
   const defaultCollapsed = shouldCollapseSourcesList(spanCount);
   const [open, setOpen] = useState(!defaultCollapsed);
   const panelId = useId();
   if (!citations || citations.length === 0) return null;
 
-  const grouped = groupCitationsByDocumentAndPage(citations);
+  const groups = groupCitationsBySourceAndUnit(citations);
 
   return (
     <section className="mt-2 border border-black bg-card" aria-label="Sources">
@@ -231,17 +206,18 @@ function SourcesList({ citations }: { citations: Citation[] }) {
         onClick={() => setOpen((v) => !v)}
         className={`w-full text-left px-2 py-1.5 text-xs font-mono font-medium hover:bg-tool ${focusRingClass}`}
       >
-        Sources（出处）· {pageCount} 页 · {spanCount} spans
+        Sources（出处）· {unitCount}{" "}
+        {sourceCountWord(citations.map((c) => c.display))} · {spanCount} spans
       </button>
       <p className="px-2 pb-1.5 text-xs text-gray-600 border-b border-black">
         citation gate 匹配片段，可能有半句重叠，不代表发送失败
       </p>
       {open ? (
         <div id={panelId}>
-          {grouped.map((docGroup) => (
+          {groups.map((group) => (
             <DocumentSourcesGroup
-              key={docGroup.document_id}
-              group={docGroup}
+              key={group.identity}
+              group={group}
               defaultCollapsed={defaultCollapsed}
             />
           ))}

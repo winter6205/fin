@@ -33,6 +33,7 @@ from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+from fin.corpus.extracted import load_extracted_tree
 from fin.corpus.object_store import InMemoryObjectStore
 from fin.corpus.object_store_errors import UnknownObjectKeyError
 from fin.host.attachment_budgets import AttachmentBudgets
@@ -61,13 +62,18 @@ from fin.host.run_control import RunControl
 from fin.host.scripted_model import ScriptedChatModel
 from fin.host.thread_store import InMemoryThreadStore, PostgresThreadStore
 from fin.host.workspace_http import _resume_one_attachment_wait
-from fin.retrieve import ExtractedTreeReadPort
+from fin.retrieve import FakeRetrievePort
 
 AAPL_2022Q3 = "AAPL-2022Q3"
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
-_TREE_READ_PORT = ExtractedTreeReadPort(
-    Path("data/corpus/manifest.json"),
-    Path("data/corpus/extracted"),
+# The committed corpus units behind the graph's ``read_source`` company leg;
+# the serve path itself never walks the tree (ADR 0046 / 0047).
+_READ_ADAPTER = FakeRetrievePort(
+    pages_by_doc={
+        AAPL_2022Q3: load_extracted_tree(
+            Path("data/corpus/manifest.json"), Path("data/corpus/extracted")
+        )[AAPL_2022Q3]
+    }
 )
 
 # The repo's gate for every Postgres-backed case: unset means the durable
@@ -399,7 +405,7 @@ def _compile_graph(
         "checkpointer": InMemorySaver(),
         "model": model,
         "known_document_ids": KNOWN_IDS,
-        "read_port": _TREE_READ_PORT,
+        "adapter": _READ_ADAPTER,
     }
     # WHY optional: the gate node only exists in the topology when an
     # attachment service is injected (the production composition root

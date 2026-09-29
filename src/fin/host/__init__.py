@@ -1,7 +1,7 @@
 """Host capability slice: the host graph, tool wrappers, citation gate, and surfaces.
 
-T3 adds the ADR 0009 tool wrappers (``list_files``, ``read_file``) as
-plain callables. T4 adds ``retrieve`` against an injected
+T3 adds the ADR 0009 tool wrapper (``list_files``) as a plain
+callable. T4 adds ``retrieve`` against an injected
 ``BM25Adapter``. T5 introduces the citation gate at
 ``src/fin/host/citation_gate.py``: the code gate on the path to END
 that fills the user-visible citations from extractive spans that
@@ -39,7 +39,7 @@ from fin.host.state import (
     Status,
     TERMINAL_STATUSES,
 )
-from fin.host.tools import list_files, read_file
+from fin.host.tools import list_files
 
 __all__ = [
     "AgentState",
@@ -68,6 +68,5 @@ __all__ = [
     "count_tokens_approximately",
     "session_budget_tokens",
     "list_files",
-    "read_file",
     "verify_citations",
 ]

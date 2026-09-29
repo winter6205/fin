@@ -229,7 +229,7 @@ def test_lexical_tier_real_es_hit_cites_the_parent_body(
         )
         assert chunk.source_ref.document_id == _DOCUMENT_ID
         assert chunk.source_ref.version == _VERSION
-        assert chunk.source_ref.page == 1
+        assert chunk.source_ref.unit == 1
 
 
 def test_graph_tier_sends_search_mode_on_the_wire_and_matches_the_default(
@@ -288,7 +288,7 @@ def test_graph_tier_sends_search_mode_on_the_wire_and_matches_the_default(
             (
                 chunk.text,
                 chunk.source_ref.document_id,
-                chunk.source_ref.page,
+                chunk.source_ref.unit,
                 chunk.score,
             )
             for chunk in answer["chunks"]

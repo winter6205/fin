@@ -76,13 +76,13 @@ def _page_text(issuer: str) -> str:
     return _PASSAGES[issuer]
 
 
-def _chunk(issuer: str, page: int = 1) -> Chunk:
+def _chunk(issuer: str, unit: int = 1) -> Chunk:
     return Chunk(
         text=_page_text(issuer),
         source_ref=Locator(
             document_id=_document_id(issuer),
             version=_version(issuer),
-            page=page,
+            unit=unit,
         ),
         score=1.0,
     )

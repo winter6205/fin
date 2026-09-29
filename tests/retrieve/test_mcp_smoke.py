@@ -372,8 +372,8 @@ def test_malformed_line_is_a_parse_error_and_the_server_survives(
 # ----- adapter layer: real subprocess transport -----
 
 
-def _loc(document_id: str, page: int = 1) -> Locator:
-    return Locator(document_id=document_id, version="v-" + "a" * 60, page=page)
+def _loc(document_id: str, unit: int = 1) -> Locator:
+    return Locator(document_id=document_id, version="v-" + "a" * 60, unit=unit)
 
 
 def _lenient_command() -> list[str]:
@@ -397,9 +397,9 @@ def test_adapter_over_real_stdio_transport_maps_hits_to_chunks() -> None:
     adapter = MCPRetrieveAdapter(
         command=_lenient_command(),
         locator_map={
-            "fixture-1": _loc("DOC-2023Q1", page=1),
-            "fixture-2": _loc("DOC-2023Q1", page=2),
-            "fixture-3": _loc("DOC-2023Q2", page=1),
+            "fixture-1": _loc("DOC-2023Q1", unit=1),
+            "fixture-2": _loc("DOC-2023Q1", unit=2),
+            "fixture-3": _loc("DOC-2023Q2", unit=1),
         },
         timeout_seconds=20.0,
     )
@@ -486,8 +486,8 @@ def test_adapter_over_real_transport_forwards_document_id_filter() -> None:
     adapter = MCPRetrieveAdapter(
         command=_lenient_command(),
         locator_map={
-            "fixture-1": _loc("DOC-2023Q1", page=1),
-            "fixture-3": _loc("DOC-2023Q2", page=1),
+            "fixture-1": _loc("DOC-2023Q1", unit=1),
+            "fixture-3": _loc("DOC-2023Q2", unit=1),
         },
         timeout_seconds=20.0,
     )

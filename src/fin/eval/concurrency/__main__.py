@@ -143,7 +143,7 @@ class _ScriptedFullRun:
         self.llm_calls += 1
         answer = chunks[-1].text if chunks else "No grounded answer."
         evidence = [
-            EvidenceItem(locator=chunk.source_ref, page_text=chunk.text)
+            EvidenceItem(locator=chunk.source_ref, unit_text=chunk.text)
             for chunk in chunks
         ]
         gate_result = verify_citations(

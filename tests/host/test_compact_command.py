@@ -121,12 +121,13 @@ def _tool_pair(ai_text: str, tool_body: str, call_id: str) -> list:
             content=ai_text,
             tool_calls=[
                 {
-                    "name": "read_file",
+                    "name": "read_source",
                     "args": {
-                        "document_id": AAPL_2022Q3,
-                        "version": AAPL_2022Q3_VERSION,
-                        "page": 1,
-                        "page_limit": 1,
+                        "source_ref": {
+                            "document_id": AAPL_2022Q3,
+                            "version": AAPL_2022Q3_VERSION,
+                            "unit": 1,
+                        }
                     },
                     "id": call_id,
                     "type": "tool_call",
@@ -142,11 +143,11 @@ def _fat_history() -> list:
     messages: list = []
     for index in range(3):
         messages += _tool_pair(
-            f"calling read_file {index}", _TOOL_PAYLOAD, f"c-seed-{index}"
+            f"calling read_source {index}", _TOOL_PAYLOAD, f"c-seed-{index}"
         )
     messages += _tool_pair(
-        "calling read_file 3",
-        json.dumps({"document_id": AAPL_2022Q3, "page": 1}),
+        "calling read_source 3",
+        json.dumps({"source_ref": {"document_id": AAPL_2022Q3, "unit": 1}}),
         "c-seed-3",
     )
     messages.append(AIMessage(content="x" * 300))
@@ -495,3 +496,49 @@ def test_compact_does_not_rewrite_default_title(
 
     detail = client.get(f"/api/threads/{tid}").json()
     assert detail["title"] != "/compact"
+
+
+# ----- the seeded history pairs on the tool the host still exposes -----
+
+
+def test_seeded_history_scripts_read_source_with_a_unit_locator() -> None:
+    """The gate evicts whole ``tool_call`` / ``ToolMessage`` pairs, so
+    its fixtures are only a faithful reproduction of a research thread
+    while they name the tool the graph actually offers.
+
+    A history that kept scripting the removed ``read_file`` (and its
+    ``page`` / ``page_limit`` args) would stay green while pinning a
+    contract the host no longer speaks.
+    """
+    for label, history in (("fat", _fat_history()), ("mid", _mid_history())):
+        calls = [
+            call
+            for message in history
+            for call in (getattr(message, "tool_calls", None) or [])
+        ]
+        assert calls, label
+        for call in calls:
+            assert call["name"] == "read_source", label
+            assert set(call["args"]) == {"source_ref"}, label
+            assert set(call["args"]["source_ref"]) == {
+                "document_id",
+                "version",
+                "unit",
+            }, label
+        assert "read_file" not in {call["name"] for call in calls}, label
+
+
+def test_fat_history_result_body_is_a_slice_envelope_not_a_page_dump() -> None:
+    """The one JSON-bodied ``ToolMessage`` in the fat history carries the
+    bounded slice envelope, so the kept tail pair is the shape a real
+    ``read_source`` result leaves behind."""
+    bodies = []
+    for message in _fat_history():
+        if isinstance(message, ToolMessage):
+            try:
+                bodies.append(json.loads(message.content))
+            except json.JSONDecodeError:
+                continue
+    assert bodies == [
+        {"source_ref": {"document_id": AAPL_2022Q3, "unit": 1}}
+    ]

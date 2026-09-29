@@ -111,9 +111,9 @@ def _input(text: str, attachments: list[dict[str, str]] | None = None) -> dict[s
     state["evidence"] = [
         EvidenceItem(
             locator=Locator(
-                document_id="MSFT-2023Q1", version="e" * 64, page=1
+                document_id="MSFT-2023Q1", version="e" * 64, unit=1
             ),
-            page_text=EVIDENCE_TEXT,
+            unit_text=EVIDENCE_TEXT,
         )
     ]
     return state

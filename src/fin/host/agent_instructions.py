@@ -59,6 +59,26 @@ MEMORY_POINTER_TEXT: str = (
 )
 MEMORY_POINTER_BLOCK: str = f"{MEMORY_POINTER_MARKER}\n{MEMORY_POINTER_TEXT}"
 
+# ----- visual-evidence lane usage copy (ADR 0089) -----
+# Appended only when the run's graph actually bound ``read_visual_detail``,
+# so an unwired deployment never names a tool the model cannot call. The
+# copy exists for ONE reason the tool schema cannot carry: a visual answer
+# is generated, and the citation gate rejects a generated span — a model
+# that copies it as a quotation loses its whole answer instead of gaining
+# a citation.
+VISUAL_LANE_INSTRUCTIONS_MARKER: str = "[FIN_VISUAL_LANE]"
+USAGE_VISUAL_LANE: str = (
+    VISUAL_LANE_INSTRUCTIONS_MARKER + "\n"
+    "read_visual_detail answers what a chart or figure drawn on an "
+    "attachment's PDF page plots: name the attachment_id and the 1-based "
+    "physical page from this run's tool output, plus the chart, series and "
+    "category you are reading. Its answer is a generated observation of "
+    "the picture, not text from the document: state it as what the page "
+    "shows, never copy it into a citation span, and never present it as "
+    "retrieved or quoted source text. Words printed in the document still "
+    "go through retrieve and read_source."
+)
+
 # ----- memory prefetch overlay (spec SC7 / SC8 / SC11 / ADR 0048) -----
 # The user-side overlay built from the rows produced by
 # ``memory_prefetch.select_prefetch`` ([{'fact_id','title','hook'}]).
@@ -102,7 +122,7 @@ AGENT_IDENTITY: str = (
 AGENT_SOUL: str = (
     "Speak plainly. Ground every filing claim in tool output this "
     "run; do not present parametric memory as evidence — numbers "
-    "and document claims need retrieve or read_file text. Refuse to "
+    "and document claims need retrieve or read_source text. Refuse to "
     "fabricate. Avoid invented tickers, invented periods, and made-up "
     "document identifiers."
 )
@@ -118,27 +138,27 @@ USAGE_RESEARCH: str = (
     "Use the research tools before you answer; do not rely on what "
     "you already know about any company.\n"
     "- list_files: catalog over the 知识库. Optional filters narrow "
-    "the result; later read_file calls need both document_id and the "
+    "the result; later read_source calls need both document_id and the "
     "version (sha256) this catalog returns.\n"
     "- retrieve: the retrieve port's search over the ingested "
-    "corpus on the memory service (page passages). 查已入库 goes "
+    "corpus on the memory service (passage chunks over the frozen "
+    "units). 查已入库 goes "
     "through retrieve — prefer it to locate a figure or sentence; "
     "pass document_id when you already know the filing.\n"
-    "- read_file: page text from a known locator; document_id + "
-    "version required, page is 1-based. Reading an ingested filing "
-    "dispatches to the memory service's read_source; a local path "
-    "read is a local read, and thread attachments are not citable "
-    "corpus.\n"
-    "- read_source: one bounded slice of one frozen unit; continue at "
-    "next_position until null; a known locator needs no retrieve; only "
-    "returned text is citable.\n"
+    "- read_source: one bounded slice of one frozen unit. source_ref "
+    "is a company locator {document_id, version, unit} or an attachment "
+    "locator {kind: 'attachment', attachment_id, version, unit}; take "
+    "the version from tool output this run, never invent it, and unit is "
+    "1-based. position is a zero-based code-point offset into that unit; "
+    "continue at next_position until it is null. A known locator needs no "
+    "retrieve; only text a read returned is citable.\n"
     "- get_xbrl_fact: one tagged XBRL fact from the filing's fact "
     "table (concept + reporting period; document_id narrows to one "
     "filing). A miss returns a typed not-found result; the fact row "
-    "carries its own source_locator — read that page when you need a "
+    "carries its own source_locator — read that unit when you need a "
     "citable span.\n"
     "\n"
-    "Finish only after a tool this run returned page or chunk text. "
+    "Finish only after a tool this run returned unit or chunk text. "
     "Copy a sentence, table row, or caption verbatim into the answer "
     "as a citation span; do not paraphrase the span, and do not "
     "invent document_id values. After you have evidence, write "
@@ -221,7 +241,7 @@ _USAGE_LEXICAL: str = (
     "检索档 lexical 查找 (send it as MCP filters.search_mode=lexical): "
     "retrieve answers with keyword-first matches over "
     "the corpus. Query retrieve with the operator's own keywords, "
-    "open a hit with read_file before quoting it. If the exact "
+    "open a hit with read_source before quoting it. If the exact "
     "keywords miss, rephrase them once, then tell the operator "
     "plainly that the 资料 has no keyword hit."
 )
@@ -232,7 +252,7 @@ _USAGE_KNOWLEDGE_QA: str = (
     "filters.search_mode=graph): retrieve walks the "
     "iknow graph neighborhoods first, then fills with vector "
     "and BM25 passages. Ask retrieve the question as phrased; "
-    "quote only page text this run returned — graph relations "
+    "quote only unit text this run returned — graph relations "
     "are not citable evidence."
 )
 
@@ -375,7 +395,7 @@ def attachment_context_message(
             "named again on later turns; this copy of their text is for "
             "this run only. They are NOT part of the citable "
             "corpus: the citation gate only accepts spans copied from "
-            "this run's retrieve / read_file tool text, so never "
+            "this run's retrieve / read_source tool text, so never "
             "present attachment content as retrieved evidence.\n\n"
             f"{joined}"
         )
@@ -396,6 +416,7 @@ def messages_for_model(
     *,
     missing_slots: Sequence[str] | None = None,
     memory_on: bool | None = False,
+    visual_lane_on: bool = False,
     user_profile: str | None = None,
     search_mode: str | None = None,
 ) -> list[BaseMessage]:
@@ -437,6 +458,13 @@ def messages_for_model(
     SystemMessage bytes are then byte-identical to the no-profile
     call so callers that have no profile files on disk keep their
     prefix stable.
+
+    ``visual_lane_on`` (ADR 0089): truthy when THIS run's graph bound
+    the ``read_visual_detail`` tool, which appends
+    :data:`USAGE_VISUAL_LANE` to the head SystemMessage. The copy is
+    gated on the binding rather than always present because an unwired
+    deployment must not be told about a tool it cannot call; the OFF path
+    is byte-identical to the call without it.
 
     ``search_mode`` (search-mode host T3 / ADR 0061): the 检索档
     this turn's cascade ASSIGNED (one of ``LASTING_RETRIEVE_TIERS``).
@@ -480,6 +508,11 @@ def messages_for_model(
         result = existing
     else:
         result = _append_memory_pointer(existing)
+
+    if visual_lane_on:
+        result = _append_block_to_head(
+            result, VISUAL_LANE_INSTRUCTIONS_MARKER, USAGE_VISUAL_LANE
+        )
 
     mode_block = _usage_copy_for(search_mode)
     if mode_block is None:
@@ -678,8 +711,10 @@ __all__ = [
     "USAGE_DIALOGUE",
     "USAGE_OFF_TOPIC",
     "USAGE_RESEARCH",
+    "USAGE_VISUAL_LANE",
     "USER_PROFILE_HEADER",
     "USER_PROFILE_MARKER",
+    "VISUAL_LANE_INSTRUCTIONS_MARKER",
     "attachment_context_message",
     "clarify_prompt",
     "memory_prefetch_message",

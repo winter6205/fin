@@ -23,8 +23,8 @@ Why the transcript reads the corpus
 The citation gate only says ``done`` when the answer carries a
 ≥32-character span copied verbatim from evidence this run retrieved
 (ADR 0021). A hard-coded fixture answer would therefore bounce the
-moment the frozen page text changed. The transcript instead reads the
-page it is about to quote out of the committed extracted tree at boot,
+moment the frozen unit text changed. The transcript instead reads the
+unit it is about to quote out of the committed extracted tree at boot,
 so the lane's completed turn stays grounded by construction.
 
 Pacing
@@ -50,8 +50,8 @@ from langchain_core.outputs import ChatGenerationChunk
 from pydantic import Field
 
 from fin.corpus.errors import IngestMissingError
-from fin.retrieve import ExtractedTreeReadPort
 from fin.host.scripted_model import ScriptedChatModel
+from fin.retrieve import FakeRetrievePort
 
 
 logger = logging.getLogger(__name__)
@@ -66,7 +66,7 @@ SCRIPTED_SCENARIO_ENV_VAR = "FIN_SCRIPTED_SCENARIO"
 
 # Which transcript the lane replays.
 #
-# ``grounded`` is one model step that answers from the page it just
+# ``grounded`` is one model step that answers from the unit it just
 # read — the shape T7 already drove.
 #
 # ``bounce`` prefixes that with an UNGROUNDED answer step, so the
@@ -92,15 +92,15 @@ SCRIPTED_DOCUMENT_ID = "AAPL-2022Q3"
 # enough that the whole lane run stays under a few seconds.
 DEFAULT_DELTA_PACING_MS = 200
 
-# Characters of page text quoted verbatim into the answer. Must clear
-# the gate's 32-character minimum span with room to spare.
+# Characters of frozen-unit text quoted verbatim into the answer. Must
+# clear the gate's 32-character minimum span with room to spare.
 _QUOTED_SPAN_CHARS = 180
 
 # How many chunks the answer is split into on the wire.
 _ANSWER_CHUNKS = 6
 
 # The ungrounded draft the ``bounce`` scenario streams first. It quotes
-# nothing from the page, so the gate finds no verbatim span and takes
+# nothing from the unit, so the gate finds no verbatim span and takes
 # the bounce path. Long enough that the browser sees real prose in the
 # bubble before the retry replaces it — a one-word draft would make the
 # no-blank invariant untestable.
@@ -139,7 +139,7 @@ class ScriptedBootFixtureError(ScriptedBootError):
     """The frozen corpus cannot supply the transcript's grounded quote.
 
     Raised when the extracted tree is missing, does not contain
-    :data:`SCRIPTED_DOCUMENT_ID`, or its first page is shorter than the
+    :data:`SCRIPTED_DOCUMENT_ID`, or its first unit is shorter than the
     span the answer must quote. Booting anyway would serve a lane whose
     every run bounces the citation gate for reasons that have nothing
     to do with the code under test.
@@ -272,13 +272,14 @@ def build_scripted_transcript(
     *,
     document_id: str,
     version: str,
-    page_text: str,
+    unit: int,
+    unit_text: str,
     scenario: str = SCRIPTED_SCENARIO_GROUNDED,
 ) -> list[list[AIMessageChunk]]:
     """Return the streamed responses one scripted run replays.
 
     Response 1 is the research step: reasoning deltas plus a
-    ``read_file`` tool call split across chunks (exactly the shape the
+    ``read_source`` tool call split across chunks (exactly the shape the
     live provider streams). The last response is the answer step: one
     more reasoning delta, then the grounded answer split into
     :data:`_ANSWER_CHUNKS` content chunks so the wire carries deltas
@@ -293,11 +294,18 @@ def build_scripted_transcript(
             f"scenario={scenario!r} names no scripted transcript; use "
             f"one of {list(SCRIPTED_SCENARIOS)}."
         )
-    quote = page_text[:_QUOTED_SPAN_CHARS]
-    answer = f"Per {document_id} page 1: {quote}"
+    quote = unit_text[:_QUOTED_SPAN_CHARS]
+    # A company unit presents as a physical page, which is the label the
+    # browser lane's transcript and its assertions use.
+    answer = f"Per {document_id} page {unit}: {quote}"
+    # The transcript quotes ``unit_text``, so it must name that unit: an
+    # identity that did not resolve would return no text and the gate
+    # would bounce every lane run for a reason unrelated to the code
+    # under test.
     args = (
+        '{"source_ref": '
         f'{{"document_id": "{document_id}", "version": "{version}", '
-        '"page": 1, "page_limit": 1}'
+        f'"unit": {unit}}}, "position": 0}}'
     )
     draft_step: list[list[AIMessageChunk]] = []
     if scenario == SCRIPTED_SCENARIO_BOUNCE:
@@ -313,7 +321,7 @@ def build_scripted_transcript(
                 content="",
                 additional_kwargs={
                     "reasoning_details": [
-                        {"text": f"Reading {document_id} page 1 "}
+                        {"text": f"Reading {document_id} page {unit} "}
                     ]
                 },
             ),
@@ -324,7 +332,7 @@ def build_scripted_transcript(
                 },
                 tool_call_chunks=[
                     {
-                        "name": "read_file",
+                        "name": "read_source",
                         "args": "",
                         "id": "scripted-read-1",
                         "index": 0,
@@ -356,10 +364,16 @@ def build_scripted_transcript(
     ]
 
 
-def _load_fixture_page(
+def _load_fixture_unit(
     manifest_path: Path, extracted_root: Path
-) -> tuple[str, str, set[str]]:
-    """Return ``(version, page_text, known_document_ids)`` for the lane."""
+) -> tuple[str, int, str, dict[str, Any]]:
+    """Return ``(version, unit, unit_text, pages_by_doc)`` for the lane.
+
+    The tree is returned alongside the one unit because the lane's
+    company read leg is the fake retrieve port: it serves
+    ``read_source`` only from the bodies it is handed at construction,
+    and the extracted tree is that body table here.
+    """
     from fin.corpus.extracted import load_extracted_tree
 
     try:
@@ -376,13 +390,19 @@ def _load_fixture_page(
             f"the frozen corpus has no {SCRIPTED_DOCUMENT_ID}; the "
             "scripted e2e transcript quotes that filing."
         )
-    page = pages[0]
-    if len(page.text) < _QUOTED_SPAN_CHARS:
+    unit_page = pages[0]
+    if len(unit_page.text) < _QUOTED_SPAN_CHARS:
         raise ScriptedBootFixtureError(
-            f"{SCRIPTED_DOCUMENT_ID} page 1 has {len(page.text)} characters; "
-            f"the scripted transcript quotes {_QUOTED_SPAN_CHARS}."
+            f"{SCRIPTED_DOCUMENT_ID} unit {unit_page.locator.unit} has "
+            f"{len(unit_page.text)} characters; the scripted transcript "
+            f"quotes {_QUOTED_SPAN_CHARS}."
         )
-    return page.locator.version, page.text, set(tree)
+    return (
+        unit_page.locator.version,
+        unit_page.locator.unit,
+        unit_page.text,
+        dict(tree),
+    )
 
 
 # ----- the boot path -----
@@ -416,13 +436,14 @@ def compile_for_scripted_e2e(
     """
     from langgraph.checkpoint.memory import InMemorySaver
 
-    from fin.host.graph import RETRIEVE_ADAPTER_FAKE, compile_graph
+    from fin.host.graph import compile_graph
 
     delta_seconds = _delta_seconds(env)
     scenario = scripted_scenario(env)
     mpath = Path(manifest_path) if manifest_path else _DEFAULT_MANIFEST_PATH
     rpath = Path(extracted_root) if extracted_root else _DEFAULT_EXTRACTED_ROOT
-    version, page_text, known_document_ids = _load_fixture_page(mpath, rpath)
+    version, unit, unit_text, pages_by_doc = _load_fixture_unit(mpath, rpath)
+    known_document_ids = set(pages_by_doc)
 
     message = (
         f"{SCRIPTED_BOOT_ENV_VAR} is set: this process answers from a "
@@ -437,7 +458,8 @@ def compile_for_scripted_e2e(
         stream_responses=build_scripted_transcript(
             document_id=SCRIPTED_DOCUMENT_ID,
             version=version,
-            page_text=page_text,
+            unit=unit,
+            unit_text=unit_text,
             scenario=scenario,
         ),
         delta_seconds=delta_seconds,
@@ -448,13 +470,17 @@ def compile_for_scripted_e2e(
         known_document_ids=known_document_ids,
         manifest_path=mpath,
         extracted_root=rpath,
-        retrieve_adapter=RETRIEVE_ADAPTER_FAKE,
-        # The lane's transcript quotes the frozen corpus by design (see
-        # "Why the transcript reads the corpus" above), so its scripted
-        # ``read_file`` call is served by the legacy tree-backed read
-        # port — an explicit fixture choice, typed-error at boot when
-        # the tree is absent, never a serve-path SSOT (ADR 0046/0047).
-        read_port=ExtractedTreeReadPort(mpath, rpath),
+        # The transcript's read_source call is served by the run's own
+        # company leg, so the hermetic fake port is built WITH the frozen
+        # tree as its readable bodies: a port without them would answer
+        # every scripted read ``unknown_locator`` and bounce the gate for
+        # a reason unrelated to the code under test. An explicit fixture
+        # choice, typed-error at boot when the tree is absent, never a
+        # serve-path SSOT (ADR 0046/0047).
+        adapter=FakeRetrievePort(
+            known_document_ids=known_document_ids,
+            pages_by_doc=pages_by_doc,
+        ),
     )
 
 

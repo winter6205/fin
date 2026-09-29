@@ -121,14 +121,18 @@ AAPL_2022Q3_VERSION = (
 )
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
-# Legacy tree-backed read adapter over the committed corpus. Only the
-# scripted ``read_file`` transcripts need it; the default graph no
+# The ``read_source`` company leg over the committed corpus units. Only
+# the scripted ``read_source`` transcripts need it; the default graph no
 # longer reads the tree on its own (ADR 0046 / 0047).
-from fin.retrieve import ExtractedTreeReadPort
+from fin.corpus.extracted import load_extracted_tree
+from fin.retrieve import FakeRetrievePort
 
-_TREE_READ_PORT = ExtractedTreeReadPort(
-    Path("data/corpus/manifest.json"),
-    Path("data/corpus/extracted"),
+_READ_ADAPTER = FakeRetrievePort(
+    pages_by_doc={
+        AAPL_2022Q3: load_extracted_tree(
+            Path("data/corpus/manifest.json"), Path("data/corpus/extracted")
+        )[AAPL_2022Q3]
+    }
 )
 
 
@@ -136,7 +140,7 @@ def _numeric_gate_fail_run() -> dict:
     """Scripted research run whose answer quotes a wrong number.
 
     Mirrors ``tests/host/test_research_done_with_fact.py``: the
-    answer embeds a >=32-char span from the read page so the
+    answer embeds a >=32-char span from the read unit so the
     citation gate passes and the NUMERIC gate is the refusing one.
     """
     span = (
@@ -164,12 +168,13 @@ def _numeric_gate_fail_run() -> dict:
                 content="",
                 tool_calls=[
                     {
-                        "name": "read_file",
+                        "name": "read_source",
                         "args": {
-                            "document_id": AAPL_2022Q3,
-                            "version": AAPL_2022Q3_VERSION,
-                            "page": 1,
-                            "page_limit": 1,
+                            "source_ref": {
+                                "document_id": AAPL_2022Q3,
+                                "version": AAPL_2022Q3_VERSION,
+                                "unit": 1,
+                            }
                         },
                         "id": "c-read",
                         "type": "tool_call",
@@ -183,7 +188,7 @@ def _numeric_gate_fail_run() -> dict:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
         facts_root=_facts_root(),
     )
     return graph.invoke(
@@ -221,3 +226,22 @@ def test_numeric_gate_fail_run_summarizes_the_fact_lookup() -> None:
     summary = fact_rows[0]["summary"]
     assert summary != "get_xbrl_fact"
     assert "us-gaap:Revenues" in summary
+
+
+def test_numeric_gate_fail_run_reads_through_read_source() -> None:
+    """The refused turn must be produced by the tool the host still
+    exposes.
+
+    Reaching the numeric gate requires citable evidence, so a run that
+    got there through the removed ``read_file`` would pin terminal copy
+    onto a transcript no real turn can generate any more. The read row
+    also names its unit — the operator's trail back to the filing.
+    """
+    payload = _run_to_response_payload(_numeric_gate_fail_run())
+    names = [row["name"] for row in payload["tool_summaries"]]
+    assert "read_source" in names
+    assert "read_file" not in names
+    read_row = next(
+        row for row in payload["tool_summaries"] if row["name"] == "read_source"
+    )
+    assert read_row["summary"] == f"{AAPL_2022Q3} u.1"

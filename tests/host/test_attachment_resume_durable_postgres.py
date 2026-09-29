@@ -243,8 +243,8 @@ def _input(attachments: list[dict[str, str]]) -> dict[str, Any]:
     state = reset_input_state(GROUNDED, attachments=attachments)
     state["evidence"] = [
         EvidenceItem(
-            locator=Locator(document_id="MSFT-2023Q1", version="e" * 64, page=1),
-            page_text=EVIDENCE_TEXT,
+            locator=Locator(document_id="MSFT-2023Q1", version="e" * 64, unit=1),
+            unit_text=EVIDENCE_TEXT,
         )
     ]
     return state

@@ -7,6 +7,7 @@ import json
 from fin.retrieve.source_read import (
     INVALID_LOCATOR,
     INVALID_POSITION,
+    SOURCE_READ_MAX_LOCATOR_CODE_POINTS,
     SOURCE_READ_MAX_RESULT_BYTES,
     SOURCE_READ_MAX_TEXT_CODE_POINTS,
     bounded_slice,
@@ -15,6 +16,16 @@ from fin.retrieve.source_read import (
 )
 
 _REF = {"document_id": "doc-a", "version": "3", "unit": 1}
+
+
+def test_the_bounded_read_limits_are_the_pinned_policy_values() -> None:
+    """The bound's VALUE is the product promise the model can plan
+    against, so it is pinned through the public symbols rather than only
+    exercised: 8,000 code points of text, a 32 KiB serialized result, a
+    locator allowed 1,024 code points of its own."""
+    assert SOURCE_READ_MAX_TEXT_CODE_POINTS == 8000
+    assert SOURCE_READ_MAX_RESULT_BYTES == 32768
+    assert SOURCE_READ_MAX_LOCATOR_CODE_POINTS == 1024
 
 
 def test_a_short_unit_reads_one_slice_to_the_end() -> None:

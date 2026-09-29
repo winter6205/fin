@@ -15,15 +15,16 @@ fixture goes through ``IngestEndpoint`` + ``MCPPushPort`` into the live
 iknow server, and a sibling retrieve comes back with canonical,
 byte-identical chunks. This file takes the same live session one hop
 further and drives the **product research track** over it: a compiled
-host graph (:func:`fin.host.compile_graph`) whose retrieve / ``read``
-faces are the same ``MCPRetrieveAdapter`` the product boots, plus a
+host graph (:func:`fin.host.compile_graph`) whose retrieve and
+``read_source`` faces are the same ``MCPRetrieveAdapter`` the product
+boots, plus a
 scripted model. Spec SC8 asks for one research send that ends ``done``
 whose citation span is a substring of **this run's** retrieve text — so
 the two assertions that carry the test are:
 
 * the run's status is ``done`` and it carries >= 1 citation;
 * every citation's ``quote`` is a substring of a chunk text THIS RUN
-  received, and every citation's ``(document_id, version, page)`` is one
+  received, and every citation's ``(document_id, version, unit)`` is one
   of that payload's locators (ADR 0021: the locator comes from the
   evidence, never from the model's claim).
 
@@ -343,7 +344,7 @@ def test_research_done_cites_this_runs_retrieved_text(
         (
             chunk["source_ref"]["document_id"],
             chunk["source_ref"]["version"],
-            chunk["source_ref"]["page"],
+            chunk["source_ref"]["unit"],
         )
         for chunk in chunks
     ]
@@ -364,10 +365,10 @@ def test_research_done_cites_this_runs_retrieved_text(
         assert (
             citation.document_id,
             citation.version,
-            citation.page,
+            citation.unit,
         ) in retrieved_locators, (
             f"citation locator {citation.document_id!r} / "
-            f"{citation.version[:12]!r} / {citation.page!r} is not one of "
+            f"{citation.version[:12]!r} / {citation.unit!r} is not one of "
             "this run's retrieved chunk locators"
         )
 

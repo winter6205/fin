@@ -381,7 +381,7 @@ def test_subsequent_retrieve_hits_the_pushed_text() -> None:
                     source_ref=Locator(
                         document_id=locator["document_id"],
                         version=locator["version"],
-                        page=locator["unit"],
+                        unit=locator["unit"],
                     ),
                     score=1.0,
                 )

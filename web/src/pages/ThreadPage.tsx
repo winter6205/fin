@@ -4,6 +4,7 @@
 import { memo, useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import AnswerWithCitations from "../components/CitationChips";
+import VisualClaims from "../components/VisualClaims";
 import Composer from "../components/Composer";
 import type { Comparison, ToolSummary, Turn } from "../types";
 import {
@@ -25,6 +26,7 @@ import {
   shouldRenderStreamErrorKind,
   streamErrorKindRowText,
 } from "../streamErrorKind";
+import { turnVisualClaims } from "../visualClaims";
 import {
   canSubmitFeedback,
   feedbackErrorVisible,
@@ -354,6 +356,12 @@ const TurnView = memo(function TurnView({
   // they stay visible on a refuse row where the answer card holds
   // only the ordinary-person copy.
   const comparisons = turnComparisons(turn);
+  // The run's visual observations, beside the answer rather than inside it.
+  // A generated observation is not a source quote, so it never joins the
+  // chips or the sources list (spec thread-attachment-source-read lines 58 /
+  // 65). Projected through the one function the history load also uses, so a
+  // reload renders what the live stream rendered.
+  const visualClaims = turnVisualClaims(turn);
   return (
     <article className="max-w-3xl mx-auto space-y-2">
       <div className="flex justify-end">
@@ -451,6 +459,11 @@ const TurnView = memo(function TurnView({
           ) : null}
         </div>
       )}
+      {/* The visual-observation surface. A sibling of the answer card, not a
+          child of the chips, so a claim is visible on a refuse row too and
+          can never be placed as a span in the prose. The component renders
+          nothing when the turn made no claim. */}
+      <VisualClaims threadId={threadId} claims={visualClaims} />
       {/* T8: the thumbs tail card — the operator's verdict on this
           turn, rendered after the answer card so it reads as a
           per-turn action. T3 (#251): gated to the LAST terminal
@@ -642,9 +655,9 @@ function ComparisonTable({ comparison }: { comparison: Comparison }) {
           </tbody>
         </table>
       </div>
-      {/* The pages every number came from. A figure in this table
-          is not a citation — the verifier only fills verified page
-          spans — but the operator still needs the trail back to
+      {/* The source units every number came from. A figure in this
+          table is not a citation — the verifier only fills verified
+          unit spans — but the operator still needs the trail back to
           the filing. */}
       {comparison.locators.length > 0 ? (
         <p className="border-t border-gray-300 px-3 py-1.5 text-xs text-gray-500">

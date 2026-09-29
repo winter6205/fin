@@ -22,9 +22,11 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+from fin.corpus.extracted import load_extracted_tree
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.state import reset_input_state
 from fin.host.tools.compare_facts import COMPARISON_SCHEMA
+from fin.retrieve import FakeRetrievePort
 
 
 AAPL_2022Q3 = "AAPL-2022Q3"
@@ -33,14 +35,15 @@ AAPL_2022Q3_VERSION = (
 )
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "AAPL-2023Q3", "MSFT-2023Q3"}
 
-# Legacy tree-backed read adapter over the committed corpus. Only the
-# scripted ``read_file`` transcripts need it; the default graph no
+# The ``read_source`` company leg over the committed corpus units. Only
+# the scripted ``read_source`` transcripts need it; the default graph no
 # longer reads the tree on its own (ADR 0046 / 0047).
-from fin.retrieve import ExtractedTreeReadPort
-
-_TREE_READ_PORT = ExtractedTreeReadPort(
-    Path("data/corpus/manifest.json"),
-    Path("data/corpus/extracted"),
+_READ_ADAPTER = FakeRetrievePort(
+    pages_by_doc={
+        AAPL_2022Q3: load_extracted_tree(
+            Path("data/corpus/manifest.json"), Path("data/corpus/extracted")
+        )[AAPL_2022Q3]
+    }
 )
 
 # A verbatim slice of the committed AAPL-2022Q3 page 1. The citation
@@ -58,7 +61,7 @@ def _thread_config(thread_id: str) -> dict:
 def _compare_then_answer_script(
     *, answer: str, periods: list[str], issuers: list[str] | None = None
 ) -> list[AIMessage]:
-    """compare_facts -> read_file (evidence) -> prose answer."""
+    """compare_facts -> read_source (evidence) -> prose answer."""
     return [
         AIMessage(
             content="",
@@ -79,12 +82,14 @@ def _compare_then_answer_script(
             content="",
             tool_calls=[
                 {
-                    "name": "read_file",
+                    "name": "read_source",
                     "args": {
-                        "document_id": AAPL_2022Q3,
-                        "version": AAPL_2022Q3_VERSION,
-                        "page": 1,
-                        "page_limit": 1,
+                        "source_ref": {
+                            "document_id": AAPL_2022Q3,
+                            "version": AAPL_2022Q3_VERSION,
+                            "unit": 1,
+                        },
+                        "position": 0,
                     },
                     "id": "c-read",
                     "type": "tool_call",
@@ -106,7 +111,7 @@ def _run(script: list[AIMessage], *, facts_root: Path, thread_id: str) -> dict:
         checkpointer=InMemorySaver(),
         model=ScriptedChatModel(script=script),
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
         facts_root=facts_root,
     )
     return graph.invoke(
@@ -134,7 +139,7 @@ def test_compile_graph_binds_compare_facts_after_get_xbrl_fact(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
         facts_root=compare_seed.root,
     )
     names = [getattr(t, "name", repr(t)) for t in model.bound_tools]
