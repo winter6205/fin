@@ -4,7 +4,7 @@ research track ``done`` path (T5 acceptance).
 * ``test_research_done_passes_when_fact_matches_answer`` — the model
   calls ``get_xbrl_fact`` and the answer quotes the seeded value;
   numeric gate passes, citation gate passes (the answer is also
-  evidenced via a ``read_file`` span), ``status == "done"``.
+  evidenced via a ``read_source`` span), ``status == "done"``.
 * ``test_research_done_refuses_when_claim_unmatched`` — the model
   calls ``get_xbrl_fact`` and the answer cites a wrong value; numeric
   gate fails, ``status == "refuse"`` with
@@ -37,9 +37,10 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-from fin.corpus.extracted import Locator
+from fin.corpus.extracted import load_extracted_tree
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.tools.get_xbrl_fact import get_xbrl_fact
+from fin.retrieve import FakeRetrievePort
 
 
 # ----- corpus fixtures (committed tree + seed) -----
@@ -55,14 +56,15 @@ SEED_VERSION = (
 )
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
-# Legacy tree-backed read adapter over the committed corpus. Only the
-# scripted ``read_file`` transcripts need it; the default graph no
+# The ``read_source`` company leg over the committed corpus units. Only
+# the scripted ``read_source`` transcripts need it; the default graph no
 # longer reads the tree on its own (ADR 0046 / 0047).
-from fin.retrieve import ExtractedTreeReadPort
-
-_TREE_READ_PORT = ExtractedTreeReadPort(
-    Path("data/corpus/manifest.json"),
-    Path("data/corpus/extracted"),
+_READ_ADAPTER = FakeRetrievePort(
+    pages_by_doc={
+        AAPL_2022Q3: load_extracted_tree(
+            Path("data/corpus/manifest.json"), Path("data/corpus/extracted")
+        )[AAPL_2022Q3]
+    }
 )
 
 
@@ -92,11 +94,11 @@ def _invocation_script(
     2. ``get_xbrl_fact`` call (the T5 lookup).
     3. ``AIMessage(answer)`` — the final prose the gate inspects.
 
-    When ``include_read`` is True, a ``read_file`` call sits between
+    When ``include_read`` is True, a ``read_source`` call sits between
     ``get_xbrl_fact`` and the answer so the citation gate has
     evidence to ground an extractive span (the numeric gate does
     NOT contribute evidence; ``get_xbrl_fact`` returns ToolMessage
-    JSON, not page text).
+    JSON, not unit text).
     """
     script: list[AIMessage] = [
         # Step 1: look up the seeded XBRL fact.
@@ -117,8 +119,8 @@ def _invocation_script(
         ),
     ]
     if include_read:
-        # Step 2: read a real page to give the citation gate
-        # something to match a >=32-char span against. The page
+        # Step 2: read one frozen unit to give the citation gate
+        # something to match a >=32-char span against. The unit
         # text is part of the canonical extracted tree; we don't
         # quote from it here (the answer embeds its own value), so
         # the numeric gate is the binding check.
@@ -128,12 +130,14 @@ def _invocation_script(
                 content="",
                 tool_calls=[
                     {
-                        "name": "read_file",
+                        "name": "read_source",
                         "args": {
-                            "document_id": AAPL_2022Q3,
-                            "version": AAPL_2022Q3_VERSION,
-                            "page": 1,
-                            "page_limit": 1,
+                            "source_ref": {
+                                "document_id": AAPL_2022Q3,
+                                "version": AAPL_2022Q3_VERSION,
+                                "unit": 1,
+                            },
+                            "position": 0,
                         },
                         "id": read_call_id,
                         "type": "tool_call",
@@ -150,10 +154,10 @@ def _invocation_script(
 
 def test_research_done_passes_when_fact_matches_answer() -> None:
     """Scripted trajectory: model calls ``get_xbrl_fact`` then
-    ``read_file`` (for evidence), then answers with the seeded
+    ``read_source`` (for evidence), then answers with the seeded
     value verbatim. The numeric gate matches the answer's number
-    against the fact row; the citation gate has a page-text span
-    via ``read_file``. End state: ``status == "done"``."""
+    against the fact row; the citation gate has a unit-text span
+    via ``read_source``. End state: ``status == "done"``."""
     # We use the seeded value ([private source value removed] -- Apple's total net sales in
     # millions for the nine months ended July 1, 2023, as printed on
     # the cited page) so the numeric gate passes via
@@ -170,7 +174,7 @@ def test_research_done_passes_when_fact_matches_answer() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
         facts_root=_facts_root(),
     )
     out = g.invoke(
@@ -184,7 +188,7 @@ def test_research_done_passes_when_fact_matches_answer() -> None:
     )
     # The model authored the seeded value; numeric gate passes.
     # (The citation gate may still bounce if the answer doesn't
-    # carry a >=32-char extractive span from the read page; the
+    # carry a >=32-char extractive span from the read unit; the
     # numeric gate check we are pinning here is the refusal
     # semantics, not the bounce path.)
     assert out["status"] in ("done", "refuse")
@@ -201,17 +205,17 @@ def test_research_done_passes_when_fact_matches_answer() -> None:
 
 def test_research_done_refuses_when_claim_unmatched() -> None:
     """Scripted trajectory: model calls ``get_xbrl_fact`` and
-    ``read_file`` (so the citation gate can pass), then answers
+    ``read_source`` (so the citation gate can pass), then answers
     with a WRONG value (``$999``). The numeric gate flags the
     claim as unmatched; ``citation_gate_node`` refuses with
     ``status_reason == "numeric_gate_fail"``.
 
-    The answer ALSO quotes a >=32-char span from the read page so
+    The answer ALSO quotes a >=32-char span from the read unit so
     the citation gate accepts the answer's evidence (otherwise
     the citation gate bounces, not the numeric gate, and we
     would never reach the numeric check).
     """
-    # AAPL-2022Q3 page 1 real text — the citation gate extracts
+    # AAPL-2022Q3 unit 1 real text — the citation gate extracts
     # a span from it. We embed a 32+ char snippet so the citation
     # gate passes, AND a wrong number so the numeric gate fails.
     span = (
@@ -230,7 +234,7 @@ def test_research_done_refuses_when_claim_unmatched() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
         facts_root=_facts_root(),
     )
     out = g.invoke(
@@ -255,8 +259,8 @@ def test_research_done_no_fact_call_skips_numeric_gate() -> None:
     skipped per T5 acceptance ("non-research skips the fact gate";
     a research run that doesn't use the tool also skips).
 
-    The script uses ``list_files`` then ``read_file`` so the
-    citation gate has a page-text span to match — ``done``.
+    The script uses ``list_files`` then ``read_source`` so the
+    citation gate has a unit-text span to match — ``done``.
     """
     model = ScriptedChatModel(
         script=[
@@ -264,12 +268,14 @@ def test_research_done_no_fact_call_skips_numeric_gate() -> None:
                 content="",
                 tool_calls=[
                     {
-                        "name": "read_file",
+                        "name": "read_source",
                         "args": {
-                            "document_id": AAPL_2022Q3,
-                            "version": AAPL_2022Q3_VERSION,
-                            "page": 1,
-                            "page_limit": 1,
+                            "source_ref": {
+                                "document_id": AAPL_2022Q3,
+                                "version": AAPL_2022Q3_VERSION,
+                                "unit": 1,
+                            },
+                            "position": 0,
                         },
                         "id": "c-read",
                         "type": "tool_call",
@@ -279,7 +285,7 @@ def test_research_done_no_fact_call_skips_numeric_gate() -> None:
             # Numeric claims in the answer — but no fact call —
             # so the gate is skipped.
             AIMessage(
-                content="Revenue was $383,285,000,000 in 2023 Q3 (sourced from read_file)."
+                content="Revenue was $383,285,000,000 in 2023 Q3 (sourced from read_source)."
             ),
         ]
     )
@@ -287,7 +293,7 @@ def test_research_done_no_fact_call_skips_numeric_gate() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
         facts_root=_facts_root(),
     )
     out = g.invoke(
@@ -312,17 +318,17 @@ def test_research_done_no_fact_call_skips_numeric_gate() -> None:
 def test_research_fact_only_trace_without_read_or_retrieve_refuses() -> None:
     """operator-console-host-contract T3 acceptance: a research-track
     answer that asserts a numeric/filing claim about an ingested
-    filing, on a trace with NEITHER ``retrieve`` NOR ``read_file``
+    filing, on a trace with NEITHER ``retrieve`` NOR ``read_source``
     calls, must FAIL the hard gate.
 
     The script calls only ``get_xbrl_fact`` — the fact row matches
     the claimed value, so the numeric gate would pass if it were
     reached — and then answers with the seeded value and a locator
     claim. ``get_xbrl_fact`` contributes no ``EvidenceItem``s (fact
-    rows are not page text), so the citation gate has no evidence to
+    rows are not unit text), so the citation gate has no evidence to
     match a ≥32-char span against: bounce until the repair cap, then
     refuse ``citation_repair_cap``. A fact-table hit alone is not a
-    retrieve / read_source trace; grounding still requires page or
+    retrieve / read_source trace; grounding still requires unit or
     chunk text from this run's tools.
     """
     from fin.host.graph import REPAIR_CAP
@@ -337,7 +343,7 @@ def test_research_fact_only_trace_without_read_or_retrieve_refuses() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
         facts_root=_facts_root(),
     )
     out = g.invoke(
@@ -349,7 +355,7 @@ def test_research_fact_only_trace_without_read_or_retrieve_refuses() -> None:
         },
         config=_thread_config("t-research-no-read-no-retrieve"),
     )
-    # The hard gate refuses: no retrieve / read_file text on the trace
+    # The hard gate refuses: no retrieve / read_source text on the trace
     # means no evidence, and the repair cap turns the bounce loop into
     # a terminal refuse. The locator claim (AAPL-2022Q3) is in the
     # caller's known-id set, so this is the repair-cap refuse, not
@@ -419,7 +425,7 @@ def test_compile_graph_binds_get_xbrl_fact_tool() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
         facts_root=_facts_root(),
     )
     # ``bind_tools`` records the tool list on the scripted model.

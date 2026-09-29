@@ -29,9 +29,10 @@ LLM, no Postgres). The graph is injected via FastAPI's
 ``dependency_overrides`` so we can drive the route without booting
 the prod runtime composer (T8).
 
-The committed extracted tree at ``data/corpus/extracted/`` is
-required for tests that exercise the tool functions; the
-``aapl_page1_text`` fixture seeds a ≥32-char extractive span for
+The committed extracted tree at ``data/corpus/extracted/`` backs the
+``FakeRetrievePort`` manifest the scripted ``read_source`` transcripts
+read through; the graph itself never walks the tree (ADR 0046 / 0047).
+The ``aapl_page1_text`` fixture seeds a ≥32-char extractive span for
 the scripted ``done`` run.
 """
 
@@ -63,25 +64,27 @@ AAPL_2022Q3_VERSION = (
 )
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
-# Legacy tree-backed read adapter over the committed corpus. Only the
-# scripted ``read_file`` transcripts need it; the default graph no
+# The ``read_source`` company leg over the committed corpus units. Only
+# the scripted ``read_source`` transcripts need it; the default graph no
 # longer reads the tree on its own (ADR 0046 / 0047).
-from fin.retrieve import ExtractedTreeReadPort
+from fin.corpus.extracted import load_extracted_tree
+from fin.retrieve import FakeRetrievePort
 
-_TREE_READ_PORT = ExtractedTreeReadPort(
-    Path("data/corpus/manifest.json"),
-    Path("data/corpus/extracted"),
+_READ_ADAPTER = FakeRetrievePort(
+    pages_by_doc={
+        AAPL_2022Q3: load_extracted_tree(
+            Path("data/corpus/manifest.json"), Path("data/corpus/extracted")
+        )[AAPL_2022Q3]
+    }
 )
 
 
 @pytest.fixture(scope="session")
 def aapl_page1_text() -> str:
-    """Real page-1 text from AAPL-2022Q3 used to seed a ≥32-char span."""
-    from fin.corpus.extracted import load_extracted_tree
-
-    manifest = Path("data/corpus/manifest.json")
-    extracted = Path("data/corpus/extracted")
-    tree = load_extracted_tree(manifest, extracted)
+    """Real first-unit text from AAPL-2022Q3 used to seed a ≥32-char span."""
+    tree = load_extracted_tree(
+        Path("data/corpus/manifest.json"), Path("data/corpus/extracted")
+    )
     return tree[AAPL_2022Q3][0].text
 
 
@@ -114,7 +117,7 @@ def _install_graph(app: FastAPI, script: list[AIMessage], *, thread_id_for_model
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
     )
     app.dependency_overrides[get_graph] = lambda: g
     return g
@@ -126,12 +129,13 @@ def _scripted_read_then_answer(answer: str, *, document_id: str = AAPL_2022Q3, v
             content="",
             tool_calls=[
                 {
-                    "name": "read_file",
+                    "name": "read_source",
                     "args": {
-                        "document_id": document_id,
-                        "version": version,
-                        "page": 1,
-                        "page_limit": 1,
+                        "source_ref": {
+                            "document_id": document_id,
+                            "version": version,
+                            "unit": 1,
+                        }
                     },
                     "id": "c-read",
                     "type": "tool_call",
@@ -161,11 +165,30 @@ def test_ask_minimal_question_returns_200(client: TestClient, aapl_page1_text: s
     assert isinstance(body["thread_id"], str)
     uuid.UUID(body["thread_id"])  # raises if not a valid UUID
     cit = body["citations"][0]
-    assert set(cit.keys()) == {"document_id", "version", "page", "quote"}
+    # The full frozen wire contract (``run_payload`` emits these eight
+    # and nothing else): an attachment citation is openable only from
+    # ``attachment_id`` + ``display`` / ``filename``, so the shape must
+    # be pinned as a set, not as a subset.
+    assert set(cit.keys()) == {
+        "kind",
+        "document_id",
+        "attachment_id",
+        "version",
+        "unit",
+        "display",
+        "filename",
+        "quote",
+    }
+    assert cit["kind"] == "company"
     assert cit["document_id"] == AAPL_2022Q3
+    assert cit["attachment_id"] == ""
     assert cit["version"] == AAPL_2022Q3_VERSION
-    assert cit["page"] == 1
+    assert cit["unit"] == 1
+    assert cit["display"] == "page"
+    assert cit["filename"] == ""
     assert cit["quote"] == aapl_page1_text[:80]
+    # A source locator carries no generic physical-page key any more.
+    assert "page" not in cit
 
 
 def test_ask_explicit_thread_id_echoed(client: TestClient, aapl_page1_text: str) -> None:
@@ -254,7 +277,7 @@ def test_ask_refuse_citation_repair_cap_reason(client: TestClient, aapl_page1_te
     _install_graph(
         client.app,
         _scripted_read_then_answer(
-            # Deliberately no ≥32-char span from the page → bounces
+            # Deliberately no ≥32-char span from the read unit → bounces
             answer="vague answer with no evidence",
         ),
     )
@@ -318,7 +341,7 @@ def test_ask_concurrent_run_returns_409(http_app: FastAPI) -> None:
         checkpointer=InMemorySaver(),
         model=blocking,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
     )
 
     from fin.host.http import get_graph
@@ -422,7 +445,7 @@ def test_http_app_has_no_auth_or_cookie_processing() -> None:
         checkpointer=InMemorySaver(),
         model=ScriptedChatModel(script=[AIMessage(content="x")]),
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
     )
     app.dependency_overrides[get_graph] = lambda: g
 
@@ -512,7 +535,7 @@ def test_ask_error_bodies_have_no_sensitive_leakage(client: TestClient) -> None:
 
 def test_ask_follow_up_resets_evidence(client: TestClient, aapl_page1_text: str) -> None:
     """Binding SC62 mirror for ``POST /ask``: two sequential asks on
-    the SAME ``thread_id``. Run 1 reads AAPL-2022Q3 page 1 and ends
+    the SAME ``thread_id``. Run 1 reads AAPL-2022Q3 unit 1 and ends
     ``done``; run 2 answers with the same span WITHOUT re-fetching.
     With the T2 reset, evidence is empty in run 2 so the gate cannot
     match -> refuse. Without it, the stale evidence leaks in and the
@@ -538,7 +561,7 @@ def test_ask_follow_up_resets_evidence(client: TestClient, aapl_page1_text: str)
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
     )
     client.app.dependency_overrides[get_graph] = lambda: g
 
@@ -606,3 +629,33 @@ def test_ask_injects_workspace_root(
     configurable = g.configs[0].get("configurable") or {}
     assert configurable.get("workspace_root") == str(ws_root)
     assert configurable.get("thread_id") == "t-ask-seam"
+
+
+# ----- citation identity is never defaulted -----
+
+
+def test_citation_schema_carries_no_company_or_page_default() -> None:
+    """A citation row that cannot say its own ``kind`` / ``display`` is
+    a contract error, never a silently company-``page`` citation (no
+    legacy ``page`` presentation is invented)."""
+    from pydantic import ValidationError
+
+    from fin.host.http import CitationSchema
+
+    complete = {
+        "kind": "company",
+        "document_id": AAPL_2022Q3,
+        "attachment_id": "",
+        "version": AAPL_2022Q3_VERSION,
+        "unit": 1,
+        "display": "page",
+        "filename": "",
+        "quote": "Total net sales increased during the third quarter",
+    }
+    assert CitationSchema(**complete).model_dump() == complete
+
+    for missing in ("kind", "display"):
+        row = dict(complete)
+        del row[missing]
+        with pytest.raises(ValidationError):
+            CitationSchema(**row)

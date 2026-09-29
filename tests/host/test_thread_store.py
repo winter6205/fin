@@ -459,7 +459,7 @@ def test_in_memory_list_runs_returns_isolated_copies() -> None:
     object.__setattr__(
         record,
         "citations",
-        [{"document_id": "AAPL-2022Q3", "version": "v", "page": 1, "quote": "q"}],
+        [{"document_id": "AAPL-2022Q3", "version": "v", "unit": 1, "quote": "q"}],
     )
     store.append_run(record)
 

@@ -248,9 +248,9 @@ def test_collector_rejects_non_boolean_exhausted_flag() -> None:
 # ----- tool-level retry wiring (graph.py _make_retrieve_tool) -----
 
 
-def _locator(page: int = 1) -> Locator:
+def _locator(unit: int = 1) -> Locator:
     return Locator(
-        document_id="DOC-2023Q1", version="v-" + "a" * 60, page=page
+        document_id="DOC-2023Q1", version="v-" + "a" * 60, unit=unit
     )
 
 

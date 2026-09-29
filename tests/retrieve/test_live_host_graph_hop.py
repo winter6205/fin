@@ -231,7 +231,7 @@ def test_the_host_run_sends_its_assigned_档_to_the_real_server_which_answers(
     # The run's own END status is deliberately not asserted: the scripted
     # answer is citation-free, so the citation gate is what decides it, and
     # that is a different contract than the 档 hop under test.
-    passages = [item.page_text for item in out["evidence"]]
+    passages = [item.unit_text for item in out["evidence"]]
     assert passages, out
     assert any(_TOKEN in passage for passage in passages), passages
     assert {

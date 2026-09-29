@@ -59,7 +59,7 @@ class _HitPort:
 
 def _locator() -> Locator:
     return Locator(
-        document_id="DOC-2023Q1", version="v-" + "a" * 60, page=1
+        document_id="DOC-2023Q1", version="v-" + "a" * 60, unit=1
     )
 
 
@@ -102,7 +102,7 @@ def test_retrieve_tool_message_carries_error_dict_not_empty_chunks() -> None:
 
 def test_retrieve_tool_error_contributes_no_evidence() -> None:
     """A typed EXIT contributes no ``EvidenceItem`` — there is no
-    page text to cite. The citation gate must not see phantom
+    unit text to cite. The citation gate must not see phantom
     evidence from a failed transport."""
     command = _invoke_retrieve_tool(_UnavailablePort())
     assert not command.update.get("evidence")
@@ -120,7 +120,7 @@ def test_retrieve_tool_hit_still_serializes_chunks() -> None:
             "source_ref": {
                 "document_id": "DOC-2023Q1",
                 "version": "v-" + "a" * 60,
-                "page": 1,
+                "unit": 1,
             },
             "score": 2.5,
         }

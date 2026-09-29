@@ -340,11 +340,22 @@ class PreparationRequest:
     version: int
 
 
-def _safe_display_filename(raw: str) -> str:
+def safe_display_filename(raw: str) -> str:
     """Strip path and control characters; the model gets a name, never a path."""
     name = os.path.basename(raw or "").strip()
     name = "".join(char for char in name if char.isprintable())
     return name[:200] or "attachment.txt"
+
+
+def filename_is_pdf(filename: str) -> bool:
+    """True when this display name claims the PDF lane.
+
+    The citation presentation asks the same question — a PDF's frozen
+    units are presented as physical pages, every other kind as units —
+    and it must never disagree with the lane decision in
+    :func:`_page_lane`, so both read this one predicate.
+    """
+    return os.path.splitext(filename)[1].lower() in _PDF_SUFFIXES
 
 
 def text_rejection_reason(payload: bytes) -> str | None:
@@ -363,9 +374,9 @@ def text_rejection_reason(payload: bytes) -> str | None:
 
 def _page_lane(filename: str) -> str | None:
     """The lane that reads these bytes, from the name the upload claimed."""
-    suffix = os.path.splitext(filename)[1].lower()
-    if suffix in _PDF_SUFFIXES:
+    if filename_is_pdf(filename):
         return _LANE_PDF
+    suffix = os.path.splitext(filename)[1].lower()
     if suffix in _IMAGE_SUFFIXES:
         # EXIT: a standalone image is its own one-page document, so it takes
         # the pixel lane without ever being counted as a multi-page source.
@@ -513,7 +524,7 @@ class AttachmentPreparationService:
             return self.store.create(
                 thread_id=thread_id,
                 attachment_id=attachment_id,
-                filename=_safe_display_filename(filename),
+                filename=safe_display_filename(filename),
                 size_bytes=pointer.size_bytes,
                 sha256=pointer.sha256,
                 object_key=pointer.key,
@@ -551,13 +562,22 @@ class AttachmentPreparationService:
         attachment_id = record.attachment_id
         try:
             payload = self.objects.get(record.object_key)
-        except Exception as exc:
+        except Exception:
             # EXIT: the byte store is unreachable, so no text exists to
             # freeze. Named failure, never an empty ready attachment.
-            logger.warning(
-                "attachment bytes unreadable: attachment_id=%s (%s)",
+            #
+            # WHY the traceback here and not just the message: the typed
+            # reason ``source_unavailable`` is deliberately coarse — a
+            # missing key, a dead endpoint, and a credentials refusal all
+            # publish it — so the exception is the ONLY thing that tells
+            # an operator which of the three happened. A process whose
+            # logger is not configured loses it entirely (the live
+            # that pull request door child runs uvicorn's dictConfig, which disables
+            # existing loggers), which is exactly how a two-process
+            # bucket mismatch read as an unexplained storage outage.
+            logger.exception(
+                "attachment bytes unreadable: attachment_id=%s",
                 attachment_id,
-                exc,
             )
             return self.store.mark_failed(
                 attachment_id=attachment_id,
@@ -1135,6 +1155,12 @@ class AttachmentPreparationService:
             # must not sit in ``parsing`` over a dead job, so it takes the
             # typed failure the door can still say: the reader's own code
             # when it carries one, else the storage-outage exit.
+            logger.exception(
+                "attachment preparation raised: attachment_id=%s "
+                "sha256=%s; failing the row as source_unavailable",
+                job.attachment_id,
+                job.content_sha256,
+            )
             reason = str(getattr(exc, "code", "") or "").strip() or SOURCE_UNAVAILABLE
             self._fail_row(job.attachment_id, reason)
             self.jobs.mark_failed(
@@ -1457,5 +1483,7 @@ __all__ = [
     "AttachmentVisionEmptyTextError",
     "PreparationRequest",
     "ResolvedAttachment",
+    "filename_is_pdf",
+    "safe_display_filename",
     "text_rejection_reason",
 ]

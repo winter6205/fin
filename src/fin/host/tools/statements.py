@@ -59,7 +59,7 @@ def _locator(fact: Fact) -> dict[str, Any]:
     return {
         "document_id": fact.source_locator.document_id,
         "version": fact.source_locator.version,
-        "page": fact.source_locator.page,
+        "unit": fact.source_locator.unit,
     }
 
 

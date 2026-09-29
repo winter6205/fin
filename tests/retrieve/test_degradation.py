@@ -376,7 +376,7 @@ class _ScriptedMCP(MCPRetrieveAdapter):
                 "row-1": Locator(
                     document_id="DOC-2023Q1",
                     version="v-" + "a" * 60,
-                    page=3,
+                    unit=3,
                 )
             },
             **kwargs,

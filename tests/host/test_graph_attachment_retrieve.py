@@ -21,9 +21,11 @@ lines 59 + 61) and plan item 8 (T3 acceptance), pinned through the frozen
 * a run suspended by ``ensure_attachment_ready`` resumes as the SAME run
   and its post-resume retrieve publishes locator-bearing
   ``attachment_chunks`` (plan item 8's gate/branch seam);
-* attachment chunks never enter the evidence channel (T5 owns attachment
-  citation), and with no retriever wired the ``ToolMessage`` envelope is
-  byte-identical to the pre-T3 shape.
+* a hit earns evidence under the attachment identity rule (T5): only
+  while the run's thread-bound leg answers for that id at that version
+  does its text ground a citation, and an unattested hit stays display
+  text with nothing else changed; with no retriever wired the
+  ``ToolMessage`` envelope is byte-identical to the pre-T3 shape.
 
 Hermetic: a local fake ``AttachmentSearchPort`` + ``FakeRetrievePort`` +
 ``ScriptedChatModel``, wired through ``compile_graph`` exactly like
@@ -35,6 +37,7 @@ from __future__ import annotations
 import json
 import sys
 import types
+from dataclasses import dataclass
 from typing import Any, Iterator
 
 import pytest
@@ -57,6 +60,7 @@ from fin.host.graph import _make_retrieve_tool
 from fin.host.state import reset_input_state
 from fin.retrieve import Chunk
 from fin.retrieve.fake_port import FakeRetrievePort
+from fin.retrieve.source_read import ATTACHMENT_KIND
 from attachment_fakes import FakeAttachmentService
 
 KNOWN_IDS = {"AAPL-2023Q3"}
@@ -79,7 +83,7 @@ _DEFAULT_WINDOW = 8
 def _company_chunk() -> Chunk:
     return Chunk(
         text=COMPANY_TEXT,
-        source_ref=Locator(document_id="AAPL-2023Q3", version="d" * 64, page=3),
+        source_ref=Locator(document_id="AAPL-2023Q3", version="d" * 64, unit=3),
         score=1.5,
     )
 
@@ -184,6 +188,7 @@ def _compile(
     *,
     company_hits: bool = True,
     attachment_retriever: Any | None = None,
+    attachment_reader_factory: Any | None = None,
     checkpointer: Any | None = None,
     model: Any | None = None,
 ) -> Any:
@@ -194,6 +199,7 @@ def _compile(
         adapter=_company_port(hits=company_hits),
         known_document_ids=set(KNOWN_IDS),
         attachment_retriever=attachment_retriever,
+        attachment_source_reader_factory=attachment_reader_factory,
     )
     graph.test_model = model
     return graph
@@ -254,18 +260,112 @@ def test_attachment_hit_carries_the_typed_locator() -> None:
     ]
 
 
-def test_attachment_chunks_never_enter_evidence() -> None:
-    """T5 owns attachment citation; today the branch is display text only."""
+def test_an_attested_attachment_hit_enters_the_evidence_channel() -> None:
+    """Retrieved attachment text is this-run evidence, exactly as a read
+    slice is: the identity comes from the trusted record, the text from
+    the hit."""
+    retriever = FakeAttachmentSearchPort(
+        {_THREAD_A: [_attachment_chunk("att-1"), _attachment_chunk("att-2")]}
+    )
+    graph = _compile(
+        attachment_retriever=retriever,
+        attachment_reader_factory=lambda thread_id: _HandoffReader(
+            ATTACHMENT_TEXT, thread_id=thread_id, version=2
+        ),
+    )
+
+    out = _run(graph, _THREAD_A)
+
+    assert len(_envelope(out)["attachment_chunks"]) == 2
+    attachments = [
+        item for item in out["evidence"] if item.kind == ATTACHMENT_KIND
+    ]
+    assert [item.attachment_id for item in attachments] == ["att-1", "att-2"]
+    assert [item.locator.unit for item in attachments] == [4, 4]
+    assert all(
+        (item.filename, item.display) == ("memo.txt", "unit")
+        for item in attachments
+    )
+    # The company leg is untouched by the branch: one hit, one item.
+    assert [
+        (item.kind, item.locator.document_id)
+        for item in out["evidence"]
+        if item.kind != ATTACHMENT_KIND
+    ] == [("company", "AAPL-2023Q3")]
+
+
+def test_a_quote_from_a_retrieved_hit_alone_carries_an_attachment_citation() -> None:
+    """The end-to-end clause: text the run only ever ``retrieve``d — never
+    ``read_source``d — grounds a ``unit`` citation carrying the
+    attachment's own identity, not a document id."""
+    chunk = _attachment_chunk("MEMO-1", version=2, unit=4)
+    model = ScriptedChatModel(
+        script=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "retrieve",
+                        "args": {"query": GROUNDED},
+                        "id": "c-retrieve",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content=f"Verbatim: {ATTACHMENT_TEXT}"),
+        ]
+    )
+    graph = _compile(
+        attachment_retriever=FakeAttachmentSearchPort({_THREAD_A: [chunk]}),
+        attachment_reader_factory=lambda thread_id: _HandoffReader(
+            chunk.text, thread_id=thread_id, version=2
+        ),
+        model=model,
+    )
+
+    out = _run(graph, _THREAD_A)
+
+    assert out["status"] == "done", out
+    assert [citation.kind for citation in out["citations"]] == ["attachment"]
+    citation = out["citations"][0]
+    assert citation.attachment_id == "MEMO-1"
+    assert citation.document_id == ""
+    assert citation.unit == 4
+    assert citation.display == "unit"
+    assert citation.filename == "memo.txt"
+
+
+def test_an_unattested_attachment_hit_stays_display_text_only() -> None:
+    """No identity leg wired: the published text is unchanged, and the
+    evidence channel holds the company hit alone — a quote the model
+    copies from such a hit has nothing to be attributed to."""
     retriever = FakeAttachmentSearchPort(
         {_THREAD_A: [_attachment_chunk("att-1"), _attachment_chunk("att-2")]}
     )
     graph = _compile(attachment_retriever=retriever)
 
     out = _run(graph, _THREAD_A)
-    envelope = _envelope(out)
 
-    assert len(envelope["attachment_chunks"]) == 2
-    assert [item.locator.document_id for item in out["evidence"]] == ["AAPL-2023Q3"]
+    assert len(_envelope(out)["attachment_chunks"]) == 2
+    assert [item.kind for item in out["evidence"]] == ["company"]
+
+
+def test_a_hit_the_record_has_been_reprepared_past_earns_no_evidence() -> None:
+    """The version the hit carries is the version the citation would
+    claim; a record that has moved on answers for nothing."""
+    graph = _compile(
+        attachment_retriever=FakeAttachmentSearchPort(
+            {_THREAD_A: [_attachment_chunk("att-1", version=2)]}
+        ),
+        attachment_reader_factory=lambda thread_id: _HandoffReader(
+            ATTACHMENT_TEXT, thread_id=thread_id, version=3
+        ),
+    )
+
+    out = _run(graph, _THREAD_A)
+
+    assert len(_envelope(out)["attachment_chunks"]) == 1
+    assert [item.kind for item in out["evidence"]] == ["company"]
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +582,7 @@ def test_retriever_absent_keeps_the_envelope_byte_identical() -> None:
                 "source_ref": {
                     "document_id": "AAPL-2023Q3",
                     "version": "d" * 64,
-                    "page": 3,
+                    "unit": 3,
                 },
                 "score": 1.5,
             }
@@ -693,36 +793,82 @@ def test_the_composition_root_threads_the_service_as_the_retriever(
 # ---------------------------------------------------------------------------
 
 
-class _HandoffReader:
-    """Attachment read leg that bounds real text through the T4 contract."""
+@dataclass(frozen=True)
+class _HandoffRecord:
+    """The trusted record a handoff read was admitted under."""
 
-    def __init__(self, text: str) -> None:
+    thread_id: str
+    filename: str
+    version: int
+
+
+class _HandoffReader:
+    """Attachment read leg that bounds real text through the T4 contract.
+
+    Carries the two identity faces the host asks of the run's own leg: the
+    record behind an ``attachment_id`` (safe filename + version) and
+    whether that identity is still current for the run's thread. A reader
+    without them returns text the citation gate cannot attribute.
+    """
+
+    def __init__(self, text: str, *, thread_id: str, version: int = 2) -> None:
         self._text = text
+        self._record = _HandoffRecord(
+            thread_id=thread_id, filename="memo.txt", version=version
+        )
 
     def read_slice(self, source_ref: Any, position: int = 0) -> dict[str, Any]:
         from fin.retrieve.source_read import bounded_slice
 
         return bounded_slice(dict(source_ref), self._text, position)
 
+    def owned_record(self, attachment_id: str) -> _HandoffRecord:
+        return self._record
 
-def test_same_thread_retrieve_then_read_source_handoff() -> None:
-    """The locator T3 publishes is the locator T4 reads, in one run.
+    def identity_is_current(
+        self, attachment_id: str, version_int: int | None
+    ) -> bool:
+        return attachment_id == "MEMO-1" and version_int == self._record.version
 
-    One graph wiring BOTH seams (search port + source-reader factory),
-    one thread: ``retrieve`` answers with the typed ``source_ref``, the
-    model copies that exact dict into ``read_source``, the slice comes
-    back bounded, and only the READ text — never the hit text — carries
-    the citation (attachment chunks stay out of the evidence channel).
+
+class _StaleHandoffReader(_HandoffReader):
+    """A leg whose record still grants the display pair while its parsed
+    content has moved to another version — the race the citation
+    re-check exists to close.
+    """
+
+    def identity_is_current(
+        self, attachment_id: str, version_int: int | None
+    ) -> bool:
+        return False
+
+
+class _FaultingHandoffReader(_HandoffReader):
+    """A leg whose store cannot answer the identity question at all."""
+
+    def identity_is_current(
+        self, attachment_id: str, version_int: int | None
+    ) -> bool:
+        raise OSError("store unreachable")
+
+
+class _ReadonlyHandoffReader(_HandoffReader):
+    """A leg with no identity face: it can return text and nothing else."""
+
+    identity_is_current = None  # type: ignore[assignment]
+
+
+def _run_attachment_read_handoff(
+    reader_factory: Any,
+) -> dict[str, Any]:
+    """One graph, one thread: retrieve, read the published locator, then
+    answer with the attachment text verbatim.
+
+    The answer is word-for-word grounded, so whether it can carry a
+    citation depends only on the identity the host can attest.
     """
     chunk = _attachment_chunk("MEMO-1", version=2, unit=4)
-    retriever = FakeAttachmentSearchPort({_THREAD_A: [chunk]})
     handoff_ref = chunk.source_ref.as_source_ref()
-    built: list[str] = []
-
-    def factory(thread_id: str) -> Any:
-        built.append(thread_id)
-        return _HandoffReader(chunk.text)
-
     model = ScriptedChatModel(
         script=[
             AIMessage(
@@ -755,18 +901,70 @@ def test_same_thread_retrieve_then_read_source_handoff() -> None:
         model=model,
         adapter=_company_port(hits=True),
         known_document_ids=set(KNOWN_IDS),
-        attachment_retriever=retriever,
-        attachment_source_reader_factory=factory,
+        attachment_retriever=FakeAttachmentSearchPort({_THREAD_A: [chunk]}),
+        attachment_source_reader_factory=reader_factory,
     )
-
-    out = graph.invoke(
+    return graph.invoke(
         reset_input_state(GROUNDED),
         config={"configurable": {"thread_id": _THREAD_A}},
     )
 
+
+def test_same_thread_retrieve_then_read_source_handoff() -> None:
+    """The locator T3 publishes is the locator T4 reads, in one run.
+
+    One graph wiring BOTH seams (search port + source-reader factory),
+    one thread: ``retrieve`` answers with the typed ``source_ref``, the
+    model copies that exact dict into ``read_source``, the slice comes
+    back bounded, and the citation carries the attachment identity the
+    host attested — not anything the answer claimed.
+    """
+    chunk = _attachment_chunk("MEMO-1", version=2, unit=4)
+    handoff_ref = chunk.source_ref.as_source_ref()
+    built: list[str] = []
+
+    def factory(thread_id: str) -> Any:
+        built.append(thread_id)
+        return _HandoffReader(chunk.text, thread_id=thread_id, version=2)
+
+    out = _run_attachment_read_handoff(factory)
+
     assert out["status"] == "done"
-    assert built == [_THREAD_A]
+    assert built and set(built) == {_THREAD_A}
     envelope = _envelope(out)
     assert envelope["attachment_chunks"][0]["source_ref"] == handoff_ref
-    assert out["citations"]
-    assert out["citations"][0].document_id == "MEMO-1"
+    citation = out["citations"][0]
+    # The attachment identity is the attachment id, not a document id: the
+    # company slot stays empty, and the presentation comes from the trusted
+    # record (a ``.txt`` unit is never labeled a page).
+    assert citation.kind == "attachment"
+    assert citation.attachment_id == "MEMO-1"
+    assert citation.document_id == ""
+    assert citation.filename == "memo.txt"
+    assert citation.display == "unit"
+    assert citation.unit == 4
+
+
+@pytest.mark.parametrize(
+    "reader_class",
+    [_FaultingHandoffReader, _ReadonlyHandoffReader, _StaleHandoffReader],
+    ids=["store_fault", "no_identity_face", "stale_or_foreign_identity"],
+)
+def test_an_unattested_attachment_identity_leaves_the_quote_uncitable(
+    reader_class: Any,
+) -> None:
+    """A verbatim attachment quote still needs a current identity.
+
+    A store that cannot answer, a leg that never promised to, and a
+    record whose parsed version moved on all fail closed: the run ends
+    refused with no citation, and no foreign or stale identity reaches
+    the wire.
+    """
+    out = _run_attachment_read_handoff(
+        lambda thread_id: reader_class(
+            ATTACHMENT_TEXT, thread_id=thread_id, version=2
+        )
+    )
+
+    assert out["status"] == "refuse"
+    assert out["citations"] == []

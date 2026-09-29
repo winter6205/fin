@@ -48,11 +48,12 @@ from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import Field
 
+from fin.corpus.extracted import load_extracted_tree
 from fin.corpus.object_store import InMemoryObjectStore
 from fin.host.attachment_budgets import AttachmentBudgets
 from fin.host.scripted_model import ScriptedChatModel
 
-from fin.retrieve import ExtractedTreeReadPort
+from fin.retrieve import FakeRetrievePort
 
 
 # ----- shared fixtures (mirror tests/host/test_workspace_http.py) -----
@@ -61,9 +62,14 @@ from fin.retrieve import ExtractedTreeReadPort
 AAPL_2022Q3 = "AAPL-2022Q3"
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
-_TREE_READ_PORT = ExtractedTreeReadPort(
-    Path("data/corpus/manifest.json"),
-    Path("data/corpus/extracted"),
+# The committed corpus units behind the graph's ``read_source`` company leg;
+# the serve path itself never walks the tree (ADR 0046 / 0047).
+_READ_ADAPTER = FakeRetrievePort(
+    pages_by_doc={
+        AAPL_2022Q3: load_extracted_tree(
+            Path("data/corpus/manifest.json"), Path("data/corpus/extracted")
+        )[AAPL_2022Q3]
+    }
 )
 
 # A unique sentinel no corpus fixture contains; the recording model
@@ -166,7 +172,7 @@ def _compile_with(model: ScriptedChatModel) -> Any:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
     )
 
 
@@ -997,38 +1003,37 @@ def test_attach_and_send_never_ingest_or_push(
 def test_attach_does_not_trigger_mcp_read_source(
     client: TestClient, fresh_store, http_app: FastAPI, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Thread attach never resolves a body through MCP ``read_source``.
+    """Thread attach never resolves a body through the MCP ``read_source`` leg.
 
     The attach door hands the model the thread's own stored text (ADRs
     0047/0086); it is not a corpus locator. Re-routing attachment text
-    through MCP would silently
-    expand the read_file tool's surface, so the seam must short-circuit
-    in the host graph before any MCP call. A spy on
-    ``MCPRetrieveAdapter.read`` is installed and the graph is rebuilt
-    with the MCP adapter as its ``read_port``; the assertion holds
-    whether or not the model itself asks for ``read_file``.
+    through MCP would silently widen the company read surface, so the seam
+    must short-circuit in the host graph before any MCP call. A spy on
+    ``MCPRetrieveAdapter.read_slice`` is installed and the graph is rebuilt
+    with the MCP adapter as its bound company leg; the assertion holds
+    whether or not the model itself asks for ``read_source``.
     """
     from fin.host.http import get_graph
     from fin.retrieve import MCPRetrieveAdapter
 
-    calls: list[tuple[str, str]] = []
+    calls: list[dict[str, Any]] = []
 
-    real_read = MCPRetrieveAdapter.read
+    real_read_slice = MCPRetrieveAdapter.read_slice
 
-    def _spy(self, document_id, version, page=1, page_limit=1):
-        calls.append((document_id, version))
-        return real_read(self, document_id, version, page, page_limit)
+    def _spy(self, source_ref, position=0):
+        calls.append(dict(source_ref))
+        return real_read_slice(self, source_ref, position)
 
-    monkeypatch.setattr(MCPRetrieveAdapter, "read", _spy)
+    monkeypatch.setattr(MCPRetrieveAdapter, "read_slice", _spy)
 
-    # Build a graph whose read port IS the MCP adapter so the spy
+    # Build a graph whose company read leg IS the MCP adapter so the spy
     # is on the actual seam, not a side branch.
     mcp_adapter = MCPRetrieveAdapter(
         command=None,
         known_document_ids=KNOWN_IDS,
     )
     model = RecordingScriptedModel(script=[AIMessage(content="ok")])
-    graph = _compile_with_mcp_read_port(model, mcp_adapter)
+    graph = _compile_with_mcp_adapter(model, mcp_adapter)
     http_app.dependency_overrides[get_graph] = lambda: graph
 
     thread_id = _new_thread(client)
@@ -1037,21 +1042,21 @@ def test_attach_does_not_trigger_mcp_read_source(
     sent = _send(client, thread_id, attachment_ids=[attached["attachment_id"]])
     assert sent.status_code == 200
 
-    # No MCP ``read`` happened on the attach turn.
+    # No MCP company read happened on the attach turn.
     assert calls == [], (
-        "thread attach triggered an MCP read; the attach door must "
+        "thread attach triggered an MCP company read; the attach door must "
         "never resolve a body through read_source"
     )
 
 
-def _compile_with_mcp_read_port(model: ScriptedChatModel, mcp_adapter: Any) -> Any:
+def _compile_with_mcp_adapter(model: ScriptedChatModel, mcp_adapter: Any) -> Any:
     from fin.host import compile_graph
 
     return compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=mcp_adapter,
+        adapter=mcp_adapter,
     )
 
 
@@ -1059,7 +1064,7 @@ def test_attachment_text_cannot_satisfy_citation_gate(
     client: TestClient, fresh_store, http_app: FastAPI
 ) -> None:
     """ADR 0046 / SC9 unchanged: the gate matches spans against
-    THIS-run retrieve/read_file payloads only. An answer quoting a
+    THIS-run retrieve/read_source payloads only. An answer quoting a
     32+ char span that exists ONLY in the attachment text bounces and
     ends in the typed refuse — the model read the text but cannot
     cite it."""
@@ -1410,24 +1415,32 @@ def test_the_shipped_attachment_delete_path_is_the_one_the_chip_calls(
 ) -> None:
     """Host route and web request must name one URL.
 
-    ``web/src/api.ts`` builds its own path string and has no router to consult,
-    so this is where the two halves of the same door are pinned together: a
-    template change on either side would otherwise leave the chip's delete
-    calling a path that answers 404.
+    ``web/src/api.ts`` has no router to consult, so this is where the two
+    halves of the same door are pinned together: a template change on either
+    side would otherwise leave the chip's delete calling a path that answers
+    404.
+
+    The template lives in ``sourceLocator.ts`` because the visual-claim lane
+    resolves the same attachment URL. The pin therefore follows the string to
+    its helper AND asserts that ``api.ts`` still reaches the door through
+    that helper — delegation is the property worth pinning, since an inline
+    copy here is exactly the drift that would fork the two lanes.
     """
     from fin.host.workspace_http import _attachment_delete_path
 
-    api_source = (
-        Path(__file__).resolve().parents[2]
-        / "web"
-        / "src"
-        / "api.ts"
-    ).read_text(encoding="utf-8")
+    web_src = Path(__file__).resolve().parents[2] / "web" / "src"
+    locator_source = (web_src / "sourceLocator.ts").read_text(encoding="utf-8")
+    helper = locator_source.split(
+        "export function threadAttachmentUrl", 1
+    )[1].split("\nexport ", 1)[0]
+    assert "/api/threads/${encodeURIComponent(threadId)}/attachments/" in helper
+    assert "encodeURIComponent(attachmentId)" in helper
+
+    api_source = (web_src / "api.ts").read_text(encoding="utf-8")
     request = api_source.split(
         "export async function deleteThreadAttachment", 1
     )[1].split("\nexport ", 1)[0]
-    assert "/api/threads/${encodeURIComponent(threadId)}/attachments/" in request
-    assert "encodeURIComponent(attachmentId)" in request
+    assert "threadAttachmentUrl(threadId, attachmentId)" in request
     assert 'method: "DELETE"' in request
     assert "/retry" not in request
 

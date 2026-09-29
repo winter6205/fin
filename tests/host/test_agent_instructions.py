@@ -72,8 +72,29 @@ def test_messages_for_model_off_topic_selects_off_topic_prompt() -> None:
 def test_host_prompt_names_every_research_tool() -> None:
     """The research track can call four tools; the prompt must name
     all four, ``get_xbrl_fact`` included (spec SC12)."""
-    for tool_name in ("list_files", "retrieve", "read_file", "get_xbrl_fact"):
+    for tool_name in ("list_files", "retrieve", "read_source", "get_xbrl_fact"):
         assert tool_name in HOST_SYSTEM_PROMPT
+
+
+def test_host_prompt_drops_legacy_read_file_name() -> None:
+    """``read_source`` replaces the model-facing ``read_file`` with no
+    compatibility path (spec thread-attachment-source-read decision 5):
+    the retired tool name must not appear in any track prompt."""
+    from fin.host.agent_instructions import (
+        CLARIFY_SYSTEM_PROMPT,
+        DIALOGUE_SYSTEM_PROMPT,
+        OFF_TOPIC_SYSTEM_PROMPT,
+        SEARCH_MODE_USAGE_COPY,
+    )
+
+    for prompt in (
+        HOST_SYSTEM_PROMPT,
+        DIALOGUE_SYSTEM_PROMPT,
+        OFF_TOPIC_SYSTEM_PROMPT,
+        CLARIFY_SYSTEM_PROMPT,
+        *SEARCH_MODE_USAGE_COPY.values(),
+    ):
+        assert "read_file" not in prompt
 
 
 def test_host_prompt_drops_stale_bm25_mention() -> None:
@@ -175,8 +196,8 @@ def test_attachment_context_message_without_an_id_keeps_the_old_header() -> None
 def test_attachment_context_message_states_not_citable_discipline() -> None:
     """ADR 0046 discipline is stated to the model: attachment text is
     NOT citable corpus; the gate only accepts this-run retrieve /
-    read_file spans. (The structural guarantee is that attachment text
-    never enters the ``evidence`` channel.)"""
+    read_source spans. (The structural guarantee is that attachment
+    text never enters the ``evidence`` channel.)"""
     from fin.host.agent_instructions import attachment_context_message
 
     msg = attachment_context_message(
@@ -186,6 +207,8 @@ def test_attachment_context_message_states_not_citable_discipline() -> None:
     content = str(msg.content)
     assert "NOT part of the citable corpus" in content
     assert "retrieve" in content
+    assert "read_source" in content
+    assert "read_file" not in content
 
 
 def test_attachment_context_message_states_the_thread_lifetime() -> None:

@@ -32,6 +32,7 @@ from fin.host.attachment_store import (
     AttachmentThreadGoneError,
     InMemoryAttachmentStore,
     ParsedAttachmentUnit,
+    StoredPageRegion,
 )
 from fin.host.thread_store import InMemoryThreadStore
 
@@ -341,6 +342,97 @@ def test_record_units_on_a_deleted_attachment_raises_thread_gone() -> None:
     with pytest.raises(AttachmentThreadGoneError):
         store.record_units(attachment_id=aid, version=1, units=UNITS)
     assert store.units(aid, 1) == ()
+
+
+# ----- page region boxes (spec item 10: a region is persisted, not invented) --
+
+# The two boxes of the committed mixed-chart gold case, page 3, in the media
+# box the fixture measures (612 x 792 pt): the 528 x 328 pt chart, and the
+# 33 x 40 pt logotype on page 1 that the legibility floor rejects. Real
+# shapes, because the crop lane must not be measured on invented geometry.
+CHART_REGION = StoredPageRegion(
+    page=3, kind="figure", left_pt=42.0, top_pt=100.0, right_pt=570.0, bottom_pt=428.0
+)
+LOGOTYPE_REGION = StoredPageRegion(
+    page=1, kind="figure", left_pt=289.5, top_pt=322.0, right_pt=322.5, bottom_pt=362.0
+)
+REGIONS = (LOGOTYPE_REGION, CHART_REGION)
+
+
+def test_recorded_regions_read_back_ordered_by_page_for_one_version(store_pair) -> None:
+    threads, store, _backend = store_pair
+    thread = threads.create_thread(title="region thread")
+    record = _create(store, thread.id, filename="mixed.pdf")
+
+    store.record_regions(
+        attachment_id=record.attachment_id, version=1, regions=REGIONS
+    )
+
+    # The box is read back with the same four PDF-point edges it was written
+    # with, and one page's regions stay addressable without touching another
+    # page's: a crop is only ever taken from the page the run named.
+    assert store.regions(record.attachment_id, 1, page=3) == (CHART_REGION,)
+    assert store.regions(record.attachment_id, 1) == REGIONS
+    assert store.regions(record.attachment_id, 2) == ()
+
+
+def test_recording_regions_replaces_that_version_and_leaves_other_versions(store_pair) -> None:
+    threads, store, _backend = store_pair
+    thread = threads.create_thread(title="region versions")
+    record = _create(store, thread.id, filename="mixed.pdf")
+    aid = record.attachment_id
+    store.record_regions(attachment_id=aid, version=1, regions=REGIONS)
+    store.record_regions(attachment_id=aid, version=2, regions=(LOGOTYPE_REGION,))
+
+    store.record_regions(attachment_id=aid, version=1, regions=(CHART_REGION,))
+
+    # Re-preparation replaces one version's boxes rather than accumulating
+    # them: a re-run layout pass must not leave a stale box croppable.
+    assert store.regions(aid, 1) == (CHART_REGION,)
+    assert store.regions(aid, 2) == (LOGOTYPE_REGION,)
+
+
+def test_recording_no_regions_clears_the_version_and_is_not_an_error(store_pair) -> None:
+    threads, store, _backend = store_pair
+    thread = threads.create_thread(title="empty regions")
+    record = _create(store, thread.id, filename="mixed.pdf")
+    aid = record.attachment_id
+    store.record_regions(attachment_id=aid, version=1, regions=REGIONS)
+
+    store.record_regions(attachment_id=aid, version=1, regions=())
+
+    # A page lane that located nothing is the whole-page fallback's input,
+    # not a store fault, so it stores the absence honestly.
+    assert store.regions(aid, 1) == ()
+
+
+def test_record_regions_on_a_deleted_attachment_raises_thread_gone(store_pair) -> None:
+    threads, store, _backend = store_pair
+    thread = threads.create_thread(title="gone regions")
+    aid = _create(store, thread.id, filename="mixed.pdf").attachment_id
+    store.delete_for_thread(thread.id)
+    with pytest.raises(AttachmentThreadGoneError):
+        store.record_regions(attachment_id=aid, version=1, regions=REGIONS)
+    assert store.regions(aid, 1) == ()
+
+
+def test_a_malformed_region_is_refused_at_the_store_boundary(store_pair) -> None:
+    threads, store, _backend = store_pair
+    thread = threads.create_thread(title="bad regions")
+    aid = _create(store, thread.id, filename="mixed.pdf").attachment_id
+
+    with pytest.raises(AttachmentStoreError):
+        store.record_regions(
+            attachment_id=aid,
+            version=1,
+            regions=(
+                StoredPageRegion(
+                    page=1, kind="figure", left_pt=0.0, top_pt=0.0,
+                    right_pt=0.0, bottom_pt=10.0,
+                ),
+            ),
+        )
+    assert store.regions(aid, 1) == ()
 
 
 def test_record_units_on_a_deleted_thread_raises_thread_gone() -> None:
@@ -990,6 +1082,8 @@ _PROTOCOL_METHODS = (
     "record_units",
     "units",
     "clear_units",
+    "record_regions",
+    "regions",
     "put_index",
     "index_postings",
     "indexed_versions",

@@ -46,7 +46,7 @@ from fin.host.stream_map import (
     strip_thinking_from_answer,
     summarize_get_xbrl_fact,
     summarize_list_files,
-    summarize_read_file,
+    summarize_read_source,
     summarize_retrieve,
 )
 
@@ -469,7 +469,7 @@ def test_summarize_list_files_shows_the_form_filter() -> None:
 def test_summarize_retrieve_renders_query_and_hit_count() -> None:
     """Head line is ``"<query>': n hits"`` when a query exists."""
     out = summarize_retrieve(
-        chunks=[{"source_ref": {"document_id": "AAPL-2023Q1", "page": 4}}],
+        chunks=[{"source_ref": {"document_id": "AAPL-2023Q1", "unit": 4}}],
         args={"query": "revenue growth"},
     )
     assert "revenue growth" in out
@@ -479,25 +479,25 @@ def test_summarize_retrieve_renders_query_and_hit_count() -> None:
 def test_summarize_retrieve_pluralises_hit() -> None:
     """``n hits`` (plural) when n != 1; ``1 hit`` singular."""
     chunks = [
-        {"source_ref": {"document_id": "AAPL-2023Q1", "page": 1}},
-        {"source_ref": {"document_id": "AAPL-2023Q1", "page": 2}},
+        {"source_ref": {"document_id": "AAPL-2023Q1", "unit": 1}},
+        {"source_ref": {"document_id": "AAPL-2023Q1", "unit": 2}},
     ]
     out = summarize_retrieve(chunks=chunks, args={"query": "q"})
     assert "2 hits" in out
 
 
 def test_summarize_retrieve_appends_locators_up_to_three() -> None:
-    """Up to 3 locators render so the operator can scan which pages
+    """Up to 3 locators render so the operator can scan which units
     were touched."""
     chunks = [
-        {"source_ref": {"document_id": f"D-{i}", "page": i}} for i in range(1, 6)
+        {"source_ref": {"document_id": f"D-{i}", "unit": i}} for i in range(1, 6)
     ]
     out = summarize_retrieve(chunks=chunks, args={"query": "q"})
-    assert "D-1 p.1" in out
-    assert "D-3 p.3" in out
+    assert "D-1 u.1" in out
+    assert "D-3 u.3" in out
     # 4th and 5th are out of the cap.
-    assert "D-4 p.4" not in out
-    assert "D-5 p.5" not in out
+    assert "D-4 u.4" not in out
+    assert "D-5 u.5" not in out
 
 
 def test_summarize_retrieve_document_id_filter_appended() -> None:
@@ -519,7 +519,7 @@ def test_summarize_retrieve_accepts_locator_objects() -> None:
         type("C", (), {"source_ref": Locator("AAPL-2023Q1", "v1", 4)})(),
     ]
     out = summarize_retrieve(chunks=chunks, args={"query": "q"})
-    assert "AAPL-2023Q1 p.4" in out
+    assert "AAPL-2023Q1 u.4" in out
 
 
 def test_summarize_retrieve_skips_chunk_without_locator() -> None:
@@ -527,52 +527,126 @@ def test_summarize_retrieve_skips_chunk_without_locator() -> None:
     but contributes no locator the operator cannot open."""
     chunks = [
         {"text": "no source_ref here"},
-        {"source_ref": {"document_id": "AAPL-2023Q1", "page": 4}},
+        {"source_ref": {"document_id": "AAPL-2023Q1", "unit": 4}},
     ]
     out = summarize_retrieve(chunks=chunks, args={"query": "q"})
     assert "2 hits" in out
-    assert out.endswith(" -> AAPL-2023Q1 p.4")
+    assert out.endswith(" -> AAPL-2023Q1 u.4")
 
 
-# ----- summarize_read_file -----
+def test_summarize_retrieve_never_labels_a_locator_as_a_page() -> None:
+    """A tool row renders the unit ordinal even when the payload also
+    carries a ``display`` key: the page presentation belongs to a
+    citation, which the trusted record grants it, and a hit count has no
+    such grant, so borrowing one would print an unverified page claim."""
+    chunks = [
+        {"source_ref": {"document_id": "AAPL-2023Q1", "unit": 4, "display": "page"}},
+        {"source_ref": {"document_id": "note-1", "unit": 1, "display": "unit"}},
+    ]
+    out = summarize_retrieve(chunks=chunks, args={"query": "q"})
+    assert out.endswith(" -> AAPL-2023Q1 u.4, note-1 u.1")
+    assert "p.4" not in out
+    assert "p.1" not in out
 
 
-def test_summarize_read_file_renders_document_and_page() -> None:
-    """Spec line 32: ``document_id p.N``."""
-    out = summarize_read_file(
+# ----- summarize_read_source -----
+
+
+def test_summarize_read_source_renders_document_and_unit() -> None:
+    """Spec thread-attachment-source-read: the row names the source
+    and the one frozen unit the read resolved."""
+    out = summarize_read_source(
         result=None,
-        args={"document_id": "AAPL-2023Q1", "page": 4, "page_limit": 1},
+        args={
+            "source_ref": {
+                "document_id": "AAPL-2023Q1",
+                "version": "v" * 64,
+                "unit": 4,
+            }
+        },
     )
-    assert out == "AAPL-2023Q1 p.4"
+    assert out == "AAPL-2023Q1 u.4"
 
 
-def test_summarize_read_file_renders_page_range_when_limit_gt_one() -> None:
-    """``page_limit > 1`` produces ``p.start-end``."""
-    out = summarize_read_file(
-        result=None,
-        args={"document_id": "AAPL-2023Q1", "page": 4, "page_limit": 3},
+def test_summarize_read_source_renders_continuation_offset() -> None:
+    """A bounded slice that did not reach the end of the unit shows
+    ``next_position`` so the operator sees the read continues there."""
+    out = summarize_read_source(
+        result={
+            "source_ref": {
+                "document_id": "AAPL-2023Q1",
+                "version": "v" * 64,
+                "unit": 4,
+            },
+            "text": "a bounded slice",
+            "next_position": 8000,
+        },
+        args=None,
     )
-    assert out == "AAPL-2023Q1 p.4-6"
+    assert out == "AAPL-2023Q1 u.4 -> 8000"
 
 
-def test_summarize_read_file_appends_unknown_locator_marker() -> None:
+def test_summarize_read_source_renders_attachment_identity() -> None:
+    """An attachment slice names the attachment_id (the citation
+    identity), not a company document_id."""
+    out = summarize_read_source(
+        result={
+            "source_ref": {
+                "kind": "attachment",
+                "attachment_id": "att-7",
+                "version": "3",
+                "unit": 2,
+            },
+            "text": "attached unit text",
+            "next_position": None,
+        },
+        args=None,
+    )
+    assert out == "att-7 u.2"
+
+
+def test_summarize_read_source_appends_unknown_locator_marker() -> None:
     """A miss (the tool returned ``{"error": "unknown_locator"}``)
     surfaces that error token so the operator can see why evidence
     is empty."""
-    out = summarize_read_file(
+    out = summarize_read_source(
         result={"error": "unknown_locator"},
-        args={"document_id": "AAPL-2023Q1", "page": 4, "page_limit": 1},
+        args={
+            "source_ref": {
+                "document_id": "AAPL-2023Q1",
+                "version": "v" * 64,
+                "unit": 4,
+            }
+        },
     )
     assert "(unknown_locator)" in out
+    assert "AAPL-2023Q1 u.4" in out
 
 
-def test_summarize_read_file_falls_back_to_result_when_args_missing() -> None:
-    """If only ``result`` is available (test path), use it."""
-    out = summarize_read_file(
-        result={"document_id": "AAPL-2023Q1", "page": 7, "page_limit": 1},
+def test_summarize_read_source_falls_back_to_result_when_args_missing() -> None:
+    """The result echoes the resolved ref the leg actually read; with
+    no args the row still names it."""
+    out = summarize_read_source(
+        result={
+            "source_ref": {
+                "document_id": "AAPL-2023Q1",
+                "version": "v" * 64,
+                "unit": 7,
+            },
+            "text": "tail",
+            "next_position": None,
+        },
         args=None,
     )
-    assert out == "AAPL-2023Q1 p.7"
+    assert out == "AAPL-2023Q1 u.7"
+
+
+def test_summarize_read_file_is_removed() -> None:
+    """The legacy whole-page ``read_file`` renderer has no compatibility
+    path (spec thread-attachment-source-read decision 5)."""
+    import fin.host.stream_map as stream_map
+
+    assert not hasattr(stream_map, "summarize_read_file")
 
 
 # ----- format_tool_summary (dispatch) -----
@@ -598,14 +672,29 @@ def test_format_tool_summary_dispatches_retrieve() -> None:
     assert "growth" in out
 
 
-def test_format_tool_summary_dispatches_read_file() -> None:
-    """Dispatch on ``name='read_file'`` calls the read_file formatter."""
+def test_format_tool_summary_dispatches_read_source() -> None:
+    """Dispatch on ``name='read_source'`` calls the read_source
+    formatter."""
+    out = format_tool_summary(
+        "read_source",
+        result=None,
+        args={"source_ref": {"document_id": "X", "version": "v1", "unit": 3}},
+    )
+    assert out == "X u.3"
+
+
+def test_format_tool_summary_does_not_dispatch_read_file() -> None:
+    """A stale ``read_file`` row (an old checkpoint replaying a
+    removed tool name) must not reach a locator formatter: it falls to
+    the unknown-tool fallback, which never renders ``u.N`` / ``p.N``."""
     out = format_tool_summary(
         "read_file",
         result=None,
         args={"document_id": "X", "page": 3, "page_limit": 1},
     )
-    assert out == "X p.3"
+    assert "read_file" in out
+    assert out != "X u.3"
+    assert "p.3" not in out
 
 
 def test_format_tool_summary_unknown_tool_without_args_or_result_keeps_bare_name() -> None:
@@ -723,7 +812,7 @@ def test_summarize_get_xbrl_fact_renders_concept_period_and_value() -> None:
             "source_locator": {
                 "document_id": "AAPL-2023Q3",
                 "version": "v" * 64,
-                "page": 4,
+                "unit": 4,
             },
         },
         args={"concept": "us-gaap:Revenues", "period": "2023-Q3-YTD"},
@@ -733,7 +822,7 @@ def test_summarize_get_xbrl_fact_renders_concept_period_and_value() -> None:
     assert load_private_fixture("c18591bcf0070a92596e8fa66285e8cb7eafe482710c7f278506d2292ef3c207") in out
     assert "USD" in out
     assert "millions" in out
-    assert "AAPL-2023Q3 p.4" in out
+    assert "AAPL-2023Q3 u.4" in out
 
 
 def test_summarize_get_xbrl_fact_renders_float_value() -> None:
@@ -747,7 +836,7 @@ def test_summarize_get_xbrl_fact_renders_float_value() -> None:
 
 def test_summarize_get_xbrl_fact_appends_miss_token() -> None:
     """The typed miss (``fact_not_found``) surfaces its token the
-    same way ``summarize_read_file`` surfaces ``unknown_locator``."""
+    same way ``summarize_read_source`` surfaces ``unknown_locator``."""
     out = summarize_get_xbrl_fact(
         result={
             "error": "fact_not_found",
@@ -785,7 +874,7 @@ def test_format_tool_summary_get_xbrl_fact_is_not_the_bare_name() -> None:
             "source_locator": {
                 "document_id": "AAPL-2023Q3",
                 "version": "v" * 64,
-                "page": 4,
+                "unit": 4,
             },
         },
         args={"concept": "us-gaap:Revenues", "period": "2023-Q3-YTD"},
@@ -842,8 +931,8 @@ def test_summarize_get_xbrl_fact_no_qualifiers_omits_parens() -> None:
     assert out == "c p = 1"
 
 
-def test_summarize_get_xbrl_fact_locator_without_page_names_document() -> None:
-    """A page-less locator still names the document it came from."""
+def test_summarize_get_xbrl_fact_locator_without_unit_names_document() -> None:
+    """An ordinal-less locator still names the document it came from."""
     out = summarize_get_xbrl_fact(
         result={
             "concept": "c",
@@ -864,7 +953,7 @@ def test_summarize_get_xbrl_fact_locator_without_doc_id_dropped() -> None:
             "concept": "c",
             "period": "p",
             "value": 1,
-            "source_locator": {"page": 4},
+            "source_locator": {"unit": 4},
         },
         args=None,
     )

@@ -1,11 +1,12 @@
 """T4 live acceptance: fin's bounded read legs against real iknow-memory.
 
-Drives the shipped ``MCPRetrieveAdapter.read_slice`` / ``read`` paths (not
-raw tools/call frames) against the real stdio server whose ``read_source``
-caps each slice at 8,000 code points / 32 KiB — the exact condition the
-legacy full-body fetch had to grow a cursor walk for. Concatenation,
-cursor advance, and typed-error mapping are asserted on observable wire
-behavior (spec ``thread-attachment-source-read`` acceptance 7/8/9).
+Drives the shipped ``MCPRetrieveAdapter.read_slice`` leg and the
+model-facing ``read_source`` tool (not raw tools/call frames) against the
+real stdio server whose ``read_source`` caps each slice at 8,000 code
+points / 32 KiB — the exact condition the removed whole-body fetch had to
+grow a cursor walk for. Concatenation, cursor advance, and typed-error
+mapping are asserted on observable wire behavior (spec
+``thread-attachment-source-read`` acceptance 7/8/9).
 """
 
 from __future__ import annotations
@@ -16,10 +17,9 @@ from typing import Any, Iterator
 import pytest
 
 from fin.corpus.chunking import split_unit
-from fin.corpus.extracted import Locator
-from fin.corpus.parsers._common import UnitLocator, build_unit
-from fin.corpus.push import envelope_of_unit, serialize_source_ref
-from fin.retrieve.mcp_adapter import MCPRetrieveAdapter
+from fin.corpus.parsers._common import build_unit
+from fin.corpus.push import envelope_of_unit
+from fin.host.tools.read_source import read_source
 from fin.retrieve.source_read import (
     INVALID_LOCATOR,
     INVALID_POSITION,
@@ -34,7 +34,6 @@ from live_iknow_support import IKNOW_ROOT, live_iknow
 
 pytestmark = pytest.mark.mcp
 
-_TIMEOUT_SECONDS = 20.0
 _DOCUMENT_ID = "T4-LIVE-BOUNDED-READ"
 
 
@@ -121,21 +120,29 @@ def test_live_read_slice_cursor_walk_reproduces_the_unit_exactly(
     assert not any(0xD800 <= ord(ch) <= 0xDFFF for ch in collected)
 
 
-def test_live_legacy_read_follows_the_cursor_to_the_full_body(
+def test_live_read_source_tool_walks_the_cursor_to_the_full_body(
     live: Any, pushed: str
 ) -> None:
-    """``read()`` assembles the whole unit from bounded wire slices."""
-    adapter = MCPRetrieveAdapter(
-        session=live.session,
-        timeout_seconds=_TIMEOUT_SECONDS,
-        locator_map={
-            serialize_source_ref(
-                UnitLocator(_DOCUMENT_ID, _VERSION, 1)
-            ): Locator(_DOCUMENT_ID, _VERSION, 1),
-        },
-    )
-    result = adapter.read(_DOCUMENT_ID, _VERSION, page=1, page_limit=1)
-    assert result["text"] == pushed
+    """The model-facing seam that replaced the removed whole-page ``read``
+    assembly: one ``read_source`` tool call answers one bounded slice with
+    the request identity echoed, and following its cursor reaches the
+    complete frozen unit."""
+    collected = ""
+    position = 0
+    calls = 0
+    while True:
+        result = read_source(_TRIPLE, position, company_reader=live.retrieve)
+        assert is_slice_result(result), result
+        assert result["source_ref"] == _TRIPLE
+        assert len(result["text"]) <= SOURCE_READ_MAX_TEXT_CODE_POINTS
+        collected += result["text"]
+        if result["next_position"] is None:
+            break
+        assert result["next_position"] > position
+        position = result["next_position"]
+        calls += 1
+        assert calls < 10
+    assert collected == pushed
 
 
 def test_live_wire_failures_map_to_fin_typed_codes(

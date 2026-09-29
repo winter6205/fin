@@ -135,7 +135,7 @@ def dataset_eval_set(
 
     tree = load_extracted_tree(corpus_root / "manifest.json", extracted_dir)
     text_by_unit: dict[tuple[str, int], str] = {
-        (page.locator.document_id, page.locator.page): page.text
+        (page.locator.document_id, page.locator.unit): page.text
         for pages in tree.values()
         for page in pages
     }
@@ -163,7 +163,7 @@ def dataset_eval_set(
         gold = Locator(
             document_id=document_id,
             version=str(locator_payload["version"]),
-            page=unit,
+            unit=unit,
         )
         question = str(item["question"])
         arms = ARMS_BY_QUERY_CLASS[str(item["query_class"])]
@@ -186,7 +186,7 @@ def dataset_eval_set(
                         source_ref=Locator(
                             document_id=neighbour_id,
                             version=str(neighbour_locator["version"]),
-                            page=neighbour_unit,
+                            unit=neighbour_unit,
                         ),
                         score=0.5 - 0.1 * offset,
                     ),

@@ -40,7 +40,7 @@ T4 export binds to::
                 "display": "[private source value removed]",     # "—" when missing
                 "unit": "USD",
                 "scale": "millions",
-                "locator": {"document_id","version","page"}|null
+                "locator": {"document_id","version","unit"}|null
               }
             ]
           }
@@ -58,7 +58,7 @@ T4 export binds to::
         "missing": [{"row","column","reason"}],
         "hit_count": 2,
         "cell_count": 2,
-        "locators": [{"document_id","version","page"}]
+        "locators": [{"document_id","version","unit"}]
       }
     }
 
@@ -75,8 +75,8 @@ Typed EXITs (dict values, never exceptions — spec § Boundaries
   refusal, not a multi-thousand-cell payload on the SSE wire.
 
 Like ``get_xbrl_fact``, this tool contributes NO ``EvidenceItem``:
-a fact row is not page text, so the citation verifier still needs a
-``read_file`` / ``retrieve`` span before the prose answer can pass.
+a fact row is not unit text, so the citation verifier still needs a
+``read_source`` / ``retrieve`` span before the prose answer can pass.
 The numeric gate is what binds the comparison's numbers to the
 answer (see ``fin.host.graph``).
 """
@@ -147,7 +147,7 @@ def _locator_dict(fact: Fact) -> dict[str, Any]:
     return {
         "document_id": fact.source_locator.document_id,
         "version": fact.source_locator.version,
-        "page": fact.source_locator.page,
+        "unit": fact.source_locator.unit,
     }
 
 

@@ -210,9 +210,9 @@ def test_citation_gate_passes_32_char_span_over_real_block_text() -> None:
                 locator=Locator(
                     document_id=str(page["document_id"]),
                     version=str(page["version"]),
-                    page=int(page["page"]),  # type: ignore[arg-type]
+                    unit=int(page["page"]),  # type: ignore[arg-type]
                 ),
-                page_text=chunk_text,
+                unit_text=chunk_text,
             )
         ],
         repair_count=0,

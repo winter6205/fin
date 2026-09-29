@@ -1,65 +1,59 @@
-"""Boundary tests for the read seam (ADR 0046 / ADR 0047, T1).
+"""Boundary tests for the company read seam (ADR 0046 / ADR 0047, ADR 0088).
 
-The serve path must not treat the local ``data/corpus/extracted``
-tree as the company-corpus SSOT. ``read_file`` therefore reads through
-an injected **read port** — the same port idea as the retrieve port:
+The serve path must not treat the local ``data/corpus/extracted`` tree as
+the company-corpus SSOT, and the whole-page read seam is gone: there is
+no pagination port and no compatibility path. What ``read_port``
+holds now are the two authorities every pages-backed company read shares:
 
-* ``ReadPort`` — structural protocol; ``read(document_id, version,
-  page, page_limit)`` returns the read_file contract dict or the
-  ``{"error": "unknown_locator"}`` miss dict.
-* ``read_from_pages`` — the shared boundary logic (page bounds, ADR
-  0009 clamp, version match, ``\\n\\n`` join) every pages-backed
-  implementation reuses.
-* ``ExtractedTreeReadPort`` — the legacy tree-backed adapter. It stays
-  importable for offline / committed-corpus tests, but NO product
-  compile path builds it (the graph injects the retrieve adapter or a
-  typed-miss port instead).
-* ``MissReadPort`` — the explicit "this backend cannot read objects"
-  adapter: every read is the typed miss.
-* ``FakeRetrievePort.read`` — the fake answers reads from its own
-  ``pages_by_doc`` manifest, so a scripted serve test can give the
-  model a readable body without any on-disk tree.
-* ``MCPRetrieveAdapter.read`` — iknow-memory exposes no read tool
-  (handoff 2026-09-04), so the product MCP read is the named
-  ``read_unavailable`` failure — never a silent success, never a
-  fallback to the local tree.
+* ``validate_company_source_ref`` — the one place a company locator
+  triple's shape and size are judged; both read legs resolve their
+  locator through it.
+* ``unit_text_from_pages`` — the in-memory ``{document_id: pages}``
+  lookup of one frozen unit's text, which is what the fake serve path
+  (:class:`fin.retrieve.fake_port.FakeRetrievePort`) reads its
+  ``pages_by_doc`` manifest through.
 
-Covers the five boundary classes: empty (no pages), negative (page /
-page_limit below 1), overflow (page past the end, page_limit above the
-ADR 0009 cap), concurrent (read-only shared state), exception (missing
-tree → typed miss, never raised).
+The body a caller finally receives is that text put through the shared
+bounded slicer (:mod:`fin.retrieve.source_read`), so the bound on a read
+is a SIZE bound — the code-point and serialized-result caps — not a
+page-count window. Those bounds are pinned here through the pages-backed
+leg, because that is the seam ``read_port`` feeds.
+
+Covers the five boundary classes: empty (no pages), negative (unit below
+1, malformed keys), overflow (unit past the end, oversized locator, body
+past the code-point and byte caps), concurrent (read-only shared state),
+exception (nothing raises at the model — every miss is a typed answer).
 """
 
 from __future__ import annotations
 
 import concurrent.futures
-import json
-from pathlib import Path
 
 import pytest
 
-from fin.corpus.errors import IngestMissingError
-from fin.corpus.extracted import ExtractedPage, Locator, load_extracted_tree
-from fin.retrieve import (
-    ExtractedTreeReadPort,
-    FakeRetrievePort,
-    MCPRetrieveAdapter,
-    MissReadPort,
-    ReadPort,
-    read_from_pages,
+from fin.corpus.extracted import ExtractedPage, Locator
+from fin.retrieve import mcp_adapter as mcp_adapter_module
+from fin.retrieve import read_port as read_port_module
+from fin.retrieve.fake_port import FakeRetrievePort
+from fin.retrieve.read_port import unit_text_from_pages, validate_company_source_ref
+from fin.retrieve.source_read import (
+    SOURCE_READ_MAX_RESULT_BYTES,
+    SOURCE_READ_MAX_TEXT_CODE_POINTS,
+    serialized_result_bytes,
 )
 
 
 VERSION = "a" * 64
+DOCUMENT_ID = "TEST-2023Q1"
 
 
-# ----- synthetic pages fixture (no on-disk tree needed) -----
+# ----- synthetic unit fixture (no on-disk tree needed) -----
 
 
-def _pages(document_id: str = "TEST-2023Q1", count: int = 3) -> tuple[ExtractedPage, ...]:
+def _pages(document_id: str = DOCUMENT_ID, count: int = 3) -> tuple[ExtractedPage, ...]:
     return tuple(
         ExtractedPage(
-            locator=Locator(document_id=document_id, version=VERSION, page=n),
+            locator=Locator(document_id=document_id, version=VERSION, unit=n),
             text=f"PAGE {n} BODY",
             passages=(),
         )
@@ -67,290 +61,207 @@ def _pages(document_id: str = "TEST-2023Q1", count: int = 3) -> tuple[ExtractedP
     )
 
 
-# ----- protocol shape -----
+def _single_unit_table(text: str) -> dict[str, tuple[ExtractedPage, ...]]:
+    """A one-unit manifest whose whole body is ``text``.
 
-
-def test_fake_port_with_pages_satisfies_read_port_protocol() -> None:
-    """The fake's ``read`` makes it structurally a ``ReadPort`` — that
-    is the seam ``compile_graph`` injects into the ``read_file`` tool."""
-    assert isinstance(FakeRetrievePort(pages_by_doc={}), ReadPort)
-
-
-def test_miss_port_satisfies_read_port_protocol() -> None:
-    assert isinstance(MissReadPort(), ReadPort)
-
-
-def test_tree_port_satisfies_read_port_protocol(tmp_path: Path) -> None:
-    assert isinstance(
-        ExtractedTreeReadPort(tmp_path / "manifest.json", tmp_path / "extracted"),
-        ReadPort,
-    )
-
-
-# ===== read_from_pages: the shared boundary logic =====
-
-
-def test_read_from_pages_happy_path_joins_range() -> None:
-    result = read_from_pages(
-        {"TEST-2023Q1": _pages()}, "TEST-2023Q1", VERSION, page=2, page_limit=2
-    )
-    assert result == {
-        "document_id": "TEST-2023Q1",
-        "version": VERSION,
-        "page": 2,
-        "text": "PAGE 2 BODY\n\nPAGE 3 BODY",
-        "page_count": 3,
+    Built from the caller's string so the expected slice is read off the
+    fixture, not recomputed from what the read path returns.
+    """
+    return {
+        DOCUMENT_ID: (
+            ExtractedPage(
+                locator=Locator(document_id=DOCUMENT_ID, version=VERSION, unit=1),
+                text=text,
+                passages=(),
+            ),
+        )
     }
 
 
-def test_read_from_pages_empty_page_table_is_miss() -> None:
-    """No pages at all (the default fake's shape) → typed miss."""
-    assert read_from_pages({}, "TEST-2023Q1", VERSION, 1, 1) == {
+def _company_ref(document_id: str = DOCUMENT_ID, unit: int = 1) -> dict:
+    return {"document_id": document_id, "version": VERSION, "unit": unit}
+
+
+# ===== the seam's surface: a locator gate and a lookup, nothing else =====
+
+
+def test_the_read_seam_exposes_only_the_locator_gate_and_the_unit_lookup() -> None:
+    """The frozen contract: ``read_port`` answers through exactly two
+    functions. A re-introduced pagination port or page-limit helper would
+    give one frozen unit a second read identity, so its absence is part
+    of the contract, asserted by name."""
+    assert sorted(read_port_module.__all__) == [
+        "unit_text_from_pages",
+        "validate_company_source_ref",
+    ]
+    for removed in (
+        "PAGE_LIMIT",
+        "PAGE_LIMIT_CAP",
+        "ReadPort",
+        "MissReadPort",
+        "ExtractedTreeReadPort",
+        "clamp_page_limit",
+        "read_from_pages",
+    ):
+        assert not hasattr(read_port_module, removed), removed
+
+
+@pytest.mark.parametrize(
+    "module",
+    [pytest.param(read_port_module, id="read-port"),
+     pytest.param(mcp_adapter_module, id="mcp-read-leg")],
+)
+def test_a_read_leg_carries_no_local_tree_fallback(module: object) -> None:
+    """ADR 0046 / ADR 0047: neither company read leg may fall back to the
+    committed extracted tree on disk. With the tree-backed port deleted
+    this is now structural — the loader is not reachable from a read leg
+    at all, so a missing or malformed tree cannot be papered over by a
+    silent second read path."""
+    assert not hasattr(module, "load_extracted_tree")
+
+
+# ===== unit_text_from_pages: the shared in-memory lookup =====
+
+
+def test_unit_text_resolves_the_addressed_unit() -> None:
+    assert (
+        unit_text_from_pages({DOCUMENT_ID: _pages()}, DOCUMENT_ID, VERSION, 2)
+        == "PAGE 2 BODY"
+    )
+
+
+def test_unit_text_of_an_empty_table_is_none() -> None:
+    """No pages at all (the default fake's shape) is a miss, not an
+    empty body."""
+    assert unit_text_from_pages({}, DOCUMENT_ID, VERSION, 1) is None
+
+
+def test_unit_text_of_an_unknown_document_is_none() -> None:
+    assert (
+        unit_text_from_pages({DOCUMENT_ID: _pages()}, "BOGUS-2099Q9", VERSION, 1)
+        is None
+    )
+
+
+def test_unit_text_of_a_mismatched_version_is_none() -> None:
+    """The rows carry the ingested sha256; a caller asking for a version
+    the table does not hold gets a miss, never another version's text."""
+    assert (
+        unit_text_from_pages({DOCUMENT_ID: _pages()}, DOCUMENT_ID, "b" * 64, 1)
+        is None
+    )
+
+
+@pytest.mark.parametrize("bad_unit", [0, -1, 4])
+def test_unit_outside_the_table_is_none(bad_unit: int) -> None:
+    """``unit < 1`` (negative boundary) and ``unit > len(pages)``
+    (overflow boundary) are both the same named miss — no zero-based
+    reinterpretation, no wrap-around to the first unit."""
+    assert (
+        unit_text_from_pages({DOCUMENT_ID: _pages()}, DOCUMENT_ID, VERSION, bad_unit)
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("table", "ref"),
+    [
+        pytest.param({}, _company_ref(), id="no-documents"),
+        pytest.param({DOCUMENT_ID: ()}, _company_ref(), id="empty-document"),
+        pytest.param({DOCUMENT_ID: _pages(count=1)}, _company_ref(unit=3), id="past-the-end"),
+        pytest.param({DOCUMENT_ID: _pages()}, _company_ref(document_id="GONE"), id="no-such-document"),
+    ],
+)
+def test_an_incomplete_table_is_a_typed_miss_never_an_exception(
+    table: dict, ref: dict
+) -> None:
+    """SC3: with nothing readable behind it, the model still gets the
+    typed ``unknown_locator`` dict — the lookup returns ``None`` and the
+    leg folds that to a name, so no missing or short artifact can raise
+    ``IngestMissingError`` at the model or answer an empty success."""
+    assert FakeRetrievePort(pages_by_doc=table).read_slice(ref) == {
         "error": "unknown_locator"
     }
 
 
-def test_read_from_pages_unknown_document_is_miss() -> None:
-    assert read_from_pages(
-        {"TEST-2023Q1": _pages()}, "BOGUS-2099Q9", VERSION, 1, 1
-    ) == {"error": "unknown_locator"}
+# ===== the surviving bound on a body: size, not a page-count window =====
 
 
-def test_read_from_pages_version_mismatch_is_miss() -> None:
-    assert read_from_pages(
-        {"TEST-2023Q1": _pages()}, "TEST-2023Q1", "b" * 64, 1, 1
-    ) == {"error": "unknown_locator"}
+def test_a_unit_longer_than_the_bound_is_read_in_capped_slices() -> None:
+    """The bound that replaced the page window: an over-long unit never
+    arrives whole. One read hands back at most
+    ``SOURCE_READ_MAX_TEXT_CODE_POINTS`` code points and a cursor that
+    advances to the remainder, which is the surviving form of the old
+    "the range clamps to the cap" promise."""
+    text = "A" * (SOURCE_READ_MAX_TEXT_CODE_POINTS + 7)
+    port = FakeRetrievePort(pages_by_doc=_single_unit_table(text))
+
+    first = port.read_slice(_company_ref())
+    assert first["text"] == text[:SOURCE_READ_MAX_TEXT_CODE_POINTS]
+    assert first["next_position"] == SOURCE_READ_MAX_TEXT_CODE_POINTS
+
+    tail = port.read_slice(_company_ref(), first["next_position"])
+    assert tail["text"] == text[SOURCE_READ_MAX_TEXT_CODE_POINTS:]
+    assert tail["next_position"] is None
+    assert first["text"] + tail["text"] == text
 
 
-@pytest.mark.parametrize("bad_page", [0, -1, 4])
-def test_read_from_pages_page_out_of_range_is_miss(bad_page: int) -> None:
-    """``page < 1`` (negative boundary) and ``page > page_count``
-    (overflow boundary) are both the typed miss."""
-    assert read_from_pages(
-        {"TEST-2023Q1": _pages()}, "TEST-2023Q1", VERSION, bad_page, 1
-    ) == {"error": "unknown_locator"}
+def test_a_multibyte_unit_is_shrunk_until_the_whole_result_fits_the_byte_cap() -> None:
+    """The cap measures the complete serialized result, so a unit whose
+    text costs four bytes a code point is cut below the code-point cap
+    rather than handed over the byte bound. The cursor still strictly
+    advances and the walk reassembles the stored text exactly."""
+    text = "\U0001F600" * (SOURCE_READ_MAX_TEXT_CODE_POINTS + 100)
+    port = FakeRetrievePort(pages_by_doc=_single_unit_table(text))
+
+    collected = ""
+    position = 0
+    guard = 0
+    while True:
+        result = port.read_slice(_company_ref(), position)
+        assert serialized_result_bytes(result) <= SOURCE_READ_MAX_RESULT_BYTES
+        collected += result["text"]
+        if result["next_position"] is None:
+            break
+        assert result["next_position"] > position
+        position = result["next_position"]
+        guard += 1
+        assert guard < 100, "a non-advancing cursor must not spin the walk"
+    assert collected == text
 
 
-@pytest.mark.parametrize("bad_limit", [0, -1])
-def test_read_from_pages_page_limit_below_one_is_miss(bad_limit: int) -> None:
-    assert read_from_pages(
-        {"TEST-2023Q1": _pages()}, "TEST-2023Q1", VERSION, 1, bad_limit
-    ) == {"error": "unknown_locator"}
+# ===== FakeRetrievePort.read_slice: the pages-backed leg =====
 
 
-def test_read_from_pages_page_limit_above_cap_clamps_to_three() -> None:
-    """``page_limit > 3`` is silently clamped (ADR 0009 cap)."""
-    clamped = read_from_pages(
-        {"TEST-2023Q1": _pages()}, "TEST-2023Q1", VERSION, 1, 10
-    )
-    full = read_from_pages({"TEST-2023Q1": _pages()}, "TEST-2023Q1", VERSION, 1, 3)
-    assert clamped == full
-
-
-def test_read_from_pages_range_clamps_to_page_count() -> None:
-    result = read_from_pages(
-        {"TEST-2023Q1": _pages()}, "TEST-2023Q1", VERSION, 3, 3
-    )
-    assert result["text"] == "PAGE 3 BODY"
-
-
-# ===== FakeRetrievePort.read: the fake manifest answers reads =====
-
-
-def test_fake_port_read_serves_body_from_pages_by_doc() -> None:
-    """The open-point answer: a scripted serve test gives the fake a
-    ``pages_by_doc`` manifest and ``read_file`` bodies come from it —
-    no extracted tree on disk anywhere."""
-    fake = FakeRetrievePort(pages_by_doc={"TEST-2023Q1": _pages()})
-    result = fake.read("TEST-2023Q1", VERSION, page=1, page_limit=1)
-    assert result["text"] == "PAGE 1 BODY"
-    assert result["page_count"] == 3
-
-
-def test_fake_port_without_pages_manifest_reads_miss() -> None:
-    """Default fake (no manifest): every read is the typed miss — the
-    fake corpus is empty, and that is a named answer, not a crash."""
-    assert FakeRetrievePort().read("TEST-2023Q1", VERSION) == {
-        "error": "unknown_locator"
-    }
-
-
-def test_fake_port_read_shares_read_only_state_across_threads() -> None:
-    fake = FakeRetrievePort(pages_by_doc={"TEST-2023Q1": _pages()})
+def test_fake_read_slice_shares_read_only_state_across_threads() -> None:
+    """Concurrent reads of one shared fake answer identically: the
+    manifest is copied at construction and never mutated by a read."""
+    port = FakeRetrievePort(pages_by_doc={DOCUMENT_ID: _pages()})
 
     def _call() -> dict:
-        return fake.read("TEST-2023Q1", VERSION, page=1, page_limit=1)
+        return port.read_slice(_company_ref(unit=1))
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(lambda _: _call(), range(8)))
     assert all(r == results[0] for r in results)
+    assert results[0]["text"] == "PAGE 1 BODY"
 
 
-def test_fake_port_pages_by_doc_is_copied_not_aliased() -> None:
+def test_fake_pages_by_doc_is_copied_not_aliased() -> None:
     """Mutating the caller's mapping after construction cannot change
     what the fake serves (same defensive-copy rule as hits_by_query)."""
-    pages = {"TEST-2023Q1": _pages()}
-    fake = FakeRetrievePort(pages_by_doc=pages)
+    pages = {DOCUMENT_ID: _pages()}
+    port = FakeRetrievePort(pages_by_doc=pages)
     pages["INJECTED-2024Q1"] = _pages("INJECTED-2024Q1")
-    assert fake.read("INJECTED-2024Q1", VERSION) == {"error": "unknown_locator"}
-
-
-# ===== MCPRetrieveAdapter.read: MCP dispatch, no local fallback =====
-
-
-def test_mcp_adapter_read_unknown_without_locator_map() -> None:
-    """A document with no unit locator map is a typed miss and never
-    silently consults the local extracted tree."""
-    adapter = MCPRetrieveAdapter(command=None)
-    assert adapter.read("TEST-2023Q1", VERSION) == {"error": "unknown_locator"}
-
-
-def test_mcp_adapter_read_touches_no_local_tree(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An MCP read with no known document cannot fall through to the
-    extracted tree loader."""
-
-    def _boom(*args: object, **kwargs: object) -> None:
-        raise AssertionError("MCP read consulted the local tree")
-
-    monkeypatch.setattr(
-        "fin.retrieve.read_port.load_extracted_tree", _boom, raising=False
-    )
-    adapter = MCPRetrieveAdapter(command=["iknow-memory"])
-    assert adapter.read("TEST-2023Q1", VERSION) == {"error": "unknown_locator"}
-
-
-# ===== ExtractedTreeReadPort: legacy adapter, typed miss on broken tree =====
-
-
-def _write_synthetic_tree(tmp_path: Path) -> tuple[Path, Path]:
-    extracted_root = tmp_path / "extracted"
-    doc_dir = extracted_root / "TEST-2023Q1"
-    doc_dir.mkdir(parents=True)
-    (doc_dir / "page-001.json").write_text(
-        json.dumps(
-            {
-                "document_id": "TEST-2023Q1",
-                "version": VERSION,
-                "page": 1,
-                "text": "PAGE 1 BODY",
-            }
-        )
-    )
-    (doc_dir / "passages-001.json").write_text(
-        json.dumps(
-            {
-                "passages": [
-                    {
-                        "text": "PAGE 1 BODY",
-                        "char_start": 0,
-                        "char_end": 12,
-                    }
-                ]
-            }
-        )
-    )
-    (extracted_root / "_index.json").write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "documents": {
-                    "TEST-2023Q1": {"page_count": 1, "version": VERSION}
-                },
-            }
-        )
-    )
-    manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "upstream": {
-                    "repo": "test",
-                    "commit": "test",
-                    "path": "test",
-                    "license": "test",
-                },
-                "tickers": ["TEST"],
-                "periods": ["2023 Q1"],
-                "note": "synthetic test fixture",
-                "documents": [
-                    {
-                        "document_id": "TEST-2023Q1",
-                        "source_id": "TEST",
-                        "company": "TEST",
-                        "period": "2023 Q1",
-                        "doc_type": "10-Q",
-                        "filename": "test.pdf",
-                        "upstream_name": "test.pdf",
-                        "bytes": 0,
-                        "sha256": VERSION,
-                    }
-                ],
-            }
-        )
-    )
-    return manifest_path, extracted_root
-
-
-def test_tree_port_happy_path_matches_tree_loader(tmp_path: Path) -> None:
-    manifest_path, extracted_root = _write_synthetic_tree(tmp_path)
-    port = ExtractedTreeReadPort(manifest_path, extracted_root)
-    result = port.read("TEST-2023Q1", VERSION, page=1, page_limit=1)
-    assert result["text"] == "PAGE 1 BODY"
-
-    tree = load_extracted_tree(manifest_path, extracted_root)
-    assert result["page_count"] == len(tree["TEST-2023Q1"])
-
-
-def test_tree_port_missing_tree_is_typed_miss_not_exception(
-    tmp_path: Path,
-) -> None:
-    """SC3: with the local extracted tree absent, the tree-backed port
-    answers the typed miss dict — it never raises ``IngestMissingError``
-    at the model and never silently succeeds."""
-    port = ExtractedTreeReadPort(
-        tmp_path / "manifest.json", tmp_path / "extracted"
-    )
-    assert (tmp_path / "extracted").exists() is False
-    assert port.read("TEST-2023Q1", VERSION) == {"error": "unknown_locator"}
-
-
-def test_tree_port_broken_tree_is_typed_miss(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A malformed tree raises ``IngestMissingError`` from the loader;
-    the port converts it to the model-facing miss dict (ADR 0009 +
-    ADR 0020 contract preserved from the old ``read_file``)."""
-
-    def _raise(*args: object, **kwargs: object) -> None:
-        raise IngestMissingError("simulated missing tree")
-
-    monkeypatch.setattr("fin.retrieve.read_port.load_extracted_tree", _raise)
-    port = ExtractedTreeReadPort(
-        tmp_path / "manifest.json", tmp_path / "extracted"
-    )
-    assert port.read("TEST-2023Q1", VERSION) == {"error": "unknown_locator"}
-
-
-# ===== MissReadPort =====
-
-
-def test_miss_port_always_misses() -> None:
-    port = MissReadPort()
-    assert port.read("TEST-2023Q1", VERSION) == {"error": "unknown_locator"}
-    assert port.read("ANY-2024Q2", "b" * 64, page=2, page_limit=3) == {
+    assert port.read_slice(_company_ref("INJECTED-2024Q1")) == {
         "error": "unknown_locator"
     }
 
 
-# ===== validate_company_source_ref: the shared locator gate (T4) =====
+# ===== validate_company_source_ref: the shared locator gate =====
 
 
 def test_validator_resolves_a_well_formed_triple() -> None:
-    from fin.retrieve.read_port import validate_company_source_ref
-
     located = validate_company_source_ref(
         {"document_id": "TEST-2023Q1", "version": VERSION, "unit": 3}
     )
@@ -413,8 +324,6 @@ def test_validator_names_every_malformed_shape(bad_ref: object, reason: str) -> 
     """The reason tokens are the closed vocabulary both read legs
     report; ``request_locator_oversized`` reuses the backend's own
     token so one oversized identity has one name."""
-    from fin.retrieve.read_port import validate_company_source_ref
-
     assert validate_company_source_ref(bad_ref) == {
         "error": "invalid_locator",
         "reason": reason,
@@ -426,8 +335,6 @@ def test_validator_names_every_malformed_shape(bad_ref: object, reason: str) -> 
 )
 def test_validator_never_raises_on_junk(junk: object) -> None:
     """The boundary contract: garbage in, a typed failure dict out."""
-    from fin.retrieve.read_port import validate_company_source_ref
-
     result = validate_company_source_ref(junk)
     assert isinstance(result, dict)
     assert result["error"] == "invalid_locator"

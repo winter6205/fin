@@ -8,16 +8,18 @@ the product live item is the named live suite. Default pytest stays hermetic.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
+from fin.corpus.extracted import ExtractedPage, load_extracted_tree
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.citation_gate import HIDDEN_BOUNCE_MARKER
 from fin.host.jev_choice import JEV_CHOICE_EXIT_TRANSPORT, JevChoiceError
 from fin.host.track_decision import decide_track
-from fin.retrieve import ExtractedTreeReadPort
+from fin.retrieve import FakeRetrievePort
 from jev_fake import FakeJevChoice
 
 pytestmark = pytest.mark.soft_track
@@ -28,21 +30,67 @@ AAPL_2022Q3_VERSION = (
 )
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 
-_TREE_READ_PORT = ExtractedTreeReadPort(
-    Path("data/corpus/manifest.json"),
-    Path("data/corpus/extracted"),
-)
+MANIFEST_PATH = Path("data/corpus/manifest.json")
+EXTRACTED_ROOT = Path("data/corpus/extracted")
+
+_READ_MANIFEST: dict[str, tuple[ExtractedPage, ...]] | None = None
+
+
+def _read_manifest() -> dict[str, tuple[ExtractedPage, ...]]:
+    """The committed extracted tree as a ``{document_id: pages}`` read
+    manifest.
+
+    The graph never reads the tree (ADR 0046 / 0047), so a scripted
+    ``read_source`` transcript hands its bodies in through the bound
+    adapter's ``pages_by_doc``. Cached per module:
+    ``ExtractedPage`` is frozen and ``FakeRetrievePort`` copies what it
+    is handed, so no graph build disturbs another case's bodies.
+    """
+    global _READ_MANIFEST
+    if _READ_MANIFEST is None:
+        _READ_MANIFEST = load_extracted_tree(MANIFEST_PATH, EXTRACTED_ROOT)
+    return _READ_MANIFEST
+
+
+def _tree_read_adapter() -> FakeRetrievePort:
+    """A fake retrieve port whose company read leg serves the committed
+    corpus, so scripted ``read_source`` calls land on real filing text."""
+    return FakeRetrievePort(pages_by_doc=_read_manifest())
+
+
+def _read_source_call(unit: int, call_id: str) -> AIMessage:
+    """One ``read_source`` hop for one frozen unit, read from its start."""
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "read_source",
+                "args": {
+                    "source_ref": {
+                        "document_id": AAPL_2022Q3,
+                        "version": AAPL_2022Q3_VERSION,
+                        "unit": unit,
+                    },
+                    "position": 0,
+                },
+                "id": call_id,
+                "type": "tool_call",
+            }
+        ],
+    )
+
+
+def _tool_message_names(messages: list[Any]) -> set[str]:
+    return {
+        name
+        for name in (getattr(message, "name", None) for message in messages)
+        if name
+    }
 
 
 @pytest.fixture(scope="module")
 def aapl_page1_text() -> str:
-    from fin.corpus.extracted import load_extracted_tree
-
-    tree = load_extracted_tree(
-        Path("data/corpus/manifest.json"),
-        Path("data/corpus/extracted"),
-    )
-    return tree[AAPL_2022Q3][0].text
+    return _read_manifest()[AAPL_2022Q3][0].text
 
 
 def _cfg(thread_id: str) -> dict:
@@ -66,22 +114,7 @@ def test_sc_ambiguous_high_conf_grounded_binds_tools(
     span = aapl_page1_text[:80]
     model = ScriptedChatModel(
         script=[
-            AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "read_file",
-                        "args": {
-                            "document_id": AAPL_2022Q3,
-                            "version": AAPL_2022Q3_VERSION,
-                            "page": 1,
-                            "page_limit": 1,
-                        },
-                        "id": "c-jev-grounded",
-                        "type": "tool_call",
-                    }
-                ],
-            ),
+            _read_source_call(1, "c-jev-grounded"),
             AIMessage(content=f"Per the filing: {span}"),
         ]
     )
@@ -91,7 +124,7 @@ def test_sc_ambiguous_high_conf_grounded_binds_tools(
         model=model,
         jev_client=fake,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_tree_read_adapter(),
     )
     out = g.invoke(
         {
@@ -115,10 +148,23 @@ def test_sc_ambiguous_high_conf_grounded_binds_tools(
     assert out["track"] == "grounded"
     assert out["track_decision"]["decision_tier"] == "jev"
     assert out["search_mode_decision"]["search_mode"] == "graph"
-    # The research leaf ran with tools: the served read_file produced a
-    # citation and no bounce marker entered the transcript.
+    # The research leaf ran with tools: the served ``read_source`` slice
+    # produced a citation and no bounce marker entered the transcript.
     assert len(out["citations"]) >= 1
     assert HIDDEN_BOUNCE_MARKER not in str(out.get("messages", []))
+    # The citation is the unit this run read, not a page ordinal the
+    # model named: ``read_source`` replaced the whole-page ``read_file``
+    # seam with no compatibility path (spec thread-attachment-source-read
+    # decision 5 / SC11).
+    citation = out["citations"][0]
+    assert citation.kind == "company"
+    assert citation.document_id == AAPL_2022Q3
+    assert citation.version == AAPL_2022Q3_VERSION
+    assert citation.unit == 1
+    assert citation.quote == span
+    tool_names = _tool_message_names(out["messages"])
+    assert "read_source" in tool_names
+    assert "read_file" not in tool_names
 
 
 def test_sc_low_conf_any_label_clarifies_no_tools() -> None:

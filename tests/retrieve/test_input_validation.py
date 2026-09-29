@@ -97,7 +97,7 @@ MANIFEST_DOCS: dict[str, dict[str, object]] = {
 
 
 def _locator(document_id: str = "DOC-2023Q1") -> Locator:
-    return Locator(document_id=document_id, version="v-" + "a" * 60, page=1)
+    return Locator(document_id=document_id, version="v-" + "a" * 60, unit=1)
 
 
 def _chunk(text: str = "revenue rose") -> Chunk:
@@ -556,9 +556,9 @@ def test_a_failure_claiming_degraded_is_refused_at_the_count() -> None:
 
 def test_unknown_locator_is_not_reclassified_by_this_ticket() -> None:
     """``unknown_locator`` (SC43's third clause) keeps its own semantics:
-    it is the ``read_file`` miss code, not an input-validation class, so
-    this ticket's registry must not adopt it and change how the citation
-    gate reads it."""
+    it is the ``read_source`` miss code, not an input-validation class,
+    so this ticket's registry must not adopt it and change how the
+    citation gate reads it."""
     assert classify_input_failure_code("unknown_locator") is None
     assert "unknown_locator" not in input_validation_codes()
 

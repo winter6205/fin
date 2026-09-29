@@ -36,6 +36,7 @@ from typing import Any
 import pytest
 
 from fin.corpus.object_store import InMemoryObjectStore
+from fin.corpus.object_store_errors import UnknownObjectKeyError
 from fin.host.attachment_job_store import InMemoryThreadAttachmentJobStore
 from fin.host.attachment_prepare import (
     ATTACHMENT_INDEX_UNAVAILABLE,
@@ -346,6 +347,86 @@ def test_a_crashed_job_fails_the_row_with_a_typed_reason() -> None:
     assert record.failure_reason == "source_unavailable"
     jobs = stack.jobs.incomplete()
     assert jobs == ()
+
+
+def test_a_crashed_job_logs_the_originating_exception(caplog: pytest.LogCaptureFixture) -> None:
+    """The crash belt never swallows the originating exception silently.
+
+    ``_run_job``'s blanket ``except Exception`` names a typed failure the
+    door can still say, but the row's reason is only a code: without the
+    exception log, an operator reading ``source_unavailable`` cannot tell
+    a crashed preparation from a storage outage (the exact gap the that pull request
+    live door hit). The record must therefore carry the traceback.
+    """
+    stack = _stack()
+    attachment_id = _upload(stack)
+    stack.service.request_preparation(stack.thread_id, attachment_id)
+
+    def boom(_: str) -> Any:
+        raise RuntimeError("executor crashed mid-run")
+
+    original = stack.service.prepare
+    try:
+        stack.service.prepare = boom  # type: ignore[method-assign]
+        with caplog.at_level("ERROR", logger="fin.host.attachment_prepare"):
+            assert stack.service.drain_attachment_jobs() == 1
+    finally:
+        stack.service.prepare = original  # type: ignore[method-assign]
+
+    crash_records = [
+        r
+        for r in caplog.records
+        if r.name == "fin.host.attachment_prepare"
+        and r.exc_info is not None
+        and r.exc_info[0] is RuntimeError
+    ]
+    assert crash_records, [
+        (r.name, r.levelname, r.getMessage()) for r in caplog.records
+    ]
+    # The traceback must carry the exception's own text, not just its type.
+    assert "executor crashed mid-run" in caplog.text
+    assert attachment_id in caplog.text
+
+
+def test_unreadable_bytes_log_the_store_exception_with_a_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``source_unavailable`` row must stay attributable to its cause.
+
+    The reason is deliberately coarse — a missing key, a dead endpoint,
+    and a credentials refusal all publish it — so the store exception is
+    the only thing that distinguishes them. This is the leg the live
+    that pull request door hit: a second process with a different bucket claimed
+    the job, and the row read as an unexplained storage outage.
+    """
+    stack = _stack()
+    attachment_id = _upload(stack)
+    record = stack.service.store.get(attachment_id)
+
+    def refuse(key: str) -> bytes:
+        raise UnknownObjectKeyError(f"unknown object key: {key}")
+
+    original = stack.service.objects.get
+    try:
+        stack.service.objects.get = refuse  # type: ignore[method-assign]
+        with caplog.at_level("ERROR", logger="fin.host.attachment_prepare"):
+            prepared = stack.service.prepare(attachment_id)
+    finally:
+        stack.service.objects.get = original  # type: ignore[method-assign]
+
+    assert prepared.status == "failed"
+    assert prepared.failure_reason == "source_unavailable"
+    store_records = [
+        r
+        for r in caplog.records
+        if r.name == "fin.host.attachment_prepare" and r.exc_info is not None
+    ]
+    assert store_records, [(r.name, r.getMessage()) for r in caplog.records]
+    assert any(
+        r.exc_info[0] is UnknownObjectKeyError for r in store_records
+    ), [r.exc_info[0].__name__ for r in store_records if r.exc_info]
+    assert record is not None
+    assert record.object_key in caplog.text
 
 
 def test_a_preparation_that_never_lands_fails_the_job_index_unavailable() -> None:

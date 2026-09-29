@@ -5,7 +5,7 @@ authored in this repo: model node + tool node + citation gate on
 the path to END + step cap 32 in fin state. Tests cover:
 
 * **happy path** — scripted tool call + scripted answer with a
-  ≥32-char extractive span from that page → ``done`` with
+  ≥32-char extractive span from that frozen unit → ``done`` with
   non-empty citations.
 * **bounce loop** — scripted tool call returning a non-citable
   answer + bounce template → 3 iterations → ``refuse`` with
@@ -38,7 +38,7 @@ the path to END + step cap 32 in fin state. Tests cover:
 All tests use ``ScriptedChatModel`` (no live LLM) and
 ``InMemorySaver`` (no Postgres). The committed extracted tree at
 ``data/corpus/extracted/`` is required for tests that exercise
-the tool functions against real page text — it is loaded once
+the tool functions against real unit text — it is loaded once
 per session via the ``corpus_tree`` module-level fixture.
 """
 
@@ -67,7 +67,7 @@ from fin.host import (
     ScriptedChatModel,
     compile_graph,
 )
-from fin.retrieve import BM25Adapter, ExtractedTreeReadPort
+from fin.retrieve import BM25Adapter, FakeRetrievePort
 
 
 # ----- corpus fixtures -----
@@ -75,8 +75,8 @@ from fin.retrieve import BM25Adapter, ExtractedTreeReadPort
 
 # Pulled from the frozen corpus manifest. The version (sha256)
 # belongs to the committed extracted tree; tests that drive
-# ``read_file`` against the real extracted tree use these values
-# verbatim so the tool returns a happy-path page-text dict.
+# ``read_source`` against those unit texts use these values
+# verbatim so the tool returns a happy-path slice.
 AAPL_2022Q3 = "AAPL-2022Q3"
 AAPL_2022Q3_VERSION = (
     "a7a0d8261a0923404fc45446afd71b9965bd2b4064772df0287e761bb68ba9f2"
@@ -84,15 +84,6 @@ AAPL_2022Q3_VERSION = (
 MSFT_2023Q1 = "MSFT-2023Q1"
 
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
-
-# Legacy tree-backed read adapter over the committed corpus. Only the
-# tests that script a ``read_file`` call inject it — the default graph
-# no longer reads the tree on its own (ADR 0046 / 0047; see
-# ``test_serve_path_no_tree_ssot.py``).
-_TREE_READ_PORT = ExtractedTreeReadPort(
-    Path("data/corpus/manifest.json"),
-    Path("data/corpus/extracted"),
-)
 
 
 @pytest.fixture(scope="session")
@@ -115,6 +106,15 @@ def aapl_page1_text(corpus_tree):
     return corpus_tree[AAPL_2022Q3][0].text
 
 
+@pytest.fixture(scope="session")
+def aapl_read_adapter(corpus_tree) -> FakeRetrievePort:
+    """The ``read_source`` company leg over the committed AAPL-2022Q3
+    units. Only the tests that script a ``read_source`` call inject it
+    as ``adapter=`` — the default graph no longer reads the tree on its
+    own (see ``test_serve_path_no_tree_ssot.py``)."""
+    return FakeRetrievePort(pages_by_doc={AAPL_2022Q3: corpus_tree[AAPL_2022Q3]})
+
+
 # ----- helpers -----
 
 
@@ -122,27 +122,29 @@ def _thread_config(thread_id: str) -> dict:
     return {"configurable": {"thread_id": thread_id}}
 
 
-def _scripted_read_file_then_answer(
+def _scripted_read_source_then_answer(
     answer: str,
     *,
     document_id: str = AAPL_2022Q3,
     version: str = AAPL_2022Q3_VERSION,
-    page: int = 1,
-    page_limit: int = 1,
+    unit: int = 1,
+    position: int = 0,
     read_call_id: str = "c-read",
 ) -> list[AIMessage]:
-    """Build the script: a read_file tool call followed by the answer AIMessage."""
+    """Build the script: a read_source tool call followed by the answer AIMessage."""
     return [
         AIMessage(
             content="",
             tool_calls=[
                 {
-                    "name": "read_file",
+                    "name": "read_source",
                     "args": {
-                        "document_id": document_id,
-                        "version": version,
-                        "page": page,
-                        "page_limit": page_limit,
+                        "source_ref": {
+                            "document_id": document_id,
+                            "version": version,
+                            "unit": unit,
+                        },
+                        "position": position,
                     },
                     "id": read_call_id,
                     "type": "tool_call",
@@ -158,21 +160,22 @@ def _invoke_done(
     model: ScriptedChatModel,
     thread_id: str,
     span_source: str,
+    adapter: FakeRetrievePort,
 ) -> dict:
     """Drive the happy-path ``done`` script and return the resulting state.
 
-    ``span_source`` is the page text the answer quotes from; the
+    ``span_source`` is the unit text the answer quotes from; the
     scripted answer embeds its first 80 characters verbatim so the
     citation gate finds a ≥32-char extractive span.
     """
     assert len(span_source) >= 32, "test fixture must seed a ≥32-char span"
     quoted_answer = f"Per the filing: {span_source[:80]}"
-    model.script = _scripted_read_file_then_answer(quoted_answer)
+    model.script = _scripted_read_source_then_answer(quoted_answer)
     g = compile_graph(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=adapter,
     )
     return g.invoke(
         {
@@ -188,14 +191,17 @@ def _invoke_done(
 # ----- happy path -----
 
 
-def test_done_path_read_file_then_answer_with_span(aapl_page1_text):
+def test_done_path_read_source_then_answer_with_span(
+    aapl_page1_text, aapl_read_adapter
+):
     """Scripted tool call + answer that contains a ≥32-char span from
-    page 1 of AAPL-2022Q3 ends ``done`` with non-empty citations."""
+    unit 1 of AAPL-2022Q3 ends ``done`` with non-empty citations."""
     model = ScriptedChatModel(script=[])
     out = _invoke_done(
         model=model,
         thread_id="t-done",
         span_source=aapl_page1_text,
+        adapter=aapl_read_adapter,
     )
     assert out["status"] == "done"
     assert out["status_reason"] == "done"
@@ -206,7 +212,7 @@ def test_done_path_read_file_then_answer_with_span(aapl_page1_text):
     citation = out["citations"][0]
     assert citation.document_id == AAPL_2022Q3
     assert citation.version == AAPL_2022Q3_VERSION
-    assert citation.page == 1
+    assert citation.unit == 1
     assert citation.quote == aapl_page1_text[:80]
     # step_count = 2 (model -> tools -> model -> gate)
     assert out["step_count"] == 2
@@ -217,12 +223,14 @@ def test_done_path_read_file_then_answer_with_span(aapl_page1_text):
 # ----- bounce loop -----
 
 
-def test_bounce_loop_ends_at_repair_cap_refuse(aapl_page1_text):
-    """Scripted read_file returns a happy-page evidence list, but the
-    scripted answer contains no ≥32-char span from that page →
+def test_bounce_loop_ends_at_repair_cap_refuse(
+    aapl_page1_text, aapl_read_adapter
+):
+    """Scripted read_source returns one readable slice, but the
+    scripted answer contains no ≥32-char span from that unit →
     bounce → bounce → bounce → refuse(citation_repair_cap)."""
-    model = ScriptedChatModel(script=_scripted_read_file_then_answer(
-        # Deliberately no ≥32-char span from the page text — the
+    model = ScriptedChatModel(script=_scripted_read_source_then_answer(
+        # Deliberately no ≥32-char span from the unit text — the
         # gate will bounce.
         answer="I think revenue was strong this quarter, definitely up.",
     ))
@@ -230,7 +238,7 @@ def test_bounce_loop_ends_at_repair_cap_refuse(aapl_page1_text):
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=aapl_read_adapter,
     )
     out = g.invoke(
         {
@@ -604,16 +612,16 @@ def test_compile_graph_distinct_args_yield_distinct_graphs():
 # ----- tool-node evidence propagation -----
 
 
-def test_read_file_tool_appends_evidence(aapl_page1_text):
-    """``read_file`` adds one ``EvidenceItem`` per page to the
-    state when the page read succeeds; the citation gate then
+def test_read_source_tool_appends_evidence(aapl_page1_text, aapl_read_adapter):
+    """``read_source`` adds one ``EvidenceItem`` for the slice it
+    returns when the unit read succeeds; the citation gate then
     matches the answer's span against that evidence."""
-    # First iteration: read_file. Second iteration: answer with a
-    # span from the same page text. ``done`` requires the citation
+    # First iteration: read_source. Second iteration: answer with a
+    # span from the same unit text. ``done`` requires the citation
     # gate to match the span, which means evidence must have made
     # it into state from the tool node.
     model = ScriptedChatModel(
-        script=_scripted_read_file_then_answer(
+        script=_scripted_read_source_then_answer(
             answer=f"Answer quoting: {aapl_page1_text[:80]}"
         )
     )
@@ -621,7 +629,7 @@ def test_read_file_tool_appends_evidence(aapl_page1_text):
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=aapl_read_adapter,
     )
     out = g.invoke(
         {
@@ -634,11 +642,17 @@ def test_read_file_tool_appends_evidence(aapl_page1_text):
     )
     assert out["status"] == "done"
     assert len(out["evidence"]) >= 1
-    # The matched citation's locator must be the AAPL page-1 locator
+    # The admitted evidence is exactly the unit this read returned: its
+    # locator and its text, not something the run never saw.
+    item = out["evidence"][0]
+    assert item.locator == Locator(AAPL_2022Q3, AAPL_2022Q3_VERSION, 1)
+    assert item.unit_text == aapl_page1_text
+    # The matched citation's locator must be the AAPL unit-1 locator
     # (NOT a model-invented version — ADR 0021).
     cit = out["citations"][0]
     assert cit.document_id == AAPL_2022Q3
     assert cit.version == AAPL_2022Q3_VERSION
+    assert cit.unit == 1
 
 
 def test_list_files_tool_does_not_contribute_evidence():
@@ -828,10 +842,10 @@ def test_unknown_tool_name_becomes_error_tool_message():
 
 
 def test_malformed_evidence_raises_typed_error(aapl_page1_text):
-    """An ``EvidenceItem`` with an empty ``page_text`` violates the
+    """An ``EvidenceItem`` with an empty ``unit_text`` violates the
     citation gate's contract; the graph must surface the typed
     ``MalformedEvidenceError`` out of ``invoke`` instead of
-    swallowing it."""
+    swallowing it, naming which item broke."""
     # We seed the input state with malformed evidence. The model
     # immediately returns an answer (no tool call); the gate runs
     # on turn 1 and raises.
@@ -843,17 +857,18 @@ def test_malformed_evidence_raises_typed_error(aapl_page1_text):
         model=model,
         known_document_ids=KNOWN_IDS,
     )
-    bad_locator = Locator(document_id=AAPL_2022Q3, version=AAPL_2022Q3_VERSION, page=1)
-    with pytest.raises(MalformedEvidenceError):
+    bad_locator = Locator(document_id=AAPL_2022Q3, version=AAPL_2022Q3_VERSION, unit=1)
+    with pytest.raises(MalformedEvidenceError) as excinfo:
         g.invoke(
             {
                 "messages": [HumanMessage("What was AAPL net sales in 2023 Q3?")],
-                "evidence": [EvidenceItem(locator=bad_locator, page_text="")],
+                "evidence": [EvidenceItem(locator=bad_locator, unit_text="")],
                 "repair_count": 0,
                 "step_count": 0,
             },
             config=_thread_config("t-bad-ev"),
         )
+    assert "evidence[0]" in str(excinfo.value)
 
 
 # ----- graph surface -----
@@ -925,7 +940,7 @@ def test_model_node_streams_not_invokes(aapl_page1_text):
             "evidence": [
                 EvidenceItem(
                     locator=Locator(AAPL_2022Q3, AAPL_2022Q3_VERSION, 1),
-                    page_text=aapl_page1_text,
+                    unit_text=aapl_page1_text,
                 )
             ],
             "repair_count": 0,
@@ -973,7 +988,7 @@ def test_streamed_thinking_never_lands_in_answer_or_state_answer(
     state_in["evidence"] = [
         EvidenceItem(
             locator=Locator(AAPL_2022Q3, AAPL_2022Q3_VERSION, 1),
-            page_text=aapl_page1_text,
+            unit_text=aapl_page1_text,
         )
     ]
     out = g.invoke(state_in, config=_thread_config("t-thinking-split"))
@@ -1016,7 +1031,7 @@ def test_inline_thinking_block_is_stripped_before_citation_gate(
     state_in["evidence"] = [
         EvidenceItem(
             locator=Locator(AAPL_2022Q3, AAPL_2022Q3_VERSION, 1),
-            page_text=aapl_page1_text,
+            unit_text=aapl_page1_text,
         )
     ]
     out = g.invoke(state_in, config=_thread_config("t-inline-thinking"))
@@ -1098,7 +1113,7 @@ def test_model_node_sends_host_instructions_before_user_turn(aapl_page1_text):
             "evidence": [
                 EvidenceItem(
                     locator=Locator(AAPL_2022Q3, AAPL_2022Q3_VERSION, 1),
-                    page_text=aapl_page1_text,
+                    unit_text=aapl_page1_text,
                 )
             ],
             "repair_count": 0,
@@ -1117,7 +1132,7 @@ def test_model_node_sends_host_instructions_before_user_turn(aapl_page1_text):
     )
 
 
-def test_tool_summaries_appended_by_tool_node(aapl_page1_text):
+def test_tool_summaries_appended_by_tool_node(aapl_page1_text, aapl_read_adapter):
     """``tool_node`` appends one human-readable summary per tool call
     to ``state['tool_summaries']``; each entry carries name +
     summary + tool_call_id. Raw ToolMessage JSON stays off the
@@ -1128,12 +1143,14 @@ def test_tool_summaries_appended_by_tool_node(aapl_page1_text):
                 content="",
                 tool_calls=[
                     {
-                        "name": "read_file",
+                        "name": "read_source",
                         "args": {
-                            "document_id": AAPL_2022Q3,
-                            "version": AAPL_2022Q3_VERSION,
-                            "page": 1,
-                            "page_limit": 1,
+                            "source_ref": {
+                                "document_id": AAPL_2022Q3,
+                                "version": AAPL_2022Q3_VERSION,
+                                "unit": 1,
+                            },
+                            "position": 0,
                         },
                         "id": "c-read-1",
                         "type": "tool_call",
@@ -1147,7 +1164,7 @@ def test_tool_summaries_appended_by_tool_node(aapl_page1_text):
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=aapl_read_adapter,
     )
     out = g.invoke(
         reset_input_state_for_test("What was AAPL net sales in 2023 Q3?"),
@@ -1157,9 +1174,9 @@ def test_tool_summaries_appended_by_tool_node(aapl_page1_text):
     assert len(summaries) == 1
     entry = summaries[0]
     assert set(entry.keys()) == {"name", "summary", "tool_call_id"}
-    assert entry["name"] == "read_file"
+    assert entry["name"] == "read_source"
     assert entry["tool_call_id"] == "c-read-1"
-    assert f"{AAPL_2022Q3} p.1" in entry["summary"]
+    assert f"{AAPL_2022Q3} u.1" in entry["summary"]
     # Raw JSON never leaks into the summary.
     assert "{" not in entry["summary"]
 

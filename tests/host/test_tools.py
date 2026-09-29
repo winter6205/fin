@@ -1,19 +1,19 @@
-"""Boundary tests for the v1 host tools (``list_files``, ``read_file``).
+"""Boundary tests for the v1 host tools (``list_files``, ``read_source``).
 
 Covers the five boundary classes from the defensive-contract-validator
 axis: empty, negative, overflow, concurrent, exception. Together they
-exercise the ADR 0009 contract that T6's host graph and T5's citation
-gate rely on: tools return dicts (not exceptions), and the model can
+exercise the ADR 0009 contract that the host graph and the citation gate
+rely on: tools return dicts (not exceptions), and the model can
 distinguish a known-unknown ``unknown_locator`` from a tool that
 crashed mid-run.
 
 The committed catalog metadata table at ``data/corpus/catalog.json``
-(T2 / ADR 0047) is the fixture for the ``list_files`` happy-path
-tests; the committed extracted tree still backs the ``read_file``
-tests via the explicitly injected tree port. No real LLM is invoked;
-no corpus is mocked. The one ``read_file`` exception test
-monkey-patches ``load_extracted_tree`` to verify the typed-error
-translation rule.
+(ADR 0047) is the fixture for the ``list_files`` happy-path tests; the
+committed extracted tree still backs the ``read_source`` tests, served
+through the company leg the graph binds (a retrieve port carrying
+``pages_by_doc``). No real LLM is invoked and no backend is contacted;
+the synthetic three-unit tree is the fixture for the bounded-cursor
+cases, which need a unit longer than the read bound.
 """
 
 from __future__ import annotations
@@ -26,10 +26,15 @@ from pathlib import Path
 import pytest
 
 from fin.corpus.catalog import record_filings
-from fin.corpus.errors import IngestMissingError
-from fin.corpus.extracted import load_extracted_tree
-from fin.host.tools import list_files, read_file
-from fin.retrieve import ExtractedTreeReadPort
+from fin.corpus.extracted import ExtractedPage, Locator, load_extracted_tree
+from fin.host.tools import list_files
+from fin.host.tools.read_source import read_source
+from fin.retrieve import FakeRetrievePort
+from fin.retrieve.source_read import (
+    SOURCE_READ_MAX_RESULT_BYTES,
+    SOURCE_READ_MAX_TEXT_CODE_POINTS,
+    serialized_result_bytes,
+)
 
 
 # ----- paths -----
@@ -52,16 +57,30 @@ def _catalog_path() -> Path:
     return _project_data_dir() / "catalog.json"
 
 
-def _tree_reader() -> ExtractedTreeReadPort:
-    """The legacy tree-backed read adapter over the committed corpus.
+def _committed_pages() -> dict[str, list[ExtractedPage]]:
+    """The committed extracted tree, keyed as the company leg wants it."""
+    return {
+        document_id: list(pages)
+        for document_id, pages in load_extracted_tree(
+            _manifest_path(), _extracted_root()
+        ).items()
+    }
 
-    These unit tests exercise the ``read_file`` boundary contract
-    against real page text, so they inject the tree port explicitly.
-    Product compile paths never build one (ADR 0046 / 0047) — the
-    graph injects the retrieve adapter's ``read`` or a typed-miss
-    port instead.
+
+def _company_reader(
+    pages_by_doc: dict[str, list[ExtractedPage]] | None = None,
+) -> FakeRetrievePort:
+    """A company read leg over the committed (or injected) page table.
+
+    The graph serves company reads from the bound adapter's own
+    ``read_slice``, so the leg under test here is that same face, driven
+    by the committed tree instead of an invented body.
     """
-    return ExtractedTreeReadPort(_manifest_path(), _extracted_root())
+    return FakeRetrievePort(
+        pages_by_doc=(
+            _committed_pages() if pages_by_doc is None else pages_by_doc
+        )
+    )
 
 
 # sha256 of the AAPL 2022-Q3 PDF (manifest SSOT)
@@ -71,15 +90,36 @@ AAPL_2022Q3_SHA = (
 AAPL_2022Q3_PAGE_COUNT = 28
 
 
-# ----- synthetic 3-page fixture builder -----
+def _company_ref(document_id: str, version: str, unit: int) -> dict:
+    """The typed company triple ``read_source`` routes to the company leg."""
+    return {"document_id": document_id, "version": version, "unit": unit}
 
 
-def _build_synthetic_3page_tree(
+def _synthetic_pages(
+    document_id: str, version: str, texts: list[str]
+) -> list[ExtractedPage]:
+    """Build one document's frozen unit table in memory.
+
+    The read bound is per unit, so the cursor cases need a unit longer
+    than the bound — far too large to commit as a corpus artifact —
+    while staying the exact shape the loader hands the leg.
+    """
+    return [
+        ExtractedPage(
+            locator=Locator(document_id=document_id, version=version, unit=n),
+            text=text,
+            passages=(),
+        )
+        for n, text in enumerate(texts, start=1)
+    ]
+
+
+def _build_synthetic_3unit_tree(
     tmp_path: Path,
     document_id: str = "TEST-2023Q1",
 ) -> tuple[Path, Path, str]:
     """Build a minimal synthetic manifest + extracted tree for a single
-    3-page document. Returns ``(manifest_path, extracted_root, version)``.
+    3-unit document. Returns ``(manifest_path, extracted_root, version)``.
     """
     version = "a" * 64
     extracted_root = tmp_path / "extracted"
@@ -201,21 +241,26 @@ def test_list_files_empty_returns_full_library_list() -> None:
         assert filing["page_count"] > 0
 
 
-def test_read_file_happy_path_returns_first_page() -> None:
-    """``read_file("AAPL-2022Q3", sha, page=1, page_limit=1)`` returns page 1."""
-    result = read_file(
-        "AAPL-2022Q3",
-        AAPL_2022Q3_SHA,
-        page=1,
-        page_limit=1,
-        reader=_tree_reader(),
+def test_read_source_happy_path_returns_first_unit_slice() -> None:
+    """``read_source`` over the committed corpus returns one complete
+    bounded slice of the addressed unit and a terminal cursor."""
+    result = read_source(
+        _company_ref("AAPL-2022Q3", AAPL_2022Q3_SHA, 1),
+        0,
+        company_reader=_company_reader(),
     )
-    assert "error" not in result
-    assert result["document_id"] == "AAPL-2022Q3"
-    assert result["version"] == AAPL_2022Q3_SHA
-    assert result["page"] == 1
-    assert result["page_count"] == AAPL_2022Q3_PAGE_COUNT
-    assert result["text"]  # non-empty
+    assert set(result) == {"source_ref", "text", "next_position"}
+    assert result["source_ref"] == _company_ref(
+        "AAPL-2022Q3", AAPL_2022Q3_SHA, 1
+    )
+    tree = load_extracted_tree(_manifest_path(), _extracted_root())
+    first_unit_text = tree["AAPL-2022Q3"][0].text
+    # Expected text comes from the committed artifact, not from the read
+    # seam: this unit fits the bound, so the slice is the whole unit and
+    # the cursor is exhausted.
+    assert result["text"] == first_unit_text
+    assert result["next_position"] is None
+    assert len(result["text"]) <= SOURCE_READ_MAX_TEXT_CODE_POINTS
 
 
 # ===== boundary 2: negative =====
@@ -239,219 +284,209 @@ def test_list_files_unknown_period_returns_empty() -> None:
     assert result == {"filings": []}
 
 
-def test_read_file_unknown_document_id_returns_unknown_locator() -> None:
+def test_read_source_unknown_document_id_returns_unknown_locator() -> None:
     """Unknown ``document_id`` returns the ``unknown_locator`` dict."""
-    result = read_file(
-        "BOGUS-2099Q9",
-        AAPL_2022Q3_SHA,
-        page=1,
-        page_limit=1,
-        reader=_tree_reader(),
+    result = read_source(
+        _company_ref("BOGUS-2099Q9", AAPL_2022Q3_SHA, 1),
+        0,
+        company_reader=_company_reader(),
     )
     assert result == {"error": "unknown_locator"}
 
 
-def test_read_file_version_mismatch_returns_unknown_locator() -> None:
-    """Wrong-length / wrong-content ``version`` returns the ``unknown_locator`` dict."""
-    # Wrong-length version (still 64 hex chars but not the manifest sha256).
-    result = read_file(
-        "AAPL-2022Q3",
-        "0" * 64,
-        page=1,
-        page_limit=1,
-        reader=_tree_reader(),
+def test_read_source_version_mismatch_returns_unknown_locator() -> None:
+    """A 64-char ``version`` that is not the manifest sha256 returns the
+    ``unknown_locator`` dict."""
+    result = read_source(
+        _company_ref("AAPL-2022Q3", "0" * 64, 1),
+        0,
+        company_reader=_company_reader(),
     )
     assert result == {"error": "unknown_locator"}
 
 
-def test_read_file_empty_version_returns_unknown_locator() -> None:
-    """Empty ``version`` is not a sha256; returns the ``unknown_locator`` dict."""
-    result = read_file(
-        "AAPL-2022Q3",
-        "",
-        page=1,
-        page_limit=1,
-        reader=_tree_reader(),
+def test_read_source_empty_version_returns_invalid_locator() -> None:
+    """Empty ``version`` is not a locator at all: the shape verdict is
+    named before any corpus lookup, so it never looks like a miss."""
+    result = read_source(
+        _company_ref("AAPL-2022Q3", "", 1),
+        0,
+        company_reader=_company_reader(),
     )
-    assert result == {"error": "unknown_locator"}
+    assert result["error"] == "invalid_locator"
+    assert "text" not in result
 
 
-@pytest.mark.parametrize("bad_page", [0, -1])
-def test_read_file_page_below_one_returns_unknown_locator(bad_page: int) -> None:
-    """``page < 1`` returns the ``unknown_locator`` dict."""
-    result = read_file(
-        "AAPL-2022Q3",
-        AAPL_2022Q3_SHA,
-        page=bad_page,
-        page_limit=1,
-        reader=_tree_reader(),
+@pytest.mark.parametrize("bad_unit", [0, -1])
+def test_read_source_unit_below_one_returns_invalid_locator(bad_unit: int) -> None:
+    """``unit < 1`` is a malformed ordinal, not a coordinate into the
+    tree: refused as ``invalid_locator`` whatever the corpus holds."""
+    result = read_source(
+        _company_ref("AAPL-2022Q3", AAPL_2022Q3_SHA, bad_unit),
+        0,
+        company_reader=_company_reader(),
     )
-    assert result == {"error": "unknown_locator"}
+    assert result["error"] == "invalid_locator"
 
 
-def test_read_file_page_beyond_returns_unknown_locator() -> None:
-    """``page`` past the last page returns the ``unknown_locator`` dict."""
-    for bad_page in (AAPL_2022Q3_PAGE_COUNT + 1, AAPL_2022Q3_PAGE_COUNT + 10):
-        result = read_file(
-            "AAPL-2022Q3",
-            AAPL_2022Q3_SHA,
-            page=bad_page,
-            page_limit=1,
-            reader=_tree_reader(),
+def test_read_source_legacy_page_key_is_not_a_locator() -> None:
+    """A ref still carrying the physical ``page`` field is a malformed
+    locator: the triple has exactly one spelling, so a second ordinal
+    name cannot quietly address a unit."""
+    result = read_source(
+        {
+            "document_id": "AAPL-2022Q3",
+            "version": AAPL_2022Q3_SHA,
+            "page": 1,
+        },
+        0,
+        company_reader=_company_reader(),
+    )
+    assert result["error"] == "invalid_locator"
+
+
+def test_read_source_unit_beyond_returns_unknown_locator() -> None:
+    """``unit`` past the last unit of the document returns the
+    ``unknown_locator`` dict."""
+    for bad_unit in (AAPL_2022Q3_PAGE_COUNT + 1, AAPL_2022Q3_PAGE_COUNT + 10):
+        result = read_source(
+            _company_ref("AAPL-2022Q3", AAPL_2022Q3_SHA, bad_unit),
+            0,
+            company_reader=_company_reader(),
         )
         assert result == {"error": "unknown_locator"}
-
-
-@pytest.mark.parametrize("bad_limit", [0, -1])
-def test_read_file_page_limit_below_one_returns_unknown_locator(
-    bad_limit: int,
-) -> None:
-    """``page_limit < 1`` returns the ``unknown_locator`` dict."""
-    result = read_file(
-        "AAPL-2022Q3",
-        AAPL_2022Q3_SHA,
-        page=1,
-        page_limit=bad_limit,
-        reader=_tree_reader(),
-    )
-    assert result == {"error": "unknown_locator"}
-
-
-def test_read_file_page_limit_above_cap_clamps_to_three() -> None:
-    """``page_limit > 3`` is silently clamped to 3 (ADR 0009 cap)."""
-    result_limit_10 = read_file(
-        "AAPL-2022Q3",
-        AAPL_2022Q3_SHA,
-        page=1,
-        page_limit=10,
-        reader=_tree_reader(),
-    )
-    result_limit_3 = read_file(
-        "AAPL-2022Q3",
-        AAPL_2022Q3_SHA,
-        page=1,
-        page_limit=3,
-        reader=_tree_reader(),
-    )
-    # Same text as a clean ``page_limit=3`` call.
-    assert result_limit_10["text"] == result_limit_3["text"]
-    assert "error" not in result_limit_10
-    assert result_limit_10["page_count"] == AAPL_2022Q3_PAGE_COUNT
 
 
 # ===== boundary 3: overflow =====
 
 
-def test_read_file_three_page_doc_with_page_limit_3_returns_all_three(
-    tmp_path: Path,
-) -> None:
-    """Synthetic 3-page doc + ``page_limit=3`` returns all three pages."""
-    manifest_path, extracted_root, version = _build_synthetic_3page_tree(tmp_path)
+def test_read_source_one_call_never_exceeds_the_bound(tmp_path: Path) -> None:
+    """The model owns no window parameter: whatever the unit length, one
+    call answers at most the bound in code points and the serialized
+    result stays inside the byte cap.
+    """
+    document_id = "TEST-2023Q1"
+    version = "a" * 64
+    long_unit = "x" * (SOURCE_READ_MAX_TEXT_CODE_POINTS + 500)
+    reader = _company_reader({document_id: _synthetic_pages(document_id, version, [long_unit])})
 
-    result = read_file(
-        "TEST-2023Q1",
-        version,
-        page=1,
-        page_limit=3,
-        reader=ExtractedTreeReadPort(manifest_path, extracted_root),
+    result = read_source(
+        _company_ref(document_id, version, 1),
+        0,
+        company_reader=reader,
     )
     assert "error" not in result
-    assert result["page_count"] == 3
-    assert result["text"] == "PAGE 1 BODY\n\nPAGE 2 BODY\n\nPAGE 3 BODY"
+    assert len(result["text"]) <= SOURCE_READ_MAX_TEXT_CODE_POINTS
+    assert serialized_result_bytes(result) <= SOURCE_READ_MAX_RESULT_BYTES
+    # A truncated body must hand back a cursor, never a silent cut.
+    assert result["next_position"] == len(result["text"])
+    assert result["next_position"] is not None
 
 
-def test_read_file_page_beyond_with_page_limit_3_clamps_to_existing_pages() -> None:
-    """``page + page_limit - 1 > page_count`` clamps to existing pages."""
-    page = 27  # 27 + 3 - 1 = 29 > 28
-    result = read_file(
-        "AAPL-2022Q3",
-        AAPL_2022Q3_SHA,
-        page=page,
-        page_limit=3,
-        reader=_tree_reader(),
+def test_read_source_cursor_reaches_the_whole_unit(tmp_path: Path) -> None:
+    """Bounded slices are not a lossy view: following ``next_position``
+    until it is ``None`` reconstructs the unit exactly, with strict
+    advance at every step.
+    """
+    document_id = "TEST-2023Q1"
+    version = "a" * 64
+    long_unit = "".join(
+        f"UNIT1 SEGMENT {i:04d} " for i in range(1200)
+    )  # > SOURCE_READ_MAX_TEXT_CODE_POINTS, so several reads are needed
+    assert len(long_unit) > SOURCE_READ_MAX_TEXT_CODE_POINTS
+    reader = _company_reader({document_id: _synthetic_pages(document_id, version, [long_unit])})
+
+    collected: list[str] = []
+    position = 0
+    for _ in range(10):
+        result = read_source(
+            _company_ref(document_id, version, 1),
+            position,
+            company_reader=reader,
+        )
+        assert "error" not in result
+        collected.append(result["text"])
+        if result["next_position"] is None:
+            break
+        # Strict advance: the cursor can never stall and loop forever.
+        assert result["next_position"] > position
+        position = result["next_position"]
+    else:
+        pytest.fail("the read cursor did not terminate")
+
+    assert "".join(collected) == long_unit
+
+
+def test_read_source_resolves_exactly_one_unit(tmp_path: Path) -> None:
+    """One call reads one unit: a read never bridges into the next
+    unit's text, so a quote can only ever vouch for the unit it names.
+    """
+    manifest_path, extracted_root, version = _build_synthetic_3unit_tree(
+        tmp_path
     )
-    assert "error" not in result
-    assert result["page"] == page
-    assert result["page_count"] == AAPL_2022Q3_PAGE_COUNT
-
-    # Must join pages 27 and 28 only (clamped).
-    tree = load_extracted_tree(_manifest_path(), _extracted_root())
-    expected_text = "\n\n".join(
-        tree["AAPL-2022Q3"][i - 1].text for i in (27, 28)
+    reader = _company_reader(
+        {
+            "TEST-2023Q1": list(
+                load_extracted_tree(manifest_path, extracted_root)[
+                    "TEST-2023Q1"
+                ]
+            )
+        }
     )
-    assert result["text"] == expected_text
 
-
-def test_read_file_page2_with_page_limit_2_joins_pages_2_and_3() -> None:
-    """``page=2, page_limit=2`` joins pages 2 and 3."""
-    result = read_file(
-        "AAPL-2022Q3",
-        AAPL_2022Q3_SHA,
-        page=2,
-        page_limit=2,
-        reader=_tree_reader(),
+    first = read_source(
+        _company_ref("TEST-2023Q1", version, 1), 0, company_reader=reader
     )
-    assert "error" not in result
-    assert result["page"] == 2
-
-    tree = load_extracted_tree(_manifest_path(), _extracted_root())
-    expected_text = "\n\n".join(
-        tree["AAPL-2022Q3"][i - 1].text for i in (2, 3)
+    second = read_source(
+        _company_ref("TEST-2023Q1", version, 2), 0, company_reader=reader
     )
-    assert result["text"] == expected_text
+
+    assert first["text"] == "PAGE 1 BODY"
+    assert "PAGE 2" not in first["text"]
+    assert first["next_position"] is None
+    assert second["text"] == "PAGE 2 BODY"
+    assert "PAGE 1" not in second["text"]
+    assert second["source_ref"]["unit"] == 2
 
 
 # ===== boundary 4: concurrent =====
 
 
-def test_concurrent_read_file_returns_identical_text() -> None:
-    """10 parallel ``read_file`` calls against the same document return
-    byte-identical text. Read-only safety under threading.
+def test_concurrent_read_source_returns_identical_text() -> None:
+    """10 parallel ``read_source`` calls against the same unit return
+    byte-identical results. Read-only safety under threading.
     """
 
     def _call() -> str:
-        result = read_file(
-            "AAPL-2022Q3",
-            AAPL_2022Q3_SHA,
-            page=1,
-            page_limit=1,
-            reader=_tree_reader(),
+        return json.dumps(
+            read_source(
+                _company_ref("AAPL-2022Q3", AAPL_2022Q3_SHA, 1),
+                0,
+                company_reader=_company_reader(),
+            ),
+            sort_keys=True,
         )
-        return result["text"]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
-        texts = list(pool.map(lambda _: _call(), range(10)))
+        payloads = list(pool.map(lambda _: _call(), range(10)))
 
-    # All 10 calls must produce byte-identical text.
-    assert len(set(texts)) == 1
+    # All 10 calls must produce byte-identical results.
+    assert len(set(payloads)) == 1
 
 
 # ===== boundary 5: exception =====
 
 
-def test_read_file_ingest_missing_returns_unknown_locator(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A broken body source converts to the ``unknown_locator`` dict
-    instead of propagating a typed error to the model (ADR 0009 +
-    ADR 0020): the tree port's ``IngestMissingError`` is caught inside
-    the read port, and a reader that itself raises is out of contract —
-    here we drive the tree-port path with a simulated missing tree."""
+def test_read_source_with_no_bodies_is_a_typed_miss_never_a_raise() -> None:
+    """A body source that holds nothing converts to the ``unknown_locator``
+    dict instead of propagating a typed error to the model (ADR 0009 +
+    ADR 0020): the leg is present and wired, the corpus behind it is
+    empty, and the answer is still a dict with no text."""
 
-    def _raise_ingest_missing(*args, **kwargs):
-        raise IngestMissingError("simulated missing tree")
-
-    monkeypatch.setattr(
-        "fin.retrieve.read_port.load_extracted_tree",
-        _raise_ingest_missing,
-    )
-
-    result = read_file(
-        "AAPL-2022Q3",
-        AAPL_2022Q3_SHA,
-        page=1,
-        page_limit=1,
-        reader=_tree_reader(),
+    result = read_source(
+        _company_ref("AAPL-2022Q3", AAPL_2022Q3_SHA, 1),
+        0,
+        company_reader=FakeRetrievePort(pages_by_doc={}),
     )
     assert result == {"error": "unknown_locator"}
 
@@ -553,7 +588,7 @@ def test_host_tools_do_not_import_pdfplumber() -> None:
     tools_dir = (
         Path(__file__).resolve().parents[2] / "src" / "fin" / "host" / "tools"
     )
-    for sub in ("list_files.py", "read_file.py"):
+    for sub in ("list_files.py", "read_source.py"):
         _assert_no_pdfplumber(tools_dir / sub)
 
 

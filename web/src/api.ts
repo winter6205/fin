@@ -19,11 +19,14 @@ import type {
   ThreadDetail,
   ThreadListItem,
   TrackDecision,
+  VisualClaim,
   WatchEntry,
   WorkspaceStatus,
 } from "./types";
 import { parseChoiceWindow } from "./choiceWindow";
 import { parseComparison } from "./comparison";
+import { threadAttachmentUrl } from "./sourceLocator";
+import { parseVisualClaimFrame } from "./visualClaims";
 import { parseWorkspaceStatus } from "./knowledgeMcp";
 import { parseSoftTrack, parseTrackDecision } from "./softTrack";
 import { parseStreamErrorKind } from "./streamErrorKind";
@@ -254,6 +257,12 @@ export type SendEvent =
     }
   | { type: "answer"; text: string; reset?: boolean }
   | { type: "citations"; citations: Citation[] }
+  // The run's visual-claim rows, emitted on their OWN event after
+  // the answer frames and before the terminal ``citations`` event (and
+  // repeated on the GET history row). Provenance only — the row carries
+  // no answer text, so a generated visual observation can never be placed
+  // as a verbatim span by the chip logic.
+  | { type: "visual_claims"; visual_claims: VisualClaim[] }
   // T3 (enterprise-kb Focus 1): one structured comparison table,
   // emitted right after the ``compare_facts`` tool returns. The
   // only structured payload on this wire — tool-computed data, not
@@ -443,6 +452,9 @@ async function consumeSseStream(
     comparisons: [],
   };
 
+  // Hoisted so the per-frame dispatch below does not re-decide
+  // "is there a listener?" at every call site.
+  const emit = onEvent ?? (() => {});
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -485,7 +497,7 @@ async function consumeSseStream(
           // concatenates. The prose never participates in citation
           // matching (SC60 binding).
           const t = payload as { text: string };
-          onEvent?.({ type: "thinking", text: t.text ?? "" });
+          emit({ type: "thinking", text: t.text ?? "" });
           break;
         }
         case "tool_call": {
@@ -497,7 +509,7 @@ async function consumeSseStream(
             args: Record<string, unknown>;
             tool_call_id: string;
           };
-          onEvent?.({
+          emit({
             type: "tool_call",
             name: tc.name,
             args: tc.args ?? {},
@@ -513,7 +525,7 @@ async function consumeSseStream(
             name: string;
             summary?: string;
           };
-          onEvent?.({
+          emit({
             type: "tool_result",
             tool_call_id: tr.tool_call_id,
             name: tr.name,
@@ -554,7 +566,7 @@ async function consumeSseStream(
           if (typeof s.run_id === "string" && s.run_id.length > 0) {
             result.run_id = s.run_id;
           }
-          onEvent?.({
+          emit({
             type: "status",
             run_id: result.run_id,
             status: s.status,
@@ -569,8 +581,20 @@ async function consumeSseStream(
         }
         case "citations":
           result.citations = payload as SendResult["citations"];
-          onEvent?.({ type: "citations", citations: result.citations });
+          emit({ type: "citations", citations: result.citations });
           break;
+        case "visual_claims": {
+          // The run's visual-claim rows arrive on their own event,
+          // after the answer frames and BEFORE the terminal ``citations``
+          // event, as ``{"visual_claims": [row, …]}``. Parsed at this
+          // boundary (the wire is ``unknown``) exactly like ``comparison``:
+          // a malformed payload yields no rows instead of a half-rendered
+          // provenance line, and it never reaches ``result.citations`` —
+          // the quote channel stays closed to a generated observation.
+          const claims = parseVisualClaimFrame(payload);
+          emit({ type: "visual_claims", visual_claims: claims });
+          break;
+        }
         case "comparison": {
           // T3: one ``fin.comparison.v1`` envelope. Parsed at this
           // boundary (the wire is ``unknown``) so a payload from a
@@ -580,7 +604,7 @@ async function consumeSseStream(
           const comparison = parseComparison(payload);
           if (comparison !== null) {
             result.comparisons.push(comparison);
-            onEvent?.({ type: "comparison", comparison });
+            emit({ type: "comparison", comparison });
           }
           break;
         }
@@ -590,7 +614,7 @@ async function consumeSseStream(
           // terminal frames follow while the run waits for a pick —
           // so nothing here touches ``result``.
           const window = parseChoiceWindow(payload);
-          if (window !== null) onEvent?.({ type: "choice_window", window });
+          if (window !== null) emit({ type: "choice_window", window });
           break;
         }
         case "attachment_wait": {
@@ -610,7 +634,7 @@ async function consumeSseStream(
             w.run_id.length > 0 &&
             w.kind === ATTACHMENT_PREPARATION_KIND
           ) {
-            onEvent?.({
+            emit({
               type: "attachment_wait",
               run_id: w.run_id,
               kind: ATTACHMENT_PREPARATION_KIND,
@@ -628,7 +652,7 @@ async function consumeSseStream(
             a.text ?? "",
             { statusSeen: sawStatus, reset: a.reset },
           );
-          onEvent?.({
+          emit({
             type: "answer",
             text: a.text ?? "",
             reset: a.reset === true,
@@ -956,11 +980,9 @@ export async function deleteThreadAttachment(
   threadId: string,
   attachmentId: string,
 ): Promise<AttachmentDeleteReceipt> {
-  const res = await fetch(
-    `/api/threads/${encodeURIComponent(threadId)}/attachments/` +
-      encodeURIComponent(attachmentId),
-    { method: "DELETE" },
-  );
+  const res = await fetch(threadAttachmentUrl(threadId, attachmentId), {
+    method: "DELETE",
+  });
   if (!res.ok) {
     throw new AttachFailedError(await namedErrorCode(res), res.status);
   }

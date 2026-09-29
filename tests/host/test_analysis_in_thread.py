@@ -12,11 +12,12 @@ from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-from fin.corpus.extracted import Locator
+from fin.corpus.extracted import Locator, load_extracted_tree
 from fin.corpus.facts import Fact, write_facts
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.state import reset_input_state
 from fin.host.thread_store import InMemoryThreadStore
+from fin.retrieve import FakeRetrievePort
 
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "corpus"
@@ -28,14 +29,15 @@ AAPL_2023Q3_VERSION = (
 )
 KNOWN_IDS = {"AAPL-2022Q3", "AAPL-2023Q3"}
 
-# Legacy tree-backed read adapter over the committed corpus. Only the
-# scripted ``read_file`` transcripts need it; the default graph no
+# The ``read_source`` company leg over the committed corpus units. Only
+# the scripted ``read_source`` transcripts need it; the default graph no
 # longer reads the tree on its own (ADR 0046 / 0047).
-from fin.retrieve import ExtractedTreeReadPort
-
-_TREE_READ_PORT = ExtractedTreeReadPort(
-    Path("data/corpus/manifest.json"),
-    Path("data/corpus/extracted"),
+_READ_ADAPTER = FakeRetrievePort(
+    pages_by_doc={
+        "AAPL-2022Q3": load_extracted_tree(
+            DATA_DIR / "manifest.json", DATA_DIR / "extracted"
+        )["AAPL-2022Q3"]
+    }
 )
 PAGE_SPAN = "UNITED STATES SECURITIES AND EXCHANGE COMMISSION"
 
@@ -66,14 +68,14 @@ def test_compile_graph_registers_t6_analysis_tools() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
         manifest_path=DATA_DIR / "manifest.json",
         extracted_root=DATA_DIR / "extracted",
         facts_root=DATA_DIR / "facts",
     )
 
     names = [getattr(tool, "name", "") for tool in model.bound_tools]
-    # read_source is bound last (ADR 0087) until T5 removes read_file;
+    # read_source is bound last (ADR 0087);
     # the analysis trio keeps its relative order ahead of it.
     assert names[-4:] == [
         "redline",
@@ -91,7 +93,7 @@ def test_redline_tool_result_lands_on_graph_state() -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
         manifest_path=DATA_DIR / "manifest.json",
         extracted_root=DATA_DIR / "extracted",
         facts_root=DATA_DIR / "facts",
@@ -144,12 +146,14 @@ def test_workspace_get_history_contains_structured_redline(
                 content="",
                 tool_calls=[
                     {
-                        "name": "read_file",
+                        "name": "read_source",
                         "args": {
-                            "document_id": "AAPL-2022Q3",
-                            "version": AAPL_2022Q3_VERSION,
-                            "page": 1,
-                            "page_limit": 1,
+                            "source_ref": {
+                                "document_id": "AAPL-2022Q3",
+                                "version": AAPL_2022Q3_VERSION,
+                                "unit": 1,
+                            },
+                            "position": 0,
                         },
                         "id": "c-read",
                         "type": "tool_call",
@@ -163,7 +167,7 @@ def test_workspace_get_history_contains_structured_redline(
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
         manifest_path=DATA_DIR / "manifest.json",
         extracted_root=DATA_DIR / "extracted",
         facts_root=DATA_DIR / "facts",
@@ -205,7 +209,7 @@ def test_statement_numbers_are_checked_by_numeric_gate(tmp_path: Path) -> None:
                     unit="USD",
                     scale="millions",
                     source_locator=Locator(
-                        document_id=document_id, version="f" * 64, page=4
+                        document_id=document_id, version="f" * 64, unit=4
                     ),
                 )
             ],
@@ -231,12 +235,14 @@ def test_statement_numbers_are_checked_by_numeric_gate(tmp_path: Path) -> None:
                 content="",
                 tool_calls=[
                     {
-                        "name": "read_file",
+                        "name": "read_source",
                         "args": {
-                            "document_id": "AAPL-2022Q3",
-                            "version": AAPL_2022Q3_VERSION,
-                            "page": 1,
-                            "page_limit": 1,
+                            "source_ref": {
+                                "document_id": "AAPL-2022Q3",
+                                "version": AAPL_2022Q3_VERSION,
+                                "unit": 1,
+                            },
+                            "position": 0,
                         },
                         "id": "c-read-statement",
                         "type": "tool_call",
@@ -250,7 +256,7 @@ def test_statement_numbers_are_checked_by_numeric_gate(tmp_path: Path) -> None:
         checkpointer=InMemorySaver(),
         model=model,
         known_document_ids=KNOWN_IDS,
-        read_port=_TREE_READ_PORT,
+        adapter=_READ_ADAPTER,
         manifest_path=DATA_DIR / "manifest.json",
         extracted_root=DATA_DIR / "extracted",
         facts_root=facts_root,
