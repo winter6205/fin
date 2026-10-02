@@ -12,6 +12,12 @@ CPU-only torch, Tesseract on CPU) under the 4 GiB ceiling enforced by
   decision rule and language string (``fin.corpus.ocr.detect_ocr_required`` /
   ``fin.corpus.ocr.TesseractEngine``, imported from the read-only worktree
   mount) so the measurement exercises the same rule ADR 0054 freezes;
+* the product's *figure* rule for the pages that rule cannot select
+  (``fin.corpus.parsers._pages.crop_is_legible`` + ``crop_png``), because
+  ``detect_ocr_required`` asks whether a text layer collapsed and can never
+  answer "yes" on a page that has one — which is the only way a chart's own
+  pixel labels are ever read. Both the rule and the cut are the product's own
+  functions, so a change to the core moves this measurement with it;
 * a full-page bitmap render of EVERY physical page with its pixel dimensions
   and DPI, because the page-cap / vision-call budget decision depends on the
   size of the image a vision call would carry;
@@ -38,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import statistics
@@ -110,6 +117,47 @@ OOM_KILL_COUNTER_SOURCE: Final[str] = "cgroup memory.events oom_kill counter"
 # table-structure weights does not start hashing the whole cache; a weight above
 # it is reported as a named gap rather than as an absent digest.
 _MAX_HASHED_ARTIFACT_BYTES: Final[int] = 2 * 1024**3
+
+# The product's figure rule and Region, bound from the mounted source tree.
+# They are module-level so the figure lane calls the *product's* function
+# rather than a threshold restated here. The bind is a no-op when the product
+# is not importable, which is why ``_apply_figure_region_ocr`` refuses rather
+# than falling back to a local floor: a locally re-implemented rule would stop
+# being a measurement of fin.
+crop_is_legible: Any = None
+_Region: Any = None
+_crop_png: Any = None
+_PageRaster: Any = None
+
+
+def _bind_product_region_rule() -> bool:
+    """Bind the product's figure rule and cut from the source tree beside this file.
+
+    Returns False when the product is not importable, which is the only case in
+    which the figure lane cannot run; the caller names that rather than
+    measuring against a local copy of the rule or the crop.
+    """
+    global crop_is_legible, _Region, _crop_png, _PageRaster
+    src = Path(__file__).resolve().parents[2] / "src"
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    try:
+        from fin.corpus.parsers._pages import (  # noqa: PLC0415
+            PageRaster,
+            Region,
+            crop_is_legible as rule,
+            crop_png,
+        )
+    except Exception:  # pragma: no cover - a host without the product on its path
+        return False
+    crop_is_legible = rule
+    _Region = Region
+    _crop_png = crop_png
+    _PageRaster = PageRaster
+    return True
+
+
+_bind_product_region_rule()
 
 
 def log(msg: str) -> None:
@@ -549,6 +597,259 @@ def _apply_page_ocr(
                 )  # EXIT: a leaked bitmap is not a gap in a number, but not invisible either
 
 
+def _figure_region_record(entry: dict[str, object], **values: object) -> None:
+    """Declare this page's figure-OCR keys before any region is read.
+
+    The record's rule is that a reading which did not happen is never a zero, so
+    a page that has not been through the figure rule spells its keys as null
+    rather than leaving a reader to infer the difference from a missing key.
+    """
+    entry.update(
+        {
+            "figure_ocr_regions_read": None,
+            "figure_ocr_text_char_count": None,
+            "figure_ocr_text_sample": None,
+            "figure_ocr_text_file": None,
+            "figure_ocr_text_sha256": None,
+            "figure_ocr_error": None,
+            "figure_ocr_skipped_reason": None,
+        }
+    )
+    entry.update(values)
+
+
+def _apply_figure_region_ocr(
+    entry: dict[str, object],
+    figure_boxes: list[dict[str, object]] | None,
+    page_png: bytes,
+    *,
+    page_no: int,
+    dpi: int,
+    image_dir: Path | None,
+    ocr_engine: Any,
+    failures: list[str],
+) -> None:
+    """Read the pixels of every figure region the product's rule calls legible.
+
+    The page rule (``detect_ocr_required``) asks whether a page's text layer
+    collapsed while it still carries images, so on a page with a healthy text
+    layer it can never answer "yes" and the chart's own labels -- which exist
+    only as pixels -- are never read. The product's *figure* rule
+    (``fin.corpus.parsers._pages.crop_is_legible``) is the other half of its own
+    two-rule contract and is what reaches that content
+    (``src/fin/corpus/parsers/_pages.py``: "which is how text inside a chart on
+    a page that also has a text layer is reached at all"). Both the rule and the
+    cut (``crop_png``) are the product's own functions rather than a threshold
+    and a crop re-implemented here, so a change to ``MIN_OCR_REGION_EDGE_PX`` or
+    to the crop's bounds moves this measurement with the code it measures.
+
+    A page the page rule already read whole is not re-read per region: the
+    product skips crops in that case (``_pages.py`` ``_one_pdf_page``), and
+    recognizing the same bitmap twice would misprice the OCR cost.
+    """
+    if entry.get("ocr_used"):
+        # EXIT: the page rule has had every pixel on this page; its crops would
+        # recognize the same bitmap again for nothing added. The rule ran and
+        # selected nothing to read, which is a real answer, not a gap.
+        _figure_region_record(
+            entry,
+            figure_ocr_regions_read=0,
+            figure_ocr_text_char_count=0,
+            figure_ocr_skipped_reason="page_ocr_already_read_whole_page",
+        )
+        return
+
+    if crop_is_legible is None or _Region is None or _crop_png is None:
+        # EXIT: without the product's own rule this would be a locally chosen
+        # floor, which is a guess about the product rather than a measurement.
+        reason = "product_figure_rule_unavailable"
+        _figure_region_record(entry, figure_ocr_skipped_reason=reason)
+        failures.append(f"figure region OCR skipped: {reason}")
+        return
+
+    boxes = list(figure_boxes or [])
+    # A figure box the record could not describe is a gap in the evidence, not
+    # a region that happened to be too small: it is named before the rule runs,
+    # so a malformed box cannot be read as a page with no legible figure.
+    malformed = [box for box in boxes if not isinstance(box, dict) or not _box_readable(box)]
+    legible = [box for box in boxes if _legible_figure_box(box)]
+    if malformed:
+        reason = (
+            f"page {page_no}: {len(malformed)} figure box(es) the record did not "
+            "describe in four finite edges"
+        )
+        _figure_region_record(
+            entry,
+            figure_ocr_regions_read=None,
+            figure_ocr_text_char_count=None,
+            figure_ocr_error=reason,
+        )
+        failures.append(reason)
+        return
+    if not legible:
+        # EXIT: the rule ran and selected nothing, which is a measurement.
+        _figure_region_record(
+            entry, figure_ocr_regions_read=0, figure_ocr_text_char_count=0
+        )
+        return
+
+    raster = _PageRaster.of(page_png, width_px=_png_width(page_png), height_px=_png_height(page_png))
+    texts: list[str] = []
+    for box in legible:
+        region = _region_from_box(box)
+        try:
+            crop = _crop_png(region, raster=raster, dpi=dpi)
+        except Exception as exc:  # fin.corpus.errors.PageRenderError
+            # EXIT: a box the raster cannot show names itself; it is not a box
+            # that happened to hold no text.
+            reason = error_text(
+                exc, prefix=f"page {page_no}: figure region crop failed: "
+            )
+            _figure_region_record(
+                entry,
+                figure_ocr_regions_read=None,
+                figure_ocr_text_char_count=None,
+                figure_ocr_error=reason,
+            )
+            failures.append(reason)
+            return
+        crop_path = _png_path(page_no, None).with_name(
+            f"g4_figure_{os.getpid()}_{page_no:04d}.png"
+        )
+        try:
+            crop_path.write_bytes(crop)
+            text = ocr_engine.recognize(source=crop_path, page=page_no)
+        except Exception as exc:  # fin.corpus.ocr's typed OcrRequiredUnavailableError
+            # EXIT: a crop that could not be read says nothing about the page;
+            # zero characters with no error would read as "read, held no text".
+            reason = error_text(
+                exc, prefix=f"page {page_no}: figure region OCR failed: "
+            )
+            _figure_region_record(
+                entry,
+                figure_ocr_regions_read=None,
+                figure_ocr_text_char_count=None,
+                figure_ocr_error=reason,
+            )
+            failures.append(reason)
+            return
+        finally:
+            try:
+                crop_path.unlink(missing_ok=True)
+            except OSError as exc:
+                failures.append(
+                    error_text(
+                        exc,
+                        prefix=f"page {page_no}: figure crop {crop_path.name} not removed: ",
+                    )
+                )  # EXIT: a leaked crop is not a gap in a number, but not invisible
+        if text and text.strip():
+            texts.append(text)
+
+    joined = " ".join(texts)
+    _figure_region_record(
+        entry,
+        figure_ocr_regions_read=len(legible),
+        figure_ocr_text_char_count=len(joined),
+        # Bounded like the page-level sample, so the single JSON line stays
+        # bounded however much a chart's labels read back.
+        figure_ocr_text_sample=" ".join(joined.split())[:160] or None,
+    )
+    _save_figure_ocr_text(entry, joined, page_no, image_dir)
+
+
+def _box_readable(box: object) -> bool:
+    """Whether a recorded box carries four finite numeric edges.
+
+    Only readability is checked here, not order: the record keeps Docling's
+    bottom-left origin, so a well-formed box has ``t > b`` and the order is
+    judged after the flip onto the product's own Region.
+    """
+    if not isinstance(box, dict):
+        return False
+    try:
+        values = [float(box[field]) for field in ("l", "t", "r", "b")]  # noqa: PLR1702
+    except (KeyError, TypeError, ValueError):
+        return False
+    return all(value == value and value not in (float("inf"), float("-inf")) for value in values)
+
+
+def _region_from_box(box: dict[str, object]) -> Any:
+    """One recorded figure box as the product's own Region value.
+
+    The record keeps Docling's bottom-left origin, so ``t`` is the higher edge
+    and the product's top-left space is reached by flipping it, the same flip
+    ``src/fin/host/attachment_layout.py`` performs for the same record.
+    """
+    height = float(box.get("page_height_pt") or 792.0)
+    left, right = float(box["l"]), float(box["r"])  # noqa: PLR1702
+    top, bottom = height - float(box["t"]), height - float(box["b"])
+    return _Region(
+        kind="figure", left_pt=left, top_pt=top, right_pt=right, bottom_pt=bottom
+    )
+
+
+def _png_size(png: bytes) -> tuple[int, int]:
+    """A PNG's own pixel size, read from its IHDR rather than guessed."""
+    if len(png) < 24 or png[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("figure lane needs the page's own PNG bytes")
+    width = int.from_bytes(png[16:20], "big")
+    height = int.from_bytes(png[20:24], "big")
+    return width, height
+
+
+def _png_width(png: bytes) -> int:
+    return _png_size(png)[0]
+
+
+def _png_height(png: bytes) -> int:
+    return _png_size(png)[1]
+
+
+def _save_figure_ocr_text(
+    entry: dict[str, object], ocr_text: str, page_no: int, image_dir: Path | None
+) -> None:
+    """Persist a page's whole figure-region read beside its page bitmap.
+
+    The same reasoning as the page-level sidecar applies one rule down: the
+    manifest's ``expected_ocr_quote`` for a chart page is the title and the
+    period labels, and a title sits at the TOP of a read that Tesseract returns
+    axis-first, so it can land outside a 160-character window. A committed
+    expectation that the artefact cannot reach is an expectation nothing can
+    settle, so the full text is written next to the pixels it was read from and
+    named with its digest. The bounded sample in the JSON line is unchanged.
+    """
+    if image_dir is None:
+        return  # EXIT: no bitmap was kept, so no text artefact is written either
+    path = image_dir / f"page_{page_no:04d}.figure-ocr.txt"
+    path.write_text(ocr_text, encoding="utf-8")
+    entry["figure_ocr_text_file"] = path.name
+    entry["figure_ocr_text_sha256"] = sha256_bytes(path)[1]
+
+
+def _legible_figure_box(box: object) -> bool:
+    """Whether one recorded figure box passes the product's own legibility rule.
+
+    A box whose four edges the record did not answer in numbers is not legible
+    and not merely small: there is no place to cut, so the caller names it.
+    """
+    if not isinstance(box, dict):
+        return False
+    try:
+        float(box["l"]), float(box["t"]), float(box["r"]), float(box["b"])  # noqa: PLR1702
+    except (KeyError, TypeError, ValueError):
+        return False
+    if crop_is_legible is None or _Region is None:
+        return False
+    # The record keeps Docling's bottom-left origin, so ``t`` is the HIGHER edge
+    # and the box is well formed when ``t > b``; the order is checked after the
+    # flip, on the product's own Region, rather than against the record's.
+    region = _region_from_box(box)
+    if region.right_pt <= region.left_pt or region.bottom_pt <= region.top_pt:
+        return False
+    return bool(crop_is_legible(region))
+
+
 @dataclass(frozen=True, slots=True)
 class RenderPass:
     """One entry per physical page, plus the render window that produced them."""
@@ -593,6 +894,15 @@ def _page_structure_entry(
         "ocr_text_sha256": None,
         "ocr_error_code": None,
         "ocr_error": None,
+        # The figure rule runs after the layout pass, because a region has to
+        # exist before it can be asked whether its pixels are worth a read.
+        "figure_ocr_regions_read": None,
+        "figure_ocr_text_char_count": None,
+        "figure_ocr_text_sample": None,
+        "figure_ocr_text_file": None,
+        "figure_ocr_text_sha256": None,
+        "figure_ocr_error": None,
+        "figure_ocr_skipped_reason": None,
     }
 
 
@@ -682,6 +992,69 @@ def render_pages(
         pages.append(entry)
 
     return RenderPass(pages=pages, latency_ms=(time.monotonic() - started_at) * 1000.0)
+
+
+def run_figure_region_pass(
+    *,
+    pages: list[dict[str, object]],
+    pdf_doc: Any,
+    dpi: int,
+    image_dir: Path | None,
+    ocr_engine: Any,
+    failures: list[str],
+) -> None:
+    """Apply the product's figure rule to every page, once regions are known.
+
+    This runs after the layout pass because the question it asks is about a
+    region: a page's chart labels are pixels inside a box Docling has to have
+    found first. The page is rendered again for the pages that have a legible
+    figure box, because the crop is cut from the same full-page raster the page
+    rule would have used, so a region read and a page read are the same pixels.
+    """
+    for idx, entry in enumerate(pages):
+        page_no = int(entry["page_no"])
+        boxes = entry.get("figure_boxes")
+        if boxes is None:
+            # EXIT: the region source failed; there is no box to ask about, and
+            # the null stays rather than becoming a zero.
+            _figure_region_record(entry)
+            continue
+        legible = any(_legible_figure_box(box) for box in boxes)
+        if not legible and not entry.get("ocr_used"):
+            # EXIT: nothing above the floor, and the page rule did not read the
+            # page either. The rule ran and selected nothing, which is a
+            # measurement, so no render is charged for it.
+            _apply_figure_region_ocr(
+                entry, list(boxes), b"", page_no=page_no, dpi=dpi,
+                image_dir=image_dir, ocr_engine=ocr_engine, failures=failures,
+            )
+            continue
+        if not legible:
+            _apply_figure_region_ocr(
+                entry, list(boxes), b"", page_no=page_no, dpi=dpi,
+                image_dir=image_dir, ocr_engine=ocr_engine, failures=failures,
+            )
+            continue
+        try:
+            bitmap = pdf_doc[idx].render(scale=dpi / 72.0)
+            png = bitmap.to_pil()
+            buffer = io.BytesIO()
+            png.save(buffer, format="PNG")
+            page_png = buffer.getvalue()
+            del png, bitmap
+        except Exception as exc:
+            reason = error_text(
+                exc, prefix=f"page {page_no}: figure-region render failed: "
+            )
+            _figure_region_record(
+                entry, figure_ocr_text_char_count=None, figure_ocr_error=reason
+            )
+            failures.append(reason)
+            continue
+        _apply_figure_region_ocr(
+            entry, list(boxes), page_png, page_no=page_no, dpi=dpi,
+            image_dir=image_dir, ocr_engine=ocr_engine, failures=failures,
+        )
 
 
 # --------------------------------------------------------------------------
@@ -934,6 +1307,17 @@ def attach_regions(
         entry["table_boxes"] = reg.get("table_boxes", []) if measured else None
         entry["figure_boxes"] = reg.get("figure_boxes", []) if measured else None
         entry["docling_page_size_pt"] = docling.page_sizes_pt.get(page_no)
+        # The figure rule works in the product's top-left space, so a figure
+        # box carries the page it belongs to: the record keeps Docling's
+        # bottom-left origin and the flip is what makes a recorded box a place
+        # the product can crop. Only figure boxes need it — a table box is
+        # never cropped by the figure rule.
+        height_pt = (
+            entry.get("docling_page_size_pt") or entry.get("size_pt") or [None, 792.0]
+        )[1]
+        for box in entry["figure_boxes"] or []:
+            if isinstance(box, dict):
+                box["page_height_pt"] = height_pt
     # A whole-document pass that counted pages but read no size is the one case
     # where per-page nulls carry no explanation: ``docling_error`` is null
     # because nothing raised. Naming it keeps ``null`` meaning "not measured"
@@ -1130,6 +1514,15 @@ def page_rule_counts(pages: list[dict[str, object]]) -> dict[str, object]:
         "ocr_text_chars_total": _sum_or_gap(
             [p["ocr_text_char_count"] for p in pages]
         ),
+        # The figure rule's own totals. They are the second half of the
+        # product's two-rule contract: the page rule above cannot answer "yes"
+        # on a page with a text layer, and a chart's labels are pixels.
+        "figure_ocr_regions_read": _sum_or_gap(
+            [p.get("figure_ocr_regions_read") for p in pages]
+        ),
+        "figure_ocr_text_chars_total": _sum_or_gap(
+            [p.get("figure_ocr_text_char_count") for p in pages]
+        ),
     }
 
 
@@ -1276,6 +1669,7 @@ def build_record(
         "heron_artifact": {**artifact_identity(artifacts_path), **pipeline_identity},
         "repo_rule_provenance": {
             "ocr_decision": "fin.corpus.ocr.detect_ocr_required(min_text_chars=1)",
+            "figure_ocr_decision": "fin.corpus.parsers._pages.crop_is_legible + crop_png",
             "ocr_engine": "fin.corpus.ocr.TesseractEngine",
             "tesseract_lang_default": tesseract_lang,
             "page_unit_rule": "one frozen unit per physical page (fin.corpus.parsers._pdf)",
@@ -1342,11 +1736,14 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
-def load_repo_ocr(fin_src: Path) -> tuple[Any, Any, str]:
+def load_repo_ocr(fin_src: Path) -> tuple[Any, Any, str, Any]:
     """fin.corpus.ocr's rule, engine and language string, read off the mount.
 
     Hard failure if absent: a locally re-implemented rule would stop being a
-    measurement of fin.
+    measurement of fin. The product's *figure* rule
+    (``fin.corpus.parsers._pages.crop_is_legible``) is returned alongside it,
+    for the reason the module docstring names: it is how text inside a chart on
+    a page that also has a text layer is reached at all.
     """
     sys.path.insert(0, str(fin_src))
     from fin.corpus.ocr import (  # noqa: E402
@@ -1354,11 +1751,21 @@ def load_repo_ocr(fin_src: Path) -> tuple[Any, Any, str]:
         TesseractEngine,
         detect_ocr_required,
     )
+    from fin.corpus.parsers._pages import (  # noqa: E402
+        Region,
+        crop_is_legible,
+    )
+
+    # Bound at module scope so the figure lane measures the product's own rule
+    # and can build the product's own Region; see their declaration above.
+    globals()["crop_is_legible"] = crop_is_legible
+    globals()["_Region"] = Region
 
     return (
         detect_ocr_required,
         TesseractEngine(lang=DEFAULT_TESSERACT_LANG),
         DEFAULT_TESSERACT_LANG,
+        crop_is_legible,
     )
 
 
@@ -1369,7 +1776,9 @@ def main() -> int:
         log(f"[driver] no such PDF: {pdf_path}")
         return 2  # EXIT: nothing was measured, so no line is printed at all
 
-    detect_ocr_required, ocr_engine, tesseract_lang = load_repo_ocr(args.fin_src)
+    detect_ocr_required, ocr_engine, tesseract_lang, _figure_rule = load_repo_ocr(
+        args.fin_src
+    )
     import pypdfium2 as pdfium  # noqa: E402
 
     checkpoints: list[MemorySnapshot] = [memory_snapshot("start")]
@@ -1397,6 +1806,15 @@ def main() -> int:
 
     docling = run_docling_pass(conv, pdf_path, checkpoints)
     attach_regions(render.pages, docling, harness_failures)
+
+    # The product's figure rule needs the regions the layout pass just found,
+    # so it runs here rather than inside the render pass above.
+    run_figure_region_pass(
+        pages=render.pages, pdf_doc=pdf_doc, dpi=args.dpi,
+        image_dir=args.image_dir if args.write_images else None,
+        ocr_engine=ocr_engine, failures=harness_failures,
+    )
+    checkpoints.append(memory_snapshot("after_figure_region_ocr"))
 
     slice_pass = run_slice_pass(
         pdfium_mod=pdfium, pdf_doc=pdf_doc, conv=conv, pages=render.pages,
