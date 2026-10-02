@@ -497,6 +497,100 @@ def _page_image_objects(page: Any) -> tuple[int | None, str | None]:
         )  # EXIT: an unreadable object list is a gap, not a zero
 
 
+def image_placements(page: Any) -> list[dict[str, float]]:
+    """Where this page actually places each of its image XObjects, in points.
+
+    The layout stage reports a *detection* box, which is a model's opinion about
+    where artwork is. A PDF already states where its own artwork is: an image
+    XObject's placement, in the same bottom-left origin the record uses. Reading
+    it from the page is what lets a figure region cover the pixels it names
+    instead of only the part of them a box happened to land on — the chart title
+    sits in the band above the detection box, so a crop of the box cannot read
+    it.
+
+    The kind constant is the pinned library's own, and the placement is its
+    ``get_bounds()``, so this is a reading rather than a constant: an image the
+    library will not place, and a page whose object list cannot be read, both
+    yield nothing here and leave the layout box as it was. Neither guesses.
+    """
+    placements: list[dict[str, float]] = []
+    try:
+        from pypdfium2 import raw
+
+        objects = page.get_objects(filter=[int(raw.FPDF_PAGEOBJ_IMAGE)])
+        for obj in objects:
+            try:
+                left, bottom, right, top = (float(v) for v in obj.get_bounds())
+            except Exception:
+                # EXIT: an object the library will not place is a gap in the
+                # evidence, never a zero-sized box that would shrink a region.
+                continue
+            if right <= left or top <= bottom:
+                continue  # EXIT: an inverted placement describes no area
+            placements.append(
+                {"l": round(left, 1), "b": round(bottom, 1), "r": round(right, 1), "t": round(top, 1)}
+            )
+    except Exception as exc:
+        log(f"[driver] image placement scan failed: {error_text(exc)}")
+        return []  # EXIT: an unreadable object list yields no placement, not a guess
+    return placements
+
+
+def artwork_extent(
+    box: dict[str, Any], placements: list[dict[str, float]]
+) -> dict[str, Any]:
+    """The artwork's real extent when the layout box names that artwork.
+
+    A detection box and the image placement it sits on name the same artwork, and
+    the placement is the one that bounds the pixels. When they overlap, the
+    region becomes the placement, so the figure rule crops the whole chart —
+    title, axis and labels together — rather than the inner rectangle a detector
+    chose.
+
+    Overlap, not strict containment, is the test, because a detector's box and
+    the artwork's placement routinely miss each other by a fraction of a point:
+    on this gold set the p1 logotype's box is ``l 288.8`` while its placement is
+    ``l 289.5``, which no strict containment would ever match. What keeps two
+    nearby figures from being merged is the choice among overlapping placements:
+    the *tightest* one wins, so a full-page raster cannot absorb a region on a
+    scanned page, and a second figure that only brushes the box loses to the
+    one the box is actually inside. A box overlapping no image at all (a vector
+    chart, a drawn diagram) is left exactly as the model reported it.
+    """
+    if not placements:
+        return dict(box)  # EXIT: nothing on the page to cover, so nothing changes
+    try:
+        left, bottom = float(box["l"]), float(box["b"])  # noqa: PLR1702
+        right, top = float(box["r"]), float(box["t"])
+    except (KeyError, TypeError, ValueError):
+        return dict(box)  # EXIT: a box with no four edges is passed through, not grown
+    best: tuple[float, dict[str, float]] | None = None
+    for place in placements:
+        pl, pb = float(place["l"]), float(place["b"])  # noqa: PLR1702
+        pr, pt = float(place["r"]), float(place["t"])
+        overlap_w = min(right, pr) - max(left, pl)
+        overlap_h = min(top, pt) - max(bottom, pb)
+        if overlap_w <= 0 or overlap_h <= 0:
+            continue  # EXIT: no shared area means no shared artwork
+        area = (pr - pl) * (pt - pb)
+        if best is None or area < best[0]:
+            # Tightest overlapping placement wins: a full-page raster would
+            # otherwise grow every region on a scanned page to the whole page.
+            best = (area, place)
+    if best is None:
+        return dict(box)  # EXIT: the box is over no image, so it stays the model's
+    widened = dict(box)
+    widened.update(
+        {
+            "l": float(best[1]["l"]),
+            "b": float(best[1]["b"]),
+            "r": float(best[1]["r"]),
+            "t": float(best[1]["t"]),
+        }
+    )
+    return widened
+
+
 def _png_path(page_no: int, image_dir: Path | None) -> Path:
     """Kept page bitmap path, or a per-process temp path when nothing is kept."""
     if image_dir is not None:
@@ -868,6 +962,10 @@ def _page_structure_entry(
     n_images, images_error = _page_image_objects(page)
     if images_error is not None:
         log(f"[driver] page {page_no} object scan failed: {images_error}")
+    # Where the page places its own artwork, so a layout box can be widened to
+    # the pixels it names. Read here, beside the image count the OCR rule needs,
+    # because both come from the same object scan.
+    placements = image_placements(page)
     # The rule cannot be asked without its image input: running it on a
     # fabricated 0 would let a failed scan clear or select OCR, and
     # pages_needing_ocr is one of the quantities the page cap is priced from.
@@ -884,6 +982,10 @@ def _page_structure_entry(
         "native_text_char_count": len(native_text),
         "pdf_image_objects": n_images,
         "pdf_image_objects_error": images_error,
+        # Read from the page, not from the layout pass: the placement is a fact
+        # of the document, and the figure pass runs before the regions exist.
+        "image_placements": placements,
+        "figure_boxes_detected": None,
         "ocr_required_by_repo_rule": rule,
         "ocr_used": False,
         "ocr_trigger": None,
@@ -1316,8 +1418,34 @@ def attach_regions(
             entry.get("docling_page_size_pt") or entry.get("size_pt") or [None, 792.0]
         )[1]
         for box in entry["figure_boxes"] or []:
-            if isinstance(box, dict):
-                box["page_height_pt"] = height_pt
+            if not isinstance(box, dict):
+                continue
+            box["page_height_pt"] = height_pt
+            # The layout stage reports where it DETECTED the artwork; the page
+            # reports where the artwork IS. A detection box inset inside the
+            # image's own placement leaves the chart's title outside the crop,
+            # so the region the figure rule acts on is the placement the page
+            # states, widened from the detection rather than written down here.
+            # The model's own box is kept beside it so the record can show what
+            # the layout stage said and what the page said.
+            detections = entry.get("figure_boxes_detected")
+            if detections is None:
+                # EXIT: the key is spelled as null on a page that has not been
+                # through the layout pass; the first box found starts the list.
+                detections = []
+                entry["figure_boxes_detected"] = detections
+            detections.append(
+                {k: box[k] for k in ("l", "t", "r", "b") if k in box}
+            )
+            box.update(
+                {
+                    k: v
+                    for k, v in artwork_extent(
+                        {k: box[k] for k in ("l", "t", "r", "b") if k in box},
+                        list(entry.get("image_placements") or []),
+                    ).items()
+                }
+            )
     # A whole-document pass that counted pages but read no size is the one case
     # where per-page nulls carry no explanation: ``docling_error`` is null
     # because nothing raised. Naming it keeps ``null`` meaning "not measured"
