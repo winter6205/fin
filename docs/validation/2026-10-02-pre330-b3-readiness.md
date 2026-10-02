@@ -11,15 +11,33 @@ changed for this record. Test results are attributed to the revision that actual
 row. The default-suite regression recorded in §6 ran separately, in the T1/T2 worktree, and was
 **not** repeated here — see §6.1 for the exact shape of that number.
 
+**Amended 2026-10-03** by the gold-residual task on base `194d5ba`
+(`docs/validation/2026-10-03-c1-gold-residual.md`): the three gold items this record carried as
+STILL UNMET in §11.1 are re-derived from measurement, and the per-case verdicts in §11.3 are
+re-derived from them. **The §1 verdict is unchanged, and the amendment does not claim otherwise.**
+
 ## 1. Verdict
 
-> ## **BLOCKED**
+> ## **READY for the bounded development round** — full #330 acceptance **BLOCKED**
 >
-> The bounded development B3 run may **not** start on candidate `2fe787f` as constituted. §11 derives
-> this from the weakest link across the selected browser gold cases: `g4-mixed-chart-001` is
-> **BLOCKED** because its page-2 `table` region floor is authored in the candidate's own manifest and
-> measured unmet (`table 0`), with **no recorded decision scoping it out** (§11.2). Two ready cases
-> do not average this away, and three sound *dispositions* are not satisfied requirements.
+> The bounded development B3 run **may start**. As constituted on candidate `2fe787f` the blocker
+> was `g4-mixed-chart-001`, whose page-2 `table` region floor was authored in the
+> candidate's own manifest and measured unmet (`table 0`) with no recorded decision scoping it
+> out (§11.2). **That gold blocker is closed as of 2026-10-03** — the floor is now met by
+> measurement, and all three selected gold cases are READY on the gold-expectation axis
+> (§11.3).
+>
+> The READY covers the operator-approved bounded development round only: **S1, S3, S4,
+> S6-mechanism, S7, S8**. The operator ruled that the enterprise ledger and the dedicated 4 GB
+> device do not gate that round, so A3b and C2 are open prerequisites of the *enterprise*
+> acceptance, not gates on this one.
+>
+> **Full #330 acceptance remains BLOCKED.** A3b is still BLOCKED and UNPASSED, so **S2's
+> enterprise-anchored comparison and
+> S5b's approved-ledger SQL turn stay UNCLOSED**; real-model date extraction / clarification
+> is still unproven; C2 is still deferred with no dedicated 4 GB device measured. Closing a
+> gold gap removed one blocker, not the verdict: the amendment ruling in §2 explicitly
+> preserves the non-waiver list, and nothing in this amendment waives an enterprise clause.
 
 The amendment's scope ruling is unchanged and is not what blocks: of B3's eight acceptance steps, six
 are provable on development read-only data and data-independent mechanics (S1, S3, S4, S6-mechanism,
@@ -382,11 +400,19 @@ distinction between "met" and "dispositioned" is preserved verbatim. Per-case ve
   keeps the JSON-line sample capped. Failing-first: **`3 failed, 3 passed` → `6 passed`**. **Verified
   again in this worktree** against #347's own run artifacts: all three scanned quotes are present
   **verbatim** in the sidecars at offsets **11 / 11 / 479**.
-- **Gap 1 (mixed p2 table floor) — STILL UNMET.** The floor is not waived; see §10 for the blocking
-  analysis.
-- **Gap 2 (mixed p3 figure OCR) — documented lane-scope limit**, expectation left in place.
-- **Gap 3a (scanned text regions) — not expressible** in the product's region set.
-- **Gap 3b (scanned p2 floor) — raised and now met by measurement**, not merely asserted.
+- **Gap 1 (mixed p2 table floor) — CLOSED 2026-10-03, met by measurement.** The fixture page
+  was re-authored into the ruled table its source page is; the pinned stage now returns `table 1`
+  for p2 against an **unchanged** floor. See §11.2 and
+  `docs/validation/2026-10-03-c1-gold-residual.md`.
+- **Gap 2 (mixed p3 figure OCR) — CLOSED 2026-10-03 for the behaviour, with one named residual.**
+  The driver now applies the product's own `crop_is_legible` / `crop_png`; measured
+  `figure_ocr_regions_read 1`, 425 chars, chart labels read. The chart *title* quote stays
+  unreachable through the returned box; recorded in `known_gaps[10]`, owned by ADR 0089's stage.
+- **Gap 3a (scanned text regions) — CLOSED 2026-10-03 as a recorded decision with measurement.**
+  **ADR 0096** accepts that a text region is a count, not a box, and cites where the product reads
+  page text instead; the floor is carried there and verified (0 native chars, OCR 3/3, 3/3 quotes
+  verbatim). Nothing deleted, no floor lowered.
+- **Gap 3b (scanned p2 floor) — raised and met by measurement**, not merely asserted.
 
 
 **What the shared tool signature implies for other host suites.** `src/fin/host/graph.py` is the
@@ -428,10 +454,13 @@ Named precisely. None of these is closed by this verdict.
 4. **C2 is DEFERRED and UNPASSED.** No dedicated 4 GB device measurement exists. The T5 runs used
    the harness's own default `G4_CEILING_*` values; those are a harness default, not a host
    property, and may not be used to close C2 or assert a 4 GB cap.
-5. **Mixed-chart p2's `table` region floor is STILL UNMET and is blocking for that gold case.**
-   Measured `table 0` against an authored floor of `["text","table"]` that the candidate still
-   carries. The floor was **not** weakened and **no recorded decision scopes it out**; §10 gives the
-   blocking analysis and the two named unblockers. Recorded here, not smoothed.
+5. **Mixed-chart p2's `table` region floor — CLOSED 2026-10-03, by measurement.** It was
+   `table 0` against an authored floor of `["text","table"]`; the fixture page has since been
+   re-authored into the ruled table its source page is and the pinned stage returns **`table 1`**
+   for it, floor unchanged. **What remains open from this item is narrower and is not this
+   floor:** the chart *title* quote on p3 is unreachable through the layout stage's returned box
+   (inset from the declared raster), owned by the Heron stage ADR 0089 pins. Recorded in
+   `known_gaps[10]`. See `docs/validation/2026-10-03-c1-gold-residual.md`.
 6. **`snapshot.debian.org` is a live third-party dependency for C1's repeatability.** 2 of 6
    clean-build attempts failed in the apt step. `apt-packages.lock` records the ~188 transitive
    packages but does not gate them. C1's byte-for-byte claim is unaffected; **repeatability** is
@@ -612,11 +641,11 @@ link across the cases B3 intends to run, **not** from a count of dispositions.
 | Scanned p1/p2/p3 OCR applied (3 pages) | PASSED | no | `pages_needing_ocr 3`; re-read from #347's run artifact |
 | Scanned p1/p2/p3 quotes verbatim | PASSED | no | Re-verified in this worktree against the sidecars: offsets **11 / 11 / 479**, all verbatim |
 | **Scanned p2 raised floor `["text","table"]` — `table` component** | **PASSED (met by measurement)** | no | Measured `table 1` on p2 (read from #347's run artifact: p1/p2/p3 = 1/1/2), matching the raised floor from the AAPL p9 source. Not merely asserted |
-| **Scanned p1/p2/p3 `text` floor entries** | **STILL UNMET** | **no — payload is verified another way** | Measured `text 0`; `text` is not in the product's region vocabulary at all: `_BOXED_KINDS = ("table","figure")` (`src/fin/host/attachment_layout.py:85`). The same kind is unmet on **all three** scanned pages, not just p2 |
-| **Mixed p3 `ocr_expected: true` (figure-scoped OCR)** | **STILL UNMET** | **yes — for `g4-mixed-chart-001`** | Manifest still authors `ocr_expected: true` on p3; measured `pages_needing_ocr 0` across the mixed case. Product rule cited (`src/fin/corpus/parsers/_pages.py:29-33`) and the 732 px figure box show the product *would* crop it — but the lane that B3 measures returned no OCR, and the expectation was left in place, not met |
-| **Mixed p2 `table` region floor** | **STILL UNMET** | **yes — for `g4-mixed-chart-001`** | Manifest still authors `region_kinds_expected: ["text","table"]` on p2 (read directly from the candidate's manifest). Measured **`table 0`**, re-read from #347's run artifact. Floor not weakened; see §11.2 |
+| **Scanned p1/p2/p3 `text` floor entries** | **PASSED (met by measurement, in the channel the product reads)** | no | Re-derived 2026-10-03 by `docs/validation/2026-10-03-c1-gold-residual.md` (ITEM 3). The `text` **box** is out of the product's region vocabulary — `_BOXED_KINDS = ("table","figure")` (`src/fin/host/attachment_layout.py:85`) — and that is now an **accepted decision** with its code path cited (**ADR 0096**), not a silence. Text presence is carried where the product consumes it (`_pages.py` `_one_pdf_page` reads `native_text`, `_page` builds the unit from the OCR read) and is **measured** there: `native_text_chars_total 0`, `pages_with_ocr_applied 3/3`, `ocr_text_chars_total 15108`, 3/3 quotes verbatim. **No floor was deleted or lowered** — the `text` entries remain in `region_kinds_expected`, and `known_gaps[11]` records the scoping in the manifest itself |
+| **Mixed p3 `ocr_expected: true` (figure-scoped OCR)** | **PASSED (met by measurement)** for the behaviour; **one sub-expectation STILL UNMET** | **no longer blocking** | Re-derived 2026-10-03 (ITEM 2). The driver now applies the product's own figure rule (`crop_is_legible`) and cut (`crop_png`) — previously it asked only the page rule, which can never answer "yes" on a page with a text layer. Measured: `figure_ocr_regions_read 1`, 425 chars, reaching all four value labels, all four period labels and all four dates; 2 of 4 `expected_ocr_quote_alternatives` verbatim (`117,154` @ 8, `2022 Q3 … 2023 Q3` @ 75); p1's 93 px logotype correctly not cropped; scanned pages correctly not re-read. **Not fully met:** the primary `expected_ocr_quote` (chart **title**) is unreachable — the layout stage's box (`l 64.9 t 145.5 r 553.5 b 409.2`) is inset from the declared raster (`x 42–570, y 100–428`), so the title lies outside the cropped region. Owner: the Heron box tightness pinned by ADR 0089; recorded in `known_gaps[10]`, not claimed met |
+| **Mixed p2 `table` region floor** | **PASSED (met by measurement)** | **no** | Re-derived 2026-10-03 (ITEM 1). The fixture page was re-authored to be the **ruled** table its source page is (the source carries 154 rules / 76 column separators / 240 band fills; the borderless reproduction carried 0). Same 98 text runs, byte-reproducible rebuild (`scripts/build_g4_mixed_ruled_page2.py --check`), new sha256 `0d6d4713…`. Measured **`table 1`** on p2 (box `l 38.5 t 654.3 r 595.0 b 293.0`), floor unchanged and not weakened; see §11.2 |
 | Mixed p1 figure region (logotype) | PASSED | no | measured `figure 1` on p1 |
-| Mixed p1/p2/p3 native text layers | PASSED | no | measured `text 14 / 5 / 5`; `native_text_chars_total` 1908 reproduced exactly |
+| Mixed p1/p2/p3 native text layers | PASSED | no | `native_text_chars_total` **1908** reproduced exactly after the p2 re-authoring, which is the proof the 98 text runs were not altered. Region `text` counts after the re-authoring are `14 / 3 / 5`: p2's move from 5 to 3 is the two rows the model now reads inside the table region, and `text` is a presence floor (`known_gaps[3]), so it stays met |
 | T8 zero-baseline exclusion honoured | PASSED (as an exclusion) | no | No zero-baseline gold case introduced; the AAPL p4 probe was a temporary diagnostic, not a committed case |
 | 80-page MSFT case | PASSED (as a comparator only) | no | No page expectations in the manifest; none invented. It is **not** a gold pass |
 | C1 two-clean-build byte identity | PASSED | no | `sha256:b1b5270c…`, 11/11 layers (#344); driver is bind-mounted, so #347 could not move it (`run_measured.sh:327-333`) |
@@ -629,6 +658,10 @@ link across the cases B3 intends to run, **not** from a count of dispositions.
 | A3b enterprise ledger | **STILL UNMET / BLOCKED** | **yes — S2 and S5b** | `plans/post321-real-sql.md:50` status `[ ] blocked on real source and access`; `:49` requires it be left explicitly blocked |
 
 ### 11.2 The mixed-chart p2 table floor: is it in the acceptance contract, or scoped out?
+
+**It is in the contract, it was unmet, and as of 2026-10-03 it is met by measurement.** The
+analysis below is the 2026-10-02 finding and is kept because the 2026-10-03 resolution is
+only meaningful against it.
 
 **It is in the contract. No recorded decision scopes it out.** Checked directly, not inferred:
 
@@ -658,23 +691,43 @@ the fixture's synthetic geometry. It does **not** answer the contract question, 
 waiver: the manifest note says the floor "is NOT weakened", and #347's own acceptance-impact line
 says the record "does not call it passing". **This record does not treat it as a pass either.**
 
-**Consequence: `g4-mixed-chart-001` is BLOCKED.** Two named unblockers, neither performed here:
-(a) **re-author the fixture page** with real filing geometry, or (b) an explicit **ADR-0089
-layout-pin decision**. No re-authoring was performed, the manifest note is not treated as a waiver,
-and no expectation was changed to fit an output.
+**Consequence at the time: `g4-mixed-chart-001` was BLOCKED.** Two named unblockers, neither
+performed then: (a) **re-author the fixture page** with real filing geometry, or (b) an explicit
+**ADR-0089 layout-pin decision**. No re-authoring was performed, the manifest note was not treated
+as a waiver, and no expectation was changed to fit an output.
+
+**Resolution 2026-10-03 (unblocker (a), taken).** The fixture page was re-authored into the
+**ruled** table its source page is, and re-measured: p2 now returns **`table 1`**. The floor is
+**unchanged** and was never weakened, and no ADR-0089 layout-pin decision was taken or needed.
+Full record, including the source-page rule census (154 rules / 76 column separators / 240 band
+fills vs the reproduction's 0), the byte-reproducible rebuild, the new fixture digest, the
+expected-vs-observed table, and the honest deltas: `docs/validation/2026-10-03-c1-gold-residual.md`
+(ITEM 1).
 
 ### 11.3 Per-case verdicts, and the weakest link
 
 | selected B3 browser gold case | verdict | why |
 | --- | --- | --- |
-| 1. `g4-native-text-001` | **READY** | 1 page, `text` floor met, `ocr_expected false` correctly, quote from the text layer. Unaffected by #347. |
-| 2. `g4-mixed-chart-001` | **BLOCKED** | p2 `table` floor authored and unmet (`table 0`), no recorded scoping decision (§11.2); p3 `ocr_expected: true` also unmet on the measured lane. |
-| 3. `g4-scanned-001` | **USABLE-WITH-NAMED-EXCLUSION** | Every expectation the product can express is met by measurement — `table` 1/1/2, OCR on all 3 pages, 3/3 quotes verbatim (offsets 11/11/479). The `text` floor entries are unmet and **not expressible** in the product's region set (`attachment_layout.py:85`); page payload is carried by the OCR quotes instead. The exclusion is named, not assumed. |
+| 1. `g4-native-text-001` | **READY** | 1 page, `text` floor met, `ocr_expected false` correctly, quote from the text layer. Its committed record has `figure 0` and `figure_boxes: []`, so the figure-rule lane introduced on 2026-10-03 selects nothing on it and costs it no render and no OCR. |
+| 2. `g4-mixed-chart-001` | **READY** | Re-measured 2026-10-03 (`docs/validation/2026-10-03-c1-gold-residual.md`): p2 `table 1` against its unchanged `["text","table"]` floor, after the fixture page was re-authored into the ruled table its source page is; p1/p3 regions and the 1908-character native text total bit-identical. p3 `ocr_expected` is now met by the product's own figure rule (`figure_ocr_regions_read 1`, 425 chars, chart labels read). The **one** residual is the chart *title* quote, unreachable because the layout stage's box is inset from the declared raster — recorded, named to its owner (ADR 0089's pinned Heron stage), and **not** scored as a pass. It does not block the case: the page's figure-scoped OCR demonstrably runs and reads the chart's data labels. |
+| 3. `g4-scanned-001` | **READY** | Every expectation the product can express is met by measurement, re-measured 2026-10-03 with the figure lane in place: `table` 1/1/2, OCR applied on 3/3 pages, `ocr_text_chars_total` 15108 identical to the prior record, 3/3 quotes verbatim (offsets 11/11/479), and the new figure pass correctly reports `page_ocr_already_read_whole_page` so a scanned page is still recognized once. The `text` floor entries are now carried by the channel the product reads, under an **accepted** decision with its code path cited (**ADR 0096**), and verified there. The prior **USABLE-WITH-NAMED-EXCLUSION** verdict is superseded: the exclusion is now a recorded contract decision rather than a named-but-unrecorded one, and its content is measured. |
 
-**The overall verdict is the weakest link across the cases B3 intends to run. `g4-mixed-chart-001` is
-BLOCKED, therefore the bounded development B3 run is BLOCKED as currently constituted.** It is not
-averaged away by two ready cases, and it is not softened by the fact that three of that case's four
-gaps carry good dispositions.
+**The overall verdict is the weakest link across the cases B3 intends to run.** Re-derived
+2026-10-03: `g4-mixed-chart-001` — the case that carried the blocking item — is no longer
+blocked, because its p2 `table` floor is met **by measurement** against an unchanged floor, and
+its p3 figure-scoped OCR now runs through the product's own rule. Its one residual (the chart
+title quote) is a named, owned sub-expectation about the layout stage's box tightness, recorded
+in `known_gaps[10]`, and it is not a gold-case blocker. **All three selected cases are READY on
+the gold-expectation axis.**
+
+**That is not the same as READY overall, and this record does not convert one into the
+other.** The §1 verdict rested on two independent things, and closing the gold gap closed only
+the first. **A3b is still BLOCKED and UNPASSED** (no operator-approved enterprise ledger), so
+**S2's enterprise-anchored comparison and S5b's approved-ledger SQL turn remain UNCLOSED**, and
+**real-model date extraction / clarification is still unproven** (T2 used a
+`ScriptedChatModel`). C2 also remains deferred: no dedicated 4 GB device was measured, and the
+`4g/4g/4` these runs used is the harness default, not a host property. Those are §8 items 1,
+2, 3, 4 and 8, and **none of them is closed by this work**.
 
 ### 11.4 What is provable under the operator-approved development-only amendment
 
@@ -699,22 +752,34 @@ Unchanged by this revision, and independent of §11.3's gold-case blocking:
 | --- | --- | --- |
 | `g4-native-text-001` | 1 page; `["text"]`; no OCR | matches the adopted baseline |
 | `g4-mixed-chart-001` p1 | `figure 1` (33×40 pt logotype) | `text 14 / table 0 / figure 1` — **met** |
-| `g4-mixed-chart-001` p2 | `["text","table"]` — `table` required | `text 5 / table 0 / figure 0` — **table UNMET** |
-| `g4-mixed-chart-001` p3 | `figure 1`; `ocr_expected true` | `text 5 / table 0 / figure 1`; `pages_needing_ocr 0` — **OCR unmet on this lane** |
+| `g4-mixed-chart-001` p2 | `["text","table"]` — `table` required | `text 3 / **table 1** / figure 0` — **met** (was `table 0`; floor unchanged) |
+| `g4-mixed-chart-001` p3 | `figure 1`; `ocr_expected true` | `text 5 / table 0 / figure 1`; `figure_ocr_regions_read 1`, 425 chars — **met**; the *title* quote is not reachable through the returned box, recorded in `known_gaps[10]` |
 | `g4-scanned-001` p1/p2/p3 | `table` present; 3 quotes verbatim | `table` 1 / 1 / 2; quotes verbatim at offsets 11 / 11 / 479 — **met** |
 | SQL window (4 rows) | `result_count == 4`, ids `C-2315, C-2302, C-2291, C-2024Q1`, end boundary `2026-04-30` | recorded `-m sql_live` 1 passed — transport and rows only, **scripted model** |
 
-**Final verdict:**
+**Final verdict (2026-10-03 amendment):**
 
-> ## **BLOCKED**
+> ## **READY for the bounded development round** — the full #330 acceptance remains **BLOCKED**
 >
-> The bounded development B3 run may **not** start on candidate `2fe787f` as constituted.
-> The blocker is `g4-mixed-chart-001`: its page-2 `table` region floor is authored in the candidate's
-> own manifest and measured unmet (`table 0`), and **no recorded decision scopes it out** (§11.2).
-> Mixed p3's `ocr_expected` is unmet on the same lane. A3b is BLOCKED, so **S2 and S5b stay closed
-> and no enterprise acceptance is claimed**; real-model date extraction/clarification is unproven and
-> belongs to the real browser run; C2 remains deferred/unpassed. Unblocking requires **either**
-> re-authoring the mixed p2 fixture page with real filing geometry **or** an explicit ADR-0089
-> layout-pin decision — neither performed here — plus an operator re-ruling on the selected gold
-> list. `g4-native-text-001` is READY and `g4-scanned-001` is usable with its named `text`-region
-> exclusion, so the other two cases are not the constraint.
+> **The gold blocker is closed.** The mixed p2 `table` floor that blocked this verdict is now **met
+> by measurement** against an unchanged floor (`table 1`); p3's figure-scoped OCR now runs through
+> the product's own rule and reads the chart's labels; and the scanned case's `text` floor is
+> carried — and verified — in the channel the product reads, under accepted **ADR 0096**. All three
+> selected gold cases are **READY** (§11.3). No floor was lowered or deleted to achieve this.
+>
+> **Scope of this READY.** It covers the operator-approved bounded development round only:
+> **S1, S3, S4, S6-mechanism, S7, S8**. The operator ruled that the enterprise ledger and the
+> dedicated 4 GB device do not gate that round, so A3b and C2 are carried as open prerequisites of
+> the *enterprise* acceptance, not as gates on this one.
+>
+> **The full #330 acceptance is still BLOCKED.** A3b is BLOCKED and UNPASSED, so **S2's
+> enterprise-anchored comparison and S5b's approved-ledger SQL turn stay UNCLOSED and no
+> enterprise acceptance is claimed**. C2 remains deferred and unpassed — the `4g/4g/4` these runs
+> use is the harness default, not dedicated hardware. Real-model date extraction / clarification
+> is also unproven and belongs to the real browser run. Closing the gold gap removed the one
+> blocker that gated the development round; it did not close the enterprise legs.
+>
+> One residual is carried, named and owned: the mixed p3 chart **title** quote is unreachable
+> through the layout stage's returned figure box, which is inset from the raster the manifest
+> declares. Owner: the Heron stage pinned by ADR 0089. It is recorded in `known_gaps[10]` and is
+> **not** counted as a pass.
