@@ -69,10 +69,10 @@ fi
 # What this proves is narrow and worth stating exactly. It proves the host can
 # run the declared reproducible build path (buildx on the declared BuildKit
 # builder, under the declared memory ceiling), so that the image-identity check
-# below is comparing like with like. It does not prove the full pinned build
-# reproduces byte-for-byte yet: the L7 digest `8e10185f…` predates this builder
-# and stays declared and unmatched until the operator baselines it, which is
-# why every build still fails the image-identity check (EX_TEMPFAIL) on this host.
+# below is comparing like with like. The declared digest is the one two
+# independent clean builds agreed on (see docs/validation/2026-10-02-c1-pin-policy.md);
+# the L7 digest `8e10185f…` predates this builder and is kept as history only.
+# The check still refuses (EX_TEMPFAIL) any image that is not the declared one.
 
 # The live engine version, or empty when the daemon cannot be asked. Empty is
 # not "any version": an unanswered question is a gap, and pin.py refuses on it.

@@ -40,11 +40,18 @@ PIN_MANIFEST = PIPELINE_DIR / "PIN_MANIFEST.md"
 FREEZE = PIPELINE_DIR / "results" / "image_pip_freeze.txt"
 IDENTITY = PIPELINE_DIR / "results" / "image_identity.txt"
 
-# The image ID L7 recorded, and the one the committed snapshot actually holds.
-# They disagree today; that disagreement is the defect under repair, so it is
-# named here as data rather than restated as a constant somewhere it could rot.
+# The identity the operator adopted on 2026-10-02: two independent clean builds
+# of commit 16adabe produced it identically (T4, docs/validation/
+# 2026-10-02-c1-pin-policy.md). `image-pin.json` must carry exactly this.
+ADOPTED_IMAGE_ID = "sha256:b1b5270c49cffbd2165aed904226612f2ccf925072c91766b4d4979f24bb9296"
+# L7's legacy-builder digest, and the one the committed snapshot holds. They
+# disagree with each other and with the adopted baseline; that disagreement is
+# the defect this module exists to keep visible, so all three are named as data
+# rather than restated as a constant somewhere it could rot.
 L7_RECORDED_IMAGE_ID = "sha256:8e10185fa27ea5adcfca94732adc27a2720ed9a31b67698d0a2c9e7a1a62c800"
 COMMITTED_IMAGE_ID = "sha256:0f278c22daa45a8361235f37620fa31a237f0284501436256429e2a8eba35229"
+# Every id the manifest is allowed to cite as this image's identity.
+KNOWN_IMAGE_IDS = (ADOPTED_IMAGE_ID, COMMITTED_IMAGE_ID, L7_RECORDED_IMAGE_ID)
 
 
 def _pin() -> ModuleType:
@@ -385,11 +392,11 @@ def test_manifest_does_not_contradict_its_declared_sources() -> None:
     manifest_digests = pin.manifest_image_digests(PIN_MANIFEST.read_text(encoding="utf-8"))
     committed = pin.parse_image_identity(IDENTITY.read_text(encoding="utf-8"))
     stale = pin.stale_manifest_digests(
-        PIN_MANIFEST.read_text(encoding="utf-8"), known=(committed, L7_RECORDED_IMAGE_ID)
+        PIN_MANIFEST.read_text(encoding="utf-8"), known=KNOWN_IMAGE_IDS
     )
     assert not stale, (
-        f"PIN_MANIFEST.md cites {stale} but results/image_identity.txt records {committed} "
-        f"and image-pin.json declares {L7_RECORDED_IMAGE_ID}"
+        f"PIN_MANIFEST.md cites {stale} but the declared baseline is {ADOPTED_IMAGE_ID} "
+        f"and results/image_identity.txt records {committed}"
     )
     assert manifest_digests, "the guard below cannot fail if it sees no digests at all"
 
@@ -721,10 +728,10 @@ def test_build_script_delegates_verification_to_the_pin_module() -> None:
 
 def test_manifest_cites_at_least_one_digest_the_guard_can_see() -> None:
     """The guard `test_manifest_does_not_contradict_its_declared_sources` is
-    built on must not match nothing. The C1 rewrite of the manifest cites every
-    image digest truncated (`sha256:8e10185f…`), so a 64-hex-only matcher
-    returns `[]` and the assertion below can never fail -- the L7 regression
-    test green because it is blind.
+    built on must not match nothing. The manifest cites every image digest
+    truncated (`sha256:b1b5270c…`), so a 64-hex-only matcher returns `[]` and
+    the assertion below can never fail -- the L7 regression test green because
+    it is blind.
     """
     pin = _pin()
     digests = pin.manifest_image_digests(PIN_MANIFEST.read_text(encoding="utf-8"))
@@ -747,7 +754,7 @@ def test_a_stale_truncated_digest_in_the_manifest_is_caught() -> None:
         pin.manifest_identity_section(text) + "\n| stale | `sha256:deadbeef…` | drift |\n",
     )
     stale = pin.stale_manifest_digests(
-        contaminated, known=(COMMITTED_IMAGE_ID, L7_RECORDED_IMAGE_ID)
+        contaminated, known=KNOWN_IMAGE_IDS
     )
     assert stale, "a truncated digest matching no known id must be reported as stale"
 
@@ -756,7 +763,7 @@ def test_a_truncated_digest_matching_a_known_id_is_not_stale() -> None:
     pin = _pin()
     text = PIN_MANIFEST.read_text(encoding="utf-8")
     assert not pin.stale_manifest_digests(
-        text, known=(COMMITTED_IMAGE_ID, L7_RECORDED_IMAGE_ID)
+        text, known=KNOWN_IMAGE_IDS
     ), "the committed manifest must agree with the ids it cites"
 
 
@@ -824,13 +831,16 @@ def test_build_script_never_truncates_a_committed_snapshot_before_it_succeeds() 
 
 
 def test_drift_check_is_reachable_and_fails_loudly(tmp_path: Path) -> None:
-    """End to end through the real CLI, with no docker: a declared expected id
-    that does not match the observed one must exit non-zero and name itself.
+    """End to end through the real CLI, with no docker: the adopted baseline
+    declared against a build that is not it must exit non-zero and name itself.
+    It declares the *adopted* value rather than a historical one, so the leg
+    that matters after a re-baseline — "the new baseline still refuses a
+    different image" — is the one under test.
     """
     observed = tmp_path / "image_identity.txt"
     observed.write_text(f"image_id={COMMITTED_IMAGE_ID}\n", encoding="utf-8")
     declared = tmp_path / "image-pin.json"
-    declared.write_text(f'{{"expected_image_id": "{L7_RECORDED_IMAGE_ID}"}}\n', encoding="utf-8")
+    declared.write_text(f'{{"expected_image_id": "{ADOPTED_IMAGE_ID}"}}\n', encoding="utf-8")
 
     result = subprocess.run(
         [

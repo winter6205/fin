@@ -5,10 +5,12 @@
     "It must never be read back from results/image_identity.txt, which build.sh writes: comparing a",
     "value against the file the same run just produced is true by construction and detects nothing.",
     "",
-    "expected_image_id is the digest L7 recorded as the canonical target",
-    "(docs/validation/2026-09-29-g4-t5-unit-citation-legacy-removal.md). It is deliberately NOT",
-    "re-baselined to the 0f278c22 a drifted rebuild produced. Issue 324 forbids silently replacing",
-    "the expected digest; changing it is an operator decision, not a build artifact.",
+    "expected_image_id is the digest two independent clean builds of this Dockerfile agreed on,",
+    "adopted by the operator on 2026-10-02 (see the T4 proof in",
+    "docs/validation/2026-10-02-c1-pin-policy.md). It is deliberately NOT the 0f278c22 a drifted",
+    "rebuild produced, nor the 8e10185f the retired legacy builder produced. Issue 324 forbids",
+    "silently replacing the expected digest; this was an explicit operator decision, not a build",
+    "artifact, and the 8e10185f value is kept below in blocking_reason as history.",
     "",
     "What IS pinned mechanically and does reproduce: the base image digest, the apt snapshot and its",
     "188 recorded package versions, and all 104 Python requirements with their sha256 hashes.",
@@ -20,15 +22,16 @@
     "builder existence, driver, BuildKit version and ceiling against this declaration BEFORE building;",
     "a host that cannot run the declared path exits 65. Probe measurements (2026-09-30, this branch)",
     "show this path reproduces byte-identical image ids for clean builds of the declared step shapes;",
-    "the full pinned image has NOT yet been proved reproducible post --no-compile fix (63601e6), so",
-    "no new baseline is declared here and expected_image_id remains the unmatched L7 value.",
+    "the full pinned image HAS been proved reproducible post --no-compile fix (16adabe): two",
+    "independent clean builds produced b1b5270c49cffbd2165aed904226612f2ccf925072c91766b4d4979f24bb9296",
+    "with 11 of 11 layers identical, and the operator adopted it as expected_image_id on 2026-10-02.",
     "",
     "cpuset_cpus is null because the buildx path bounds only memory (via --driver-opt): the legacy",
     "`docker build --cpuset-cpus=0-3` CPU affinity is dropped there, and recording that as data rather",
     "than prose keeps the omission explicit and reversible only by editing this field."
   ],
-  "expected_image_id": "sha256:8e10185fa27ea5adcfca94732adc27a2720ed9a31b67698d0a2c9e7a1a62c800",
-  "expected_image_id_source": "L7, docs/validation/2026-09-29-g4-t5-unit-citation-legacy-removal.md",
+  "expected_image_id": "sha256:b1b5270c49cffbd2165aed904226612f2ccf925072c91766b4d4979f24bb9296",
+  "expected_image_id_source": "Two independent clean builds of this Dockerfile from commit 16adabe, built as fin-g4-pipeline:r1 and :r2 on the declared g4repro buildx builder, 11 of 11 layers identical; operator adopted as the baseline on 2026-10-02. Proof record: T4 in docs/validation/2026-10-02-c1-pin-policy.md; per-layer digests in docs/validation/2026-10-02-c1-layer-diffids.txt.",
   "base_image": "python:3.12-slim@sha256:44ff437bba879d4941b710a369a8f19266aea34b29002807f0c487fabc9eec9b",
   "apt_snapshot": "20260929T083940Z",
   "builder": {
@@ -42,9 +45,9 @@
     "network": "host",
     "source_date_epoch": 1700000000,
     "source": "operator option (a), docs/validation/2026-09-30-g4-buildkit-reproducibility.md; engine per docs/validation/2026-09-29-324-c1-reproducible-pin.md Environment table",
-    "note": "The legacy builder named by the earlier declaration cannot reproduce a fixed digest and was retired by the operator's option (a) decision; this block pins the replacement path mechanically. It is NOT a claim that the full pinned image reproduces: that needs two clean buildx builds of this Dockerfile since the --no-compile fix, not yet run."
+    "note": "The legacy builder named by the earlier declaration cannot reproduce a fixed digest and was retired by the operator's option (a) decision; this block pins the replacement path mechanically. Two clean buildx builds of this Dockerfile since the --no-compile fix did agree on one identity, so the block now also names the build path expected_image_id was measured on. It still does not claim the build reproduces unconditionally: the apt snapshot mirror is a live third-party dependency, so this is a reproducibility property of the declared inputs, not a guarantee about the mirror's uptime."
   },
   "python_requirements": 104,
-  "status": "BLOCKED_ON_OPERATOR_DECISION",
-  "blocking_reason": "expected_image_id is the L7 value built with the now-retired legacy builder and is unreachable by any builder; it is kept declared and unmatched per the issue. Closing C1 needs the operator to accept a new baseline proven by two independent clean builds of the full pinned Dockerfile on this buildx path (remaining evidence: the 2026-09-30 record measured two such builds BEFORE the --no-compile fix differing in 2 of 11 layers; the fix is untested at full scale here)."
+  "status": "BASELINE_ADOPTED",
+  "blocking_reason": "Nothing blocks C1. The previous value sha256:8e10185fa27ea5adcfca94732adc27a2720ed9a31b67698d0a2c9e7a1a62c800 (L7, 2026-09-29) was produced by the retired legacy builder and is unreachable by any current builder: that path stamps a wall-clock created and per-build mtimes into the image, so no build-hygiene work can make buildx produce it. It is recorded here as history, not as a pending target. The current baseline is sha256:b1b5270c49cffbd2165aed904226612f2ccf925072c91766b4d4979f24bb9296, produced identically by two independent clean builds from commit 16adabe (fin-g4-pipeline:r1 and :r2, 11 of 11 layers identical) and adopted by the operator on 2026-10-02; see the T4 proof in docs/validation/2026-10-02-c1-pin-policy.md. The gate is unchanged by the adoption and still exits 75 on any other digest."
 }

@@ -27,6 +27,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_RETRIES=8 \
     PIP_TIMEOUT=120 \
     PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    # A reproducibility input, not a preference: it stops the RUN steps below
+    # from writing .pyc into the image, at a per-run cost instead. The whole
+    # .pyc account, tradeoff included, is at the --no-compile comment below.
     # Keep every model download inside the mounted cache volume, never in an
     # image layer, so the Heron weights are fetched once on the host and reused.
     HF_HOME=/models/hf \
@@ -57,7 +61,15 @@ RUN printf 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/%s\nSuit
         tesseract-ocr=5.5.0-1+b1 \
         tesseract-ocr-eng=1:4.1.0-2 \
         tesseract-ocr-chi-sim=1:4.1.0-2 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* /var/cache/fontconfig/* /var/cache/ldconfig/aux-cache \
+    && rm -f /var/log/apt/history.log /var/log/apt/term.log /var/log/dpkg.log
+# The cleanup above is a reproducibility input, not housekeeping. Every path
+# purged here was measured to differ between two clean builds of otherwise
+# identical committed inputs, so it is generated state, not pinned state.
+# fontconfig and ldconfig rebuild their caches on first use and dpkg reopens
+# its logs on the next package operation, so nothing at run time needs them
+# baked in. The snapshot step below still records the *resolved* package set
+# via dpkg-query, which reads dpkg's database and is unaffected.
 
 # Fail the build (not the measurement) if a required tessdata file is missing.
 # Checked through the tesseract CLI itself so the exact tessdata prefix of the
@@ -88,11 +100,25 @@ RUN tesseract --version \
 ARG PIP_FIND_LINKS
 COPY requirements.lock /opt/g4/requirements.lock
 # --no-compile suppresses the .pyc bytecode pip would otherwise write while
-# installing. Those files embed the source path and the mtime of the module they
-# were compiled from, so they are a per-build artifact of a step that is
-# otherwise fully pinned: two clean builds of this image produced 14,787 of them
-# and the install layer hashed differently each time. Python regenerates them on
-# first import, so nothing at run time needs them baked in.
+# installing, and PYTHONDONTWRITEBYTECODE (in the ENV above) keeps the two RUN
+# steps that import from writing it either. Those files embed the source path
+# and the mtime of the module they were compiled from, so they are derived from
+# the install rather than pinned by it and can only ever drift. Measured, not
+# assumed: across a pair of clean builds of the pre-repair tree, diff id 7 --
+# this install -- was byte-identical (52ac419b81c4…) while diff ids 8 and 9,
+# the steps that run Python, differed; that is what the 1,099 .pyc under
+# site-packages (of 1,327 in the image) and the 787 that differed between those
+# two builds were.
+#
+# Nothing at run time needs them baked in -- Python regenerates them on first
+# import -- but that is not free, and the cost is not in the build. The ENV
+# above is permanent, and run_measured.sh starts a fresh container per run
+# without overriding it, so no cache survives between runs: the modules behind
+# those 1,327 files are recompiled from source on every run, and that compile
+# lands inside the wall_clock_ms the driver reports. Build-time determinism is
+# bought with a per-run first-import cost inside the measured number. Treat the
+# reported wall clock as including it, and do not read a latency change as
+# caused by the .pyc change alone -- the image changed size at the same time.
 RUN pip install --no-cache-dir --no-compile --require-hashes -r /opt/g4/requirements.lock
 
 # Guard: the whole point of the index choice. If torch is a CUDA build the

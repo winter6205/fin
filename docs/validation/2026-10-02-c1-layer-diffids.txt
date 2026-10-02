@@ -1,0 +1,128 @@
+Per-layer diff ids behind the T3/T4 measurements in
+docs/validation/2026-10-02-c1-pin-policy.md
+
+Committed 2026-10-02 with the operator's adoption of expected_image_id, so the
+root-cause layer numbers quoted in that record and in
+scripts/g4_pipeline/Dockerfile can be re-checked instead of taken on trust.
+
+Every value below was re-read from the local daemon on the measuring host with:
+
+  docker image inspect <tag> --format '{{.Id}} size={{.Size}} created={{.Created}}{{range $i, $l := .RootFS.Layers}}{{"\n"}}{{$i}} {{$l}}{{end}}'
+
+The image TAGS are local build outputs, not committed artifacts; the DIGESTS
+they returned are the values asserted. Re-running the command on a host that
+still holds these tags reproduces the table exactly; on a host that does not,
+the rows are unverifiable and must not be treated as re-measured.
+
+  0-indexed diff id
+  Layer -> Dockerfile step (BuildKit history order)
+    0..3  base image python:3.12-slim (4 layers)
+    4     RUN  apt snapshot pin + install of the 8 native packages
+    5     RUN  tesseract --version / --list-langs guard
+    6     COPY requirements.lock
+    7     RUN  pip install --no-cache-dir --no-compile --require-hashes
+    8     RUN  python - <<PY   (the torch CPU assert)
+    9     RUN  mkdir -p /opt/g4 ... && pip freeze && dpkg-query -W ...
+    10    (empty-diff metadata layer)
+
+=== pre-repair pair, tree at ecd3ab4 (the disagreeing pair) ===================
+
+fin-g4-pipeline:s2b1  sha256:717881c47e2c45e58418edb2582deeecc33d546832ab812a4fa2ac962f50ce22
+  size=589605751  created=2023-11-14T22:13:20Z
+    0 sha256:a6dc765193a52cbaede3c93a9ff48b9540948dd0774bbe7031fcb5847606f9ac
+    1 sha256:7ca599ccfc97fa428fcf941eda7c2d643f066feb947020dcdbbf913cec34d5dc
+    2 sha256:b54011271bdbf69ae643cb5a4af6a5bc2f834ae8bc0833b736b52bbd2396e99f
+    3 sha256:c321a426ca693e386f4df5f198d7f32c2da49e29f53ff77d695ceb02dfb0a421
+    4 sha256:96df11f4ae8d8d770fa38ab556cfc2174e3f73bda307ae601aca7c7b28924829   <-- differs
+    5 sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef
+    6 sha256:679689fc9645e49b7f79c8047bc99383306abc4438b95f9048d8df599340dcd3
+    7 sha256:52ac419b81c4a1845350bd16448b9603711b03af313f50c0288ce24bcb0377fc   <-- IDENTICAL to s2b2
+    8 sha256:f1abf791aae234e917c721a42cbc278cb2bfa31e9fa0405d29ff6d5be8a63401   <-- differs
+    9 sha256:c74c45f0f28c4b5a00c2fba4cdc38ca20905f08f5cdd0de1596d5c489b104c7c   <-- differs
+   10 sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef
+
+fin-g4-pipeline:s2b2  sha256:fd61c0042ddb98bb3b8090e9a4e6ee8a4641e0ddd7a4685ec46cebe995a9476f
+  size=589605661  created=2023-11-14T22:13:20Z
+    0 sha256:a6dc765193a52cbaede3c93a9ff48b9540948dd0774bbe7031fcb5847606f9ac
+    1 sha256:7ca599ccfc97fa428fcf941eda7c2d643f066feb947020dcdbbf913cec34d5dc
+    2 sha256:b54011271bdbf69ae643cb5a4af6a5bc2f834ae8bc0833b736b52bbd2396e99f
+    3 sha256:c321a426ca693e386f4df5f198d7f32c2da49e29f53ff77d695ceb02dfb0a421
+    4 sha256:b09b2c990b20a6e432db7a4c0da0e685f37b420f467b8d332f88cf05cbbf9e19   <-- differs
+    5 sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef
+    6 sha256:679689fc9645e49b7f79c8047bc99383306abc4438b95f9048d8df599340dcd3
+    7 sha256:52ac419b81c4a1845350bd16448b9603711b03af313f50c0288ce24bcb0377fc   <-- IDENTICAL to s2b1
+    8 sha256:91cef19856791a6fdfaa7d97e3103af9769b992023381a5a3761047be99e8cc7   <-- differs
+    9 sha256:d5ed626438544cdea96cdb3d069674534b262798228eeb5f0d8c7b95016f9970   <-- differs
+   10 sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef
+
+8 of 11 identical; 4, 8 and 9 differ. Note the shape of that result: the pip
+install layer (7) is BYTE-IDENTICAL across the pair. The pre-repair Dockerfile
+comment claiming the install layer "hashed differently each time" was false and
+has been corrected.
+
+=== the adopted pair, tree at 16adabe (the agreeing pair) ====================
+
+fin-g4-pipeline:r1  sha256:b1b5270c49cffbd2165aed904226612f2ccf925072c91766b4d4979f24bb9296
+fin-g4-pipeline:r2  sha256:b1b5270c49cffbd2165aed904226612f2ccf925072c91766b4d4979f24bb9296
+  size=579825559 (both)  created=2023-11-14T22:13:20Z (both)
+    0 sha256:a6dc765193a52cbaede3c93a9ff48b9540948dd0774bbe7031fcb5847606f9ac
+    1 sha256:7ca599ccfc97fa428fcf941eda7c2d643f066feb947020dcdbbf913cec34d5dc
+    2 sha256:b54011271bdbf69ae643cb5a4af6a5bc2f834ae8bc0833b736b52bbd2396e99f
+    3 sha256:c321a426ca693e386f4df5f198d7f32c2da49e29f53ff77d695ceb02dfb0a421
+    4 sha256:78e09befccd12c439995c99cd9d16c292b15d0b5c19ee7eb448298f27688e4e5
+    5 sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef
+    6 sha256:679689fc9645e49b7f79c8047bc99383306abc4438b95f9048d8df599340dcd3
+    7 sha256:724e4a9754250a2622ff807aa1afb4ebc989a3dd21804dbb696da5ab65ec8b84
+    8 sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef
+    9 sha256:682668e07d5d0775dd239d3290259832eaa32d22692ec9220e61e451b4e3b327
+   10 sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef
+
+11 of 11 identical, no layer differs. Layer 8 now carries the empty-diff digest
+sha256:5f70bf18a086… that layers 5 and 10 also carry, which is the structural
+signature of a step that no longer writes anything. Image size fell
+589,605,751 -> 579,825,559 B, a difference of 9,780,192 B.
+
+=== the third, unadopted buildx-era identity ================================
+
+fin-g4-pipeline:pre330-a
+  sha256:d3bae2c0de4907b34f6fd83939b69b1c87f0aa4f4c05c75046c023938fc77ccc
+  size=589605874  created=2023-11-14T22:13:20Z
+  observed, exit 75, NOT adopted, and not the current baseline
+
+=== baked .pyc, re-counted 2026-10-02 =====================================
+
+The T4 record's counts (1,099 .pyc baked, 787 differing) were taken from the
+differing layer TARS. Re-counted here against the merged root filesystem, and
+the two numbers are consistent, not contradictory: 1,099 is the count under
+site-packages; 1,327 is every .pyc in the image.
+
+  docker run --rm --network none --entrypoint /bin/bash fin-g4-pipeline:s2b1 \
+    -c 'find / -xdev -name "*.pyc" -type f | wc -l'          # -> 1327
+  docker run --rm --network none --entrypoint /bin/bash fin-g4-pipeline:s2b1 \
+    -c 'find / -xdev -name "*.pyc" -type f | grep -c site-packages/'  # -> 1099
+  docker run --rm --network none --entrypoint /bin/bash fin-g4-pipeline:r1 \
+    -c 'find / -xdev -name "*.pyc" -type f | wc -l'          # -> 0
+  # r1 additionally reports PYTHONDONTWRITEBYTECODE=1; s2b1 reports it empty.
+
+All 1,327 paths are under /usr/local/lib/python3.12. Caveat: if you redirect
+find's output to a file inside the container, find will count that file too and
+report 1328. Write outside the container's filesystem, or subtract one.
+
+=== per-file differing-path lists: NOT committed ==========================
+
+The per-file evidence behind "8 differing in layer 4, 774 in layer 8, 13 in
+layer 9" is not committed; only the digests above are. A reader can regenerate
+it on a host holding s2b1 and s2b2 (needs ~600 MB of scratch per image):
+
+  docker save fin-g4-pipeline:s2b1 -o s2b1.tar && mkdir -p a && tar -xf s2b1.tar -C a
+  docker save fin-g4-pipeline:s2b2 -o s2b2.tar && mkdir -p b && tar -xf s2b2.tar -C b
+  # layer N's tar is a/layer<N>/layer.tar, per index in manifest.json
+  for n in 4 8 9; do
+    (cd a/layer$n && find . -type f | sort | xargs sha256sum) > /tmp/a.$n
+    (cd b/layer$n && find . -type f | sort | xargs sha256sum) > /tmp/b.$n
+    diff /tmp/a.$n /tmp/b.$n | grep '^[<>]' | wc -l
+  done
+
+Path, mode, size, uid, gid and mtime were identical in all three layers; only
+file content differed. Do not use `diff -r` on the extracted trees as a
+substitute: it compares the merged result, which does not isolate a layer.
