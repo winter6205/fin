@@ -1,7 +1,7 @@
 // Comparison-table presentation, kept pure so the parse boundary
 // and the rendering decisions are testable without a DOM.
 //
-// The data is the ``fin.comparison.v1`` envelope from the
+// The data is the ``fin.comparison`` envelope from the
 // ``compare_facts`` host tool (SSOT:
 // src/fin/host/tools/compare_facts.py). Two rules shape this
 // module:
@@ -10,11 +10,16 @@
 //    ``display`` string the tool already formatted off a fact row
 //    with a locator; a client-side calculation would be a second,
 //    ungated source of numbers next to the citation verifier.
-// 2. The wire is ``unknown``. ``parseComparison`` is the boundary —
-//    a payload that does not carry the v1 schema tag and a
-//    non-empty grid renders nothing rather than crashing the turn.
+// 2. The wire is ``unknown``. ``decodeComparison`` is the boundary —
+//    it returns either a typed table or a named refusal. The nullable
+//    ``parseComparison`` wrapper remains for presentation callers.
 
 import { citationSourceId, formatUnitLocator } from "./sourceLocator";
+import {
+  COMPARISON_SCHEMA,
+  decodeComparisonContract,
+} from "./evidenceContract";
+import type { ComparisonDecode } from "./evidenceContract";
 import type {
   Comparison,
   ComparisonCell,
@@ -22,38 +27,38 @@ import type {
   ComparisonLocator,
 } from "./types";
 
-/** The only envelope version this client renders. T4's export
- * binds to the same tag, so a future v2 must opt in explicitly
- * rather than flow through the v1 table. */
-export const COMPARISON_SCHEMA = "fin.comparison.v1";
+/** The only envelope SHAPE this client renders (spec §2.1: the token
+ * names the shape, the version is the ``schema_version`` sibling). T4's
+ * export binds to the same tag, so a future envelope must opt in
+ * explicitly rather than flow through this table. */
+export { COMPARISON_SCHEMA };
 
 /** Placeholder for a cell with no fact row. Mirrors the tool's
  * ``MISSING_DISPLAY``: a blank cell reads as "zero", the em dash
  * reads as "not reported". */
 export const MISSING_CELL_DISPLAY = "—";
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+/**
+ * Decode one wire payload to its typed outcome. A schema-valid empty
+ * grid is retained at this boundary so malformed data stays distinct.
+ *
+ * The nullable compatibility wrapper below additionally hides an empty
+ * grid from presentation because an empty table would read as "we looked
+ * and the filings report nothing" — a claim the tool never made.
+ */
+export function decodeComparison(value: unknown): ComparisonDecode {
+  return decodeComparisonContract(value);
 }
 
-/**
- * Narrow one wire payload to a renderable ``Comparison``, else null.
- *
- * Null covers the two typed EXITs as well as malformed input: both
- * ``empty_comparison`` and ``comparison_overflow`` carry a
- * column-less skeleton, and an empty grid on screen would read as
- * "we looked and the filings report nothing" — a claim the tool
- * never made.
- */
+/** Compatibility wrapper for presentation callers that only need to ask
+ * whether a table can render. Wire boundaries use ``decodeComparison``
+ * so refusals stay visible instead of disappearing as ``null``. */
 export function parseComparison(value: unknown): Comparison | null {
-  if (!isRecord(value)) return null;
-  if (value.schema !== COMPARISON_SCHEMA) return null;
-  const { columns, rows, deltas, locators, missing } = value;
-  if (!Array.isArray(columns) || columns.length === 0) return null;
-  if (!Array.isArray(rows) || rows.length === 0) return null;
-  if (!Array.isArray(deltas) || !Array.isArray(locators)) return null;
-  if (!Array.isArray(missing)) return null;
-  return value as unknown as Comparison;
+  const outcome = decodeComparison(value);
+  if (outcome.status !== "ok") return null;
+  return outcome.comparison.columns.length > 0 && outcome.comparison.rows.length > 0
+    ? outcome.comparison
+    : null;
 }
 
 /** Every renderable table in a wire list; malformed entries drop
@@ -135,7 +140,7 @@ export function locatorLabel(locator: ComparisonLocator): string {
   // old ``document_id || attachment_id`` chain was a second rule for one
   // concept: a table row and a chip could end up naming different sources
   // for the same figure, and a company row whose document_id was empty
-  // read as an attachment. An absent ``kind`` is the v1 envelope, which
+  // read as an attachment. An absent ``kind`` is the current envelope, which
   // carries only document_id. ``quote`` / ``filename`` are inert to the
   // rule — a comparison locator has neither, and "" is what a company
   // citation sends for both.

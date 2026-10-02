@@ -1,7 +1,7 @@
 """Unit tests for the workspace thread / run store.
 
 The store is the persistence seam for the workspace HTTP surface
-(T1, #28). Two implementations live behind a single protocol:
+(T1). Two implementations live behind a single protocol:
 
 * ``InMemoryThreadStore`` - used by tests and when
   ``FIN_CHECKPOINT_URL`` is unset.
@@ -438,7 +438,7 @@ def test_postgres_append_run_rejects_malformed_status(pg_store) -> None:
         pg_store.append_run(bogus)
 
 
-# ----- deepcopy isolation on list_runs (M8 / Standards #17) -----
+# ----- deepcopy isolation on list_runs (M8) -----
 
 
 def test_in_memory_list_runs_returns_isolated_copies() -> None:
@@ -481,7 +481,7 @@ def test_postgres_list_runs_returns_isolated_copies(pg_store) -> None:
     assert len(runs) == 1
 
 
-# ----- store-minted ids (M9 / Standards #14) -----
+# ----- store-minted ids (M9) -----
 
 
 def test_create_thread_without_id_mints_uuid() -> None:
@@ -609,6 +609,337 @@ def test_default_thread_store_when_env_set(monkeypatch, postgres_store_url: str)
 
 
 # ===== T2: update_thread_title (first real send on a default-titled thread) =====
+
+
+# ===== E4: evidence validated on durable write, replayed as untrusted =====
+
+
+QUOTE62 = "Total net sales increased during the third quarter fiscal 2022"
+
+_V1_DOC_ROW = {
+    "kind": "company",
+    "document_id": "AAPL-2022Q3",
+    "attachment_id": "",
+    "version": "7",
+    "unit": 4,
+    "display": "page",
+    "filename": "",
+    "quote": QUOTE62,
+}
+_PAGE_ERA_ROW = {"document_id": "AAPL-2022Q3", "version": "1", "page": 4, "quote": QUOTE62}
+_LEDGER_ROW = {
+    "kind": "database-row",
+    "document_id": "",
+    "attachment_id": "",
+    "version": "2026-03-01T09:14:22Z",
+    "unit": 1,
+    "display": "record",
+    "filename": "",
+    "quote": "contract C-2291 notice_days 30",
+    "database_row": {
+        "source": "contracts",
+        "record_key": {"contract_id": "C-2291"},
+        "queried_at": "2026-03-01T09:14:22Z",
+        "fields": {"notice_days": "30"},
+        "summary": "contract C-2291 notice_days 30",
+    },
+}
+_VISUAL_V0_ROW = {
+    "kind": "visual_observation",
+    "attachment_id": "att-7",
+    "version": "3",
+    "unit": 2,
+    "page": 2,
+    "observation_version": 1,
+    "scope": None,
+    "provider": "p",
+    "model_version": "m",
+    "page_image_sha256": "0" * 64,
+    "detail": "d",
+    "filename": "contract.txt",
+    "reused": False,
+    "outbound_calls": 1,
+}
+
+
+class _InsertCapturingConn:
+    """Stub connection that records INSERTs and answers SELECTs with
+    a fixed row tuple; raises anything the test injects on connect."""
+
+    def __init__(self, sink: list, select_row=None, raise_on_execute=None):
+        self._sink = sink
+        self._select_row = select_row
+        self._raise_on_execute = raise_on_execute
+
+    def execute(self, sql, params=None):
+        if self._raise_on_execute is not None:
+            raise self._raise_on_execute
+        if params is not None:
+            self._sink.append(params)
+        return _StubFetch(self._select_row or (self._sink[-1] if self._sink else None))
+
+    def commit(self):
+        pass
+
+
+class _StubFetch:
+    def __init__(self, row):
+        self._row = row
+
+    def fetchone(self):
+        return self._row
+
+    def fetchall(self):
+        return [self._row] if self._row is not None else []
+
+
+class _StubCM4:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __enter__(self):
+        return self._conn
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _stub_pg(monkeypatch, conn_factory):
+    import fin.host.thread_store as ts_mod
+
+    monkeypatch.setattr(ts_mod.psycopg, "connect", lambda *a, **kw: _StubCM4(conn_factory()))
+    from fin.host.thread_store import PostgresThreadStore
+
+    store = PostgresThreadStore.__new__(PostgresThreadStore)
+    store._url = "postgresql://stub"
+    return store
+
+
+def test_postgres_append_run_persists_an_admitted_run_unchanged(monkeypatch) -> None:
+    """The write guard adds no new refusals: evidence a run reached
+    admission with today — a full v1 document row, the pre-cutover
+    ledger row, a legacy ``page``-era row, and a 14-key visual claim —
+    persists byte-unchanged. The §7 grace shapes are exactly what the
+    live writers still emit before the E5 schema cutover."""
+    import json
+
+    from fin.host.thread_store import RunRecord
+
+    captured: list = []
+    conn = _InsertCapturingConn(captured)
+    store = _stub_pg(monkeypatch, lambda: conn)
+
+    citations = [dict(_V1_DOC_ROW), dict(_LEDGER_ROW), dict(_PAGE_ERA_ROW)]
+    store.append_run(
+        RunRecord(
+            id="r-ok",
+            thread_id="t-ok",
+            question="q",
+            status="done",
+            answer="a",
+            citations=citations,
+            visual_claims=[dict(_VISUAL_V0_ROW)],
+        )
+    )
+    assert captured, "append_run issued no INSERT"
+    assert json.loads(captured[0][6]) == citations
+    assert json.loads(captured[0][18]) == [dict(_VISUAL_V0_ROW)]
+
+
+def test_postgres_append_run_refuses_a_contradictory_citation_before_storage(monkeypatch) -> None:
+    """A row the store was handed that matches neither the v1 channel
+    nor the frozen v0 shape (here: ``unit`` AND ``page``, a
+    contradiction) is refused BEFORE the INSERT — a corrupt row never
+    reaches durable storage."""
+    import pytest as _pytest
+
+    from fin.host.thread_store import (
+        EvidenceContractWriteError,
+        RunRecord,
+        ThreadStoreError,
+    )
+
+    captured: list = []
+    store = _stub_pg(monkeypatch, lambda: _InsertCapturingConn(captured))
+    bad = dict(_V1_DOC_ROW, page=9)
+    with _pytest.raises(ThreadStoreError) as excinfo:
+        store.append_run(
+            RunRecord(id="r-bad", thread_id="t-bad", question="q", status="done",
+                      citations=[bad])
+        )
+    assert isinstance(excinfo.value, EvidenceContractWriteError)
+    assert excinfo.value.code == "malformed_evidence_contract"
+    assert not captured, "a refused row must not reach the INSERT"
+
+
+def test_postgres_append_run_refuses_a_lane_marker_without_kind(monkeypatch) -> None:
+    """§7.1: defaulting an absent ``kind`` to the document kind is
+    legal only without a lane marker — the write guard is where a
+    row→citation coercion is caught before it can be stored."""
+    import pytest as _pytest
+
+    from fin.host.thread_store import EvidenceContractWriteError, RunRecord
+
+    captured: list = []
+    store = _stub_pg(monkeypatch, lambda: _InsertCapturingConn(captured))
+    forged = dict(_LEDGER_ROW)
+    del forged["kind"]
+    with _pytest.raises(EvidenceContractWriteError) as excinfo:
+        store.append_run(
+            RunRecord(id="r-f", thread_id="t-f", question="q", status="done",
+                      citations=[forged])
+        )
+    assert excinfo.value.code == "malformed_evidence_contract"
+    assert not captured
+
+
+def test_postgres_append_run_refuses_a_32_kib_snapshot_before_storage(monkeypatch) -> None:
+    """A §3 content bound is not a §7 shape grace: a lane-marked v1
+    ledger row that is SHAPE-legal yet whose canonical snapshot exceeds
+    32 KiB is refused with the named ``database_row_overflow`` code before
+    the INSERT, so an over-bound snapshot never enters history to be
+    re-refused on every replay (mirror of the read-side replay guard)."""
+    import pytest as _pytest
+
+    from fin.host.thread_store import EvidenceContractWriteError, RunRecord
+
+    captured: list = []
+    store = _stub_pg(monkeypatch, lambda: _InsertCapturingConn(captured))
+    huge = "y" * (33 * 1024)
+    row = dict(_LEDGER_ROW, quote=huge)
+    row["database_row"] = dict(
+        _LEDGER_ROW["database_row"],
+        schema="fin.evidence.database_row_snapshot",
+        schema_version=1,
+        summary=huge,
+    )
+    with _pytest.raises(EvidenceContractWriteError) as excinfo:
+        store.append_run(
+            RunRecord(id="r-o", thread_id="t-o", question="q", status="done",
+                      citations=[row])
+        )
+    assert excinfo.value.code == "database_row_overflow"
+    assert not captured, "an over-bound snapshot must not reach the INSERT"
+
+
+def test_postgres_append_run_refuses_a_quote_over_the_ceiling_before_storage(monkeypatch) -> None:
+    """The document-lane twin of the snapshot pin: a quote over the
+    2,000-code-point ceiling is shape-legal but breaks a §3 bound, so
+    the durable write names ``citation_overflow`` before storage."""
+    import pytest as _pytest
+
+    from fin.host.thread_store import EvidenceContractWriteError, RunRecord
+
+    captured: list = []
+    store = _stub_pg(monkeypatch, lambda: _InsertCapturingConn(captured))
+    row = dict(_V1_DOC_ROW, quote="q" * 2001)
+    with _pytest.raises(EvidenceContractWriteError) as excinfo:
+        store.append_run(
+            RunRecord(id="r-q", thread_id="t-q", question="q", status="done",
+                      citations=[row])
+        )
+    assert excinfo.value.code == "citation_overflow"
+    assert not captured
+
+
+def test_persistence_exception_is_named_persistence_unavailable(monkeypatch) -> None:
+    """§6 infrastructure-failure row: the store itself failing to be
+    read or written is the named ``persistence_unavailable`` outcome —
+    a distinct type and code from every contract failure — never a
+    bare crash and never empty history."""
+    import pytest as _pytest
+
+    import psycopg
+
+    from fin.host.thread_store import (
+        PersistenceUnavailableError,
+        RunRecord,
+        ThreadNotFoundError,
+    )
+
+    def down(*a, **kw):
+        raise psycopg.OperationalError("the database is down")
+
+    import fin.host.thread_store as ts_mod
+
+    monkeypatch.setattr(ts_mod.psycopg, "connect", down)
+    from fin.host.thread_store import PostgresThreadStore
+
+    store = PostgresThreadStore.__new__(PostgresThreadStore)
+    store._url = "postgresql://stub"
+
+    with _pytest.raises(PersistenceUnavailableError) as write_exc:
+        store.append_run(RunRecord(id="r-d", thread_id="t-d", question="q", status="done"))
+    assert write_exc.value.code == "persistence_unavailable"
+
+    with _pytest.raises(PersistenceUnavailableError):
+        store.list_runs("t-d")
+
+    # The FK case keeps its own meaning: unknown thread, not outage.
+    def fk_violation(*a, **kw):
+        raise psycopg.errors.ForeignKeyViolation("no such thread")
+
+    monkeypatch.setattr(ts_mod.psycopg, "connect", fk_violation)
+    with _pytest.raises(ThreadNotFoundError):
+        store.append_run(RunRecord(id="r-x", thread_id="t-x", question="q", status="done"))
+
+
+def test_replay_read_treats_stored_rows_as_untrusted() -> None:
+    """``_row_to_run`` re-validates what came back from JSONB: a
+    legacy v0 row comes up as the projected shape it names (the stored
+    ``page`` read into the ``unit`` slot), while a contradictory row is
+    kept verbatim for the read boundary to refuse per-record — never
+    defaulted, never dropped."""
+    import json
+    from datetime import datetime, timezone
+
+    from fin.host.thread_store import PostgresThreadStore
+
+    contradictory = dict(_PAGE_ERA_ROW, unit=7)
+    row = (
+        "r-1", "t-1", "q", "done", "", "a",
+        json.dumps([dict(_PAGE_ERA_ROW), contradictory]),
+        "", "[]", "", datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    record = PostgresThreadStore._row_to_run(row)
+    assert record.citations[0] == {
+        "kind": "company",
+        "document_id": "AAPL-2022Q3",
+        "attachment_id": "",
+        "version": "1",
+        "unit": 4,
+        "display": "page",
+        "filename": "",
+        "quote": QUOTE62,
+    }
+    assert record.citations[1] == contradictory
+
+
+def test_project_stored_citation_is_closed_over_the_nine_names() -> None:
+    """Input-boundary sweep of the §7 projection home: empty, non-
+    object, missing required slots, xor violations, and out-of-set
+    keys all refuse; only the frozen shapes project."""
+    from fin.host.thread_store import project_stored_citation
+
+    assert project_stored_citation(None) is None
+    assert project_stored_citation("row") is None
+    assert project_stored_citation({}) is None
+    assert project_stored_citation({"document_id": "D", "version": "1", "quote": "q"}) is None
+    assert project_stored_citation(dict(_PAGE_ERA_ROW, unit=3)) is None
+    assert project_stored_citation(dict(_PAGE_ERA_ROW, bogus=1)) is None
+    projected = project_stored_citation(dict(_PAGE_ERA_ROW))
+    assert projected == {
+        "kind": "company",
+        "document_id": "AAPL-2022Q3",
+        "attachment_id": "",
+        "version": "1",
+        "unit": 4,
+        "display": "page",
+        "filename": "",
+        "quote": QUOTE62,
+    }
+    assert project_stored_citation(dict(_V1_DOC_ROW)) is not None
+    assert project_stored_citation(dict(_LEDGER_ROW)) == _LEDGER_ROW
 
 
 def test_in_memory_update_thread_title_roundtrip() -> None:

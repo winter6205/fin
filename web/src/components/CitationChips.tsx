@@ -24,7 +24,12 @@ import {
   citationSourceLabel,
   formatUnitLocator,
 } from "../sourceLocator";
-import type { Citation } from "../types";
+import {
+  databaseRowFieldLines,
+  databaseRowIdentityLabel,
+  evidenceRefusalRowText,
+} from "../evidenceContract";
+import type { Citation, EvidenceRefusal } from "../types";
 
 type AnswerPart = string | { quote: string; index: number };
 
@@ -79,6 +84,11 @@ function SourceRow({ citation, index }: { citation: Citation; index: number }) {
     citation.display,
     citation.unit,
   )}`;
+  // A ledger row is a value read at a moment, so its citation says when
+  // it was read. The wording is deliberately "as of" and never "still"
+  // or "unchanged": the product makes no claim that the row is current,
+  // and a reader must not be able to read one into this line (spec 8.1).
+  const row = citation.database_row;
   return (
     <li className="text-xs font-mono text-gray-700">
       <button
@@ -92,6 +102,20 @@ function SourceRow({ citation, index }: { citation: Citation; index: number }) {
       >
         {label}
       </button>
+      {row ? (
+        <p
+          data-testid="database-row-identity"
+          className="mt-0.5 ml-4 text-gray-600"
+        >
+          {databaseRowIdentityLabel(row)}
+        </p>
+      ) : null}
+      {row ? (
+        <p className="mt-0.5 ml-4 text-gray-500">
+          as of {row.queried_at} — a snapshot of that query, not a live
+          read
+        </p>
+      ) : null}
       <p
         id={`source-quote-${index}`}
         className={
@@ -102,6 +126,20 @@ function SourceRow({ citation, index }: { citation: Citation; index: number }) {
       >
         “{citation.quote}”
       </p>
+      {/* Opening this row displays the STORED snapshot — the values the
+          query returned at ``queried_at``, each rendered to text per
+          spec §4.4. It issues no query: this block reads the citation's
+          own ``database_row`` and fetches nothing (a refresh would be a
+          NEW evidence item, outside this surface). */}
+      {open && row ? (
+        <ul data-testid="database-row-fields" className="mt-1 ml-8 space-y-0.5">
+          {databaseRowFieldLines(row).map((line) => (
+            <li key={line} className="text-gray-600 font-mono">
+              {line}
+            </li>
+          ))}
+        </ul>
+      ) : null}
     </li>
   );
 }
@@ -227,12 +265,39 @@ function SourcesList({ citations }: { citations: Citation[] }) {
   );
 }
 
+/** The visible named-code indicator (plan E6 display policy): a decoded
+ * ``evidence_refusals`` entry or a history ``rejected_citations`` row
+ * renders beside the answer with its §6 code — never silently dropped,
+ * never an empty citation list standing in for a refusal. Same posture
+ * as the refuse-row "原因" status line: a precise named failure the
+ * operator can see, keyed off data that already passed the runtime
+ * decoder. */
+function EvidenceRefusalNotice({ refusals }: { refusals: EvidenceRefusal[] }) {
+  if (refusals.length === 0) return null;
+  return (
+    <ul className="mt-2 space-y-0.5" aria-label="被拒绝的出处">
+      {refusals.map((entry) => (
+        <li
+          key={`${entry.citation_index}-${entry.error}`}
+          data-testid="evidence-refusal"
+          data-code={entry.error}
+          className="text-xs text-gray-500"
+        >
+          {evidenceRefusalRowText(entry)}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 export default function AnswerWithCitations({
   answer,
   citations,
+  refusals = [],
 }: {
   answer: string;
   citations: Citation[];
+  refusals?: EvidenceRefusal[];
 }) {
   if (!answer) return null;
   const parts = splitAnswerAtCitations(answer, citations);
@@ -255,6 +320,7 @@ export default function AnswerWithCitations({
         )}
       </p>
       <SourcesList citations={citations} />
+      <EvidenceRefusalNotice refusals={refusals} />
     </>
   );
 }

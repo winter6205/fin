@@ -24,11 +24,13 @@ PDF extraction, no corpus code.
 
 from __future__ import annotations
 
-from typing import Any, Iterator
+from collections.abc import Callable, Sequence
+from typing import Any, Iterator, cast
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.tools import BaseTool
 from pydantic import Field
 
 
@@ -67,7 +69,7 @@ class ScriptedChatModel(BaseChatModel):
 
     script: list[AIMessage] = Field(default_factory=list)
     stream_script: list[AIMessageChunk] = Field(default_factory=list)
-    # T1 (#33): one entry per ``stream()`` call, each entry a FULL
+    # T1: one entry per ``stream()`` call, each entry a FULL
     # response as a list of chunks. Lets a test script two distinct
     # streamed model calls (tool-call response, then thinking +
     # answer deltas) which the flat ``stream_script`` cannot express.
@@ -85,7 +87,7 @@ class ScriptedChatModel(BaseChatModel):
 
     def bind_tools(
         self,
-        tools: list[Any],
+        tools: Sequence[dict[str, Any] | type | Callable[..., Any] | BaseTool],
         **kwargs: Any,
     ) -> "ScriptedChatModel":
         """Record the bound tools and return ``self``.
@@ -156,7 +158,7 @@ class ScriptedChatModel(BaseChatModel):
 
         Response selection, in priority order:
 
-        * ``stream_responses`` (T1 #33) — one entry per call; the
+        * ``stream_responses`` (T1) — one entry per call; the
           entry's chunks are yielded in full. Once exhausted the
           LAST entry replays (the step-cap loop contract).
         * ``stream_script`` — the first ``stream()`` call walks the
@@ -193,10 +195,11 @@ class ScriptedChatModel(BaseChatModel):
                 messages, stop=stop, run_manager=run_manager, **kwargs
             )
             for generation in result.generations:
+                message = cast(AIMessage, generation.message)
                 chunk = AIMessageChunk(
-                    content=generation.message.content,
-                    tool_calls=list(generation.message.tool_calls),
-                    additional_kwargs=dict(generation.message.additional_kwargs),
+                    content=message.content,
+                    tool_calls=list(message.tool_calls),
+                    additional_kwargs=dict(message.additional_kwargs),
                 )
                 yield ChatGenerationChunk(message=chunk)
             return
@@ -233,10 +236,11 @@ class ScriptedChatModel(BaseChatModel):
                 messages, stop=stop, run_manager=run_manager, **kwargs
             )
             for generation in result.generations:
+                message = cast(AIMessage, generation.message)
                 chunk = AIMessageChunk(
-                    content=generation.message.content,
-                    tool_calls=list(generation.message.tool_calls),
-                    additional_kwargs=dict(generation.message.additional_kwargs),
+                    content=message.content,
+                    tool_calls=list(message.tool_calls),
+                    additional_kwargs=dict(message.additional_kwargs),
                 )
                 yield ChatGenerationChunk(message=chunk)
             return

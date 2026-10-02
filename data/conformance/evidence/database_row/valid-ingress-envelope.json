@@ -1,0 +1,45 @@
+{
+  "case": "valid-ingress-envelope",
+  "direction": "producer",
+  "expect": "accept",
+  "refusal_code": null,
+  "payload": {
+    "chunks": [],
+    "database_rows": {
+      "schema": "fin.evidence.retrieve_rows",
+      "schema_version": 1,
+      "result_count": 2,
+      "rows": [
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2291"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2377"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Pacific Retail Group",
+            "expiry_date": "2026-04-02",
+            "notice_days": 15,
+            "active": true,
+            "credit_note": null
+          },
+          "summary": "C-2377 Pacific Retail Group, expires 2026-04-02"
+        }
+      ]
+    }
+  }
+}

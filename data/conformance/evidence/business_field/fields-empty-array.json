@@ -1,0 +1,9 @@
+{
+  "case": "fields-empty-array",
+  "direction": "consumer",
+  "expect": "accept",
+  "refusal_code": null,
+  "payload": {
+    "business_fields": []
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "case": "unsupported-kind-hyphen",
+  "direction": "consumer",
+  "expect": "refuse",
+  "refusal_code": "unsupported_evidence_contract",
+  "payload": {
+    "business_fields": [
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business-field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 1,250.00",
+        "normalized_text": "1250.00",
+        "status": "extracted"
+      }
+    ]
+  }
+}

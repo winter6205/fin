@@ -34,11 +34,29 @@ from __future__ import annotations
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from fin.corpus.extracted import Locator
-from fin.host.citation_gate import EvidenceItem
+from fin.host.citation_gate import (
+    DATABASE_ROW_DISPLAY,
+    DATABASE_ROW_KIND,
+    DatabaseRow,
+    EvidenceItem,
+)
+from fin.host.evidence_contract import (
+    seed_context_from_rows,
+    validate_evidence,
+)
 from fin.retrieve.hit_mapping import (
     MAPPING_FAILURE_NON_LOCATOR_SOURCE_REF,
     MAPPING_STAGE_EVIDENCE_ADMISSION,
     MappingFailureLedger,
+)
+from fin.retrieve.port import (
+    DATABASE_ROWS_KEY,
+    DATABASE_ROWS_RESULT_COUNT_FIELD,
+    DATABASE_ROWS_ROWS_FIELD,
+    DATABASE_ROWS_SCHEMA,
+    DATABASE_ROWS_SCHEMA_FIELD,
+    DATABASE_ROWS_SCHEMA_VERSION,
+    DATABASE_ROWS_SCHEMA_VERSION_FIELD,
 )
 from fin.retrieve.source_read import ATTACHMENT_KIND
 
@@ -89,6 +107,82 @@ def evidence_from_chunks(chunks: Sequence[Any]) -> list[EvidenceItem]:
         EvidenceItem(locator=chunk.source_ref, unit_text=chunk.text)
         for chunk in chunks
     ]
+
+
+def database_row_shape_refusal(raw: Any) -> str | None:
+    """The exact §6 code the structural validator refuses one wire row
+    with, or ``None`` when its shape holds.
+
+    The single shape decision for this lane lives in
+    :mod:`fin.host.evidence_contract`; this seam wraps one row in a
+    minimal conforming envelope so the frozen envelope checks (schema
+    token, key set, types, bounds, timestamp) judge the row, and the
+    admission boundary never re-implements them inline. The context
+    seeding is the validator home's :func:`seed_context_from_rows` —
+    one posture for every boundary, including its never-hash rule.
+    """
+    envelope = {
+        DATABASE_ROWS_KEY: {
+            DATABASE_ROWS_SCHEMA_FIELD: DATABASE_ROWS_SCHEMA,
+            DATABASE_ROWS_SCHEMA_VERSION_FIELD: DATABASE_ROWS_SCHEMA_VERSION,
+            DATABASE_ROWS_ROWS_FIELD: [raw],
+            DATABASE_ROWS_RESULT_COUNT_FIELD: 1,
+        }
+    }
+    context = seed_context_from_rows(database_row_values=[raw])
+    validation = validate_evidence(envelope, context)
+    if validation.refusal is None:
+        return None
+    return validation.refusal.code
+
+
+def evidence_from_database_rows(rows: Sequence[Any] | None) -> list[EvidenceItem]:
+    """One ``database-row`` ``EvidenceItem`` per readable wire row.
+
+    The sql 档's consumer half (spec
+    search-mode-business-sql-contract §8.0): a ledger row arrives as the
+    ``database_rows`` sibling of ``chunks`` and is NOT a chunk — it has
+    no document, no version, no ordinal, and bridging one into the
+    ``Locator`` shape would put a fake file identity in front of the
+    citation gate. Each row rides the d2c3aa0 ``DatabaseRow`` carrier
+    with the empty document slots, and the gate's own row lane verifies
+    the claim against ``record_key`` / ``fields`` (ADR 0091).
+
+    A row the E1 structural validator refuses is DROPPED, never
+    half-built: :func:`database_row_shape_refusal` holds that decision
+    (a non-mapping, an off-shape key set, a bad schema token, an
+    unknown field, a non-strict timestamp — each named by its §6 code
+    at the boundary). The empty-value guard below stays a separate
+    carrier check the shape validator does not own: an all-keys-present
+    row with an empty ``source`` / ``record_key`` / ``queried_at`` /
+    ``summary`` is shape-legal, but ``_validate_evidence`` raises
+    ``MalformedEvidenceError`` on an empty ``unit_text``, so such a row
+    would refuse the whole run instead of simply not being citable.
+    ``None`` input is the absent sibling (no rows applicable) and builds
+    nothing.
+    """
+    items: list[EvidenceItem] = []
+    for raw in rows or ():
+        if database_row_shape_refusal(raw) is not None:
+            continue
+        row = DatabaseRow.from_wire(raw)
+        if (
+            not row.source
+            or not row.record_key
+            or not row.queried_at
+            or not row.summary
+        ):
+            continue
+        items.append(
+            EvidenceItem(
+                locator=Locator(document_id="", version="", unit=1),
+                unit_text=row.summary,
+                kind=DATABASE_ROW_KIND,
+                display=DATABASE_ROW_DISPLAY,
+                database_row=(row,),
+            )
+        )
+    return items
 
 
 def unit_ordinal(raw: Any) -> int | None:
@@ -165,6 +259,8 @@ def attachment_evidence_from_ref(
 __all__ = [
     "admit_retrieved_chunks",
     "attachment_evidence_from_ref",
+    "database_row_shape_refusal",
     "evidence_from_chunks",
+    "evidence_from_database_rows",
     "unit_ordinal",
 ]

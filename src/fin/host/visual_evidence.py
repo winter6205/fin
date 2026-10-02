@@ -178,8 +178,12 @@ def visual_crop_bounds(scope: Any) -> tuple[float, float, float, float] | None:
     top = getattr(scope, "top", None)
     right = getattr(scope, "right", None)
     bottom = getattr(scope, "bottom", None)
-    parts = (left, top, right, bottom)
-    if any(not isinstance(part, (int, float)) for part in parts):
+    if not (
+        isinstance(left, (int, float))
+        and isinstance(top, (int, float))
+        and isinstance(right, (int, float))
+        and isinstance(bottom, (int, float))
+    ):
         return None  # EXIT: an unreadable scope claims no region.
     return (float(left), float(top), float(right), float(bottom))
 

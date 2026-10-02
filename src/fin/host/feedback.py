@@ -69,8 +69,10 @@ def _validate_run_id(run_id: object) -> str:
 
 
 def _validate_value(value: object) -> FeedbackValue:
-    if value == "up" or value == "down":
-        return value
+    if value == "up":
+        return "up"
+    if value == "down":
+        return "down"
     raise InvalidFeedbackError("feedback value must be 'up' or 'down'")
 
 

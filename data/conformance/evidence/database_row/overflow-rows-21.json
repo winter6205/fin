@@ -1,0 +1,310 @@
+{
+  "case": "overflow-rows-21",
+  "direction": "consumer",
+  "expect": "refuse",
+  "refusal_code": "database_row_overflow",
+  "payload": {
+    "chunks": [],
+    "database_rows": {
+      "schema": "fin.evidence.retrieve_rows",
+      "schema_version": 1,
+      "result_count": 21,
+      "rows": [
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2400"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2401"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2402"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2403"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2404"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2405"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2406"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2407"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2408"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2409"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2410"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2411"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2412"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2413"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2414"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2415"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2416"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2417"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2418"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2419"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        },
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2420"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        }
+      ]
+    }
+  }
+}

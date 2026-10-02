@@ -889,3 +889,94 @@ def test_each_named_failure_has_its_own_copy(reason: str) -> None:
     copy = ORDINARY_PERSON_COPY[reason]
     assert copy.strip()
     assert reason not in copy
+
+
+# ----- E2: the route-level insufficient_evidence exit (pure decision) -----
+
+_ENTERPRISE_AUDIT: dict[str, Any] = {
+    "track": "grounded",
+    "decision_tier": "rules",
+    "signals": {"enterprise_material": True},
+}
+_FILING_AUDIT: dict[str, Any] = {
+    "track": "grounded",
+    "decision_tier": "rules",
+    "signals": {"filing_ask": True},
+}
+
+
+def test_enterprise_route_repair_cap_names_insufficient_evidence() -> None:
+    """Material was in front of the run and nothing in it grounds the
+    asked rule claim: that is 「the material does not state the rule」,
+    the spec §6 E2 route-level exit, not the gate's mechanism token."""
+    assert named_refusal_reason(
+        evidence=[object()],
+        outcomes=[{"chunks": 1, "mapping_failures": 0}],
+        verifier_reason="citation_repair_cap",
+        track_decision=_ENTERPRISE_AUDIT,
+    ) == "insufficient_evidence"
+
+
+def test_other_routes_keep_the_verifier_reason_under_enterprise_kwarg() -> None:
+    """The re-label is route-conditioned: a filing audit keeps the
+    gate's verdict byte-identical (the pre-E2 invariant tested above by
+    ``test_the_verifier_verdict_survives_when_retrieve_did_produce_hits``)."""
+    assert named_refusal_reason(
+        evidence=[object()],
+        outcomes=[{"chunks": 1, "mapping_failures": 0}],
+        verifier_reason="citation_repair_cap",
+        track_decision=_FILING_AUDIT,
+    ) == "citation_repair_cap"
+
+
+def test_unknown_locator_never_becomes_insufficient_evidence() -> None:
+    """The immediate hallucinated-locator refusal is the gate's own
+    fact; the E2 exit names only the repair-capped shape."""
+    assert named_refusal_reason(
+        evidence=[object()],
+        outcomes=[{"chunks": 1, "mapping_failures": 0}],
+        verifier_reason="unknown_locator",
+        track_decision=_ENTERPRISE_AUDIT,
+    ) == "unknown_locator"
+
+
+def test_enterprise_route_without_delivered_hits_keeps_verifier_reason() -> None:
+    """Zero delivered chunks is NOT 「the material did not answer」:
+    0-chunk outcomes with evidence from another route keep the
+    verifier's verdict (the module's reach doctrine)."""
+    assert named_refusal_reason(
+        evidence=[object()],
+        outcomes=[{"chunks": 0, "mapping_failures": 0}],
+        verifier_reason="citation_repair_cap",
+        track_decision=_ENTERPRISE_AUDIT,
+    ) == "citation_repair_cap"
+
+
+def test_malformed_enterprise_audit_is_not_the_route_fact() -> None:
+    """Only an explicit ``signals.enterprise_material is True`` names
+    the route; absent / non-Mapping / lookalike audits never invent
+    the exit."""
+    for audit in (
+        {},
+        {"signals": {}},
+        {"signals": {"enterprise_material": False}},
+        {"signals": {"enterprise_material": "true"}},
+        {"signals": "enterprise_material"},
+        "not-a-mapping",
+    ):
+        assert named_refusal_reason(
+            evidence=[object()],
+            outcomes=[{"chunks": 1, "mapping_failures": 0}],
+            verifier_reason="citation_repair_cap",
+            track_decision=audit,
+        ) == "citation_repair_cap"
+
+
+def test_absent_track_decision_keeps_the_pre_e2_contract() -> None:
+    """Callers that pass no audit (every pre-E2 call shape) get exactly
+    the old answers: the new keyword default cannot change them."""
+    assert named_refusal_reason(
+        evidence=[object()],
+        outcomes=[{"chunks": 1, "mapping_failures": 0}],
+        verifier_reason="citation_repair_cap",
+    ) == "citation_repair_cap"

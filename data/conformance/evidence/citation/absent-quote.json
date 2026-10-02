@@ -1,0 +1,21 @@
+{
+  "case": "absent-quote",
+  "direction": "consumer",
+  "expect": "refuse",
+  "refusal_code": "malformed_evidence_contract",
+  "payload": {
+    "evidence_schema": "fin.evidence.citation",
+    "schema_version": 1,
+    "citations": [
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 3,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf"
+      }
+    ]
+  }
+}

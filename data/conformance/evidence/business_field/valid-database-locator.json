@@ -1,0 +1,26 @@
+{
+  "case": "valid-database-locator",
+  "direction": "consumer",
+  "expect": "accept",
+  "refusal_code": null,
+  "payload": {
+    "business_fields": [
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2291"
+          },
+          "snapshot_digest": "sha256:be4d128329663df4526a766b24c4eea183dc32497b53e88fe418516d684a7c44"
+        },
+        "original_value": "USD 1,250.00",
+        "normalized_text": "1250.00",
+        "status": "extracted"
+      }
+    ]
+  }
+}

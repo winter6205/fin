@@ -17,8 +17,9 @@ copy", ADR 0061):
   NEXT model call still carries the current turn's 档 copy — the
   call-scoped shape satisfies re-injection by construction; this suite
   locks that behaviour.
-* unassigned turns (dialogue track, typed fail, clarify awaiting a
-  pick) inject NOTHING.
+* unassigned turns (dialogue track, clarify awaiting a pick; the
+  typed-fail class has no producer since the tracked change T7 emptied the refusal
+  table) inject NOTHING.
 """
 
 from __future__ import annotations
@@ -362,21 +363,48 @@ def test_dialogue_turn_injects_no_copy() -> None:
         assert not _mode_blocks(call)
 
 
-def test_typed_fail_grounded_turn_injects_no_copy() -> None:
-    """An unopened 档 (sql 真数据库) is a typed fail with
-    ``search_mode=None``: the grounded model call runs with NO copy —
-    nothing was assigned. (``global`` 综述 used to be the unopened 档 here;
-    it is now an open report arm, so ``sql`` carries the same typed-fail
-    contract.)"""
+def test_clarify_grounded_turn_injects_no_copy() -> None:
+    """An unassigned grounded turn injects NOTHING: the tracked change T7 (6e8ed97)
+    emptied the routing-time refusal table, so the residual that leaves
+    ``search_mode=None`` is now the clarify turn (no 档 named, no judge
+    client) — the same "nothing assigned, nothing injected" contract the
+    old typed-fail case carried (that case rode ``sql``, first as the
+    unopened ``global``, and is now impossible for a closed-set naming;
+    the positive flip is pinned by
+    :func:`test_assigned_sql_turn_injects_its_copy_once`)."""
     model = _RecordingScriptedModel(
         script=[AIMessage(content="Net sales grew.")]
     )
     g = _compile(model)
-    out = _invoke(g, "sql档 what was AAPL net sales in 2023 Q3?", "smcp-typed-fail")
-    assert out["search_mode_decision"]["decision_tier"] == "typed_fail"
+    out = _invoke(g, "what was AAPL net sales in 2023 Q3?", "smcp-clarify")
+    assert out["track"] == "grounded"
+    assert out["search_mode_decision"]["decision_tier"] == "clarify"
     assert out["search_mode_decision"]["search_mode"] is None
     for call in model.captured:
         assert not _mode_blocks(call)
+
+
+def test_assigned_sql_turn_injects_its_copy_once() -> None:
+    """The the tracked change T7 flip of the old typed-fail pin, equal half 2: naming
+    the now-open 真数据库 assigns it, so the grounded model call carries
+    the ``sql`` usage copy exactly once — 综述 and 真数据库 both moved
+    from "no copy, refusal" to "own copy, routed" and neither is the
+    other 档's copy."""
+    model = _RecordingScriptedModel(
+        script=[AIMessage(content="Net sales grew.")]
+    )
+    g = _compile(model)
+    out = _invoke(g, "sql档 what was AAPL net sales in 2023 Q3?", "smcp-sql-copy")
+    audit = out["search_mode_decision"]
+    assert audit["decision_tier"] == "rules"
+    assert audit["search_mode"] == "sql"
+    assert audit["failure_code"] is None
+    assert model.captured
+    call = model.captured[-1]
+    blocks = _mode_blocks(call)
+    assert len(blocks) == 1
+    assert "检索档 sql" in str(blocks[0].content)
+    assert SEARCH_MODE_USAGE_COPY["sql"] in str(blocks[0].content)
 
 
 def test_copy_reinjected_after_compaction() -> None:

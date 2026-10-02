@@ -563,6 +563,69 @@ def test_render_result_citation_label_reads_display_and_unit():
     ]
 
 
+def test_render_result_prints_a_ledger_row_as_a_record():
+    """A ledger row names the view and record it answers about, and
+    presents as a record — never as a ``document_id`` (it has none) and
+    never as ``u1``, a position in a document that does not exist
+    (ADR 0091).
+
+    Its version column is the query's ``queried_at``, so the printed
+    line always says when the value was true.
+    """
+    from fin.host.citation_gate import Citation
+
+    row = Citation(
+        kind="database-row",
+        document_id="",
+        attachment_id="",
+        version="2026-03-01T09:14:22Z",
+        unit=1,
+        display="record",
+        filename="",
+        quote="C-2291 Northwind Logistics, notice period 30 days",
+        database_source_id="ledger_ro.contract_expiry#contract_id=C-2291",
+        database_source="ledger_ro.contract_expiry",
+        database_record_key=(("contract_id", "C-2291"),),
+        database_fields=(("notice_days", "30"),),
+    )
+
+    text = render_result(
+        {"status": "done", "answer": "a", "citations": (row,), "messages": []}
+    )
+    lines = [line for line in text.splitlines() if line.startswith("  - ")]
+
+    assert lines == [
+        "  - ledger_ro.contract_expiry#contract_id=C-2291 "
+        f"v2026-03-01T09:14:22Z record: {row.quote}"
+    ]
+
+
+def test_render_result_never_prints_an_unknown_kind_as_a_company_row():
+    """The old label switch was binary — ``attachment`` else
+    ``document_id`` — so an unrecognised kind printed a filing id it
+    does not have. An unknown kind prints its own name instead."""
+    from fin.host.citation_gate import Citation
+
+    alien = Citation(
+        kind="some-future-kind",
+        document_id=AAPL_2022Q3,
+        attachment_id="",
+        version="1",
+        unit=1,
+        display="unit",
+        filename="",
+        quote="a span long enough to be quoted verbatim",
+    )
+
+    text = render_result(
+        {"status": "done", "answer": "a", "citations": (alien,), "messages": []}
+    )
+    lines = [line for line in text.splitlines() if line.startswith("  - ")]
+
+    assert lines == [f"  - some-future-kind v1 u1: {alien.quote}"]
+    assert AAPL_2022Q3 not in lines[0]
+
+
 def test_render_result_ignores_a_legacy_page_attribute():
     """A stale citation object still carrying a ``page`` attribute cannot
     steer the printed number: a unit-8 citation whose ``page`` says 99

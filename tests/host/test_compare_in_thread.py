@@ -24,6 +24,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.extracted import load_extracted_tree
 from fin.host import ScriptedChatModel, compile_graph
+from fin.host.evidence_contract import AdmissionContext, validate_evidence
 from fin.host.state import reset_input_state
 from fin.host.tools.compare_facts import COMPARISON_SCHEMA
 from fin.retrieve import FakeRetrievePort
@@ -34,6 +35,24 @@ AAPL_2022Q3_VERSION = (
     "a7a0d8261a0923404fc45446afd71b9965bd2b4064772df0287e761bb68ba9f2"
 )
 KNOWN_IDS = {AAPL_2022Q3, "AAPL-2023Q1", "AAPL-2023Q3", "MSFT-2023Q3"}
+COMPARISON_ENVELOPE_FIELDS = frozenset(
+    {
+        "schema",
+        "schema_version",
+        "kind",
+        "axis",
+        "concept",
+        "unit",
+        "scale",
+        "columns",
+        "rows",
+        "deltas",
+        "missing",
+        "hit_count",
+        "cell_count",
+        "locators",
+    }
+)
 
 # The ``read_source`` company leg over the committed corpus units. Only
 # the scripted ``read_source`` transcripts need it; the default graph no
@@ -167,8 +186,24 @@ def test_comparison_lands_on_state_as_structured_data(compare_seed) -> None:
     comparisons = out["comparisons"]
     assert len(comparisons) == 1
     entry = comparisons[0]
+    assert set(entry) == COMPARISON_ENVELOPE_FIELDS
     assert entry["schema"] == COMPARISON_SCHEMA
-    assert entry["tool_call_id"] == "c-compare"
+    comparison_summary = next(
+        summary
+        for summary in out["tool_summaries"]
+        if summary["name"] == "compare_facts"
+    )
+    assert comparison_summary["tool_call_id"] == "c-compare"
+    context = AdmissionContext(
+        received_source_versions=frozenset(
+            {
+                (compare_seed.aapl_2022_doc, compare_seed.aapl_2022_version),
+                (compare_seed.aapl_2023_doc, compare_seed.aapl_2023_version),
+            }
+        )
+    )
+    validation = validate_evidence({"comparison": entry}, context)
+    assert validation.accepted, validation.refusal
     assert [cell["value"] for cell in entry["rows"][0]["cells"]] == [
         compare_seed.aapl_2022_value,
         compare_seed.aapl_2023_value,

@@ -33,6 +33,7 @@ import {
   mergeReconciledTurn,
   type LiveAnswerState,
 } from "./turnStream";
+import { mergeEvidenceRefusals } from "./evidenceContract";
 import {
   closeOpenBursts,
   foldTraceFrame,
@@ -321,6 +322,20 @@ function foldResumeFrame(
     case "citations":
       patches.flushThen((t) => ({ ...t, citations: event.citations }));
       break;
+    case "evidence_refusals":
+      // E6 refusal fold: appended onto the turn's refusal list through
+      // the shared union helper (arrival order kept, duplicates dropped)
+      // and folded via ``flushThen`` like every non-delta frame — the
+      // invariant that no queued delta may overtake it. Nothing here
+      // touches ``citations``: a refusal fold never reorders them.
+      patches.flushThen((t) => ({
+        ...t,
+        evidence_refusals: mergeEvidenceRefusals(
+          t.evidence_refusals,
+          event.refusals,
+        ),
+      }));
+      break;
     case "visual_claims":
       // Same fold, same field, same reason as ``sendQuestion``: the visual
       // lane is not a citation, so a resumed run lands its rows here
@@ -426,6 +441,13 @@ function finalizeResumedTurn(
     ...closeOpenBurstsOnTurn(t),
     in_flight: fold.windowPending !== null,
     citations: result.citations.length > 0 ? result.citations : t.citations,
+    // Same refusal union as the send finalize: the resume stream's
+    // accumulated refusals fold onto the row without touching the
+    // citations order.
+    evidence_refusals: mergeEvidenceRefusals(
+      t.evidence_refusals,
+      result.evidence_refusals,
+    ),
     track: result.track ?? t.track,
     track_decision: result.track_decision ?? t.track_decision,
     status_classified: result.status_classified ?? t.status_classified,
@@ -585,6 +607,11 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       status_reason: "",
       answer: "",
       citations: [],
+      // E6: defined-empty until the ``evidence_refusals`` frame or a
+      // decode refusal lands — the indicator renders from this field on
+      // both doors (stream and GET history), so a reloaded turn shows
+      // the same named codes it showed live.
+      evidence_refusals: [],
       thinking_text: "",
       thinking_duration_ms: 0,
       tool_summaries: [],
@@ -723,6 +750,18 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
               citations: event.citations,
             }));
             break;
+          case "evidence_refusals":
+            // Same fold, same ordering invariant as the resume path
+            // (see ``foldResumeFrame``): refusals stay visible, citations
+            // are never reordered by the fold.
+            turnPatches.flushThen((t) => ({
+              ...t,
+              evidence_refusals: mergeEvidenceRefusals(
+                t.evidence_refusals,
+                event.refusals,
+              ),
+            }));
+            break;
           case "visual_claims":
             // Its own field, never ``citations`` — the chip layer
             // places a span with ``answer.indexOf(quote)`` and a visual
@@ -800,6 +839,15 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           in_flight: fold.windowPending !== null || preparationWait,
           citations:
             result.citations.length > 0 ? result.citations : t.citations,
+          // Union of everything the per-frame fold already saw and the
+          // terminal result accumulated from the wire — duplicates drop
+          // (the same run can be named by both the server refusal lane
+          // and a web decode), order and the citations array are
+          // untouched.
+          evidence_refusals: mergeEvidenceRefusals(
+            t.evidence_refusals,
+            result.evidence_refusals,
+          ),
           track: result.track ?? t.track,
           track_decision: result.track_decision ?? t.track_decision,
           status_classified: result.status_classified ?? t.status_classified,
@@ -1211,7 +1259,21 @@ function reconcileTurnTable(
   const persistedRunIds = new Set(persisted.turns.map((t) => t.run_id));
   const reconciled = persisted.turns.map((row) => {
     const live = streamedByRunId.get(row.run_id);
-    return live ? mergeReconciledTurn(live, row) : row;
+    if (!live) return row;
+    const merged = mergeReconciledTurn(live, row);
+    // E6 refusal fold across the two doors: mergeReconciledTurn is
+    // server-row authoritative and knows nothing about this live-only
+    // field, so the union happens HERE — stream-observed refusals and
+    // the history read's rejected_citations rows keep one entry per
+    // (index, code), and neither list may reorder the merged row's
+    // citations (plan E6 acceptance).
+    return {
+      ...merged,
+      evidence_refusals: mergeEvidenceRefusals(
+        row.evidence_refusals,
+        live.evidence_refusals,
+      ),
+    };
   });
   const stillRunning = streamed.turns.filter(
     (t) => t.in_flight === true && !persistedRunIds.has(t.run_id),

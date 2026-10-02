@@ -391,7 +391,7 @@ class ChatModelVisionAdapter:
 
     # -- provider leg
 
-    def _request(self, parts: list[dict[str, Any]]) -> Any:
+    def _request(self, parts: list[str | dict[str, Any]]) -> Any:
         try:
             client = self._ensure_client()
             return client.invoke([_human_message(parts)])
@@ -430,6 +430,7 @@ def _build_chat_model_client(
     import os
 
     from langchain_openai import ChatOpenAI
+    from pydantic import SecretStr
 
     source: Mapping[str, str] = os.environ if env is None else env
     api_key = _trimmed(source.get(FIN_API_KEY_ENV))
@@ -440,7 +441,7 @@ def _build_chat_model_client(
     return ChatOpenAI(
         model=config.model_id,
         base_url=config.base_url,
-        api_key=api_key,
+        api_key=SecretStr(api_key),
         timeout=120.0,
         max_retries=0,
     )
@@ -455,7 +456,7 @@ def _content_parts(
     target: VisionTarget,
     media_type: str,
     question: str | None,
-) -> list[dict[str, Any]]:
+) -> list[str | dict[str, Any]]:
     """Validated input becomes the multimodal parts one call carries."""
     if not isinstance(image, (bytes, bytearray)) or not image:
         raise ValueError("image must be non-empty rendered bytes")
@@ -492,7 +493,7 @@ def _scope_phrase(target: VisionTarget) -> str:
     )
 
 
-def _human_message(parts: list[dict[str, Any]]) -> Any:
+def _human_message(parts: list[str | dict[str, Any]]) -> Any:
     from langchain_core.messages import HumanMessage
 
     return HumanMessage(content=parts)

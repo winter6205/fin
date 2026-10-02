@@ -63,6 +63,17 @@ def test_mcp_marker_is_registered() -> None:
     assert "mcp" in names, _markers()
 
 
+def test_sql_live_marker_is_registered_and_distinct() -> None:
+    """The live business-ledger acceptance rides its OWN
+    ``sql_live`` mark — the registered meaning of ``mcp`` is the
+    fixture-server protocol smoke, and spec §9 / AGENTS.md require the
+    two to stay distinguishable. Both are opt-in (deselected by
+    default), so neither leaks into the hermetic run."""
+    names = [marker.split(":", 1)[0].strip() for marker in _markers()]
+    assert "sql_live" in names, _markers()
+    assert names.index("sql_live") != names.index("mcp")
+
+
 def test_existing_optin_marker_lines_are_untouched() -> None:
     """SC18: adding ``mcp`` must not change the ``eval`` (or
     ``soft_track``) marker configuration."""
@@ -143,6 +154,27 @@ def test_hook_keeps_mcp_items_when_the_mark_is_selected() -> None:
     config, items = _run_hook("mcp", [marked, plain])
     assert items == [marked, plain]
     assert config.hook.deselected == []
+
+
+def test_hook_deselects_sql_live_unless_it_is_named() -> None:
+    """The two opt-in marks are independent: ``-m mcp`` selects the
+    fixture-server smoke but must NOT drag the live business-ledger
+    acceptance in (and the default run drops both)."""
+    mcp_item = _StubItem("smoke", "mcp")
+    live_item = _StubItem("live", "sql_live")
+    plain = _StubItem("unit")
+
+    config, items = _run_hook("", [mcp_item, live_item, plain])
+    assert items == [plain]
+    assert config.hook.deselected == [mcp_item, live_item]
+
+    config, items = _run_hook("mcp", [mcp_item, live_item, plain])
+    assert items == [mcp_item, plain]
+    assert config.hook.deselected == [live_item]
+
+    config, items = _run_hook("sql_live", [mcp_item, live_item, plain])
+    assert items == [live_item, plain]
+    assert config.hook.deselected == [mcp_item]
 
 
 @pytest.mark.parametrize("markexpr", ["", "eval", "soft_track", "not slow"])

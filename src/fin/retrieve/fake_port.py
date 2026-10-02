@@ -41,10 +41,13 @@ from fin.retrieve.input_validation import (
     validate_query,
 )
 from fin.retrieve.port import (
+    DATABASE_ROWS_KEY,
     Chunk,
+    new_database_rows,
     resolve_search_mode,
     RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY,
     RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY,
+    RETRIEVE_OUTCOME_SQL_NO_MATCHING_ROWS,
 )
 from fin.retrieve.read_port import (
     unit_text_from_pages,
@@ -125,6 +128,23 @@ class FakeRetrievePort:
         exits with ``community_summary_index_failure`` rather than an
         ordinary empty. Default ``False``: ordinary fakes must not teach
         every empty corpus a summary-index failure.
+    database_rows_by_query
+        Optional scripted sql 档 answer keyed by the raw query string:
+        each value is the row-mapping list the fake returns as the
+        ``rows`` of the E1 row OBJECT under the ``database_rows``
+        sibling beside an EMPTY chunk list (a row is never a chunk —
+        spec search-mode-business-sql-contract §8.0, envelope contract
+        §4.4).
+        The fake ranks no rows and opens no connection; it mirrors the
+        wire SHAPE so the host consumer can be tested hermetically.
+    sql_named_failure
+        Optional declared producer failure the sql arm answers with
+        instead of rows: one token from the sql failure vocabulary in
+        :mod:`fin.retrieve.tiers` (not provisioned / denied / timeout /
+        unverified / unbound request). When set, every legal ``sql``
+        answer is the typed EXIT dict ``{"error": <token>}`` under its
+        OWN name — never a silent empty and never a collapsed
+        ``retrieve_unavailable``. Default ``None``.
     """
 
     def __init__(
@@ -137,6 +157,10 @@ class FakeRetrievePort:
         input_validation_ledger: InputValidationLedger | None = None,
         fast_graph_empty: bool = False,
         community_summary_unready: bool = False,
+        database_rows_by_query: (
+            Mapping[str, Sequence[Mapping[str, Any]]] | None
+        ) = None,
+        sql_named_failure: str | None = None,
     ) -> None:
         # Defensive copy so a caller mutating the source dict
         # after construction cannot affect the fake.
@@ -161,6 +185,13 @@ class FakeRetrievePort:
         self._input_validation_ledger = input_validation_ledger
         self._fast_graph_empty = fast_graph_empty
         self._community_summary_unready = community_summary_unready
+        # Defensive copies so a caller mutating the source rows after
+        # construction cannot change what a ``sql`` call answers.
+        self._database_rows: dict[str, list[Mapping[str, Any]]] = {
+            key: [dict(row) for row in value]
+            for key, value in (database_rows_by_query or {}).items()
+        }
+        self._sql_named_failure = sql_named_failure
         # Every completed ``retrieve`` call, in order, as the kwargs the
         # port received (``test_retrieve_typed_exit``'s recording style).
         # Rejected calls (named input errors) are NOT recorded: nothing
@@ -218,7 +249,9 @@ class FakeRetrievePort:
         filing_date: str | None = None,
         limit: int = 8,
         search_mode: str | None = None,
-    ) -> dict[str, list[Chunk]]:
+        sql_window_start: str | None = None,
+        sql_window_end: str | None = None,
+    ) -> dict[str, Any]:
         """Return ``{"chunks": [...]}`` or ``{"chunks": []}``.
 
         Mirrors the ``RetrievePort`` protocol:
@@ -227,11 +260,23 @@ class FakeRetrievePort:
         * provably conflicting filters (needs ``manifest_docs``)
           → ``ConflictingFiltersError``
         * ``search_mode`` mirrors the port's 档 contract exactly
-          (T2): out-of-set → ``InvalidSearchModeError``, unopened
-          global/sql → ``TierUnavailableError`` (Fake is not a 档 and does
+          (T2): out-of-set → ``InvalidSearchModeError``; every member
+          of the closed set is open since A2, so no 档 refusal is
+          reachable here (Fake is not a 档 and does
           not rank differently per 档 — spec SC8); an accepted token
           is recorded on ``self.calls`` so tests can assert what the
           caller asked for
+        * ``sql_window_start`` / ``sql_window_end`` are ACCEPTED AND
+          RECORDED, not enforced: the fake holds no ledger to bind, and
+          the window gate lives at the MCP transport seam
+          (``resolve_sql_window``). Recording them keeps the caller's
+          contract assertable.
+        * the ``sql`` 档 answers its own shape (spec §8.0): scripted
+          rows ride the ``database_rows`` sibling beside an empty chunk
+          list; an unscripted query is the RECORDED named empty
+          ``sql_no_matching_rows`` (never the silent miss envelope the
+          document 档 use); ``sql_named_failure`` answers the typed
+          EXIT dict under its own token.
         * unknown ``document_id`` (when ``known_document_ids`` is
           set) → ``{"chunks": []}``
         * empty EDGAR-shaped filter values
@@ -283,6 +328,8 @@ class FakeRetrievePort:
                 "filing_date": filing_date,
                 "limit": limit,
                 "search_mode": effective_search_mode,
+                "sql_window_start": sql_window_start,
+                "sql_window_end": sql_window_end,
             }
         )
 
@@ -307,6 +354,28 @@ class FakeRetrievePort:
             return {
                 "chunks": [],
                 RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY: True,
+            }
+        if effective_search_mode == "sql":
+            # The sql 档's own answer shape (spec §7/§8.0), mirroring the
+            # real producer's three outcomes: a DECLARED failure keeps
+            # its own token as a typed EXIT dict; scripted rows ride the
+            # ``database_rows`` sibling beside an EMPTY chunk list (a row
+            # is never a chunk); and a query with no scripted row is the
+            # RECORDED named empty — the same job fact the MCP adapter
+            # records off the wire, never the silent document-miss
+            # envelope the host would read as 语料未就绪.
+            if self._sql_named_failure is not None:
+                return {"error": self._sql_named_failure}
+            rows = self._database_rows.get(query)
+            if rows:
+                return {
+                    "chunks": [],
+                    DATABASE_ROWS_KEY: new_database_rows(rows),
+                }
+            return {
+                "chunks": [],
+                DATABASE_ROWS_KEY: new_database_rows([]),
+                RETRIEVE_OUTCOME_SQL_NO_MATCHING_ROWS: True,
             }
         if (
             document_id is not None

@@ -1,0 +1,9 @@
+{
+  "case": "source-not-provisioned",
+  "direction": "consumer",
+  "expect": "refuse",
+  "refusal_code": "real_db_not_wired",
+  "payload": {
+    "error": "real_db_not_wired"
+  }
+}

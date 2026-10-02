@@ -1050,28 +1050,28 @@ def test_bm25_metadata_filter_is_noop_when_manifest_docs_unset(
 def test_bm25_mirrors_the_tier_named_exits_without_ranking() -> None:
     """The archived adapter takes the 档 parameter for port parity only
     (ADR 0030: BM25 is off the product path, its one ranking IS
-    lexical): an open 档 answers with the ordinary result, while an
-    unopened or illegal token raises the port's named errors — so a
-    caller can never slip a 档 request past this implementation
-    unnoticed, and the Fake-class negative exits are mirrored on
-    EVERY ``RetrievePort`` shape, not just the live adapter."""
-    from fin.retrieve.port import InvalidSearchModeError, TierUnavailableError
+    lexical): every closed-set token is accepted and answered with the
+    ordinary result — since A2 nothing is refused at routing on ANY
+    ``RetrievePort`` shape — while an illegal token still raises the
+    port's named error, so a caller can never slip a bad 档 request past
+    this implementation unnoticed."""
+    from fin.retrieve.port import InvalidSearchModeError
 
     adapter = BM25Adapter({})
 
     assert adapter.retrieve("revenue", search_mode="lexical") == {"chunks": []}
     assert adapter.retrieve("revenue", search_mode="graph") == {"chunks": []}
-    # 综述 opened: it is now an accepted 档 on EVERY RetrievePort shape,
-    # answered with the ordinary (empty) result rather than a named refusal.
+    # 综述 opened (fin task 4) and sql opened (A2): both are accepted 档
+    # on EVERY RetrievePort shape, answered with the ordinary (empty)
+    # result rather than a named refusal. BM25 holds no ledger to bind,
+    # so the window pair is parity-only there too — the window gate
+    # belongs to the MCP wire seam (``resolve_sql_window``).
     assert adapter.retrieve("revenue", search_mode="global") == {"chunks": []}
+    assert adapter.retrieve("revenue", search_mode="sql") == {"chunks": []}
 
     with pytest.raises(InvalidSearchModeError) as excinfo:
         adapter.retrieve("revenue", search_mode="B")
     assert excinfo.value.code == "invalid_search_mode"
-
-    with pytest.raises(TierUnavailableError) as excinfo:
-        adapter.retrieve("revenue", search_mode="sql")
-    assert excinfo.value.code == "real_db_not_wired"
 
     with pytest.raises(InvalidSearchModeError) as excinfo:
         adapter.retrieve("revenue", search_mode="summary")

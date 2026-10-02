@@ -1,0 +1,9 @@
+{
+  "case": "claims-empty-array",
+  "direction": "consumer",
+  "expect": "accept",
+  "refusal_code": null,
+  "payload": {
+    "visual_claims": []
+  }
+}

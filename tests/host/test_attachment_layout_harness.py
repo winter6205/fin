@@ -48,6 +48,62 @@ from fin.host.attachment_layout import (
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 HARNESS: Final[Path] = REPO_ROOT / "scripts/g4_pipeline/run_measured.sh"
+# The harness reads the model pin before it does anything else, and it reads it
+# through pin.py beside itself. Copying the script alone would leave the gate
+# exiting 65 before docker ever runs, which is a correct refusal of an unpinned
+# fetch and a useless test: the behaviour under test is what the run does AFTER
+# the pin is satisfied. So the pin travels with the script.
+PIN_MODULE: Final[Path] = REPO_ROOT / "scripts/g4_pipeline/pin.py"
+MODELS_LOCK: Final[Path] = REPO_ROOT / "scripts/g4_pipeline/models.lock"
+# sha256 of the zero-byte marker files these tests stand in for model weights.
+# The harness verifies the cache against models.lock on every run, so a lock
+# describing the real 171 MB and 213 MB payloads would correctly refuse a test
+# cache. These tests are about what the run does after the pin is satisfied, so
+# the lock they ship describes the cache they build.
+_EMPTY_SHA256: Final[str] = (
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+)
+
+
+def _test_models_lock(weights: dict[str, str]) -> str:
+    """A models.lock plus the metadata the gate reads, matching empty markers.
+
+    ``weights`` maps a cache_dir to the file name inside it. The revisions are
+    full 40-character commits because the parser refuses a branch name. The
+    sidecar is written because ``verify_models`` reads the commit and ETag from
+    it and hashes the payload itself; a lock with no sidecar would correctly be
+    reported as "never fetched", which is a real refusal and the wrong thing for
+    a test that is not about the model gate.
+    """
+    sections = []
+    for index, (cache_dir, file_name) in enumerate(sorted(weights.items()), start=1):
+        revision = f"{index + 1:040x}"
+        sections.append(
+            f"[fixture-{index}]\n"
+            f"repo = fixture/model-{index}\n"
+            f"revision = {revision}\n"
+            f"file = {file_name}\n"
+            f"bytes = 0\n"
+            f"file_sha256 = {_EMPTY_SHA256}\n"
+            f"cache_dir = {cache_dir}\n"
+        )
+    return "\n".join(sections)
+
+
+def _write_fixture_metadata(cache_root: Path, weights: dict[str, str]) -> None:
+    """The download sidecars `verify_models` reads, matching the test lock.
+
+    The sidecar sits under the artifact's cache_dir at the path the real Hub
+    snapshot uses, which for the table-structure weights is a nested directory
+    rather than the cache_dir root -- so the file name from the lock is used
+    whole, not flattened to its basename.
+    """
+    for index, (cache_dir, file_name) in enumerate(sorted(weights.items()), start=1):
+        sidecar = cache_root / cache_dir / ".cache" / "huggingface" / "download"
+        sidecar.mkdir(parents=True, exist_ok=True)
+        target = sidecar / f"{file_name}.metadata"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"{index + 1:040x}\n{_EMPTY_SHA256}\n", encoding="utf-8")
 GOLD_MIXED: Final[Path] = REPO_ROOT / "data/corpus/g4_attachment_gold/g4-mixed-chart-001.pdf"
 GOLD_RECORD: Final[Path] = (
     REPO_ROOT
@@ -128,15 +184,33 @@ def _wait_until_dead(pid: int, *, within_s: float = 5.0) -> bool:
     return False
 
 
-def _copy_harness(tmp_path: Path) -> Path:
+def _copy_harness(tmp_path: Path, *, cache_root: Path | None = None) -> Path:
     """The shipped harness, planted deep enough that its own worktree is tmp_path.
 
     A copy rather than a fixture: this has to be the file the adapter would
     really run, traps included, and ``results/`` must not be the repository's.
+    The pin module and the lock come along, because the harness resolves them
+    relative to itself and refuses to run without them. When a ``cache_root`` is
+    given, the shipped lock is replaced by one describing that cache, so the
+    model gate stays a real gate instead of being switched off for the tests.
     """
     planted = tmp_path / "scripts" / "g4_pipeline" / "run_measured.sh"
     planted.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(HARNESS, planted)
+    shutil.copyfile(PIN_MODULE, planted.parent / "pin.py")
+    if cache_root is None:
+        shutil.copyfile(MODELS_LOCK, planted.parent / "models.lock")
+    else:
+        weights = {
+            "docling-project--docling-layout-heron": "model.safetensors",
+            "docling-project--docling-models": (
+                "model_artifacts/tableformer/accurate/tableformer_accurate.safetensors"
+            ),
+        }
+        (planted.parent / "models.lock").write_text(
+            _test_models_lock(weights), encoding="utf-8"
+        )
+        _write_fixture_metadata(cache_root, weights)
     return planted
 
 
@@ -817,12 +891,12 @@ def _planted_harness(tmp_path: Path, monkeypatch) -> tuple[Path, Path, Path]:
     The cache markers are what keep this off the network: the harness fetches
     weights only when they are absent, and the fetch is not the path under test.
     """
-    script = _copy_harness(tmp_path)
     cache = tmp_path / "model-cache"
     for weight in (_HERON_WEIGHT, _TABLEFORMER_WEIGHT):
         marker = cache / weight
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_bytes(b"")
+    script = _copy_harness(tmp_path, cache_root=cache)
     binary = tmp_path / "bin"
     binary.mkdir()
     docker = binary / "docker"

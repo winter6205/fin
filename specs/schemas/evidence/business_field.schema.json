@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "fin.evidence.business_field",
+  "title": "Business-field lane element (spec 4.5)",
+  "description": "One business field: eight frozen keys, the closed status set, and exactly one of the three frozen source_locator shapes (document, attachment, database snapshot identity). Subject trust and the per-subject overflow are the validator home's; see x-bounds.",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "kind",
+    "subject_ref",
+    "source_locator",
+    "original_value",
+    "normalized_text",
+    "status"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": "fin.evidence.business_field" },
+    "schema_version": { "type": "integer", "const": 1 },
+    "kind": { "const": "business_field" },
+    "subject_ref": { "type": "string", "minLength": 1 },
+    "source_locator": { "oneOf": [
+      { "$ref": "#/$defs/document_locator" },
+      { "$ref": "#/$defs/attachment_locator" },
+      { "$ref": "#/$defs/database_locator" }
+    ] },
+    "original_value": { "type": "string" },
+    "normalized_text": { "type": "string" },
+    "status": {
+      "enum": ["extracted", "missing", "ambiguous", "conflicting", "unverified"]
+    }
+  },
+  "x-bounds": {
+    "original_value_normalized_text": "512 chars each (business_field_overflow)",
+    "per_run": "32 fields; 24 per subject (validator home channel checks)"
+  },
+  "$defs": {
+    "document_locator": {
+      "type": "object",
+      "required": ["document_id", "version", "unit"],
+      "additionalProperties": false,
+      "properties": {
+        "document_id": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "unit": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "attachment_locator": {
+      "type": "object",
+      "required": ["kind", "attachment_id", "version", "unit"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "attachment" },
+        "attachment_id": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "unit": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "database_locator": {
+      "description": "The snapshot identity carrier (spec 4.4, ADR 0092): the consumer-minted digest, never a producer-supplied one.",
+      "type": "object",
+      "required": ["source", "record_key", "snapshot_digest"],
+      "additionalProperties": false,
+      "properties": {
+        "source": { "type": "string", "minLength": 1 },
+        "record_key": {
+          "type": "object",
+          "additionalProperties": {
+            "type": ["string", "number", "integer", "boolean", "null"]
+          }
+        },
+        "snapshot_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
+    }
+  }
+}

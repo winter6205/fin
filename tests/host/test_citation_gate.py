@@ -43,12 +43,17 @@ from fin.host.citation_gate import (
     COMPANY_KIND,
     Citation,
     CitationGateError,
+    DATABASE_ROW_DISPLAY,
+    DATABASE_ROW_KIND,
+    DatabaseRow,
     DoneResult,
     EvidenceItem,
     GateResult,
     MalformedEvidenceError,
     QUOTABLE_EVIDENCE_KINDS,
     RefuseResult,
+    UNSUPPORTED_DATABASE_CLAIM,
+    format_database_row_source_id,
     verify_citations,
 )
 from fin.retrieve.source_read import ATTACHMENT_KIND
@@ -1014,10 +1019,12 @@ def test_quote_that_lives_only_in_never_returned_text_never_cites() -> None:
 
 
 def test_quotable_evidence_kinds_are_closed() -> None:
-    """Only the two read legs feed the quote channel. A generated visual
-    observation is derived prose, never a verbatim source quote, so its
-    kind is outside the set by construction."""
-    assert QUOTABLE_EVIDENCE_KINDS == frozenset({COMPANY_KIND, ATTACHMENT_KIND})
+    """Only the two read legs and the ledger row feed the quote channel.
+    A generated visual observation is derived prose, never a verbatim
+    source quote, so its kind is outside the set by construction."""
+    assert QUOTABLE_EVIDENCE_KINDS == frozenset(
+        {COMPANY_KIND, ATTACHMENT_KIND, DATABASE_ROW_KIND}
+    )
     assert PLOTTED_VALUE_KIND not in QUOTABLE_EVIDENCE_KINDS
 
 
@@ -1141,3 +1148,845 @@ def test_citation_gate_module_does_not_import_pdfplumber() -> None:
         / "citation_gate.py"
     )
     _assert_no_pdfplumber(gate_path)
+
+
+# ===== the row on the shared wire shaper =====
+
+
+def test_a_verified_row_survives_onto_the_wire_as_its_snapshot() -> None:
+    """The gate's citation becomes the stored dict the ``/ask`` response,
+    the workspace SSE frame and the turn table all read, so the row's
+    evidence has to travel with it. Without the snapshot those three
+    would offer a citation no client could open without re-querying the
+    ledger — the one thing opening a row may never do (spec 8.1).
+    """
+    from fin.host.run_payload import _run_to_response_payload
+
+    row = _contract_row()
+    result = verify_citations(
+        answer=f"{row.summary}. Notice period 30 days.",
+        evidence=[_row_evidence(row)],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+    assert isinstance(result, DoneResult), result
+
+    payload = _run_to_response_payload(
+        {
+            "status": "done",
+            "answer": result.answer,
+            "citations": result.citations,
+        }
+    )
+
+    assert payload["citations"] == [
+        {
+            "kind": DATABASE_ROW_KIND,
+            "document_id": "",
+            "attachment_id": "",
+            "version": "2026-03-01T09:14:22Z",
+            "unit": 1,
+            "display": DATABASE_ROW_DISPLAY,
+            "filename": "",
+            "quote": row.summary,
+            "database_row": {
+                "source": "ledger_ro.contract_expiry",
+                "record_key": {"contract_id": "C-2291"},
+                "queried_at": "2026-03-01T09:14:22Z",
+                "fields": {
+                    "counterparty": "Northwind Logistics",
+                    "expiry_date": "2026-03-14",
+                    "notice_days": "30",
+                    "notice_by": "2026-02-12",
+                },
+                "summary": row.summary,
+            },
+        }
+    ]
+
+
+def test_a_document_citation_gains_no_key_on_the_wire() -> None:
+    """The shared shaper OMITS the snapshot key for the two document
+    kinds, so every citation row already in ``fin_run.citations`` is
+    byte-equal to what the surfaces publish today. The key is absent,
+    not ``None``: a stored row gaining a null field is still a
+    migration every historical thread would need."""
+    from fin.host.run_payload import _run_to_response_payload
+
+    result = verify_citations(
+        answer=f"Per the filing: {_MEMO_SPAN} end.",
+        evidence=[_evidence("PREAMBLE_" + _MEMO_SPAN + "_POSTAMBLE")],
+        repair_count=0,
+        known_document_ids=KNOWN_IDS_DEFAULT,
+    )
+    assert isinstance(result, DoneResult), result
+
+    payload = _run_to_response_payload(
+        {
+            "status": "done",
+            "answer": result.answer,
+            "citations": result.citations,
+        }
+    )
+
+    assert set(payload["citations"][0]) == {
+        "kind",
+        "document_id",
+        "attachment_id",
+        "version",
+        "unit",
+        "display",
+        "filename",
+        "quote",
+    }
+
+
+# ===== the ledger row: a second verification rule behind one closed set =====
+#
+# ADR 0091 / spec 8: a row returned by the ``sql`` 档 is not a document
+# passage. It verifies by reference to its ``record_key`` and the
+# ``fields`` THIS ROUND returned, so the 32-code-point span rule does
+# not apply to it. The asymmetry is deliberate and is not an exception
+# to be cleaned up: a scalar ledger value is a real fact and a window
+# around it proves nothing.
+
+# The canonical row from spec 8, so the fixture and the decision it
+# records cannot drift apart.
+_CONTRACT_ROW_WIRE = {
+    "kind": "database-row",
+    "source": "ledger_ro.contract_expiry",
+    "record_key": {"contract_id": "C-2291"},
+    "queried_at": "2026-03-01T09:14:22Z",
+    "fields": {
+        "counterparty": "Northwind Logistics",
+        "expiry_date": "2026-03-14",
+        "notice_days": 30,
+        "notice_by": "2026-02-12",
+    },
+    "summary": (
+        "C-2291 Northwind Logistics, expires 2026-03-14, "
+        "notice by 2026-02-12"
+    ),
+}
+
+
+def _contract_row(**overrides: object) -> DatabaseRow:
+    """The spec's own contract row, one field overridable."""
+    wire = {**_CONTRACT_ROW_WIRE, **overrides}
+    return DatabaseRow.from_wire(wire)
+
+
+def _row_evidence(*rows: DatabaseRow, **overrides: object) -> EvidenceItem:
+    """Evidence carrying ledger rows and no document identity.
+
+    ``unit_text`` is the display line the model was shown, so the row
+    is quotable the way a retrieved passage is: the model received it
+    this round and may repeat it. ``locator`` is a row's own — empty
+    document id, no manifest version, and no ordinal to bridge on.
+    """
+    fields: dict[str, object] = {
+        # A row is not a page of a frozen file: the document slots stay
+        # empty and there is no manifest version to state.
+        "locator": Locator(document_id="", version="", unit=1),
+        "unit_text": rows[0].summary,
+        "kind": DATABASE_ROW_KIND,
+        "display": DATABASE_ROW_DISPLAY,
+        "database_row": rows,
+    }
+    fields.update(overrides)
+    return EvidenceItem(**fields)  # type: ignore[arg-type]
+
+
+def test_a_supported_ledger_figure_cites_without_any_span() -> None:
+    """A ``notice_days`` of ``30`` is a legitimate citation.
+
+    The answer quotes the row's display line and states a scalar. There
+    is no ≥32-character span anywhere in it, and it does not need one:
+    the row verifies by its record key and this round's returned fields
+    (ADR 0091), so the span rule is scoped to document kinds and a
+    scalar ledger fact stays citable.
+    """
+    result = verify_citations(
+        answer=(
+            f"{_CONTRACT_ROW_WIRE['summary']}. The notice period is "
+            f"{_CONTRACT_ROW_WIRE['fields']['notice_days']} days."
+        ),
+        evidence=[_row_evidence(_contract_row())],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+
+    assert isinstance(result, DoneResult), result
+    assert len(result.citations) == 1
+    citation = result.citations[0]
+    assert citation.kind == DATABASE_ROW_KIND
+    # The identity is the row's own: the view that answered, the record
+    # it answered about, and when it was true.
+    assert citation.database_source == "ledger_ro.contract_expiry"
+    assert dict(citation.database_record_key) == {"contract_id": "C-2291"}
+    assert citation.database_source_id == format_database_row_source_id(
+        "ledger_ro.contract_expiry", {"contract_id": "C-2291"}
+    )
+    # A row opens through neither document id slot, and its version is
+    # its time: a ledger value is true as of the query, not of a frozen
+    # file.
+    assert citation.document_id == ""
+    assert citation.attachment_id == ""
+    assert citation.version == "2026-03-01T09:14:22Z"
+    assert citation.display == DATABASE_ROW_DISPLAY
+    # The fields are carried whole so the citation can show the snapshot
+    # it was built from without issuing a query.
+    assert dict(citation.database_fields)["notice_days"] == "30"
+    # The quote is the row's own display line, not a window of the
+    # model's prose: a document citation echoes the span it matched and
+    # a ledger row has no such span.
+    assert citation.quote == _CONTRACT_ROW_WIRE["summary"]
+
+
+def test_the_span_rule_does_not_apply_to_a_database_row() -> None:
+    """The asymmetry is asserted as a PROPERTY of this kind, not as an
+    accident: the same answer and the same evidence are bounced when the
+    figure is a document passage and accepted when it is a row."""
+    answer = "The notice period is 30 days."
+    assert len(answer) < 32, "this answer must be shorter than one span"
+
+    document = verify_citations(
+        answer=answer,
+        evidence=[_evidence("The notice period is 30 days per the filing.")],
+        repair_count=0,
+        known_document_ids=KNOWN_IDS_DEFAULT,
+    )
+    row = verify_citations(
+        answer=answer,
+        evidence=[_row_evidence(_contract_row())],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+
+    assert isinstance(document, BounceResult), document
+    assert isinstance(row, DoneResult), row
+
+
+def test_figures_supported_by_different_rows_together_pass_the_subset_check() -> None:
+    """The SUBSET rule is per-token, not per-row-identity: a figure one
+    row returned and a figure another row returned are both returned
+    values this round, and a fully supported multi-figure answer must
+    still complete (and both rows cite what they each state)."""
+    second = DatabaseRow.from_wire(
+        {
+            **_CONTRACT_ROW_WIRE,
+            "record_key": {"contract_id": "C-3407"},
+            "fields": {
+                "counterparty": "Vertex Freight",
+                "expiry_date": "2026-04-30",
+                "notice_days": 45,
+                "notice_by": "2026-03-16",
+            },
+            "summary": (
+                "C-3407 Vertex Freight, expires 2026-04-30, "
+                "notice by 2026-03-16"
+            ),
+        }
+    )
+    result = verify_citations(
+        answer="One notice period is 30 days; the other is 45 days.",
+        evidence=[
+            _row_evidence(_contract_row()),
+            _row_evidence(second),
+        ],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+
+    assert isinstance(result, DoneResult), result
+    assert [c.database_source_id for c in result.citations] == [
+        format_database_row_source_id(
+            "ledger_ro.contract_expiry", {"contract_id": "C-2291"}
+        ),
+        format_database_row_source_id(
+            "ledger_ro.contract_expiry", {"contract_id": "C-3407"}
+        ),
+    ]
+
+
+def test_a_number_supported_by_no_row_refuses_beside_supported_ones() -> None:
+    """Even with two rows in the round, a figure NEITHER returned
+    refuses: the union of returned numbers is the whole allowlist for
+    this answer's claims (spec §8)."""
+    result = verify_citations(
+        answer="One notice period is 30 days; the penalty is 777 days.",
+        evidence=[_row_evidence(_contract_row())],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+
+    assert isinstance(result, RefuseResult), result
+    assert result.reason == UNSUPPORTED_DATABASE_CLAIM
+
+
+def test_an_unsupported_figure_is_refused_on_its_own_reason() -> None:
+    """A number no returned field supports is an unsupported claim, and
+    it refuses on its own reason — never as a bounce and never as a
+    missing locator.
+
+    The distinction is the product fact: a bounce says "cite
+    something", and there is nothing here to cite, so a repair loop
+    would only produce another invented figure. ``unknown_locator``
+    would say a filing identity is wrong, and none is. Both wrong copies
+    would send the operator after the wrong fix.
+    """
+    result = verify_citations(
+        answer=(
+            f"{_CONTRACT_ROW_WIRE['summary']}. The notice period is "
+            f"{99} days."
+        ),
+        evidence=[_row_evidence(_contract_row())],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+
+    assert isinstance(result, RefuseResult), result
+    assert result.reason == UNSUPPORTED_DATABASE_CLAIM
+    assert result.reason != "unknown_locator"
+    assert result.reason != "citation_repair_cap"
+
+
+def test_an_unsupported_figure_refuses_at_repair_count_zero() -> None:
+    """The refusal is immediate and does not consume the repair budget:
+    a repair loop cannot produce a figure the ledger never returned, so
+    spending three bounces on it would only delay the same answer."""
+    result = verify_citations(
+        answer="The notice period is 99 days.",
+        evidence=[_row_evidence(_contract_row())],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+
+    assert isinstance(result, RefuseResult), result
+    assert result.reason == UNSUPPORTED_DATABASE_CLAIM
+
+
+def test_a_refused_figure_and_a_missing_locator_are_distinguishable() -> None:
+    """The two terminal failures answer different product facts, so each
+    is reachable from an answer the other rule would have allowed."""
+    unknown_filing = verify_citations(
+        answer="Per AAPL-2022Q3, revenue rose.",
+        evidence=[_row_evidence(_contract_row())],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+    unsupported_figure = verify_citations(
+        answer="The notice period is 99 days.",
+        evidence=[_row_evidence(_contract_row())],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+
+    assert isinstance(unknown_filing, RefuseResult), unknown_filing
+    assert unknown_filing.reason == "unknown_locator"
+    assert isinstance(unsupported_figure, RefuseResult), unsupported_figure
+    assert unsupported_figure.reason == UNSUPPORTED_DATABASE_CLAIM
+    assert unknown_filing.reason != unsupported_figure.reason
+
+
+def test_an_answer_with_no_figure_and_no_quoted_row_still_bounces() -> None:
+    """An answer that states no number and quotes no row's display line
+    cited nothing this round. That is the ordinary bounce, and it keeps
+    counting toward the ordinary repair cap — the unsupported-claim
+    refusal needs a figure to be unsupported."""
+    answer = "The contract is expiring soon, per the operations ledger."
+
+    bouncing = verify_citations(
+        answer=answer,
+        evidence=[_row_evidence(_contract_row())],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+    refused = verify_citations(
+        answer=answer,
+        evidence=[_row_evidence(_contract_row())],
+        repair_count=3,
+        known_document_ids=set(),
+    )
+
+    assert isinstance(bouncing, BounceResult), bouncing
+    assert bouncing.repair_count == 1
+    assert isinstance(refused, RefuseResult), refused
+    assert refused.reason == "citation_repair_cap"
+
+
+def test_a_field_value_never_supports_a_different_number() -> None:
+    """A field of ``30`` supports a claim of 30 and nothing else: the
+    check is on the number, not on a substring of the answer."""
+    for claim in (30, 99, 3, 300, 0):
+        result = verify_citations(
+            answer=f"The notice period is {claim} days.",
+            evidence=[_row_evidence(_contract_row())],
+            repair_count=0,
+            known_document_ids=set(),
+        )
+        if claim == 30:
+            assert isinstance(result, DoneResult), (claim, result)
+        else:
+            assert isinstance(result, RefuseResult), (claim, result)
+            assert result.reason == UNSUPPORTED_DATABASE_CLAIM
+
+
+def test_a_record_key_never_supports_a_number_it_does_not_contain() -> None:
+    """A counterparty reference shaped like a filing locator
+    (``ACME-2024Q1``) is an ordinary ledger VALUE, and a row's own key
+    supports the numbers it actually contains.
+
+    This is the case that motivated the separate rule: a
+    ``field=value`` text line fed to the document locator regex read a
+    normal ledger value as a forged filing locator and refused the whole
+    run. A row is verified against its own returned values, so no
+    ledger value can trip the filing-identity heuristic.
+    """
+    row = _contract_row(
+        source="ledger_ro.contract_expiry",
+        record_key={"contract_id": "ACME-2024Q1"},
+    )
+
+    result = verify_citations(
+        answer="ACME-2024Q1 expires 2026-03-14, notice by 2026-02-12.",
+        evidence=[_row_evidence(row)],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+
+    assert isinstance(result, DoneResult), result
+    assert [c.kind for c in result.citations] == [DATABASE_ROW_KIND]
+
+
+def test_a_document_span_never_stands_in_for_an_unsupported_figure() -> None:
+    """The two rules never borrow each other's evidence. A run that saw
+    both a ledger row and a filing passage refuses the unsupported
+    figure even though a document span grounds some part of the answer
+    — otherwise an ungrounded number could always buy itself a citation
+    with any unrelated document text.
+    """
+    result = verify_citations(
+        answer=(
+            "Total net sales increased during the third quarter of 2022. "
+            "The notice period is 99 days."
+        ),
+        evidence=[
+            _evidence(
+                "Total net sales increased during the third quarter of 2022."
+            ),
+            _row_evidence(_contract_row()),
+        ],
+        repair_count=0,
+        known_document_ids=KNOWN_IDS_DEFAULT,
+    )
+
+    assert isinstance(result, RefuseResult), result
+    assert result.reason == UNSUPPORTED_DATABASE_CLAIM
+
+
+def test_a_ledger_figure_and_a_document_span_cite_both_kinds() -> None:
+    """An answer that rests on a row AND on a document passage produces
+    one citation of each kind, rather than one kind silently absorbing
+    the other.
+
+    The passage prose states NO figure on purpose: since the subset
+    rule, a number the answer states must be a number a row returned
+    (spec §8, and the sibling pin
+    :func:`test_a_document_span_never_stands_in_for_an_unsupported_figure`
+    refuses the alternative), so "a figure inside the document span"
+    is not an input this acceptance may use."""
+    result = verify_citations(
+        answer=(
+            "Total net sales increased during the third quarter. "
+            f"{_CONTRACT_ROW_WIRE['summary']}. Notice period 30 days."
+        ),
+        evidence=[
+            _evidence("Total net sales increased during the third quarter."),
+            _row_evidence(_contract_row()),
+        ],
+        repair_count=0,
+        known_document_ids=KNOWN_IDS_DEFAULT,
+    )
+
+    assert isinstance(result, DoneResult), result
+    assert [c.kind for c in result.citations] == [
+        DATABASE_ROW_KIND,
+        COMPANY_KIND,
+    ]
+
+
+def test_the_document_and_attachment_legs_are_unchanged_by_the_row_rule() -> None:
+    """Adding a third kind changed nothing for the two document kinds:
+    the same evidence, the same answers and the same outcomes as before.
+
+    The row branch is selected by WHAT the evidence is, so a run that
+    produced no row cannot enter it — this asserts that directly rather
+    than by reading the branch.
+    """
+    answer = f"Per the memo: {_MEMO_SPAN} end."
+
+    company = verify_citations(
+        answer=f"Per the filing: {_MEMO_SPAN} end.",
+        evidence=[_evidence("PREAMBLE_" + _MEMO_SPAN + "_POSTAMBLE")],
+        repair_count=0,
+        known_document_ids=KNOWN_IDS_DEFAULT,
+    )
+    attachment = verify_citations(
+        answer=answer,
+        evidence=[_memo_evidence()],
+        repair_count=0,
+        known_document_ids=set(),
+        attachment_identity_current=lambda item: True,
+    )
+
+    assert isinstance(company, DoneResult), company
+    assert [c.kind for c in company.citations] == [COMPANY_KIND]
+    assert isinstance(attachment, DoneResult), attachment
+    assert [c.kind for c in attachment.citations] == [ATTACHMENT_KIND]
+
+
+def test_an_unknown_kind_is_refused_rather_than_defaulted() -> None:
+    """A kind outside the closed set raises, and a ``database-row`` item
+    is NOT how an unknown kind reaches the document path. The two rules
+    are selected by an exact kind compare, so nothing falls through to
+    the other: an unknown kind must be refused, never defaulted into
+    either rule (ADR 0091)."""
+    with pytest.raises(MalformedEvidenceError) as exc:
+        verify_citations(
+            answer="A claim about an unknown kind of evidence.",
+            evidence=[
+                EvidenceItem(
+                    locator=_locator(),
+                    unit_text="legitimate text",
+                    kind="some-future-kind",
+                    database_row=(_contract_row(),),
+                )
+            ],
+            repair_count=0,
+            known_document_ids=KNOWN_IDS_DEFAULT,
+        )
+
+    assert exc.value.index == 0
+    assert "some-future-kind" in str(exc.value)
+
+
+def test_a_row_claim_never_falls_through_to_the_document_span_rule() -> None:
+    """A row item whose text happens to hold a long span is still not a
+    document item: an answer that quotes only the row's display line and
+    states a supported figure must not ALSO pick up a span citation
+    from the same evidence, and one that states an unsupported figure
+    must refuse rather than being rescued by a span.
+
+    The row's ``unit_text`` is the display line, which is exactly the
+    text a span match would find, so this is the overlap that would
+    exist if the two rules shared one matching path.
+    """
+    row = _contract_row()
+    result = verify_citations(
+        answer=f"{row.summary}. The notice period is 30 days.",
+        evidence=[_row_evidence(row)],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+
+    assert isinstance(result, DoneResult), result
+    assert [c.kind for c in result.citations] == [DATABASE_ROW_KIND]
+
+
+def test_a_row_kept_its_snapshot_and_the_quote_is_the_snapshot() -> None:
+    """Opening the citation shows the retained snapshot and issues no
+    query: the citation carries the row's ``fields`` and the row's own
+    ``queried_at`` as DATA, and nothing in it claims the data is still
+    the same now (spec 8.1).
+
+    The absence of any "unchanged"/"still"/"current" claim in the
+    citation is the part that is assertable here; a drift promise is
+    not something a citation is allowed to contain at all.
+    """
+    result = verify_citations(
+        answer=f"{_CONTRACT_ROW_WIRE['summary']}. Notice period 30 days.",
+        evidence=[_row_evidence(_contract_row())],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+
+    assert isinstance(result, DoneResult), result
+    citation = result.citations[0]
+    assert citation.version == "2026-03-01T09:14:22Z"
+    assert dict(citation.database_fields) == {
+        key: str(value) for key, value in _CONTRACT_ROW_WIRE["fields"].items()
+    }
+    text = " ".join(
+        [citation.quote, citation.version, citation.display]
+    ).lower()
+    for drift_promise in ("unchanged", "still", "as of today", "current"):
+        assert drift_promise not in text, drift_promise
+
+
+def test_two_rounds_produce_two_independent_citations() -> None:
+    """A refresh is a NEW query: new rows, a new time, a new evidence
+    set. It never rewrites a prior answer, so a citation from the first
+    round keeps the first round's time and fields while the second
+    round's citation carries the second round's.
+
+    This is what "the citation shows what the answer was built from"
+    means operationally: the two snapshots coexist, and nothing merges
+    them or claims they agree.
+    """
+    first = _contract_row()
+    second = DatabaseRow.from_wire(
+        {
+            **_CONTRACT_ROW_WIRE,
+            "queried_at": "2026-04-02T11:00:00Z",
+            "fields": {
+                **_CONTRACT_ROW_WIRE["fields"],
+                "notice_days": 45,
+                "notice_by": "2026-02-27",
+            },
+            "summary": (
+                "C-2291 Northwind Logistics, expires 2026-03-14, "
+                "notice by 2026-02-27"
+            ),
+        }
+    )
+
+    first_result = verify_citations(
+        answer=f"{first.summary}. Notice period 30 days.",
+        evidence=[_row_evidence(first)],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+    second_result = verify_citations(
+        answer=f"{second.summary}. Notice period 45 days.",
+        evidence=[_row_evidence(second)],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+
+    assert isinstance(first_result, DoneResult), first_result
+    assert isinstance(second_result, DoneResult), second_result
+    first_citation = first_result.citations[0]
+    second_citation = second_result.citations[0]
+    # The first answer is intact: the refresh did not rewrite it.
+    assert first_citation.version == "2026-03-01T09:14:22Z"
+    assert dict(first_citation.database_fields)["notice_days"] == "30"
+    assert second_citation.version == "2026-04-02T11:00:00Z"
+    assert dict(second_citation.database_fields)["notice_days"] == "45"
+    # And a figure from one round is unsupported in the other, which is
+    # what makes them two answers rather than one drifting fact.
+    stale = verify_citations(
+        answer=f"{second.summary}. Notice period 30 days.",
+        evidence=[_row_evidence(second)],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+    assert isinstance(stale, RefuseResult), stale
+    assert stale.reason == UNSUPPORTED_DATABASE_CLAIM
+
+
+@pytest.mark.parametrize(
+    "broken, message",
+    [
+        ({"source": ""}, "source"),
+        ({"record_key": {}}, "record_key"),
+        ({"queried_at": ""}, "queried_at"),
+    ],
+    ids=["no_source", "no_record_key", "no_queried_at"],
+)
+def test_a_row_missing_its_own_identity_is_malformed(
+    broken: dict[str, object], message: str
+) -> None:
+    """A row with no source, no key or no time states nothing the
+    citation could point at, so it raises like any other broken evidence
+    — it is not verified against an empty identity and published.
+
+    ``queried_at`` is in the list because a citation about a value that
+    moves, with no time on it, is a claim about a target that keeps
+    moving (spec 8).
+    """
+    row = _contract_row(**broken)  # type: ignore[arg-type]
+
+    with pytest.raises(MalformedEvidenceError) as exc:
+        verify_citations(
+            answer="A claim resting on a row with no identity.",
+            evidence=[_row_evidence(row)],
+            repair_count=0,
+            known_document_ids=set(),
+        )
+
+    assert exc.value.index == 0
+    assert message in str(exc.value)
+
+
+def test_a_database_item_with_no_row_is_malformed() -> None:
+    """The kind alone does not make text quotable: an item declared as a
+    row that carries no row would otherwise be verified by the document
+    span rule, which is the defaulting ADR 0091 forbids."""
+    with pytest.raises(MalformedEvidenceError) as exc:
+        verify_citations(
+            answer="A claim resting on a row item that carries no row.",
+            evidence=[
+                EvidenceItem(
+                    locator=Locator(document_id="", version="", unit=1),
+                    unit_text="legitimate text",
+                    kind=DATABASE_ROW_KIND,
+                )
+            ],
+            repair_count=0,
+            known_document_ids=set(),
+        )
+
+    assert exc.value.index == 0
+    assert "database_row" in str(exc.value)
+
+
+def test_a_row_never_borrows_the_document_id_slot() -> None:
+    """A row that also names a document is refused: naming one would
+    point the citation at a filing the ledger never read, which is the
+    same confusion as an attachment item wearing a company id."""
+    row = _contract_row()
+    item = _row_evidence(row)
+    with pytest.raises(MalformedEvidenceError) as exc:
+        verify_citations(
+            answer=f"{row.summary}. Notice period 30 days.",
+            evidence=[
+                EvidenceItem(
+                    locator=Locator(
+                        document_id="AAPL-2022Q3", version=item.locator.version, unit=1
+                    ),
+                    unit_text=item.unit_text,
+                    kind=DATABASE_ROW_KIND,
+                    database_row=item.database_row,
+                )
+            ],
+            repair_count=0,
+            known_document_ids=set(),
+        )
+
+    assert exc.value.index == 0
+    assert "document_id" in str(exc.value)
+
+
+def test_a_row_item_never_bridges_two_slices() -> None:
+    """A record is not a slice, so a row item can never join a
+    contiguous run: the offsets a ``read_source`` continuation uses are
+    the document path's, and a row has no position in a frozen unit."""
+    row = _contract_row()
+    item = _row_evidence(row, position=10, next_position=10 + len(row.summary))
+
+    result = verify_citations(
+        answer=f"{row.summary} and then some unrelated trailing prose.",
+        evidence=[item],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+
+    assert isinstance(result, DoneResult), result
+    assert [c.kind for c in result.citations] == [DATABASE_ROW_KIND]
+
+
+def test_database_row_wire_shape_survives_number_and_date_fields() -> None:
+    """The row is built from the wire a JSON adapter produces, so a
+    numeric field arrives as ``int`` and a date as text. Both must read
+    as the ledger stated them — and neither may be read as a filing
+    locator or as a different number.
+    """
+    row = DatabaseRow.from_wire(_CONTRACT_ROW_WIRE)
+
+    assert row.source == "ledger_ro.contract_expiry"
+    assert dict(row.record_key) == {"contract_id": "C-2291"}
+    assert row.queried_at == "2026-03-01T09:14:22Z"
+    assert dict(row.fields) == {
+        "counterparty": "Northwind Logistics",
+        "expiry_date": "2026-03-14",
+        "notice_days": "30",
+        "notice_by": "2026-02-12",
+    }
+    # 30 is a returned value, and 31 is not one this row returned.
+    assert row.tokens & {"30"}
+    assert not row.tokens & {"99", "31", "2291"}
+
+
+def test_id_delimiters_in_record_values_never_collide_two_records() -> None:
+    """The source id joins ``key=value`` pairs with ``,``, so a record
+    key or value that itself carries those characters must be escaped
+    at build time: without it, two different records spell ONE id and
+    the exported trail or a clicked chip opens the wrong row
+    (spec 8.0 — one id opens one record)."""
+    # ``{"k": "a=b"}`` vs ``{"k=a": "b"}`` both spelled ``v#k=a=b``
+    # before escaping existed.
+    first = format_database_row_source_id("v", {"k": "a=b"})
+    second = format_database_row_source_id("v", {"k=a": "b"})
+    assert first != second, (first, second)
+
+    # ``{"j": "1", "k": "b,c"}`` vs ``{"j": "1,k=b", "c": ...}`` —
+    # an unescaped ``,`` inside a value is a second pair to the parser.
+    third = format_database_row_source_id("v", {"j": "1", "k": "b,c"})
+    fourth = format_database_row_source_id("v", {"j": "1,k=b"})
+    assert third != fourth, (third, fourth)
+
+    # And the escape itself is injective: a literal backslash cannot
+    # imitate an escaped delimiter.
+    assert format_database_row_source_id(
+        "v", {"k": "a\\=b"}
+    ) != format_database_row_source_id("v", {"k": "a=b"})
+
+
+def test_two_records_with_delimiter_values_keep_distinct_source_ids() -> None:
+    """The same rule through the row object: two ``DatabaseRow``s whose
+    keys need escaping cite as two distinct records end to end."""
+    row_a = _contract_row(record_key={"counterparty": "A=B, Ltd"})
+    row_b = _contract_row(record_key={"counterparty": "A", "x": "B, Ltd"})
+    assert row_a.source_id != row_b.source_id
+    # Escaping lives in the ID, not in the evidence: the record key the
+    # gate verifies claims against stays the ledger's own verbatim text.
+    assert dict(row_a.record_key) == {"counterparty": "A=B, Ltd"}
+
+
+def test_a_grouped_figure_is_the_same_figure() -> None:
+    """A model may write a ledger's grouped figure either way; a
+    supported value must not be refused over its punctuation."""
+    row = _contract_row(
+        fields={**_CONTRACT_ROW_WIRE["fields"], "penalty_usd": 125000}
+    )
+
+    grouped = verify_citations(
+        answer=f"{row.summary}. The penalty is 125,000 USD.",
+        evidence=[_row_evidence(row)],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+    plain = verify_citations(
+        answer=f"{row.summary}. The penalty is 125000 USD.",
+        evidence=[_row_evidence(row)],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+
+    assert isinstance(grouped, DoneResult), grouped
+    assert isinstance(plain, DoneResult), plain
+
+
+def test_a_date_field_is_one_value_and_not_three_numbers() -> None:
+    """A ``2026-03-14`` expiry is one returned value. Read as three
+    numbers it would make a claim of "2026 contracts" supported by a
+    date, and would compare a claim about the month against hyphens."""
+    row = _contract_row()
+
+    same_date = verify_citations(
+        answer="The expiry date is 2026-03-14 per the ledger.",
+        evidence=[_row_evidence(row)],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+    year_only = verify_citations(
+        answer="The ledger shows 2026 contracts in the portfolio.",
+        evidence=[_row_evidence(row)],
+        repair_count=0,
+        known_document_ids=set(),
+    )
+
+    assert isinstance(same_date, DoneResult), same_date
+    assert isinstance(year_only, RefuseResult), year_only
+    assert year_only.reason == UNSUPPORTED_DATABASE_CLAIM

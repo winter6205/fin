@@ -1,0 +1,11 @@
+{
+  "case": "citations-empty-array",
+  "direction": "consumer",
+  "expect": "accept",
+  "refusal_code": null,
+  "payload": {
+    "evidence_schema": "fin.evidence.citation",
+    "schema_version": 1,
+    "citations": []
+  }
+}

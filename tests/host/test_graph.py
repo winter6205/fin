@@ -1316,3 +1316,119 @@ def test_default_config_keeps_boot_thinking_binding() -> None:
     )
     assert model.seen_extra_bodies
     assert all(body is None for body in model.seen_extra_bodies)
+
+
+# ----- numeric-gate fact collection: JSON content boundary -----
+
+
+def _fact_call_and_message(payload: object) -> list:
+    """One ``get_xbrl_fact`` call plus its ToolMessage carrying
+    ``payload`` (a JSON string, or raw content for the malformed
+    shapes)."""
+    from langchain_core.messages import ToolMessage
+
+    call = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "get_xbrl_fact",
+                "args": {"concept": "us-gaap:Revenues", "period": "2023-Q3"},
+                "id": "c1",
+                "type": "tool_call",
+            }
+        ],
+    )
+    content = payload if isinstance(payload, str) else json.dumps(payload)
+    return [
+        call,
+        ToolMessage(content=content, tool_call_id="c1", name="get_xbrl_fact"),
+    ]
+
+
+_FACT_LOCATOR = {
+    "document_id": "AAPL-2023Q3",
+    "version": "v-test",
+    "unit": 1,
+}
+
+
+def test_collect_fact_tool_calls_hit_row_yields_fact() -> None:
+    """Normal path: the hit-shaped ToolMessage JSON becomes one
+    ``(concept, period)`` claim and one evidenced ``Fact`` row."""
+    from fin.host.graph import _collect_fact_tool_calls
+
+    messages = _fact_call_and_message(
+        {
+            "concept": "us-gaap:Revenues",
+            "value": 89502,
+            "period": "2023-Q3",
+            "unit": "USD",
+            "scale": "",
+            "source_locator": _FACT_LOCATOR,
+        }
+    )
+    claimed, facts = _collect_fact_tool_calls(messages)
+    assert claimed == [("us-gaap:Revenues", "2023-Q3")]
+    assert [f.value for f in facts] == [89502]
+
+
+def test_collect_fact_tool_calls_non_json_content_is_dropped() -> None:
+    """Failure path: unparseable content contributes no fact but the
+    claim still stands; nothing raises inside the graph."""
+    from fin.host.graph import _collect_fact_tool_calls
+
+    messages = _fact_call_and_message("not-json")
+    claimed, facts = _collect_fact_tool_calls(messages)
+    assert claimed == [("us-gaap:Revenues", "2023-Q3")]
+    assert facts == []
+
+
+def test_tool_result_for_call_multimodal_content_is_none() -> None:
+    """Boundary: a list-content (multimodal) ToolMessage is not a JSON
+    envelope; the summarizer reads it as no result instead of raising
+    inside the graph."""
+    from langchain_core.messages import ToolMessage
+
+    from fin.host.graph import _tool_result_for_call
+
+    messages = [
+        ToolMessage(
+            content=[{"type": "text", "text": '{"filings": []}'}],
+            tool_call_id="c1",
+            name="list_files",
+        )
+    ]
+    assert _tool_result_for_call("c1", messages) is None
+
+
+def test_comparison_from_tool_message_multimodal_content_is_none() -> None:
+    """Boundary: list content with no str parts is unparseable, so the
+    reader returns its documented ``None`` (the refusal leg the
+    ``(TypeError, ValueError)`` guard now sees as ``JSONDecodeError``)
+    instead of raising inside the graph."""
+    from langchain_core.messages import ToolMessage
+
+    from fin.host.graph import comparison_from_tool_message
+
+    message = ToolMessage(
+        content=[{"type": "image", "image_url": "ignored"}],
+        tool_call_id="c1",
+        name="compare_facts",
+    )
+    assert comparison_from_tool_message(message) is None
+
+
+def test_analysis_from_tool_message_multimodal_content_is_none() -> None:
+    """Boundary: same refusal contract on the analysis reader — an
+    unparseable list-content payload yields ``None``, not an exception
+    raised inside the graph."""
+    from langchain_core.messages import ToolMessage
+
+    from fin.host.graph import analysis_from_tool_message
+
+    message = ToolMessage(
+        content=[{"type": "image", "image_url": "ignored"}],
+        tool_call_id="c1",
+        name="redline",
+    )
+    assert analysis_from_tool_message(message) is None

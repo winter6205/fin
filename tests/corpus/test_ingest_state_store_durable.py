@@ -80,9 +80,12 @@ def postgres_url() -> str:
 def clean_tables(postgres_url: str) -> Iterator[str]:
     """An empty job/audit pair, before and after the case.
 
-    Both sides because a run killed mid-case would otherwise decide the next
-    run's row counts.
+    Initialize the real store before clearing its tables so the fixture also
+    works against a fresh database/schema. Clear both sides because a run
+    killed mid-case would otherwise decide the next run's row counts.
     """
+    initializer = PostgresIngestStateStore(postgres_url)
+    initializer.close()
     _wipe(postgres_url)
     yield postgres_url
     _wipe(postgres_url)

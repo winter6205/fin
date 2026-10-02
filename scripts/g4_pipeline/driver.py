@@ -105,6 +105,12 @@ _READ_ERRORS_HINT: Final[str] = "see memory_checkpoints[].read_errors"
 # both the provenance field and the gap reason, so the two cannot drift apart.
 OOM_KILL_COUNTER_SOURCE: Final[str] = "cgroup memory.events oom_kill counter"
 
+# Ceiling on an artifact the driver will hash inside a measured run. It is the
+# rule the layout lane already used, kept so widening the hashing to the
+# table-structure weights does not start hashing the whole cache; a weight above
+# it is reported as a named gap rather than as an absent digest.
+_MAX_HASHED_ARTIFACT_BYTES: Final[int] = 2 * 1024**3
+
 
 def log(msg: str) -> None:
     """Diagnostics on stderr only - stdout carries exactly one JSON line."""
@@ -375,21 +381,41 @@ def artifact_identity(artifacts_path: Path) -> dict[str, object]:
     for path in sorted(artifacts_path.rglob("*")):
         if not path.is_file():
             continue
-        size = path.stat().st_size
-        total += size
+        stat_size = path.stat().st_size
+        total += stat_size
         count += 1
         rel = str(path.relative_to(artifacts_path))
-        # sha256 only for the layout weights that define the Heron pin; hashing
-        # the whole cache would dominate the measurement run.
-        digest = None
-        if "layout" in rel.lower() and size <= 2 * 1024**3:
-            digest = sha256_bytes(path)[1]
-        entry = {"path": rel, "bytes": size}
-        if digest:
-            entry["sha256"] = digest
-            layout.append(entry)
-        elif size > 1_000_000:
-            files.append(entry)
+        # The lane rule is unchanged from the committed records: hashed layout
+        # files go to `layout_files[]`, everything else over 1 MB to `files[]`,
+        # and the rest is walked and counted but never reported.
+        is_layout = "layout" in rel.lower()
+        hashable = stat_size <= _MAX_HASHED_ARTIFACT_BYTES
+        if not (is_layout and hashable or stat_size > 1_000_000):
+            continue
+        # Every reported artifact is hashed, not just the layout ones: a swap
+        # of tableformer_accurate.safetensors performed after the build's
+        # verify-models gate and during a measurement is otherwise invisible to
+        # the run's own record. The hashing read is the size that gets reported,
+        # so a payload replaced between the two cannot be described by a size
+        # that no longer belongs to the bytes that were hashed.
+        entry: dict[str, object] = {"path": rel, "bytes": stat_size}
+        if not hashable:
+            # An artifact too large to hash is a digest that was not measured,
+            # which is a gap with a reason and never an absent key.
+            entry["sha256"] = None
+            entry["sha256_error"] = (
+                f"artifact is {stat_size} bytes, over the "
+                f"{_MAX_HASHED_ARTIFACT_BYTES} this harness hashes"
+            )
+        else:
+            try:
+                size, digest = sha256_bytes(path)
+            except OSError as exc:
+                record_unmeasured(entry, "sha256", exc)
+            else:
+                entry["bytes"] = size
+                entry["sha256"] = digest
+        (layout if is_layout and hashable else files).append(entry)
     info["cache_total_bytes"] = total
     info["file_count"] = count
     info["files"] = files

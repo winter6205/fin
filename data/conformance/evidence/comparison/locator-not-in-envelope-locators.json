@@ -1,0 +1,81 @@
+{
+  "case": "locator-not-in-envelope-locators",
+  "direction": "consumer",
+  "expect": "refuse",
+  "refusal_code": "malformed_evidence_contract",
+  "payload": {
+    "comparison": {
+      "schema": "fin.comparison",
+      "schema_version": 1,
+      "kind": "table",
+      "axis": "period",
+      "concept": "us-gaap:Revenues",
+      "unit": "USD",
+      "scale": "millions",
+      "columns": [
+        {
+          "key": "2022-Q3-YTD",
+          "label": "2022-Q3-YTD"
+        },
+        {
+          "key": "2023-Q3-YTD",
+          "label": "2023-Q3-YTD"
+        }
+      ],
+      "rows": [
+        {
+          "key": "AAPL",
+          "label": "AAPL",
+          "kind": "issuer",
+          "cells": [
+            {
+              "row": "AAPL",
+              "column": "2023-Q3-YTD",
+              "status": "hit",
+              "value": 293787.0,
+              "display": "293,787",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2021Q3",
+                "version": "sha256:9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+                "unit": 12
+              }
+            }
+          ]
+        }
+      ],
+      "deltas": [
+        {
+          "from": {
+            "row": "AAPL",
+            "column": "2022-Q3-YTD"
+          },
+          "to": {
+            "row": "AAPL",
+            "column": "2023-Q3-YTD"
+          },
+          "absolute": 100666.0,
+          "percent": 52.13,
+          "direction": "up",
+          "display": "+100,666 (+52.13%)"
+        }
+      ],
+      "missing": [],
+      "hit_count": 2,
+      "cell_count": 2,
+      "locators": [
+        {
+          "document_id": "AAPL-2022Q3",
+          "version": "sha256:1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809",
+          "unit": 41
+        },
+        {
+          "document_id": "AAPL-2023Q3",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 43
+        }
+      ]
+    }
+  }
+}

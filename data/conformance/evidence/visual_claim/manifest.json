@@ -1,0 +1,146 @@
+{
+  "profile": "visual_claim",
+  "contract": "specs/enterprise-evidence-contract.md",
+  "cases": [
+    {
+      "case": "valid-whole-page",
+      "file": "valid-whole-page.json",
+      "direction": "consumer",
+      "expect": "accept",
+      "refusal_code": null,
+      "class": "valid"
+    },
+    {
+      "case": "valid-crop",
+      "file": "valid-crop.json",
+      "direction": "consumer",
+      "expect": "accept",
+      "refusal_code": null,
+      "class": "valid"
+    },
+    {
+      "case": "claims-empty-array",
+      "file": "claims-empty-array.json",
+      "direction": "consumer",
+      "expect": "accept",
+      "refusal_code": null,
+      "class": "empty-vs-malformed-vs-missing"
+    },
+    {
+      "case": "absent-hash",
+      "file": "absent-hash.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "wrong-type-page",
+      "file": "wrong-type-page.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "malformed-hash-prefixed",
+      "file": "malformed-hash-prefixed.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "malformed-hash-bad-hex",
+      "file": "malformed-hash-bad-hex.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "unsupported-version",
+      "file": "unsupported-version.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "unsupported_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "unsupported-schema-version",
+      "file": "unsupported-schema-version.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "unsupported_evidence_contract",
+      "class": "negative",
+      "note": "Recognized token, unsupported schema_version integer: the payload is otherwise shape-valid, so the refusal can only come from the version check (spec section 2.1) and pins that a correct token with a wrong version is unsupported_evidence_contract, not a silent default or an older parser."
+    },
+    {
+      "case": "unsupported-kind-hyphen",
+      "file": "unsupported-kind-hyphen.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "unsupported_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "crop-inverted-bounds",
+      "file": "crop-inverted-bounds.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "crop-out-of-range",
+      "file": "crop-out-of-range.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "observation-version-stale",
+      "file": "observation-version-stale.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "observation_stale",
+      "class": "negative"
+    },
+    {
+      "case": "unknown-field",
+      "file": "unknown-field.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "untrusted-attachment",
+      "file": "untrusted-attachment.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "visual_claim_trust_denied",
+      "class": "untrusted-identity",
+      "e1_decision": "E1 named the lane trust denial (spec sections 4.2/6): same family as citation_trust_denied — shape-valid is not authorized; named per-item refusal, never a silent drop."
+    },
+    {
+      "case": "overflow-detail-4001",
+      "file": "overflow-detail-4001.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "visual_claim_overflow",
+      "class": "overflow",
+      "e1_decision": "E1 named the lane overflow code (spec sections 3/6): detail over the 4,000-code-point bound reports visual_claim_overflow; refuse, never truncate."
+    },
+    {
+      "case": "overflow-claims-33",
+      "file": "overflow-claims-33.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "visual_claim_overflow",
+      "class": "overflow",
+      "e1_decision": "E1 named the lane overflow code (spec sections 3/6): more than 32 visual claims per run reports visual_claim_overflow; refuse, never truncate."
+    }
+  ]
+}

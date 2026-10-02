@@ -290,6 +290,50 @@ def test_get_thread_unknown_returns_404(client: TestClient, fresh_store) -> None
     assert r.json() == {"error": "thread_not_found"}
 
 
+def test_get_thread_store_outage_is_named_persistence_unavailable_503(
+    client: TestClient, http_app: FastAPI, fresh_store
+) -> None:
+    """Spec §6 infrastructure class at the HTTP boundary: a thread
+    store that cannot be reached is the typed 503
+    ``persistence_unavailable`` — never a bare 500, and never the empty
+    turn table that swallowing the outage would masquerade as."""
+    from fin.host.http import get_thread_store
+    from fin.host.thread_store import PersistenceUnavailableError
+
+    class _OutageStore:
+        def get_thread(self, thread_id):
+            raise PersistenceUnavailableError("store down")
+
+    http_app.dependency_overrides[get_thread_store] = lambda: _OutageStore()
+    r = client.get("/api/threads/any-id")
+    assert r.status_code == 503
+    assert r.json() == {"error": "persistence_unavailable"}
+
+
+def test_get_thread_run_list_outage_is_named_persistence_unavailable_503(
+    client: TestClient, http_app: FastAPI, fresh_store
+) -> None:
+    """The second store read of the same route: the thread exists, the
+    RUN list is unreachable — still the named 503, never a thread page
+    silently served with an empty table (§6 exception class)."""
+    from fin.host.http import get_thread_store
+    from fin.host.thread_store import PersistenceUnavailableError
+
+    thread = fresh_store.create_thread(title="t")
+
+    class _HalfOutageStore:
+        def get_thread(self, thread_id):
+            return fresh_store.get_thread(thread_id)
+
+        def list_runs(self, thread_id):
+            raise PersistenceUnavailableError("run list down")
+
+    http_app.dependency_overrides[get_thread_store] = lambda: _HalfOutageStore()
+    r = client.get(f"/api/threads/{thread.id}")
+    assert r.status_code == 503
+    assert r.json() == {"error": "persistence_unavailable"}
+
+
 def test_delete_thread_then_get_returns_404(
     client: TestClient, fresh_store
 ) -> None:
@@ -461,56 +505,84 @@ def _attachment_wire_row(**overrides: Any) -> dict[str, Any]:
     return row
 
 
-def test_citations_wire_payload_drops_an_attachment_row_without_display() -> None:
-    """A stored attachment row that lost ``display`` is dropped: it
-    must never be published as a page-labelled attachment citation."""
-    from fin.host.workspace_http import _citations_wire_payload
+def _refusal_entry(index: int, code: str) -> dict[str, Any]:
+    """One mid-stream wire refusal, shaped like the history read's
+    ``rejected_citations`` entry: original index + exact §6 code."""
+    return {"citation_index": index, "error": code}
+
+
+def test_citations_wire_projection_refuses_an_attachment_row_without_display() -> None:
+    """A stored attachment row that lost ``display`` is refused by
+    name: it must never be published as a page-labelled attachment
+    citation, and never vanish from the stream silently either."""
+    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.workspace_http import _citations_wire_projection
 
     row = _attachment_wire_row()
     del row["display"]
 
-    assert _citations_wire_payload([row]) == []
+    rows, refusals = _citations_wire_projection([row])
+
+    assert rows == []
+    assert refusals == [_refusal_entry(0, MALFORMED_EVIDENCE_CONTRACT)]
 
 
-def test_citations_wire_payload_drops_a_row_without_kind() -> None:
-    """A stored row with no ``kind`` is dropped, never silently
-    labelled ``company``."""
-    from fin.host.workspace_http import _citations_wire_payload
+def test_citations_wire_projection_refuses_a_row_without_kind() -> None:
+    """A stored row with no ``kind`` is refused by name, never
+    silently labelled ``company``."""
+    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.workspace_http import _citations_wire_projection
 
     attachment = _attachment_wire_row()
     del attachment["kind"]
     company = _company_wire_row()
     del company["kind"]
 
-    assert _citations_wire_payload([attachment, company]) == []
+    rows, refusals = _citations_wire_projection([attachment, company])
+
+    assert rows == []
+    assert refusals == [
+        _refusal_entry(0, MALFORMED_EVIDENCE_CONTRACT),
+        _refusal_entry(1, MALFORMED_EVIDENCE_CONTRACT),
+    ]
 
 
-def test_citations_wire_payload_drops_a_malformed_identity() -> None:
+def test_citations_wire_projection_refuses_a_malformed_identity() -> None:
     """An out-of-closed-set ``kind`` or ``display`` is a row that lost
-    its identity, so it is dropped rather than guessed."""
-    from fin.host.workspace_http import _citations_wire_payload
+    its identity: the closed-set break is the named unsupported code,
+    every wrong-type or broken-identity row the named malformed code."""
+    from fin.host.evidence_contract import (
+        MALFORMED_EVIDENCE_CONTRACT,
+        UNSUPPORTED_EVIDENCE_CONTRACT,
+    )
+    from fin.host.workspace_http import _citations_wire_projection
 
-    for row in (
-        _company_wire_row(kind="visual_observation"),
-        _company_wire_row(kind=""),
-        _company_wire_row(kind=["company"]),
-        _company_wire_row(display=""),
-        _company_wire_row(display="paragraph"),
-        _company_wire_row(display=None),
-        _attachment_wire_row(attachment_id=""),
-    ):
-        assert _citations_wire_payload([row]) == []
+    cases = (
+        (_company_wire_row(kind="visual_observation"), UNSUPPORTED_EVIDENCE_CONTRACT),
+        (_company_wire_row(kind=""), UNSUPPORTED_EVIDENCE_CONTRACT),
+        (_company_wire_row(kind=["company"]), MALFORMED_EVIDENCE_CONTRACT),
+        (_company_wire_row(display=""), MALFORMED_EVIDENCE_CONTRACT),
+        (_company_wire_row(display="paragraph"), MALFORMED_EVIDENCE_CONTRACT),
+        (_company_wire_row(display=None), MALFORMED_EVIDENCE_CONTRACT),
+        (_attachment_wire_row(attachment_id=""), MALFORMED_EVIDENCE_CONTRACT),
+    )
+    for row, code in cases:
+        rows, refusals = _citations_wire_projection([row])
+        assert rows == []
+        assert refusals == [_refusal_entry(0, code)]
 
 
-def test_citations_wire_payload_keeps_well_formed_rows() -> None:
+def test_citations_wire_projection_keeps_well_formed_rows() -> None:
     """The closed eight-key wire shape is unchanged for rows that do
-    carry their identity, with ``display`` read off each row."""
-    from fin.host.workspace_http import _citations_wire_payload
+    carry their identity, with ``display`` read off each row, and a
+    refused-free run leaves the refusal list empty."""
+    from fin.host.workspace_http import _citations_wire_projection
 
     company, attachment = _company_wire_row(), _attachment_wire_row()
 
-    out = _citations_wire_payload([company, attachment])
+    out, refusals = _citations_wire_projection([company, attachment])
 
+    assert refusals == []
     assert len(out) == 2
     for cit in out:
         assert set(cit.keys()) == {
@@ -529,40 +601,719 @@ def test_citations_wire_payload_keeps_well_formed_rows() -> None:
     assert out[1]["display"] == "unit"
 
 
-def test_citations_wire_payload_dict_and_dataclass_answer_identically() -> None:
+def test_citations_wire_projection_dict_and_dataclass_answer_identically() -> None:
     """One shape, one rule: the same identity read off a stored dict or
     off a ``Citation`` dataclass gives one wire dict, and a malformed
-    ``display`` drops either of them."""
+    ``display`` is the named contract refusal for either of them."""
     from dataclasses import replace
 
     from fin.host.citation_gate import Citation
-    from fin.host.workspace_http import _citations_wire_payload
+    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.workspace_http import _citations_wire_projection
 
     row = _attachment_wire_row()
 
-    assert _citations_wire_payload([Citation(**row)]) == [row]
-    assert _citations_wire_payload([_attachment_wire_row(display="paragraph")]) == []
-    assert _citations_wire_payload(
-        [replace(Citation(**row), display="paragraph")]
-    ) == []
+    rows, refusals = _citations_wire_projection([Citation(**row)])
+    assert rows == [row]
+    assert refusals == []
+
+    for source in (
+        _attachment_wire_row(display="paragraph"),
+        replace(Citation(**row), display="paragraph"),
+    ):
+        rows, refusals = _citations_wire_projection([source])
+        assert rows == []
+        assert refusals == [_refusal_entry(0, MALFORMED_EVIDENCE_CONTRACT)]
 
 
-def test_citations_wire_payload_logs_a_drop_without_the_quote(
+def test_citations_wire_projection_logs_a_refusal_without_the_quote(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The drop is visible in the log (silent loss is not) while the
-    quoted answer text stays out of it."""
+    """The named refusal is also visible in the log while the quoted
+    answer text stays out of it."""
     import logging
 
-    from fin.host.workspace_http import _citations_wire_payload
+    from fin.host.workspace_http import _citations_wire_projection
 
     row = _company_wire_row(display="paragraph")
     with caplog.at_level(logging.WARNING, logger="fin.host.workspace_http"):
-        assert _citations_wire_payload([row]) == []
+        rows, refusals = _citations_wire_projection([row])
+        assert rows == []
+        assert refusals == [_refusal_entry(0, "malformed_evidence_contract")]
 
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert warnings, "a dropped citation row must leave a WARNING"
+    assert warnings, "a refused citation row must leave a WARNING"
     assert row["quote"] not in " ".join(r.getMessage() for r in warnings)
+
+
+# ----- a ledger row on the wire -----
+
+
+def _database_row_wire_row(**overrides: Any) -> dict[str, Any]:
+    """A complete stored ledger citation, one slot overridable.
+
+    The row names NEITHER document id: a ledger row has no filing behind
+    it, and its ``version`` is the round's ``queried_at``. The retained
+    snapshot rides on ``database_row`` — that key is what opening the
+    citation reads, so it carries the row instead of a query (spec 8.1).
+    """
+    row = {
+        "kind": "database-row",
+        "document_id": "",
+        "attachment_id": "",
+        "version": "2026-03-01T09:14:22Z",
+        "unit": 1,
+        "display": "record",
+        "filename": "",
+        "quote": (
+            "C-2291 Northwind Logistics, expires 2026-03-14, "
+            "notice by 2026-02-12"
+        ),
+        "database_row": {
+            "source": "ledger_ro.contract_expiry",
+            "record_key": {"contract_id": "C-2291"},
+            "queried_at": "2026-03-01T09:14:22Z",
+            "fields": {
+                "counterparty": "Northwind Logistics",
+                "expiry_date": "2026-03-14",
+                "notice_days": "30",
+                "notice_by": "2026-02-12",
+            },
+            "summary": (
+                "C-2291 Northwind Logistics, expires 2026-03-14, "
+                "notice by 2026-02-12"
+            ),
+        },
+    }
+    row.update(overrides)
+    return row
+
+
+def _emitted_database_row(row: dict[str, Any]) -> dict[str, Any]:
+    """The expectation change a fresh wire frame carries for a valid
+    ledger row: the snapshot gains the frozen ``schema`` token and its
+    ``schema_version`` integer sibling at E5 emission (spec 2.1 rule 1 /
+    4.4 egress / section 9). Everything else stays byte-equal, and an
+    already-versioned stored snapshot is passed through untouched —
+    minting never rewrites a row's own stated token."""
+    snapshot = row.get("database_row")
+    if not isinstance(snapshot, dict) or "schema" in snapshot:
+        return dict(row)
+    return {
+        **row,
+        "database_row": {
+            "schema": "fin.evidence.database_row_snapshot",
+            "schema_version": 1,
+            **snapshot,
+        },
+    }
+
+
+def test_citations_wire_projection_carries_a_rows_retained_snapshot() -> None:
+    """A row publishes with its snapshot, and opens through it.
+
+    The snapshot is the evidence the answer was built from, so the wire
+    has to carry it: a client that opened the citation must read THIS
+    row rather than re-query, and a citation whose time is a
+    ``queried_at`` always says when the value was true. The fresh frame
+    states the snapshot's versioned shape (the one added key).
+    """
+    from fin.host.workspace_http import _citations_wire_projection
+
+    row = _database_row_wire_row()
+
+    out, refusals = _citations_wire_projection([row])
+
+    assert refusals == []
+    assert out == [_emitted_database_row(row)]
+    assert out[0]["database_row"]["queried_at"] == "2026-03-01T09:14:22Z"
+    assert out[0]["database_row"]["record_key"] == {"contract_id": "C-2291"}
+
+
+def test_citations_wire_projection_leaves_document_rows_byte_identical() -> None:
+    """The third kind added an OPTIONAL key, not a ninth one: a company
+    or attachment row keeps exactly the eight keys it had before, so a
+    turn stored before this change is byte-equal to what reloads today.
+    """
+    from fin.host.workspace_http import _citations_wire_projection
+
+    company, attachment = _company_wire_row(), _attachment_wire_row()
+
+    out, refusals = _citations_wire_projection([company, attachment])
+
+    assert refusals == []
+    for cit in out:
+        assert set(cit.keys()) == {
+            "kind",
+            "document_id",
+            "attachment_id",
+            "version",
+            "unit",
+            "display",
+            "filename",
+            "quote",
+        }
+    assert out[0] == company
+    assert out[1] == attachment
+
+
+def test_citations_wire_projection_refuses_a_row_without_its_snapshot() -> None:
+    """A row that lost its snapshot is refused by name: publishing it
+    would leave a citation the client cannot open without re-querying the
+    ledger, which is the one thing opening a row may never do
+    (spec 8.1)."""
+    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.workspace_http import _citations_wire_projection
+
+    for source in (
+        _database_row_wire_row(database_row=None),
+        {k: v for k, v in _database_row_wire_row().items() if k != "database_row"},
+    ):
+        rows, refusals = _citations_wire_projection([source])
+        assert rows == []
+        assert refusals == [_refusal_entry(0, MALFORMED_EVIDENCE_CONTRACT)]
+
+
+def test_citations_wire_projection_refuses_a_row_with_an_empty_record_key() -> None:
+    """A snapshot with a source but no record key names a view without
+    naming a record, so the citation opens nothing — the named malformed
+    failure, never a silent drop."""
+    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.workspace_http import _citations_wire_projection
+
+    row = _database_row_wire_row(
+        database_row={
+            "source": "ledger_ro.contract_expiry",
+            "record_key": {},
+            "queried_at": "2026-03-01T09:14:22Z",
+            "fields": {},
+            "summary": "",
+        }
+    )
+
+    rows, refusals = _citations_wire_projection([row])
+
+    assert rows == []
+    assert refusals == [_refusal_entry(0, MALFORMED_EVIDENCE_CONTRACT)]
+
+
+def test_citations_wire_projection_refuses_a_document_row_wearing_a_snapshot() -> None:
+    """A company row carrying a ledger snapshot would show one source's
+    provenance under another's label, so it is refused rather than
+    published — the two identities must not be mixed on one row."""
+    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.workspace_http import _citations_wire_projection
+
+    row = _company_wire_row(
+        database_row=_database_row_wire_row()["database_row"]
+    )
+
+    rows, refusals = _citations_wire_projection([row])
+
+    assert rows == []
+    assert refusals == [_refusal_entry(0, MALFORMED_EVIDENCE_CONTRACT)]
+
+
+def test_citations_wire_projection_never_defaults_an_unknown_kind() -> None:
+    """The id-slot switch is a three-way exact compare, so an unknown
+    kind is refused by name instead of defaulting into the document
+    path.
+
+    The old switch was binary — ``attachment`` else ``document_id`` — so
+    a kind the host had not heard of would have been published as a
+    company citation pointing at a document id it does not have.
+    """
+    from fin.host.evidence_contract import UNSUPPORTED_EVIDENCE_CONTRACT
+    from fin.host.workspace_http import _citations_wire_projection
+
+    for source in (
+        _company_wire_row(kind="some-future-kind"),
+        _company_wire_row(kind=""),
+    ):
+        rows, refusals = _citations_wire_projection([source])
+        assert rows == []
+        assert refusals == [_refusal_entry(0, UNSUPPORTED_EVIDENCE_CONTRACT)]
+
+
+def test_citations_wire_projection_refuses_a_row_with_a_document_display() -> None:
+    """A row presents as a record. A row claiming ``page`` or ``unit``
+    would read as a document unit, which is the confusion the third
+    display value exists to prevent — named, never dropped."""
+    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.workspace_http import _citations_wire_projection
+
+    rows, refusals = _citations_wire_projection(
+        [_database_row_wire_row(display="page")]
+    )
+
+    assert rows == []
+    assert refusals == [_refusal_entry(0, MALFORMED_EVIDENCE_CONTRACT)]
+
+
+def test_citations_wire_projection_dict_and_dataclass_answer_identically_for_a_row() -> None:
+    """One shape, one rule: the same ledger row read off a stored dict
+    and off the gate's own ``Citation`` dataclass produce one wire dict.
+
+    The dataclass path is the one the live SSE stream takes, so the two
+    cannot answer differently — a stream that published a row without
+    its snapshot would be a citation no client could open. The fresh
+    frame carries the v1 snapshot token on both paths.
+    """
+    from fin.host.citation_gate import Citation, DatabaseRow
+    from fin.host.workspace_http import _citations_wire_projection
+
+    row = DatabaseRow.from_wire(
+        {
+            "source": "ledger_ro.contract_expiry",
+            "record_key": {"contract_id": "C-2291"},
+            "queried_at": "2026-03-01T09:14:22Z",
+            "fields": {"notice_days": 30, "expiry_date": "2026-03-14"},
+            "summary": (
+                "C-2291 Northwind Logistics, expires 2026-03-14, "
+                "notice by 2026-02-12"
+            ),
+        }
+    )
+    citation = Citation(
+        kind="database-row",
+        document_id="",
+        attachment_id="",
+        version=row.queried_at,
+        unit=1,
+        display="record",
+        filename="",
+        quote=row.summary,
+        database_source_id=row.source_id,
+        database_source=row.source,
+        database_record_key=row.record_key,
+        database_fields=row.fields,
+    )
+
+    out, refusals = _citations_wire_projection([citation])
+
+    assert refusals == []
+    assert len(out) == 1
+    assert out[0]["kind"] == "database-row"
+    assert out[0]["database_row"] == {
+        "schema": "fin.evidence.database_row_snapshot",
+        "schema_version": 1,
+        "source": "ledger_ro.contract_expiry",
+        "record_key": {"contract_id": "C-2291"},
+        "queried_at": "2026-03-01T09:14:22Z",
+        "fields": {"notice_days": "30", "expiry_date": "2026-03-14"},
+        "summary": row.summary,
+    }
+    # A numeric field is text on the wire, so the snapshot the client
+    # renders says the same thing the ledger said.
+    assert out[0]["database_row"]["fields"]["notice_days"] == "30"
+
+
+def test_citations_wire_projection_logs_a_refused_row_without_the_snapshot(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A refused row leaves a WARNING naming its §6 code, and the
+    warning names the KIND only — the refused row's own field values are
+    ledger material that must not reach a log line."""
+    import logging
+
+    from fin.host.evidence_contract import UNSUPPORTED_EVIDENCE_CONTRACT
+    from fin.host.workspace_http import _citations_wire_projection
+
+    row = _database_row_wire_row()
+    with caplog.at_level(logging.WARNING, logger="fin.host.workspace_http"):
+        rows, refusals = _citations_wire_projection(
+            [row, _company_wire_row(kind="alien")]
+        )
+
+    assert rows == [_emitted_database_row(row)]
+    assert refusals == [_refusal_entry(1, UNSUPPORTED_EVIDENCE_CONTRACT)]
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings
+    assert "alien" in " ".join(r.getMessage() for r in warnings)
+    assert "Northwind Logistics" not in " ".join(r.getMessage() for r in warnings)
+
+
+def test_citations_wire_projection_keeps_an_empty_array_empty() -> None:
+    """Empty evidence keeps its defined meaning (spec 6.1): a run with
+    no citation is an empty frame with no refusal, never a failure."""
+    from fin.host.workspace_http import _citations_wire_projection
+
+    rows, refusals = _citations_wire_projection([])
+
+    assert rows == []
+    assert refusals == []
+
+
+def test_citations_wire_projection_refuses_an_oversize_frame_without_truncating() -> None:
+    """A frame beyond the §3 count bound is refused whole by name: the
+    wire never silently publishes a truncated head of the list."""
+    from fin.host.evidence_contract import CITATION_OVERFLOW, MAX_CITATIONS_PER_RUN
+    from fin.host.workspace_http import _citations_wire_projection
+
+    frame = [_company_wire_row() for _ in range(MAX_CITATIONS_PER_RUN + 1)]
+
+    rows, refusals = _citations_wire_projection(frame)
+
+    assert rows == []
+    assert refusals == [_refusal_entry(0, CITATION_OVERFLOW)]
+
+
+def test_citations_wire_projection_names_an_unserializable_row_and_serves_the_rest() -> None:
+    """A serialization failure is a named contract error, never an empty
+    success: a snapshot value the home cannot read as a JSON scalar is
+    refused, and the well-formed rows still reach the wire."""
+    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.workspace_http import _citations_wire_projection
+
+    broken = _database_row_wire_row(
+        database_row={
+            "source": "ledger_ro.contract_expiry",
+            "record_key": {"contract_id": "C-2291"},
+            "queried_at": "2026-03-01T09:14:22Z",
+            "fields": {"not_json": object()},
+            "summary": "C-2291 Northwind Logistics, expires 2026-03-14",
+        }
+    )
+
+    rows, refusals = _citations_wire_projection([broken, _company_wire_row()])
+
+    assert rows == [_company_wire_row()]
+    assert refusals == [_refusal_entry(0, MALFORMED_EVIDENCE_CONTRACT)]
+
+
+def test_citations_wire_projection_refuses_a_frame_with_an_unknown_schema_token() -> None:
+    """A snapshot that already states a version the registry has not
+    frozen is the named ``unsupported`` refusal — minting never rewrites
+    a row's own stated token.
+
+    PREMISE CHANGED (ADR 0093 decision 12). The frame used to carry the
+    token ALONE, relying on a token-only snapshot; decision 12 withdrew
+    that leniency — a record naming a ``schema`` and omitting
+    ``schema_version`` is ``malformed_evidence_contract`` and nothing may
+    back-fill the missing number. The fixture therefore now carries the
+    ATOMIC PAIR (spec §2.1 rule 1), which is what makes the token check
+    the single possible source of the refusal: with ``schema_version``
+    present the only remaining defect is the unrecognized token name, so
+    this test isolates what its own name claims instead of exiting on
+    the missing key before the token is ever read. The three legs below
+    pin the ordering this premise depends on.
+    """
+    from fin.host.evidence_contract import UNSUPPORTED_EVIDENCE_CONTRACT
+    from fin.host.workspace_http import _citations_wire_projection
+
+    row = _database_row_wire_row(
+        database_row={
+            "schema": "fin.evidence.database_row_snapshot.v2",
+            "schema_version": 1,
+            "source": "ledger_ro.contract_expiry",
+            "record_key": {"contract_id": "C-2291"},
+            "queried_at": "2026-03-01T09:14:22Z",
+            "fields": {},
+            "summary": (
+                "C-2291 Northwind Logistics, expires 2026-03-14, "
+                "notice by 2026-02-12"
+            ),
+        }
+    )
+
+    rows, refusals = _citations_wire_projection([row])
+
+    assert rows == []
+    assert refusals == [_refusal_entry(0, UNSUPPORTED_EVIDENCE_CONTRACT)]
+
+
+def test_citations_wire_projection_refuses_an_unknown_token_before_the_version_check() -> None:
+    """An UNKNOWN token beside an ABSENT version is ``malformed``, not
+    ``unsupported``.
+
+    This pins the ORDERING the pairing rule depends on, which nothing
+    else in this file states: spec §2.1 rule 1 calls the pair atomic and
+    ADR 0093 decision 12 makes the absent version a refusal of its own,
+    so a frame that is defective in BOTH ways must not report the token
+    skew. If the token check ran first, this frame would be
+    ``unsupported_evidence_contract`` and a producer with a type bug
+    would be told to fix a version skew instead (ADR 0093 decision 6:
+    neither is repaired by a guess).
+    """
+    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.workspace_http import _citations_wire_projection
+
+    row = _database_row_wire_row(
+        database_row={
+            "schema": "fin.evidence.database_row_snapshot.v2",
+            "source": "ledger_ro.contract_expiry",
+            "record_key": {"contract_id": "C-2291"},
+            "queried_at": "2026-03-01T09:14:22Z",
+            "fields": {},
+            "summary": "C-2291 Northwind Logistics, expires 2026-03-14",
+        }
+    )
+
+    rows, refusals = _citations_wire_projection([row])
+
+    assert rows == []
+    assert refusals == [_refusal_entry(0, MALFORMED_EVIDENCE_CONTRACT)]
+
+
+def test_citations_wire_projection_refuses_a_known_token_whose_version_is_absent() -> None:
+    """A RECOGNIZED token beside an ABSENT version is also
+    ``malformed``, not ``unsupported``.
+
+    Same clause, other half: the refusal must not depend on whether the
+    token would have been accepted. Spec §2.1 rule 1 and ADR 0093
+    decision 12 state the pairing as atomic and admit no back-fill, so
+    'this is the right shape' never buys the missing number a pass — an
+    ACTIVE frame may not borrow the §7 legacy rule, which is keyed on
+    the ABSENCE of ``schema`` and does not apply here.
+    """
+    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.workspace_http import _citations_wire_projection
+
+    row = _database_row_wire_row(
+        database_row={
+            "schema": "fin.evidence.database_row_snapshot",
+            "source": "ledger_ro.contract_expiry",
+            "record_key": {"contract_id": "C-2291"},
+            "queried_at": "2026-03-01T09:14:22Z",
+            "fields": {},
+            "summary": "C-2291 Northwind Logistics, expires 2026-03-14",
+        }
+    )
+
+    rows, refusals = _citations_wire_projection([row])
+
+    assert rows == []
+    assert refusals == [_refusal_entry(0, MALFORMED_EVIDENCE_CONTRACT)]
+
+
+def test_citations_wire_projection_refuses_a_known_token_at_an_unsupported_version() -> None:
+    """A RECOGNIZED token carrying a well-formed integer that is not the
+    current version is ``unsupported``.
+
+    This is the positive half of the same ordering: once the pair is
+    complete, the version rule is reachable and the skew is named as the
+    skew. Spec §2.1 rule 3 and ADR 0093 decisions 6 and 7 reserve
+    ``unsupported_evidence_contract`` for a recognized name carrying an
+    unsupported version INTEGER, and split that from the ``malformed``
+    a wrong TYPE gets — so a frame defective only in its version integer
+    must not be filed as malformed.
+    """
+    from fin.host.evidence_contract import UNSUPPORTED_EVIDENCE_CONTRACT
+    from fin.host.workspace_http import _citations_wire_projection
+
+    row = _database_row_wire_row(
+        database_row={
+            "schema": "fin.evidence.database_row_snapshot",
+            "schema_version": 2,
+            "source": "ledger_ro.contract_expiry",
+            "record_key": {"contract_id": "C-2291"},
+            "queried_at": "2026-03-01T09:14:22Z",
+            "fields": {},
+            "summary": "C-2291 Northwind Logistics, expires 2026-03-14",
+        }
+    )
+
+    rows, refusals = _citations_wire_projection([row])
+
+    assert rows == []
+    assert refusals == [_refusal_entry(0, UNSUPPORTED_EVIDENCE_CONTRACT)]
+
+
+class _CitationStampingGraph:
+    """The real scripted graph with the citation channel stamped on.
+
+    Same seam the visual-lane file's proxy uses: filling
+    ``state["citations"]`` with a corrupt row through the real gate would
+    take another file's verifier contract, and this pin owns only what
+    the HTTP surface does with the rows it is handed. Everything else —
+    locks, checkpoints, finalization — stays the real graph's behaviour.
+    """
+
+    def __init__(self, inner: Any, citations: Any) -> None:
+        self._inner = inner
+        self.citations = citations
+
+    def stream(self, input: Any, config: dict | None = None, **kwargs: Any):
+        for mode, payload in self._inner.stream(input, config=config, **kwargs):
+            if mode == "values" and isinstance(payload, dict):
+                payload = {**payload, "citations": self.citations}
+            yield mode, payload
+
+    def invoke(self, input: Any, config: dict | None = None, **kwargs: Any):
+        result = self._inner.invoke(input, config=config, **kwargs)
+        if isinstance(result, dict):
+            return {**result, "citations": self.citations}
+        return result
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def test_send_message_status_frame_declares_the_evidence_channel(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """The terminal status object is where the response declares its
+    evidence channel once (spec 2.2): ``evidence_schema`` rides the
+    status frame itself, never a wrapper around the citations array."""
+    from fin.host.http import get_graph
+
+    answer = f"Per the filing: {aapl_page1_text[:80]}"
+    g = _install_graph(http_app, _read_then_answer_script(answer))
+    http_app.dependency_overrides[get_graph] = lambda: g
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    events = _post_message(client, created["id"], "What was AAPL net sales?")
+
+    status_event = next(d for n, d in events if n == "status")
+    assert status_event["evidence_schema"] == "fin.evidence.citation"
+
+
+def test_get_thread_history_envelope_declares_the_evidence_channel(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """A history GET is the same frozen channel as the live stream: the
+    response envelope states ``evidence_schema`` once, so a client
+    decodes the turns' citations against a named version instead of a
+    guess."""
+    from fin.host.http import get_graph
+
+    answer = f"Per the filing: {aapl_page1_text[:80]}"
+    _install_graph(http_app, _read_then_answer_script(answer))
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    _post_message(client, created["id"], "What was AAPL net sales?")
+
+    detail = client.get(f"/api/threads/{created['id']}").json()
+    assert detail["evidence_schema"] == "fin.evidence.citation"
+
+
+def test_history_citation_rows_carry_the_exact_stream_key_set(
+    client: TestClient, fresh_store
+) -> None:
+    """Reload reads like live (the browser-run bug): a stored company
+    row must NOT come back carrying ``database_row: null`` on the history
+    GET, because the SSE stream omits the key entirely and the web
+    decoder refuses any non-ledger row that carries it. ONE omission
+    rule, one owner: for every citation kind the history dict and the
+    stream projection dict have EXACTLY the same keys — absent for
+    company / attachment rows, present-and-non-null for a ledger row.
+    """
+    from fin.host.thread_store import RunRecord
+    from fin.host.workspace_http import _citations_wire_projection
+
+    stored = [_company_wire_row(), _attachment_wire_row(), _database_row_wire_row()]
+    thread = fresh_store.create_thread(title="reload")
+    fresh_store.append_run(
+        RunRecord(
+            id="r-1",
+            thread_id=thread.id,
+            question="q",
+            status="done",
+            answer="a",
+            citations=[dict(row) for row in stored],
+        )
+    )
+
+    stream_rows, stream_refusals = _citations_wire_projection(stored)
+    assert stream_refusals == []
+    detail = client.get(f"/api/threads/{thread.id}").json()
+    history_rows = detail["turns"][0]["citations"]
+
+    assert len(history_rows) == len(stream_rows)
+    for position, (history, stream) in enumerate(zip(history_rows, stream_rows)):
+        assert set(history.keys()) == set(stream.keys()), (
+            f"row {position}: history and stream must emit one key set"
+        )
+    assert "database_row" not in history_rows[0]
+    assert "database_row" not in history_rows[1]
+    assert history_rows[2]["database_row"] is not None
+    assert detail["turns"][0]["rejected_citations"] == []
+
+
+def test_send_message_refused_citation_rides_its_own_named_frame(
+    client: TestClient, fresh_store, http_app: FastAPI, aapl_page1_text: str
+) -> None:
+    """A row the wire cannot publish neither vanishes nor blanks the
+    run: the stream names it on a dedicated ``evidence_refusals`` frame
+    BEFORE the terminal ``citations`` frame (which closes the reader),
+    the good rows still publish, and the run still completes.
+
+    The frame is NEW vocabulary, so today's web reader skips it (its
+    switch defaults on unknown events); E6 gives it a decoder.
+    """
+    from fin.host.citation_gate import Citation
+    from fin.host.evidence_contract import MALFORMED_EVIDENCE_CONTRACT
+    from fin.host.http import get_graph
+
+    answer = f"Per the filing: {aapl_page1_text[:80]}"
+    inner = _install_graph(http_app, _read_then_answer_script(answer))
+    good, corrupt = (
+        Citation(**_company_wire_row()),
+        Citation(**_company_wire_row(display="paragraph")),
+    )
+    http_app.dependency_overrides[get_graph] = (
+        lambda: _CitationStampingGraph(inner, [good, corrupt])
+    )
+
+    created = client.post("/api/threads", json={"first_message": "q"}).json()
+    events = _post_message(client, created["id"], "What was AAPL net sales?")
+
+    names = [name for name, _ in events]
+    assert names[-1] == "citations"
+    assert names.index("evidence_refusals") == len(names) - 2
+    refusal_frame = events[names.index("evidence_refusals")][1]
+    assert refusal_frame == {
+        "refusals": [{"citation_index": 1, "error": MALFORMED_EVIDENCE_CONTRACT}]
+    }
+    citations_event = events[names.index("citations")][1]
+    assert citations_event == [_company_wire_row()]
+    assert next(d for n, d in events if n == "status")["status"] == "done"
+
+
+_HTTP_SSE_CONFORMANCE = (
+    Path(__file__).resolve().parents[2]
+    / "data"
+    / "conformance"
+    / "evidence"
+    / "http_sse"
+)
+
+
+def test_committed_http_sse_conformance_example_matches_the_emitter() -> None:
+    """E5 acceptance: the one committed HTTP/SSE frame-sequence example
+    under ``data/conformance/evidence/http_sse/`` is LIVE, not prose —
+    feeding its ``input_citations`` through the wire projection must
+    reproduce the published ``emitted_frames`` exactly (rows, snapshot
+    schema mint, terminal status envelope, mid-stream refusal frame).
+
+    the tracked change consumes this example without copying an independently defined
+    schema; a test that only re-reads the JSON would let the emitter
+    drift, so the fixture's payload IS the projection input here.
+    """
+    case = json.loads(
+        (_HTTP_SSE_CONFORMANCE / "valid-terminal-frames.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    manifest = json.loads(
+        (_HTTP_SSE_CONFORMANCE / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert [entry["case"] for entry in manifest["cases"]] == [case["case"]]
+
+    payload = case["payload"]
+    assert payload["evidence_schema"] == "fin.evidence.citation"
+
+    from fin.host.workspace_http import _citations_wire_projection
+
+    rows, refusals = _citations_wire_projection(payload["input_citations"])
+
+    frames = {frame["event"]: frame["data"] for frame in payload["emitted_frames"]}
+    assert rows == frames["citations"]
+    assert refusals == frames["evidence_refusals"]["refusals"]
+    # The envelope token rides the status frame, and the citations frame
+    # stays a plain array (never a wrapper) — the carrier rule of plan E5.
+    assert isinstance(frames["citations"], list)
+    assert frames["status"]["evidence_schema"] == payload["evidence_schema"]
 
 
 def test_send_message_refuse_unknown_locator_emits_status_refuse_and_empty_citations(
@@ -4133,7 +4884,9 @@ def test_a_pre_migration_citation_row_still_reads_in_the_turn_table() -> None:
     old shape. The history door validates them through ``TurnRow``, and one
     row that cannot validate answers the whole thread's history with a 500 —
     the operator loses every turn in the thread over one stale row. This
-    pins the tolerance the ``kind`` / ``display`` defaults already declare.
+    pins the frozen v0 projection instead of the retired permissive defaults:
+    the stored ``page`` reads into the ``unit`` slot as its identity map
+    (spec §7.1), so the row states its ordinal rather than a sentinel 0.
     """
     from fin.host.workspace_http import CitationPayload, TurnRow
 
@@ -4145,7 +4898,7 @@ def test_a_pre_migration_citation_row_still_reads_in_the_turn_table() -> None:
     }
 
     citation = CitationPayload(**legacy)
-    assert citation.unit == 0, "a legacy row reads unit 0, never a crash"
+    assert citation.unit == 4, "a legacy page-era row reads its stored ordinal"
     # The display default keeps a legacy company row presented as a page,
     # which is what it was before the rename.
     assert citation.display == "page"

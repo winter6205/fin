@@ -1,0 +1,9 @@
+{
+  "case": "transport-error",
+  "direction": "consumer",
+  "expect": "refuse",
+  "refusal_code": "retrieve_unavailable",
+  "payload": {
+    "error": "retrieve_unavailable"
+  }
+}

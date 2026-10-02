@@ -1,0 +1,25 @@
+{
+  "case": "valid-attachment-locator",
+  "direction": "consumer",
+  "expect": "accept",
+  "refusal_code": null,
+  "payload": {
+    "business_fields": [
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "kind": "attachment",
+          "attachment_id": "att-7401",
+          "version": "17",
+          "unit": 4
+        },
+        "original_value": "USD 1,250.00",
+        "normalized_text": "1250.00",
+        "status": "extracted"
+      }
+    ]
+  }
+}

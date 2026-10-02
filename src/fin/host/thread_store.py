@@ -30,6 +30,12 @@ keeps each lifecycle explicit.
 The default selector :func:`default_thread_store` mirrors the
 existing ``compile_for_runtime`` pattern: read
 ``FIN_CHECKPOINT_URL`` from the environment and pick accordingly.
+
+Known debt (review note, deliberate deferral — see spec §9): this
+module carries both store backends plus the §7 replay projection and
+the durable-write evidence guard in one file (1,200+ lines). The
+Session-E changes are localized on purpose; a backend/guard split is a
+standalone refactor so its diff never mixes with contract work.
 """
 
 from __future__ import annotations
@@ -37,11 +43,39 @@ from __future__ import annotations
 import copy
 import threading
 import uuid
+from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Literal, Protocol
+from typing import Any, Iterator, Literal, Protocol
 
 import psycopg
+
+from fin.host.citation_gate import COMPANY_KIND, DATABASE_ROW_KIND
+from fin.host.evidence_contract import (
+    CITATION_CHANNEL_SCHEMA,
+    CITATION_OVERFLOW,
+    CITATION_SNAPSHOT_KEY,
+    DATABASE_ROW_OVERFLOW,
+    EVIDENCE_SCHEMA_VERSION,
+    EVIDENCE_SCHEMA_VERSION_FIELD,
+    AdmissionContext,
+    VISUAL_CLAIM_OVERFLOW,
+    seed_context_from_rows,
+    validate_evidence,
+)
+from fin.host.visual_evidence import VISUAL_CLAIM_FIELDS, VISUAL_EVIDENCE_KIND
+
+# WHY the §7 frozen-shape grace at the durable write does NOT cover these:
+# the legacy-shapes escape exists for a pre-cutover writer's STRUCTURE
+# (absent kind defaulting, the page->unit rename) — the §2.3 nearest-older-
+# parser concern. A §3 content bound (quote length, snapshot size, visual
+# detail size) applied to every writer generation, so a row that is
+# shape-legal yet over-bound is corruption the guard must stop HERE, not
+# smuggle into the JSONB column for every later replay to re-refuse.
+_SHAPE_GRACE_EXCEPTIONS: frozenset[str] = frozenset(
+    {CITATION_OVERFLOW, DATABASE_ROW_OVERFLOW, VISUAL_CLAIM_OVERFLOW}
+)
 
 
 # ----- typed errors -----
@@ -58,6 +92,134 @@ class ThreadNotFoundError(ThreadStoreError):
     operations that REQUIRE an existing row (append_run, list_runs,
     delete_thread) so misconfigured routes fail loudly.
     """
+
+
+class PersistenceUnavailableError(ThreadStoreError):
+    """The store itself could not be read or written.
+
+    Distinct from every contract failure: the evidence may be perfectly
+    well-shaped and the database still be down. Spec §6 names this
+    outcome ``persistence_unavailable`` so an outage is never a bare
+    driver crash, and never silently served as empty history.
+    """
+
+    code = "persistence_unavailable"
+
+
+class EvidenceContractWriteError(ThreadStoreError):
+    """Outgoing evidence matched neither the v1 channel nor the frozen
+    legacy shape, so it is refused BEFORE durable storage.
+
+    The code carried from the validator names which contract failed; a
+    corrupt row never reaches the JSONB column to be replayed later.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+# ----- the frozen legacy (v0) citation shape -----
+
+# The nine names a stored v0 citation row may carry: the eight slots the
+# wire knows plus the pre-rename ``page`` key still living in old JSONB
+# rows. Any key outside this set is corruption, not an older generation.
+_V0_CITATION_NAMES: frozenset[str] = frozenset(
+    {
+        "kind",
+        "document_id",
+        "attachment_id",
+        "version",
+        "unit",
+        "display",
+        "filename",
+        "quote",
+        "page",
+    }
+)
+
+# The eight slots every decoded citation must end up filling.
+_V0_CITATION_SLOTS: tuple[str, ...] = (
+    "kind",
+    "document_id",
+    "attachment_id",
+    "version",
+    "unit",
+    "display",
+    "filename",
+    "quote",
+)
+
+
+def project_stored_citation(row: Any) -> dict[str, Any] | None:
+    """Match one untrusted stored row against the frozen v0 shape.
+
+    Stored citation rows span three real writer generations and no
+    migration was ever shipped, so a replay read cannot take JSONB
+    content on faith. A row is v0-valid iff its keys are a subset of
+    the nine names, it carries ``document_id``, ``version`` and
+    ``quote``, and EXACTLY ONE of ``unit`` or ``page`` names its
+    ordinal — both is a contradiction, neither is corruption. The
+    defaults are then frozen facts of that shape: an absent ``kind``
+    reads as the document kind (legal only while no lane marker rides
+    the row, which is what keeps this from being the forbidden
+    row→citation coercion), a ``page`` maps identically into ``unit``,
+    an absent ``display`` reads as ``page``, and absent
+    ``attachment_id`` / ``filename`` read as ``""``.
+
+    A row carrying the ``database_row`` lane marker is not a v0
+    candidate at all: it passes through unchanged only when it already
+    states the row kind and fills every slot — historical snapshots
+    keep their original values, and defaulting a marked row would let
+    a ledger record pose as a filing citation.
+
+    ``None`` means the row matches no frozen shape. The caller keeps it
+    verbatim so the read boundary refuses it per-record — visible,
+    typed, never defaulted and never dropped.
+    """
+    if not isinstance(row, Mapping) or not row:
+        return None
+    keys = frozenset(row)
+    if CITATION_SNAPSHOT_KEY in keys:
+        if not keys <= (_V0_CITATION_NAMES | {CITATION_SNAPSHOT_KEY}):
+            return None
+        if row.get("kind") != DATABASE_ROW_KIND:
+            return None
+        if any(slot not in row for slot in _V0_CITATION_SLOTS):
+            return None
+        return dict(row)
+    if not keys <= _V0_CITATION_NAMES:
+        return None
+    if any(
+        slot not in row or not isinstance(row[slot], str)
+        for slot in ("document_id", "version", "quote")
+    ):
+        return None
+    has_unit = "unit" in row
+    has_page = "page" in row
+    if has_unit == has_page:
+        return None
+    ordinal = row["unit"] if has_unit else row["page"]
+    if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 1:
+        return None
+    kind = row.get("kind", COMPANY_KIND)
+    display = row.get("display", "page")
+    attachment_id = row.get("attachment_id", "")
+    filename = row.get("filename", "")
+    if not all(
+        isinstance(value, str) for value in (kind, display, attachment_id, filename)
+    ):
+        return None
+    return {
+        "kind": kind,
+        "document_id": row["document_id"],
+        "attachment_id": attachment_id,
+        "version": row["version"],
+        "unit": ordinal,
+        "display": display,
+        "filename": filename,
+        "quote": row["quote"],
+    }
 
 
 # ----- records -----
@@ -117,7 +279,7 @@ class RunRecord:
     a values frame).
 
     T3 (enterprise-kb Focus 1): ``comparisons`` holds the
-    ``fin.comparison.v1`` envelopes this run's ``compare_facts``
+    ``fin.comparison`` envelopes this run's ``compare_facts``
     calls produced — the STRUCTURE the turn table renders as a
     table instead of re-parsing prose. Shape SSOT is
     ``fin.host.tools.compare_facts``; stored as JSONB so the
@@ -158,7 +320,7 @@ class RunRecord:
     # engine. Persisted so a reload restores the label the SPA
     # rendered live.
     status_classified: str = ""
-    # T3 (enterprise-kb Focus 1): ``fin.comparison.v1`` envelopes,
+    # T3 (enterprise-kb Focus 1): ``fin.comparison`` envelopes,
     # one per ``compare_facts`` call this run made. Nested plain
     # JSON (rows / cells / deltas / locators), not a dataclass, so
     # the JSONB round-trip is lossless without a codec.
@@ -253,13 +415,6 @@ class ThreadStore(Protocol):
         ``list_runs``) so misconfigured routes fail loudly.
         Lock covers the dict read so a concurrent
         ``delete_thread`` does not produce a torn view."""
-        ...
-
-    def update_thread_title(self, thread_id: str, *, title: str) -> ThreadRecord:
-        """Set ``title`` on the thread row; return the refreshed
-        ``ThreadRecord``. Concrete bodies live in
-        :class:`InMemoryThreadStore` and :class:`PostgresThreadStore`.
-        """
         ...
 
     def delete_thread(self, thread_id: str) -> bool:
@@ -502,7 +657,7 @@ CREATE TABLE IF NOT EXISTS fin_run (
     -- server / unknown). Empty on rows whose refusal came from
     -- the gate rather than the stream engine.
     status_classified TEXT NOT NULL DEFAULT '',
-    -- T3 (enterprise-kb Focus 1): fin.comparison.v1 envelopes from
+    -- T3 (enterprise-kb Focus 1): fin.comparison envelopes from
     -- this run's compare_facts calls. JSONB so the turn table can
     -- render structure instead of re-parsing prose.
     comparisons       JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -569,6 +724,91 @@ ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS visual_claims JSONB NOT NULL DEFAUL
 """
 
 
+# ----- durable-write evidence guard -----
+
+
+def _store_admission_context(record: "RunRecord") -> AdmissionContext:
+    """Seed the context-dependent checks from the record's own rows.
+
+    Delegates to the validator home's :func:`seed_context_from_rows` —
+    the posture (and its never-hash rule) has one authority, not one
+    copy per boundary. See that function for WHY self-seeding is right
+    at a durable-write replay.
+    """
+    return seed_context_from_rows(
+        citation_rows=record.citations,
+        visual_claim_rows=record.visual_claims,
+    )
+
+
+def _is_pre_e5_visual_row(row: Any) -> bool:
+    """The frozen legacy visual shape: exactly the fourteen keys the
+    visual-claim SSOT names, under the visual kind. Writers before the
+    schema cutover legitimately emit this today, so the durable write
+    must not refuse it."""
+    return (
+        isinstance(row, Mapping)
+        and frozenset(row) == frozenset(VISUAL_CLAIM_FIELDS)
+        and row.get("kind") == VISUAL_EVIDENCE_KIND
+    )
+
+
+def _outgoing_evidence_error(record: "RunRecord") -> "EvidenceContractWriteError | None":
+    """Validate the run's evidence at the durable boundary before storage.
+
+    Each row is first held to the home contract (spec §4.4 channel
+    rules), then — only when the home refuses it — to the frozen legacy
+    shapes §7 settles for pre-cutover writers. Admission already gates
+    fresh runs against the same rules, so this guard refuses nothing
+    today's admitted runs persisted; what it stops are corrupt or
+    out-of-set rows that would otherwise live in the JSONB column and
+    poison every later replay.
+    """
+    ctx = _store_admission_context(record)
+    for index, row in enumerate(record.citations):
+        result = validate_evidence(
+            {
+                "evidence_schema": CITATION_CHANNEL_SCHEMA,
+                EVIDENCE_SCHEMA_VERSION_FIELD: EVIDENCE_SCHEMA_VERSION,
+                "citations": [row],
+            },
+            ctx,
+        )
+        if result.accepted:
+            continue
+        # The §7 grace covers a legacy SHAPE, never a §3 content bound
+        # (see _SHAPE_GRACE_EXCEPTIONS): a shape-legal row that overflows
+        # is refused here, not persisted for every replay to re-refuse.
+        if (
+            project_stored_citation(row) is not None
+            and (result.refusal is None or result.refusal.code not in _SHAPE_GRACE_EXCEPTIONS)
+        ):
+            continue
+        if result.refusal is None:
+            # Unreachable by construction (not accepted ⇒ a typed
+            # refusal); an explicit raise keeps the invariant enforced
+            # under ``python -O`` where ``assert`` vanishes.
+            raise RuntimeError(f"citation {index}: refused outcome carries no code")
+        return EvidenceContractWriteError(
+            result.refusal.code, f"citation {index}: {result.refusal.message}"
+        )
+    for index, row in enumerate(record.visual_claims):
+        result = validate_evidence({"visual_claims": [row]}, ctx)
+        if result.accepted:
+            continue
+        if (
+            _is_pre_e5_visual_row(row)
+            and (result.refusal is None or result.refusal.code not in _SHAPE_GRACE_EXCEPTIONS)
+        ):
+            continue
+        if result.refusal is None:
+            raise RuntimeError(f"visual claim {index}: refused outcome carries no code")
+        return EvidenceContractWriteError(
+            result.refusal.code, f"visual claim {index}: {result.refusal.message}"
+        )
+    return None
+
+
 class PostgresThreadStore:
     """psycopg-backed store against the shared ``FIN_CHECKPOINT_URL``.
 
@@ -589,6 +829,25 @@ class PostgresThreadStore:
     def _connect(self) -> Any:
         return psycopg.connect(self._url)
 
+    @contextmanager
+    def _guarded(self, action: str) -> Iterator[Any]:
+        """Every public call's driver work runs through here.
+
+        A store failure the contract does not name becomes the typed
+        ``persistence_unavailable`` outcome instead of a bare driver
+        crash. FK violations keep their operation's own meaning (the
+        thread is gone) and pass through for the caller to map.
+        """
+        try:
+            with self._connect() as conn:
+                yield conn
+        except psycopg.errors.ForeignKeyViolation:
+            raise
+        except psycopg.Error as exc:
+            raise PersistenceUnavailableError(
+                f"{action}: the thread store could not be reached"
+            ) from exc
+
     @staticmethod
     def _row_to_thread(row: Any) -> ThreadRecord:
         return ThreadRecord(id=row[0], title=row[1], created_at=row[2])
@@ -605,6 +864,22 @@ class PostgresThreadStore:
         # caller cannot reach into the driver's buffer.
         # ``list_runs`` follows up with a deepcopy on the
         # outer record for full isolation.
+        stored_citations = json.loads(row[6]) if isinstance(row[6], str) else list(row[6])
+        # WHY stored evidence is untrusted here: the JSONB column keeps
+        # rows from three writer generations and a blind coercion would
+        # default a contradictory or corrupt row into looking valid. A
+        # row matching the frozen v0 shape is projected to what it
+        # names itself as; a row matching no frozen shape is kept
+        # verbatim so the read boundary refuses it per-record, never
+        # silently dropping or blanking it.
+        citations = copy.deepcopy(
+            [
+                projected
+                if (projected := project_stored_citation(entry)) is not None
+                else entry
+                for entry in stored_citations
+            ]
+        )
         return RunRecord(
             id=row[0],
             thread_id=row[1],
@@ -612,9 +887,7 @@ class PostgresThreadStore:
             status=_validate_status(row[3]),
             status_reason=row[4],
             answer=row[5],
-            citations=copy.deepcopy(
-                json.loads(row[6]) if isinstance(row[6], str) else list(row[6])
-            ),
+            citations=citations,
             thinking_text=row[7],
             tool_summaries=copy.deepcopy(
                 json.loads(row[8]) if isinstance(row[8], str) else list(row[8])
@@ -698,7 +971,7 @@ class PostgresThreadStore:
         # caller never reuses an id (id is UUID4), so the
         # simpler INSERT is sufficient; PK violation here is
         # a programmer error and surfaces as an exception.
-        with self._connect() as conn:
+        with self._guarded("create thread") as conn:
             thread_id = id or str(uuid.uuid4())
             row = conn.execute(
                 "INSERT INTO fin_thread (id, title) VALUES (%s, %s) "
@@ -706,7 +979,16 @@ class PostgresThreadStore:
                 (thread_id, title),
             ).fetchone()
             conn.commit()
-            assert row is not None
+            if row is None:
+                # An INSERT ... RETURNING that yields no row is a driver
+                # anomaly, not a contract outcome: name it as the store
+                # outage it is. WHY an explicit raise and not an assert:
+                # ``python -O`` strips asserts, and a silently-massaged
+                # None would reach ``_row_to_thread`` unpacking a wrong
+                # arity further down.
+                raise PersistenceUnavailableError(
+                    "create thread: INSERT ... RETURNING yielded no row"
+                )
             return self._row_to_thread(row)
 
     def list_threads(self) -> list[ThreadRecord]:
@@ -716,7 +998,7 @@ class PostgresThreadStore:
         # Fresh-copy semantics: each row is mapped to a new
         # ``ThreadRecord`` dataclass, so a caller cannot
         # mutate the row by mutating the return value.
-        with self._connect() as conn:
+        with self._guarded("list threads") as conn:
             rows = conn.execute(
                 "SELECT id, title, created_at FROM fin_thread "
                 "ORDER BY created_at DESC"
@@ -729,7 +1011,7 @@ class PostgresThreadStore:
         # layer translates miss to 404. Reserve the exception
         # for operations that REQUIRE an existing row
         # (``append_run`` / ``list_runs``).
-        with self._connect() as conn:
+        with self._guarded("get thread") as conn:
             row = conn.execute(
                 "SELECT id, title, created_at FROM fin_thread WHERE id = %s",
                 (thread_id,),
@@ -744,7 +1026,7 @@ class PostgresThreadStore:
         # Unknown id maps to ``ThreadNotFoundError`` so the
         # caller sees the same exception the in-memory store
         # raises (the HTTP layer translates it to 404).
-        with self._connect() as conn:
+        with self._guarded("update thread title") as conn:
             row = conn.execute(
                 "UPDATE fin_thread SET title = %s WHERE id = %s "
                 "RETURNING id, title, created_at",
@@ -766,7 +1048,7 @@ class PostgresThreadStore:
         # layer relies on the cascade to keep
         # ``GET /api/threads/{id}`` from resurrecting orphan
         # runs after a delete.
-        with self._connect() as conn:
+        with self._guarded("delete thread") as conn:
             cur = conn.execute(
                 "DELETE FROM fin_thread WHERE id = %s", (thread_id,)
             )
@@ -791,11 +1073,18 @@ class PostgresThreadStore:
         # across implementations lets the HTTP layer
         # uniformly treat it as "thread gone" without
         # branching on the underlying engine.
+        # WHY evidence is validated here, before storage: durable
+        # storage is the last point a corrupt row can be stopped
+        # cheaply. Once it is in the JSONB column every replay has to
+        # carry a refusal for it; refused here it never enters history.
         import json
 
         _validate_status(record.status)
+        refusal = _outgoing_evidence_error(record)
+        if refusal is not None:
+            raise refusal
         try:
-            with self._connect() as conn:
+            with self._guarded("append run") as conn:
                 conn.execute(
                     "INSERT INTO fin_run (id, thread_id, question, status, "
                     "status_reason, answer, citations, thinking_text, "
@@ -845,7 +1134,7 @@ class PostgresThreadStore:
         # WHY deepcopy on the returned rows: same invariant
         # as the in-memory path — caller cannot mutate
         # store state through the returned records.
-        with self._connect() as conn:
+        with self._guarded("list runs") as conn:
             exists = conn.execute(
                 "SELECT 1 FROM fin_thread WHERE id = %s", (thread_id,)
             ).fetchone()
@@ -913,7 +1202,9 @@ def default_thread_store(env: Any = None) -> ThreadStore:
 
 # Re-exported so callers can ``isinstance`` without importing psycopg.
 __all__ = [
+    "EvidenceContractWriteError",
     "InMemoryThreadStore",
+    "PersistenceUnavailableError",
     "PostgresThreadStore",
     "RunRecord",
     "RunStatus",
@@ -922,4 +1213,5 @@ __all__ = [
     "ThreadStore",
     "ThreadStoreError",
     "default_thread_store",
+    "project_stored_citation",
 ]

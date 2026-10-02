@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "fin.evidence.visual_claim",
+  "title": "Visual-claim lane element (spec 4.2, ADR 0089)",
+  "description": "One visual claim: the fourteen frozen provenance keys of VISUAL_CLAIM_FIELDS in their committed order, plus the schema token and the schema_version carrier (sixteen keys total). Trust and observation-staleness checks are context-grounded and stay with the validator home; see x-bounds.",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "kind",
+    "attachment_id",
+    "version",
+    "unit",
+    "page",
+    "observation_version",
+    "scope",
+    "provider",
+    "model_version",
+    "page_image_sha256",
+    "detail",
+    "filename",
+    "reused",
+    "outbound_calls"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": "fin.evidence.visual_claim" },
+    "schema_version": { "type": "integer", "const": 1 },
+    "kind": { "const": "visual_observation" },
+    "attachment_id": { "type": "string" },
+    "version": { "type": "string", "minLength": 1 },
+    "unit": { "type": "integer", "minimum": 1 },
+    "page": { "type": "integer", "minimum": 1 },
+    "observation_version": { "type": "integer", "minimum": 1 },
+    "scope": {
+      "type": ["null", "array"],
+      "items": { "type": ["number", "integer"] },
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "provider": { "type": "string" },
+    "model_version": { "type": "string" },
+    "page_image_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "detail": { "type": "string" },
+    "filename": { "type": "string" },
+    "reused": { "type": "boolean" },
+    "outbound_calls": { "type": "integer", "minimum": 0 }
+  },
+  "x-bounds": {
+    "scope": "normalized crop: 0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1 (spec 4.2)",
+    "detail": "4,000 code points (visual_claim_overflow)",
+    "per_run": "32 claims (lane channel bound, validator home)"
+  }
+}

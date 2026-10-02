@@ -1,0 +1,28 @@
+{
+  "case": "observation-version-stale",
+  "direction": "consumer",
+  "expect": "refuse",
+  "refusal_code": "observation_stale",
+  "payload": {
+    "visual_claims": [
+      {
+        "schema": "fin.evidence.visual_claim",
+        "schema_version": 1,
+        "kind": "visual_observation",
+        "attachment_id": "att-7401",
+        "version": "17",
+        "unit": 4,
+        "page": 4,
+        "observation_version": 1,
+        "scope": null,
+        "provider": "configured-vision",
+        "model_version": "vision-model-v1",
+        "page_image_sha256": "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "detail": "Table on page 4 lists meal caps: 75 USD per day in major cities, 55 USD elsewhere; receipts required above 25 USD.",
+        "filename": "expense-policy.pdf",
+        "reused": false,
+        "outbound_calls": 1
+      }
+    ]
+  }
+}

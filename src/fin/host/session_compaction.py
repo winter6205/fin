@@ -287,12 +287,14 @@ class OccupancyCompactor:
                 call_ids = {call["id"] for call in current.tool_calls}
                 unit: list[BaseMessage] = [current]
                 index += 1
-                while (
-                    index < len(messages)
-                    and isinstance(messages[index], ToolMessage)
-                    and messages[index].tool_call_id in call_ids
-                ):
-                    unit.append(messages[index])
+                while index < len(messages):
+                    candidate = messages[index]
+                    if not (
+                        isinstance(candidate, ToolMessage)
+                        and candidate.tool_call_id in call_ids
+                    ):
+                        break
+                    unit.append(candidate)
                     index += 1
                 units.append(unit)
             else:
@@ -303,7 +305,7 @@ class OccupancyCompactor:
     def _greedy_keep(
         self,
         units: Sequence[Sequence[BaseMessage]],
-        floor_tokens: int,
+        floor_tokens: float,
     ) -> tuple[Sequence[BaseMessage], Sequence[BaseMessage]]:
         """Pick the newest suffix of units whose total tokens <= floor_tokens.
 

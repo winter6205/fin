@@ -9,6 +9,7 @@ import type {
   ChoiceWindow,
   Citation,
   Comparison,
+  EvidenceRefusal,
   Filing,
   IngestResult,
   JobStatus,
@@ -24,7 +25,13 @@ import type {
   WorkspaceStatus,
 } from "./types";
 import { parseChoiceWindow } from "./choiceWindow";
-import { parseComparison } from "./comparison";
+import { decodeComparison } from "./comparison";
+import {
+  decodeCitationsArray,
+  decodeEvidenceRefusalsFrame,
+  decodeEvidenceSchemaField,
+  decodeThreadDetail,
+} from "./evidenceContract";
 import { threadAttachmentUrl } from "./sourceLocator";
 import { parseVisualClaimFrame } from "./visualClaims";
 import { parseWorkspaceStatus } from "./knowledgeMcp";
@@ -76,7 +83,13 @@ export async function getThread(threadId: string): Promise<ThreadDetail> {
   // 缺 / 坏 boot. Surfacing it as a plain 404 would tell the operator
   // the thread is gone when it is not (ADR 0051).
   if (res.status === 409) throw await threadConflictError(res);
-  return jsonOrThrow<ThreadDetail>(res);
+  // E6: the history body is ``unknown`` at runtime — strict tsc types
+  // are compile-time only and never satisfy a decode (spec §6 web row).
+  // The blind ``jsonOrThrow<ThreadDetail>`` cast is replaced by the
+  // evidence guards: citation rows decode, ``rejected_citations`` rows
+  // become visible refusals, and an unknown envelope token names its
+  // class instead of serving an empty success.
+  return decodeThreadDetail(await jsonOrThrow<unknown>(res));
 }
 
 export async function deleteThread(threadId: string): Promise<void> {
@@ -198,6 +211,10 @@ export interface SendResult {
   status: "done" | "refuse" | "step_cap";
   reason?: string | null;
   citations: Citation[];
+  // E6 (spec §6 web row): this run's per-row evidence refusals — the
+  // decoded ``evidence_refusals`` frame entries plus anything a runtime
+  // decode refused at this boundary. Visible, named, never a silent drop.
+  evidence_refusals: EvidenceRefusal[];
   answerText: string;
   // T2: ordinary-person copy from the SSE ``status`` frame
   // (non-empty only on refuse / step_cap).
@@ -257,6 +274,12 @@ export type SendEvent =
     }
   | { type: "answer"; text: string; reset?: boolean }
   | { type: "citations"; citations: Citation[] }
+  // E6 (the tracked change): the run's named per-row evidence refusals. New
+  // event vocabulary minted at E5 — ``{"refusals": [{citation_index,
+  // error}]}`` emitted BEFORE the terminal ``citations`` frame, which
+  // closes the reader — entry shape mirroring the history read's
+  // ``rejected_citations`` so stream and history fill one field.
+  | { type: "evidence_refusals"; refusals: EvidenceRefusal[] }
   // The run's visual-claim rows, emitted on their OWN event after
   // the answer frames and before the terminal ``citations`` event (and
   // repeated on the GET history row). Provenance only — the row carries
@@ -410,6 +433,7 @@ export async function sendMessage(
       run_id: crypto.randomUUID(),
       status: "done",
       citations: [],
+      evidence_refusals: [],
       answerText: "",
       assistantMessage: "",
       comparisons: [],
@@ -447,6 +471,7 @@ async function consumeSseStream(
     status: "done",
     reason: null,
     citations: [],
+    evidence_refusals: [],
     answerText: "",
     assistantMessage: "",
     comparisons: [],
@@ -552,6 +577,10 @@ async function consumeSseStream(
             track?: unknown;
             track_decision?: unknown;
             status_classified?: string;
+            // E5 declares the citation channel once on the terminal
+            // status frame ("fin.evidence.citation" + its schema_version).
+            evidence_schema?: unknown;
+            schema_version?: unknown;
           };
           result.status = s.status;
           result.reason = s.reason ?? null;
@@ -563,6 +592,29 @@ async function consumeSseStream(
             result.track_decision = trackDecision;
           const classified = parseStreamErrorKind(s.status_classified) ?? "";
           if (classified) result.status_classified = classified;
+          // E5 declares the citation channel once on the terminal status
+          // frame. A token this client cannot name is the unsupported
+          // class — visible as a refusal (§2.3: never the nearest older
+          // parser), while an absent token is a pre-E5 peer and leaves
+          // the rows to the per-row guards below.
+          const envelope = decodeEvidenceSchemaField(
+            s.evidence_schema,
+            s.schema_version,
+          );
+          if (envelope === "unsupported" || envelope === "malformed") {
+            const envelopeRefusal: EvidenceRefusal = {
+              citation_index: 0,
+              error:
+                envelope === "unsupported"
+                  ? "unsupported_evidence_contract"
+                  : "malformed_evidence_contract",
+            };
+            result.evidence_refusals.push(envelopeRefusal);
+            emit({
+              type: "evidence_refusals",
+              refusals: [envelopeRefusal],
+            });
+          }
           if (typeof s.run_id === "string" && s.run_id.length > 0) {
             result.run_id = s.run_id;
           }
@@ -579,10 +631,40 @@ async function consumeSseStream(
           });
           break;
         }
-        case "citations":
-          result.citations = payload as SendResult["citations"];
-          emit({ type: "citations", citations: result.citations });
+        case "citations": {
+          // E6: the old ``payload as Citation[]`` blind cast is replaced
+          // by the runtime guard (spec §6 web-decode row). A row this
+          // boundary cannot decode keeps its frame index and surfaces as
+          // a visible named refusal — never a silent drop, a coercion,
+          // or a shortened frame presented as success. The server-side
+          // refusal lane (E5) already split refused rows onto the
+          // ``evidence_refusals`` event; the cast rule from the E5
+          // carrier notes (a plain-array payload) still holds.
+          const frame = decodeCitationsArray(payload);
+          result.citations = frame.citations;
+          result.evidence_refusals = result.evidence_refusals.concat(
+            frame.refusals,
+          );
+          emit({ type: "citations", citations: frame.citations });
+          if (frame.refusals.length > 0)
+            emit({ type: "evidence_refusals", refusals: frame.refusals });
           break;
+        }
+        case "evidence_refusals": {
+          // E5 vocabulary, E6 decoder: ``{"refusals": [{citation_index,
+          // error}]}``, arriving BEFORE the terminal citations frame. An
+          // empty list is defined-empty (§6.1 empty row) — it is not a
+          // failure and not a missing channel. A malformed entry stays
+          // visible as its own named malformed refusal.
+          const refusals = decodeEvidenceRefusalsFrame(payload);
+          if (refusals.length > 0) {
+            result.evidence_refusals = result.evidence_refusals.concat(
+              refusals,
+            );
+            emit({ type: "evidence_refusals", refusals });
+          }
+          break;
+        }
         case "visual_claims": {
           // The run's visual-claim rows arrive on their own event,
           // after the answer frames and BEFORE the terminal ``citations``
@@ -596,15 +678,21 @@ async function consumeSseStream(
           break;
         }
         case "comparison": {
-          // T3: one ``fin.comparison.v1`` envelope. Parsed at this
-          // boundary (the wire is ``unknown``) so a payload from a
-          // future schema renders nothing instead of a half-drawn
-          // table; the frame is skipped exactly like a malformed
-          // one.
-          const comparison = parseComparison(payload);
-          if (comparison !== null) {
-            result.comparisons.push(comparison);
-            emit({ type: "comparison", comparison });
+          // T3: decode the envelope at the wire boundary. A rejected
+          // comparison follows the same named-refusal lane as other
+          // runtime evidence failures, rather than vanishing as an
+          // empty table.
+          const outcome = decodeComparison(payload);
+          if (outcome.status === "ok") {
+            result.comparisons.push(outcome.comparison);
+            emit({ type: "comparison", comparison: outcome.comparison });
+          } else {
+            const refusal: EvidenceRefusal = {
+              citation_index: 0,
+              error: outcome.error,
+            };
+            result.evidence_refusals.push(refusal);
+            emit({ type: "evidence_refusals", refusals: [refusal] });
           }
           break;
         }
@@ -716,6 +804,7 @@ export async function resumeThread(
       run_id: crypto.randomUUID(),
       status: "done",
       citations: [],
+      evidence_refusals: [],
       answerText: "",
       assistantMessage: "",
       comparisons: [],

@@ -400,7 +400,7 @@ const TurnView = memo(function TurnView({
       ) : null}
       {comparisons.map((comparison, i) => (
         <ComparisonTable
-          key={`${comparison.tool_call_id ?? "compare"}-${i}`}
+          key={`comparison-${i}`}
           comparison={comparison}
         />
       ))}
@@ -431,6 +431,7 @@ const TurnView = memo(function TurnView({
             <AnswerWithCitations
               answer={turn.answer}
               citations={turn.citations}
+              refusals={turn.evidence_refusals ?? []}
             />
           ) : null}
           {/* T2 spec SC67: refuse / step_cap turns show the

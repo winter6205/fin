@@ -1,0 +1,80 @@
+{
+  "purpose": "Canonical-JSON digest inputs for the stored database-snapshot identity rule (E1 spec section 4.4, ADR 0092). The fin consumer mints snapshot_digest = sha256:<hex of sha256(canonical_json(m))> at admission; the producer never sends a digest. The producer can reproduce each digest from identity_input_m + canonical_json without any fin code.",
+  "text_rendering_rule": "strings as-is; numbers as shortest round-trip decimal; booleans as lowercase true/false; null as the empty string; object keys sorted lexicographically at every level; separators ',' and ':'; UTF-8, ensure_ascii false.",
+  "snapshots": [
+    {
+      "case": "database_row/digest-carrier-valid",
+      "raw_ingress_snapshot": {
+        "source": "ledger_ro.contract_expiry",
+        "record_key": {
+          "contract_id": "C-2291"
+        },
+        "queried_at": "2026-03-01T09:14:22Z",
+        "fields": {
+          "counterparty": "Northwind Logistics",
+          "expiry_date": "2026-03-14",
+          "notice_days": 30,
+          "notice_by": "2026-02-12"
+        },
+        "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+      },
+      "identity_input_m": {
+        "source": "ledger_ro.contract_expiry",
+        "record_key": {
+          "contract_id": "C-2291"
+        },
+        "queried_at": "2026-03-01T09:14:22Z",
+        "fields": {
+          "counterparty": "Northwind Logistics",
+          "expiry_date": "2026-03-14",
+          "notice_by": "2026-02-12",
+          "notice_days": "30"
+        },
+        "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+      },
+      "canonical_json": "{\"fields\":{\"counterparty\":\"Northwind Logistics\",\"expiry_date\":\"2026-03-14\",\"notice_by\":\"2026-02-12\",\"notice_days\":\"30\"},\"queried_at\":\"2026-03-01T09:14:22Z\",\"record_key\":{\"contract_id\":\"C-2291\"},\"source\":\"ledger_ro.contract_expiry\",\"summary\":\"C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12\"}",
+      "snapshot_digest": "sha256:be4d128329663df4526a766b24c4eea183dc32497b53e88fe418516d684a7c44"
+    },
+    {
+      "case": "database_row/valid-ingress-envelope row 2 (recomputable reference for scalar text rules, boolean true -> 'true', null -> '')",
+      "raw_ingress_snapshot": {
+        "source": "ledger_ro.contract_expiry",
+        "record_key": {
+          "contract_id": "C-2377"
+        },
+        "queried_at": "2026-03-01T09:14:22Z",
+        "fields": {
+          "counterparty": "Pacific Retail Group",
+          "expiry_date": "2026-04-02",
+          "notice_days": 15,
+          "active": true,
+          "credit_note": null
+        },
+        "summary": "C-2377 Pacific Retail Group, expires 2026-04-02"
+      },
+      "identity_input_m": {
+        "source": "ledger_ro.contract_expiry",
+        "record_key": {
+          "contract_id": "C-2377"
+        },
+        "queried_at": "2026-03-01T09:14:22Z",
+        "fields": {
+          "active": "true",
+          "counterparty": "Pacific Retail Group",
+          "credit_note": "",
+          "expiry_date": "2026-04-02",
+          "notice_days": "15"
+        },
+        "summary": "C-2377 Pacific Retail Group, expires 2026-04-02"
+      },
+      "canonical_json": "{\"fields\":{\"active\":\"true\",\"counterparty\":\"Pacific Retail Group\",\"credit_note\":\"\",\"expiry_date\":\"2026-04-02\",\"notice_days\":\"15\"},\"queried_at\":\"2026-03-01T09:14:22Z\",\"record_key\":{\"contract_id\":\"C-2377\"},\"source\":\"ledger_ro.contract_expiry\",\"summary\":\"C-2377 Pacific Retail Group, expires 2026-04-02\"}",
+      "snapshot_digest": "sha256:1fbd350ea088dd6fa3667472e5757f7d28f3d9d4a4e015f2d4bdab051517fc90"
+    },
+    {
+      "case": "database_row/digest-carrier-mismatch",
+      "note": "same identity_input_m as digest-carrier-valid; the carrier digest differs from the recomputation in its last hex char and must be refused as malformed_evidence_contract.",
+      "carrier_snapshot_digest": "sha256:be4d128329663df4526a766b24c4eea183dc32497b53e88fe418516d684a7c40",
+      "recomputed_digest": "sha256:be4d128329663df4526a766b24c4eea183dc32497b53e88fe418516d684a7c44"
+    }
+  ]
+}

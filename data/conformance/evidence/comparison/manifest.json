@@ -1,0 +1,96 @@
+{
+  "profile": "comparison",
+  "contract": "specs/enterprise-evidence-contract.md",
+  "cases": [
+    {
+      "case": "valid-period-table",
+      "file": "valid-period-table.json",
+      "direction": "consumer",
+      "expect": "accept",
+      "refusal_code": null,
+      "class": "valid"
+    },
+    {
+      "case": "cells-all-missing",
+      "file": "cells-all-missing.json",
+      "direction": "consumer",
+      "expect": "accept",
+      "refusal_code": null,
+      "class": "empty-vs-malformed-vs-missing"
+    },
+    {
+      "case": "unsupported-schema",
+      "file": "unsupported-schema.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "unsupported_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "unsupported-schema-version",
+      "file": "unsupported-schema-version.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "unsupported_evidence_contract",
+      "class": "negative",
+      "note": "Recognized token, unsupported schema_version integer: the payload is otherwise shape-valid, so the refusal can only come from the version check (spec section 2.1) and pins that a correct token with a wrong version is unsupported_evidence_contract, not a silent default or an older parser."
+    },
+    {
+      "case": "cell-missing-locator",
+      "file": "cell-missing-locator.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "wrong-type-columns",
+      "file": "wrong-type-columns.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "unknown-field-envelope",
+      "file": "unknown-field-envelope.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "hit-cell-null-value",
+      "file": "hit-cell-null-value.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "locator-not-in-envelope-locators",
+      "file": "locator-not-in-envelope-locators.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "overflow-grid-72-cells",
+      "file": "overflow-grid-72-cells.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "comparison_overflow",
+      "class": "overflow"
+    },
+    {
+      "case": "untrusted-source-version",
+      "file": "untrusted-source-version.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "comparison_source_unverified",
+      "class": "untrusted-identity",
+      "e1_decision": "E1 named the lane code (spec sections 4.3/6): the frame binds to a source version this run did not receive, so the binding cannot be established — unverified-context family, kept distinct from denial's checked-and-no (the split SQL contract section 7 sets); named refusal, not a silent eligibility drop."
+    }
+  ]
+}

@@ -8,7 +8,12 @@ Five boundary classes (spec Boundaries "Test classes"), mapped to names:
 
 * empty      -> ``test_empty_utterance_residual_clarifies_without_inventing_c``
 * negative   -> ``test_jev_label_outside_the_closed_set_is_a_typed_exit`` /
-                ``test_pin_of_real_db_tier_is_typed_fail_with_its_own_code``
+                ``test_invalid_pin_is_typed_exit_and_falls_through``
+                (the two assignment-flip tests
+                ``test_pin_of_the_global_tier_is_now_assigned_not_a_typed_fail``
+                and ``test_pin_of_real_db_tier_is_now_assigned_not_a_typed_fail``
+                record that with the refusal table empty only
+                out-of-closed-set input stays a negative)
 * overflow   -> ``test_cascade_has_no_step_cap_of_its_own`` /
                 ``test_snapshot_inherit_does_not_wipe_history``
 * concurrent -> ``test_mode_channel_does_not_leak_across_threads`` (the
@@ -37,7 +42,10 @@ from fin.host.jev_choice import (
     JevChoiceClient,
     JevChoiceError,
 )
-from fin.host.named_failures import REAL_DB_NOT_WIRED
+from fin.host.named_failures import (
+    REAL_DB_NOT_WIRED,
+    TIER_UNAVAILABLE_CODE,
+)
 from fin.host.run_payload import _run_to_response_payload
 from fin.host.named_failures import LASTING_RETRIEVE_TIERS
 from fin.host.search_mode_decision import (
@@ -204,7 +212,8 @@ def test_pin_of_the_global_tier_is_now_assigned_not_a_typed_fail() -> None:
     """Boundary flipped by opening global (fin task 4): pin 综述 no longer
     exits 具名失败 档未开 — the cascade assigns the LASTING token at the
     rules tier, exactly as it assigns graph/lexical. This is the opposite
-    of the old 「不 invent 档」 failure; sql still owns that path (next test)."""
+    of the old 「不 invent 档」 failure; the tracked change T7 flipped the ``sql`` pin the
+    same way (next test), so NO closed-set pin can produce a typed fail."""
     decision = decide_search_mode(
         _msgs("what was AAPL net sales in 2023 Q3?"), pinned_mode="global"
     )
@@ -214,13 +223,22 @@ def test_pin_of_the_global_tier_is_now_assigned_not_a_typed_fail() -> None:
     assert decision.signals.get("pinned") is True
 
 
-def test_pin_of_real_db_tier_is_typed_fail_with_its_own_code() -> None:
-    """「真库未接」 is a DISTINCT exit from 「档未开」 — never collapsed."""
+def test_pin_of_real_db_tier_is_now_assigned_not_a_typed_fail() -> None:
+    """Flipped by the tracked change T7 (commit 6e8ed97): the old pin asserted
+    ``typed_fail`` carrying ``real_db_not_wired`` — the 「真库未接」 exit
+    distinct from 「档未开」. Opening sql emptied the refusal table, so
+    the pin now assigns the LASTING token at the rules tier exactly like
+    global/lexical, with no failure code. 「真库未接」 survives narrowed:
+    it is the producer's structured not-provisioned wire token, no longer
+    a cascade exit (spec search-mode-business-sql-contract §7)."""
     decision = decide_search_mode(_msgs("what was revenue?"), pinned_mode="sql")
-    assert decision.search_mode is None
-    assert decision.decision_tier == "typed_fail"
-    assert decision.failure_code == REAL_DB_NOT_WIRED
-    assert decision.signals.get("requested_mode") == "sql"
+    assert decision.search_mode == "sql"
+    assert decision.decision_tier == "rules"
+    assert decision.failure_code is None
+    assert decision.signals.get("pinned") is True
+    # And the typed-fail class has no closed-set producer left: the SSOT
+    # the cascade reads is literally empty.
+    assert TIER_UNAVAILABLE_CODE == {}
 
 
 def test_invalid_pin_is_typed_exit_and_falls_through() -> None:
@@ -505,18 +523,32 @@ def test_empty_utterance_residual_clarifies_without_inventing_c() -> None:
     assert decision.options == clarify_options()
 
 
-def test_clarify_options_are_structured_with_opened_flags() -> None:
+def test_clarify_options_are_structured_with_opened_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The Ticket-2 choice window consumes this: ids + operator labels;
-    the SSOT (``TIER_UNAVAILABLE_CODE``) marks 真数据库 unopened and — since
-    fin task 4 — 综述 opened — no duplicated 档 enumeration here. The ids
-    are the LASTING tokens, so a pick resumes with exactly the value the
-    audit and the port carry."""
+    the ``opened`` flag reads the ``TIER_UNAVAILABLE_CODE`` SSOT — empty
+    since the tracked change T7 (commit 6e8ed97) opened sql, so ALL FOUR 档 now render
+    opened (old pin: ``[True, True, True, False]`` with 真数据库 marked
+    unopened). Equal-or-stronger replaces the frozen fourth slot with a
+    two-sided proof: the current table value renders all-open, AND the
+    flag still FOLLOWS the table — monkeypatching a row back in flips
+    exactly that option and nothing else, which is what keeps the
+    mechanism honest for the next plan slot. No duplicated 档
+    enumeration here; the ids are the LASTING tokens, so a pick resumes
+    with exactly the value the audit and the port carry."""
     options = clarify_options()
     assert [o["id"] for o in options] == list(LASTING_RETRIEVE_TIERS)
     assert [o["label"] for o in options] == [
         MODE_LABELS[t] for t in LASTING_RETRIEVE_TIERS
     ]
-    assert [o["opened"] for o in options] == [True, True, True, False]
+    assert [o["opened"] for o in options] == [True] * len(options)
+
+    monkeypatch.setitem(smd.TIER_UNAVAILABLE_CODE, "sql", REAL_DB_NOT_WIRED)
+    flipped = clarify_options()
+    assert [o["opened"] for o in flipped] == [
+        o["id"] != "sql" for o in options
+    ], flipped
 
 
 def test_normalize_search_mode_closed_set_only() -> None:

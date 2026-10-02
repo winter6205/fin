@@ -73,6 +73,7 @@ from fin.host.attachment_store import (
 )
 from fin.host.attachment_vision import VisionCallResult
 from fin.host.citation_gate import QUOTABLE_EVIDENCE_KINDS
+from fin.host.evidence_contract import EVIDENCE_SCHEMA_VERSION
 from fin.host.state import reset_input_state
 from fin.host.thread_store import PostgresThreadStore
 from fin.host.visual_evidence import (
@@ -935,9 +936,18 @@ def test_the_claim_reaches_run_state_and_the_wire_without_becoming_a_quote(
     assert len(claim_rows) == 1
 
     # -- the outward channel: the same row shape, projected as a frame body
-    frames = _visual_claims_wire_payload(claim_rows)
+    frames, refusals = _visual_claims_wire_payload(claim_rows)
+    assert refusals == []
     assert len(frames) == 1
-    assert list(frames[0]) == list(VISUAL_CLAIM_FIELDS)
+    # The token and its ``schema_version`` sibling travel together (spec
+    # 2.1 rule 1, ADR 0093 decision 12), so the row key set is
+    # VISUAL_CLAIM_FIELDS plus BOTH. This lane is ``mcp``-marked and is
+    # skipped without a vision credential, so an assertion here is only
+    # ever exercised where the real provider runs — which is exactly why
+    # it must state the full shape rather than the pre-versioning one.
+    assert list(frames[0]) == list(VISUAL_CLAIM_FIELDS) + ["schema", "schema_version"]
+    assert frames[0]["schema"] == "fin.evidence.visual_claim"
+    assert frames[0]["schema_version"] == EVIDENCE_SCHEMA_VERSION
 
     # -- persisted run state, on real Postgres
     run_id = f"run-t3-{uuid.uuid4().hex[:12]}"

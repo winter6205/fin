@@ -37,12 +37,18 @@ markers = [
     "eval: opt-in eval cases (default `pytest -q` does NOT run these)",
     "soft_track: Soft-Track opt-in contracts (deselected by default)",
     "mcp: opt-in MCP 2.0 protocol smoke against a fixture server (deselected by default)",
+    "sql_live: opt-in live business-ledger acceptance against the isolated dev PostgreSQL (deselected by default; a missing role or instance is a named failure, never a skip)",
     "memory_on: opt-in memory ON cases (default `pytest -q` deselects these; run with `-m memory_on`)",
     "jev_live: opt-in live Jev Choice round-trip (ADR 0080; deselected by default; a missing key is a named fail, never a skip)",
 ]
 
+[tool.pyright]
+typeCheckingMode = "standard"
+pythonVersion = "3.12"
+include = ["src/fin/host", "src/fin/retrieve"]
+
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pyright==1.1.414"]
 
 [project.scripts]
 fin-serve = "fin.host.http:serve"

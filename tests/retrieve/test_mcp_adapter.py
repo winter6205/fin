@@ -1091,13 +1091,16 @@ def test_retrieve_payload_filters_is_plural_record() -> None:
 # ----- search_mode forwarding + named 档 exits (search-mode-retrieve T2) -----
 
 from fin.host.named_failures import (  # noqa: E402  (section-local imports)
+    INVALID_BUSINESS_QUERY,
     REAL_DB_NOT_WIRED,
 )
 from fin.retrieve.port import (  # noqa: E402
+    InvalidBusinessQueryError,
     InvalidSearchModeError,
     RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY,
     SEARCH_MODE_FILTER_KEY,
-    TierUnavailableError,
+    SQL_WINDOW_END_FILTER_KEY,
+    SQL_WINDOW_START_FILTER_KEY,
 )
 from fin.retrieve.tiers import COMMUNITY_SUMMARY_INDEX_FAILURE  # noqa: E402
 
@@ -1149,34 +1152,50 @@ def test_the_wire_never_carries_a_retired_letter() -> None:
     assert adapter.payloads == []
 
 
-@pytest.mark.parametrize(
-    ("tier", "code"),
-    [
-        pytest.param("sql", REAL_DB_NOT_WIRED, id="tier-sql"),
-    ],
-)
-def test_an_unopened_tier_is_a_named_exit_without_an_mcp_call(
-    tier: str, code: str
-) -> None:
-    """A 档 pin that names an unopened 档 gets the SAME public code the
-    send door uses (``TIER_UNAVAILABLE_CODE`` mapping), not a silent
-    default-``graph`` retrieve: the request never reaches the transport
-    (payloads stays empty), and the exit is not the miss shape
-    ``{"chunks": []}`` (that would read as "the corpus has nothing").
+_SQL_WINDOW = {"sql_window_start": "2026-01-01", "sql_window_end": "2026-12-31"}
 
-    Only ``sql`` is an unopened 档 now: opening ``global`` (fin task 4)
-    moved it onto the same forwarded path as lexical/graph (pinned by the
-    next test), so it can no longer wear this refusal."""
+
+def test_sql_is_an_open_tier_forwarded_to_the_wire() -> None:
+    """A2 (the tracked change T7) retired the routing-time sql refusal: a ledger
+    request with a bindable window now RUNS — it reaches the transport
+    and carries its 档 token beside the bound window pair. This is the
+    old 「档未开」pin turned into its acceptance mirror (spec §4: opening a
+    档 is one table row and nowhere else)."""
     adapter = _CapturingAdapter()
-    result = adapter.retrieve("revenue", search_mode=tier)
-    assert result == {"error": code}
-    assert "chunks" not in result
-    assert adapter.payloads == []
+    result = adapter.retrieve("revenue", search_mode="sql", **_SQL_WINDOW)
+    assert "error" not in result, result
+    assert len(adapter.payloads) == 1
+    filters = adapter.payloads[0]["params"]["arguments"]["filters"]
+    assert filters[SEARCH_MODE_FILTER_KEY] == "sql"
+    assert filters[SQL_WINDOW_START_FILTER_KEY] == "2026-01-01"
+    assert filters[SQL_WINDOW_END_FILTER_KEY] == "2026-12-31"
+
+
+def test_a_producer_not_provisioned_failure_keeps_its_own_name() -> None:
+    """The retired table row's token survived NARROWED:
+    ``real_db_not_wired`` is now what the PRODUCER declares — a structured
+    ``isError`` body naming it passes through under its own name, never
+    collapsing into ``retrieve_unavailable`` (spec §7: not-provisioned
+    asks for provisioning, an outage asks for a retry; conflating them
+    sends the operator the wrong advice)."""
+    adapter = _ScriptedAdapter(
+        scripted_response=_an_error_result(
+            text=json.dumps(
+                {
+                    "error": REAL_DB_NOT_WIRED,
+                    "message": "no business ledger provisioned on this instance",
+                }
+            )
+        )
+    )
+    assert adapter.retrieve(
+        "revenue", search_mode="sql", **_SQL_WINDOW
+    ) == {"error": REAL_DB_NOT_WIRED}
 
 
 def test_global_is_an_open_tier_forwarded_to_the_wire() -> None:
-    """The mirror of the refusal above, for the 档 this change opened:
-    ``global`` 综述 now runs a real report arm, so the adapter SENDS the
+    """The other 档 that walked this same path when it opened (fin task
+    4): ``global`` 综述 runs a real report arm, so the adapter SENDS the
     token to the server (it reaches the transport) rather than answering
     「档未开」without a call."""
     adapter = _CapturingAdapter()
@@ -1188,24 +1207,38 @@ def test_global_is_an_open_tier_forwarded_to_the_wire() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    ("tier", "code"),
-    [
-        pytest.param("sql", REAL_DB_NOT_WIRED, id="tier-sql"),
-    ],
-)
-def test_aretrieve_raises_the_typed_tier_error_before_transport(
-    tier: str, code: str
-) -> None:
-    """The async seam carries the named failure as its typed error
-    (the sync ``retrieve`` translates it to the product dict, the same
-    split as ``RetrieveUnavailableError``). Only ``sql`` remains a
-    routing-time refusal after global was opened."""
+def test_aretrieve_raises_the_typed_sql_refusal_before_transport() -> None:
+    """The async seam still raises its named typed error BEFORE any round
+    trip — only the refusal's identity moved: after A2 no 档 is refused at
+    routing, and what the port refuses pre-transport is a ``sql`` request
+    whose window the template cannot bind (same code the producer names
+    before it connects; a defaulted window would be a query the operator
+    never asked)."""
     adapter = _CapturingAdapter()
-    with pytest.raises(TierUnavailableError) as excinfo:
-        asyncio.run(adapter.aretrieve("revenue", search_mode=tier))
-    assert excinfo.value.code == code
+    with pytest.raises(InvalidBusinessQueryError) as excinfo:
+        asyncio.run(adapter.aretrieve("revenue", search_mode="sql"))
+    assert excinfo.value.code == INVALID_BUSINESS_QUERY
     assert adapter.payloads == []
+
+
+def test_aretrieve_resolves_the_producer_not_provisioned_exit_by_name() -> None:
+    """The async path surfaces the routed sql 档's producer declaration
+    under its own name (the sync seam's mirror): ``aretrieve`` answers the
+    typed EXIT dict rather than raising — a recorded refusal is not a
+    transport fault."""
+    adapter = _ScriptedAdapter(
+        scripted_response=_an_error_result(
+            text=json.dumps(
+                {
+                    "error": REAL_DB_NOT_WIRED,
+                    "message": "no business ledger provisioned",
+                }
+            )
+        )
+    )
+    assert asyncio.run(
+        adapter.aretrieve("revenue", search_mode="sql", **_SQL_WINDOW)
+    ) == {"error": REAL_DB_NOT_WIRED}
 
 
 @pytest.mark.parametrize(
@@ -1228,17 +1261,18 @@ def test_a_mode_outside_the_closed_set_raises_invalid_search_mode(
 #
 # The same matrix as ``test_fake_port``'s T3 section, on the PRODUCT
 # adapter: an accepted 档 must not bend the empty / overflow /
-# concurrent / exception contracts, and a refused 档 keeps its OWN
-# name even when the transport is down (spec SC4/SC7 — the exits never
-# cross).
+# concurrent / exception contracts, and since A2 every closed-set 档 is
+# accepted, so a fault under a 档 request names its OWN failure level
+# (transport outage vs producer declaration — spec SC4/SC7, the exits
+# never cross).
 
 
 def test_an_open_tier_with_an_empty_wire_answer_is_the_legal_miss() -> None:
     """Boundary 'empty' × 档: an accepted 档 that reaches the server and
-    finds nothing is the miss shape ``{"chunks": []}`` — and, unlike a
-    refused 档, the request DID go out (one payload), so an operator
-    can tell "searched at lexical, nothing there" from "the port never
-    opened that 档"."""
+    finds nothing is the miss shape ``{"chunks": []}`` — and the request
+    DID go out (one payload), so an operator can tell "searched at
+    lexical, nothing there" from a named failure that never spent a
+    round trip (an out-of-set token, or an unbindable sql window)."""
     adapter = _CapturingAdapter()
     assert adapter.retrieve("foo", search_mode="lexical") == {"chunks": []}
     assert len(adapter.payloads) == 1
@@ -1270,25 +1304,19 @@ def test_transport_down_with_an_open_tier_is_still_retrieve_unavailable() -> Non
     }
 
 
-@pytest.mark.parametrize(
-    ("tier", "code"),
-    [
-        pytest.param("sql", REAL_DB_NOT_WIRED, id="tier-sql"),
-    ],
-)
-def test_a_closed_tier_keeps_its_name_even_when_the_transport_is_down(
-    tier: str, code: str
-) -> None:
-    """Named-exit ordering under fault: the 档 check runs BEFORE the
-    transport, so even a down MCP answers the 档's own code, never
-    ``retrieve_unavailable``. The distinction is actionable: retrying
-    the transport changes nothing for 「档未开」, while
-    ``retrieve_unavailable`` means the 档 IS open and the call is
-    worth retrying. Only ``sql`` is a closed 档 after global was
-    opened; a global request over a down transport is the transport's
-    own failure, pinned in the next test."""
+def test_sql_over_a_down_transport_is_retrieve_unavailable() -> None:
+    """Named-exit ordering under fault, re-pinned for the OPEN sql 档:
+    nothing is refused before the transport anymore, so a ledger request
+    over a down MCP names the thing that actually broke —
+    ``retrieve_unavailable`` (retry-worthy). The distinction stays two
+    tests deep: that retry advice must never wear the producer's
+    not-provisioned name, and the structured ``real_db_not_wired`` exit
+    (pinned above on a live scripted transport) must never wear the
+    outage's — spec §7 keeps 未接/未提供, miss, and outage advice apart."""
     adapter = _ScriptedAdapter(scripted_exception=OSError("down"))
-    assert adapter.retrieve("foo", search_mode=tier) == {"error": code}
+    assert adapter.retrieve(
+        "foo", search_mode="sql", **_SQL_WINDOW
+    ) == {"error": "retrieve_unavailable"}
 
 
 def test_an_open_global_over_a_down_transport_is_retrieve_unavailable() -> None:

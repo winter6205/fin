@@ -194,6 +194,19 @@ _OFF_DOMAIN_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Enterprise-material cue (spec ``enterprise-evidence-contract`` E2 /
+# ADR 0090): the utterance names an authorized non-financial document
+# ("corporate travel expense policy"). fin is a knowledge-QA entry
+# point for ANY ingested material, so such an ask is a grounded
+# knowledge-QA request, never a gray-zone clarify — filing vocabulary
+# (company ticker + period, SEC metrics) is not the only route into
+# the retrieve path.
+_ENTERPRISE_MATERIAL_RE = re.compile(
+    r"\b(?:(?:corporate|company|travel|expense|employee)\s+){1,3}"
+    r"polic(?:y|ies)\b",
+    re.IGNORECASE,
+)
+
 
 def _last_human_text(messages: list[BaseMessage]) -> str:
     for message in reversed(messages or []):
@@ -379,6 +392,21 @@ def _rules_decision(text: str, signals: dict[str, Any]) -> TrackDecision | None:
                 decision_tier="rules",
                 signals=signals,
             )
+
+    # Enterprise-material ask (E2): a question anchored to a named
+    # policy document is grounded even when it carries no filing
+    # signal at all. Placed LAST in the rules tier so every utterance
+    # an existing rule already decided keeps its prior route; only
+    # asks that used to fail-close to the gray-zone clarify enter the
+    # grounded knowledge-QA path here.
+    if text and _ENTERPRISE_MATERIAL_RE.search(text):
+        signals["enterprise_material"] = True
+        return TrackDecision(
+            track="grounded",
+            confidence=0.9,
+            decision_tier="rules",
+            signals=signals,
+        )
 
     return None
 

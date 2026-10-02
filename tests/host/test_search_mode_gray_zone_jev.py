@@ -26,7 +26,6 @@ import fin.host.search_mode_decision as smd
 from fin.host import ScriptedChatModel, compile_graph
 from fin.host.named_failures import (
     LASTING_RETRIEVE_TIERS,
-    REAL_DB_NOT_WIRED,
     TIER_LABELS,
 )
 from fin.host.search_mode_decision import clarify_options, decide_search_mode
@@ -105,10 +104,11 @@ def test_choice_instructions_teach_each_operator_label() -> None:
 
 def test_rules_naming_skips_the_judge() -> None:
     """When the rules tier can name the 档, the judge never runs — that
-    short-circuit holds for either rules outcome. 综述 is now OPEN: naming
-    it assigns at the rules tier; a still-unopened 档 (真数据库) is a rules
-    typed_fail; BOTH paths skip the judge because the rules already read
-    the utterance and returned a decided value."""
+    short-circuit holds for either rules outcome. 综述 is open (fin task
+    4) and 真数据库 too since the tracked change T7 (commit 6e8ed97, which flipped the
+    old sql pin from a rules typed_fail to a rules assignment): naming
+    either assigns at the rules tier; BOTH paths skip the judge because
+    the rules already read the utterance and returned a decided value."""
     fake: FakeJevChoice = FakeJevChoice([])  # any call would raise
     assigned = decide_search_mode(_msgs("综述档 说明一下"), jev_client=fake)
     assert fake.calls == []
@@ -117,11 +117,11 @@ def test_rules_naming_skips_the_judge() -> None:
     assert assigned.failure_code is None
 
     fake2: FakeJevChoice = FakeJevChoice([])
-    refused = decide_search_mode(_msgs("sql档 查一下"), jev_client=fake2)
+    named_sql = decide_search_mode(_msgs("sql档 查一下"), jev_client=fake2)
     assert fake2.calls == []
-    assert refused.decision_tier == "typed_fail"
-    assert refused.failure_code == REAL_DB_NOT_WIRED
-    assert refused.search_mode is None
+    assert named_sql.decision_tier == "rules"
+    assert named_sql.search_mode == "sql"
+    assert named_sql.failure_code is None
 
 
 def test_choice_criteria_carry_one_gloss_per_lasting_tier() -> None:
@@ -176,14 +176,21 @@ def test_missing_client_names_the_judge_as_the_reason() -> None:
     assert decision.options == clarify_options()
 
 
-def test_judge_names_a_real_db_tier_as_its_own_named_failure() -> None:
-    """「真库未接」 reached through the JUDGE (not only through a pin) is a
-    DISTINCT exit from 「档未开」 and must never collapse into it."""
+def test_judge_naming_the_real_db_tier_is_now_assigned_at_the_jev_tier() -> None:
+    """Flipped by the tracked change T7 (commit 6e8ed97): the old pin asserted the
+    judge naming sql exited 「真库未接」 (``real_db_not_wired``) with no
+    assignment — a 「档未开」-distinct named failure. The 档 is open now,
+    so a judge answer of ``sql`` assigns exactly like ``global`` does
+    (mirror of ``test_jev_naming_the_global_tier_is_assigned_at_the_jev_tier``
+    in the cascade suite): the judge's label rides the audit, no failure
+    code, and fin never invents a refusal for a 档 it now runs."""
     fake = FakeJevChoice([("sql", 0.95)])
     decision = decide_search_mode(_msgs(AMBIGUOUS), jev_client=fake)
 
-    assert decision.search_mode is None
-    assert decision.failure_code == REAL_DB_NOT_WIRED
+    assert decision.search_mode == "sql"
+    assert decision.decision_tier == "jev"
+    assert decision.failure_code is None
+    assert decision.signals["mode_jev_label"] == "sql"
 
 
 # ---------------------------------------------------------------------------

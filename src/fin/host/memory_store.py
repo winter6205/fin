@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Literal, Protocol, Sequence, cast
 
+from psycopg.abc import QueryNoTemplate
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -127,7 +128,10 @@ class MemoryRow:
         result is truncated to ``HOOK_MAX_CHARS`` characters per spec
         SC5. Single-line bodies equal the hook.
         """
-        for line in self.body.splitlines():
+        # Mirrors the ``__post_init__`` invariant (body falls back to text)
+        # so the read is total even before normalisation.
+        body = self.text if self.body is None else self.body
+        for line in body.splitlines():
             stripped = line.strip()
             if stripped:
                 folded = _HOOK_FOLD_RE.sub(" ", stripped)
@@ -327,7 +331,7 @@ class PostgresMemoryStore:
 
         with self._pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(sql, params)
+                cur.execute(cast(QueryNoTemplate, sql), params)
                 records = cur.fetchall()
         return [_row_from_record(record) for record in records]
 

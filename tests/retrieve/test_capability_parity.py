@@ -194,9 +194,11 @@ def test_a_hit_scripted_under_no_capability_is_rejected() -> None:
 # ----- search_mode mirroring (search-mode-retrieve T2 / T3) -----
 #
 # This fake is not a 档 (SC8): an accepted token answers with the SAME
-# all-on script, while the port's named exits for unopened / illegal
-# tokens are mirrored rather than swallowed — the eval lane must reject
-# the same calls the product adapter rejects.
+# all-on script, while the port's named exit for an illegal token is
+# mirrored rather than swallowed — the eval lane must reject the same
+# calls the product adapter rejects. Since A2 the routing-time refusal
+# class is empty (every closed-set token is accepted); the closed-set
+# teeth below are unchanged.
 
 
 def test_an_open_tier_answers_with_the_same_script(port) -> None:
@@ -209,18 +211,19 @@ def test_an_open_tier_answers_with_the_same_script(port) -> None:
     assert global_tiered == plain
 
 
-@pytest.mark.parametrize(
-    ("mode", "code"),
-    [("sql", "real_db_not_wired")],
-)
-def test_the_capability_fake_refuses_an_unopened_tier_like_the_port(
-    port, mode: str, code: str
+def test_the_capability_fake_routes_the_open_sql_tier_like_the_port(
+    port,
 ) -> None:
-    from fin.retrieve.port import TierUnavailableError
-
-    with pytest.raises(TierUnavailableError) as excinfo:
-        port.retrieve("营业收入同比", search_mode=mode)
-    assert excinfo.value.code == code
+    """A2 (T7) retired the routing-time refusal this test used
+    to mirror: the closed set is now ALL open, so eval-lane parity means
+    ``sql`` is accepted and answers the SAME all-on script — Fake is not
+    a 档 (SC8), opening a 档 changes routing, never ranking. The
+    closed-set teeth are unchanged: an out-of-set token still raises
+    ``invalid_search_mode`` (next test), so the shrinking refusal never
+    became a silent map onto some other 档."""
+    plain = port.retrieve("营业收入同比")
+    sql_tiered = port.retrieve("营业收入同比", search_mode="sql")
+    assert sql_tiered == plain
 
 
 def test_the_capability_fake_refuses_an_illegal_mode_like_the_port(port) -> None:

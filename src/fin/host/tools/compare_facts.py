@@ -10,7 +10,7 @@ Contract
 ``compare_facts`` resolves one XBRL ``concept`` over a grid of
 **rows** (issuers or documents) x **columns** (periods) against the
 ingest-built fact table (``fin.corpus.facts``), and returns the
-``fin.comparison.v1`` envelope described below. Numbers come from
+``fin.comparison`` envelope described below. Numbers come from
 fact rows with a ``locator`` each; the deltas are computed HERE, so
 the model never authors the arithmetic (CONTEXT ``get_xbrl_fact``).
 
@@ -19,8 +19,9 @@ T4 export binds to::
 
     {
       "comparison": {
-        "schema": "fin.comparison.v1",
-        "kind": "table",                  # rendering hint; v1 = table
+        "schema": "fin.comparison",
+        "schema_version": 1,              # the shape's version, not a stage
+        "kind": "table",                  # rendering hint; table is the shape
         "axis": "period"|"peer"|"matrix"|"single",
         "concept": "us-gaap:Revenues",
         "unit": "USD",                    # first hit's unit ("" if none)
@@ -90,7 +91,12 @@ from typing import Any, Iterable
 from fin.corpus.facts import Fact, lookup_fact, list_fact_documents
 
 
-COMPARISON_SCHEMA = "fin.comparison.v1"
+# The stable NAME of the comparison envelope shape (spec §2.1 rule 1);
+# the version is the explicit integer sibling ``schema_version`` below.
+# No version suffix: a token that carries one reads as a stage marker,
+# and ADR 0093 retired that.
+COMPARISON_SCHEMA = "fin.comparison"
+COMPARISON_SCHEMA_VERSION = 1
 
 # Upper bound on ``len(rows) * len(columns)``. 64 cells is already a
 # table no operator reads in one glance; beyond it the payload is
@@ -155,6 +161,7 @@ def _empty_comparison(concept: str) -> dict[str, Any]:
     """The skeleton every typed EXIT still carries."""
     return {
         "schema": COMPARISON_SCHEMA,
+        "schema_version": COMPARISON_SCHEMA_VERSION,
         "kind": "table",
         "axis": "single",
         "concept": concept,
@@ -433,13 +440,14 @@ def _refusal(request: _GridRequest) -> dict[str, Any] | None:
 
 
 def _envelope(request: _GridRequest, grid: _Grid) -> dict[str, Any]:
-    """The ``fin.comparison.v1`` envelope around a walked grid.
+    """The ``fin.comparison`` envelope around a walked grid.
 
     Key order is part of the wire shape the export and the persisted
     turn row round-trip: keep it."""
     return {
         "comparison": {
             "schema": COMPARISON_SCHEMA,
+            "schema_version": COMPARISON_SCHEMA_VERSION,
             "kind": "table",
             "axis": _axis(len(grid.rows), len(request.columns)),
             "concept": request.concept,
@@ -466,7 +474,7 @@ def compare_facts(
 ) -> dict[str, Any]:
     """Compare one XBRL ``concept`` across periods and/or issuers.
 
-    Returns the ``fin.comparison.v1`` envelope documented at the top
+    Returns the ``fin.comparison`` envelope documented at the top
     of this module. Never raises: an unresolvable request is a typed
     ``empty_comparison`` / ``comparison_overflow`` dict, and an
     unresolvable CELL is a ``missing`` cell with reason
@@ -493,6 +501,7 @@ def compare_facts(
 
 __all__ = [
     "COMPARISON_SCHEMA",
+    "COMPARISON_SCHEMA_VERSION",
     "MAX_CELLS",
     "MISSING_DISPLAY",
     "compare_facts",

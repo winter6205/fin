@@ -29,15 +29,18 @@ Focus assertions — what this fin-side driver PROVES (spec
   BOTH core arms — vector and the ES/BM25 lexical arm — participated.
 * **graph order** — the adapter faithfully preserves iknow's descending
   fused-score order.
-* **global is a token the SERVER knows** — fin's port has not opened 综述
-  yet, so the ordinary call refuses 「档未开」 before the wire; the raw
-  round trip still proves iknow accepts ``global`` and answers with its
-  own not-ready fact (``community_summary_index_failure``), never with a
-  refused enum value.
-* **sql / leftover letters / invalid** — the named exits
-  (``real_db_not_wired``, ``invalid_search_mode`` for every retired letter
-  ``A``/``B``/``C``/``D`` and for ``local``) are unchanged when the full
-  stack is live: the 档 check still runs before the transport.
+* **global is a token the SERVER knows** — 综述 is an OPEN 档: fin forwards
+  it to the wire, and a not-ready report index comes back as the server's
+  own RUNTIME fact (``community_summary_index_failure``), never a refused
+  enum value and never a routing-time 「档未开」.
+* **sql / leftover letters / invalid** — the sql 档 is OPEN since A2: a
+  ledger request with a bindable window SPENDS its wire call and the live
+  producer answers under its own name (row evidence, the recorded zero-row
+  empty, or a structured not-provisioned refusal) — never a routing-time
+  door-refusal with no request out. ``invalid_search_mode`` for every
+  retired letter ``A``/``B``/``C``/``D`` and for ``local`` is unchanged
+  when the full stack is live: the closed-set check still runs before the
+  transport.
 
 What this driver does NOT prove: graph-priority REORDERING is iknow's
 internal contract, validated against real Neo4j + GDS in the tracked change
@@ -62,9 +65,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
+import re
 import string
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Iterator
 
 import pytest
@@ -72,11 +78,13 @@ import pytest
 from fin.corpus.chunking import split_unit
 from fin.corpus.parsers._common import build_unit
 from fin.corpus.push import envelope_of_unit
+from fin.host.evidence_contract import seed_context_from_rows, validate_evidence
 from fin.host.named_failures import (
     COMMUNITY_SUMMARY_INDEX_FAILURE,
-    REAL_DB_NOT_WIRED,
+    SQL_PRODUCER_FAILURE_CODES,
 )
 from fin.retrieve.port import (
+    DATABASE_ROWS_KEY,
     InvalidSearchModeError,
     RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY,
     SEARCH_MODE_FILTER_KEY,
@@ -406,27 +414,108 @@ def test_a_global_send_reaches_the_server_and_surfaces_the_runtime_index_failure
     )
 
 
-@pytest.mark.parametrize(
-    ("mode", "code"),
-    [
-        pytest.param("sql", REAL_DB_NOT_WIRED, id="tier-sql"),
-    ],
-)
-def test_unopened_tier_keeps_its_named_exit_with_the_full_stack_live(
-    live: Any, mode: str, code: str
+def test_sql_tier_reaches_the_real_producer_with_the_full_stack_live(
+    live: Any,
 ) -> None:
-    """An unopened 档 exit is routing-time, not transport-time: even with
-    real ES/PG/Neo4j behind iknow (where a graph-shaped answer WOULD
-    succeed), the port still refuses 「真库未接」 by name and the request
-    never reaches the wire — no silent default answer dressed as 真数据库.
-    (``global`` no longer appears here: it is an open 档 now, so it spends
-    its wire call and surfaces the runtime index fact instead.)"""
+    """A2 (the tracked change T7) retired this file's old 「真库未接 refuses at the
+    door」pin: the sql 档 is OPEN, so a ledger request with a bindable
+    window SPENDS its wire call — the acceptance mirror of the refusal the
+    routing table used to answer. The live producer then answers under its
+    OWN name: row evidence beside the chunks, the recorded zero-row empty,
+    or a structured declaration from the sql failure vocabulary (on a
+    per-run schema with no ledger table provisioned, that is exactly
+    ``real_db_not_wired`` — not-provisioned now, never refused-at-door).
+    What may NOT happen is the old zero-call door exit, and a routed sql
+    answer never wears the bare document-miss ``{"chunks": []}``."""
 
     before = len(_retrieve_requests(live))
-    assert live.retrieve.retrieve(_GRAPH_TOKEN, search_mode=mode) == {
-        "error": code
+    result = live.retrieve.retrieve(
+        _GRAPH_TOKEN,
+        search_mode="sql",
+        sql_window_start="2020-01-01",
+        sql_window_end="2100-01-01",
+    )
+    assert len(_retrieve_requests(live)) == before + 1, (
+        "an open 档 must spend its wire call; the port no longer refuses "
+        "it before the transport"
+    )
+    if "error" in result:
+        assert result["error"] in SQL_PRODUCER_FAILURE_CODES, result
+    else:
+        assert DATABASE_ROWS_KEY in result, (
+            "a routed sql answer carries its row-evidence sibling key, "
+            f"never the bare document-miss shape: {result!r}"
+        )
+
+
+def test_sql_tier_returns_seeded_ledger_rows_through_the_full_stack(
+    request: pytest.FixtureRequest,
+) -> None:
+    """The routed SQL lane must return the independently seeded ledger rows.
+
+    This positive acceptance is deliberately separate from the routing test:
+    ``real_db_not_wired`` remains valid only for the routing case, while a
+    missing or broken configured ledger fails this test instead of becoming
+    a green skip. The IDs and shape expectations are restated from the
+    committed ledger fixture, not read back from PostgreSQL.
+    """
+    if not os.environ.get("FIN_BUSINESS_LEDGER_URL", "").strip():
+        pytest.fail(
+            "FIN_BUSINESS_LEDGER_URL is unset: the real-ledger positive SQL "
+            "acceptance is blocked, not skipped"
+        )
+    if not (IKNOW_ROOT / "dist" / "index.js").is_file():
+        pytest.fail(
+            f"the pinned iknow producer build is missing under {IKNOW_ROOT}; "
+            "the real-ledger positive SQL acceptance is blocked, not skipped"
+        )
+
+    live = request.getfixturevalue("live")
+    result = live.retrieve.retrieve(
+        "Which contracts expire and when is notice due?",
+        search_mode="sql",
+        sql_window_start="2026-01-01",
+        sql_window_end="2026-04-30",
+    )
+    assert "error" not in result, result
+    assert result.get("chunks") == [], result
+
+    envelope = result.get(DATABASE_ROWS_KEY)
+    assert isinstance(envelope, dict), result
+    assert set(envelope) == {"schema", "schema_version", "rows", "result_count"}
+    assert envelope["schema"] == "fin.evidence.retrieve_rows"
+    assert envelope["schema_version"] == 1
+
+    rows = envelope["rows"]
+    assert isinstance(rows, list)
+    assert envelope["result_count"] == len(rows) == 4
+    expected_contract_ids = ["C-2315", "C-2302", "C-2291", "C-2024Q1"]
+    assert [row["record_key"]["contract_id"] for row in rows] == expected_contract_ids
+
+    expected_row_fields = {
+        "source", "record_key", "queried_at", "fields", "summary"
     }
-    assert len(_retrieve_requests(live)) == before
+    expected_business_fields = {
+        "title", "counterparty", "expiry_date", "notice_by",
+        "total_amount", "currency", "owner_dept",
+    }
+    for row in rows:
+        assert isinstance(row, dict)
+        assert set(row) == expected_row_fields
+        assert row["source"] == "ledger_ro.contract_expiry"
+        assert set(row["record_key"]) == {"contract_id"}
+        assert set(row["fields"]) == expected_business_fields
+        queried_at = row["queried_at"]
+        assert isinstance(queried_at, str)
+        assert re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", queried_at
+        ), queried_at
+        parsed = datetime.fromisoformat(queried_at.replace("Z", "+00:00"))
+        assert parsed.tzinfo == timezone.utc
+
+    context = seed_context_from_rows(database_row_values=rows)
+    validation = validate_evidence(result, context)
+    assert validation.refusal is None, validation
 
 
 @pytest.mark.parametrize("leftover", ["A", "B", "C", "D", "b", "c", "local"])

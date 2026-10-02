@@ -169,6 +169,12 @@ def test_retrieve_tool_forwards_edgar_filters_to_the_port() -> None:
             # job, another spec): the port receives an explicit
             # ``None`` = "do not send", iknow's default B.
             "search_mode": None,
+            # Record-shape half since the tracked change T7 (6e8ed97): the sql 档's
+            # window pair is recorded on EVERY call (the keys are the
+            # port's contract shape; values stay ``None`` here because
+            # no 档 — let alone sql — was assigned).
+            "sql_window_start": None,
+            "sql_window_end": None,
         }
     ]
 

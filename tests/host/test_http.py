@@ -638,6 +638,8 @@ def test_citation_schema_carries_no_company_or_page_default() -> None:
     """A citation row that cannot say its own ``kind`` / ``display`` is
     a contract error, never a silently company-``page`` citation (no
     legacy ``page`` presentation is invented)."""
+    import json
+
     from pydantic import ValidationError
 
     from fin.host.http import CitationSchema
@@ -652,10 +654,88 @@ def test_citation_schema_carries_no_company_or_page_default() -> None:
         "filename": "",
         "quote": "Total net sales increased during the third quarter",
     }
-    assert CitationSchema(**complete).model_dump() == complete
+    assert json.loads(CitationSchema(**complete).model_dump_json()) == complete
 
     for missing in ("kind", "display"):
         row = dict(complete)
         del row[missing]
         with pytest.raises(ValidationError):
             CitationSchema(**row)
+
+
+def test_citation_schema_dumps_no_null_database_row_on_a_document_citation() -> None:
+    """The field-level ``model_serializer`` is the ONE place the
+    omit-null rule lives, and it fires on both the schema's own JSON
+    encoding and the nested encoding FastAPI's ``response_model`` uses.
+
+    A ninth ``"database_row": null`` would be a wire change every
+    existing caller of ``/ask`` sees, and the snapshot key belongs to a
+    ledger row alone — so the key set of a document citation is pinned
+    exactly here, not merely "no database_row key"."""
+    import json
+
+    from fin.host.http import AskResponse, CitationSchema
+
+    complete = {
+        "kind": "company",
+        "document_id": AAPL_2022Q3,
+        "attachment_id": "",
+        "version": AAPL_2022Q3_VERSION,
+        "unit": 1,
+        "display": "page",
+        "filename": "",
+        "quote": "Total net sales increased during the third quarter",
+    }
+    response = AskResponse(
+        status="done",
+        citations=[CitationSchema(**complete)],
+        thread_id="t-1",
+    )
+
+    assert (
+        set(json.loads(CitationSchema(**complete).model_dump_json()))
+        == set(complete)
+    )
+    body = json.loads(response.model_dump_json())
+    assert "database_row" not in body["citations"][0]
+    assert set(body["citations"][0]) == set(complete)
+
+
+def test_citation_schema_carries_a_rows_snapshot_through_both_dumps() -> None:
+    """A ledger row's retained snapshot is what opening the citation
+    reads, so the serialized body must publish it — a client that lost
+    the snapshot would have to re-query the ledger to show the evidence
+    (spec 8.1). The key set WITH the snapshot is pinned to exactly the
+    eight document keys plus ``database_row``, so neither door can gain
+    or lose a key silently."""
+    import json
+
+    from fin.host.http import AskResponse, CitationSchema
+
+    row = {
+        "kind": "database-row",
+        "document_id": "",
+        "attachment_id": "",
+        "version": "2026-03-01T09:14:22Z",
+        "unit": 1,
+        "display": "record",
+        "filename": "",
+        "quote": "C-2291 Northwind Logistics, notice period 30 days",
+        "database_row": {
+            "source": "ledger_ro.contract_expiry",
+            "record_key": {"contract_id": "C-2291"},
+            "queried_at": "2026-03-01T09:14:22Z",
+            "fields": {"notice_days": "30"},
+            "summary": "C-2291 Northwind Logistics, notice period 30 days",
+        },
+    }
+    response = AskResponse(
+        status="done", citations=[CitationSchema(**row)], thread_id="t-1"
+    )
+
+    dumped = json.loads(CitationSchema(**row).model_dump_json())
+    assert dumped["database_row"] == row["database_row"]
+    assert set(dumped) == set(row)
+    body = json.loads(response.model_dump_json())
+    assert body["citations"][0]["database_row"] == row["database_row"]
+    assert set(body["citations"][0]) == set(row)

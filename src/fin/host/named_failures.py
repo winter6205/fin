@@ -28,8 +28,35 @@ never by matching prose::
                        as a distinct, reserved exit, and 「档未开」 is not
                        what a runtime summary-index failure is (that is
                        ``community_summary_index_failure`` below)
-    real_db_not_wired  检索档 sql 真数据库 is a plan slot, not
-                       implemented (token formerly spelled ``D``)
+    real_db_not_wired  NARROWED since A2 opened the sql 档: the exit the
+                       PRODUCER declares when no business ledger is
+                       provisioned on its instance — a runtime wire
+                       fact, not a routing-time refusal (the run DOES
+                       start when the operator names 真数据库; whether
+                       the far side can answer is the producer's).
+                       Formerly the「档未接」400 that refused every sql
+                       send before the run existed.
+    sql_no_matching_rows
+                       the sql 档's RECORDED empty: the permitted query
+                       ran against the live ledger and matched no row
+                       (spec search-mode-business-sql-contract §7) —
+                       its own copy naming the database and the window,
+                       deliberately NOT ``corpus_not_ready`` (whose
+                       ingest advice is factually wrong after a
+                       database miss) and never invented from a bare
+                       empty
+    sql_query_denied / sql_query_timeout / sql_authorization_unverified
+                       the sql arm's other declared runtime facts, read
+                       off the structured ``error`` field of the
+                       producer's refusal (§7.1) and surfaced under
+                       their OWN names — distinct from each other and
+                       from a transport-down ``retrieve_unavailable``
+    invalid_business_query
+                       a sql request whose expiry window the producer
+                       (or fin, mirroring it pre-transport) cannot
+                       bind: missing / malformed bounds, end before
+                       start — the request never reached a permitted
+                       query, so nothing ran and nothing missed
     community_summary_index_failure
                        the open global 综述 档's runtime not-ready exit:
                        its 社区 summary index is not-ready (the
@@ -61,9 +88,14 @@ never by matching prose::
 ``corpus_not_ready`` / ``mapping_drop`` ride ``AgentState.status_reason``
 on the run record / SSE ``status`` frame and resolve to ordinary-person
 copy through :data:`fin.host.run_payload.ORDINARY_PERSON_COPY`.
-``tier_not_open`` / ``real_db_not_wired`` are the routing-time 400
-``{"error": <code>}`` (see ``fin.host.workspace_http``): the operator
-named a 档 that is not implemented, and the run never starts.
+``tier_not_open`` / ``real_db_not_wired`` remain public vocabulary but
+have NO routing-time producer since A2: the send door's refusal table
+(:data:`TIER_UNAVAILABLE_CODE`) is empty, so a named 档 always starts
+the run — ``tier_not_open`` reserved for a future plan slot,
+``real_db_not_wired`` emitted only when the producer itself declares
+the missing ledger. The sql family's runtime exits
+(``SQL_PRODUCER_FAILURE_CODES``) travel as the structured ``error``
+field of the retrieve envelope, under their own names.
 
 Sibling-repo alignment: the iknow-memory side carries the same
 ``corpus_not_ready`` / ``mapping_drop`` tokens; see
@@ -92,13 +124,20 @@ from typing import Final, Iterable, Mapping, Sequence
 from fin.retrieve.port import (
     RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY,
     RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY,
+    RETRIEVE_OUTCOME_SQL_NO_MATCHING_ROWS,
 )
 from fin.retrieve.tiers import (
     COMMUNITY_SUMMARY_INDEX_FAILURE,
+    INVALID_BUSINESS_QUERY,
     LASTING_RETRIEVE_TIERS,
     REAL_DB_NOT_WIRED,
     RETRIEVE_TIERS,
     RetrieveTier,
+    SQL_AUTHORIZATION_UNVERIFIED,
+    SQL_NO_MATCHING_ROWS,
+    SQL_PRODUCER_FAILURE_CODES,
+    SQL_QUERY_DENIED,
+    SQL_QUERY_TIMEOUT,
     TIER_LABELS,
     TIER_NOT_OPEN,
     TIER_UNAVAILABLE_CODE,
@@ -111,6 +150,22 @@ from fin.retrieve.tiers import (
 CORPUS_NOT_READY: Final[str] = "corpus_not_ready"
 
 MAPPING_DROP: Final[str] = "mapping_drop"
+
+# The E2 route-level missing-data exit (spec ``enterprise-evidence-contract``
+# §6): the run asked authorized enterprise material about a rule, retrieve
+# DID return that material, and the run still ended with the verifier's
+# ``citation_repair_cap`` refusal — nothing in what was retrieved grounds
+# the asked claim. Distinct from ``corpus_not_ready`` (the collection was
+# empty) and from the verifier's own vocabulary (ADR 0008 — the gate is
+# never re-worded except BY THIS ONE ROUTE-CONDITIONED RE-LABEL; every
+# other route keeps the verifier's verdict). Frozen spelling: the token
+# ``insufficient_evidence`` in spec §6's typed-outcome table.
+INSUFFICIENT_EVIDENCE: Final[str] = "insufficient_evidence"
+
+# The citation gate's repair-cap refusal reason — referenced here ONLY as
+# the input this module re-labels on the enterprise-material route; the
+# gate's vocabulary itself is untouched (ADR 0008).
+_CITATION_REPAIR_CAP: Final[str] = "citation_repair_cap"
 
 # The global 综述 档 is open, and this is its runtime not-ready exit: the
 # 社区 summary index the report arm reads is absent or unpopulated (the
@@ -161,6 +216,7 @@ _RETRIEVE_JOB_FACTS: Final[tuple[tuple[str, str], ...]] = (
         RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY,
         COMMUNITY_SUMMARY_INDEX_FAILURE,
     ),
+    (RETRIEVE_OUTCOME_SQL_NO_MATCHING_ROWS, SQL_NO_MATCHING_ROWS),
 )
 
 _JOB_FACT_KEYS: Final[frozenset[str]] = frozenset(
@@ -228,9 +284,11 @@ def retrieve_blocking_failure(
     reason.
 
     A record may additionally carry a RECORDED job fact — the Fast 抽图
-    empty-graph fact under :data:`RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY` or the
+    empty-graph fact under :data:`RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY`, the
     global 综述 index-not-ready fact under
-    :data:`RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY` — and only an
+    :data:`RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY`, or the sql 档's
+    zero-row fact under :data:`RETRIEVE_OUTCOME_SQL_NO_MATCHING_ROWS` —
+    and only an
     explicit ``True`` is that fact: fin never upgrades a plain empty
     collection into a job failure (that would blame a job which never
     reported one). When the run ends with no chunk anywhere, a recorded
@@ -263,11 +321,49 @@ def retrieve_blocking_failure(
     return CORPUS_NOT_READY
 
 
+def _retrieve_delivered_hits(
+    outcomes: Iterable[Mapping[str, object]] | None,
+) -> bool:
+    """True when a contract-conforming retrieve record reported ``chunks`` > 0.
+
+    An unusable record contributes nothing, exactly as in
+    :func:`retrieve_blocking_failure`: the route-level exit may only be
+    named from recorded facts, never guessed from an unreadable one.
+    """
+    for record in outcomes or ():
+        counts = _valid_counts(record)
+        if counts is None:
+            continue
+        chunks, _failures = counts
+        if chunks > 0:
+            return True
+    return False
+
+
+def _is_enterprise_material_route(
+    track_decision: Mapping[str, object] | None,
+) -> bool:
+    """The classify audit's enterprise-material route fact, read narrowly.
+
+    Only an explicit ``signals.enterprise_material is True`` counts —
+    a missing, non-Mapping, or lookalike audit is NOT the route, so an
+    invented exit can never ride a malformed audit (same explicit-True
+    doctrine as :func:`_recorded_job_fact_keys`).
+    """
+    if not isinstance(track_decision, Mapping):
+        return False
+    signals = track_decision.get("signals")
+    if not isinstance(signals, Mapping):
+        return False
+    return signals.get("enterprise_material") is True
+
+
 def named_refusal_reason(
     *,
     evidence: Sequence[object],
     outcomes: Iterable[Mapping[str, object]] | None,
     verifier_reason: str,
+    track_decision: Mapping[str, object] | None = None,
 ) -> str:
     """The reason a ``refuse`` must carry for THIS run.
 
@@ -278,8 +374,25 @@ def named_refusal_reason(
     evidence by any other route (``read_source`` included) keeps the
     verifier's own verdict, because the 具名失败 would then be describing
     a collection the run did not actually depend on.
+
+    ``track_decision`` (optional) is the classify audit for this run.
+    It is consulted for exactly ONE additional naming, the E2 route-level
+    exit (spec ``enterprise-evidence-contract`` §6): on the
+    enterprise-material route, when retrieve DID deliver material yet
+    the verifier capped the run with ``citation_repair_cap``, the
+    operator's fact is 「the authorized material does not state the asked
+    rule」 — :data:`INSUFFICIENT_EVIDENCE`. Every other route, and every
+    other verifier reason (``unknown_locator`` included), keeps the
+    verifier's verdict unchanged. With no ``track_decision`` passed the
+    behavior is byte-identical to the pre-E2 contract.
     """
     if evidence:
+        if (
+            _is_enterprise_material_route(track_decision)
+            and verifier_reason == _CITATION_REPAIR_CAP
+            and _retrieve_delivered_hits(outcomes)
+        ):
+            return INSUFFICIENT_EVIDENCE
         return verifier_reason
     return retrieve_blocking_failure(outcomes) or verifier_reason
 
@@ -337,8 +450,11 @@ def unavailable_tier(requested_tiers: Iterable[str] | None) -> str | None:
     — as a 422 input error before this helper is reached. So the lookup in
     :data:`TIER_UNAVAILABLE_CODE` is exact and nothing is normalized here:
     a normalize step would quietly accept a shape the door already refuses,
-    which is the second vocabulary the rename forbids. Only ``sql`` is
-    refused here (``global`` 综述 is now an open 档); an unknown token is
+    which is the second vocabulary the rename forbids. The table is EMPTY
+    since A2 opened ``sql``: every member of the closed set starts its
+    run, and this helper answers ``None`` — the mechanism stays so closing
+    or adding a plan slot is one table row (spec
+    search-mode-business-sql-contract §4). An unknown token is
     ignored — this helper never guesses that a string "meant" a 档 (the same
     closed-list rule as :data:`TIER_UNAVAILABLE_CODE`).
     """
@@ -352,13 +468,21 @@ __all__ = [
     "COMMUNITY_SUMMARY_INDEX_FAILURE",
     "CORPUS_NOT_READY",
     "EMPTY_FAST_GRAPH_FAILURE",
+    "INSUFFICIENT_EVIDENCE",
+    "INVALID_BUSINESS_QUERY",
     "LASTING_RETRIEVE_TIERS",
     "MAPPING_DROP",
     "REAL_DB_NOT_WIRED",
     "RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY",
     "RETRIEVE_OUTCOME_FAST_GRAPH_EMPTY",
+    "RETRIEVE_OUTCOME_SQL_NO_MATCHING_ROWS",
     "RETRIEVE_TIERS",
     "RetrieveTier",
+    "SQL_AUTHORIZATION_UNVERIFIED",
+    "SQL_NO_MATCHING_ROWS",
+    "SQL_PRODUCER_FAILURE_CODES",
+    "SQL_QUERY_DENIED",
+    "SQL_QUERY_TIMEOUT",
     "TIER_LABELS",
     "TIER_NOT_OPEN",
     "TIER_UNAVAILABLE_CODE",

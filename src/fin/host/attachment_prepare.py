@@ -39,7 +39,7 @@ import os
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import ClassVar, Final, Literal, Sequence
+from typing import Final, Literal, Sequence, get_args
 
 from fin.corpus.errors import (
     EmptySourceParseError,
@@ -151,14 +151,20 @@ _IMAGE_SUFFIXES: Final[frozenset[str]] = frozenset({".png", ".jpg", ".jpeg"})
 _BYTES_STILL_OWED: Final[str] = "still owed, the same door can retry it"
 _BYTES_ORPHANED: Final[str] = "orphaned, no record is left to retry it"
 
-# The two above are the whole set: a verdict is never free text, because the
-# one log line an operator reads has to say which of the two leftovers it is.
-# Same ``Literal[*tuple]`` shape the retrieve tiers use.
-_BYTE_DELETE_VERDICTS: Final[tuple[str, ...]] = (
-    _BYTES_STILL_OWED,
-    _BYTES_ORPHANED,
-)
-_ByteDeleteVerdict = Literal[*_BYTE_DELETE_VERDICTS]
+# The two constants above are the whole set: a verdict is never free text,
+# because the one log line an operator reads has to say which of the two
+# leftovers it is. WHY the member values are restated as literals here: a
+# type checker rejects ``Literal[*tuple_variable]`` (variables are not allowed
+# in type expressions), so the set cannot be derived from the constants at
+# type level; this pin makes drift raise at import, in runtime-raise form
+# because ``python -O`` strips bare asserts.
+_ByteDeleteVerdict = Literal[
+    "still owed, the same door can retry it",
+    "orphaned, no record is left to retry it",
+]
+
+if tuple(get_args(_ByteDeleteVerdict)) != (_BYTES_STILL_OWED, _BYTES_ORPHANED):
+    raise RuntimeError("_ByteDeleteVerdict literal drifted from the verdict constants")
 
 
 # ----- typed door errors -----
@@ -178,7 +184,7 @@ class AttachmentPreparationError(AttachmentError):
     a ``failed`` row.
     """
 
-    code: ClassVar[str]
+    code: str
 
     def __init__(self, attachment_id: str, detail: str) -> None:
         super().__init__(f"attachment_id={attachment_id!r}: {detail}")
@@ -916,7 +922,9 @@ class AttachmentPreparationService:
             raise AttachmentEmptyTextError(
                 attachment_id, "the source carries no bytes"
             )
-        if not self._page_lane_deployed():
+        budgets = self.budgets
+        pages = self.pages
+        if budgets is None or pages is None:
             # EXIT: page work with no deployed cap or wired ports is this
             # deployment having no page lane at all, so it is refused before
             # a page is opened, nothing about the document is judged, and
@@ -938,7 +946,7 @@ class AttachmentPreparationService:
                 "the filename claims a PDF and the bytes carry no PDF"
                 " signature in their leading window",
             )
-        return self.budgets, self.pages
+        return budgets, pages
 
     @staticmethod
     def _extract(

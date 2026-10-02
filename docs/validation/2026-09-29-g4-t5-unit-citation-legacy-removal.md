@@ -357,6 +357,35 @@ wording says "a reliable persisted table/figure region" and was not narrowed.**
   this branch and were not edited here, so no implementation or test change
   accompanies this note.
 
+### O1 resolution — operator ruling recorded 2026-09-30
+
+The operator accepted figure-only crop with the current honest whole-page
+fallback for table regions. The contract/status wording that overstated table
+crop was reconciled in `plans/pr321-merge-followup.md` (T2 Acceptance, T2
+Status, L9 row) and `plans/post321-real-browser-acceptance.md` (Q1, B3
+dependencies); the contradictory T2 done marker was corrected so no artifact
+claims table crop is delivered. Table crop is retained as a recorded BACKLOG
+enhancement — explicitly not required acceptance and not a B3/Session-D
+blocker. O1 is closed by this recorded decision. The spec was not narrowed:
+the ruling matches `specs/thread-attachment-source-read.md`:55-58 as written
+(chart/region-centric — "a high-resolution crop of each relevant
+chart/region (or the full page if no reliable box exists)").
+
+This subsection is the canonical home of the backlog scope; other artifacts
+reference it rather than restate it. A future bounded table-crop ticket needs:
+
+1. a table-value detail key contract — `plotted_value_key(...)` in
+   `src/fin/host/attachment_observations.py` and the chart/series/category
+   `VisualDetail` it keys in `src/fin/host/attachment_visual_read.py`
+   (`:121`); a table box holds no keyable detail today;
+2. legibility-rule widening in `src/fin/corpus/parsers/_pages.py`
+   (the figure-only `region.kind` rule behind `crop_is_legible`);
+3. crop selection in `src/fin/host/attachment_visual_read.py`
+   (`_inspected_crop` / `_reliable_boxes`);
+4. independently expected real table gold data (current measured table
+   recall is 0 on `g4-mixed-chart-001` p2);
+5. failing-first host tests plus a live-lane leg.
+
 ## Merge gates
 
 Every row names the code revision its result was taken at. `round` = `8d7a4ba`
@@ -420,8 +449,10 @@ Status of all nine limitations, reconciled with
   open product defect while items 10/10a stay pending — the full original
   acceptance is wider than this lane.
 * **L9 — closed by T2** (`0638436`) after this round was first written: a valid
-  request with a reliable persisted region now inspects that crop and reports
-  the actual scope, with the whole-page fallback still permitted and reported.
+  request with a reliable persisted figure region now inspects that crop and reports
+  the actual scope; a table region uses the permitted whole-page fallback and
+  reports that actual scope (operator ruling 2026-09-30 — see the O1 resolution
+  above; table crop is recorded backlog, not delivered).
 
 Item 10 / 10a status lines in `plans/` are NOT flipped by this record — and
 not by T3's `f3b8b2e` either, which proves the LIVE LANE, not the full

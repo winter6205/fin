@@ -1,7 +1,7 @@
 # Spec: corpus-ops-depth
 
 > 工作区知识库的运营深化：原始字节进 **object store**、可操作 ingest、OCR 写回、在已有切分权威上扩库与分析深度、真 filing 的 in-app 监控。
-> 不重开切分归属（ADR 0037 / `specs/corpus-retrieval.md` 已定：解析与父子分块归 fin）。本 spec 接到 **当前 main** 的 `corpus` / `host` / `web`，不引入第二套运行时解析器，不整包 rebase 开着的 the tracked change through the tracked change。
+> 不重开切分归属（ADR 0037 / `specs/corpus-retrieval.md` 已定：解析与父子分块归 fin）。本 spec 接到 **当前 main** 的 `corpus` / `host` / `web`，不引入第二套运行时解析器，不整包 rebase 开着的分支。
 
 ## Assumption gate (confirmed 2026-08-29)
 
@@ -18,7 +18,7 @@ Operator confirmed the numbered gate in-thread. These are in force:
 9. Analysis depth = paragraph redline + table extract + three-year statements from XBRL; page-image preview is Out.
 10. Monitoring = real filing source + in-app alert on top of existing watchlist; outbound email/Slack is Out.
 11. Selective algorithmic OCR (write-back into frozen unit text) and ingest state machine + audit are in scope. Existing S1 `ocr_applied` / `ocr_required_unavailable` is **Inherits**, not a parallel OCR product.
-12. `#141` / `enterprise-kb-agent` deliveries (compare_facts, watchlist, stop, export, fan-out, health) are **Inherits** — not rebuilt.
+12. `enterprise-kb-agent` deliveries (compare_facts, watchlist, stop, export, fan-out, health) are **Inherits** — not rebuilt.
 
 ## Objective
 
@@ -35,7 +35,7 @@ Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 - **ingest**: A CLI that writes frozen locator-unit text from official filings (or the existing extracted tree) into an extracted tree. 滑动窗口式**切分**是 fin 的职责而非排序栈（ADR 0037），排序仍留在 fin 之外；the ask path does not fetch EDGAR or open source filings.
 - **locator**: Cite identity `{document_id, version, unit}`: for the frozen 12, `version` is the PDF sha256 and `unit` is the 1-based pdfplumber `page`; for live EDGAR, `version` hashes the official primary iXBRL `.htm` bytes and `unit` is a deterministic frozen partition of that HTML's stripped text, not an SEC or unofficial-PDF page. The claimed span is a quote string, not a locator field; the citation verifier checks it is a contiguous substring of that unit's frozen text; chunks carry the locator as `source_ref` and are not the identity.
 - **object store**: MinIO/S3-compatible storage for raw filing (and later multi-format) bytes. Postgres holds metadata and pointers; the extracted cite tree stays in fin. Git is not the byte warehouse once configured.
-- **compare_facts**: Research-track host tool that resolves one XBRL concept over a grid of rows (issuers or documents) x columns (periods) against the same fact table `get_xbrl_fact` reads, and returns the `fin.comparison.v1` envelope. Deltas are computed in the tool, not by the model. Every column is an implicit `(concept, period)` claim for the numeric gate, so an answer quoting figures the table never reported cannot `done`. It contributes no citation evidence: a fact row is not page text.
+- **compare_facts**: Research-track host tool that resolves one XBRL concept over a grid of rows (issuers or documents) x columns (periods) against the same fact table `get_xbrl_fact` reads, and returns the `fin.comparison` envelope. Deltas are computed in the tool, not by the model. Every column is an implicit `(concept, period)` claim for the numeric gate, so an answer quoting figures the table never reported cannot `done`. It contributes no citation evidence: a fact row is not page text.
 
 ## Boundaries
 
@@ -68,7 +68,7 @@ Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 
 - **Confirms with human:** none remaining after the 2026-08-29 gate.
 
-- **Out of this spec:** memory subsystem / dream / DST / thumbs; Redis; SSO/RBAC; Public API; fin MCP server; email/Slack; attach_image / vision answers; page-image preview product UI; YAML playbooks; Elasticsearch+Milvus in-repo; LlamaIndex runtime path; rewriting Soft-Track tracks; weakening the citation verifier; merging parked GitHub that pull request–#185 as the implementation vehicle; changing `specs/corpus-retrieval.md` §B1–§B6.
+- **Out of this spec:** memory subsystem / dream / DST / thumbs; Redis; SSO/RBAC; Public API; fin MCP server; email/Slack; attach_image / vision answers; page-image preview product UI; YAML playbooks; Elasticsearch+Milvus in-repo; LlamaIndex runtime path; rewriting Soft-Track tracks; weakening the citation verifier; merging parked GitHub pull requests as the implementation vehicle; changing `specs/corpus-retrieval.md` §B1–§B6.
 
 ## Success Criteria
 
@@ -91,7 +91,7 @@ Each line is binary. Sequential plans map onto a subset. Default `uv run pytest 
 
 ## Inherits / Changes
 
-**Inherits:** Python 3.12 + uv + pytest; slices `src/fin/corpus/`, `src/fin/retrieve/` (port only), `src/fin/host/`, SPA `web/`; ScriptedChatModel + InMemorySaver default tests; marks `soft_track`, `eval`, `mcp` stay opt-in; typed EXITs `retrieve_unavailable`, `unknown_locator`, `{chunks: []}`, `{filings: []}`, 409 `{error: concurrent_run}`, 503 `{error: ingest_missing}`; S1 OCR `ocr_applied` / `ocr_required_unavailable`; corpus-retrieval parsers + parent/child split + push/invalidation Fake ports; ADR 0020 extracted ingest SSOT; ADR 0021 citations from verifier; ADR 0029 product corpus; ADR 0031 catalog filters + `get_xbrl_fact`; ADR 0032 retrieve adapter; ADR 0037 chunking owned by fin; ADR 0043 object store; `compare_facts` / watchlist / export / fan-out / health from `specs/enterprise-kb-agent.md`. Parked that pull request–#185 are **reference diffs only**.
+**Inherits:** Python 3.12 + uv + pytest; slices `src/fin/corpus/`, `src/fin/retrieve/` (port only), `src/fin/host/`, SPA `web/`; ScriptedChatModel + InMemorySaver default tests; marks `soft_track`, `eval`, `mcp` stay opt-in; typed EXITs `retrieve_unavailable`, `unknown_locator`, `{chunks: []}`, `{filings: []}`, 409 `{error: concurrent_run}`, 503 `{error: ingest_missing}`; S1 OCR `ocr_applied` / `ocr_required_unavailable`; corpus-retrieval parsers + parent/child split + push/invalidation Fake ports; ADR 0020 extracted ingest SSOT; ADR 0021 citations from verifier; ADR 0029 product corpus; ADR 0031 catalog filters + `get_xbrl_fact`; ADR 0032 retrieve adapter; ADR 0037 chunking owned by fin; ADR 0043 object store; `compare_facts` / watchlist / export / fan-out / health from `specs/enterprise-kb-agent.md`. Parked pull requests are **reference diffs only**.
 
 **Changes this spec adds:** object store for raw bytes on current main; ingest state machine + audit; OCR write-back as extension of S1 OCR (not a second product); structure-aware locators without a second splitter; expandable SEC-shaped library beyond frozen-12; paragraph redline tool + table extract + XBRL three-year statements; real filing monitor with in-app notice.
 

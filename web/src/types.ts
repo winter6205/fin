@@ -9,24 +9,77 @@ export interface ThreadListItem {
 
 // How the UI labels one source unit: "page" only when the unit is a
 // physical PDF page; every other unit reads "unit" (spec
-// thread-attachment-source-read).
-export type SourceDisplay = "page" | "unit";
+// thread-attachment-source-read). "record" is a ledger row: a record
+// has no page and no ordinal (ADR 0091).
+export type SourceDisplay = "page" | "unit" | "record";
+
+/** The quotable evidence kinds. `database-row` is a ledger row from the
+ * `sql` 档 — a record, not a document passage, verified by its record
+ * key and this round's returned fields rather than by a text span
+ * (ADR 0091). */
+export type CitationKind = "company" | "attachment" | "database-row";
+
+/** One JSON scalar of a snapshot (spec §4.4 value-text rule; R2 of
+ * the E1 reconcile notes: ingress values are scalars and the consumer
+ * renders each to text — strings as-is, numbers as shortest round-trip
+ * decimal, booleans lowercase, null as ""). */
+export type DatabaseScalar = string | number | boolean | null;
+
+/** The retained snapshot a `database-row` citation opens.
+ *
+ * It is the evidence THIS answer was built from, with the `queried_at`
+ * of the query that produced it. Opening a citation shows this and
+ * issues NO query; a refresh is a new query with a new time, and it
+ * never rewrites a prior answer (spec 8.1). Nothing here states that
+ * the data is unchanged — the product does not claim that without a
+ * fresh query, so a reader cannot mistake silence for stability.
+ *
+ * ``schema`` names the shape and ``schema_version`` versions it
+ * (spec §2.1); E5 mints both on live emissions. Snapshots stored before
+ * the token are legacy v0 and simply lack the key (spec §7) — absent is
+ * valid, an UNKNOWN value never decodes. Both stay optional together:
+ * a row declares the shape, or it declares nothing. */
+export interface DatabaseRowSnapshot {
+  schema?: "fin.evidence.database_row_snapshot";
+  schema_version?: number;
+  // Which permitted view answered, so the read scope is auditable from
+  // the citation alone.
+  source: string;
+  // The row's own identity: a claim traces to a record, not to a
+  // position in a text.
+  record_key: Record<string, DatabaseScalar>;
+  // When the values were true. A ledger changes; a value with no time
+  // is a claim about a moving target.
+  queried_at: string;
+  // The values this round actually returned.
+  fields: Record<string, DatabaseScalar>;
+  // One display line, minted by the host from those fields.
+  summary: string;
+}
 
 export interface Citation {
-  kind: "company" | "attachment";
-  // Company filings carry document_id; an attachment citation sends "".
+  kind: CitationKind;
+  // Company filings carry document_id; an attachment citation sends "",
+  // and so does a database-row citation — a ledger row has no filing
+  // behind it and naming one would point at a document the query never
+  // read.
   document_id: string;
   // Attachment identity; a company citation sends "". The filename is
   // display-only — grouping and DOM keys use this id.
   attachment_id: string;
   version: string;
   // 1-based source unit (a PDF page for physical filings, a parsed
-  // chunk otherwise).
+  // chunk otherwise). A ledger row has no ordinal and sends 1.
   unit: number;
   display: SourceDisplay;
   // Safe display name for an attachment; a company citation sends "".
   filename: string;
   quote: string;
+  // The retained snapshot a database-row citation opens. Absent on a
+  // document citation, which is why the host dumps it with
+  // `exclude_none` — every stored filing citation keeps the exact wire
+  // shape it had before this kind existed.
+  database_row?: DatabaseRowSnapshot;
 }
 
 // The attachment leg of a ``source_ref`` — the locator ``read_source``
@@ -87,6 +140,47 @@ export interface VisualClaim {
   outbound_calls: number;
 }
 
+// The closed §6 name set of specs/enterprise-evidence-contract.md (plus
+// the delegated verifier exits the gate owns and the refusal lanes
+// legitimately carry). A refusal code outside this set is itself a
+// malformed entry — prose never rides this lane (plan E5: "per-row codes
+// are the §6 names, never prose").
+export type EvidenceRefusalCode =
+  | "malformed_evidence_contract"
+  | "unsupported_evidence_contract"
+  | "citation_overflow"
+  | "visual_claim_overflow"
+  | "database_row_overflow"
+  | "business_field_overflow"
+  | "comparison_overflow"
+  | "corpus_not_ready"
+  | "insufficient_evidence"
+  | "sql_no_matching_rows"
+  | "sql_query_denied"
+  | "citation_trust_denied"
+  | "visual_claim_trust_denied"
+  | "business_field_trust_denied"
+  | "comparison_source_unverified"
+  | "attachment_unavailable"
+  | "observation_stale"
+  | "visual_lane_unwired"
+  | "retrieve_unavailable"
+  | "persistence_unavailable"
+  | "tier_not_open"
+  | "real_db_not_wired"
+  | "unknown_locator"
+  | "citation_repair_cap";
+
+// One per-row evidence refusal as the wire names it: the SSE
+// ``evidence_refusals`` entry and the history read's
+// ``rejected_citations`` row share this shape (E5 carrier rule), and the
+// web decoder keeps both in the one ``Turn.evidence_refusals`` field so
+// a reloaded turn renders identically to a streamed one.
+export interface EvidenceRefusal {
+  citation_index: number;
+  error: EvidenceRefusalCode;
+}
+
 export type RunStatus = "done" | "refuse" | "step_cap";
 
 // Stream error taxonomy for mid-flight failures (model raise,
@@ -136,7 +230,7 @@ export type TraceItem =
 
 // ----- T3 comparison (enterprise-kb Focus 1) -----
 //
-// The ``fin.comparison.v1`` envelope produced by the
+// The ``fin.comparison`` envelope produced by the
 // ``compare_facts`` host tool. SSOT for the shape (including the
 // typed EXITs this SPA never renders) is
 // src/fin/host/tools/compare_facts.py; these interfaces mirror it
@@ -185,7 +279,7 @@ export interface ComparisonCell {
 export interface ComparisonRow {
   key: string;
   label: string;
-  kind: "issuer" | "document";
+  kind: string;
   cells: ComparisonCell[];
 }
 
@@ -203,7 +297,7 @@ export interface ComparisonDelta {
   absolute: number;
   // Null at a zero baseline (percent change is undefined there).
   percent: number | null;
-  direction: "up" | "down" | "flat";
+  direction: string;
   display: string;
 }
 
@@ -214,9 +308,14 @@ export interface ComparisonMissing {
 }
 
 export interface Comparison {
-  schema: "fin.comparison.v1";
-  kind: "table";
-  axis: "period" | "peer" | "matrix" | "single";
+  schema: "fin.comparison";
+  // The envelope's version (spec §2.1). Required here exactly as the
+  // token is: the spec's comparison schema lists it in ``required``, and
+  // a required discriminant with an optional version is the half-versioned
+  // state §2.1 exists to remove.
+  schema_version: number;
+  kind: string;
+  axis: string;
   concept: string;
   unit: string;
   scale: string;
@@ -227,9 +326,6 @@ export interface Comparison {
   hit_count: number;
   cell_count: number;
   locators: ComparisonLocator[];
-  // Present on wire entries (both SSE and persisted); correlates
-  // the table with the tool row that produced it.
-  tool_call_id?: string;
 }
 
 // ----- search-mode-host T2: the choice window (ADR 0062 HITL) -----
@@ -270,6 +366,13 @@ export interface Turn {
   status_reason?: string;
   answer: string;
   citations: Citation[];
+  // E6 (the tracked change): this run's per-row evidence refusals — the decoded
+  // SSE ``evidence_refusals`` entries and the history read's
+  // ``rejected_citations`` rows, folded into ONE field so a reloaded turn
+  // renders identically. A refused citation is never silently dropped and
+  // never an empty citation list: each entry is a visible named-code
+  // indicator beside the answer (display policy, plan E6).
+  evidence_refusals?: EvidenceRefusal[];
   // T3: the run's streamed thinking prose (header-only when the
   // thinking fold is collapsed). Empty when the model surfaced no reasoning.
   thinking_text?: string;

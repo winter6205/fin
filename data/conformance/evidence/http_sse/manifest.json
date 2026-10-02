@@ -1,0 +1,21 @@
+{
+  "profile": "http_sse",
+  "contract": "specs/enterprise-evidence-contract.md",
+  "purpose": "One committed HTTP/SSE wire-conformance example (E5): the exact terminal frame sequence fin emits for a mixed valid run plus one mid-stream named refusal, consumable by the producer without copying an independently defined schema. The frame data is the projection of the payload's input_citations through fin.host.workspace_http._citations_wire_projection, pinned live by tests/host/test_workspace_http.py so the example cannot drift from the emitter.",
+  "notes": {
+    "evidence_schema": "carried once on the status (terminal) frame and the response envelopes; the citations frame data stays the plain array of frozen rows (plan E5 carrier rule).",
+    "citations_frame": "document rows byte-identical to the stored shape; a ledger row's snapshot gains the fin.evidence.database_row_snapshot token minted on the emission only (stored v0 rows are never rewritten).",
+    "evidence_refusals_frame": "new event vocabulary; entry shape mirrors the history read's rejected_citations (citation_index + section 6 code); today's web reader skips unknown events until E6 decodes this one.",
+    "order": "status -> answer -> evidence_refusals (only when a row is refused) -> citations; the citations frame closes the reader, so refusals ride BEFORE it."
+  },
+  "cases": [
+    {
+      "case": "http-sse-terminal-citation-frames",
+      "file": "valid-terminal-frames.json",
+      "direction": "consumer",
+      "expect": "accept",
+      "refusal_code": null,
+      "class": "valid"
+    }
+  ]
+}

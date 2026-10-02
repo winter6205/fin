@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "fin.evidence.database_row_snapshot",
+  "title": "database_row egress snapshot (spec 4.4, ADR 0092)",
+  "description": "The seven frozen snapshot keys (spec 4.4 egress; the five data keys of the original shape, the schema token, and the schema_version carrier). Identity rules (canonical-text digest, mirror equality onto the citation's flat slots, byte bound on identity input m) are the validator home's; see x-bounds.",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "source",
+    "record_key",
+    "queried_at",
+    "fields",
+    "summary"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": "fin.evidence.database_row_snapshot" },
+    "schema_version": { "type": "integer", "const": 1 },
+    "source": { "type": "string" },
+    "record_key": {
+      "type": "object",
+      "additionalProperties": {
+        "type": ["string", "number", "integer", "boolean", "null"]
+      }
+    },
+    "queried_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "fields": {
+      "type": "object",
+      "additionalProperties": {
+        "type": ["string", "number", "integer", "boolean", "null"]
+      }
+    },
+    "summary": { "type": "string" }
+  },
+  "x-bounds": {
+    "record_key": "8 pairs, 64-char keys, 128-code-point rendered-text values (spec 3)",
+    "fields": "16 entries, 64-char keys, 512-code-point rendered-text values (spec 3)",
+    "source": "128 chars",
+    "summary": "1,000 code points",
+    "snapshot": "canonical identity input m must serialize under 32 KiB (database_row_overflow)"
+  }
+}

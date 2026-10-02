@@ -46,7 +46,7 @@ import threading
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
-from typing import Literal, Protocol, Sequence
+from typing import Literal, Mapping, Protocol, Sequence
 
 from fin.corpus.parsers._pages import REGION_KINDS
 from fin.host.attachment_observations import (
@@ -281,7 +281,7 @@ class AttachmentStore(Protocol):
         *,
         attachment_id: str,
         version: int,
-        postings: dict[str, Sequence[int]],
+        postings: Mapping[str, Sequence[int]],
     ) -> None:
         """Replace the derived index of ``version`` and mark it usable."""
         ...
@@ -572,7 +572,7 @@ def _normalized_regions(
 
 
 def _normalized_postings(
-    postings: dict[str, Sequence[int]],
+    postings: Mapping[str, Sequence[int]],
 ) -> dict[str, tuple[int, ...]]:
     """Coerce a posting table to ``term -> ordered unit ordinals``.
 
@@ -882,7 +882,7 @@ class InMemoryAttachmentStore:
         *,
         attachment_id: str,
         version: int,
-        postings: dict[str, Sequence[int]],
+        postings: Mapping[str, Sequence[int]],
     ) -> None:
         _require_version(version)
         rows = _normalized_postings(postings)
@@ -1707,7 +1707,7 @@ class PostgresAttachmentStore:
         *,
         attachment_id: str,
         version: int,
-        postings: dict[str, Sequence[int]],
+        postings: Mapping[str, Sequence[int]],
     ) -> None:
         _require_version(version)
         rows = _normalized_postings(postings)

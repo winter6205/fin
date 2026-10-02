@@ -17,12 +17,20 @@ from __future__ import annotations
 
 from typing import Any, Final, TypedDict
 
-from fin.host.citation_gate import strip_hidden_bounce_marker
+from fin.host.citation_gate import (
+    DATABASE_ROW_KIND,
+    DATABASE_ROW_SNAPSHOT_KEY,
+    UNSUPPORTED_DATABASE_CLAIM,
+    database_row_snapshot,
+    strip_hidden_bounce_marker,
+)
 from fin.host.named_failures import (
     COMMUNITY_SUMMARY_INDEX_FAILURE,
     CORPUS_NOT_READY,
     EMPTY_FAST_GRAPH_FAILURE,
+    INSUFFICIENT_EVIDENCE,
     MAPPING_DROP,
+    SQL_NO_MATCHING_ROWS,
 )
 from fin.host.state import STEP_CAP
 from fin.host.thread_store import RunStatus
@@ -63,7 +71,7 @@ class RunResponsePayload(TypedDict):
     reached grounded.
 
     T3 (enterprise-kb Focus 1): ``comparisons`` carries the
-    ``fin.comparison.v1`` envelopes this run's ``compare_facts``
+    ``fin.comparison`` envelopes this run's ``compare_facts``
     calls produced (shape SSOT:
     ``fin.host.tools.compare_facts``). Unlike ``answer`` /
     ``citations`` it survives a ``refuse``: the table is TOOL
@@ -92,6 +100,37 @@ class RunResponsePayload(TypedDict):
     evidence_locators: list[dict[str, Any]]
 
 
+def citation_to_wire(citation: Any) -> dict[str, Any]:
+    """One ``Citation`` as the wire dict the shared shaper publishes.
+
+    A ledger row's retained snapshot rides on
+    :data:`~fin.host.citation_gate.DATABASE_ROW_SNAPSHOT_KEY`, assembled
+    by the gate family's single owner
+    (:func:`~fin.host.citation_gate.database_row_snapshot`), so every
+    surface that reads this dict — the ``/ask`` response, the workspace
+    SSE frame, the turn table — offers the same evidence and opening it
+    never means a query (spec 8.1). The key is OMITTED for the two
+    document kinds rather than set to ``None``: their rows are already
+    stored in ``fin_run.citations``, and adding a key to every one of
+    them is a migration nothing here can do.
+    """
+    out: dict[str, Any] = {
+        "kind": citation.kind,
+        "document_id": citation.document_id,
+        "attachment_id": citation.attachment_id,
+        "version": citation.version,
+        "unit": citation.unit,
+        "display": citation.display,
+        "filename": citation.filename,
+        "quote": citation.quote,
+    }
+    if citation.kind == DATABASE_ROW_KIND:
+        snapshot = database_row_snapshot(citation)
+        if snapshot is not None:
+            out[DATABASE_ROW_SNAPSHOT_KEY] = snapshot
+    return out
+
+
 # Ordinary-person copy the SPA renders when a run ended
 # ``refuse`` or ``step_cap`` (T2 / spec SC67). The mapping lives
 # here so the workspace send path, the ``/ask`` route, and the
@@ -108,6 +147,15 @@ ORDINARY_PERSON_COPY: Final[dict[str, str]] = {
     "citation_repair_cap": (
         "I couldn't match the answer to the cited sources after a "
         "few tries - try rephrasing or narrower scope."
+    ),
+    # ADR 0091: the answer stated a figure no ledger row this round
+    # returned supports. Its own reason because its own fix: neither
+    # "cite something" (nothing here to cite) nor "the filing id is
+    # wrong" (none is) would send the operator anywhere useful, and a
+    # blank copy would report this refusal as silence.
+    UNSUPPORTED_DATABASE_CLAIM: (
+        "That figure isn't what the database returned for this query. "
+        "Ask about the record again, or query the ledger directly."
     ),
     # Numeric gate (ADR 0031): the answer's figure did not match
     # any XBRL fact row the model looked up this run.
@@ -154,6 +202,27 @@ ORDINARY_PERSON_COPY: Final[dict[str, str]] = {
         "to standard extract (or fix the Fast extractor), re-run the "
         "index, then ask again."
     ),
+    # E2 / spec enterprise-evidence-contract §6 — the authorized
+    # material WAS found and retrieved, it simply does not state the
+    # rule that was asked. Not 资料未就绪: the documents are there, so
+    # ingest advice would be wrong; the honest fact is the coverage
+    # gap in the material itself.
+    INSUFFICIENT_EVIDENCE: (
+        "The authorized materials don't state an answer to this "
+        "question — the documents were found, but none covers this "
+        "rule. Check whether the policy is expected to cover it."
+    ),
+    # search-mode-business-sql-contract §7 — the permitted ledger query
+    # RAN in the requested window and matched no row. Its own copy on
+    # purpose: 语料未就绪's advice (add documents, re-ingest) is
+    # factually wrong after a database miss — nothing here is waiting
+    # to be indexed. The fix names what the miss was about: the
+    # database, the window, the record.
+    SQL_NO_MATCHING_ROWS: (
+        "The business database has no ledger row for this query in the "
+        "window you asked about. Widen the dates or name a different "
+        "record, then ask again."
+    ),
 }
 
 
@@ -162,10 +231,11 @@ def ordinary_person_copy(status: str, reason: str) -> str:
 
     ``done`` -> ``""`` (the run produced a real ``answer``).
     ``refuse`` -> keyed by ``reason`` (``unknown_locator`` /
-    ``citation_repair_cap`` / ``numeric_gate_fail`` /
+    ``citation_repair_cap`` / ``unsupported_database_claim`` /
+    ``numeric_gate_fail`` /
     ``corpus_not_ready`` / ``mapping_drop`` /
     ``community_summary_index_failure`` /
-    ``empty_fast_graph_failure``).
+    ``empty_fast_graph_failure`` / ``insufficient_evidence``).
     ``step_cap`` -> the step-cap string regardless of ``reason``.
     Unknown terminal -> ``""`` (defensive; the gate never
     produces one).
@@ -311,19 +381,10 @@ def _run_to_response_payload(raw: dict[str, Any]) -> RunResponsePayload:
         # The full citation contract goes on the wire, not just the
         # company triple: an attachment citation carries no
         # ``document_id`` and is only openable from its identity plus
-        # ``display`` / ``filename``.
+        # ``display`` / ``filename``, and a ledger row names neither id
+        # and is only openable from its own retained snapshot.
         citations_payload: list[dict[str, Any]] = [
-            {
-                "kind": cit.kind,
-                "document_id": cit.document_id,
-                "attachment_id": cit.attachment_id,
-                "version": cit.version,
-                "unit": cit.unit,
-                "display": cit.display,
-                "filename": cit.filename,
-                "quote": cit.quote,
-            }
-            for cit in raw_citations
+            citation_to_wire(cit) for cit in raw_citations
         ]
         return RunResponsePayload(
             status="done",

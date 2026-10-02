@@ -23,7 +23,9 @@ state.
 
 from __future__ import annotations
 
-from fin.retrieve.port import Chunk, RetrievePort
+from typing import Any
+
+from fin.retrieve.port import RetrievePort
 
 
 def retrieve(
@@ -36,8 +38,10 @@ def retrieve(
     filing_date: str | None = None,
     limit: int = 8,
     search_mode: str | None = None,
+    sql_window_start: str | None = None,
+    sql_window_end: str | None = None,
     adapter: RetrievePort | None = None,
-) -> dict[str, list[Chunk]]:
+) -> dict[str, Any]:
     """Adapter-bound retrieve: returns the ADR 0009 contract shape.
 
     Parameters
@@ -65,6 +69,12 @@ def retrieve(
         (``fin.host.search_mode_decision.assigned_retrieve_mode``), so the
         wrapper is the seam, not the source: an omitted value means "send
         no 档" and iknow answers with its own default.
+    sql_window_start / sql_window_end
+        The ``sql`` 档's inclusive expiry window: passed through
+        untouched like the 档 token — the port seam
+        (``fin.retrieve.port.resolve_sql_window``) names a missing or
+        malformed bound pair ``invalid_business_query`` before anything
+        reaches the wire, and the wrapper does not duplicate that gate.
     adapter
         The shared ``RetrievePort`` implementation. The host graph
         (T6) constructs one adapter per run and threads it through
@@ -77,7 +87,8 @@ def retrieve(
     dict
         ``{"chunks": [Chunk, ...]}`` in descending score order.
         Each ``Chunk`` carries ``text``, ``source_ref`` (Locator),
-        and ``score``.
+        and ``score``. A ``sql`` run may carry the ``database_rows``
+        sibling beside an empty chunk list (spec §8.0).
     """
     if adapter is None:
         raise ValueError(
@@ -94,6 +105,8 @@ def retrieve(
         filing_date=filing_date,
         limit=limit,
         search_mode=search_mode,
+        sql_window_start=sql_window_start,
+        sql_window_end=sql_window_end,
     )
 
 

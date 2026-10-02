@@ -1,0 +1,38 @@
+{
+  "case": "valid-egress-citation",
+  "direction": "consumer",
+  "expect": "accept",
+  "refusal_code": null,
+  "payload": {
+    "evidence_schema": "fin.evidence.citation",
+    "schema_version": 1,
+    "citations": [
+      {
+        "kind": "database-row",
+        "document_id": "",
+        "attachment_id": "",
+        "version": "2026-03-01T09:14:22Z",
+        "unit": 1,
+        "display": "record",
+        "filename": "",
+        "quote": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12",
+        "database_row": {
+          "schema": "fin.evidence.database_row_snapshot",
+          "schema_version": 1,
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2291"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_by": "2026-02-12",
+            "notice_days": "30"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        }
+      }
+    ]
+  }
+}

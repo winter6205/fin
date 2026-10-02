@@ -1,0 +1,22 @@
+{
+  "case": "egress-missing-snapshot",
+  "direction": "consumer",
+  "expect": "refuse",
+  "refusal_code": "malformed_evidence_contract",
+  "payload": {
+    "evidence_schema": "fin.evidence.citation",
+    "schema_version": 1,
+    "citations": [
+      {
+        "kind": "database-row",
+        "document_id": "",
+        "attachment_id": "",
+        "version": "2026-03-01T09:14:22Z",
+        "unit": 1,
+        "display": "record",
+        "filename": "",
+        "quote": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+      }
+    ]
+  }
+}

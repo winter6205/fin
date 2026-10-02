@@ -36,7 +36,8 @@ export type UnitGroup = {
 
 export type SourceGroup = {
   // Stable identity: attachment_id for attachments, document_id for
-  // company rows. Never the filename.
+  // company rows, the permitted view plus record key for a ledger row.
+  // Never the filename.
   identity: string;
   label: string;
   units: UnitGroup[];

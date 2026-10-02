@@ -44,8 +44,30 @@ function attachmentCitation(
   };
 }
 
-describe("shouldCollapseSourcesList", () => {
-  it("keeps an empty sources list open", () => {
+// A ledger row citation: a record from the ``sql`` 档, verified by its
+// record key and this round's returned fields rather than by a text span
+// (ADR 0091). It names no filing and has no unit ordinal.
+function databaseRowCitation(contractId: string): Citation {
+  return {
+    kind: "database-row",
+    document_id: "",
+    attachment_id: "",
+    version: "2026-03-01T09:14:22Z",
+    unit: 1,
+    display: "record",
+    filename: "",
+    quote: `${contractId} Northwind Logistics, notice period 30 days`,
+    database_row: {
+      source: "ledger_ro.contract_expiry",
+      record_key: { contract_id: contractId },
+      queried_at: "2026-03-01T09:14:22Z",
+      fields: { counterparty: "Northwind Logistics", notice_days: "30" },
+      summary: `${contractId} Northwind Logistics, notice period 30 days`,
+    },
+  };
+}
+
+describe("shouldCollapseSourcesList", () => {  it("keeps an empty sources list open", () => {
     expect(shouldCollapseSourcesList(0)).toBe(false);
   });
 
@@ -149,6 +171,35 @@ describe("groupCitationsBySourceAndUnit", () => {
     ]);
     expect(groups[0].units[0].display).toBe("page");
     expect(groups[1].units[0].display).toBe("unit");
+  });
+
+  it("keys a ledger row by its view and record key, not by unit", () => {
+    // A row has no ordinal: two rows of the same view are two records,
+    // and grouping them under a shared "u.1" would merge two answers'
+    // evidence into one (ADR 0091).
+    const groups = groupCitationsBySourceAndUnit([
+      databaseRowCitation("C-2291"),
+      databaseRowCitation("C-2292"),
+    ]);
+    expect(groups.map((g) => g.identity)).toEqual([
+      "ledger_ro.contract_expiry#contract_id=C-2291",
+      "ledger_ro.contract_expiry#contract_id=C-2292",
+    ]);
+    expect(groups[0].units[0].display).toBe("record");
+  });
+
+  it("never files a ledger row under a filing's units", () => {
+    // The old binary identity switch defaulted every unrecognised kind
+    // to document_id, which is "" for a row — so rows would have merged
+    // into one group, and that one with any filing that also had an
+    // empty id.
+    const groups = groupCitationsBySourceAndUnit([
+      citation(1),
+      databaseRowCitation("C-2291"),
+    ]);
+    expect(groups).toHaveLength(2);
+    expect(groups[0].identity).toBe("AAPL-10Q-2024Q3");
+    expect(groups[1].identity).toBe("ledger_ro.contract_expiry#contract_id=C-2291");
   });
 });
 

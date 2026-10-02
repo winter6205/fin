@@ -1,0 +1,13 @@
+{
+  "case": "digest-carrier-malformed-hash",
+  "direction": "consumer",
+  "expect": "refuse",
+  "refusal_code": "malformed_evidence_contract",
+  "payload": {
+    "source": "ledger_ro.contract_expiry",
+    "record_key": {
+      "contract_id": "C-2291"
+    },
+    "snapshot_digest": "md5:1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809"
+  }
+}

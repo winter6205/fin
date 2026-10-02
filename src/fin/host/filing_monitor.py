@@ -26,6 +26,7 @@ class FilingSource(Protocol):
 
     def fetch(self, watches: Sequence[WatchEntry]) -> Iterable[dict[str, Any]]:
         """Return current filings for the requested watches."""
+        ...
 
 
 @dataclass(frozen=True)

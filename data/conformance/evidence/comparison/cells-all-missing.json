@@ -1,0 +1,53 @@
+{
+  "case": "cells-all-missing",
+  "direction": "consumer",
+  "expect": "accept",
+  "refusal_code": null,
+  "payload": {
+    "comparison": {
+      "schema": "fin.comparison",
+      "schema_version": 1,
+      "kind": "table",
+      "axis": "period",
+      "concept": "us-gaap:NoSuchConcept",
+      "unit": "",
+      "scale": "",
+      "columns": [
+        {
+          "key": "2023-Q3-YTD",
+          "label": "2023-Q3-YTD"
+        }
+      ],
+      "rows": [
+        {
+          "key": "AAPL",
+          "label": "AAPL",
+          "kind": "issuer",
+          "cells": [
+            {
+              "row": "AAPL",
+              "column": "2023-Q3-YTD",
+              "status": "missing",
+              "value": null,
+              "display": "—",
+              "unit": "",
+              "scale": "millions",
+              "locator": null
+            }
+          ]
+        }
+      ],
+      "deltas": [],
+      "missing": [
+        {
+          "row": "AAPL",
+          "column": "2023-Q3-YTD",
+          "reason": "no fact row"
+        }
+      ],
+      "hit_count": 0,
+      "cell_count": 1,
+      "locators": []
+    }
+  }
+}

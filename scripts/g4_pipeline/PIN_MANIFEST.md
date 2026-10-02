@@ -7,11 +7,14 @@ versions appear, and it does not claim to be. Where each one is authoritative:
 
 | where | what it is the source of |
 |---|---|
-| `Dockerfile` (`ARG DOCLING_VERSION`, the two `==…+cpu` requirements) | what the build installs |
+| `image-pin.json` (`expected_image_id`) | **the expected image identity**, declared outside the build output |
+| `requirements.lock` | what the build installs, and the bytes of each artifact |
+| `apt-packages.lock` | the OS packages the build requests and the versions it actually installed |
+| `Dockerfile` | the base image digest and the apt snapshot the lock is anchored to |
 | `results/image_pip_freeze.txt` | what pip actually resolved inside the built image |
 | per-run `pipeline_identity` in `results/*.json` | the classes, flags, device and thread counts a real run used, read out of the live objects |
 | `docs/validation/2026-09-26-g4-t2a-page-vision-budgets.md` | the decision the measurements fed, and the commands that ran |
-| this file | why the pin is what it is, and the guard commands that prove it |
+| this file | why the pin is what it is. Since C1 it is **not** a source of the pin itself — the rows above are |
 
 `pyproject.toml` and `uv.lock` are deliberately **untouched**: docling is **not**
 a declared dependency of the repo yet, and adding it is T2d's runtime-dependency
@@ -30,33 +33,141 @@ download metadata that the image wrote itself.
 
 ## 1. Image identity
 
+**This section used to contradict the two files it names as its own source.**
+It recorded image id `8e10185f…` and `docling-parse 7.21.0`, while
+`results/image_identity.txt` recorded `0f278c22…` and
+`results/image_pip_freeze.txt` recorded `docling-parse 7.22.1`. Neither
+authority is prose; both are committed artifacts. That is L7 in
+`docs/validation/2026-09-29-g4-t5-unit-citation-legacy-removal.md`, and it is
+the defect the tracked change task C1 set out to remove.
+
+**Reconciliation (C1).** Three values, and they are not the same kind of thing:
+
+| value | where it lives | what it is |
+|---|---|---|
+| `sha256:8e10185f…` | `image-pin.json` → `expected_image_id` | the **declared expectation** — what a rebuild must reproduce |
+| `sha256:0f278c22…` | `results/image_identity.txt` | the **observed identity** of a rebuild that drifted |
+| `python:3.12-slim@sha256:44ff437b…` | `Dockerfile` | the **digest-pinned base** the pin is now anchored to |
+
+`8e10185f…` stays the expectation. It has **not** been re-baselined to
+`0f278c22…`: the tracked change forbids silently replacing the expected digest, and
+`0f278c22…` is the very artifact whose drift is the open defect, so adopting it
+would launder the bug into the contract. `build.sh` therefore **fails today**,
+by design, with exit 75. That is the honest state, not a defect in the verifier —
+see *Builder reproducibility* below for the measured cause.
+
 | field | value |
 |---|---|
 | tag | `fin-g4-pipeline:t2a` |
-| image id | `sha256:8e10185fa27ea5adcfca94732adc27a2720ed9a31b67698d0a2c9e7a1a62c800` |
-| created | `2026-09-26T00:41:58.341799675+08:00` |
-| content size (`size_bytes`) | `681909257` bytes = 650.3 MiB |
+| declared expected image id | `sha256:8e10185f…` (in `image-pin.json`) |
+| observed image id of the last build | `sha256:0f278c22…` (in `results/image_identity.txt`) |
+| **agreement** | **none — the check fails, awaiting an operator decision** |
 | arch | `amd64` |
-| base image | `python:3.12-slim` |
+| base image | `python:3.12-slim@sha256:44ff437bba879d4941b710a369a8f19266aea34b29002807f0c487fabc9eec9b` |
+| builder | buildx builder declared in `image-pin.json` (name `g4repro`, driver docker-container, BuildKit v0.32.2, `memory="4g"`, `network="host"`); `build.sh` compares it against the live host before building. Formerly the Docker CLI 29.1.3 **legacy** builder — retired by the operator's option (a) decision, history below. |
+| builder reproducibility | the declared buildx path **reproduces** image ids byte-for-byte on probe builds (see §1a); the full pinned image is **not yet re-proved** on this path since the `--no-compile` fix, so the L7 id below stays declared and unmatched |
 | Python | `3.12.14 (main, Sep 19 2026, 01:04:57) [GCC 14.2.0]` |
 
-Source of these values: `docker image inspect` snapshot in `results/image_identity.txt`;
-`size_bytes` is that snapshot's only size field, so no larger unpacked figure is recorded
-anywhere in `results/`.
+`size_bytes` and `created` are no longer tabulated here. Both are wall-clock
+values the legacy builder writes into the image config, so neither is
+reproducible and neither is a property of the pin; they live only in
+`results/image_identity.txt`.
 
-## 2. System packages (apt, `python:3.12-slim` bookworm)
+> **`repo_digests` in `results/image_identity.txt` is not registry provenance.**
+> An earlier `build.sh` recorded `docker image inspect .RepoDigests`, and for a
+> locally built, never-pushed image that field echoes the image ID back. It was
+> dropped rather than quoted, because treating it as a registry digest would
+> make a local build look attested. This image is never pushed.
 
-```
-ca-certificates curl libgl1 libglib2.0-0 libgomp1
-tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim
-```
+### Builder reproducibility — the measured blocker
 
-Tesseract is **not** version-pinned by apt on this base; the installed binary is
-recorded by measurement instead. `tesseract --version` is baked into the image at
-`/opt/g4/tesseract_version.txt`, and `build.sh` copies it out to
-`results/image_tesseract_version.txt`, so the `tesseract 5.5.0` cited by the
-validation record is readable from a committed artifact rather than from memory
-(leptonica 1.84.1, AVX2/FMA/SSE4.1 and OpenMP 201511 found).
+The legacy builder **cannot** produce the byte-identical image id the issue
+asks for, from any amount of input pinning. Two clean `--no-cache` builds of a
+deliberately trivial 2-layer Dockerfile over the same digest-pinned base:
+
+| | build 1 | build 2 |
+|---|---|---|
+| image id | `sha256:a0f088b8…` | `sha256:ed2ae686…` |
+| `created` | `2026-09-29T20:55:47.408482569+08:00` | `2026-09-29T20:56:57.577821291+08:00` |
+| base layers (4) | byte-identical | byte-identical |
+| `RUN` layer diffID | `sha256:6901e9d2…` | `sha256:08c4005e…` |
+
+The cause is isolated, not inferred: the 4 base layers hash identically in both
+builds, the `RUN` layer's **file contents are byte-identical** (`diff -r` clean)
+and only its mtimes differ by exactly the build gap, and the image config differs
+in `created`, in each `history[].created`, and in `rootfs.diff_ids` — with both
+configs measuring exactly 6025 bytes, i.e. the same bytes with a different
+timestamp substituted. `SOURCE_DATE_EPOCH=1700000000` changes nothing: two
+builds with it set produced `sha256:1b0668ab…` and `sha256:09e027d4…`.
+
+So the timestamp is written into both the layer tar and the config, and the
+config is what the image ID hashes. This is a property of the builder, not of
+the pin. Everything the pin *can* control — base digest, OS packages, Python
+resolution, model revisions — is controlled and checked. The one thing it cannot
+control is the builder's clock, which is why C1 is blocked rather than complete.
+
+**Follow-up, 2026-09-30: the operator chose option (a) — buildx/BuildKit.** The
+record (`docs/validation/2026-09-30-g4-buildkit-reproducibility.md`) measured
+that BuildKit with `rewrite-timestamp=true` plus `SOURCE_DATE_EPOCH` makes clean
+probe builds byte-identical, while the *full* build then in use still differed
+in 2 of 11 layers; the differing layer content was traced to pip's build-time
+`.pyc` files and suppressed with `--no-compile` on the install line. Re-verified
+on this branch the same day: two clean buildx builds of a 2-layer probe gave the
+same manifest digest, and two clean buildx builds of a probe shaped like the
+real steps (COPY lock, `pip install --no-cache-dir --no-compile
+--require-hashes`, timestamp-free snapshot writes) also gave one shared digest.
+A deliberately non-reproducible variant (a snapshot file recording `stat`
+mtimes) diverged in exactly that layer, confirming the mechanism reads the
+build clock only through file *contents* now. `build.sh` therefore builds
+through the declared buildx builder. What is NOT closed: two clean builds of
+the full pinned Dockerfile on this path have not been run since `--no-compile`,
+so no new baseline is declared and `8e10185f…` (a legacy-builder artifact)
+remains declared and unmatched — the build fails the identity check by design
+until the operator accepts a baseline proved by those two full builds.
+
+**Builder provenance is mechanical.** the tracked change asks for package, OS, base,
+builder, model and source provenance to be checkable "without prose-only
+pins". All six are now declared in `image-pin.json` / lock files and verified
+before or after each build. The builder block names engine, buildx builder,
+driver, BuildKit version, memory ceiling, network and SOURCE_DATE_EPOCH, and
+`pin.py`'s `check-builder` (fed by `build.sh` with the live host's engine, mode,
+and `buildx inspect` output) refuses to build on a host where any of
+them differs (exit 65). Earlier text here described this as prose-only; that
+gap was closed by the builder-identity contract in
+`tests/host/test_g4_pipeline_builder_identity_contract.py`.
+Declaring the engine is mechanical work this task did not complete, and it is
+listed as such in the validation record rather than left to look covered.
+
+## 2. System packages (apt)
+
+Mechanically pinned in **`apt-packages.lock`**, not by this prose. The previous
+version of this section said `python:3.12-slim` *bookworm*; the digest-pinned
+base is Debian 13 **trixie**, and the tag had moved between the two without any
+edit here. That single drift is why the base is now pinned by digest.
+
+| field | value | where |
+|---|---|---|
+| mirror | `snapshot.debian.org` @ `20260929T083940Z` | `apt-packages.lock` `[mirror]` |
+| requested (8) | `ca-certificates`, `curl`, `libgl1`, `libglib2.0-0`, `libgomp1`, `tesseract-ocr`, `tesseract-ocr-eng`, `tesseract-ocr-chi-sim` | `[requested]`, each `=version` |
+| installed (188) | every package in the image, dependencies included | `[installed]` |
+
+The 8 requested packages are pinned to exact versions in the `Dockerfile`, and
+`pin.py` closes that loop: it rejects an install line carrying any unpinned
+token, any pinned name absent from `[requested]` or present at a different
+version, and any `[requested]` entry missing from the line. Their
+~180 transitive dependencies are **not** in the Dockerfile, because pinning each
+would make the build unreadable and apt would still resolve them; instead the
+full installed set is committed, so what the build actually installed stays
+comparable without a container. That set is a record rather than a gate.
+Trixie renamed `libglib2.0-0` to `libglib2.0-0t64` and kept
+the old name as a virtual provide, so `pin.py` resolves that suffix rather than
+reporting a pinned package as missing.
+
+Tesseract is still recorded by measurement as well as by pin:
+`tesseract --version` is baked into the image at `/opt/g4/tesseract_version.txt`
+and copied out to `results/image_tesseract_version.txt`, so the `tesseract 5.5.0`
+cited by the validation record is readable from a committed artifact (leptonica
+1.84.1, AVX2/FMA/SSE4.1 and OpenMP 201511 found).
 
 OCR language guard (runs at build time and aborts the build on failure):
 
@@ -71,46 +182,54 @@ osd
 `eng` and `chi_sim` are both present, which is what
 `fin.corpus.ocr.DEFAULT_TESSERACT_LANG = "chi_sim+eng"` requires.
 
-## 3. Python pins — the packages this measurement depends on
+## 3. Python pins
 
-Install order matters and is baked into the Dockerfile: torch/torchvision are resolved from
-the **CPU-only wheel index first**, then docling is installed with
-`--extra-index-url https://download.pytorch.org/whl/cpu` so pip can never substitute the
-default CUDA build.
+**The resolution is mechanically pinned in `requirements.lock`, not by the table
+this section used to carry.** All 104 packages are `==`-pinned with a
+`--hash=sha256:` for every artifact pip may select, and the Dockerfile installs
+that one file under `--require-hashes`. Previously 4 packages carried an explicit
+`==` and ~100 were labelled "transitive" — meaning unpinned, which is precisely
+how `docling-parse` moved 7.21.0 → 7.22.1, `Faker` 40.39.0 → 40.40.0 and `regex`
+2026.9.10 → 2026.9.29 between two builds. Under `--require-hashes` a wheel that
+changes upstream now **fails the build** instead of silently changing the image.
 
-| package | resolved version | pinned as |
+The table below is retained as a reading aid for the packages the measurement
+actually depends on, not as the pin. `docling-parse` is corrected to `7.22.1`,
+the value in `results/image_pip_freeze.txt` and `requirements.lock`; the `7.21.0`
+above was the prose drift L7 recorded.
+
+| package | resolved version | why the measurement needs it |
 |---|---|---|
-| docling | `2.130.0` | `docling==2.130.0` (explicit) |
-| docling-slim | `2.130.0` | transitive (docling meta-package) |
-| docling-core | `2.99.0` | transitive |
-| docling-ibm-models | `4.0.3` | transitive |
-| docling-parse | `7.21.0` | transitive |
-| torch | `2.9.1+cpu` | `torch==2.9.1+cpu` (explicit, `+cpu` local version = CPU index) |
-| torchvision | `0.24.1+cpu` | `torchvision==0.24.1+cpu` (explicit) |
-| transformers | `5.17.0` | transitive |
-| opencv-python | `5.0.0.93` | transitive |
-| pypdfium2 | `5.13.0` | transitive (also the render/text backend used by the driver) |
-| pytesseract | `0.3.13` | `pytesseract==0.3.13` (explicit) |
-| numpy | `2.5.2` | transitive |
-| scipy | `1.18.1` | transitive |
-| pillow | `12.3.0` | transitive |
-| huggingface_hub | `1.33.0` | transitive |
-| hf-xet | `1.6.0` | transitive (transport **disabled** at run time, see §7) |
-| safetensors | `0.8.0` | transitive |
-| accelerate | `1.15.0` | transitive |
-| rapidocr | `3.9.2` | transitive — present but *unused* (fin's OCR path is Tesseract) |
-| onnxruntime | **absent** | confirmed: `pip freeze` has no onnxruntime ⇒ Docling's ONNX engine
-  override for heron is not usable, so layout runs on the **torch** engine |
+| docling | `2.130.0` | the measured pipeline |
+| docling-slim | `2.130.0` | docling meta-package |
+| docling-core | `2.99.0` | docling core |
+| docling-ibm-models | `4.0.3` | docling models |
+| docling-parse | `7.22.1` | `ThreadedDoclingParseDocumentBackend`, the selected PDF backend |
+| torch | `2.9.1+cpu` | CPU-only layout engine (`+cpu` local version = CPU index) |
+| torchvision | `0.24.1+cpu` | torch vision ops |
+| transformers | `5.17.0` | model loading |
+| opencv-python | `5.0.0.93` | image ops for the render path |
+| pypdfium2 | `5.13.0` | the render/text backend used by the driver |
+| pytesseract | `0.3.13` | fin's OCR front-end |
+| numpy | `2.5.2` | numeric base |
+| scipy | `1.18.1` | scipy ops |
+| pillow | `12.3.0` | image I/O |
+| huggingface_hub | `1.33.0` | artifact download |
+| hf-xet | `1.6.0` | transport **disabled** at run time, see §7 |
+| safetensors | `0.8.0` | weight format |
+| accelerate | `1.15.0` | device placement |
+| rapidocr | `3.9.2` | present but *unused* (fin's OCR path is Tesseract) |
+| onnxruntime | **absent** | confirmed: neither the lock nor `pip freeze` has it ⇒ Docling's ONNX engine override for heron is not usable, so layout runs on the **torch** engine |
 
-CPU-wheel guard (runs at build time, aborts the build otherwise):
+The CPU wheel index is declared in the lock as `--extra-index-url`, and torch and
+torchvision are pinned to their `+cpu` local versions. PyPI publishes no `+cpu`
+build, so no CUDA wheel can be selected — a separate build-time guard also asserts
+`not torch.cuda.is_available()` and aborts the build otherwise.
 
-```
-python -c "import torch,sys;
-  ok = 'cpu' in torch.__version__ and not torch.cuda.is_available(); ..."
-```
-
-Full 104-line resolution: `results/image_pip_freeze.txt` (also baked in-image at
-`/opt/g4/pip_freeze.txt`).
+`requirements.lock` is generated from `results/image_pip_freeze.txt` by
+`gen_requirements_lock.py`; regenerate both together and commit them in one
+commit. Full 104-line resolution: `results/image_pip_freeze.txt` (also baked
+in-image at `/opt/g4/pip_freeze.txt`).
 
 ## 4. Pipeline actually exercised (no VLM, no local model beyond layout+table)
 
@@ -134,6 +253,37 @@ The concrete class names, model spec (`name`/`repo_id`/`revision`), engine overr
 `do_*` flags, device and thread counts are re-emitted per run inside
 `pipeline_identity` of the measurement JSON — they are read out of the objects, not asserted
 from this document.
+
+## 4a. What is NOT in the image digest
+
+An image id covers the layers and the config. It does **not** cover anything
+mounted at run time, so a reproducible image id is necessary but not sufficient
+to say a measurement is reproducible. These inputs are named here so a reader
+does not assume the digest covers them:
+
+| input | how it reaches the run | why it is outside the image |
+|---|---|---|
+| **Model weights** (Heron, TableFormer — §5) | host dir `~/.cache/fin-g4-docling-models` → `/models` | fetched by `huggingface_hub.snapshot_download(revision=…)` on the host, revision read from `models.lock` (§5), never baked; `HF_HOME=/models/hf` points out of the image |
+| **Source revision** | worktree → `/worktree:ro`, `PYTHONPATH=/worktree/src` | `driver.py` and all of `src/fin` are mounted read-only; the image contains no `fin` code |
+| **Gold PDF bytes** | `--volume .../results/<run>:/out` and the caller's PDF path | inputs to the measurement, not to the build |
+| **Harness scripts** (`driver.py`, `run_measured.sh`) | the same worktree mount | deliberately not baked, to avoid a second stale copy |
+| **Host cgroup state** | `--memory/--memory-swap/--cpus` at `docker run` | §6 |
+
+The gold-set fixture bytes are committed under `data/corpus/` and are covered by
+their own manifest hashes, not by the image id.
+
+**Closed (83b53ba).** The driver's `artifact_identity` now hashes **every
+reported artifact**, not only paths containing `layout`: an over-1 MB file such
+as `tableformer_accurate.safetensors` (212,758,388 B ≤ the 2 GiB hash ceiling)
+is read and gets its own `sha256` in `heron_artifact.files[]`, so a swap made
+*after* the build gate and *during* a measurement shows up as a digest
+mismatch in that run's record rather than passing unseen. An artifact whose
+digest could not be measured is emitted as `sha256: null` plus a named
+`sha256_error` — never a silent zero or an absent key. The build-time gate is
+unchanged: `pin.py verify-models` still hashes each payload itself and both
+`build.sh` (a cache must be present or the build stops with exit 75) and
+`run_measured.sh` (an unbound or mismatched cache stops the run with exit 75)
+check the cache against `models.lock` before any measurement.
 
 ## 5. Heron / TableFormer artifact pins (host-mounted cache, never baked into the image)
 
@@ -165,36 +315,84 @@ docling-project--docling-models/.cache/.../tableformer_accurate.safetensors.meta
 
 Both ETags equal the independently computed `sha256sum` of the local file, so the weights
 really came from `huggingface.co` and were not silently satisfied from a mirror or a
-pre-existing directory. The driver additionally re-hashes any path containing `layout`
-on every run (`heron_artifact` in the JSON) — the hash above is that measured value.
+pre-existing directory. The driver additionally re-hashes every reported artifact
+over 1 MB on every run, layout and TableFormer alike (`heron_artifact` in the
+JSON) — the hash above is that measured value.
 
-Fetch command (idempotent preamble in `run_measured.sh`, run **under the same ceiling**):
+### Model revisions are pinned and the fetch is bound to them
+
+The revisions above are now mechanical, in **`models.lock`**: every artifact is
+declared at a 40-character commit, and `pin.py parse_models_lock` **rejects**
+`main`, `master`, `HEAD` and `latest` outright. Heron moves from the branch it
+was recorded against (`revision_was = main`) to
+`8f39ad3c0b4c58e9c2d2c84a38465abf757272d8`.
+
+`pin.py verify-models --pin models.lock --cache-root <dir>` checks the fetched
+weights against that file, reading the HuggingFace download metadata the fetch
+itself wrote (line 1 = commit, line 2 = Hub ETag, which for LFS files is the
+payload's SHA-256). A missing or empty metadata file is reported as a failure,
+never as a match — the same `-1`-is-not-`null` discipline the driver applies to
+cgroup readings. `build.sh` runs it on every build and **refuses to proceed when
+no model cache is present** (exit 75): a cold host stops at the gate rather than
+building unverified.
+
+**The fetch is bound to a revision (83b53ba).** `run_measured.sh` reads the
+revisions out of `models.lock` through `pin.py`'s own parser and fetches each
+`repo@commit` with `huggingface_hub.snapshot_download(revision=…)`. This
+replaces the earlier `docling-tools models download`, which has no `--revision`
+for any model kind and so landed a fresh host on whatever `main` pointed at
+today rather than on `8f39ad3c…`. The plan is a function of the declaration:
+editing a pin changes the fetch, and nothing on the command line can drift it
+back to a branch. After the fetch, and on **every** run whether or not a fetch
+happened, `verify-models` gates the cache against `models.lock`; a mismatch stops
+the run with exit 75 before any measurement.
+
+Fetch command as it stands today (idempotent preamble in `run_measured.sh`, one
+`snapshot_download` per distinct `repo@revision` read from `models.lock`, run
+**under the same ceiling**; the payload verification above is what enforces the
+pin, since `snapshot_download` checks the Hub ETag but the harness re-checks it
+against `models.lock`):
 
 ```
 docker run --rm --memory=4g --memory-swap=4g --cpus=4 --user 1000:1000 --env HOME=/tmp \
   --env HF_HOME=/models/hf --env DOCLING_ARTIFACTS_PATH=/models \
   --env HF_HUB_DISABLE_XET=1 --env HF_HUB_DOWNLOAD_TIMEOUT=180 --env HF_HUB_ETAG_TIMEOUT=120 \
   --volume /home/winner/.cache/fin-g4-docling-models:/models \
-  --entrypoint /usr/local/bin/docling-tools fin-g4-pipeline:t2a \
-  models download --output-dir /models layout tableformer
+  --entrypoint /usr/local/bin/python fin-g4-pipeline:t2a - \
+  docling-project/docling-layout-heron@8f39ad3c0b4c58e9c2d2c84a38465abf757272d8:/models/docling-project--docling-layout-heron \
+  docling-project/docling-models@fc0f2d45e2218ea24bce5045f58a389aed16dc23:/models/docling-project--docling-models \
+  <<'PY'
+from huggingface_hub import snapshot_download
+import sys
+for spec in sys.argv[1:]:
+    repo, rest = spec.split("@", 1)
+    revision, local_dir = rest.split(":", 1)
+    snapshot_download(repo_id=repo, revision=revision, local_dir=local_dir)
+PY
 ```
 
 ## 6. Hard 4 GB ceiling — verbatim commands
 
-Build (the ceiling is applied to build steps too, so a pip install that cannot fit in 4 GiB
-fails here rather than misleadingly succeeding):
+Build (the ceiling is enforced on the BuildKit builder itself, so any step that
+cannot fit in 4 GiB fails here rather than misleadingly succeeding):
 
 ```
-docker build \
-  --memory=4g \
-  --memory-swap=4g \
-  --cpuset-cpus=0-3 \
-  -t fin-g4-pipeline:t2a \
-  scripts/g4_pipeline
+docker buildx create --name g4repro --driver docker-container \
+  --driver-opt memory=4g,network=host --use
+SOURCE_DATE_EPOCH=1700000000 docker buildx build \
+  --builder g4repro --no-cache --provenance=false --sbom=false \
+  --output type=docker,rewrite-timestamp=true,name=fin-g4-pipeline:t2a \
+  --file scripts/g4_pipeline/Dockerfile scripts/g4_pipeline
 ```
 
-(`docker build` on this docker CLI's legacy builder has no `--cpus`, hence `--cpuset-cpus=0-3`
-for the 4-core equivalent. `docker buildx` is not installed.)
+(`build.sh` runs the second command with the builder name, epoch and flags read
+from `image-pin.json`, after gating the live builder against that declaration.
+The legacy `docker build --memory/--cpuset-cpus` form is retired: `docker
+buildx build` has no per-build memory flag — the ceiling moves to the builder's
+driver-opt, which bounds the whole BuildKit process tree, and `network=host` is
+load-bearing because the BuildKit container otherwise cannot resolve the
+digest-pinned base. The former note "`docker buildx` is not installed" is out
+of date as of the option (a) decision.)
 
 Run (the real, literal per-measurement command shape; `run_measured.sh` prints the fully
 expanded instance for every run):
@@ -261,8 +459,9 @@ the swap half of the ceiling should re-run this harness before the caps are froz
 1. **Docling 2.130.0 does not auto-download weights when `artifacts_path` is set.** With
    `DOCLING_ARTIFACTS_PATH=/models` and an empty cache the layout model raises
    `FileNotFoundError: Model 'docling-project/docling-layout-heron' not found in artifacts_path`.
-   The harness therefore carries the idempotent `docling-tools models download` preamble
-   above. This is a real property of the pin, not a quirk of this host.
+   The harness therefore carries the idempotent revision-bound fetch preamble
+   in §5 (`huggingface_hub.snapshot_download`, read from `models.lock`). This is
+   a real property of the pin, not a quirk of this host.
 2. **`hf-xet` 1.6.0 transport times out from this network** (`LocalEntryNotFoundError` /
    `ConnectTimeout`). `HF_HUB_DISABLE_XET=1` forces plain HTTPS, which works.
 3. **Default HF download timeouts (10 s) are too short for a 171 MB/213 MB LFS payload here**;
@@ -278,11 +477,17 @@ the swap half of the ceiling should re-run this harness before the caps are froz
 
 | file | role |
 |---|---|
-| `Dockerfile` | pinned runtime (docling + CPU torch + tesseract eng/chi_sim), with build-time guards |
-| `build.sh` | ceiling-constrained build + `tesseract --list-langs` verification + freeze snapshot |
+| `Dockerfile` | pinned runtime (docling + CPU torch + tesseract eng/chi_sim) on a **digest-pinned base**, apt from a **snapshot mirror at exact versions**, Python from `requirements.lock` under `--require-hashes` |
+| `build.sh` | ceiling-constrained build. Orchestration only: it validates the declared inputs, builds, records snapshots via temp-file-then-`mv`, and delegates the identity check to `pin.py`. Exits 65 on an invalid pin (nothing built), 75 on identity drift |
+| `pin.py` | every rule that can fail about the declared inputs, in one testable unit with no docker. `self-check` and `compare-image-id` subcommands; raises rather than defaulting, so an unreadable lock is a named failure and never an empty one |
+| `image-pin.json` | the **declared expected image id**, read by `build.sh` and never written by it. Holding the expectation here is what keeps the drift check from being true by construction |
+| `requirements.lock` | the full 104-package Python resolution, each `==`-pinned with `--hash=sha256:` for every artifact pip may select |
+| `gen_requirements_lock.py` | regenerates `requirements.lock` from `results/image_pip_freeze.txt` by resolving hashes from PyPI and the PyTorch CPU index. Network-using and **not** part of the default test suite; the build never calls it |
+| `apt-packages.lock` | the apt snapshot timestamp, the 8 requested package versions, and all 188 installed versions |
+| `models.lock` | each host-mounted model artifact at a **40-character commit** plus its payload sha256. `pin.py verify-models` checks the fetched weights against it and refuses `main`/`master`/`HEAD`/`latest` outright |
 | `driver.py` | in-container measurement driver; emits exactly one JSON line, logs to stderr |
 | `run_measured.sh` | ceiling-constrained `docker run` wrapper; merges `docker inspect` OOMKilled with its own out-of-band read of the container scope's `memory.peak` / `memory.swap.peak`. That host-side cross-check read nothing on this host — `host_side_cgroup_memory_peak_bytes` and `host_side_cgroup_memory_swap_peak_bytes` are `null` in every committed meta — so every peak here comes from the driver's in-container reads. It writes the measured line whether or not the run succeeded, then **exits non-zero** when `docker run` failed or the container exited non-zero, naming `docker_run_exit`, `container_exit` and any `state_error` on stderr, so a captured record can never be read as a succeeded run from the exit status alone |
-| `PIN_MANIFEST.md` | this file |
+| `PIN_MANIFEST.md` | this file — why the pin is what it is. It is **not** the pin; §1–§3 now describe inputs that are mechanically enforced elsewhere |
 | `results/` | build snapshots (`image_*.txt`) + one dir and one `<name>.measured.jsonl` per measured run |
 
 This directory is the harness only. It was built and run before the rest of

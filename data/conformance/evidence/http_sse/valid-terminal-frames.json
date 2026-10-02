@@ -1,0 +1,134 @@
+{
+  "case": "http-sse-terminal-citation-frames",
+  "direction": "consumer",
+  "expect": "accept",
+  "refusal_code": null,
+  "payload": {
+    "evidence_schema": "fin.evidence.citation",
+    "schema_version": 1,
+    "input_citations": [
+      {
+        "kind": "company",
+        "document_id": "AAPL-2022Q3",
+        "attachment_id": "",
+        "version": "a7a0d8261a0923404fc45446afd71b9965bd2b4064772df0287e761bb68ba9f2",
+        "unit": 4,
+        "display": "page",
+        "filename": "",
+        "quote": "Total net sales increased during the third quarter"
+      },
+      {
+        "kind": "attachment",
+        "document_id": "",
+        "attachment_id": "att-7",
+        "version": "3",
+        "unit": 2,
+        "display": "unit",
+        "filename": "contract.txt",
+        "quote": "the attached unit states a payment term of thirty days"
+      },
+      {
+        "kind": "database-row",
+        "document_id": "",
+        "attachment_id": "",
+        "version": "2026-03-01T09:14:22Z",
+        "unit": 1,
+        "display": "record",
+        "filename": "",
+        "quote": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12",
+        "database_row": {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": { "contract_id": "C-2291" },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": "30",
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        }
+      },
+      {
+        "kind": "company",
+        "document_id": "AAPL-2022Q3",
+        "attachment_id": "",
+        "version": "a7a0d8261a0923404fc45446afd71b9965bd2b4064772df0287e761bb68ba9f2",
+        "unit": 4,
+        "display": "paragraph",
+        "filename": "",
+        "quote": "Total net sales increased during the third quarter"
+      }
+    ],
+    "emitted_frames": [
+      {
+        "event": "status",
+        "data": {
+          "run_id": "run-conformance-1",
+          "status": "done",
+          "reason": null,
+          "assistant_message": "Revenue grew as reported in the filing.",
+          "evidence_schema": "fin.evidence.citation",
+          "schema_version": 1
+        }
+      },
+      {
+        "event": "evidence_refusals",
+        "data": {
+          "refusals": [
+            { "citation_index": 3, "error": "malformed_evidence_contract" }
+          ]
+        }
+      },
+      {
+        "event": "citations",
+        "data": [
+          {
+            "kind": "company",
+            "document_id": "AAPL-2022Q3",
+            "attachment_id": "",
+            "version": "a7a0d8261a0923404fc45446afd71b9965bd2b4064772df0287e761bb68ba9f2",
+            "unit": 4,
+            "display": "page",
+            "filename": "",
+            "quote": "Total net sales increased during the third quarter"
+          },
+          {
+            "kind": "attachment",
+            "document_id": "",
+            "attachment_id": "att-7",
+            "version": "3",
+            "unit": 2,
+            "display": "unit",
+            "filename": "contract.txt",
+            "quote": "the attached unit states a payment term of thirty days"
+          },
+          {
+            "kind": "database-row",
+            "document_id": "",
+            "attachment_id": "",
+            "version": "2026-03-01T09:14:22Z",
+            "unit": 1,
+            "display": "record",
+            "filename": "",
+            "quote": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12",
+            "database_row": {
+              "schema": "fin.evidence.database_row_snapshot",
+              "schema_version": 1,
+              "source": "ledger_ro.contract_expiry",
+              "record_key": { "contract_id": "C-2291" },
+              "queried_at": "2026-03-01T09:14:22Z",
+              "fields": {
+                "counterparty": "Northwind Logistics",
+                "expiry_date": "2026-03-14",
+                "notice_days": "30",
+                "notice_by": "2026-02-12"
+              },
+              "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

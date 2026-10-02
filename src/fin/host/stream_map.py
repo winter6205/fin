@@ -73,6 +73,13 @@ from typing import Any, Iterable, Mapping
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 
 from fin.host.degradation_notice import DEGRADATION_NOTICE_FIELD
+from fin.host.named_failures import (
+    INVALID_BUSINESS_QUERY,
+    REAL_DB_NOT_WIRED,
+    SQL_AUTHORIZATION_UNVERIFIED,
+    SQL_QUERY_DENIED,
+    SQL_QUERY_TIMEOUT,
+)
 from fin.host.tools.issuer_fanout import ISSUER_FANOUT_TOOL
 from fin.retrieve.degradation import degraded_reasons_for_display
 
@@ -753,8 +760,21 @@ def summarize_list_files(
 # (``specs/s1-corpus-retrieve.md``). A typed EXIT means retrieval
 # never ran, so it must NOT read like a miss: "0 hits" would tell
 # the operator the corpus has nothing.
+#
+# The sql 档's declared failures (spec search-mode-business-sql-contract
+# §7) each name their own fact here: 「未配置台账」, a denied read, a
+# timeout, an unverified authorization and an unbound request are five
+# different operator instructions, and NONE of them is the outage line
+# above — collapsing them into one would retry a refusal in vain. An
+# unknown code still falls back to the verbatim naming below, so a new
+# producer token surfaces under its own name before it ever gets copy.
 _RETRIEVE_ERROR_COPY: dict[str, str] = {
     "retrieve_unavailable": "retrieve backend unavailable",
+    REAL_DB_NOT_WIRED: "business ledger is not provisioned on this backend",
+    SQL_QUERY_DENIED: "the ledger refused this query",
+    SQL_QUERY_TIMEOUT: "the ledger query timed out",
+    SQL_AUTHORIZATION_UNVERIFIED: "the ledger read authorization is unverified",
+    INVALID_BUSINESS_QUERY: "the ledger request has no bindable date window",
 }
 
 

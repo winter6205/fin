@@ -7,14 +7,18 @@ typed 404."
 Binding to T3
 -------------
 The comparison export reads ``RunRecord.comparisons`` — the
-``fin.comparison.v1`` envelopes ``compare_facts`` produced this run
+``fin.comparison`` envelopes ``compare_facts`` produced this run
 (shape SSOT: ``fin.host.tools.compare_facts``). The export renders
 those envelopes and NOTHING else:
 
 * every figure in the CSV is a cell's own ``display`` string;
 * every redline is a delta's own ``display`` / ``direction``;
 * an envelope carrying a different ``schema`` value is refused, not
-  best-effort rendered.
+  best-effort rendered;
+* so is a recognized token whose ``schema_version`` is present and
+  wrong (ADR 0093 decisions 6 and 7) — and so is a recognized token
+  whose ``schema_version`` is ABSENT, as ``malformed_evidence_contract``
+  (decision 12).
 
 CONTEXT (``compare_facts`` entry) forbids "computing the delta in the
 SPA or the export": this module therefore has no arithmetic at all, and
@@ -42,8 +46,18 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Sequence
 
-from fin.host.citation_gate import COMPANY_KIND, QUOTABLE_EVIDENCE_KINDS
-from fin.host.tools.compare_facts import COMPARISON_SCHEMA
+from fin.host.citation_gate import (
+    COMPANY_KIND,
+    DATABASE_ROW_KIND,
+    DATABASE_ROW_SNAPSHOT_KEY,
+    QUOTABLE_EVIDENCE_KINDS,
+    format_database_row_source_id,
+)
+from fin.host.evidence_contract import _is_integer_value
+from fin.host.tools.compare_facts import (
+    COMPARISON_SCHEMA,
+    COMPARISON_SCHEMA_VERSION,
+)
 from fin.retrieve.source_read import ATTACHMENT_KIND
 
 
@@ -79,7 +93,7 @@ class ExportEmptyError(ExportError):
 
 
 class UnsupportedComparisonSchemaError(ExportError):
-    """The stored envelope is not ``fin.comparison.v1``."""
+    """The stored envelope is not ``fin.comparison``."""
 
     code = "unsupported_comparison_schema"
 
@@ -147,10 +161,25 @@ _CsvRow = list[Any]
 
 
 def _meta_rows(comparison: dict[str, Any]) -> list[_CsvRow]:
-    """The envelope's identity: what was compared, in what unit."""
+    """The envelope's identity: what was compared, in what unit, and
+    under which declared shape version (the token names the shape; the
+    version numbers it, so a reader of the CSV can tell two otherwise
+    identical tables apart).
+
+    WHY the version cell here is never empty: ADR 0093 decision 12
+    refuses a recognized token whose ``schema_version`` is ABSENT, so by
+    the time a row is rendered the version is always the current one and
+    the cell always carries it. Decision 10's empty-cell rendering still
+    describes the WRITER's default for an absent identity value (that is
+    what ``concept``/``axis``/``unit``/``scale`` do below), but no
+    comparison envelope reaches this function with an absent version —
+    see :func:`_schema_version_problem`, which refuses one first. A
+    record carrying NO ``schema`` at all never reaches here either: it is
+    not ``fin.comparison`` and :func:`_bound_comparisons` drops it.
+    """
     return [
         [field, comparison.get(field, "")]
-        for field in ("schema", "concept", "axis", "unit", "scale")
+        for field in ("schema", "schema_version", "concept", "axis", "unit", "scale")
     ]
 
 
@@ -231,7 +260,7 @@ def _comparison_sections(comparison: dict[str, Any]) -> list[list[_CsvRow]]:
 
 
 def _comparison_csv(comparisons: Sequence[dict[str, Any]]) -> str:
-    """Render ``fin.comparison.v1`` envelopes as one CSV document.
+    """Render ``fin.comparison`` envelopes as one CSV document.
 
     Sections per comparison — metadata, the table, the deltas, the
     locators — because a single flat table cannot hold the redline and
@@ -250,15 +279,53 @@ def _comparison_csv(comparisons: Sequence[dict[str, Any]]) -> str:
     return buffer.getvalue()
 
 
-def _source_id_key(kind: str) -> str:
-    """The citation field that opens a unit of ``kind``.
+def _source_id_key(kind: str) -> str | None:
+    """The stored citation field that opens a unit of ``kind``.
 
     Mirrors the gate's own identity rule (``citation_gate._citation_from``):
-    the attachment leg is addressed by its attachment, every other
-    quotable kind by the corpus document — so the export never has to
-    carry a second, divergent notion of "which id opens this row".
+    the attachment leg is addressed by its attachment, the company leg by
+    the corpus document, and a ledger row by NEITHER — its identity is
+    its ``record_key`` under the snapshot key, which is read on its own
+    below.
+
+    ``None`` is a real answer, not a fallback: a kind outside the closed
+    set has no id slot at all, and defaulting it to ``document_id`` would
+    export an unknown kind as if it named a filing (ADR 0091).
     """
-    return "attachment_id" if kind == ATTACHMENT_KIND else "document_id"
+    if kind == COMPANY_KIND:
+        return "document_id"
+    if kind == ATTACHMENT_KIND:
+        return "attachment_id"
+    if kind == DATABASE_ROW_KIND:
+        return DATABASE_ROW_SNAPSHOT_KEY
+    return None
+
+
+def _database_row_source_id(citation: Mapping[str, Any]) -> str:
+    """The id that opens a stored ledger citation row, or ``""``.
+
+    Read off the row's own retained snapshot — the permitted view plus
+    the record key the query returned — so the exported trail names
+    which view answered and which record, not a fabricated filing id.
+    """
+    snapshot = citation.get(DATABASE_ROW_SNAPSHOT_KEY)
+    if not isinstance(snapshot, Mapping):
+        return ""
+    source = str(snapshot.get("source") or "")
+    record_key = snapshot.get("record_key")
+    if not source or not isinstance(record_key, Mapping) or not record_key:
+        return ""
+    return format_database_row_source_id(source, record_key)
+
+
+def _row_source_id(citation: Mapping[str, Any], kind: str) -> str:
+    """The one id that opens this citation row, read by its own kind."""
+    key = _source_id_key(kind)
+    if key == DATABASE_ROW_SNAPSHOT_KEY:
+        return _database_row_source_id(citation)
+    if key is None:
+        return ""
+    return str(citation.get(key) or "")
 
 
 def _citations_csv(citations: Sequence[dict[str, Any]]) -> str:
@@ -267,11 +334,11 @@ def _citations_csv(citations: Sequence[dict[str, Any]]) -> str:
     ``source_id`` is the ONE id that opens the cited unit for that row's
     kind, because since the unit-citation contract the identity is
     kind-dependent (``document_id`` for a company row, ``attachment_id``
-    for an attachment row); a fixed ``document_id`` column exported an
-    empty first cell for every attachment row, which no reader can open.
-    A row that names no source at all is refused by
-    :func:`_bound_citations` before this renders, so the column is never
-    blank here.
+    for an attachment row, the view plus record key for a ledger row); a
+    fixed ``document_id`` column exported an empty first cell for every
+    attachment row, which no reader can open. A row that names no source
+    at all is refused by :func:`_bound_citations` before this renders, so
+    the column is never blank here.
 
     ``csv.writer`` owns the quoting: a citation quote is prose and will
     contain commas and double quotes, and a hand-rolled join would
@@ -291,7 +358,7 @@ def _citations_csv(citations: Sequence[dict[str, Any]]) -> str:
         writer.writerow(
             [
                 kind,
-                citation.get(_source_id_key(kind), ""),
+                _row_source_id(citation, kind),
                 citation.get("version", ""),
                 citation.get("unit", ""),
                 citation.get("quote", ""),
@@ -303,6 +370,101 @@ def _citations_csv(citations: Sequence[dict[str, Any]]) -> str:
 # ----- payload binding and json body -----
 
 
+def _schema_version_problem(comparison: Mapping[str, Any]) -> str | None:
+    """Why this recognized-token envelope's ``schema_version`` is refused,
+    or ``None`` when the export speaks it.
+
+    The rule is the operator's frozen split (ADR 0093 decisions 6, 7 and
+    12, spec §2.1 rules 1 and 3, and the same ladder
+    ``evidence_contract._check_schema_version`` runs at every other
+    boundary) so the export cannot drift from the validator that owns the
+    fact:
+
+    * ABSENT key — ``malformed_evidence_contract``. This is decision 12's
+      ruling, not decision 9's: a token and its version are minted
+      together, so an envelope that names ``fin.comparison`` and omits the
+      number is a producer type bug, and NO component may infer, default,
+      or back-fill it. Decision 9's absent-accepts half was explicitly
+      "Superseded in part by decision 12"; the surviving half is the v0
+      rule (below), and this export was re-synced to that supersession.
+      An earlier version of this function read decision 9's PRE-ruling
+      text and accepted the absent case, which was the one boundary on
+      which this export disagreed with the validator and with the web.
+    * PRESENT but not a finite integer BY VALUE (``1.5``, ``NaN``/``inf``,
+      string, bool, null, list, object) — ``malformed_evidence_contract``: a
+      producer's type bug, not a contract skew. ``bool`` is excluded
+      explicitly because ``isinstance(True, int)`` is true in Python and
+      ``True`` would otherwise pass as version ``1``.
+    * PRESENT finite integer other than
+      :data:`COMPARISON_SCHEMA_VERSION` — ``unsupported_evidence_contract``:
+      a genuine version skew, refused rather than parsed by the nearest
+      older reader.
+
+    WHY the rule is over the DECODED VALUE and not the Python type: this
+    module reads what the store already decoded, and Python's ``json.loads``
+    gives the JSON text ``1.0`` the float ``1.0``. The operator's ruling is
+    that BOTH ends validate a version as a finite integer value, so ``1.0``
+    is the same version ``1`` and binds here exactly as it does in the
+    validator (a JavaScript decoder turns the same ``1.0`` text into the
+    integer ``1`` outright). The predicate is IMPORTED from
+    ``evidence_contract`` rather than restated, so there is exactly one
+    implementation of the rule on the Python side and the two boundaries
+    cannot drift.
+
+    Both classes name ``UnsupportedComparisonSchemaError`` on the export
+    surface — the module's one comparison-schema refusal, whose ``code``
+    string is frozen — and the message carries which of the two it was.
+
+    WHAT STILL RENDERS AN EMPTY VERSION CELL, so decision 10 is not dead:
+    nothing in this module's CSV path. Decision 10's "an absent version
+    renders as an empty cell" was written to describe a case that reaches
+    the CSV; decision 12 removed that case from this boundary. The
+    ``comparison.get(field, "")`` default in :func:`_meta_rows` still
+    renders an empty cell for every OTHER absent identity value, which is
+    what decision 10's "exactly like the other absent identity values"
+    describes.
+
+    WHY decision 9's v0 half cannot reach this function at all: this
+    function has exactly one caller, :func:`_bound_comparisons`, and that
+    caller filters on ``c.get("schema") == COMPARISON_SCHEMA`` BEFORE
+    calling. A record with NO ``schema`` field at all — the v0 shape
+    decision 12 explicitly left untouched — is therefore dropped as
+    another schema, and a run carrying only those raises
+    ``unsupported_comparison_schema``. Decision 9's leniency half was
+    never load-bearing here; it was unreachable in this module even before
+    decision 12 withdrew it. This is the durable fact behind the absent
+    branch's wording: the branch can only be reached by an envelope that
+    already IS ``fin.comparison``, so the refusal describes a missing
+    version beside a recognized token and nothing else.
+    """
+    if "schema_version" not in comparison:
+        # WHY the message names no token: this function is only reached for
+        # an envelope already bound as ``fin.comparison``, and the
+        # interpolation below would otherwise read "a recognized None
+        # token" or "a recognized 'fin.other' token" for the inputs the
+        # caller filters out — describing as recognized a token this
+        # module never recognized, and describing decision 9's v0 half
+        # (no ``schema`` at all) as a missing version. State the actual
+        # precondition instead.
+        return (
+            "malformed_evidence_contract: schema_version is absent beside "
+            f"the {COMPARISON_SCHEMA} token (ADR 0093 decision 12: the token "
+            "and its version are minted together and nothing back-fills it)"
+        )
+    version = comparison["schema_version"]
+    if not _is_integer_value(version):
+        return (
+            "malformed_evidence_contract: schema_version "
+            f"{version!r} is not a finite integer"
+        )
+    if version != COMPARISON_SCHEMA_VERSION:
+        return (
+            f"unsupported_evidence_contract: schema_version {version!r} "
+            f"is not the current version {COMPARISON_SCHEMA_VERSION}"
+        )
+    return None
+
+
 def _bound_comparisons(
     payload: Sequence[dict[str, Any]], *, run_id: Any
 ) -> list[dict[str, Any]]:
@@ -311,8 +473,24 @@ def _bound_comparisons(
     An envelope from another schema is dropped rather than
     best-effort rendered; when that leaves nothing, the caller gets
     ``unsupported_comparison_schema`` naming what was actually found.
+
+    A RECOGNIZED token carrying an unsupported ``schema_version`` is not
+    dropped — it is refused. The CSV renders the declared version as its
+    own identity row, so silently shipping a version skew would write the
+    wrong number straight into a file an operator downloads, and a run
+    that carries one has no envelope this export honestly speaks. The same
+    holds for a recognized token with NO version at all, which decision 12
+    classes as ``malformed_evidence_contract``; see
+    :func:`_schema_version_problem`.
     """
     bound = [c for c in payload if c.get("schema") == COMPARISON_SCHEMA]
+    for index, comparison in enumerate(bound):
+        problem = _schema_version_problem(comparison)
+        if problem is not None:
+            raise UnsupportedComparisonSchemaError(
+                f"run {run_id!r} comparison {index} carries an "
+                f"unsupported {COMPARISON_SCHEMA} version: {problem}"
+            )
     if not bound:
         raise UnsupportedComparisonSchemaError(
             "run "
@@ -371,7 +549,17 @@ def _bound_citations(
                 f"outside the quotable kinds {sorted(QUOTABLE_EVIDENCE_KINDS)}"
             )
         source_key = _source_id_key(kind)
-        if not str(citation.get(source_key) or ""):
+        if source_key is None:
+            # A kind outside the closed set has no id slot at all, and
+            # the check above already refused it. Reaching here would
+            # mean the closed set and this switch disagree, so it is
+            # answered as the refusal it is rather than defaulted into
+            # the document column.
+            raise MalformedCitationRowError(
+                f"run {run_id!r} citation row {index} has kind {kind!r}, "
+                f"which names no source id slot"
+            )
+        if not _row_source_id(citation, kind):
             raise MalformedCitationRowError(
                 f"run {run_id!r} citation row {index} (kind {kind!r}) "
                 f"names no {source_key}"

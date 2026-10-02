@@ -1,0 +1,65 @@
+# Model pin for the G4 pipeline image (task C1).
+#
+# These weights are NOT baked into the image: the host cache
+# ~/.cache/fin-g4-docling-models is mounted at /models. So the image digest does
+# not cover them, and a recorded sha256 that nothing checks is a fact about the
+# past rather than a gate on the next fetch. `pin.py verify-models` checks this
+# file against the HuggingFace download metadata the fetch itself wrote.
+#
+# `revision` is the commit the fetch must be bound to. It is written as a commit
+# hash, never as `main`: `main` is a movable branch, so a fresh host fetching
+# today would get whatever it points at now. The asymmetry below is the point --
+# TableFormer is already on the immutable tag `v2.3.0`, and Heron, the one model
+# the layout stage actually depends on, was not pinned at all.
+#
+# `file_sha256` is the HuggingFace Hub ETag, which for LFS files is the SHA-256
+# of the payload. It was independently confirmed to equal the `sha256sum` of the
+# local file, so the weights really came from huggingface.co and were not
+# satisfied from a mirror or a pre-existing directory.
+#
+# The fetch is bound to the revisions in this file. `run_measured.sh` reads them
+# through `pin.py parse_models_lock` and fetches each repo with
+# `huggingface_hub.snapshot_download(revision=…)` (docling-tools `models download`
+# has no `--revision`, so it could not express the pin); `pin.py verify-models`
+# then gates the cache against this file on every run. The fetch description in
+# PIN_MANIFEST.md §5 reflects this.
+
+[heron]
+repo = docling-project/docling-layout-heron
+revision = 8f39ad3c0b4c58e9c2d2c84a38465abf757272d8
+revision_was = main
+role = layout detection (the pipeline's `layout_heron_default` preset), torch engine
+file = model.safetensors
+bytes = 171658996
+file_sha256 = 00333a43451945aaf89db8ca9c0a17e75d1537c17db60fdb91aa95f4c7929e0c
+cache_dir = docling-project--docling-layout-heron
+
+[tableformer-accurate]
+repo = docling-project/docling-models
+revision = fc0f2d45e2218ea24bce5045f58a389aed16dc23
+revision_was = v2.3.0
+role = table structure, `accurate` -- the variant the preset selects
+file = model_artifacts/tableformer/accurate/tableformer_accurate.safetensors
+bytes = 212758388
+file_sha256 = 2a7d6c924b3cd12fb99a09280ca9c33a89c5d60b93253617d2e088c1a40374d9
+cache_dir = docling-project--docling-models
+
+[tableformer-fast]
+repo = docling-project/docling-models
+revision = fc0f2d45e2218ea24bce5045f58a389aed16dc23
+revision_was = v2.3.0
+role = fetched as a pair by `docling-tools models download tableformer`; NOT used
+file = model_artifacts/tableformer/fast/tableformer_fast.safetensors
+bytes = 145453276
+file_sha256 = 3119563aab5a7c96fda4d621119b63fd8806272b86c30936d15507616422f718
+cache_dir = docling-project--docling-models
+
+[heron-onnx]
+repo = docling-project/docling-layout-heron-onnx
+revision = 40bde044036bb181c130ddf6c51792187268748f
+revision_was = main
+role = INACTIVE -- no onnxruntime is installed, so the ONNX engine override is unusable
+file = model.onnx
+bytes = 171220471
+file_sha256 = 59c81a3a2923042d85034ffc487f8f47e4854117e879aef89b2b9f728fb4922a
+cache_dir = docling-project--docling-layout-heron-onnx
