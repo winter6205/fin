@@ -456,6 +456,39 @@ def _png_path(page_no: int, image_dir: Path | None) -> Path:
     return Path(f"/tmp/g4_page_{os.getpid()}_{page_no:04d}.png")
 
 
+def _ocr_text_path(page_no: int, image_dir: Path | None) -> Path | None:
+    """Sidecar for one page's full recognized text, or None when nothing is kept.
+
+    Named beside ``_png_path``'s bitmap and kept in the same directory, so the
+    pixels a quote was read from and the text read off them stay together in the
+    run directory.
+    """
+    if image_dir is None:
+        return None  # EXIT: nothing is kept, so there is no artefact to point at
+    return image_dir / f"page_{page_no:04d}.ocr.txt"
+
+
+def _save_ocr_text(
+    entry: dict[str, object], ocr_text: str, page_no: int, image_dir: Path | None
+) -> None:
+    """Persist the whole recognized text so a committed quote is checkable.
+
+    ``ocr_text_sample`` is capped so the single JSON line this harness gates on
+    stays bounded, which leaves a page's numeric rows outside the record. The
+    gold manifest commits an ``expected_quote`` per page, and on a scanned page
+    that quote is the fixture-independent check that OCR did not drop digits, so
+    a record that cannot reach the row cannot settle the expectation. The
+    sidecar widens the evidence without widening the line, and it is written
+    only where the page bitmap is written.
+    """
+    path = _ocr_text_path(page_no, image_dir)
+    if path is None:
+        return  # EXIT: no bitmap was kept, so no text artefact is written either
+    path.write_text(ocr_text, encoding="utf-8")
+    entry["ocr_text_file"] = path.name
+    entry["ocr_text_sha256"] = sha256_bytes(path)[1]
+
+
 def _save_page_png(
     entry: dict[str, object], pil: Any, png_path: Path, *, keep: bool
 ) -> None:
@@ -501,6 +534,7 @@ def _apply_page_ocr(
         # Short sample so the OCR output is auditable without shipping
         # the whole page text in the measurement line.
         entry["ocr_text_sample"] = " ".join(ocr_text.split())[:160]
+        _save_ocr_text(entry, ocr_text, page_no, image_dir)
     finally:
         entry["ocr_lang"] = ocr_engine.lang
         if image_dir is None:
@@ -555,6 +589,8 @@ def _page_structure_entry(
         "ocr_lang": None,
         "ocr_text_char_count": 0,
         "ocr_text_sample": None,
+        "ocr_text_file": None,
+        "ocr_text_sha256": None,
         "ocr_error_code": None,
         "ocr_error": None,
     }
