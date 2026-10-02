@@ -1100,6 +1100,19 @@ def _make_retrieve_tool(
         ticker: str | None = None,
         filing_date: str | None = None,
         attachment_ids: list[str] | None = None,
+        sql_window_start: Annotated[
+            str | None,
+            "Inclusive sql expiry window START as YYYY-MM-DD, copied from a "
+            "date the user stated. Pass it together with sql_window_end or "
+            "omit both; never substitute today's date, a relative phrase, or "
+            "a default.",
+        ] = None,
+        sql_window_end: Annotated[
+            str | None,
+            "Inclusive sql expiry window END as YYYY-MM-DD, copied from a "
+            "date the user stated. Pass it together with sql_window_start or "
+            "omit both; a single bound or a malformed date is refused.",
+        ] = None,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
         state: Annotated[Any, InjectedState()] = None,
         config: Annotated[RunnableConfig, InjectedToolArg()] = cast(
@@ -1130,6 +1143,21 @@ def _make_retrieve_tool(
         it is not an argument, so another thread's files cannot be
         reached from here. With no attachment retriever wired the
         argument is inert: the envelope stays the pre-T3 shape.
+
+        ``sql_window_start`` / ``sql_window_end`` are the 检索档 sql's
+        inclusive expiry window: BOTH strict ``YYYY-MM-DD`` calendar days
+        copied from dates the user stated — pass both or neither, since a
+        single bound is refused. The producer binds them as
+        ``WHERE expiry_date BETWEEN $1::date AND $2::date``, so both ends
+        are included. Copy the user's own dates and change nothing: when
+        the user named no dates, named them relatively ("the next 90
+        days"), or named more than one range, OMIT both rather than
+        guessing. Never substitute today's date, a relative expression,
+        or a plausible default — an invented window answers a question
+        nobody asked, and a malformed one is refused
+        ``invalid_business_query``. Both arguments ride the document
+        retrieve untouched and are ignored unless this run's cascade
+        assigned ``sql``.
         """
         def _port_call(retry_query: str) -> dict[str, Any]:
             """One adapter-bound retrieve call for the retry helper.
@@ -1153,6 +1181,9 @@ def _make_retrieve_tool(
                     # invocation), not at compile time — the graph is
                     # cached and shared across runs.
                     search_mode=assigned_retrieve_mode(state),
+                    # ``resolve_sql_window`` is the one gate for the pair.
+                    sql_window_start=sql_window_start,
+                    sql_window_end=sql_window_end,
                     adapter=adapter,
                 )
             except InputValidationError as exc:
