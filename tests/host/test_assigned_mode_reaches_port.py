@@ -35,7 +35,7 @@ carries, never how iknow ranks (spec SC8).
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from langchain_core.messages import AIMessage
@@ -354,6 +354,220 @@ def test_the_档_is_not_a_model_visible_tool_argument() -> None:
     tool = _make_retrieve_tool(_port())
     assert "search_mode" not in tool.args, tool.args
     assert "state" not in tool.args, tool.args
+
+
+# ----- the sql window as a model-supplied tool argument (T1 / T2) -----
+
+
+class _RecordingWindowAdapter(_CapturingMcpAdapter):
+    """Records the exact kwargs the host forwarded, THEN runs the real gate.
+
+    The record is taken at the port's own entry, before
+    ``resolve_sql_window`` refuses, so a window that is refused is still
+    proven to have reached the gate spelled the way the model spelled it.
+    Ordering is the whole point: recording after the gate would prove
+    nothing for every case this file is here to cover.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.forwarded: list[dict[str, Any]] = []
+
+    def retrieve(  # type: ignore[override]
+        self, query: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        self.forwarded.append(dict(kwargs))
+        return super().retrieve(query, **kwargs)
+
+
+def _sql_ask() -> str:
+    # ``PLAIN_ASK`` keeps the TRACK grounded, so the 档 cascade actually
+    # runs and assigns the named 档; a bare sql question without it lands
+    # on the clarify residual and never reaches the port.
+    return f"sql档 AAPL net sales 2023 Q3, which contracts expire?"
+
+
+def _window_script(**args: Any) -> list[AIMessage]:
+    """One scripted MODEL turn whose retrieve call carries ``args``."""
+    return [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "retrieve",
+                    "args": {"query": "revenue", **args},
+                    "id": "c-window",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        AIMessage(content="Per the filings: revenue grew."),
+    ]
+
+
+def _run_with_args(
+    adapter: Any, args: dict[str, Any], thread_id: str
+) -> dict[str, Any]:
+    return _run(
+        _compile(adapter, model=ScriptedChatModel(script=_window_script(**args))),
+        _sql_ask(),
+        thread_id,
+    )
+
+
+def test_the_sql_window_arguments_are_model_visible() -> None:
+    """T1: the model supplies the pair, so the two arguments and their
+    format guidance are part of the tool's contract surface. LangChain
+    derives ``tool.args`` from the signature; the tool description is the
+    text the model reads about the tool as a whole, and each property's
+    own ``description`` is what rides next to that argument in the
+    tool-call schema the model fills in (contract rule 7)."""
+    tool = _make_retrieve_tool(_port())
+
+    assert "sql_window_start" in tool.args, tool.args
+    assert "sql_window_end" in tool.args, tool.args
+
+    schema = cast(Any, tool.tool_call_schema).model_json_schema()
+    properties = schema["properties"]
+    for name in ("sql_window_start", "sql_window_end"):
+        description = properties[name].get("description", "")
+        assert description.strip(), (
+            name,
+            "carries no description in the tool-call schema, so the "
+            "contract's per-argument guidance has no surface to live on",
+            properties[name],
+        )
+        assert "YYYY-MM-DD" in description, (name, description)
+        assert "both" in description.lower(), (name, description)
+
+    description = tool.description or ""
+    # The load-bearing instruction is pinned case-sensitively and in
+    # full: "omit" alone is trivia (``attachment_ids`` already used it),
+    # so only the both-or-neither rule itself is asserted here.
+    assert "pass both or neither" in description, description
+    assert "OMIT both" in description, description
+
+
+def test_a_model_supplied_window_reaches_the_wire_as_the_exact_bounds() -> None:
+    """T2: the two arguments ride the ONE existing port call and bind
+    into the adapter filters verbatim — no reformat, no reordering, no
+    bound invented.
+
+    The half this file covers is the transport SHAPE. The live
+    business-ledger leg is a separate file,
+    ``tests/retrieve/test_live_sql_window_user_path.py``, which spends
+    the same model-supplied pair against the real producer.
+    """
+    adapter = _CapturingMcpAdapter()
+    out = _run_with_args(
+        adapter,
+        {"sql_window_start": "2026-01-01", "sql_window_end": "2026-04-30"},
+        "wire-sql-window",
+    )
+
+    assert out["search_mode_decision"]["search_mode"] == "sql"
+    sql_calls = [
+        a for a in _arguments(adapter)
+        if a.get("filters", {}).get("search_mode") == "sql"
+    ]
+    assert sql_calls, _arguments(adapter)
+    for arg in sql_calls:
+        assert arg["filters"]["sql_window_start"] == "2026-01-01", arg
+        assert arg["filters"]["sql_window_end"] == "2026-04-30", arg
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param({}, id="missing"),
+        pytest.param({"sql_window_start": "2026-01-01"}, id="half"),
+        pytest.param(
+            {"sql_window_start": "2026-01-01", "sql_window_end": "later"},
+            id="malformed",
+        ),
+        pytest.param(
+            {"sql_window_start": "20260101", "sql_window_end": "2026-04-30"},
+            id="basic-form",
+        ),
+        pytest.param(
+            {"sql_window_start": "2026-04-30", "sql_window_end": "2026-01-01"},
+            id="reversed",
+        ),
+    ],
+)
+def test_an_unbindable_model_window_is_refused_by_name_before_the_wire(
+    args: dict[str, Any],
+) -> None:
+    """T1: every unusable pair REACHES ``resolve_sql_window`` with exactly
+    the values the model spelled, and is refused ``invalid_business_query``
+    before the transport.
+
+    The forwarding assertion is the load-bearing half. The envelope alone
+    cannot tell this seam from the base tree: pydantic drops unknown tool
+    arguments, so a host that never declared the pair would reach the same
+    gate with ``None`` and produce the same named refusal. Asserting the
+    exact supplied values is what makes the case fail if the wiring is
+    reverted — including the malformed and reversed spellings, which are
+    values only a forwarding implementation can carry.
+    """
+    adapter = _RecordingWindowAdapter()
+    out = _run_with_args(adapter, args, "wire-sql-refused")
+
+    assert out["search_mode_decision"]["search_mode"] == "sql"
+
+    assert adapter.forwarded, "the port was never reached"
+    for call in adapter.forwarded:
+        assert call["search_mode"] == "sql", call
+        # The ``missing`` case pins that NO bound was invented to fill the
+        # pair: the port receives both keys, spelled as ``None``, rather
+        # than one of them defaulted. That is this slot's new surface, and
+        # it is not what the pre-existing 档-only sql case asserts.
+        assert "sql_window_start" in call and "sql_window_end" in call, call
+        assert call["sql_window_start"] == args.get("sql_window_start"), call
+        assert call["sql_window_end"] == args.get("sql_window_end"), call
+
+    for arg in _arguments(adapter):
+        filters = arg.get("filters", {})
+        assert filters.get("search_mode") != "sql", arg
+        assert "sql_window_start" not in filters, arg
+        assert "sql_window_end" not in filters, arg
+    refusals = [
+        m.content
+        for m in out["messages"]
+        if getattr(m, "type", "") == "tool"
+        and isinstance(m.content, str)
+        and "invalid_business_query" in m.content
+    ]
+    assert refusals, [m.content for m in out["messages"]]
+
+
+def test_a_document_档_never_learns_the_window_keys() -> None:
+    """The window keys are the sql 档's alone. The model DID supply them
+    and the port DID receive them — asserted here, so the case fails if the
+    forwarding is reverted instead of passing vacuously on a tree that
+    never emits the keys — and the adapter still drops them before the
+    wire, so the document envelope stays byte-identical."""
+    adapter = _RecordingWindowAdapter()
+    graph = _compile(
+        cast(Any, adapter),
+        model=ScriptedChatModel(
+            script=_window_script(
+                sql_window_start="2026-01-01", sql_window_end="2026-04-30"
+            )
+        ),
+    )
+    out = _run(graph, _utterance("lexical"), "wire-lexical-window")
+
+    assert out["search_mode_decision"]["search_mode"] == "lexical"
+    assert adapter.forwarded, "the port was never reached"
+    for call in adapter.forwarded:
+        assert call["sql_window_start"] == "2026-01-01", call
+        assert call["sql_window_end"] == "2026-04-30", call
+    arguments = _arguments(adapter)
+    assert arguments, "the scripted retrieve still ran"
+    for arg in arguments:
+        assert "sql_window_start" not in arg.get("filters", {}), arg
+        assert "sql_window_end" not in arg.get("filters", {}), arg
 
 
 def test_the_graph_still_binds_exactly_one_retrieve_tool() -> None:
