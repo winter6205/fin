@@ -34,38 +34,44 @@ download metadata that the image wrote itself.
 ## 1. Image identity
 
 **This section used to contradict the two files it names as its own source.**
-It recorded image id `8e10185f…` and `docling-parse 7.21.0`, while
+It recorded a legacy image id and `docling-parse 7.21.0`, while
 `results/image_identity.txt` recorded `0f278c22…` and
 `results/image_pip_freeze.txt` recorded `docling-parse 7.22.1`. Neither
 authority is prose; both are committed artifacts. That is L7 in
 `docs/validation/2026-09-29-g4-t5-unit-citation-legacy-removal.md`, and it is
-the defect the tracked change task C1 set out to remove.
+the defect the tracked change task C1 set out to remove. That legacy digest is
+`8e10185f…`, and it is unreachable by any current builder; *Builder
+reproducibility* below is where it is recorded as history, because a value
+this section still calls the expectation would be a live claim.
 
 **Reconciliation (C1).** Three values, and they are not the same kind of thing:
 
 | value | where it lives | what it is |
 |---|---|---|
-| `sha256:8e10185f…` | `image-pin.json` → `expected_image_id` | the **declared expectation** — what a rebuild must reproduce |
+| `sha256:b1b5270c…` | `image-pin.json` → `expected_image_id` | the **declared expectation** — what a rebuild must reproduce, adopted by the operator 2026-10-02 |
 | `sha256:0f278c22…` | `results/image_identity.txt` | the **observed identity** of a rebuild that drifted |
 | `python:3.12-slim@sha256:44ff437b…` | `Dockerfile` | the **digest-pinned base** the pin is now anchored to |
 
-`8e10185f…` stays the expectation. It has **not** been re-baselined to
-`0f278c22…`: the tracked change forbids silently replacing the expected digest, and
-`0f278c22…` is the very artifact whose drift is the open defect, so adopting it
-would launder the bug into the contract. `build.sh` therefore **fails today**,
-by design, with exit 75. That is the honest state, not a defect in the verifier —
-see *Builder reproducibility* below for the measured cause.
+`b1b5270c…` is the expectation, and it is **not** `0f278c22…`: the tracked change forbids
+silently replacing the expected digest, and `0f278c22…` is the very artifact
+whose drift was the open defect, so adopting it would launder the bug into the
+contract. `b1b5270c…` was adopted instead because two independent clean builds
+of this Dockerfile produced it identically — see *Builder reproducibility* below
+for the measurements. The expected value and the committed snapshot still
+**disagree**, so `build.sh` still **fails**, with exit 75: that disagreement is
+now the recorded `0f278c22…` rebuild of the pre-repair tree, not an undecided
+baseline. The honest state, not a defect in the verifier.
 
 | field | value |
 |---|---|
-| tag | `fin-g4-pipeline:t2a` |
-| declared expected image id | `sha256:8e10185f…` (in `image-pin.json`) |
-| observed image id of the last build | `sha256:0f278c22…` (in `results/image_identity.txt`) |
-| **agreement** | **none — the check fails, awaiting an operator decision** |
+| tag | `fin-g4-pipeline:r1` |
+| declared expected image id | `sha256:b1b5270c…` (in `image-pin.json`) |
+| observed image id of the last build | `sha256:0f278c22…` (in `results/image_identity.txt`, the pre-repair rebuild) |
+| **agreement** | **none — the check still fails, but on a recorded drift, not an undecided baseline** |
 | arch | `amd64` |
 | base image | `python:3.12-slim@sha256:44ff437bba879d4941b710a369a8f19266aea34b29002807f0c487fabc9eec9b` |
 | builder | buildx builder declared in `image-pin.json` (name `g4repro`, driver docker-container, BuildKit v0.32.2, `memory="4g"`, `network="host"`); `build.sh` compares it against the live host before building. Formerly the Docker CLI 29.1.3 **legacy** builder — retired by the operator's option (a) decision, history below. |
-| builder reproducibility | the declared buildx path **reproduces** image ids byte-for-byte on probe builds (see §1a); the full pinned image is **not yet re-proved** on this path since the `--no-compile` fix, so the L7 id below stays declared and unmatched |
+| builder reproducibility | the declared buildx path **reproduces** the full pinned image: two independent clean builds since the `--no-compile` fix agreed on `b1b5270c…`, 11 of 11 layers (see §1a) |
 | Python | `3.12.14 (main, Sep 19 2026, 01:04:57) [GCC 14.2.0]` |
 
 `size_bytes` and `created` are no longer tabulated here. Both are wall-clock
@@ -124,6 +130,11 @@ the full pinned Dockerfile on this path have not been run since `--no-compile`,
 so no new baseline is declared and `8e10185f…` (a legacy-builder artifact)
 remains declared and unmatched — the build fails the identity check by design
 until the operator accepts a baseline proved by those two full builds.
+
+**Superseded, 2026-10-02.** That last paragraph is the 2026-09-30 state. The
+two full builds have since been run: they agreed on `b1b5270c…`, and the
+operator adopted it as `expected_image_id`, so §1 is the current statement and
+this subsection is history. The legacy digest stays unreachable either way.
 
 **Builder provenance is mechanical.** the tracked change asks for package, OS, base,
 builder, model and source provenance to be checkable "without prose-only

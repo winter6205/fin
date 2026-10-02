@@ -1,6 +1,6 @@
 """The builder is a declared input checked in pin.py, not a shell paragraph.
 
-the tracked change task C1 asks for builder provenance checkable "without prose-only
+Task C1 asks for builder provenance checkable "without prose-only
 pins". The engine version, the buildx builder, its BuildKit version and the
 4 GiB ceiling were compared by ~9 fail-capable rules inlined in `build.sh`, so
 the only way to test them was to extract shell text and run it against a stub
@@ -16,9 +16,11 @@ build, no network -- which is exactly the reachability the refactor was for.
 The declaration is read once, by pin.py. `build.sh` no longer runs its own
 `python3 -c 'import json'` accessors against `image-pin.json`.
 
-This change does **not** re-baseline `expected_image_id`: L7's `8e10185f…` stays
-declared and unmatched, and `build.sh` still exits 75 on every build until the
-operator accepts a new baseline proved by two independent clean full builds.
+This change did **not** re-baseline `expected_image_id`; that was a separate,
+later operator decision. `expected_image_id` now carries the identity two
+independent clean builds agreed on (`b1b5270c…`), and the tests below assert
+that value explicitly so a quiet edit to any other digest fails. The gate
+itself is unchanged: it still refuses any image that is not the declared one.
 """
 
 from __future__ import annotations
@@ -38,7 +40,15 @@ IMAGE_PIN = PIPELINE_DIR / "image-pin.json"
 PIN_MODULE_PATH = PIPELINE_DIR / "pin.py"
 
 RECORDED_ENGINE = "29.1.3"
-L7_EXPECTED_IMAGE_ID = "sha256:8e10185fa27ea5adcfca94732adc27a2720ed9a31b67698d0a2c9e7a1a62c800"
+# The baseline the operator adopted on 2026-10-02: two independent clean builds
+# of commit 16adabe produced it identically (T4, docs/validation/
+# 2026-10-02-c1-pin-policy.md). Named here so the declaration is checked against
+# a recorded value rather than against whatever the file happens to hold.
+ADOPTED_IMAGE_ID = "sha256:b1b5270c49cffbd2165aed904226612f2ccf925072c91766b4d4979f24bb9296"
+# The two digests the declaration must NOT carry: L7's legacy-builder value
+# (unreachable by any current builder) and the drifted pre-repair rebuild.
+L7_HISTORICAL_IMAGE_ID = "sha256:8e10185fa27ea5adcfca94732adc27a2720ed9a31b67698d0a2c9e7a1a62c800"
+DRIFTED_IMAGE_ID = "sha256:0f278c22daa45a8361235f37620fa31a237f0284501436256429e2a8eba35229"
 
 _PIN_MODULE: ModuleType | None = None
 
@@ -368,11 +378,56 @@ def test_clean_build_is_the_default() -> None:
     assert "G4_BUILD_USE_CACHE" in build
 
 
-def test_the_expected_image_id_is_untouched() -> None:
-    """This moved the build path and relocated the checks; it does not
-    re-baseline the digest. A quiet re-baseline would make every claim in the C1
-    record false."""
-    assert L7_EXPECTED_IMAGE_ID in IMAGE_PIN.read_text(encoding="utf-8")
+def test_the_expected_image_id_is_the_adopted_baseline() -> None:
+    """The declaration must carry the one identity an operator decision adopted
+    on 2026-10-02 — and not any other. The original form of this test asserted
+    the file was *untouched*, which a substring check satisfies for any value
+    that happens to be mentioned anywhere in the file; a quiet re-baseline onto
+    a drifted digest (or back onto the unreachable legacy one) would have left
+    it green. It now reads the field and names the digests it must reject.
+    """
+    import json
+
+    declared = json.loads(IMAGE_PIN.read_text(encoding="utf-8"))["expected_image_id"]
+    assert declared == ADOPTED_IMAGE_ID, (
+        "expected_image_id must be the adopted two-build baseline; a different "
+        f"value is an unrecorded re-baseline: {declared!r}"
+    )
+    for rejected, why in (
+        (L7_HISTORICAL_IMAGE_ID, "legacy builder, unreachable by any current builder"),
+        (DRIFTED_IMAGE_ID, "the drifted pre-repair rebuild, the artifact that WAS the open defect"),
+    ):
+        assert declared != rejected, f"expected_image_id must not be {why}"
+
+
+def test_the_gate_still_refuses_an_image_that_is_not_the_declared_one() -> None:
+    """Adopting a baseline must not disarm the gate. The refusal leg this module
+    used to leave implied is executed here against the *shipped* pin file: the
+    real CLI, the committed declaration, and an observed identity that is not it.
+    """
+    import json
+    import subprocess
+    import tempfile
+
+    declared = json.loads(IMAGE_PIN.read_text(encoding="utf-8"))["expected_image_id"]
+    with tempfile.TemporaryDirectory() as staging:
+        observed = Path(staging) / "image_identity.txt"
+        observed.write_text(f"image_id={DRIFTED_IMAGE_ID}\n", encoding="utf-8")
+        result = subprocess.run(
+            [
+                sys.executable, str(PIN_MODULE_PATH), "compare-image-id",
+                "--pin", str(IMAGE_PIN),
+                "--observed", str(observed),
+            ],
+            capture_output=True, text=True, check=False,
+        )
+    assert result.returncode != 0, (
+        f"a non-matching image must still be refused, not accepted against {declared!r}"
+    )
+    assert "FATAL" in result.stderr, result.stderr
+    assert "do NOT re-baseline" in result.stderr, (
+        f"the refusal must name the decision it refuses to make on its own: {result.stderr!r}"
+    )
 
 
 def test_the_builder_check_does_not_claim_the_build_reproduces() -> None:
