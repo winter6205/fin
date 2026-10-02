@@ -141,6 +141,8 @@ class CapabilityAwareFakePort:
         filing_date: str | None = None,
         limit: int = 8,
         search_mode: str | None = None,
+        sql_window_start: str | None = None,
+        sql_window_end: str | None = None,
     ) -> dict[str, list[Chunk]]:
         """Return ``{"chunks": [...]}`` with every capability on.
 
@@ -148,8 +150,11 @@ class CapabilityAwareFakePort:
         the fake resolves the configuration itself rather than reading one off
         the call. ``search_mode`` joins the port signature (T2): this fake is
         not a 档, so it mirrors only the token validation — an open 档 is
-        answered with the same all-on script, an unopened or illegal one
-        raises the port's named error.
+        answered with the same all-on script, an illegal one raises the port's
+        named error. The window pair joins the same signature for parity and
+        is IGNORED: this fake scripts capability rankings, not a ledger, so
+        the window gate (``resolve_sql_window``) belongs to the product wire
+        adapter, not here.
         """
         resolve_search_mode(search_mode)
         effective = all_on_configuration(self._keys)

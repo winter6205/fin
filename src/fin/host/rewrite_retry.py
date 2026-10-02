@@ -16,6 +16,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Final
 
+from fin.retrieve.port import DATABASE_ROWS_KEY, database_rows_of
 
 MAX_REWRITE_RETRIES: Final[int] = 3
 
@@ -141,7 +142,16 @@ def _is_empty_hit(result: Mapping[str, object]) -> bool:
     """Recognise retrieve misses, never ``memories`` recall payloads."""
     if "error" in result:
         return False
-    return "chunks" in result and not result["chunks"]
+    if "chunks" not in result or result["chunks"]:
+        return False
+    # The sql 档's row sibling (spec search-mode-business-sql-contract
+    # §8.0, E1 envelope contract §4.4): rows ARE results, so an
+    # empty-chunks envelope whose ``database_rows`` row OBJECT carries
+    # rows is not a miss. Rewriting one would re-query the ledger with a
+    # lexical rewrite — and the second attempt would OVERWRITE the rows
+    # in the final result, silently discarding the answer.
+    rows = database_rows_of(result.get(DATABASE_ROWS_KEY))
+    return not rows
 
 
 def _rewrite(query: str, rewrite: Rewrite) -> str:

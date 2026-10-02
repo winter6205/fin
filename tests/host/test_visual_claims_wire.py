@@ -217,6 +217,19 @@ class _ClaimCarryingGraph:
         return getattr(self._inner, name)
 
 
+def _emitted_claim(claim: dict[str, Any]) -> dict[str, Any]:
+    """What a fresh E5 frame carries for one valid claim row: the same
+    SSOT fields in their fixed order, plus the frozen v1 token appended
+    as the one added key (spec §4.2 versioning cutover, §9). The stored
+    row itself is never rewritten — the token is minted on the emission,
+    and claims saved before E5 replay byte-identically."""
+    return {
+        **claim,
+        "schema": "fin.evidence.visual_claim",
+        "schema_version": 1,
+    }
+
+
 def _install_claim_graph(
     http_app: FastAPI,
     *,
@@ -373,8 +386,11 @@ def test_one_claim_row_emits_exactly_one_frame_before_the_terminal_citations(
     rows = frame["visual_claims"]
     assert len(rows) == 1
     row = rows[0]
-    # The key set IS the SSOT tuple, in its order - not a superset.
-    assert list(row) == list(VISUAL_CLAIM_FIELDS)
+    # The key set IS the SSOT tuple, in its order, plus the E5
+    # versioning pair appended (spec 2.1 / 4.2: the lane gains
+    # ``schema`` and its ``schema_version`` integer sibling).
+    assert list(row) == list(VISUAL_CLAIM_FIELDS) + ["schema", "schema_version"]
+    assert row["schema"] == "fin.evidence.visual_claim"
     assert row["kind"] == VISUAL_EVIDENCE_KIND
     assert row["attachment_id"] == ATTACHMENT_ID
     assert row["page_image_sha256"] == CLAIM_PAGE_SHA256
@@ -410,7 +426,9 @@ def test_two_claim_rows_travel_in_order_and_a_crop_scope_survives(
     assert rows[1]["scope"] == [0.1, 0.2, 0.35, 0.6]
     assert rows[1]["reused"] is True
     assert rows[1]["outbound_calls"] == 0
-    assert all(list(row) == list(VISUAL_CLAIM_FIELDS) for row in rows)
+    assert all(
+        list(row) == list(VISUAL_CLAIM_FIELDS) + ["schema", "schema_version"] for row in rows
+    )
 
 
 def test_answer_and_citation_frames_keep_running_when_a_claim_lands(
@@ -452,7 +470,9 @@ def test_answer_and_citation_frames_keep_running_when_a_claim_lands(
     )
     # The claims run's own frame: exactly one, carrying exactly the row the
     # channel was handed, and the claims-free run still sends none.
-    assert by_name(claims_events, "visual_claims") == [{"visual_claims": [claim]}]
+    assert by_name(claims_events, "visual_claims") == [
+        {"visual_claims": [_emitted_claim(claim)]}
+    ]
     assert by_name(plain_events, "visual_claims") == []
 
 
@@ -480,17 +500,18 @@ def test_run_with_no_claim_rows_emits_no_frame_and_persists_an_empty_list(
     assert runs[0].visual_claims == []
 
 
-def test_a_non_visual_row_on_the_channel_is_dropped_not_published(
+def test_a_non_visual_row_on_the_channel_is_refused_by_name_not_dropped(
     client: TestClient,
     http_app: FastAPI,
     aapl_page1_text: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Invalid input at the seam: a citation-shaped row (or a partial
-    provenance row) pushed onto the claim channel is dropped with a
-    WARNING and never published, so a claim cannot smuggle a quote or a
-    half-known link onto the wire. The row's CONTENT never reaches the
-    log - only the fact that a row was dropped."""
+    """Invalid input at the seam (spec §8-R4 re-pin): the silent
+    drop-with-warning is CLOSED — a citation-shaped row, a partial
+    provenance row, and a non-object pushed onto the claim channel each
+    ride the ``evidence_refusals`` frame with their exact §6 code and
+    their own index, and are never published. The row's CONTENT still
+    never reaches the log — only the index and the code."""
     answer = f"Per the filing: {aapl_page1_text[:80]}"
     store = _install_claim_graph(
         http_app,
@@ -510,8 +531,19 @@ def test_a_non_visual_row_on_the_channel_is_dropped_not_published(
 
     # Only the complete visual row survives, and the run still lands done.
     assert len(rows) == 1
-    assert list(rows[0]) == list(VISUAL_CLAIM_FIELDS)
+    assert list(rows[0]) == list(VISUAL_CLAIM_FIELDS) + ["schema", "schema_version"]
     assert next(data for name, data in events if name == "status")["status"] == "done"
+
+    # The named-refusal carrier: each malformed row is visible with its
+    # own position in the channel (the equal-or-stronger replacement for
+    # the old silent drop).
+    assert "evidence_refusals" in names, names
+    refusals = events[names.index("evidence_refusals")][1]["refusals"]
+    assert refusals == [
+        {"citation_index": 0, "error": "malformed_evidence_contract"},
+        {"citation_index": 1, "error": "malformed_evidence_contract"},
+        {"citation_index": 2, "error": "malformed_evidence_contract"},
+    ], refusals
 
     warnings = [
         record.getMessage()
@@ -521,7 +553,7 @@ def test_a_non_visual_row_on_the_channel_is_dropped_not_published(
     assert len(warnings) == 3, warnings
     assert CLAIM_PAGE_SHA256 not in caplog.text
     assert CLAIM_DETAIL not in caplog.text
-    # The drop is run-scoped: the persisted row carries only the claim
+    # The refusal is run-scoped: the persisted row carries only the claim
     # that made it onto the wire.
     assert len(store.list_runs(thread_id)[0].visual_claims) == 1
 
@@ -552,7 +584,9 @@ def test_a_gate_refused_turn_still_publishes_its_claim_rows(
     assert status["status"] == "refuse", status
 
     assert names.count("visual_claims") == 1, names
-    assert events[names.index("visual_claims")][1] == {"visual_claims": [claim]}
+    assert events[names.index("visual_claims")][1] == {
+        "visual_claims": [_emitted_claim(claim)]
+    }
     # The refusal keeps the fixed order and the empty quote channel.
     assert names[-1] == "citations", names
     assert events[-1][1] == []
@@ -560,12 +594,15 @@ def test_a_gate_refused_turn_still_publishes_its_claim_rows(
     run = store.list_runs(thread_id)[0]
     assert run.status == "refuse"
     assert run.citations == []
-    assert run.visual_claims == [claim]
+    assert run.visual_claims == [_emitted_claim(claim)]
 
     turns = client.get(f"/api/threads/{thread_id}").json()["turns"]
     assert turns[0]["status"] == "refuse"
-    assert turns[0]["visual_claims"] == [claim]
-    assert list(turns[0]["visual_claims"][0]) == list(VISUAL_CLAIM_FIELDS)
+    assert turns[0]["visual_claims"] == [_emitted_claim(claim)]
+    assert list(turns[0]["visual_claims"][0]) == list(VISUAL_CLAIM_FIELDS) + [
+        "schema",
+        "schema_version",
+    ]
 
 
 def test_a_follow_up_send_does_not_replay_the_previous_runs_claims(
@@ -589,10 +626,10 @@ def test_a_follow_up_send_does_not_replay_the_previous_runs_claims(
     runs = store.list_runs(thread_id)
     assert len(runs) == 2
     assert runs[1].visual_claims == []
-    assert runs[0].visual_claims == [claim]
+    assert runs[0].visual_claims == [_emitted_claim(claim)]
 
     turns = client.get(f"/api/threads/{thread_id}").json()["turns"]
-    assert [turn["visual_claims"] for turn in turns] == [[claim], []]
+    assert [turn["visual_claims"] for turn in turns] == [[_emitted_claim(claim)], []]
 
 
 # ----- 4. persistence + history -----
@@ -628,7 +665,10 @@ def test_claim_rows_survive_a_store_read_and_reach_history(
     turns = client.get(f"/api/threads/{thread_id}").json()["turns"]
     assert len(turns) == 1
     assert turns[0]["visual_claims"] == wire_rows
-    assert list(turns[0]["visual_claims"][0]) == list(VISUAL_CLAIM_FIELDS)
+    assert list(turns[0]["visual_claims"][0]) == list(VISUAL_CLAIM_FIELDS) + [
+        "schema",
+        "schema_version",
+    ]
 
 
 def test_history_rows_default_to_an_empty_claim_list(client: TestClient, fresh_store) -> None:
@@ -756,8 +796,10 @@ def test_ask_answers_visual_claims_defaulting_to_an_empty_list(
     claim = _claim_row()
     _install_claim_graph(http_app, claims=[claim], answer=answer)
     body = client.post("/ask", json={"question": _QUESTION}).json()
-    assert [list(row) for row in body["visual_claims"]] == [list(VISUAL_CLAIM_FIELDS)]
-    assert body["visual_claims"] == [claim]
+    assert [list(row) for row in body["visual_claims"]] == [
+        list(VISUAL_CLAIM_FIELDS) + ["schema", "schema_version"]
+    ]
+    assert body["visual_claims"] == [_emitted_claim(claim)]
     assert body["citations"], "the quote channel still travels on /ask"
     assert all(row.get("kind") != VISUAL_EVIDENCE_KIND for row in body["citations"])
 
@@ -765,37 +807,62 @@ def test_ask_answers_visual_claims_defaulting_to_an_empty_list(
 # ----- 7. the projector, pinned directly -----
 
 
-def test_projector_keeps_the_ssot_fields_in_order_and_drops_the_rest() -> None:
+def test_projector_keeps_the_ssot_fields_in_order_and_refuses_the_rest_by_name() -> None:
     """The projector is the single normaliser behind the SSE frame, the
     persisted row, and ``/ask``: it projects onto the SSOT tuple in order
-    (extra keys off, missing keys out), keeps a legitimate ``scope=None``,
-    and turns nothing at all into ``[]``."""
+    (extra keys off, missing keys out), appends the one E5 versioning
+    token last, keeps a legitimate ``scope=None``, and turns nothing at
+    all into ``[]``. Since spec §8-R4 it also RETURNS the named refusals
+    — the rows it does not publish are each an entry, never a silent
+    drop."""
     full = _claim_row(extra_key="smuggled")
-    projected = _visual_claims_wire_payload([full])
-    assert list(projected[0]) == list(VISUAL_CLAIM_FIELDS)
+    projected, refusals = _visual_claims_wire_payload([full])
+    assert refusals == []
+    assert list(projected[0]) == list(VISUAL_CLAIM_FIELDS) + ["schema", "schema_version"]
+    assert projected[0]["schema"] == "fin.evidence.visual_claim"
     assert "extra_key" not in projected[0]
 
     # Field PRESENCE, not truthiness: a whole-page claim carries
     # ``scope=None`` and falsy counters and is still a real claim.
-    sparse = _visual_claims_wire_payload(
-        [_claim_row(scope=None, page=0, outbound_calls=0, reused=False)]
+    # (Re-pin note: ``page`` is not a counter but an ordinal — the
+    # lane's own §4.2 contract bounds it at >= 1, so the falsy-presence
+    # probe now rides the genuinely falsy fields ``scope`` /
+    # ``outbound_calls`` / ``reused``; page stays a legal 1.)
+    sparse, sparse_refusals = _visual_claims_wire_payload(
+        [_claim_row(scope=None, outbound_calls=0, reused=False)]
     )
+    assert sparse_refusals == []
     assert sparse[0]["scope"] is None
     assert sparse[0]["outbound_calls"] == 0
 
-    assert _visual_claims_wire_payload(None) == []
-    assert _visual_claims_wire_payload(()) == []
-    # A row missing ONE provenance field names an unknown link, so it is
-    # not a claim at all.
+    assert _visual_claims_wire_payload(None) == ([], [])
+    assert _visual_claims_wire_payload(()) == ([], [])
+    # A row missing ONE provenance field names an unknown link, so it
+    # is refused — by name, at its own index (spec §8-R4).
     partial = _claim_row()
     partial.pop("page_image_sha256")
-    assert _visual_claims_wire_payload([partial]) == []
-    assert _visual_claims_wire_payload([{"kind": COMPANY_KIND, "quote": "x"}]) == []
-    assert _visual_claims_wire_payload([None, "x", 7]) == []
+    rows, refused = _visual_claims_wire_payload([partial])
+    assert rows == []
+    assert refused == [
+        {"citation_index": 0, "error": "malformed_evidence_contract"}
+    ]
+    rows, refused = _visual_claims_wire_payload(
+        [{"kind": COMPANY_KIND, "quote": "x"}]
+    )
+    assert rows == []
+    assert refused == [
+        {"citation_index": 0, "error": "malformed_evidence_contract"}
+    ]
+    rows, refused = _visual_claims_wire_payload([None, "x", 7])
+    assert rows == []
+    assert refused == [
+        {"citation_index": index, "error": "malformed_evidence_contract"}
+        for index in range(3)
+    ]
 
     # Input order survives, and the caller's dict is not the wire's dict.
     source = _claim_row()
-    emitted = _visual_claims_wire_payload([source])
+    emitted, _ = _visual_claims_wire_payload([source])
     emitted[0]["detail"] = "rewritten"
     assert source["detail"] == CLAIM_DETAIL
 

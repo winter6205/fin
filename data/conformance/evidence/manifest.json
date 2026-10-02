@@ -1,0 +1,234 @@
+{
+  "contract": "specs/enterprise-evidence-contract.md (E1 freeze, issue #334 step E1)",
+  "purpose": "fin-owned consumer-conformance fixtures, #334 step E3. They prove fin's consumer contract only; nothing here claims the #322 producer exists or conforms (E1 section 5).",
+  "fixture_format": "one JSON object per case: {case, direction, expect, refusal_code, payload} (E1 section 5). Manifests enumerate every case file and record named gaps.",
+  "refusal_code_null_rule": "expect=accept always carries refusal_code null. Every expect=refuse case now carries a named code: the classes the fixture pass left null were decided by the E1 owner — see the gap resolutions below. The validator must assert a NAMED refusal outcome, never a crash or empty success, for every refuse case. unknown_locator and citation_repair_cap are the delegated citation-gate verifier exits (E1 section 6), not section 6 contract codes.",
+  "harness_context_note": "cases whose refusal depends on admission context (trust, staleness, unresolvable locator, view authorization) pin the payload shape and the expected typed outcome; the E3 test harness supplies the context half (trusted thread, stored versions, authorized views). Their payloads are shape-valid by design: a well-formed identity proves neither trust nor authorization (E1 sections 4.1/4.4).",
+  "profiles": {
+    "citation": {
+      "manifest": "citation/manifest.json",
+      "cases": [
+        "valid-company",
+        "valid-attachment",
+        "citations-empty-array",
+        "absent-quote",
+        "wrong-type-unit",
+        "broken-locator-empty-version",
+        "broken-locator-unit-zero",
+        "quote-below-minimum-span",
+        "unknown-field",
+        "unsupported-evidence-schema",
+        "unsupported-schema-version",
+        "unsupported-kind-visual",
+        "locator-version-unresolvable",
+        "quote-not-in-received-text",
+        "untrusted-attachment",
+        "overflow-citations-33",
+        "overflow-quote-2001"
+      ]
+    },
+    "visual_claim": {
+      "manifest": "visual_claim/manifest.json",
+      "cases": [
+        "valid-whole-page",
+        "valid-crop",
+        "claims-empty-array",
+        "absent-hash",
+        "wrong-type-page",
+        "malformed-hash-prefixed",
+        "malformed-hash-bad-hex",
+        "unsupported-version",
+        "unsupported-schema-version",
+        "unsupported-kind-hyphen",
+        "crop-inverted-bounds",
+        "crop-out-of-range",
+        "observation-version-stale",
+        "unknown-field",
+        "untrusted-attachment",
+        "overflow-detail-4001",
+        "overflow-claims-33"
+      ]
+    },
+    "database_row": {
+      "manifest": "database_row/manifest.json",
+      "cases": [
+        "valid-ingress-envelope",
+        "valid-egress-citation",
+        "database-rows-key-absent",
+        "zero-rows",
+        "source-not-provisioned",
+        "transport-error",
+        "missing-field-queried-at",
+        "record-key-wrong-type",
+        "database-rows-envelope-wrong-type",
+        "unsupported-snapshot-version",
+        "malformed-timestamp-offset",
+        "malformed-timestamp-fraction",
+        "malformed-timestamp-leap-second",
+        "mirror-mismatch-version",
+        "egress-missing-snapshot",
+        "document-kind-carrying-snapshot",
+        "row-in-chunks",
+        "snapshot-unknown-field-kind",
+        "digest-carrier-valid",
+        "digest-carrier-mismatch",
+        "digest-carrier-malformed-hash",
+        "untrusted-view-denied",
+        "overflow-rows-21",
+        "overflow-fields-17",
+        "overflow-snapshot-33kib"
+      ]
+    },
+    "business_field": {
+      "manifest": "business_field/manifest.json",
+      "cases": [
+        "valid-document-locator",
+        "valid-attachment-locator",
+        "valid-database-locator",
+        "valid-conflicting-pair",
+        "fields-empty-array",
+        "status-missing-exit",
+        "absent-field-status",
+        "wrong-type-original-value",
+        "status-outside-closed-set",
+        "unsupported-version",
+        "unsupported-schema-version",
+        "unsupported-kind-hyphen",
+        "invented-locator-shape",
+        "unknown-field",
+        "untrusted-subject",
+        "overflow-text-513",
+        "overflow-per-subject-25"
+      ]
+    },
+    "comparison": {
+      "manifest": "comparison/manifest.json",
+      "cases": [
+        "valid-period-table",
+        "cells-all-missing",
+        "unsupported-schema",
+        "unsupported-schema-version",
+        "cell-missing-locator",
+        "wrong-type-columns",
+        "unknown-field-envelope",
+        "hit-cell-null-value",
+        "locator-not-in-envelope-locators",
+        "overflow-grid-72-cells",
+        "untrusted-source-version"
+      ]
+    },
+    "http_sse": {
+      "manifest": "http_sse/manifest.json",
+      "cases": [
+        "http-sse-terminal-citation-frames"
+      ],
+      "e1_decision": "E5 wire-conformance example (plan E5 acceptance): one committed HTTP/SSE frame-sequence example consumable by #322; pinned live by tests/host/test_workspace_http.py."
+    }
+  },
+  "supplements": [
+    {
+      "path": "database_row/digest_worksheet.json",
+      "purpose": "canonical_json inputs + digests for the snapshot-identity cases so #322 can reproduce them independently (E1 section 4.4, ADR 0092)."
+    },
+    {
+      "path": "schema_version_cases.json",
+      "purpose": "One independently-declared set of schema_version judgements that the Python validator, the comparison export, and the web decoder are ALL driven from (ADR 0093 decisions 7/8/10/12). It lives here, at the root and NOT under a per-profile directory, because it is not a profile's case: it is the shared rule the three consumers of the version field must agree on, and putting it under one profile would read as that profile's contract. Its expectations are written from the rule; the runners assert them and must not derive them. Each case names the raw JSON value for schema_version (or its absence) and the expected refusal class. Non-finite cases use a schema_version_nonfinite tag because NaN/Infinity have no strict-JSON spelling, and the tag is the only way such a value enters the set. Driven by tests/host/test_evidence_contract.py (validator + export) and web/src/evidenceContract.test.ts (decoder). There is no recorded exception: the export refuses the absent-version case as malformed_evidence_contract per ADR 0093 decision 12 (which superseded decision 9's absent-accepts half) and now agrees with the validator and the web on all 18 cases, so the export runner asserts observed == expect uniformly with no divergence to state."
+    }
+  ],
+  "refusal_codes_used": [
+    "business_field_overflow",
+    "business_field_trust_denied",
+    "citation_overflow",
+    "citation_repair_cap",
+    "citation_trust_denied",
+    "comparison_overflow",
+    "comparison_source_unverified",
+    "database_row_overflow",
+    "insufficient_evidence",
+    "malformed_evidence_contract",
+    "observation_stale",
+    "real_db_not_wired",
+    "retrieve_unavailable",
+    "sql_no_matching_rows",
+    "sql_query_denied",
+    "unknown_locator",
+    "unsupported_evidence_contract",
+    "visual_claim_overflow",
+    "visual_claim_trust_denied"
+  ],
+  "gaps": [
+    {
+      "id": "overflow-code-unnamed",
+      "note": "E1 section 3 demands a named overflow refusal and section 6.1 maps overflow at every boundary, but the section 6 code table names no overflow code. comparison/overflow-grid-72-cells uses the existing shipped comparison-tool exit comparison_overflow (section 4.3 keeps comparison rules unchanged); every other overflow case keeps refusal_code null until the E1 owner names the contract overflow code.",
+      "cases": [
+        "citation/overflow-citations-33",
+        "citation/overflow-quote-2001",
+        "visual_claim/overflow-detail-4001",
+        "visual_claim/overflow-claims-33",
+        "database_row/overflow-rows-21",
+        "database_row/overflow-fields-17",
+        "database_row/overflow-snapshot-33kib",
+        "business_field/overflow-text-513",
+        "business_field/overflow-per-subject-25"
+      ],
+      "status": "decided",
+      "resolution": "Per-lane overflow codes (E1 sections 3/6): citation_overflow, visual_claim_overflow, database_row_overflow, business_field_overflow; comparison_overflow is admitted into the taxonomy keeping its shipped tool exit (section 4.3 rules unchanged). Rule: the lane whose section 3 bound is broken reports it, at the boundary that sees the payload; refuse, never truncate. database_row byte-bound precedence: section 3."
+    },
+    {
+      "id": "citation-lane-trust-denial-code-unnamed",
+      "note": "Section 4.1 requires the attachment active-thread trust check to deny a well-formed identity, but section 6 names no denial code for the document/attachment lane (only sql_query_denied and the #322-owned historical code). Today the shipped gate drops the item from eligibility with no named per-row refusal, which section 2.4 forbids. Gap for the E1 owner.",
+      "cases": [
+        "citation/untrusted-attachment"
+      ],
+      "status": "decided",
+      "resolution": "citation_trust_denied (E1 sections 4.1/6, permission-denial row): shape-valid ≠ authorized; the active-thread trust check on a well-formed identity is a named per-item refusal, never a silent eligibility drop (section 2.4)."
+    },
+    {
+      "id": "visual-lane-trust-denial-code-unnamed",
+      "note": "Visual-lane trust denial has no E1-named code (same family as the citation lane gap; VISUAL_REFUSAL_CODES ships availability/staleness exits only). Gap for the E1 owner.",
+      "cases": [
+        "visual_claim/untrusted-attachment"
+      ],
+      "status": "decided",
+      "resolution": "visual_claim_trust_denied (E1 sections 4.2/6, permission-denial row) — same family as the citation lane; the shipped availability/staleness exits stay unchanged."
+    },
+    {
+      "id": "document-verifier-lane-code-unnamed",
+      "note": "Document text-span verifier lane (section 4.1, unchanged per ADR 0091): the shipped gate answers with its own repair/refuse outcomes (reasons such as unknown_locator); E1 names no per-citation contract code for this semantic class. The fixture asserts the lane's non-accept outcome, not acceptance. Gap for the E1 owner.",
+      "cases": [
+        "citation/locator-version-unresolvable",
+        "citation/quote-not-in-received-text"
+      ],
+      "status": "decided",
+      "resolution": "Delegated, no parallel contract code (E1 section 6 delegated-verifier note): the gate's own typed refuse exits answer the lane — unknown_locator (locator version resolves to no known document version) and citation_repair_cap (span matching exhausts the repair budget; ADR 0008/0091). The two fixtures now carry those gate exits as the expected named outcome; answerable without guessing."
+    },
+    {
+      "id": "business-field-trust-denial-code-unnamed",
+      "note": "Business-field trust denial (subject_ref well-formed but not readable by this caller) has no E1-named code; graph identity is iknow-owned (section 4.5). Gap for the E1 owner.",
+      "cases": [
+        "business_field/untrusted-subject"
+      ],
+      "status": "decided",
+      "resolution": "business_field_trust_denied (E1 sections 4.5/6, permission-denial row): graph identity stays iknow's, the lane's read-denial outcome name is fin's."
+    },
+    {
+      "id": "comparison-provenance-code-unnamed",
+      "note": "Comparison frame bound to a source version this run did not receive: section 4.3 keeps binding to the exact source version but names no code for this lane. Gap for the E1 owner.",
+      "cases": [
+        "comparison/untrusted-source-version"
+      ],
+      "status": "decided",
+      "resolution": "comparison_source_unverified (E1 sections 4.3/6, unverified-context row): the frame names an exact source version this run did not receive, so the binding cannot be established — 'could not verify', kept distinct from denial's 'checked and the answer is no' (the split #322 settled in SQL contract section 7)."
+    },
+    {
+      "id": "retrieve-rows-list-key-name",
+      "note": "E1 section 4.4 freezes the sibling key database_rows and its result_count but not the name of the snapshot-list member inside the fin.evidence.retrieve_rows object. These fixtures use 'rows'; the E3 validator or #322 must confirm the final member name (recorded as a gap, not invented as law).",
+      "cases": [
+        "database_row/valid-ingress-envelope",
+        "database_row/zero-rows"
+      ],
+      "status": "decided",
+      "resolution": "The snapshot-list member freezes as `rows` — full path database_rows.rows (E1 section 4.4). The fixture payloads already use `rows` and stand unchanged. iknow 65f2f9f's bare-array emission is the pre-envelope producer shape: it is refused as malformed_evidence_contract at ingress (database-rows-envelope-wrong-type) and #322 conforms by wrapping it in the frozen fin.evidence.retrieve_rows envelope (section 9, row 1). One name, no second list-member alias."
+    }
+  ]
+}

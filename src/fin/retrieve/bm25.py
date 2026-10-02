@@ -252,6 +252,8 @@ class BM25Adapter:
         filing_date: str | None = None,
         limit: int = 8,
         search_mode: str | None = None,
+        sql_window_start: str | None = None,
+        sql_window_end: str | None = None,
     ) -> dict[str, list[Chunk]]:
         """Return ``{"chunks": [...]}`` ranked descending by BM25 score.
 
@@ -278,9 +280,17 @@ class BM25Adapter:
             Accepted for port-signature parity only. This adapter is
             archived from the product path (ADR 0030) and its one
             ranking IS lexical, so an open 档 answers with that
-            ranking; the token validation (unopened / illegal → the
-            port's named errors) still runs, so a caller cannot slip
-            a 档 request past unnoticed.
+            ranking; the token validation (illegal → the port's named
+            errors) still runs, so a caller cannot slip a 档 request
+            past unnoticed.
+        sql_window_start / sql_window_end
+            Accepted and IGNORED for port-signature parity: this
+            adapter holds no ledger to bind a window against — the
+            window gate lives at the product wire seam
+            (``fin.retrieve.port.resolve_sql_window`` via
+            ``MCPRetrieveAdapter``). The sql 档 on BM25 answers with
+            this lexical ranking, exactly as every other open 档 does
+            here.
 
         Returns
         -------

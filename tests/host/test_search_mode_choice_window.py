@@ -8,16 +8,20 @@ Contract covered here (ADR 0062 HITL, spec SC2 "clarify window" + SC4):
 
 * grounded + ``decision_tier == "clarify"`` pauses the run BEFORE any
   model / retrieve call on a LangGraph ``interrupt`` whose payload is
-  the choice window (``kind`` + non-empty ``options`` of ``{id,label}``,
-  综述 opened so global/graph/lexical are marked opened and only sql is
-  marked unopened).
+  the choice window (``kind`` + non-empty ``options`` of ``{id,label}``;
+  since #322 T7 (6e8ed97) opened sql every lasting 档 renders marked
+  opened — the ``opened`` flag reads the emptied ``TIER_UNAVAILABLE_CODE``
+  SSOT and nothing else).
 * ``Command(resume=pick)`` assigns the picked 档 (auditable
   ``decision_tier="operator_pick"`` + ``signals.resume_pick``) and the
   grounded leaf then proceeds (retrieve runs).
 * an unknown pick REOPENS the window (never a silent 档), and so does a
   retired letter — with zero coexistence it names no option id and is
-  rejected exactly like ``Z``; a pick of an unopened 档 is the 具名失败
-  ``typed_fail`` recorded on the audit.
+  rejected exactly like ``Z``. A pick of an unopened 档 was once the
+  具名失败 ``typed_fail``; that class has no closed-set producer left (the
+  refusal table is empty), the window's ``opened`` flags agree with the
+  picks that assign, and the negative lane is owned by the reopening case
+  below.
 * the workspace SSE wire emits a ``choice_window`` frame; ``POST
   /threads/{id}/resume`` accepts ``{"pick": ...}``; a send while a
   window is pending keeps the 409 ``concurrent_run`` semantics; the
@@ -31,7 +35,10 @@ Contract covered here (ADR 0062 HITL, spec SC2 "clarify window" + SC4):
 Five boundary classes (spec Boundaries "Test classes") map to:
 empty -> ``test_ambiguous_grounded_ask_opens_choice_window`` (an ask
 the cascade cannot name IS the empty/residual input here);
-negative -> ``test_pick_of_unopened_tier_is_typed_fail_not_silent_substitute``;
+negative -> ``test_invalid_pick_reopens_window_then_valid_pick_resolves``
+(out-of-list picks and retired letters name no option and assign
+nothing; every marked-open option that assigns is pinned to itself by
+``test_pick_of_the_opened_sql_tier_assigns_it_never_a_substitute``);
 overflow -> ``test_invalid_pick_reopens_window_then_valid_pick_resolves``
 (repeated picks never accumulate a 档 — no silent default under any
 number of retries);
@@ -53,7 +60,6 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
 from fin.host import ScriptedChatModel, compile_graph
-from fin.host.named_failures import REAL_DB_NOT_WIRED
 from fin.host.state import reset_input_state
 
 pytestmark = [pytest.mark.soft_track]
@@ -142,9 +148,12 @@ def test_choice_window_payload_contract_ids_and_labels() -> None:
     # The ids are the LASTING tokens: the value a pick resumes with is
     # already the value the audit and the port carry.
     assert [o["id"] for o in options] == ["lexical", "graph", "global", "sql"]
-    # 综述 opened: lexical/graph/global are all marked opened; only
-    # 真数据库 (``sql``) remains the unopened plan slot in the window.
-    assert [o["opened"] for o in options] == [True, True, True, False]
+    # 真数据库 opened at #322 T7 (commit 6e8ed97): the old pin was
+    # ``[True, True, True, False]`` with sql the unopened plan slot; the
+    # flag reads the emptied ``TIER_UNAVAILABLE_CODE`` SSOT, so ALL FOUR
+    # now render opened — and the window can no longer offer an option
+    # whose pick the cascade would refuse.
+    assert [o["opened"] for o in options] == [True, True, True, True]
 
 
 def test_resume_pick_assigns_mode_and_grounded_retrieves() -> None:
@@ -210,21 +219,46 @@ def test_invalid_pick_reopens_window_then_valid_pick_resolves() -> None:
     assert audit["signals"].get("rejected_picks") == ["Z", "B"]
 
 
-def test_pick_of_unopened_tier_is_typed_fail_not_silent_substitute() -> None:
-    """Boundary 'negative': the operator picking 真数据库 (``sql``, the one
-    plan slot still unopened) gets the 具名失败 on the audit — the cascade
-    never substitutes another 档. This negative case moved off 综述 once
-    综述 opened."""
+def test_pick_of_the_opened_sql_tier_assigns_it_never_a_substitute() -> None:
+    """Flipped by #322 T7 (commit 6e8ed97): the old pin asserted a pick
+    of the unopened sql exited ``typed_fail`` + ``real_db_not_wired`` +
+    ``search_mode=None``. sql is open now, so the window's marked-open
+    option and the assigned 档 agree — and the invariant that survives
+    the flip is the STRONGER one the old test combined: a pick never
+    becomes a substitute 档. Every marked-open option assigns exactly
+    itself; ``typed_fail`` is no longer reachable for any of them
+    (refusal table empty), so the window can offer nothing the cascade
+    would refuse."""
     g = _compile(_ANSWER)
-    tid = "cw-unopened-pick"
-    g.invoke(_input(AMBIGUOUS), config=_cfg(tid))
+    tid = "cw-sql-pick"
+    out = g.invoke(_input(AMBIGUOUS), config=_cfg(tid))
+    payload = _interrupt_payload(out)
+    assert payload is not None
+
     done = g.invoke(Command(resume="sql"), config=_cfg(tid))
     assert not done.get("__interrupt__")
     audit = done["search_mode_decision"]
-    assert audit["decision_tier"] == "typed_fail"
-    assert audit["failure_code"] == REAL_DB_NOT_WIRED
-    assert audit["search_mode"] is None
-    assert audit["signals"].get("requested_mode") == "sql"
+    assert audit["decision_tier"] == "operator_pick"
+    assert audit["failure_code"] is None
+    assert audit["search_mode"] == "sql"
+    assert audit["signals"].get("resume_pick") == "sql"
+
+    # Window ⇄ cascade agreement: every option the payload marks opened
+    # picks to itself with no typed_fail — no marked-open option can
+    # collapse into a substitute or a refusal.
+    for option in payload["options"]:
+        if not option["opened"]:
+            continue
+        one = _compile(_ANSWER)
+        one_thread = f"cw-agree-{option['id']}"
+        one.invoke(_input(AMBIGUOUS), config=_cfg(one_thread))
+        resolved = one.invoke(
+            Command(resume=option["id"]), config=_cfg(one_thread)
+        )
+        one_audit = resolved["search_mode_decision"]
+        assert one_audit["decision_tier"] == "operator_pick", option
+        assert one_audit["search_mode"] == option["id"], option
+        assert one_audit["failure_code"] is None, option
 
 
 def test_pick_of_the_opened_综述_assigns_global() -> None:

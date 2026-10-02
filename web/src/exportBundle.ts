@@ -4,7 +4,7 @@
 // with ``download``), so this module only has to build the URL and say
 // which kinds the thread can offer. Route + typed 404 codes are owned
 // by src/fin/host/workspace_http.py; the file body — including the
-// ``fin.comparison.v1`` binding — is owned by src/fin/host/export.py.
+// ``fin.comparison`` binding — is owned by src/fin/host/export.py.
 // Nothing here reads a comparison cell, and nothing here computes a
 // delta (docs/CONTEXT.md, compare_facts).
 

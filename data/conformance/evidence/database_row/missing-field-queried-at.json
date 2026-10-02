@@ -1,0 +1,29 @@
+{
+  "case": "missing-field-queried-at",
+  "direction": "consumer",
+  "expect": "refuse",
+  "refusal_code": "malformed_evidence_contract",
+  "payload": {
+    "chunks": [],
+    "database_rows": {
+      "schema": "fin.evidence.retrieve_rows",
+      "schema_version": 1,
+      "result_count": 1,
+      "rows": [
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2291"
+          },
+          "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": 30,
+            "notice_by": "2026-02-12"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        }
+      ]
+    }
+  }
+}

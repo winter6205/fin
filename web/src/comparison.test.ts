@@ -2,7 +2,7 @@
 // DOM (this project's vitest runs no DOM testing library — see
 // ThreadPage.test.ts for the same pattern).
 //
-// The envelope under test is ``fin.comparison.v1``, produced by
+// The envelope under test is ``fin.comparison``, produced by
 // ``src/fin/host/tools/compare_facts.py`` and carried both on the
 // ``comparison`` SSE frame and on ``TurnRow.comparisons``. The
 // parser here is the SPA's boundary: the wire is ``unknown``, and a
@@ -15,6 +15,7 @@ import {
   MISSING_CELL_DISPLAY,
   cellTitle,
   comparisonCaption,
+  decodeComparison,
   deltaForRow,
   directionClass,
   directionMark,
@@ -23,12 +24,14 @@ import {
   parseComparisons,
   turnComparisons,
 } from "./comparison";
+import { EVIDENCE_SCHEMA_VERSION } from "./evidenceContract";
 import { citationSourceId } from "./sourceLocator";
 import type { Citation, Comparison, ComparisonLocator } from "./types";
 
 function makeComparison(overrides: Partial<Comparison> = {}): Comparison {
   return {
     schema: COMPARISON_SCHEMA,
+    schema_version: EVIDENCE_SCHEMA_VERSION,
     kind: "table",
     axis: "period",
     concept: "us-gaap:Revenues",
@@ -56,7 +59,6 @@ function makeComparison(overrides: Partial<Comparison> = {}): Comparison {
               document_id: "AAPL-2022Q3",
               version: "a".repeat(64),
               unit: 4,
-              display: "page",
             },
           },
           {
@@ -71,7 +73,6 @@ function makeComparison(overrides: Partial<Comparison> = {}): Comparison {
               document_id: "AAPL-2023Q3",
               version: "b".repeat(64),
               unit: 4,
-              display: "page",
             },
           },
         ],
@@ -95,13 +96,11 @@ function makeComparison(overrides: Partial<Comparison> = {}): Comparison {
         document_id: "AAPL-2022Q3",
         version: "a".repeat(64),
         unit: 4,
-        display: "page",
       },
       {
         document_id: "AAPL-2023Q3",
         version: "b".repeat(64),
         unit: 4,
-        display: "page",
       },
     ],
     ...overrides,
@@ -115,23 +114,45 @@ describe("parseComparison", () => {
     expect(parsed?.rows[0].cells[1].value).toBe(293787);
   });
 
-  it("keeps tool_call_id so a live frame can match its tool row", () => {
-    const parsed = parseComparison({
+  it("refuses an envelope-level key outside the frozen comparison schema", () => {
+    const outcome = decodeComparison({
       ...makeComparison(),
       tool_call_id: "c-compare",
     });
-    expect(parsed?.tool_call_id).toBe("c-compare");
+    expect(outcome).toEqual({
+      status: "refusal",
+      error: "malformed_evidence_contract",
+    });
+  });
+
+  it("rejects an envelope whose recognized schema carries an unsupported schema_version", () => {
+    // §2.1 rule 3: the token names the shape, the integer sibling
+    // versions it. A recognized shape at a version this client did not
+    // opt into is refused exactly like an unknown shape — the table
+    // never renders an envelope it cannot interpret.
+    expect(
+      parseComparison({ ...makeComparison(), schema_version: 2 }),
+    ).toBeNull();
+    expect(
+      parseComparison({
+        ...makeComparison(),
+        schema_version: undefined as unknown as number,
+      }),
+    ).toBeNull();
   });
 
   it("rejects a payload with the wrong schema tag", () => {
     // T4's export binds to this envelope by its schema string; a
-    // future v2 must not silently render through the v1 table.
+    // future shape must not silently render through this table. The
+    // NAKED TOKEN (a bare string, not an object) is the negative:
+    // a payload that only looks like the tag still renders nothing.
+    expect(parseComparison(COMPARISON_SCHEMA)).toBeNull();
     expect(parseComparison({ ...makeComparison(), schema: "v2" })).toBeNull();
   });
 
   it("rejects non-objects and missing structure", () => {
     expect(parseComparison(null)).toBeNull();
-    expect(parseComparison("fin.comparison.v1")).toBeNull();
+    expect(parseComparison("fin.comparison")).toBeNull();
     expect(parseComparison({ schema: COMPARISON_SCHEMA })).toBeNull();
   });
 
@@ -331,7 +352,13 @@ describe("locatorLabel", () => {
 
 describe("cellTitle", () => {
   it("names the filing page a hit came from", () => {
-    const cell = makeComparison().rows[0].cells[0];
+    const sourceCell = makeComparison().rows[0].cells[0];
+    // Presentation-only display metadata is accepted by the renderer but
+    // is not part of the closed comparison contract fixture.
+    const cell = {
+      ...sourceCell,
+      locator: { ...sourceCell.locator!, display: "page" as const },
+    };
     expect(cellTitle(cell)).toBe("AAPL-2022Q3 p.4");
   });
 

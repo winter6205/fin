@@ -118,15 +118,28 @@ def _citation_source_label(citation) -> str:
     A company citation names its ``document_id``; an attachment citation
     has none, so it names the safe filename and falls back to the logical
     ``attachment_id`` — the identity that stays unique when two uploads
-    share a filename.
+    share a filename. A ledger row has neither, so it names the permitted
+    view plus the record key (ADR 0091), and a kind this CLI does not
+    know names itself rather than falling through to the company slot.
     """
     if citation.kind == "attachment":
         return citation.filename or citation.attachment_id
-    return citation.document_id
+    if citation.kind == "database-row":
+        return citation.database_source_id or citation.kind
+    if citation.kind == "company":
+        return citation.document_id
+    return str(citation.kind)
 
 
 def _citation_unit_label(citation) -> str:
-    """``p<unit>`` for a unit presented as a page, else ``u<unit>``."""
+    """``p<unit>`` for a unit presented as a page, else ``u<unit>``.
+
+    A ledger row is neither: a record has no page and no ordinal, so it
+    reads as ``record`` rather than ``u1`` — a position in a document
+    that does not exist.
+    """
+    if citation.display == "record":
+        return "record"
     prefix = "p" if citation.display == "page" else "u"
     return f"{prefix}{citation.unit}"
 

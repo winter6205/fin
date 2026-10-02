@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { EVIDENCE_SCHEMA_VERSION } from "./evidenceContract";
 import { exportAvailability, exportUrl } from "./exportBundle";
 import type { Citation, Comparison, Turn } from "./types";
 
 const COMPARISON: Comparison = {
-  schema: "fin.comparison.v1",
+  schema: "fin.comparison",
+  schema_version: EVIDENCE_SCHEMA_VERSION,
   kind: "table",
   axis: "period",
   concept: "us-gaap:Revenues",

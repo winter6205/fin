@@ -1,0 +1,18 @@
+{
+  "case": "database-rows-key-absent",
+  "direction": "consumer",
+  "expect": "accept",
+  "refusal_code": null,
+  "payload": {
+    "chunks": [
+      {
+        "text": "policy excerpt with no ledger row",
+        "source_ref": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        }
+      }
+    ]
+  }
+}

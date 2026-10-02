@@ -1,0 +1,360 @@
+{
+  "case": "overflow-per-subject-25",
+  "direction": "consumer",
+  "expect": "refuse",
+  "refusal_code": "business_field_overflow",
+  "payload": {
+    "business_fields": [
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 0.00",
+        "normalized_text": "0",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 1.00",
+        "normalized_text": "1",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 2.00",
+        "normalized_text": "2",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 3.00",
+        "normalized_text": "3",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 4.00",
+        "normalized_text": "4",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 5.00",
+        "normalized_text": "5",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 6.00",
+        "normalized_text": "6",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 7.00",
+        "normalized_text": "7",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 8.00",
+        "normalized_text": "8",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 9.00",
+        "normalized_text": "9",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 10.00",
+        "normalized_text": "10",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 11.00",
+        "normalized_text": "11",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 12.00",
+        "normalized_text": "12",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 13.00",
+        "normalized_text": "13",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 14.00",
+        "normalized_text": "14",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 15.00",
+        "normalized_text": "15",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 16.00",
+        "normalized_text": "16",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 17.00",
+        "normalized_text": "17",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 18.00",
+        "normalized_text": "18",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 19.00",
+        "normalized_text": "19",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 20.00",
+        "normalized_text": "20",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 21.00",
+        "normalized_text": "21",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 22.00",
+        "normalized_text": "22",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 23.00",
+        "normalized_text": "23",
+        "status": "extracted"
+      },
+      {
+        "schema": "fin.evidence.business_field",
+        "schema_version": 1,
+        "kind": "business_field",
+        "subject_ref": "iknow:entity/vendor-northwind",
+        "source_locator": {
+          "document_id": "t1-expense-001",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 3
+        },
+        "original_value": "USD 24.00",
+        "normalized_text": "24",
+        "status": "extracted"
+      }
+    ]
+  }
+}

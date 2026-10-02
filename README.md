@@ -168,6 +168,15 @@ uv run pytest -q -m eval               # the nine cases, pass/fail
 uv run python scripts/eval_counts.py   # the same lane, plus done / refuse integers
 ```
 
+### Python type checking (host + retrieve)
+
+```bash
+uv sync                    # one-time precondition: installs pyright from the locked dev group
+uv run --no-sync pyright   # pyright 1.1.414 from the dev group, config in [tool.pyright]
+```
+
+The gate checks exactly two packages, `src/fin/host` and `src/fin/retrieve`, in `standard` type-checking mode against Python 3.12; scope and mode live only in `[tool.pyright]` in `pyproject.toml`. It is a static check on the locked dev toolchain — no global install required, and it never replaces `uv run pytest` runtime validation. The web package keeps its own check (`cd web && npm run typecheck`, i.e. `tsc --noEmit`).
+
 ### Live retrieve 评测（opt-in）
 
 The `live-retrieve-eval-wave` ([spec](../specs/live-retrieve-eval-wave.md), [plan](../plans/live-retrieve-eval-wave.md)) opt-in chain runs the existing ablation / concurrency harness against a real `iknow-memory` MCP retrieve port and a real LLM. Default `uv run pytest -q`, default ablation, and default scripted eval all stay on `contract_fake` / Fake adapters — none of these commands are reached by `pytest`, none auto-start iknow, and none inherit live credentials from operator `.env`. Every step below is a separate explicit invocation:

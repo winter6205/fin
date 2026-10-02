@@ -42,6 +42,25 @@ def test_feedback_accepts_negative_thumb_value() -> None:
     assert saved.value == "down"
 
 
+def test_feedback_2026_09_30_typing_pass_canonicalizes_str_subclass_value() -> None:
+    """A ``str`` SUBCLASS equal to ``"up"`` is accepted but never
+    stored: the value lands as the plain canonical literal on both the
+    returned record and the one read back."""
+    from fin.host.feedback import InMemoryFeedbackStore
+
+    class _UpFlag(str):
+        pass
+
+    store = InMemoryFeedbackStore()
+    saved = store.set_feedback("run-canonical", _UpFlag("up"))
+
+    assert type(saved.value) is str
+    assert saved.value == "up"
+    reloaded = store.get_feedback("run-canonical")
+    assert reloaded is not None
+    assert type(reloaded.value) is str
+
+
 def test_feedback_rejects_overflow_run_id() -> None:
     from fin.host.feedback import (
         MAX_RUN_ID_LENGTH,

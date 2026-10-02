@@ -1,0 +1,14 @@
+{
+  "case": "v0-unit-page-both-equal",
+  "direction": "consumer",
+  "expect": "refuse",
+  "refusal_code": "unsupported_evidence_contract",
+  "note": "Spec 7.3 with the server's frozen replay projection (thread_store.project_stored_citation): BOTH unit and page naming the SAME ordinal is still a contradiction - the v0 shape allows EXACTLY ONE ordinal name, and no value agreement rescues it. This is the cross-boundary pin: server and web both refuse with the compatibility code; neither defaults.",
+  "citation": {
+    "document_id": "t1-expense-001",
+    "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+    "unit": 3,
+    "page": 3,
+    "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+  }
+}

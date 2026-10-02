@@ -10,7 +10,7 @@ Spec Focus 3 / SC4-SC6 on the HTTP surface:
   no new HumanMessage, a later send is accepted, and a concurrent send
   is still 409 ``{"error": "concurrent_run"}`` before any SSE header;
 * export (``GET /api/threads/{id}/export``) — a file body for the
-  thread's ``fin.comparison.v1`` comparison or its citations; a missing
+  thread's ``fin.comparison`` comparison or its citations; a missing
   run is a typed 404.
 
 Fixture pattern mirrors ``tests/host/test_workspace_http.py``: a fresh
@@ -40,7 +40,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from fin.host import Citation, ScriptedChatModel, compile_graph
 from fin.host.citation_gate import COMPANY_KIND
 from fin.host.thread_store import InMemoryThreadStore, RunRecord
-from fin.host.tools.compare_facts import COMPARISON_SCHEMA
+from fin.host.tools.compare_facts import COMPARISON_SCHEMA, COMPARISON_SCHEMA_VERSION
 from fin.host.watchlist import JsonFileWatchlistStore
 
 
@@ -421,8 +421,22 @@ def _fact_locator() -> dict[str, Any]:
 
 
 def _comparison_envelope(concept: str = "us-gaap:Revenues") -> dict:
+    """A stored ``fin.comparison`` envelope, as a producer must mint it.
+
+    ``schema`` and ``schema_version`` are an ATOMIC PAIR at every
+    boundary (spec §2.1 rule 1, ADR 0093 decision 12): the token names
+    the shape, the integer numbers it, and NO component infers, defaults
+    or back-fills the number from the token. So the pair is stated here
+    as the real producer does; an envelope naming the token and omitting
+    the number is a PRODUCER TYPE BUG, and the export refuses it as
+    ``malformed_evidence_contract`` by design rather than repairing it.
+    (This fixture predated decision 12 and omitted the number, so the two
+    export tests below were served a 422 instead of the CSV / JSON body
+    they mean to pin.)
+    """
     return {
         "schema": COMPARISON_SCHEMA,
+        "schema_version": COMPARISON_SCHEMA_VERSION,
         "kind": "table",
         "axis": "period",
         "concept": concept,

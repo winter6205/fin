@@ -1,0 +1,127 @@
+{
+  "contract": "specs/enterprise-evidence-contract.md §2.1 rule 3, docs/adr/0093-evidence-token-version-carrier.md decisions 7, 8, 10 and 12",
+  "purpose": "The one independently-declared set of schema_version judgements that the Python validator, the comparison export, and the web decoder are ALL driven from. WHY this file exists: before it, each side proved only that IT agreed with ITSELF, and the one boundary that had to be right — a JSON number spelled 1.0 — was exactly the one a Python-side-only test could not see (json.loads gives the float 1.0; JSON.parse gives the integer 1). Expectations here are written from the RULE, not read off any implementation; a runner that fails is reporting a real disagreement, and the fix is to the runner or the code, never to a case in this file.",
+  "runner_instructions": {
+    "case_identity": "Every case names a RECOGNIZED frozen token (the citation channel) plus the schema_version value that travels beside it. The token is a constant of the set, not a per-case input: the rule under test is the version rule, and a token that is not recognized would exit on the token check before the version check ever ran.",
+    "absent_case": "A case carrying `schema_version_absent` has NO schema_version key at all in the carrier the runner builds. It is not the same as a case carrying `schema_version: null`, which is a PRESENT but unusable value.",
+    "nonfinite_tag": "A case carrying `schema_version_nonfinite` names one of \"NaN\", \"Infinity\", \"-Infinity\". None of the three is representable in strict JSON, so the runner MUST NOT read this file with a JSON parser that accepts bare NaN/Infinity literals and MUST NOT invent a fourth spelling. A runner maps the tag to the corresponding non-finite float / number itself, and to nothing else. The tag is the ONLY way a non-finite value enters this set; no case expresses one any other way.",
+    "present_case": "A case carrying `schema_version` supplies that value verbatim as JSON, with its JSON type preserved. This is why the `1.0` case is written `1.0` and not `1`: the two spellings are the same decoded value, and a runner that rewrote the spelling would destroy the case that exists to prove the point.",
+    "expectation_domain": "`expect` is one of accept / malformed_evidence_contract / unsupported_evidence_contract. `accept` means the carrier is spoken by every consumer of this set that the case applies to; the two refusal values are the §2.4 / §2.3 classes, kept apart because they send the producer to different places (fix the type vs. bump the version)."
+  },
+  "rule": {
+    "accept": "The value is a finite integer BY VALUE equal to the current version. The test is over the decoded value, never over the runtime type and never over the JSON text (ADR 0093 decision 8).",
+    "malformed_evidence_contract": "The value is PRESENT but is not a finite integer by value (a fractional number, a non-finite number, a string, a boolean, null, a list, an object), or the token is PRESENT and the version is ABSENT. Every one of these is a producer type bug, not a contract skew (decisions 7 and 12).",
+    "unsupported_evidence_contract": "The value is PRESENT and is a finite integer, and it is not the current version. Never the nearest older parser, never a silent default (decisions 7 and 10)."
+  },
+  "export_scope_note": "The comparison EXPORT is one of the three consumers of this set, and it now agrees with the other two on EVERY case, the absent one included. ADR 0093 decision 12 superseded decision 9's absent-accepts half: the token and its version are minted together as an atomic pair (spec §2.1 rule 1), so an envelope naming fin.comparison with no schema_version is a producer type bug that every boundary refuses as malformed_evidence_contract and that no component infers, defaults, or back-fills. The export runner therefore asserts observed == expect uniformly across all 18 cases, with no documented exception and no divergence to state.",
+  "cases": [
+    {
+      "case": "version-int-current",
+      "schema_version": 1,
+      "expect": "accept",
+      "why": "accept clause: 1 is the current version as a plain integer — the base case the other eleven numeric shapes are read against."
+    },
+    {
+      "case": "version-float-integral-current",
+      "schema_version": 1.0,
+      "expect": "accept",
+      "why": "accept clause + decision 8: 1.0 carries no fractional part, so it IS the current version. THIS is the cross-language case: Python decodes this text to the float 1.0 and a JavaScript decoder to the integer 1, and the two ends must not answer differently about the same bytes. No consumer may refuse the spelling, and no case here may assert that it is refused."
+    },
+    {
+      "case": "version-int-next",
+      "schema_version": 2,
+      "expect": "unsupported_evidence_contract",
+      "why": "unsupported clause: a finite integer that is not the current version is a contract skew, never the nearest older parser."
+    },
+    {
+      "case": "version-float-integral-next",
+      "schema_version": 2.0,
+      "expect": "unsupported_evidence_contract",
+      "why": "unsupported clause + decision 8: 2.0 and 2 are the same value, so the float spelling must reach the SAME class as the integer one. This case is the second half of the cross-language equality claim — an end that special-cased 1.0 but not 2.0 would pass the accept case and still split the wire."
+    },
+    {
+      "case": "version-int-zero",
+      "schema_version": 0,
+      "expect": "unsupported_evidence_contract",
+      "why": "unsupported clause: 0 is a finite integer and is not the current version. It is a skew, not a malformed carrier — the type is right and only the number is old."
+    },
+    {
+      "case": "version-int-negative",
+      "schema_version": -1,
+      "expect": "unsupported_evidence_contract",
+      "why": "unsupported clause: a negative version is still a finite integer, so the type check passes and the comparison against the current version is what refuses it. A lower bound guard is not the rule and would change the class."
+    },
+    {
+      "case": "version-int-far-future",
+      "schema_version": 99,
+      "expect": "unsupported_evidence_contract",
+      "why": "unsupported clause: distance from the current version is irrelevant; a far-future integer is refused exactly as the next one is."
+    },
+    {
+      "case": "version-float-fractional",
+      "schema_version": 1.5,
+      "expect": "malformed_evidence_contract",
+      "why": "malformed clause: a fractional number has no integer value, so the carrier's version field has the wrong type. §6 reads 'unsupported' as a contract skew, and 1.5 is not one — it is a producer that emitted a number that is not a version."
+    },
+    {
+      "case": "version-nonfinite-nan",
+      "schema_version_nonfinite": "NaN",
+      "expect": "malformed_evidence_contract",
+      "why": "malformed clause: NaN has no integer value (and no JSON spelling, which is why it is tagged here). A value that cannot even be compared against the current version is a type bug, not a skew."
+    },
+    {
+      "case": "version-nonfinite-infinity",
+      "schema_version_nonfinite": "Infinity",
+      "expect": "malformed_evidence_contract",
+      "why": "malformed clause: infinity is not finite, so it is outside the rule on its first word. The whole rule is a FINITE-integer rule, and infinity is the case that proves the finiteness half is real and not merely implied by integrality."
+    },
+    {
+      "case": "version-nonfinite-negative-infinity",
+      "schema_version_nonfinite": "-Infinity",
+      "expect": "malformed_evidence_contract",
+      "why": "malformed clause: as case 10, and it is carried separately rather than folded in because a rule that tested the magnitude would answer differently on the two signs."
+    },
+    {
+      "case": "version-string-current",
+      "schema_version": "1",
+      "expect": "malformed_evidence_contract",
+      "why": "malformed clause: the number 1 spelled as a string is not the number 1. Refusing it as UNSUPPORTED would be the specific wrong answer — it would tell the producer to bump a version that is spelled correctly and typed wrongly."
+    },
+    {
+      "case": "version-bool-true",
+      "schema_version": true,
+      "expect": "malformed_evidence_contract",
+      "why": "malformed clause (decision 7): a JSON true is not a number. In Python a boolean is an int subclass and would otherwise pass as version 1; the rule excludes the type explicitly, and this case is what proves it was excluded rather than merely unused."
+    },
+    {
+      "case": "version-bool-false",
+      "schema_version": false,
+      "expect": "malformed_evidence_contract",
+      "why": "malformed clause: false would fail the equality against the current version as unsupported, so carrying it separately from true is what proves the boolean is refused for being a BOOLEAN and not for not equalling 1."
+    },
+    {
+      "case": "version-null",
+      "schema_version": null,
+      "expect": "malformed_evidence_contract",
+      "why": "malformed clause: an explicit null is a PRESENT value with no integer value. It is distinct from the absent case below, which is a missing key — §2.4 keeps missing and unusable apart."
+    },
+    {
+      "case": "version-empty-array",
+      "schema_version": [],
+      "expect": "malformed_evidence_contract",
+      "why": "malformed clause: a list where a version belongs. Carried as a case because 'the value is not a scalar' is a distinct failure from 'the scalar is the wrong scalar', and a validator that only rejected bad numbers would miss it."
+    },
+    {
+      "case": "version-empty-object",
+      "schema_version": {},
+      "expect": "malformed_evidence_contract",
+      "why": "malformed clause: an object where a version belongs — the other half of the non-scalar pair."
+    },
+    {
+      "case": "version-absent-with-token",
+      "schema_version_absent": true,
+      "expect": "malformed_evidence_contract",
+      "why": "malformed clause + decision 12: the token and its version are minted together, so a carrier that names the shape and omits the number is a producer type bug. No back-fill: inferring 1 would invent a contract fact the producer never stated, and the §7 legacy grace does not reach it because that grace is keyed on the ABSENCE of the token."
+    }
+  ]
+}

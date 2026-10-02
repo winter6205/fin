@@ -1,0 +1,15 @@
+{
+  "case": "zero-rows",
+  "direction": "producer",
+  "expect": "refuse",
+  "refusal_code": "sql_no_matching_rows",
+  "payload": {
+    "chunks": [],
+    "database_rows": {
+      "schema": "fin.evidence.retrieve_rows",
+      "schema_version": 1,
+      "result_count": 0,
+      "rows": []
+    }
+  }
+}

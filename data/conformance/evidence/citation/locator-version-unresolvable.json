@@ -1,0 +1,22 @@
+{
+  "case": "locator-version-unresolvable",
+  "direction": "consumer",
+  "expect": "refuse",
+  "refusal_code": "unknown_locator",
+  "payload": {
+    "evidence_schema": "fin.evidence.citation",
+    "schema_version": 1,
+    "citations": [
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "unit": 3,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      }
+    ]
+  }
+}

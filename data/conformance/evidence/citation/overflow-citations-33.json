@@ -1,0 +1,342 @@
+{
+  "case": "overflow-citations-33",
+  "direction": "consumer",
+  "expect": "refuse",
+  "refusal_code": "citation_overflow",
+  "payload": {
+    "evidence_schema": "fin.evidence.citation",
+    "schema_version": 1,
+    "citations": [
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 1,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 2,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 3,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 4,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 5,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 6,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 7,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 8,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 9,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 10,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 11,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 12,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 13,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 14,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 15,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 16,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 17,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 18,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 19,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 20,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 21,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 22,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 23,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 24,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 25,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 26,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 27,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 28,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 29,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 30,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 31,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 32,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      },
+      {
+        "kind": "company",
+        "document_id": "t1-expense-001",
+        "attachment_id": "",
+        "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+        "unit": 33,
+        "display": "page",
+        "filename": "travel-and-expense-policy.pdf",
+        "quote": "Employees must submit expense reports within thirty (30) days of the end of the travel period."
+      }
+    ]
+  }
+}

@@ -32,6 +32,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.host import ScriptedChatModel, compile_graph
+from fin.host.citation_gate import UNSUPPORTED_DATABASE_CLAIM
 from fin.host.run_payload import (
     ORDINARY_PERSON_COPY,
     _run_to_response_payload,
@@ -40,13 +41,18 @@ from fin.host.run_payload import (
 
 
 # Every ``status_reason`` a refusing terminal state can carry:
-# ``unknown_locator`` / ``citation_repair_cap`` from the citation
-# gate (``fin.host.citation_gate``) and ``numeric_gate_fail`` from
+# ``unknown_locator`` / ``citation_repair_cap`` /
+# ``unsupported_database_claim`` from the citation gate
+# (``fin.host.citation_gate``) and ``numeric_gate_fail`` from
 # the numeric gate (``fin.host.graph.citation_gate_node``).
 REFUSE_REASONS = (
     "unknown_locator",
     "citation_repair_cap",
     "numeric_gate_fail",
+    # ADR 0091: a figure no ledger row this round returned supports. Its
+    # own reason, and therefore its own copy — a blank one would report
+    # a terminal refusal as silence.
+    UNSUPPORTED_DATABASE_CLAIM,
 )
 
 

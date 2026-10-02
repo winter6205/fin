@@ -33,7 +33,7 @@ from typing import Any, Literal
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from langchain_core.messages import HumanMessage
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_serializer
 
 from fin.corpus.errors import IngestMissingError
 from fin.host.attachment_budgets import AttachmentBudgets, from_environ
@@ -90,6 +90,12 @@ class CitationSchema(BaseModel):
     safe display name. ``display`` says how ``unit`` is presented
     (``"page"`` for a physical PDF unit). ``quote`` is the ≥32-char
     substring the gate matched.
+
+    A ``database-row`` citation sets NEITHER document id and carries its
+    retained snapshot on ``database_row``, so a caller of this
+    non-streaming door can read the same snapshot the SSE door and the
+    turn table show — and so opening it never means re-querying the
+    ledger (ADR 0091, spec 8.1).
     """
 
     # ``kind`` / ``display`` carry no default: an incomplete row must fail
@@ -103,6 +109,24 @@ class CitationSchema(BaseModel):
     display: str
     filename: str = ""
     quote: str
+    # The retained snapshot a ledger citation opens; ``None`` for the two
+    # document kinds.
+    database_row: dict[str, Any] | None = None
+
+    # ONE mechanism for the omit-null rule. FastAPI (and any caller that
+    # asks for JSON) encodes this model through the model layer, which is
+    # exactly where a ``@model_serializer`` fires — including for a nested
+    # list inside ``AskResponse``, so the enclosing response needs no rule
+    # of its own. The snapshot key belongs to a ledger row; emitting
+    # ``"database_row": null`` on a document citation would change the
+    # body every existing caller of ``/ask`` sees, so the key is ABSENT
+    # rather than null — byte-identical to the gate's own wire dict.
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: Any) -> Any:
+        out = handler(self)
+        if isinstance(out, dict) and out.get("database_row") is None:
+            out.pop("database_row", None)
+        return out
 
 
 class AskResponse(BaseModel):
@@ -533,7 +557,7 @@ def ask(
         ],
         thread_id=thread_id,
         reason=payload["reason"] or None,
-        visual_claims=_visual_claims_wire_payload(raw.get("visual_claims")),
+        visual_claims=_visual_claims_wire_payload(raw.get("visual_claims"))[0],
     )
 
 

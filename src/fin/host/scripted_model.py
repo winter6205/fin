@@ -24,11 +24,13 @@ PDF extraction, no corpus code.
 
 from __future__ import annotations
 
-from typing import Any, Iterator
+from collections.abc import Callable, Sequence
+from typing import Any, Iterator, cast
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.tools import BaseTool
 from pydantic import Field
 
 
@@ -85,7 +87,7 @@ class ScriptedChatModel(BaseChatModel):
 
     def bind_tools(
         self,
-        tools: list[Any],
+        tools: Sequence[dict[str, Any] | type | Callable[..., Any] | BaseTool],
         **kwargs: Any,
     ) -> "ScriptedChatModel":
         """Record the bound tools and return ``self``.
@@ -193,10 +195,11 @@ class ScriptedChatModel(BaseChatModel):
                 messages, stop=stop, run_manager=run_manager, **kwargs
             )
             for generation in result.generations:
+                message = cast(AIMessage, generation.message)
                 chunk = AIMessageChunk(
-                    content=generation.message.content,
-                    tool_calls=list(generation.message.tool_calls),
-                    additional_kwargs=dict(generation.message.additional_kwargs),
+                    content=message.content,
+                    tool_calls=list(message.tool_calls),
+                    additional_kwargs=dict(message.additional_kwargs),
                 )
                 yield ChatGenerationChunk(message=chunk)
             return
@@ -233,10 +236,11 @@ class ScriptedChatModel(BaseChatModel):
                 messages, stop=stop, run_manager=run_manager, **kwargs
             )
             for generation in result.generations:
+                message = cast(AIMessage, generation.message)
                 chunk = AIMessageChunk(
-                    content=generation.message.content,
-                    tool_calls=list(generation.message.tool_calls),
-                    additional_kwargs=dict(generation.message.additional_kwargs),
+                    content=message.content,
+                    tool_calls=list(message.tool_calls),
+                    additional_kwargs=dict(message.additional_kwargs),
                 )
                 yield ChatGenerationChunk(message=chunk)
             return

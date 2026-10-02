@@ -8,14 +8,15 @@ port-level half lives in ``tests/retrieve/test_fake_port.py`` and
 the **named-exit path** half:
 
 * concurrent: the 409 ``concurrent_run`` guard is orthogonal to the 档
-  selector — an open 档 (``graph`` or the newly opened ``global``) does
-  not bypass it, and the one plan slot still refused at routing (``sql``)
-  is named BEFORE the probe (a retry of the in-flight run would not
-  answer a 「真库未接」 request).
+  selector — no open 档 (``graph`` / ``global`` / and ``sql`` since #322
+  T7 opened it) bypasses it; the routing-time 400 that once pre-empted
+  the probe for an unopened plan slot has ZERO producers (the
+  ``TIER_UNAVAILABLE_CODE`` table is empty), so every closed-set pin now
+  meets the lock exactly like a tier-less send.
 * exception: the knowledge-MCP gate's 409 ``knowledge_mcp_fault``
-  applies to an open-tier send exactly as to a tier-less one, and the
-  routing-time 400 still wins over it — the unopened 档's named refusal
-  is not a transport fact, so it reads the same whether MCP is up or down.
+  applies to an open-tier send exactly as to a tier-less one — including
+  ``sql``: the 档 is no longer named by a routing 400 ahead of the gate,
+  it reaches the transport-fault decision like everyone else.
 * negative: ``community_summary_index_failure`` (T1's token) rides the
   run payload with its OWN ordinary-person copy and is never invented
   by fin's retrieve-side decision from an empty or failed retrieve.
@@ -166,16 +167,17 @@ def test_an_open_tier_send_still_meets_the_concurrent_run_409(
 
 
 @pytest.mark.parametrize("tier", ["sql"])
-def test_an_unopened_tier_is_named_before_the_concurrent_run_409(
+def test_the_opened_sql_tier_meets_the_concurrent_run_409(
     tier: str, client: TestClient, store, locked_graph
 ) -> None:
-    """Exit ORDER on the concurrency seam: the routing-time 400 naming the
-    plan slot fires BEFORE the lock probe — telling the operator to wait
-    for the in-flight run would be wrong advice for a 档 this product has
-    not opened, and retrying after the run ends answers the same 400.
-    ``sql`` (真数据库) is the plan slot left standing once 综述 was opened;
-    it takes that named exit exactly as the retired letter once did, and
-    starts no run."""
+    """Exit ORDER on the concurrency seam, restated for the opened 档
+    (#322 T7, commit 6e8ed97): the routing-time 400 that once pre-empted
+    the lock probe for a plan slot has no producer left, so a ``sql``
+    send with a run in flight now meets the SAME plain-JSON 409
+    ``concurrent_run`` as graph/global — it clears the (empty) routing
+    gate and starts no run. The ordering that survives is the schema
+    gate BEFORE the probe: an out-of-set selector is still a 422 on a
+    locked thread, never a 409 and never a run."""
     thread_id = store.create_thread(title="existing").id
 
     r = client.post(
@@ -183,8 +185,18 @@ def test_an_unopened_tier_is_named_before_the_concurrent_run_409(
         json={"question": "q", "tiers": [tier]},
     )
 
-    assert r.status_code == 400, r.text
-    assert r.json() == {"error": REAL_DB_NOT_WIRED}
+    assert r.status_code == 409, r.text
+    assert r.headers["content-type"].startswith("application/json")
+    assert r.json() == {"error": "concurrent_run"}
+
+    # Order preserved ahead of the probe: bad input is still named first,
+    # and a refused send starts no run (``_LockedGraph.invoke`` would
+    # raise on any leak).
+    bad = client.post(
+        f"/api/threads/{thread_id}/messages",
+        json={"question": "q", "tiers": ["Z"]},
+    )
+    assert bad.status_code == 422, bad.text
 
 
 # ----- exception: 409 ``knowledge_mcp_fault`` × 档 selector -----
@@ -216,13 +228,15 @@ def test_the_mcp_fault_gate_409_applies_to_an_open_tier_send(
     }
 
 
-def test_an_unopened_tier_is_named_before_the_mcp_fault_gate(
+def test_the_opened_sql_tier_meets_the_mcp_fault_gate(
     client: TestClient, store, graph, mcp_env
 ) -> None:
-    """The unopened 档's named refusal is not a transport fact: the 400
-    wins over the closed gate, so an operator with MCP down and a
-    ``sql`` (真数据库) pin gets the SAME answer as with MCP up — never a
-    retry-them advice token."""
+    """Flipped by #322 T7 (commit 6e8ed97): the old pin asserted a 400
+    ``real_db_not_wired`` WINNING over the closed gate. The routing-time
+    refusal has no producer now, so a ``sql`` pin with MCP down gets the
+    SAME 409 ``knowledge_mcp_fault`` as an open-tier graph/global send —
+    the 档 clears routing and meets the transport fact, exactly like the
+    other open 档 (mirrors the graph/global case above)."""
     thread_id = store.create_thread(title="existing").id
     publish_knowledge_mcp_state(KNOWLEDGE_MCP_FAULT)
 
@@ -231,8 +245,11 @@ def test_an_unopened_tier_is_named_before_the_mcp_fault_gate(
         json={"question": "q", "tiers": ["sql"]},
     )
 
-    assert r.status_code == 400, r.text
-    assert r.json() == {"error": REAL_DB_NOT_WIRED}
+    assert r.status_code == 409, r.text
+    assert r.json() == {
+        "error": KNOWLEDGE_MCP_FAULT_ERROR,
+        "message": KNOWLEDGE_MCP_FAULT_MESSAGE,
+    }
 
 
 # ----- negative: the 综述-not-ready token on the run payload -----

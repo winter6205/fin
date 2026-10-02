@@ -73,10 +73,47 @@ durable-byte leg additionally skips when ``FIN_OBJECT_STORE_URL`` /
 the mark already requires a deliberate opt-in, a skip here names a missing
 prerequisite rather than standing as a green pass; the validation record logs
 it as blocked evidence when it happens.
+
+How this run is isolated from everyone else's rows
+--------------------------------------------------
+The operator-supplied database and bucket MAY be shared, non-disposable, and
+outlive any one run, so "clean" cannot mean "the next process sees an empty
+world" — and the acceptance runs for this module additionally minted a per-run
+disposable database and bucket on a session-owned container. Either way the
+isolation below cannot rely on an empty world, because every child's boot
+runs ``service.recover()``, and that sweep has no ownership
+predicate of its own: ``jobs.requeue_running()`` re-adopts every ``running``
+row in the database and ``store.incomplete()`` prepares every ``parsing`` row
+in it, and the auto-resumer walks ``store.list_threads()`` in full. A process
+that is deliberately NOT executing (this module's ``workers=False`` posture)
+still performed the global sweep at construction, so residue from a prior
+partial run — or a sibling opt-in module, or an orphaned child left by either
+— was requeued and claimed out from under the run under test.
+
+So the isolation lives in the DSN. ``postgres_url`` yields the operator's
+URL with ``search_path`` pinned to a schema minted for THIS module run and
+dropped at teardown, and every probe, cleanup statement, and child's
+``FIN_CHECKPOINT_URL`` resolves unqualified table names through it. Nothing
+in the product is reconfigured or stubbed to get there: the sweep, the
+claim, the resume, and the doors are the shipped ones, pointed at a namespace
+that contains only the rows this run minted. A sibling module keeps the
+default ``search_path`` and a prior run's schema is dropped before the next
+one starts, so neither can reach into this run's work.
+
+Isolation never depends on bucket exclusivity, so the object store may stay
+shared (acceptance runs additionally used per-run disposable buckets). Its keys
+are are
+``thread-attachments/{thread_id}/{attachment_id}`` over server-minted uuid4
+ids, and every read is addressed by an ``object_key`` that came out of a row
+in this run's schema, so a foreign or abandoned key is unreachable rather
+than contended: no code path enumerates the bucket. Per-test ``$HOME`` (and
+so the ``$HOME/.fin/default`` workspace root) is separate and disposable;
+the hygiene case proves it is gone.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -90,6 +127,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -133,6 +171,24 @@ JOB_TABLE = "fin_thread_attachment_job"
 #: itself, the startup drain, and the singleton guard are the shipped ones.
 CHILD_SWEEP_INTERVAL_S = "2.0"
 
+#: A restart landing a resume in a fresh process does real work twice over:
+#: each child boots the real composition root, the prep drain's own prepare
+#: runs a page-extraction pass, and the resumed remainder then walks the real
+#: graph to a citation-gate-passing answer. Measured after the isolation
+#: fixes below, the slowest case in this module settles in 8.9s and the whole
+#: module in 34-41s across three consecutive runs, so 120s was already 13x
+#: the observed worst case; 60s keeps that margin on a loaded host without
+#: letting a genuinely stuck resume sit for minutes. Budget only — the
+#: isolation fixes are what make a run succeed at all.
+RESUME_DEADLINE_S = 60.0
+
+#: ``uvicorn``'s own boot-to-first-answer budget, sized the same way.
+SERVER_BOOT_DEADLINE_S = 60.0
+
+#: Prefix of the Postgres schema this run owns. Lower-case and unquoted-safe,
+#: so the name can never need a case-folding or quoting rule to resolve.
+_SCHEMA_PREFIX = "fin_t2f_gate_"
+
 BOUND_KEYS = tuple(key for key, _ in _PRODUCT_ENV_BOUNDS)
 
 pytestmark = pytest.mark.mcp
@@ -153,15 +209,73 @@ def deployed_bounds() -> dict[str, str]:
 
 
 @pytest.fixture(scope="module")
-def postgres_url() -> str:
-    """The live DSN, or the repo's named skip."""
+def postgres_url() -> Iterator[str]:
+    """The live DSN, narrowed to a schema this module owns, or the named skip.
+
+    The narrowing is the run's isolation boundary. ``service.recover()`` runs
+    in every child and has no ownership predicate — ``requeue_running()``
+    touches every ``running`` job row in the database and
+    ``store.incomplete()`` prepares every ``parsing`` attachment row in it —
+    so on the shared database a child this module starts would adopt and
+    execute rows belonging to a prior partial run, a sibling opt-in module,
+    or an orphaned child. Pinning ``search_path`` to a schema minted here
+    makes every unqualified statement the product issues land in a namespace
+    that holds only what this run minted, with no change to the product and
+    no stubbed sweep. The schema is dropped at teardown, so the next run
+    starts clean and a crash leaves an inert namespace rather than live work
+    for somebody else's boot to claim.
+    """
     url = (os.environ.get("FIN_CHECKPOINT_URL") or "").strip()
     if not url:
         pytest.skip(
             "FIN_CHECKPOINT_URL is not set; this module is the real-storage "
             "evidence and cannot run against an in-memory stand-in"
         )
-    return url
+    import psycopg
+
+    schema = f"{_SCHEMA_PREFIX}{uuid.uuid4().hex[:12]}"
+    with psycopg.connect(url, autocommit=True) as conn:
+        conn.execute(f'CREATE SCHEMA "{schema}"')
+    scoped = _scoped_url(url, schema)
+    # WHY: PostgresAttachmentStore creates its own tables with
+    # CREATE TABLE IF NOT EXISTS but references fin_thread without creating
+    # it, and raises AttachmentStoreError when that table is absent. On the
+    # shared database fin_thread already exists from an earlier run, so the
+    # dependency is satisfied by accident; a schema minted here starts empty
+    # and every child would fail to boot. PostgresThreadStore's constructor
+    # runs its own idempotent schema DDL, which restores the ordering the
+    # product documents, inside this run's namespace only.
+    from fin.host.thread_store import PostgresThreadStore
+
+    PostgresThreadStore(scoped)
+    try:
+        yield scoped
+    finally:
+        # WHY CASCADE: the children create their own tables inside this
+        # schema, and a dropped namespace must take the whole run's rows
+        # with it even when a test failed before its own cleanup ran.
+        # WHY suppressed: a schema this run can no longer reach (the DSN
+        # rotated, the database went away) is not a second failure worth
+        # replacing the run's result with — the cases already reported.
+        with contextlib.suppress(psycopg.Error), psycopg.connect(
+            url, autocommit=True
+        ) as conn:
+            conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+def _scoped_url(url: str, schema: str) -> str:
+    """The operator's DSN with ``search_path`` pinned to ``schema``.
+
+    Built through psycopg's own conninfo round trip so the operator's
+    password-bearing DSN is re-encoded by the library rather than by string
+    surgery here, and so an ``options`` the operator already set is replaced
+    rather than appended to (two ``-c`` flags would take the last one).
+    """
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    params = conninfo_to_dict(url)
+    params["options"] = f"-c search_path={schema}"
+    return make_conninfo(**params)
 
 
 @pytest.fixture
@@ -178,16 +292,22 @@ def durable_object_store() -> None:
     )
 
 
-@pytest.fixture(scope="module")
-def live_home() -> Iterator[Path]:
-    """A private ``$HOME`` for every child process.
+@pytest.fixture
+def live_home(registry: dict[str, list[Any]]) -> Iterator[Path]:
+    """A private ``$HOME`` per test, for every child that test starts.
 
     The workspace-root dependency resolves ``$HOME/.fin/default`` at request
     time, which is the production code path; pointing it at a throwaway
     directory keeps the real home untouched and still lets a send and a
-    restart resolve the SAME root.
+    restart resolve the SAME root — within one test. Scoping it to the test
+    rather than the module is what stops two cases from sharing one on-disk
+    workspace root and one case's artifacts from reaching the next case's
+    resumed run, and it is what makes the "no state left behind" claim
+    checkable: the directory this test used is deleted at teardown, so the
+    hygiene case can assert it is gone rather than merely empty.
     """
     root = Path(tempfile.mkdtemp(prefix="fin-t2f-gate-home-"))
+    registry["homes"].append(root)
     try:
         yield root
     finally:
@@ -196,8 +316,9 @@ def live_home() -> Iterator[Path]:
 
 @pytest.fixture(scope="module")
 def registry() -> dict[str, list[Any]]:
-    """Every id and child process this module created, for the hygiene case."""
-    return {"threads": [], "attachments": [], "children": []}
+    """Every id, home, and child process this module created, for the
+    hygiene case."""
+    return {"threads": [], "attachments": [], "children": [], "homes": []}
 
 
 class _Owned:
@@ -516,11 +637,15 @@ class _ScriptedModelServer:
                 self.end_headers()
                 self.wfile.write(raw)
 
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
-        self.port = port
-        self._server = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
+        # WHY port 0 and no probe socket: asking the OS for port 0 and
+        # reading back the port it actually assigned means the listening
+        # socket never stops existing, so nothing can take the port between
+        # the number being known and the server being bound. A probe that
+        # bound port 0, read the number, closed, and then let the real server
+        # rebind left a window in which any other process could win, and the
+        # collision surfaced as a failed case rather than a retry.
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.port = int(self._server.server_address[1])
         self._thread = threading.Thread(
             target=self._server.serve_forever, daemon=True
         )
@@ -624,6 +749,16 @@ SWEEP_INTERVAL_S = float(os.environ.get("FIN_LIVE_SWEEP_INTERVAL_S", "2.0"))
 # in this process will ever run or resume it. That is the half of the ticket
 # that says the work is durable, so the harness needs a server that is real
 # but deliberately un-executing.
+#
+# WHY the absent workers are now a real posture and not a fiction: the sweep
+# below is NOT conditional on this flag — ``recover()`` runs inside
+# ``default_attachment_service()``, so an un-executing child still requeues
+# every ``running`` job row and prepares every ``parsing`` attachment row it
+# can see. What makes the posture hold is that CHECKPOINT_URL below resolves
+# unqualified table names through a ``search_path`` pinned to the schema this
+# run minted, so the sweep can only ever reach this run's own rows. A
+# deliberate no-worker child therefore reclaims only work this run left
+# running, which is exactly what a crashed predecessor's boot would do.
 WORKERS = os.environ.get("FIN_LIVE_ATTACHMENT_WORKERS") == "1"
 
 # One attachment service for the whole process, the way serve() wires it: the
@@ -674,12 +809,7 @@ if WORKERS:
         check_interval_seconds=SWEEP_INTERVAL_S,
     )
 
-uvicorn.run(
-    http_module.app,
-    host="127.0.0.1",
-    port=int(sys.argv[1]),
-    log_level="warning",
-)
+uvicorn.run(http_module.app, fd=int(sys.argv[1]), log_level="warning")
 """
 
 _READBACK_CHILD_SOURCE = """
@@ -908,18 +1038,33 @@ def _start_live_server(
     environ["FIN_LIVE_SWEEP_INTERVAL_S"] = CHILD_SWEEP_INTERVAL_S
     environ["FIN_LIVE_ATTACHMENT_WORKERS"] = "1" if workers else "0"
 
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
+    # WHY the listener is bound HERE and handed over as an fd: the socket
+    # that owns the port is the one the child serves on, so the port cannot
+    # be taken between learning it and binding it. Reserving with a probe
+    # socket and closing it first (the old shape) left that window open, and a
+    # collision inside it killed the child at startup and surfaced as a case
+    # failure. A bounded retry is unnecessary when the reservation IS the
+    # server, so there is nothing to retry and no half-started child to reap.
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(128)
+        listener.set_inheritable(True)
+        port = int(listener.getsockname()[1])
+        process = subprocess.Popen(
+            [sys.executable, "-c", _CHILD_SOURCE, str(listener.fileno())],
+            cwd=str(REPO_ROOT),
+            env=environ,
+            pass_fds=(listener.fileno(),),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    finally:
+        # The child holds the only copy now. Dropping this one is what lets
+        # the port be released the moment the child dies.
+        listener.close()
 
-    process = subprocess.Popen(
-        [sys.executable, "-c", _CHILD_SOURCE, str(port)],
-        cwd=str(REPO_ROOT),
-        env=environ,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
     server = _LiveServer(port, process)
     server._redaction = (postgres_url, "<FIN_CHECKPOINT_URL>")
     registry["children"].append(process)
@@ -933,7 +1078,7 @@ def _start_live_server(
 
 def _wait_for_server(server: _LiveServer) -> None:
     """Block until the child answers, or fail with the child's own output."""
-    deadline = time.monotonic() + 180
+    deadline = time.monotonic() + SERVER_BOOT_DEADLINE_S
     while time.monotonic() < deadline:
         if server.process.poll() is not None:
             tail = server.process.stdout.read() if server.process.stdout else ""
@@ -993,7 +1138,8 @@ def _cleanup_live(
     survives a raw thread delete by design.
 
     Servers are stopped last, and only after the sweep, so a failure inside the
-    cleanup never leaves an orphaned uvicorn child behind.
+    cleanup never leaves an orphaned uvicorn child behind — and only PIDs this
+    test started are ever signalled.
     """
     threads = list(owned.threads)
     failures: list[str] = []
@@ -1057,6 +1203,79 @@ def _cleanup_live(
             f"live-test cleanup left {len(failures)} problem(s): "
             + "; ".join(failures[:10])
         )
+
+
+class _LiveCase:
+    """One live case's owned servers, started through one recorded path.
+
+    Registration is the point: a case names the child it wants with
+    ``start()`` and the case owns every PID it ever started, so teardown has a
+    complete list without any test having to remember to append to it. A
+    child that fails to boot is already recorded before the wait, so a boot
+    failure is still reaped.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        owned: _Owned,
+        *,
+        deployed_bounds: dict[str, str],
+        model_base_url: str,
+        live_home: Path,
+        registry: dict[str, list[Any]],
+    ) -> None:
+        self._url = url
+        self._deployed_bounds = deployed_bounds
+        self._model_base_url = model_base_url
+        self._live_home = live_home
+        self._registry = registry
+        self.owned = owned
+        self.servers: list[_LiveServer | None] = []
+
+    def start(self, *, workers: bool) -> _LiveServer:
+        server = _start_live_server(
+            self._url,
+            self._deployed_bounds,
+            model_base_url=self._model_base_url,
+            workers=workers,
+            live_home=self._live_home,
+            registry=self._registry,
+        )
+        self.servers.append(server)
+        return server
+
+
+@contextlib.contextmanager
+def _live_case(case: _LiveCase) -> Iterator[_LiveCase]:
+    """Run one live case, then clean up without ever masking its failure.
+
+    Cleanup used to be a bare ``finally: _cleanup_live(...)``, so a cleanup
+    problem raised out of the ``finally`` and REPLACED the traceback of the
+    assertion that actually failed. On a suite whose failures are timing
+    races, that inversion is the difference between a diagnosable report and
+    an unrelated-looking one: the case that failed on a resume deadline
+    reported as a cleanup complaint. So a cleanup problem is only raised when
+    the case itself passed; when the case failed, it is attached to that
+    failure as a note and the original traceback is what the report shows.
+    """
+    try:
+        yield case
+    except BaseException as failure:  # noqa: BLE001 - re-raised below
+        _cleanup_for_exit(case, failure)
+        raise
+    _cleanup_for_exit(case, None)
+
+
+def _cleanup_for_exit(
+    case: _LiveCase, failure: BaseException | None
+) -> None:
+    try:
+        _cleanup_live(case._url, case.owned, *case.servers)
+    except BaseException as cleanup:  # noqa: BLE001 - reported, never replaces
+        if failure is None:
+            raise cleanup
+        failure.add_note(f"live-test cleanup also failed: {cleanup}")
 
 
 def _sha(payload: bytes) -> str:
@@ -1141,20 +1360,18 @@ def test_a_run_suspended_on_the_gate_completes_under_a_fresh_process(
     ``ready`` and searchable, and the job row is ``succeeded``.
     """
     payload = _text_payload()
-    owned = _Owned(registry)
-    sender: _LiveServer | None = None
-    finisher: _LiveServer | None = None
-    try:
-        sender = _start_live_server(
-            postgres_url,
-            deployed_bounds,
-            model_base_url=scripted_model.base_url,
-            workers=False,
-            live_home=live_home,
-            registry=registry,
-        )
+    case = _LiveCase(
+        postgres_url,
+        _Owned(registry),
+        deployed_bounds=deployed_bounds,
+        model_base_url=scripted_model.base_url,
+        live_home=live_home,
+        registry=registry,
+    )
+    with _live_case(case):
+        sender = case.start(workers=False)
         thread_id, attachment_id, run_id, frames = _mint_send_and_pause(
-            sender, owned, payload=payload, filename="gate-note.md"
+            sender, case.owned, payload=payload, filename="gate-note.md"
         )
         assert frames[-1][1]["run_id"] == run_id, frames
         # A paused run is not a finished turn: the send route persists nothing.
@@ -1186,20 +1403,14 @@ def test_a_run_suspended_on_the_gate_completes_under_a_fresh_process(
             "the killed sender left no turn row behind"
         )
 
-        finisher = _start_live_server(
-            postgres_url,
-            deployed_bounds,
-            model_base_url=scripted_model.base_url,
-            workers=True,
-            live_home=live_home,
-            registry=registry,
-        )
+        finisher = case.start(workers=True)
 
         turn = _wait_until(
             lambda: _run_row(postgres_url, run_id),
             lambda current: current is not None,
             what="the restarted boot drain + auto-resumer never produced the "
                  "turn row for the run id the gate minted",
+            timeout_s=RESUME_DEADLINE_S,
         )
         assert turn["thread_id"] == thread_id, turn
         assert turn["status"] == "done", (
@@ -1225,6 +1436,7 @@ def test_a_run_suspended_on_the_gate_completes_under_a_fresh_process(
             lambda: _attachment_row(postgres_url, attachment_id),
             lambda current: current is not None and current["status"] == "ready",
             what="the attachment never became ready",
+            timeout_s=RESUME_DEADLINE_S,
         )
         assert row["indexed"] is True, row
         assert int(row["unit_count"]) > 0, row
@@ -1237,6 +1449,7 @@ def test_a_run_suspended_on_the_gate_completes_under_a_fresh_process(
             lambda current: len(current) == 1
             and current[0]["state"] == "succeeded",
             what="the durable job never settled as exactly one 'succeeded' row",
+            timeout_s=RESUME_DEADLINE_S,
         )
         assert jobs[0]["failure_reason"] is None, jobs[0]
 
@@ -1253,8 +1466,6 @@ def test_a_run_suspended_on_the_gate_completes_under_a_fresh_process(
         assert turns[0]["status"] == "done", turns[0]
         assert turns[0]["answer"].strip(), turns[0]
         assert turns[0]["in_flight"] is False, turns[0]
-    finally:
-        _cleanup_live(postgres_url, owned, sender, finisher)
 
 
 # =========================================================================
@@ -1281,19 +1492,18 @@ def test_the_uploaded_bytes_are_whole_in_the_real_object_store_after_the_sender_
     """
     payload = _text_payload()
     expected_sha256 = _sha(payload)
-    owned = _Owned(registry)
-    server: _LiveServer | None = None
-    try:
-        server = _start_live_server(
-            postgres_url,
-            deployed_bounds,
-            model_base_url=scripted_model.base_url,
-            workers=False,
-            live_home=live_home,
-            registry=registry,
-        )
+    case = _LiveCase(
+        postgres_url,
+        _Owned(registry),
+        deployed_bounds=deployed_bounds,
+        model_base_url=scripted_model.base_url,
+        live_home=live_home,
+        registry=registry,
+    )
+    with _live_case(case):
+        server = case.start(workers=False)
         thread_id, attachment_id, run_id, _frames = _mint_send_and_pause(
-            server, owned, payload=payload, filename="bytes-leg.md"
+            server, case.owned, payload=payload, filename="bytes-leg.md"
         )
         row = _attachment_row(postgres_url, attachment_id)
         assert row is not None and row["status"] == "parsing", row
@@ -1302,7 +1512,6 @@ def test_the_uploaded_bytes_are_whole_in_the_real_object_store_after_the_sender_
         assert object_key == f"thread-attachments/{thread_id}/{attachment_id}", row
 
         server.stop()
-        server = None
 
         completed = subprocess.run(
             [
@@ -1331,8 +1540,6 @@ def test_the_uploaded_bytes_are_whole_in_the_real_object_store_after_the_sender_
             "size_bytes": len(payload),
             "sha256": expected_sha256,
         }, result
-    finally:
-        _cleanup_live(postgres_url, owned, server)
 
 
 # =========================================================================
@@ -1355,19 +1562,18 @@ def test_bytes_that_cannot_be_read_land_as_a_named_refusal_turn(
     typed refusal becomes the turn row, carrying the job's own reason code.
     """
     payload = _binary_payload()
-    owned = _Owned(registry)
-    server: _LiveServer | None = None
-    try:
-        server = _start_live_server(
-            postgres_url,
-            deployed_bounds,
-            model_base_url=scripted_model.base_url,
-            workers=True,
-            live_home=live_home,
-            registry=registry,
-        )
+    case = _LiveCase(
+        postgres_url,
+        _Owned(registry),
+        deployed_bounds=deployed_bounds,
+        model_base_url=scripted_model.base_url,
+        live_home=live_home,
+        registry=registry,
+    )
+    with _live_case(case):
+        server = case.start(workers=True)
         thread_id, attachment_id, run_id, frames = _mint_send_and_pause(
-            server, owned, payload=payload, filename="chart-not-text.txt"
+            server, case.owned, payload=payload, filename="chart-not-text.txt"
         )
         assert len(frames) >= 1, frames
 
@@ -1376,6 +1582,7 @@ def test_bytes_that_cannot_be_read_land_as_a_named_refusal_turn(
             lambda current: len(current) == 1
             and current[0]["state"] in ("failed", "succeeded"),
             what="the boot drain never finished the unreadable attachment's job",
+            timeout_s=RESUME_DEADLINE_S,
         )
         assert jobs[0]["state"] == "failed", jobs[0]
         assert jobs[0]["failure_reason"] == ATTACHMENT_NOT_TEXT, jobs[0]
@@ -1384,6 +1591,7 @@ def test_bytes_that_cannot_be_read_land_as_a_named_refusal_turn(
             lambda: _run_row(postgres_url, run_id),
             lambda current: current is not None,
             what="the settled failure never reached a turn row",
+            timeout_s=RESUME_DEADLINE_S,
         )
         assert turn["status"] == "refuse", (
             turn["status"],
@@ -1408,8 +1616,6 @@ def test_bytes_that_cannot_be_read_land_as_a_named_refusal_turn(
             for entry in _run_rows_for_thread(postgres_url, thread_id)
             if entry["status"] == "done"
         ], thread_id
-    finally:
-        _cleanup_live(postgres_url, owned, server)
 
 
 # =========================================================================
@@ -1434,20 +1640,18 @@ def test_a_deleted_attachment_can_never_publish_late_to_its_paused_run(
     ``unknown_locator`` refusal rather than an answer built on deleted bytes.
     """
     payload = _text_payload()
-    owned = _Owned(registry)
-    deleter: _LiveServer | None = None
-    finisher: _LiveServer | None = None
-    try:
-        deleter = _start_live_server(
-            postgres_url,
-            deployed_bounds,
-            model_base_url=scripted_model.base_url,
-            workers=False,
-            live_home=live_home,
-            registry=registry,
-        )
+    case = _LiveCase(
+        postgres_url,
+        _Owned(registry),
+        deployed_bounds=deployed_bounds,
+        model_base_url=scripted_model.base_url,
+        live_home=live_home,
+        registry=registry,
+    )
+    with _live_case(case):
+        deleter = case.start(workers=False)
         thread_id, attachment_id, run_id, _frames = _mint_send_and_pause(
-            deleter, owned, payload=payload, filename="tombstone-leg.md"
+            deleter, case.owned, payload=payload, filename="tombstone-leg.md"
         )
         assert len(_job_rows(postgres_url, attachment_id)) == 1, (
             "the pause queued no durable work to void"
@@ -1480,20 +1684,13 @@ def test_a_deleted_attachment_can_never_publish_late_to_its_paused_run(
         assert _job_rows(postgres_url, attachment_id) == []
 
         deleter.stop()
-        deleter = None
 
-        finisher = _start_live_server(
-            postgres_url,
-            deployed_bounds,
-            model_base_url=scripted_model.base_url,
-            workers=True,
-            live_home=live_home,
-            registry=registry,
-        )
+        finisher = case.start(workers=True)
         turn = _wait_until(
             lambda: _run_row(postgres_url, run_id),
             lambda current: current is not None,
             what="the restart never drove the paused run to its typed absence",
+            timeout_s=RESUME_DEADLINE_S,
         )
         assert turn["status"] == "refuse", (
             turn["status"],
@@ -1510,8 +1707,6 @@ def test_a_deleted_attachment_can_never_publish_late_to_its_paused_run(
         assert _attachment_row(postgres_url, attachment_id) is None
         assert _job_rows(postgres_url, attachment_id) == []
         assert _derived_counts(postgres_url, attachment_id) == (0, 0)
-    finally:
-        _cleanup_live(postgres_url, owned, deleter, finisher)
 
 
 # =========================================================================
@@ -1536,17 +1731,17 @@ def test_two_parallel_retry_doors_join_one_durable_job(
     import concurrent.futures
 
     payload = _text_payload()
-    owned = _Owned(registry)
-    server: _LiveServer | None = None
-    try:
-        server = _start_live_server(
-            postgres_url,
-            deployed_bounds,
-            model_base_url=scripted_model.base_url,
-            workers=False,
-            live_home=live_home,
-            registry=registry,
-        )
+    case = _LiveCase(
+        postgres_url,
+        _Owned(registry),
+        deployed_bounds=deployed_bounds,
+        model_base_url=scripted_model.base_url,
+        live_home=live_home,
+        registry=registry,
+    )
+    with _live_case(case):
+        server = case.start(workers=False)
+        owned = case.owned
         thread_id = owned.thread(server.create_thread())
         status, uploaded = server.attach(thread_id, payload, "one-job.md")
         assert status == 200, (status, uploaded)
@@ -1577,10 +1772,6 @@ def test_two_parallel_retry_doors_join_one_durable_job(
         # A third, sequential trigger joins the same row rather than minting one.
         assert server.retry(thread_id, attachment_id)[0] == 200
         assert len(_job_rows(postgres_url, attachment_id)) == 1, jobs
-    finally:
-        if server is not None:
-            server.stop()
-        _cleanup_live(postgres_url, owned, server)
 
 
 # =========================================================================
@@ -1597,9 +1788,15 @@ def test_module_leaves_no_live_state_behind(
     A real-storage suite that leaves a paused checkpoint behind hands the next
     boot's auto-resumer someone else's work to drive, and that is precisely the
     sweep this module claims to have exercised.
+
+    The filesystem is in scope for the same reason. Every child resolved its
+    ``$HOME/.fin/default`` workspace root from the home this module minted, so
+    a directory left under one of them is exactly the kind of residue that
+    survives the database sweep and reaches the next case.
     """
     threads = list(registry["threads"])
     attachments = list(registry["attachments"])
+    homes = list(registry["homes"])
     assert threads, "the registry lost the threads this module created"
 
     assert _thread_count(postgres_url, threads) == 0, threads
@@ -1623,9 +1820,28 @@ def test_module_leaves_no_live_state_behind(
     assert _checkpoint_count(postgres_url, threads) == 0, threads
     assert _object_keys(postgres_url, threads) == [], threads
 
-    still_alive = [
-        process.pid for process in registry["children"] if process.poll() is None
-    ]
+    assert homes, "the module recorded no home to check for residue"
+    assert [path for path in homes if path.exists()] == [], (
+        "workspace homes left on disk: "
+        f"{[str(path) for path in homes if path.exists()]}"
+    )
+
+    # The acceptance clause is "record process IDs and prove all processes
+    # created by the test are stopped", so enumerate every child PID this run
+    # started with the exit status its Popen reports. ``poll()`` is called once
+    # here and its result reused by the assertion, so the recorded list and the
+    # proof observe the same snapshot and cannot diverge; the print makes the
+    # id list part of the gated run's own output, not just the methodology.
+    outcomes = [(process.pid, process.poll()) for process in registry["children"]]
+    print(
+        f"live-gate children created by this run ({len(outcomes)}): "
+        + ", ".join(
+            f"pid={pid} exit="
+            + ("STILL RUNNING" if exit_status is None else str(exit_status))
+            for pid, exit_status in outcomes
+        )
+    )
+    still_alive = [pid for pid, exit_status in outcomes if exit_status is None]
     assert still_alive == [], f"uvicorn children left running: {still_alive}"
 
 

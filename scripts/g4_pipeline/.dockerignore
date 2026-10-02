@@ -1,0 +1,23 @@
+# The build context is scripts/g4_pipeline/. Without this file the whole
+# directory is shipped to the daemon, including results/ -- 106 committed
+# artifacts and the per-run page images, hundreds of MB that no instruction in
+# the Dockerfile reads. That does not change the image id (only the copied
+# requirements.lock does), but it makes each build upload megabytes of measured
+# telemetry, and it means build output lands next to its own input on the daemon
+# side.
+results/
+*.meta.json
+*.measured.jsonl
+
+# The harness itself is mounted read-only at run time; driver.py is deliberately
+# not baked into the image, so shipping it into the context invites a second,
+# stale copy of the same logic.
+driver.py
+run_measured.sh
+build.sh
+PIN_MANIFEST.md
+
+# Optional local wheel directory for hosts that cannot reach
+# download-r2.pytorch.org from a build container. It is injected with
+# PIP_FIND_LINKS, not COPYed, so it must not be in the context.
+local-wheels/

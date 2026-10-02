@@ -40,8 +40,14 @@ def _run_python(statement: str) -> subprocess.CompletedProcess[str]:
 def test_tiers_module_exists_with_the_closed_set() -> None:
     from fin.retrieve.tiers import (
         COMMUNITY_SUMMARY_INDEX_FAILURE,
+        INVALID_BUSINESS_QUERY,
         REAL_DB_NOT_WIRED,
         RETRIEVE_TIERS,
+        SQL_AUTHORIZATION_UNVERIFIED,
+        SQL_NO_MATCHING_ROWS,
+        SQL_PRODUCER_FAILURE_CODES,
+        SQL_QUERY_DENIED,
+        SQL_QUERY_TIMEOUT,
         TIER_NOT_OPEN,
         TIER_UNAVAILABLE_CODE,
     )
@@ -49,15 +55,33 @@ def test_tiers_module_exists_with_the_closed_set() -> None:
     assert RETRIEVE_TIERS == ("lexical", "graph", "global", "sql")
     assert TIER_NOT_OPEN == "tier_not_open"
     assert REAL_DB_NOT_WIRED == "real_db_not_wired"
+    assert SQL_NO_MATCHING_ROWS == "sql_no_matching_rows"
+    assert SQL_QUERY_DENIED == "sql_query_denied"
+    assert SQL_QUERY_TIMEOUT == "sql_query_timeout"
+    assert SQL_AUTHORIZATION_UNVERIFIED == "sql_authorization_unverified"
+    assert INVALID_BUSINESS_QUERY == "invalid_business_query"
     assert COMMUNITY_SUMMARY_INDEX_FAILURE == "community_summary_index_failure"
-    # Opening the global 综述 档 (fin task 4) moved it from a routing-time
-    # plan slot to a real report arm, so it drops out of the「未开」table:
-    # only ``sql`` is refused at routing time now. A global send's one
-    # remaining refusal is the RUNTIME summary-index fact below, never this
-    # table — so the table keeps exactly one row.
-    assert TIER_UNAVAILABLE_CODE == {
-        "sql": "real_db_not_wired",
-    }
+    # A2 (issue #322 T7) opened the sql 档: the routing-time table has ZERO
+    # rows — no 档 is refused at routing time anymore, and the mechanism
+    # stays for the next plan slot (spec search-mode-business-sql-contract
+    # §4: "fin's change is one table row"). The old row's token survives
+    # NARROWED: ``real_db_not_wired`` is now what the PRODUCER declares
+    # when no business ledger is provisioned — not-provisioned, never
+    # refused-at-door (§7: collapsing the two is the empty-vs-error
+    # conflation the port forbids).
+    assert TIER_UNAVAILABLE_CODE == {}
+    # The sql 档's producer-side failure vocabulary is the closed set the
+    # adapter passes through under each token's OWN name (§7.1).
+    assert SQL_PRODUCER_FAILURE_CODES == frozenset(
+        {
+            "real_db_not_wired",
+            "sql_query_denied",
+            "sql_query_timeout",
+            "sql_authorization_unverified",
+            "sql_no_matching_rows",
+            "invalid_business_query",
+        }
+    )
 
 
 # ----- 1b. the retired letters are in NO set anymore -----
@@ -84,25 +108,21 @@ def test_the_refusal_message_names_the_word_form_set() -> None:
             raise AssertionError(f"{letter!r} crossed the port")
 
 
-def test_graph_and_global_are_both_open_tiers() -> None:
-    """``graph`` 知识问答 is today's default 档, and opening ``global`` 综述
-    (fin task 4) made it a real report arm too: neither carries a
-    「未开」code, so naming either resolves to the token rather than raising.
-    ``sql`` alone is still a plan slot."""
-    from fin.retrieve.port import TierUnavailableError, resolve_search_mode
-    from fin.retrieve.tiers import TIER_UNAVAILABLE_CODE
+def test_every_closed_set_tier_is_open_on_the_port() -> None:
+    """``graph`` 知识问答 is today's default 档, ``global`` 综述 runs a real
+    report arm, and since A2 ``sql`` runs a real ledger arm: the closed
+    set is fully OPEN, so naming any token resolves it for the wire and
+    the routing-time table refuses nothing. The old sql refusal here was
+    retired to an acceptance pin — the producer's structured
+    ``real_db_not_wired`` (not-provisioned) and a down transport
+    (``retrieve_unavailable``) stay distinct named exits, pinned in
+    ``test_mcp_adapter`` / ``test_sql_wire``."""
+    from fin.retrieve.port import resolve_search_mode
+    from fin.retrieve.tiers import RETRIEVE_TIERS, TIER_UNAVAILABLE_CODE
 
-    assert "graph" not in TIER_UNAVAILABLE_CODE
-    assert "global" not in TIER_UNAVAILABLE_CODE
-    assert resolve_search_mode("graph") == "graph"
-    assert resolve_search_mode("global") == "global"
-
-    try:
-        resolve_search_mode("sql")
-    except TierUnavailableError as exc:
-        assert exc.code == "real_db_not_wired"
-    else:
-        raise AssertionError("sql accepted as an open 档")
+    assert TIER_UNAVAILABLE_CODE == {}
+    for token in RETRIEVE_TIERS:
+        assert resolve_search_mode(token) == token, token
 
 
 def test_a_letter_at_the_port_is_invalid_not_routed() -> None:
@@ -116,7 +136,6 @@ def test_a_letter_at_the_port_is_invalid_not_routed() -> None:
     """
     from fin.retrieve.port import (
         InvalidSearchModeError,
-        TierUnavailableError,
         resolve_search_mode,
     )
 
@@ -133,14 +152,11 @@ def test_a_letter_at_the_port_is_invalid_not_routed() -> None:
         else:
             raise AssertionError(f"{token} still crosses the port")
 
-    # Only ``sql`` is a routing-time plan slot now: global was opened, so it
-    # resolves to its token above and cannot be refused here.
-    try:
-        resolve_search_mode("sql")
-    except TierUnavailableError as exc:
-        assert exc.code == "real_db_not_wired"
-    else:
-        raise AssertionError("sql accepted as an open 档")
+    # A2 opened ``sql``: it routes like every other closed-set token now
+    # (the retired routing row lives nowhere; a window a request cannot
+    # bind is named at the SAME seam by ``resolve_sql_window``, pinned in
+    # ``test_sql_wire``).
+    assert resolve_search_mode("sql") == "sql"
 
 
 def test_an_unknown_token_stays_unknown_after_the_rename() -> None:
@@ -162,11 +178,20 @@ def test_an_unknown_token_stays_unknown_after_the_rename() -> None:
 def test_tiers_module_is_public_via_dunder_all() -> None:
     import fin.retrieve.tiers as tiers
 
+    # A2 added the sql 档's producer-side vocabulary to the leaf's public
+    # surface: the adapter and ``named_failures`` read these tokens by
+    # name, so a rename that drops one from ``__all__`` must fail here.
     assert set(tiers.__all__) == {
         "COMMUNITY_SUMMARY_INDEX_FAILURE",
+        "INVALID_BUSINESS_QUERY",
         "LASTING_RETRIEVE_TIERS",
         "REAL_DB_NOT_WIRED",
         "RETRIEVE_TIERS",
+        "SQL_AUTHORIZATION_UNVERIFIED",
+        "SQL_NO_MATCHING_ROWS",
+        "SQL_PRODUCER_FAILURE_CODES",
+        "SQL_QUERY_DENIED",
+        "SQL_QUERY_TIMEOUT",
         "TIER_LABELS",
         "TIER_NOT_OPEN",
         "TIER_UNAVAILABLE_CODE",
@@ -267,12 +292,9 @@ import fin.retrieve.port as p
 assert p.resolve_search_mode("lexical") == "lexical"
 assert p.resolve_search_mode(None) is None
 assert p.resolve_search_mode("global") == "global"
-try:
-    p.resolve_search_mode("sql")
-except p.TierUnavailableError as e:
-    assert e.code == "real_db_not_wired"
-else:
-    raise AssertionError("sql not refused")
+# A2 opened sql: the pure validation path routes the token instead of
+# refusing it, still answering from the neutral module only.
+assert p.resolve_search_mode("sql") == "sql"
 try:
     p.resolve_search_mode("A")
 except p.InvalidSearchModeError as e:

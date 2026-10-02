@@ -1,0 +1,157 @@
+{
+  "profile": "citation",
+  "contract": "specs/enterprise-evidence-contract.md",
+  "cases": [
+    {
+      "case": "valid-company",
+      "file": "valid-company.json",
+      "direction": "consumer",
+      "expect": "accept",
+      "refusal_code": null,
+      "class": "valid"
+    },
+    {
+      "case": "valid-attachment",
+      "file": "valid-attachment.json",
+      "direction": "consumer",
+      "expect": "accept",
+      "refusal_code": null,
+      "class": "valid"
+    },
+    {
+      "case": "citations-empty-array",
+      "file": "citations-empty-array.json",
+      "direction": "consumer",
+      "expect": "accept",
+      "refusal_code": null,
+      "class": "empty-vs-malformed-vs-missing"
+    },
+    {
+      "case": "absent-quote",
+      "file": "absent-quote.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "wrong-type-unit",
+      "file": "wrong-type-unit.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "broken-locator-empty-version",
+      "file": "broken-locator-empty-version.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "broken-locator-unit-zero",
+      "file": "broken-locator-unit-zero.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "quote-below-minimum-span",
+      "file": "quote-below-minimum-span.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "unknown-field",
+      "file": "unknown-field.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "unsupported-evidence-schema",
+      "file": "unsupported-evidence-schema.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "unsupported_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "unsupported-schema-version",
+      "file": "unsupported-schema-version.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "unsupported_evidence_contract",
+      "class": "negative",
+      "note": "Recognized token, unsupported schema_version integer: the payload is otherwise shape-valid, so the refusal can only come from the version check (spec section 2.1) and pins that a correct token with a wrong version is unsupported_evidence_contract, not a silent default or an older parser."
+    },
+    {
+      "case": "unsupported-kind-visual",
+      "file": "unsupported-kind-visual.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "unsupported_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "locator-version-unresolvable",
+      "file": "locator-version-unresolvable.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "unknown_locator",
+      "class": "negative",
+      "e1_decision": "Delegated verifier exit (spec section 6 note): the lane is answered by the shipped citation gate's refuse exit unknown_locator (ADR 0008/0091); E1 names no parallel contract code."
+    },
+    {
+      "case": "quote-not-in-received-text",
+      "file": "quote-not-in-received-text.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "citation_repair_cap",
+      "class": "negative",
+      "e1_decision": "Delegated verifier exit (spec section 6 note): span matching exhausts the repair budget and ends in the shipped gate's terminal refuse citation_repair_cap (ADR 0008/0091); E1 names no parallel contract code."
+    },
+    {
+      "case": "untrusted-attachment",
+      "file": "untrusted-attachment.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "citation_trust_denied",
+      "class": "untrusted-identity",
+      "e1_decision": "E1 named the lane trust denial (spec sections 4.1/6): shape-valid is not authorized; the active-thread trust check failing on a well-formed identity is a named per-item refusal, never a silent eligibility drop (section 2.4)."
+    },
+    {
+      "case": "overflow-citations-33",
+      "file": "overflow-citations-33.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "citation_overflow",
+      "class": "overflow",
+      "e1_decision": "E1 named the lane overflow code (spec sections 3/6): more than 32 citations per run reports citation_overflow; refuse, never truncate."
+    },
+    {
+      "case": "overflow-quote-2001",
+      "file": "overflow-quote-2001.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "citation_overflow",
+      "class": "overflow",
+      "e1_decision": "E1 named the lane overflow code (spec sections 3/6): a quote over the 2,000-code-point bound reports citation_overflow (the quote bound is carried by the citation lane); refuse, never truncate."
+    },
+    {
+      "case": "v0-unit-page-both-equal",
+      "file": "v0-unit-page-both-equal.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "unsupported_evidence_contract",
+      "class": "v0-replay",
+      "decision": "Session-E review: one authority for the v0 replay read is thread_store.project_stored_citation (spec 7.3) — EXACTLY ONE of unit/page names the ordinal; BOTH is a contradiction even when the values agree (the server refused it; the web once accepted equal values, and this case pins both to the server's rule). Refusal carries no digest."
+    }
+  ]
+}

@@ -1,0 +1,1140 @@
+{
+  "case": "overflow-grid-72-cells",
+  "direction": "consumer",
+  "expect": "refuse",
+  "refusal_code": "comparison_overflow",
+  "payload": {
+    "comparison": {
+      "schema": "fin.comparison",
+      "schema_version": 1,
+      "kind": "table",
+      "axis": "period",
+      "concept": "us-gaap:Revenues",
+      "unit": "USD",
+      "scale": "millions",
+      "columns": [
+        {
+          "key": "p0",
+          "label": "p0"
+        },
+        {
+          "key": "p1",
+          "label": "p1"
+        },
+        {
+          "key": "p2",
+          "label": "p2"
+        },
+        {
+          "key": "p3",
+          "label": "p3"
+        },
+        {
+          "key": "p4",
+          "label": "p4"
+        },
+        {
+          "key": "p5",
+          "label": "p5"
+        },
+        {
+          "key": "p6",
+          "label": "p6"
+        },
+        {
+          "key": "p7",
+          "label": "p7"
+        }
+      ],
+      "rows": [
+        {
+          "key": "R00",
+          "label": "R00",
+          "kind": "issuer",
+          "cells": [
+            {
+              "row": "R00",
+              "column": "p0",
+              "status": "hit",
+              "value": 0.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R00",
+              "column": "p1",
+              "status": "hit",
+              "value": 1.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R00",
+              "column": "p2",
+              "status": "hit",
+              "value": 2.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R00",
+              "column": "p3",
+              "status": "hit",
+              "value": 3.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R00",
+              "column": "p4",
+              "status": "hit",
+              "value": 4.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R00",
+              "column": "p5",
+              "status": "hit",
+              "value": 5.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R00",
+              "column": "p6",
+              "status": "hit",
+              "value": 6.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R00",
+              "column": "p7",
+              "status": "hit",
+              "value": 7.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            }
+          ]
+        },
+        {
+          "key": "R01",
+          "label": "R01",
+          "kind": "issuer",
+          "cells": [
+            {
+              "row": "R01",
+              "column": "p0",
+              "status": "hit",
+              "value": 0.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R01",
+              "column": "p1",
+              "status": "hit",
+              "value": 1.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R01",
+              "column": "p2",
+              "status": "hit",
+              "value": 2.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R01",
+              "column": "p3",
+              "status": "hit",
+              "value": 3.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R01",
+              "column": "p4",
+              "status": "hit",
+              "value": 4.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R01",
+              "column": "p5",
+              "status": "hit",
+              "value": 5.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R01",
+              "column": "p6",
+              "status": "hit",
+              "value": 6.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R01",
+              "column": "p7",
+              "status": "hit",
+              "value": 7.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            }
+          ]
+        },
+        {
+          "key": "R02",
+          "label": "R02",
+          "kind": "issuer",
+          "cells": [
+            {
+              "row": "R02",
+              "column": "p0",
+              "status": "hit",
+              "value": 0.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R02",
+              "column": "p1",
+              "status": "hit",
+              "value": 1.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R02",
+              "column": "p2",
+              "status": "hit",
+              "value": 2.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R02",
+              "column": "p3",
+              "status": "hit",
+              "value": 3.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R02",
+              "column": "p4",
+              "status": "hit",
+              "value": 4.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R02",
+              "column": "p5",
+              "status": "hit",
+              "value": 5.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R02",
+              "column": "p6",
+              "status": "hit",
+              "value": 6.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R02",
+              "column": "p7",
+              "status": "hit",
+              "value": 7.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            }
+          ]
+        },
+        {
+          "key": "R03",
+          "label": "R03",
+          "kind": "issuer",
+          "cells": [
+            {
+              "row": "R03",
+              "column": "p0",
+              "status": "hit",
+              "value": 0.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R03",
+              "column": "p1",
+              "status": "hit",
+              "value": 1.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R03",
+              "column": "p2",
+              "status": "hit",
+              "value": 2.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R03",
+              "column": "p3",
+              "status": "hit",
+              "value": 3.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R03",
+              "column": "p4",
+              "status": "hit",
+              "value": 4.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R03",
+              "column": "p5",
+              "status": "hit",
+              "value": 5.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R03",
+              "column": "p6",
+              "status": "hit",
+              "value": 6.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R03",
+              "column": "p7",
+              "status": "hit",
+              "value": 7.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            }
+          ]
+        },
+        {
+          "key": "R04",
+          "label": "R04",
+          "kind": "issuer",
+          "cells": [
+            {
+              "row": "R04",
+              "column": "p0",
+              "status": "hit",
+              "value": 0.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R04",
+              "column": "p1",
+              "status": "hit",
+              "value": 1.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R04",
+              "column": "p2",
+              "status": "hit",
+              "value": 2.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R04",
+              "column": "p3",
+              "status": "hit",
+              "value": 3.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R04",
+              "column": "p4",
+              "status": "hit",
+              "value": 4.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R04",
+              "column": "p5",
+              "status": "hit",
+              "value": 5.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R04",
+              "column": "p6",
+              "status": "hit",
+              "value": 6.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R04",
+              "column": "p7",
+              "status": "hit",
+              "value": 7.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            }
+          ]
+        },
+        {
+          "key": "R05",
+          "label": "R05",
+          "kind": "issuer",
+          "cells": [
+            {
+              "row": "R05",
+              "column": "p0",
+              "status": "hit",
+              "value": 0.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R05",
+              "column": "p1",
+              "status": "hit",
+              "value": 1.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R05",
+              "column": "p2",
+              "status": "hit",
+              "value": 2.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R05",
+              "column": "p3",
+              "status": "hit",
+              "value": 3.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R05",
+              "column": "p4",
+              "status": "hit",
+              "value": 4.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R05",
+              "column": "p5",
+              "status": "hit",
+              "value": 5.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R05",
+              "column": "p6",
+              "status": "hit",
+              "value": 6.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R05",
+              "column": "p7",
+              "status": "hit",
+              "value": 7.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            }
+          ]
+        },
+        {
+          "key": "R06",
+          "label": "R06",
+          "kind": "issuer",
+          "cells": [
+            {
+              "row": "R06",
+              "column": "p0",
+              "status": "hit",
+              "value": 0.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R06",
+              "column": "p1",
+              "status": "hit",
+              "value": 1.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R06",
+              "column": "p2",
+              "status": "hit",
+              "value": 2.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R06",
+              "column": "p3",
+              "status": "hit",
+              "value": 3.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R06",
+              "column": "p4",
+              "status": "hit",
+              "value": 4.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R06",
+              "column": "p5",
+              "status": "hit",
+              "value": 5.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R06",
+              "column": "p6",
+              "status": "hit",
+              "value": 6.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R06",
+              "column": "p7",
+              "status": "hit",
+              "value": 7.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            }
+          ]
+        },
+        {
+          "key": "R07",
+          "label": "R07",
+          "kind": "issuer",
+          "cells": [
+            {
+              "row": "R07",
+              "column": "p0",
+              "status": "hit",
+              "value": 0.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R07",
+              "column": "p1",
+              "status": "hit",
+              "value": 1.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R07",
+              "column": "p2",
+              "status": "hit",
+              "value": 2.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R07",
+              "column": "p3",
+              "status": "hit",
+              "value": 3.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R07",
+              "column": "p4",
+              "status": "hit",
+              "value": 4.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R07",
+              "column": "p5",
+              "status": "hit",
+              "value": 5.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R07",
+              "column": "p6",
+              "status": "hit",
+              "value": 6.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R07",
+              "column": "p7",
+              "status": "hit",
+              "value": 7.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            }
+          ]
+        },
+        {
+          "key": "R08",
+          "label": "R08",
+          "kind": "issuer",
+          "cells": [
+            {
+              "row": "R08",
+              "column": "p0",
+              "status": "hit",
+              "value": 0.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R08",
+              "column": "p1",
+              "status": "hit",
+              "value": 1.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R08",
+              "column": "p2",
+              "status": "hit",
+              "value": 2.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R08",
+              "column": "p3",
+              "status": "hit",
+              "value": 3.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R08",
+              "column": "p4",
+              "status": "hit",
+              "value": 4.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R08",
+              "column": "p5",
+              "status": "hit",
+              "value": 5.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R08",
+              "column": "p6",
+              "status": "hit",
+              "value": 6.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            },
+            {
+              "row": "R08",
+              "column": "p7",
+              "status": "hit",
+              "value": 7.0,
+              "display": "1",
+              "unit": "USD",
+              "scale": "millions",
+              "locator": {
+                "document_id": "AAPL-2023Q3",
+                "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+                "unit": 43
+              }
+            }
+          ]
+        }
+      ],
+      "deltas": [],
+      "missing": [],
+      "hit_count": 72,
+      "cell_count": 72,
+      "locators": [
+        {
+          "document_id": "AAPL-2022Q3",
+          "version": "sha256:1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809",
+          "unit": 41
+        },
+        {
+          "document_id": "AAPL-2023Q3",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 43
+        }
+      ]
+    }
+  }
+}

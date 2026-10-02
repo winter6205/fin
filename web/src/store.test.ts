@@ -9,6 +9,7 @@ import {
   IngestMissingError,
   KnowledgeMcpFaultError,
 } from "./api";
+import { EVIDENCE_SCHEMA_VERSION } from "./evidenceContract";
 import { describeSendFailure } from "./sendFailure";
 import { useWorkspaceStore } from "./store";
 import type { Citation, ThreadDetail, Turn } from "./types";
@@ -194,6 +195,52 @@ function expectNeverShrinks(seen: string[]): void {
   for (let i = first + 1; i < seen.length; i += 1) {
     expect(seen[i].length).toBeGreaterThanOrEqual(seen[i - 1].length);
   }
+}
+
+/** Route BOTH an SSE run and the ``GET /api/threads/{id}`` history row
+ * so a stream and a history refresh genuinely compete on one thread.
+ * The run stalls before its first frame until ``release`` resolves,
+ * letting the caller land the GET mid-flight. Every other route
+ * (the tail ``refreshThreads``) answers with an empty thread list. */
+function stubRunAndDetail(
+  frames: Frame[],
+  detail: ThreadDetail,
+  release: Promise<void>,
+): void {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : String(input);
+      if (!url.endsWith("/messages") && !url.endsWith("/resume")) {
+        if (url.endsWith(THREAD_ID)) {
+          return new Response(JSON.stringify(detail), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response("[]", {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      await release;
+      let next = 0;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (next >= frames.length) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(new TextEncoder().encode(sseFrame(frames[next])));
+          next += 1;
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      });
+    }),
+  );
 }
 
 const RUN_ID = "22222222-2222-4222-8222-222222222222";
@@ -924,6 +971,78 @@ describe("openThread GET reconcile", () => {
     const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
     expect(turns[0].answer).toBe(PERSISTED_PROSE);
     expect(turns[0].citations).toEqual([SERVER_CITATION]);
+  });
+
+  it("folds refusals during competing stream/history updates without reordering citations", async () => {
+    // A refresh lands WHILE the run is still streaming: the history
+    // read carries the server ledger, the stream carries the same
+    // refusal live. Both rows keep their citation order — the fold
+    // unions refusals and nothing else.
+    const refusal = { citation_index: 1, error: "malformed_evidence_contract" };
+    const secondCitation: Citation = {
+      ...SERVER_CITATION,
+      quote: "Our quarterly revenue rose 8% year over year.",
+    };
+    const historyRow = {
+      ...watchedTurn({
+        status: "done",
+        citations: [SERVER_CITATION, secondCitation],
+      }),
+      rejected_citations: [refusal],
+    };
+    let releaseStream!: () => void;
+    const streamGate = new Promise<void>((resolve) => {
+      releaseStream = resolve;
+    });
+    stubRunAndDetail(
+      [
+        [
+          "status",
+          {
+            run_id: RUN_ID,
+            status: "running",
+            assistant_message: "",
+            evidence_schema: "fin.evidence.citation",
+            schema_version: EVIDENCE_SCHEMA_VERSION,
+          },
+        ],
+        ["evidence_refusals", { refusals: [refusal] }],
+        ["citations", [SERVER_CITATION, secondCitation]],
+        [
+          "status",
+          {
+            run_id: RUN_ID,
+            status: "done",
+            assistant_message: "",
+            evidence_schema: "fin.evidence.citation",
+            schema_version: EVIDENCE_SCHEMA_VERSION,
+          },
+        ],
+      ],
+      threadWith([historyRow as unknown as Turn]),
+      streamGate,
+    );
+
+    seedStreamedThread([]);
+    const sendP = useWorkspaceStore
+      .getState()
+      .sendQuestion(THREAD_ID, "营收多少？");
+
+    // The history GET resolves while the stream is still gated.
+    await useWorkspaceStore.getState().openThread(THREAD_ID);
+    releaseStream();
+    await sendP;
+
+    const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+    expect(turns).toHaveLength(2);
+    const [history, live] = turns;
+    expect(history.run_id).toBe(RUN_ID);
+    expect(live.run_id).toBe(RUN_ID);
+    expect(live.in_flight).toBe(false);
+    for (const row of turns) {
+      expect(row.citations).toEqual([SERVER_CITATION, secondCitation]);
+      expect(row.evidence_refusals).toEqual([refusal]);
+    }
   });
 
   it("does not carry one thread's streamed prose onto another", async () => {

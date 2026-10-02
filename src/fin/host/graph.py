@@ -84,6 +84,7 @@ from typing import (
     Mapping,
     Protocol,
     TypedDict,
+    cast,
 )
 
 from langchain_core.messages import (
@@ -106,8 +107,11 @@ from fin.corpus.extracted import Locator
 from fin.host.compaction import CompactionInputError
 from fin.host.citation_gate import (
     HIDDEN_BOUNCE_MARKER,
+    BounceResult,
     Citation,
+    DoneResult,
     EvidenceItem,
+    RefuseResult,
     verify_citations,
 )
 from fin.host.visual_evidence import VISUAL_LANE_UNWIRED
@@ -115,6 +119,7 @@ from fin.host.evidence_admission import (
     admit_retrieved_chunks,
     attachment_evidence_from_ref,
     evidence_from_chunks,
+    evidence_from_database_rows,
     unit_ordinal,
 )
 from fin.host.memory_port import MemoryPort
@@ -206,7 +211,7 @@ from fin.retrieve.degradation import (
 )
 from fin.retrieve.hit_mapping import MappingFailureLedger, ledger_from_env
 from fin.retrieve.input_validation import InputValidationError
-from fin.retrieve.port import RetrievePort
+from fin.retrieve.port import DATABASE_ROWS_KEY, RetrievePort, database_rows_of
 from fin.retrieve.source_read import (
     ATTACHMENT_KIND,
     UNKNOWN_LOCATOR,
@@ -371,6 +376,12 @@ _USER_PROFILE_LAYER_DIR = ".fin"
 # rendering (T7, T9) strip it before printing per ADR 0021. Imported
 # from ``citation_gate`` (the SSOT) so a rename touches one file.
 _BOUNCE_MARKER = HIDDEN_BOUNCE_MARKER
+
+# The conditional-route return meaning "end this run". The VALUE must
+# stay the ``END`` object itself — langgraph compares routes by
+# identity — so this is one identity ``cast`` for the
+# ``Literal["__end__"]`` route signatures, reused at every return site.
+_END_TOKEN = cast('Literal["__end__"]', END)
 
 
 def _resolve_path(value: Path | str | None, default: Path) -> Path:
@@ -696,7 +707,9 @@ def _make_read_source_tool(
         source_ref: dict,
         position: int = 0,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
-        config: Annotated[RunnableConfig, InjectedToolArg()] = None,
+        config: Annotated[RunnableConfig, InjectedToolArg()] = cast(
+            RunnableConfig, None
+        ),
     ) -> Command:
         """Read one bounded slice of a frozen source unit.
 
@@ -883,7 +896,9 @@ def _make_read_visual_detail_tool(
         category: str,
         scope: list[float] | None = None,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
-        config: Annotated[RunnableConfig, InjectedToolArg()] = None,
+        config: Annotated[RunnableConfig, InjectedToolArg()] = cast(
+            RunnableConfig, None
+        ),
     ) -> Command:
         """What one chart on an attachment's PDF page plots.
 
@@ -1087,7 +1102,9 @@ def _make_retrieve_tool(
         attachment_ids: list[str] | None = None,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
         state: Annotated[Any, InjectedState()] = None,
-        config: Annotated[RunnableConfig, InjectedToolArg()] = None,
+        config: Annotated[RunnableConfig, InjectedToolArg()] = cast(
+            RunnableConfig, None
+        ),
     ) -> Command:
         """Narrative retrieval over page-passage chunks.
 
@@ -1331,7 +1348,13 @@ def _make_retrieve_tool(
                     "evidence": attachment_evidence,
                 }
             )
-        raw_chunks = result.get("chunks", []) if isinstance(result, dict) else []
+        # ``result`` is JSON-typed (``dict[str, object]``); the retrieve
+        # contract's chunk list is re-asserted here for the admission
+        # helper's declared input.
+        raw_chunks = cast(
+            Iterable[Any],
+            result.get("chunks", []) if isinstance(result, dict) else [],
+        )
         # SC22: hits that did not map back to a locator are dropped and
         # counted here, so neither the evidence list nor the serialized
         # envelope below can carry a retrieval-side identifier.
@@ -1347,7 +1370,20 @@ def _make_retrieve_tool(
         # citation gate tell an empty-bound 资料集合 from a mapping
         # drop, and it changes neither admission nor the envelope below.
         chunks = admit_retrieved_chunks(raw_chunks, ledger=ledger)
-        new_evidence: list[EvidenceItem] = evidence_from_chunks(chunks)
+        # The sql 档's row sibling (spec §8.0, E1 envelope contract
+        # §4.4): the sibling is the row OBJECT ``{schema, rows,
+        # result_count}``; its rows become the ``database-row`` evidence
+        # kind — never a chunk, never a bridged passage. The ABSENT-vs-
+        # empty rule holds on this side too: a document envelope carries
+        # no ``database_rows`` key at all and contributes nothing here,
+        # byte-identical to before the 档 opened.
+        raw_rows = (
+            result.get(DATABASE_ROWS_KEY) if isinstance(result, dict) else None
+        )
+        row_evidence = evidence_from_database_rows(database_rows_of(raw_rows))
+        new_evidence: list[EvidenceItem] = (
+            evidence_from_chunks(chunks) + row_evidence
+        )
         # Serialize the chunks with their Locator as a dict so the
         # ToolMessage is JSON-friendly. The original ``Chunk`` value
         # objects live on ``unit_text`` (string) for evidence;
@@ -1365,6 +1401,15 @@ def _make_retrieve_tool(
             for chunk in chunks
         ]
         envelope: dict[str, Any] = {"chunks": serialized_chunks}
+        # The row sibling reaches the MODEL verbatim too (spec §8.0): the
+        # model can only quote the display line it was shown, and the
+        # citation gate verifies it against the same row it carries as
+        # evidence. The E1 row OBJECT passes through whole — ``schema``
+        # and ``result_count`` included. Key present on the port answer
+        # ⇒ key present here; absent (every document 档) ⇒ byte-identical
+        # pre-sql envelope.
+        if isinstance(raw_rows, dict):
+            envelope[DATABASE_ROWS_KEY] = dict(raw_rows)
         _consume_into_envelope(envelope, result, ledger=degradations)
         attachment_envelope, attachment_evidence = _attachment_leg()
         envelope.update(attachment_envelope)
@@ -1378,9 +1423,10 @@ def _make_retrieve_tool(
             "chunks": len(serialized_chunks),
             "mapping_failures": ledger.count_on_this_thread(),
         }
-        # A RECORDED job fact (Fast empty-graph, or the global 综述
-        # index-not-ready refusal) rides the run record so the citation gate
-        # can name the job, not just the empty set. One shared copy helper,
+        # A RECORDED job fact (Fast empty-graph, the global 综述
+        # index-not-ready refusal, or the sql 档's zero-row fact) rides the run
+        # record so the citation gate can name the job, not just the empty
+        # set. One shared copy helper,
         # keyed by the named_failures job-fact table — no per-flag branch here.
         copy_recorded_job_facts(result, call_outcome)
         return Command(
@@ -1455,7 +1501,7 @@ def _make_get_xbrl_fact_tool(facts_root: Path):
         document_id: str | None = None,
         issuer: str | None = None,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
-    ) -> dict:
+    ) -> Command:
         """Look up one tagged XBRL fact from the ingest-built fact table.
 
         ``concept`` is the XBRL tag (e.g., ``us-gaap:Revenues``).
@@ -1585,7 +1631,9 @@ def _make_recall_memory_tool(
     def recall_memory_tool(
         query: str,
         limit: int = 8,
-        config: Annotated[RunnableConfig, InjectedToolArg()] = None,
+        config: Annotated[RunnableConfig, InjectedToolArg()] = cast(
+            RunnableConfig, None
+        ),
     ) -> dict:
         """Return advisory memory rows that lexically hit ``query``.
 
@@ -2110,11 +2158,28 @@ def _pending_tool_calls(state: AgentState) -> list[tuple[str, dict, str]]:
                 (
                     call.get("name", ""),
                     call.get("args") or {},
-                    call.get("id", ""),
+                    # The ``ToolCall`` TypedDict types ``id`` as
+                    # ``str | None``; every consumer below compares or
+                    # renders strings, so the None leg falls back to "".
+                    str(call.get("id") or ""),
                 )
                 for call in message.tool_calls
             ]
     return []
+
+
+def _json_content(message: BaseMessage) -> Any:
+    """Decode a message's ``content`` as JSON, ``None``-shaped result
+    for non-string content.
+
+    ``content`` is ``str | list`` on the message models; only the JSON
+    string leg decodes. A list (multimodal block) content decodes the
+    empty string and raises ``JSONDecodeError`` — the same caught
+    outcome the ``TypeError`` had for it — so every caller's
+    ``(TypeError, ValueError)`` guard sees an unchanged failure path.
+    """
+    content = message.content
+    return json.loads(content if isinstance(content, str) else "")
 
 
 def _tool_result_for_call(call_id: str, tool_messages: list[BaseMessage]) -> dict | None:
@@ -2135,7 +2200,7 @@ def _tool_result_for_call(call_id: str, tool_messages: list[BaseMessage]) -> dic
         if getattr(tm, "tool_call_id", "") != call_id:
             continue
         try:
-            return json.loads(tm.content)
+            return _json_content(tm)
         except (TypeError, ValueError):
             return None
     return None
@@ -2169,8 +2234,11 @@ def _build_tool_summaries(
 
 
 def comparison_from_tool_message(message: BaseMessage) -> dict | None:
-    """The ``fin.comparison.v1`` envelope a ``compare_facts``
-    ``ToolMessage`` carries, stamped with its ``tool_call_id``.
+    """The ``fin.comparison`` envelope a ``compare_facts``
+    ``ToolMessage`` carries, copied without changing its frozen shape.
+
+    The comparison contract stays limited to the producer's envelope keys;
+    the separate ``tool_result`` frame and tool trace retain the call id.
 
     ``None`` for every other message, for a typed EXIT whose skeleton
     holds no columns (``empty_comparison`` / ``comparison_overflow``
@@ -2183,7 +2251,7 @@ def comparison_from_tool_message(message: BaseMessage) -> dict | None:
     if getattr(message, "name", "") != "compare_facts":
         return None
     try:
-        payload = json.loads(message.content)
+        payload = _json_content(message)
     except (TypeError, ValueError):
         return None
     if not isinstance(payload, dict):
@@ -2191,10 +2259,7 @@ def comparison_from_tool_message(message: BaseMessage) -> dict | None:
     comparison = payload.get("comparison")
     if not isinstance(comparison, dict) or not comparison.get("columns"):
         return None
-    return {
-        **comparison,
-        "tool_call_id": getattr(message, "tool_call_id", "") or "",
-    }
+    return dict(comparison)
 
 
 _ANALYSIS_PAYLOAD_KEYS = {
@@ -2212,7 +2277,7 @@ def analysis_from_tool_message(message: BaseMessage) -> dict | None:
     if payload_key is None:
         return None
     try:
-        payload = json.loads(message.content)
+        payload = _json_content(message)
     except (TypeError, ValueError):
         return None
     if not isinstance(payload, dict):
@@ -2401,7 +2466,7 @@ def _collect_fact_tool_calls(
                 if getattr(tm, "tool_call_id", "") != call_id:
                     continue
                 try:
-                    payload = json.loads(tm.content)
+                    payload = _json_content(tm)
                 except (TypeError, ValueError):
                     payload = None
                 if not isinstance(payload, dict) or "error" in payload:
@@ -2412,7 +2477,10 @@ def _collect_fact_tool_calls(
                 facts.append(
                     Fact(
                         concept=payload.get("concept", concept),
-                        value=payload.get("value"),
+                        # The JSON-typed payload row is asserted back
+                        # to the fact contract's value type; the
+                        # ingested row always carries one.
+                        value=cast("float | int | str", payload.get("value")),
                         period=payload.get("period", period),
                         unit=payload.get("unit", ""),
                         scale=payload.get("scale", ""),
@@ -2629,7 +2697,13 @@ class _AttachmentPreparationService(Protocol):
     capability's implementation. The real service satisfies this shape
     structurally — its ``request_preparation`` / ``resolve_for_turn``
     carry exactly these call signatures.
+
+    ``budgets`` is the deployed page-lane bound the visual ledger prices
+    against; the real service always carries it (possibly ``None`` on a
+    text-only deployment, which mints no ledger).
     """
+
+    budgets: Any
 
     def request_preparation(
         self, thread_id: str, attachment_id: str
@@ -3043,11 +3117,14 @@ def compile_graph(
     )
     # A ceiling is only worth minting for a run that can spend it: with no
     # page lane the tool is unbound, so the per-entry ledger would be an
-    # unused object on every config.
+    # unused object on every config. A non-``None`` faces factory implies
+    # a wired service (the factory reads its faces off the service).
     visual_ledger_factory = (
         None
         if visual_faces_factory is None
-        else _make_visual_ledger_factory(attachment_service.budgets)
+        else _make_visual_ledger_factory(
+            cast(_AttachmentPreparationService, attachment_service).budgets
+        )
     )
 
     # T6 (spec SC12 / SC13 / map G4): when memory is ON, expose exactly
@@ -3286,7 +3363,7 @@ def compile_graph(
             _with_turn_attachments(
                 state,
                 messages_for_model(
-                    state["messages"],
+                    cast("dict[str, Any]", state)["messages"],
                     track=track,
                     missing_slots=missing_slots,
                     user_profile=_read_profile_text(),
@@ -3437,6 +3514,11 @@ def compile_graph(
         is ignored — the host resumer (or a process restart) drives
         re-evaluation, not an operator pick.
         """
+        # The node is added to the graph only under the
+        # ``attachment_service is not None`` guard at the ``add_node``
+        # site below; this pins that invariant for the checker without
+        # adding a runtime branch.
+        assert attachment_service is not None
         items = [dict(item) for item in (state.get("attachments") or [])]
         if not any(str(item.get("attachment_id") or "") for item in items):
             # EXIT: a turn that names no eligible attachment never
@@ -3616,7 +3698,7 @@ def compile_graph(
         model_messages = _with_turn_attachments(
             state,
             messages_for_model(
-                state["messages"],
+                cast("dict[str, Any]", state)["messages"],
                 track="grounded",
                 memory_on=memory_enabled,
                 # ADR 0089: the copy naming ``read_visual_detail`` rides
@@ -3811,7 +3893,7 @@ def compile_graph(
             update["status_reason"] = "issuer_overflow"
         return update
 
-    def issuer_research_node(task: IssuerTask) -> dict[str, Any]:
+    def issuer_research_node(state: IssuerTask) -> dict[str, Any]:
         """Research ONE issuer through the retrieve port.
 
         This is the fan-out branch ADR 0034 permits. It calls the port
@@ -3820,9 +3902,13 @@ def compile_graph(
         list). Its chunks become ordinary ``EvidenceItem``s, so the one
         citation verifier after the join treats fan-out evidence
         exactly like a ``read_source`` unit.
+
+        The first parameter is named ``state`` because LangGraph's node
+        protocols declare that name; the runtime value is the
+        ``IssuerTask`` payload the ``Send`` carries.
         """
-        issuer = str(task.get("issuer") or "").strip().upper()
-        query = str(task.get("query") or "")
+        issuer = str(state.get("issuer") or "").strip().upper()
+        query = str(state.get("query") or "")
         if not issuer or not query:
             return {}
 
@@ -3833,7 +3919,7 @@ def compile_graph(
                 # SC2: the branch answers under the 档 the cascade
                 # assigned for this run — carried on the payload the
                 # router stamped, not re-read from anywhere else.
-                search_mode=task.get("search_mode"),
+                search_mode=state.get("search_mode"),
                 adapter=adapter,
             )
         except InputValidationError as exc:
@@ -3865,7 +3951,7 @@ def compile_graph(
             ledger=degradation_ledger,
             expose=lambda signal, _line: notices.append(
                 degradation_notice_entry(
-                    signal, tool_call_id=str(task.get("issuer") or "")
+                    signal, tool_call_id=str(state.get("issuer") or "")
                 )
             ),
             detail=f"issuer={issuer}",
@@ -3919,7 +4005,7 @@ def compile_graph(
         # answer. Empty content (model returned only tool_calls)
         # falls through to the bounce path so the model can retry
         # with prose.
-        messages = state["messages"]
+        messages = cast("dict[str, Any]", state)["messages"]
         candidate_answer = _last_ai_text(messages)
         evidence = list(state.get("evidence", []))
         repair_count = int(state.get("repair_count", 0))
@@ -3951,6 +4037,9 @@ def compile_graph(
         )
 
         if gate_result.outcome == "done":
+            # ``verify_citations`` builds the outcome token and the
+            # class together, so the ``outcome`` leg pins this cast.
+            done = cast(DoneResult, gate_result)
             # T5: numeric gate. Walk the AIMessage history for
             # ``get_xbrl_fact`` tool calls this run; each call is
             # an implicit (concept, period) claim. The matching
@@ -3978,7 +4067,7 @@ def compile_graph(
             # spans — so without this check a five-issuer ask could
             # ``done`` on four. Runs with no fan-out skip it entirely.
             dropped = _uncited_contributors(
-                dict(state.get("issuer_fanout") or {}), gate_result.citations
+                dict(state.get("issuer_fanout") or {}), done.citations
             )
             if dropped:
                 return {
@@ -3989,29 +4078,37 @@ def compile_graph(
                 }
             return {
                 "messages": [],
-                "answer": gate_result.answer,
-                "citations": tuple(gate_result.citations),
+                "answer": done.answer,
+                "citations": tuple(done.citations),
                 "status": "done",
                 "status_reason": "done",
                 "repair_count": repair_count,
             }
 
         if gate_result.outcome == "refuse":
+            refused = cast(RefuseResult, gate_result)
             # T3: the run had NOTHING to cite and retrieve is the
             # reason. The verifier's own vocabulary is untouched
             # (ADR 0008) — the refusal it produced is RE-LABELLED
             # with the more specific retrieve-side fact, which is
             # the whole point of 「具名失败」: an operator must not
             # have to read three different product facts as one
-            # ``unknown_locator``. With evidence present, or with no
-            # retrieve at all, the gate's verdict stands unchanged.
+            # ``unknown_locator``. With evidence present the gate's
+            # verdict stands EXCEPT on the E2 route
+            # (spec ``enterprise-evidence-contract`` §6): an
+            # enterprise-material run whose retrieve delivered material
+            # but that the verifier capped with
+            # ``citation_repair_cap`` names 「the authorized material
+            # does not state the asked rule」. With no retrieve at all
+            # the gate's verdict stands unchanged.
             return {
                 "messages": [],
                 "status": "refuse",
                 "status_reason": named_refusal_reason(
                     evidence=evidence,
                     outcomes=state.get("retrieve_outcomes"),
-                    verifier_reason=gate_result.reason,
+                    verifier_reason=refused.reason,
+                    track_decision=state.get("track_decision"),
                 ),
                 "repair_count": repair_count,
             }
@@ -4020,14 +4117,15 @@ def compile_graph(
         # the end of the message list (ADR 0021). The template is
         # data; CLI / HTTP rendering (T7 / T9) strips the marker
         # before printing.
+        bounce = cast(BounceResult, gate_result)
         hidden = SystemMessage(
-            content=_format_bounce_template(gate_result.hidden_template)
+            content=_format_bounce_template(bounce.hidden_template)
         )
         return {
             "messages": [hidden],
             "status": "running",
             "status_reason": "",
-            "repair_count": gate_result.repair_count,
+            "repair_count": bounce.repair_count,
         }
 
     # ----- session compaction gate (ADR 0044 / plan T1) -----
@@ -4173,7 +4271,7 @@ def compile_graph(
         """The gate's typed refuse exits the run; every other status
         enters the grounded leaf (T2f)."""
         if state.get("status") == "refuse":
-            return END
+            return _END_TOKEN
         return "model"
 
     def from_model(
@@ -4185,8 +4283,8 @@ def compile_graph(
         # has tool_calls (defensive — the model_node does not
         # produce a message in the step-cap branch).
         if state.get("status") == "step_cap":
-            return END
-        messages = state["messages"]
+            return _END_TOKEN
+        messages = cast("dict[str, Any]", state)["messages"]
         last = messages[-1]
         if isinstance(last, AIMessage) and last.tool_calls:
             # T6: ``research_issuers`` is served by the fan-out
@@ -4204,7 +4302,7 @@ def compile_graph(
         # Soft-Track: citation verifier is research-only.
         if normalize_track(state.get("track")) == "grounded":
             return "citation_gate"
-        return END
+        return _END_TOKEN
 
     def from_issuer_fanout(state: AgentState) -> Any:
         """Fan out one branch per approved issuer, else fall through.
@@ -4244,7 +4342,7 @@ def compile_graph(
         # call sees a possibly-compacted history.
         status = state.get("status", "running")
         if status in ("done", "refuse", "step_cap"):
-            return END
+            return _END_TOKEN
         return "compaction_gate"
 
     # ----- assemble the graph -----
@@ -4754,7 +4852,12 @@ class _LockedGraph:
         return {
             "estimated_tokens": count_tokens_approximately(messages),
             "budget_tokens": session_budget_tokens(),
-            "ratio": self._compactor.occupancy(messages),
+            # ``compile_graph`` always passes the gate's compactor; the
+            # direct attribute access (and its ``AttributeError`` on a
+            # hand-built ownerless instance) is the HEAD contract.
+            "ratio": cast(OccupancyCompactor, self._compactor).occupancy(
+                messages
+            ),
         }
 
     @staticmethod

@@ -36,6 +36,9 @@ from __future__ import annotations
 import inspect
 import json
 import shutil
+import subprocess
+import sys
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -509,6 +512,73 @@ def test_ocr_required_large_page_count_applies_to_every_page(
 
 # ---------- default pytest without OCR ----------
 
+_OCR_IMPORT_ISOLATION_SNIPPET = """
+import importlib.util
+import sys
+
+# find_spec locates the module without executing it, so this reads
+# "the [ocr] extra is installed here" and not "pytesseract is loaded".
+available = importlib.util.find_spec("pytesseract") is not None
+
+import fin.corpus.ocr  # noqa: F401  (the import IS the test)
+
+leaked = sorted(
+    name for name in sys.modules
+    if name == "pytesseract" or name.startswith("pytesseract.")
+)
+
+# Positive control: the same scan must be able to SEE pytesseract in this
+# interpreter, otherwise the empty ``leaked`` above proves nothing. The
+# control imports it for real and is therefore only conclusive when the
+# extra is installed; ``available`` says which of the two happened.
+control = "not-installed"
+if available:
+    import pytesseract  # noqa: F401
+    control = repr(
+        sorted(
+            name for name in sys.modules
+            if name == "pytesseract" or name.startswith("pytesseract.")
+        )
+    )
+
+print("ISOLATION-LEAKED " + repr(leaked))
+print("ISOLATION-AVAILABLE " + repr(available))
+print("ISOLATION-CONTROL " + control)
+"""
+
+
+def _run_ocr_import_isolation_subprocess() -> dict[str, str]:
+    """Report, from a fresh interpreter, what importing ``fin.corpus.ocr``
+    left in ``sys.modules``.
+
+    The isolation contract is about ``fin.corpus.ocr``'s own import graph,
+    so it has to be measured on a ``sys.modules`` nothing else has touched.
+    Asserting it in-process measures the suite instead: pytest imports
+    every module while COLLECTING, so a sibling's module-level
+    ``importorskip("pytesseract")`` (``test_ocr_tesseract_gold.py``) and
+    any sibling that instantiates ``TesseractEngine`` have both already
+    populated ``sys.modules`` before the first test body runs. The
+    subprocess is the pattern ``test_window_extract_contract.py`` already
+    uses for the same reason.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(_OCR_IMPORT_ISOLATION_SNIPPET)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        "the isolation subprocess did not run "
+        f"(rc={result.returncode}):\n"
+        f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+    )
+    reported: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        if key.startswith("ISOLATION-"):
+            reported[key] = value
+    return reported
+
 
 def test_default_pytest_does_not_import_pytesseract() -> None:
     """Importing ``fin.corpus.ocr`` MUST NOT pull pytesseract.
@@ -516,18 +586,33 @@ def test_default_pytest_does_not_import_pytesseract() -> None:
     Per spec: "default pytest does not require a live OCR engine".
     ``TesseractEngine`` lazily imports pytesseract inside ``__init__``;
     instantiating the engine without that env raises the typed error.
-    Here we only import the module and assert pytesseract is not in
-    ``sys.modules``.
-    """
-    import sys
-    import fin.corpus.ocr  # noqa: F401  (the import IS the test)
+    So the module-level import must leave the optional extra unloaded.
 
-    leaked = sorted(
-        m for m in sys.modules if m == "pytesseract" or m.startswith("pytesseract.")
+    The check runs in a fresh interpreter, and carries a positive control
+    that imports pytesseract afterwards through the same scan. Without
+    the control the assertion is vacuous on a host without the ``[ocr]``
+    extra: an uninstallable module is trivially absent from
+    ``sys.modules``. With the extra installed — the configuration in which
+    this contract is actually at risk — the control shows the scan does
+    detect pytesseract when it is there, and the leak list must still be
+    empty because only ``fin.corpus.ocr`` was imported.
+    """
+    reported = _run_ocr_import_isolation_subprocess()
+
+    assert "ISOLATION-LEAKED" in reported, f"no verdict reported: {reported}"
+    assert reported["ISOLATION-LEAKED"] == "[]", (
+        "fin.corpus.ocr leaked pytesseract on import: "
+        f"{reported['ISOLATION-LEAKED']}"
     )
-    assert leaked == [], (
-        f"fin.corpus.ocr leaked pytesseract on import: {leaked}"
-    )
+
+    if reported["ISOLATION-AVAILABLE"] == "True":
+        # The control must prove the scan is capable of seeing pytesseract
+        # in this interpreter, or the empty leak list means nothing.
+        assert reported["ISOLATION-CONTROL"] != "not-installed"
+        assert "'pytesseract'" in reported["ISOLATION-CONTROL"], (
+            "the positive control did not load pytesseract, so the empty "
+            f"leak list is not evidence: {reported['ISOLATION-CONTROL']}"
+        )
 
 
 def test_tesseract_engine_raises_typed_when_pytesseract_missing(

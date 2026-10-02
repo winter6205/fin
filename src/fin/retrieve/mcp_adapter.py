@@ -134,10 +134,18 @@ from fin.retrieve.mcp_session import (
     MCPStdioSession,
 )
 from fin.retrieve.port import (
+    DATABASE_ROWS_KEY,
+    DATABASE_ROWS_ROWS_FIELD,
     RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY,
+    RETRIEVE_OUTCOME_SQL_NO_MATCHING_ROWS,
     SEARCH_MODE_FILTER_KEY,
+    SQL_WINDOW_END_FILTER_KEY,
+    SQL_WINDOW_START_FILTER_KEY,
     TierUnavailableError,
+    database_rows_of,
+    new_database_rows,
     resolve_search_mode,
+    resolve_sql_window,
 )
 from fin.retrieve.read_port import validate_company_source_ref
 from fin.retrieve.source_read import (
@@ -152,7 +160,11 @@ from fin.retrieve.source_read import (
     serialized_result_bytes,
     source_error,
 )
-from fin.retrieve.tiers import COMMUNITY_SUMMARY_INDEX_FAILURE
+from fin.retrieve.tiers import (
+    COMMUNITY_SUMMARY_INDEX_FAILURE,
+    SQL_NO_MATCHING_ROWS,
+    SQL_PRODUCER_FAILURE_CODES,
+)
 
 
 _DEFAULT_LIMIT = 8
@@ -508,30 +520,30 @@ def _named_error_code_of_body(body: object) -> str | None:
     return code if isinstance(code, str) else None
 
 
-def _is_community_summary_not_ready(result: dict[str, Any]) -> bool:
-    """Whether an MCP ``tools/call`` result is the global 综述 report arm's
-    typed community-summary not-ready refusal.
+def _structured_is_error_code(result: dict[str, Any]) -> str | None:
+    """The named code an MCP ``tools/call`` refusal carries, if any.
 
-    The upstream surfaces it as an ``isError`` result whose first text
-    content block carries the JSON body ``{error:
-    "community_summary_index_failure", message: <prose>}``, and the
-    structured field is the whole name: the code is read off the decoded
-    body with the same field read the ``read_source`` miss body uses, never
-    searched for in the message, because a transport fault is free to
-    quote the token in its own prose. A refusal so named is a RECORDED job
-    fact about the report index — distinct from a transport fault (which
-    carries no such field and must stay ``retrieve_unavailable``) and from
-    a legal empty hit (which is not an error at all).
+    Every structured refusal this adapter reads projects its code the
+    same way — an ``isError`` result whose FIRST text content block
+    decodes to a JSON body with a string ``error`` field (the global 综述
+    report-index refusal, the sql 档's producer failure vocabulary) — so
+    the field is read here once and no caller matches a code against
+    prose. The producer declares its sql tokens exactly this way (spec
+    search-mode-business-sql-contract §7.1: an UNTOKENED failure is a
+    dead-server reading, and this reader is what keeps the two apart).
 
-    Only the FIRST text block is judged: a body that will not decode is a
-    decisive miss for this result, so the scan stops there instead of
-    treating later blocks as candidate envelopes.
+    ``None`` means "this refusal names no code": a non-error result, an
+    empty / non-leading-text content list, text that will not decode, or
+    a body without a string ``error`` field. Only the FIRST text block
+    is judged — a body that will not decode is a decisive miss for this
+    result, so the scan stops there instead of treating later blocks as
+    candidate envelopes.
     """
     if result.get("isError") is not True:
-        return False
+        return None
     content = result.get("content")
     if not isinstance(content, list):
-        return False
+        return None
     for block in content:
         if not isinstance(block, Mapping) or block.get("type") != "text":
             continue
@@ -542,14 +554,70 @@ def _is_community_summary_not_ready(result: dict[str, Any]) -> bool:
             body = json.loads(text)
         except ValueError as exc:
             logger.debug(
-                "community-summary error text is not JSON: %s",
+                "structured error text is not JSON: %s",
                 exc,
             )
-            return False
-        return (
-            _named_error_code_of_body(body) == COMMUNITY_SUMMARY_INDEX_FAILURE
-        )
-    return False
+            return None
+        return _named_error_code_of_body(body)
+    return None
+
+
+def _is_community_summary_not_ready(result: dict[str, Any]) -> bool:
+    """Whether an MCP ``tools/call`` result is the global 综述 report arm's
+    typed community-summary not-ready refusal.
+
+    The structured read itself is the shared :func:`_structured_is_error_code`;
+    this is the one call that asks whether the named code is the summary
+    index's. The code is read off the decoded body, never searched for in
+    the message, because a transport fault is free to quote the token in
+    its own prose. A refusal so named is a RECORDED job fact about the
+    report index — distinct from a transport fault (which carries no such
+    field and must stay ``retrieve_unavailable``) and from a legal empty
+    hit (which is not an error at all).
+    """
+    return _structured_is_error_code(result) == COMMUNITY_SUMMARY_INDEX_FAILURE
+
+
+def _rows_present(result: dict[str, Any]) -> bool:
+    """Whether the business envelope carries at least one readable row.
+
+    The degraded-release rule (「降级但有结果就放行」) counts rows as
+    results the same way it counts chunks: a sql answer of only rows
+    must not collapse into 「降级但没有可用结果」. The sibling is the E1
+    row object — presence is judged on its ``rows`` list — and an entry
+    that is not a mapping still passes this gate: the release decision
+    does not depend on mapping succeeding first, and a sibling whose
+    shape fails the validator is named as a contract failure where the
+    sibling is consumed below, not silently un-released here.
+    """
+    rows = database_rows_of(result.get(DATABASE_ROWS_KEY))
+    return bool(rows)
+
+
+def _database_rows_ingress_refusal(sibling: Mapping[str, Any]) -> str | None:
+    """The §6 code the evidence validator refuses this row object with,
+    or ``None`` when its shape holds.
+
+    WHY the import is local: the validator lives in ``fin.host``, whose
+    package chain imports back into ``fin.retrieve.mcp_adapter``, so a
+    top-level import here closes a retrieve↔host import cycle. The
+    call-in itself is the contract — shape judgment has a single home
+    and is never duplicated at this ingress, and the self-seed posture
+    (including its never-hash rule) is the home's
+    :func:`seed_context_from_rows`, not a copy of it here.
+    """
+    from fin.host.evidence_contract import (
+        seed_context_from_rows,
+        validate_evidence,
+    )
+
+    claimed = sibling.get(DATABASE_ROWS_ROWS_FIELD)
+    rows = claimed if isinstance(claimed, list) else ()
+    context = seed_context_from_rows(database_row_values=rows)
+    validation = validate_evidence({DATABASE_ROWS_KEY: sibling}, context)
+    if validation.refusal is None:
+        return None
+    return validation.refusal.code
 
 
 # ----- adapter -----
@@ -668,6 +736,8 @@ class MCPRetrieveAdapter:
         filing_date: str | None = None,
         limit: int = 8,
         search_mode: str | None = None,
+        sql_window_start: str | None = None,
+        sql_window_end: str | None = None,
     ) -> dict[str, Any]:
         """Sync retrieve: returns ``{"chunks": [...]}`` or
         ``{"error": "retrieve_unavailable"}``.
@@ -677,6 +747,11 @@ class MCPRetrieveAdapter:
         there instead (T21 — invalid input is not a miss, and the
         typed error travels out of this seam rather than being
         flattened into an envelope the model reads as "no hits").
+        A ``sql`` request whose expiry window is missing or malformed
+        raises ``InvalidBusinessQueryError`` there too — the same exit
+        the producer names before a connection exists, and it travels
+        out of this seam for the host's input-error handling rather
+        than starting a round trip fin cannot bind.
         Any MCP transport / protocol failure surfaces as
         ``{"error": "retrieve_unavailable"}`` (no BM25
         fallback). A 档 that is legal but not open on this port
@@ -694,6 +769,8 @@ class MCPRetrieveAdapter:
                     filing_date=filing_date,
                     limit=limit,
                     search_mode=search_mode,
+                    sql_window_start=sql_window_start,
+                    sql_window_end=sql_window_end,
                 )
             )
         except RetrieveUnavailableError as exc:
@@ -804,6 +881,8 @@ class MCPRetrieveAdapter:
         filing_date: str | None = None,
         limit: int = 8,
         search_mode: str | None = None,
+        sql_window_start: str | None = None,
+        sql_window_end: str | None = None,
     ) -> dict[str, Any]:
         """Async retrieve: raises ``RetrieveUnavailableError``
         on transport failure; ``retrieve`` translates that to
@@ -813,7 +892,11 @@ class MCPRetrieveAdapter:
         ``InvalidSearchModeError`` and an unopened one raises
         ``TierUnavailableError`` — both BEFORE any round trip, so an
         illegal or unopened 档 never starts a silent default-B
-        retrieve.
+        retrieve. A ``sql`` 档 request without a bindable window
+        raises ``InvalidBusinessQueryError`` at the same pre-transport
+        seam — the producer refuses the same name before it connects,
+        and a window fin invented would be a query the operator never
+        asked.
 
         Tests subclass and override ``_call_mcp`` for scripted
         transport. The default transport launches a subprocess.
@@ -827,6 +910,15 @@ class MCPRetrieveAdapter:
         # round-trip like every other invalid input (the raise is the
         # named EXIT; ``retrieve`` maps the 未开 codes to error dicts).
         effective_search_mode = resolve_search_mode(search_mode)
+        # The sql 档's expiry window: required for sql, absent for every
+        # document 档 (which resolves to None and never learns the filter
+        # keys). Refused before the transport for the same reason the
+        # producer refuses: without a bindable window the permitted
+        # query cannot be built at all, and a defaulted window would be
+        # a question the operator never asked.
+        effective_window = resolve_sql_window(
+            effective_search_mode, sql_window_start, sql_window_end
+        )
         # Empty / whitespace document_id filter: miss shape.
         if document_id is not None and not document_id.strip():
             return {"chunks": []}
@@ -886,6 +978,13 @@ class MCPRetrieveAdapter:
         # null.
         if effective_search_mode is not None:
             filters[SEARCH_MODE_FILTER_KEY] = effective_search_mode
+        # The sql 档's bound window rides beside its 档 token (validated
+        # above — reaching here means the pair is bindable). Document 档
+        # resolve to ``None`` and the keys are never sent: the wire the
+        # document path sees stays byte-identical.
+        if effective_window is not None:
+            filters[SQL_WINDOW_START_FILTER_KEY] = effective_window[0]
+            filters[SQL_WINDOW_END_FILTER_KEY] = effective_window[1]
         if filters:
             arguments["filters"] = filters
 
@@ -960,16 +1059,35 @@ class MCPRetrieveAdapter:
                     f"MCP returned non-dict result: {result!r}",
                     envelope_signal,
                 )
-        # A global 综述 report-index not-ready refusal is a recorded job
-        # fact, not a transport fault: hand back the empty-plus-flag
-        # envelope so the host names the summary-index failure for the
-        # operator instead of letting the content-block unwrap below
-        # collapse it into ``retrieve_unavailable``.
-        if _is_community_summary_not_ready(result):
+        # A named refusal on the structured field is its own fact, read
+        # once here and dispatched by name — never re-typed by prose.
+        #   * the global 综述 report-index miss is a RECORDED job fact
+        #     (empty chunks plus the flag) so the host names the summary
+        #     index for the operator;
+        #   * the sql 档's zero-row exit is the sibling RECORDED job
+        #     fact: the permitted query RAN and matched no row, which is
+        #     「数据库没这行」— not 「语料没东西」 and not an outage
+        #     (spec §7 keeps the three advice sets apart);
+        #   * the rest of the declared sql failure vocabulary (not
+        #     provisioned / denied / timeout / unverified / unbound
+        #     request) is a typed EXIT dict under its OWN name — retry
+        #     advice for a denied read differs from an outage's, and an
+        #     untokened prose error matches no set here and stays the
+        #     ``retrieve_unavailable`` reading it is.
+        named_refusal = _structured_is_error_code(result)
+        if named_refusal == COMMUNITY_SUMMARY_INDEX_FAILURE:
             return {
                 "chunks": [],
                 RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY: True,
             }
+        if named_refusal == SQL_NO_MATCHING_ROWS:
+            return {
+                "chunks": [],
+                DATABASE_ROWS_KEY: new_database_rows([]),
+                RETRIEVE_OUTCOME_SQL_NO_MATCHING_ROWS: True,
+            }
+        if named_refusal in SQL_PRODUCER_FAILURE_CODES:
+            return {"error": named_refusal}
         # Variant 3: content-block envelope. Unwrap only when the
         # block carries neither the canonical ``chunks`` key nor the
         # legacy ``hits`` key — otherwise the block's ``content`` key
@@ -1039,7 +1157,7 @@ class MCPRetrieveAdapter:
                 f"chunks={canonical_chunks!r}, hits={legacy_hits!r}",
                 signal,
             )
-        if signal.degraded and not chunks:
+        if signal.degraded and not chunks and not _rows_present(result):
             raise _unavailable(
                 "MCP returned a degraded response without usable chunks",
                 signal,
@@ -1047,7 +1165,34 @@ class MCPRetrieveAdapter:
         # A degraded response with results is 放行 (§B2 第 1 条) — but it
         # travels with its flag, so the host can record the reasons and
         # tell the user this answer is not a complete one.
-        return {"chunks": list(chunks), **signal.as_envelope_fields()}
+        envelope: dict[str, Any] = {
+            "chunks": list(chunks),
+            **signal.as_envelope_fields(),
+        }
+        # The row sibling (spec §8.0, E1 envelope contract §4.4):
+        # ``database_rows`` rides BESIDE ``chunks``, never inside it — a
+        # row is not a passage and the Chunk/Locator types stay untouched.
+        # The value is the E1 row OBJECT ``{schema, rows, result_count}``.
+        # A PRESENT row object goes through the structural evidence
+        # validator before anything is consumed: a §3/§6 violation is
+        # the named contract failure on the wire, never the silent
+        # absent-sibling and never a half-read result (the closed-set
+        # judgment lives in the validator, not duplicated here). The
+        # obsolete bare-array shape is not a row object, so it keeps
+        # today's frozen reading: consumed as if the key were absent.
+        # The key is ABSENT whenever the wire did not carry it (every
+        # document-档 envelope stays byte-identical). A conforming
+        # sibling passes through with the producer's own ``schema`` /
+        # ``result_count`` intact — re-authoring the producer's numbers
+        # here would hide exactly the drift the validator must be able
+        # to see.
+        raw_rows = result.get(DATABASE_ROWS_KEY)
+        if isinstance(raw_rows, Mapping):
+            refused = _database_rows_ingress_refusal(raw_rows)
+            if refused is not None:
+                return {"error": refused}
+            envelope[DATABASE_ROWS_KEY] = dict(raw_rows)
+        return envelope
 
     # ----- transport (test seam) -----
 

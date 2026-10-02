@@ -252,8 +252,9 @@ def _parts_bounded(detail: VisualDetail) -> bool:
 
 def _requested_crop(
     scope: tuple[float, float, float, float] | None,
-) -> VisionCrop | str:
-    """The region the question names, or the typed refusal for a bad one.
+) -> VisionCrop | str | None:
+    """The region the question names, the typed refusal for a bad one,
+    or ``None`` for the whole-page ask that has no region at all.
 
     ``VisionCrop`` is the one bound-checking shape, so nothing is validated
     twice here; a malformed region refuses before a page is drawn or a call
@@ -704,6 +705,10 @@ def _inspect(
     # The coverage this call grants is exactly the region it sent: a crop
     # answer grants its own bounds and nothing wider, so a later turn asking
     # for a larger region cannot read a narrower observation as answering it.
+    # The caller's unwired guard already refused either face; the assert
+    # restates that invariant here so the checker sees the same promise
+    # (same convention as :func:`_render` above).
+    assert faces.vision is not None and faces.ledger is not None
     scope = cut.crop if cut is not None else None
     try:
         return inspect_for_details(

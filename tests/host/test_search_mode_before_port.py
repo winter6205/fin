@@ -23,9 +23,10 @@ what is asserted is the TOKEN a call carries, never how iknow ranks
   and every call the port records carries exactly that lasting token.
 * ``test_a_pinned_letter_is_a_named_exit_and_routes_nothing`` — the same
   seam an old client used to pin with a letter.
-* ``test_an_unopened_ask_names_its_token_and_starts_no_letter`` — a plan
-  slot is named as its lasting token on every audit field, so the trail and
-  the seam agree.
+* ``test_a_newly_opened_ask_assigns_its_token_and_starts_no_letter`` —
+  the plan slot that #322 T7 opened (``sql``) now reads as a plain
+  assignment on every audit field, and the typed-fail shape no longer
+  fires for ANY closed-set naming.
 * ``test_the_value_handed_to_the_port_is_never_a_letter`` — the port
   seam's own view of what normalization produces.
 """
@@ -43,7 +44,7 @@ from fin.host.agent_instructions import SEARCH_MODE_INSTRUCTIONS_MARKER
 from fin.host.graph import compile_graph
 from fin.host.named_failures import (
     LASTING_RETRIEVE_TIERS,
-    REAL_DB_NOT_WIRED,
+    TIER_UNAVAILABLE_CODE,
 )
 from fin.host.search_mode_decision import (
     decide_search_mode,
@@ -66,17 +67,22 @@ KNOWN_IDS = {"AAPL-2022Q3"}
 # Every spelling a request can arrive with for each OPENED 档: the lasting
 # token, a case variant, and the CONTEXT label an utterance names it with.
 # ``global`` joined this set when fin task 4 opened 综述 into a real report
-# arm, so it now routes its token to the port exactly like graph/lexical.
+# arm; ``sql`` joined it at #322 T7 (commit 6e8ed97), when 真数据库 became a
+# real arm too — every lasting token in the closed set now routes itself to
+# the port, and no plan slot is left to refuse (``TIER_UNAVAILABLE_CODE``
+# is empty; the mechanism stays for a future slot).
 OPENED_SPELLINGS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("graph", ("graph", "GRAPH", "知识问答")),
     ("lexical", ("lexical", "LEXICAL", "查找")),
     ("global", ("global", "Global", "综述")),
+    ("sql", ("sql", "SQL", "真数据库")),
 )
-# The same for each plan slot, with the 具名失败 its name must yield. Only
-# ``sql`` (真数据库) is still a plan slot after global was opened.
-UNOPENED_SPELLINGS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("sql", REAL_DB_NOT_WIRED, ("sql", "SQL", "真数据库")),
-)
+# Formerly the unopened plan slot with the 具名失败 its name yielded
+# (``("sql", REAL_DB_NOT_WIRED, ...)``); #322 T7 moved sql into
+# OPENED_SPELLINGS and this set is EMPTY — the typed-fail entry point
+# below keeps testing it as a NEGATIVE invariant (nothing in the closed
+# set can produce it).
+UNOPENED_SPELLINGS: tuple[tuple[str, str, tuple[str, ...]], ...] = ()
 # A pin is a WIRE field, so only its token spellings can arrive; the
 # CONTEXT label is an utterance form the pin seam never sees.
 PIN_SPELLINGS: tuple[str, ...] = ("graph", "GRAPH")
@@ -215,35 +221,40 @@ def test_an_assigned_tier_records_its_token_before_retrieve(
         ), (spelling, blocks)
 
 
-@pytest.mark.parametrize(
-    "lasting, code, spellings",
-    UNOPENED_SPELLINGS,
-    ids=[lasting for lasting, _, _ in UNOPENED_SPELLINGS],
-)
-def test_an_unopened_ask_names_its_token_and_starts_no_letter(
-    lasting: str, code: str, spellings: tuple[str, ...]
-) -> None:
-    """A plan slot assigns nothing — but the refusal the operator can read
-    names the LASTING token, and no retired letter appears anywhere in the
-    trail the port would have been handed."""
-    for spelling in spellings:
-        out, port, _model = _run(_utterance(spelling))
+def test_a_newly_opened_ask_assigns_its_token_and_starts_no_letter() -> None:
+    """Flipped by #322 T7 (commit 6e8ed97): the old case pinned the
+    ``sql`` utterance as ``typed_fail`` + ``failure_code=real_db_not_wired``
+    + ``search_mode=None`` handed to the port. The 档 is open now, so
+    naming it ASSIGNS it — the audit reads the lasting token on every
+    field — and the typed-fail shape is kept as a NEGATIVE invariant:
+    with the refusal table empty, no closed-set naming anywhere (token,
+    case variant, or CONTEXT label) can produce ``typed_fail``, a failure
+    code, a substitute 档, or a retired letter in the trail."""
+    assert UNOPENED_SPELLINGS == ()
+    assert TIER_UNAVAILABLE_CODE == {}
 
-        audit = out["search_mode_decision"]
-        assert audit["decision_tier"] == "typed_fail", spelling
-        assert audit["failure_code"] == code, spelling
-        assert audit["search_mode"] is None
-        assert audit["signals"].get("requested_mode") == lasting
-        assert not _retired_letter_in(audit)
-        # POSITIVE: nothing was assigned, so the hop sends NO 档 — and it
-        # must not smuggle the unopened 档 onto the wire either.
-        assert port.calls, "the scripted retrieve still reached the port"
-        assert [call["search_mode"] for call in port.calls] == [None] * len(
-            port.calls
-        ), [call["search_mode"] for call in port.calls]
-        assert all(
-            call["search_mode"] not in RETIRED_LETTERS for call in port.calls
-        )
+    for lasting, _spellings in OPENED_SPELLINGS:
+        for spelling in _spellings:
+            out, port, _model = _run(_utterance(spelling))
+
+            audit = out["search_mode_decision"]
+            assert audit["decision_tier"] == "rules", spelling
+            assert audit["search_mode"] == lasting, spelling
+            assert audit["failure_code"] is None, spelling
+            assert not _retired_letter_in(audit)
+            assert port.calls, "the grounded retrieve must have reached the port"
+            # POSITIVE: the assigned 档 IS the value the port was handed —
+            # never ``None`` (that was the refusal shape) and never some
+            # other 档 (the substitute trap).
+            assert [
+                call["search_mode"] for call in port.calls
+            ] == [lasting] * len(port.calls), [
+                call["search_mode"] for call in port.calls
+            ]
+            assert all(
+                call["search_mode"] not in RETIRED_LETTERS
+                for call in port.calls
+            )
 
 
 @pytest.mark.parametrize("spelling", PIN_SPELLINGS)
@@ -317,6 +328,7 @@ def test_the_value_handed_to_the_port_is_never_a_letter() -> None:
         ("graph", ("graph", "GRAPH", " graph ")),
         ("lexical", ("lexical", "LEXICAL")),
         ("global", ("global", "Global", " global ")),
+        ("sql", ("sql", "SQL", " sql ")),
     ):
         for spelling in spellings:
             resolved = normalize_search_mode(spelling)
@@ -325,13 +337,20 @@ def test_the_value_handed_to_the_port_is_never_a_letter() -> None:
 
     assert resolve_search_mode(normalize_search_mode("GRAPH")) == "graph"
     assert resolve_search_mode(normalize_search_mode("GLOBAL")) == "global"
-    for lasting, code, _spellings in UNOPENED_SPELLINGS:
+    # Every closed-set token — ``sql`` included since #322 T7 opened it
+    # (the old pin asserted a ``TierUnavailableError`` carrying
+    # ``real_db_not_wired`` for it) — crosses the seam as itself. The
+    # refusal class stays as machinery for a future plan slot; with the
+    # table empty it has no reachable raise site, which is what the loop
+    # below proves by resolving ALL FOUR tokens without ever catching it.
+    assert TIER_UNAVAILABLE_CODE == {}
+    for token in LASTING_RETRIEVE_TIERS:
         try:
-            resolve_search_mode(normalize_search_mode(lasting))
-        except TierUnavailableError as exc:
-            assert exc.code == code, lasting
-        else:
-            raise AssertionError(f"{lasting} accepted as an open 档")
+            assert resolve_search_mode(token) == token, token
+        except TierUnavailableError as exc:  # pragma: no cover - the trap
+            raise AssertionError(
+                f"{token} still refused at the seam: {exc.code}"
+            ) from exc
 
     # And the seam keeps its own name for a letter that arrives UN-normalized:
     # the closed set is all the port forwards, so a leftover letter is a

@@ -62,7 +62,7 @@ Routes
                                           citation bundle as a file
                                           download (T4 workflow, #138).
                                           Comparison exports bind to
-                                          ``fin.comparison.v1``; a
+                                          ``fin.comparison``; a
                                           missing run is a typed 404.
 * ``POST   /api/threads/{id}/runs/{run_id}/feedback``
                                        - the operator's thumbs
@@ -167,11 +167,11 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final, Iterator, Literal
+from typing import Any, Final, Iterator, Literal, Protocol, cast
 
 from fastapi import (
     APIRouter,
@@ -194,7 +194,13 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langgraph.types import Command
-from pydantic import BaseModel, Field
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    model_serializer,
+    model_validator,
+)
 
 from fin.corpus.catalog import list_filings, record_filings
 from fin.corpus.errors import (
@@ -253,11 +259,26 @@ from fin.host.attachment_store import (
 from fin.host.attachment_vision import ChatModelVisionAdapter
 from fin.host.citation_gate import (
     COMPANY_KIND,
+    DATABASE_ROW_KIND,
+    DATABASE_ROW_SNAPSHOT_KEY,
     HIDDEN_BOUNCE_MARKER,
-    QUOTABLE_EVIDENCE_KINDS,
+    database_row_snapshot,
     strip_hidden_bounce_marker,
 )
 from fin.host.collection_bind import resolve_bound_collection_name
+from fin.host.evidence_contract import (
+    CITATION_CHANNEL_SCHEMA,
+    DATABASE_ROW_SNAPSHOT_SCHEMA,
+    EVIDENCE_SCHEMA_VERSION,
+    EVIDENCE_SCHEMA_VERSION_FIELD,
+    MALFORMED_EVIDENCE_CONTRACT,
+    MAX_CITATIONS_PER_RUN,
+    UNSUPPORTED_EVIDENCE_CONTRACT,
+    VISUAL_CLAIM_SCHEMA,
+    AdmissionContext,
+    seed_context_from_rows,
+    validate_evidence,
+)
 from fin.host.export import (
     ExportError,
     MalformedCitationRowError,
@@ -310,14 +331,15 @@ from fin.host.stream_map import (
 from fin.host.run_control import RunControl, StopToken
 from fin.host.state import reset_input_state
 from fin.host.thread_store import (
+    PersistenceUnavailableError,
     RunRecord,
     ThreadNotFoundError,
     ThreadRecord,
     ThreadStore,
+    project_stored_citation,
 )
 from fin.host.visual_evidence import (
     VISUAL_CLAIM_FIELDS,
-    VISUAL_EVIDENCE_KIND,
 )
 from fin.host.watchlist import (
     InvalidWatchError,
@@ -335,6 +357,7 @@ from fin.retrieve.invalidation_port.errors import InvalidationError
 from fin.retrieve.invalidation_port.ledger import InvalidationLedger
 from fin.retrieve.push_batching import PushJournal
 from fin.retrieve.push_port import PushError
+from fin.retrieve.source_read import ATTACHMENT_KIND
 
 
 logger = logging.getLogger(__name__)
@@ -844,28 +867,80 @@ class CitationPayload(BaseModel):
     for an attachment row whose ``filename`` is the safe display name),
     and ``display`` says how ``unit`` is presented.
 
-    The ``kind`` / ``display`` defaults serve the turn-table read only
-    (one stored row must not blank the operator's whole history); the
-    SSE wire never leans on them, because
-    :func:`_citations_wire_payload` reads both fields off the row and
-    drops a row that cannot carry them.
+    A ``database-row`` citation sets NEITHER document id: a ledger row
+    has no filing behind it, and naming one would point the citation at a
+    document the query never read. Its own id rides ``database_row``
+    (``source`` plus ``record_key``), its ``version`` is its
+    ``queried_at``, and the retained snapshot it opens is the same key.
+
+    WHY no field default is allowed on the eight slots: stored rows span
+    three writer generations in ``fin_run.citations`` JSONB, and permissive
+    per-field defaults used to paper over a corrupt row (one naming both a
+    ``page`` and a ``unit`` decoded as if nothing was wrong). A row is now
+    read through :func:`fin.host.thread_store.project_stored_citation`, the
+    frozen legacy-shape matcher: it fills only the defaults that are facts
+    of that shape (absent ``kind`` -> the document kind while no lane
+    marker rides the row, a ``page`` read as ``unit``, absent ``display``
+    -> ``page``), and any row that matches no frozen shape is refused here.
+    The history read surfaces such a row as a per-record
+    ``TurnRow.rejected_citations`` entry, and the SSE wire names the
+    same per-row outcome through :func:`_citations_wire_projection` —
+    no silent drops on either surface.
     """
 
-    kind: str = "company"
+    kind: str
     document_id: str
-    attachment_id: str = ""
+    attachment_id: str
     version: str
-    # WHY 0 and not a required field: ``fin_run.citations`` is JSONB and the
-    # ``page`` -> ``unit`` rename carried no migration, so rows written
-    # before it are still in the database. Requiring ``unit`` would make
-    # every such thread's history GET fail validation and answer 500 — one
-    # stale row blanking every turn in the thread. The history read is the
-    # one place that must tolerate them; the SSE wire does not, because
-    # :func:`_citations_wire_payload` drops a row it cannot project.
-    unit: int = 0
-    display: str = "page"
-    filename: str = ""
+    unit: int
+    display: str
+    filename: str
     quote: str
+    # The ledger row this citation opens, or ``None`` for a document
+    # kind. Optional and dumped with ``exclude_none`` so a company or
+    # attachment row's wire dict keeps EXACTLY the keys it had before the
+    # third kind existed — the snapshot is what a row needs, and asking
+    # every stored filing citation to carry one would be a migration
+    # nothing here can do.
+    database_row: dict[str, Any] | None = None
+
+    # ONE mechanism for the omit-null rule, shared by BOTH doors (the
+    # same field-level seam ``fin.host.http.CitationSchema`` uses after
+    # repair 016c342): the SSE dump, the turn-table dict, and — crucially
+    # — FastAPI's ``response_model`` re-encode of ``ThreadDetailResponse``
+    # all serialize through the model layer, so the key is dropped in
+    # exactly one place. Without it the response model re-added
+    # ``"database_row": null`` to every company / attachment row on
+    # history GET while the stream omitted the key, and the web decoder
+    # (spec §2: the sibling is present ONLY for a database-row) refused
+    # a perfectly good citation after reload.
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: Any) -> Any:
+        out = handler(self)
+        if isinstance(out, dict) and out.get("database_row") is None:
+            out.pop("database_row", None)
+        return out
+
+    @model_validator(mode="before")
+    @classmethod
+    def _match_frozen_stored_shape(cls, data: Any) -> Any:
+        projected = project_stored_citation(data)
+        if projected is None:
+            raise ValueError(UNSUPPORTED_EVIDENCE_CONTRACT)
+        return projected
+
+
+class RejectedCitationPayload(BaseModel):
+    """One stored citation the history read refused, named per record.
+
+    ``citation_index`` is the row's position in the run's stored list.
+    The refusal is visible and typed — the corrupt record can neither
+    blank the turn nor vanish from it, and the rest of the history
+    still serves.
+    """
+
+    citation_index: int
+    error: str
 
 
 class ToolSummaryPayload(BaseModel):
@@ -897,6 +972,13 @@ class TurnRow(BaseModel):
     status_reason: str = ""
     answer: str = ""
     citations: list[CitationPayload] = Field(default_factory=list)
+    # Stored rows that match no frozen shape arrive here, named
+    # per-record with their original index: a corrupt row is visible
+    # and typed instead of blanking the turn (or being silently
+    # dropped from it).
+    rejected_citations: list[RejectedCitationPayload] = Field(
+        default_factory=list
+    )
     thinking_text: str = ""
     # T4 (#37, spec line 31): total thinking duration in ms. Drives
     # the post-run one-line collapse label ("Thought for 4.2s");
@@ -921,7 +1003,7 @@ class TurnRow(BaseModel):
     # a 401 / 429 / 504 reads distinctly instead of as one opaque
     # English sentence.
     status_classified: str = ""
-    # T3 (enterprise-kb Focus 1 / SC2): the ``fin.comparison.v1``
+    # T3 (enterprise-kb Focus 1 / SC2): the ``fin.comparison``
     # envelopes this run's ``compare_facts`` calls produced. The
     # turn renders a TABLE off this field rather than re-parsing a
     # prose table out of ``answer``. Untyped nested JSON on purpose
@@ -1052,6 +1134,23 @@ class ThreadDetailResponse(BaseModel):
     # the payload dict, so the response model must declare it or
     # FastAPI filters the key off the wire.
     pending_interrupt_kind: str | None = None
+    # Spec 2.2 rule 2 (E5): the history envelope declares its citation
+    # channel once, so a client decodes the turns' citations against a
+    # named version rather than a guess. The token names the shape; the
+    # version is its explicit integer sibling. Both are frozen
+    # constants; undeclared here, FastAPI would filter them off the wire.
+    # WHY the field is named ``schema_version`` and NOT
+    # ``evidence_schema_version``: the WEB KEY IS THE CONTRACT, and one
+    # key name per fact is the whole point of the split (ADR 0093
+    # decision 2). Every other carrier of this same pair — the SSE status
+    # frame (:1685), the terminal frames, and every JSON Schema
+    # ``required`` list in the evidence home — spells the version
+    # ``schema_version`` beside whatever ``schema``/``evidence_schema``
+    # names the shape, so a differently-spelled field here would make the
+    # history envelope the one carrier the web decoder cannot read, and
+    # the version check would never fire on ``GET /api/threads/{id}``.
+    evidence_schema: str = CITATION_CHANNEL_SCHEMA
+    schema_version: int = EVIDENCE_SCHEMA_VERSION
     # T3 (ADR 0044): token occupancy from the SAME figure the
     # compaction gate computes (``graph.occupancy(thread_id)`` ->
     # ``OccupancyCompactor.occupancy`` over the checkpointed
@@ -1109,13 +1208,86 @@ def _serialize_run(
     from the feedback store (one ``list_feedback()`` for the whole
     turn table, not a query per row).
     """
+    # WHY the accepted/rejected split happens here, and WHY every
+    # refusal is named by the decision the row actually failed (review
+    # item: one authority): the history read re-uses the SAME two
+    # authorities the write and wire boundaries use — the frozen v0
+    # projection (shape mismatch = ``unsupported``) and the validator
+    # home (content/serialization = its exact §6 code) — so a reload
+    # and a live stream can never report two different codes for one
+    # corrupt row and the web's ``(index, code)`` refusal fold dedups
+    # them into one visible outcome.
+    accepted_citations: list[dict[str, Any]] = []
+    rejected_citations: list[dict[str, Any]] = []
+    for index, row in enumerate(run.citations):
+        projected = project_stored_citation(row)
+        if projected is None:
+            logger.warning(
+                "turn table: refused stored citation row %d of run %s "
+                "(unsupported_evidence_contract: matches no frozen shape)",
+                index,
+                run.id,
+            )
+            rejected_citations.append(
+                {"citation_index": index, "error": UNSUPPORTED_EVIDENCE_CONTRACT}
+            )
+            continue
+        try:
+            dumped = CitationPayload.model_validate(projected).model_dump(
+                exclude_none=True
+            )
+        except ValidationError:
+            # The projection passed but the payload cannot be built: the
+            # same serialization-failure class the SSE wire names
+            # ``malformed``, never a second vocabulary.
+            logger.warning(
+                "turn table: refused stored citation row %d of run %s "
+                "(malformed_evidence_contract on serialization)",
+                index,
+                run.id,
+            )
+            rejected_citations.append(
+                {"citation_index": index, "error": MALFORMED_EVIDENCE_CONTRACT}
+            )
+            continue
+        if dumped.get("kind") == DATABASE_ROW_KIND:
+            # Replay applies the v0 KEY-SET projection only; a
+            # lane-marked v1 row's CONTENT (bad snapshot timestamp,
+            # mirror mismatch, §3 overflow) stays unverified without
+            # this re-run. The wire candidate mints the frozen snapshot
+            # token the same way the live frame does, so a pre-E5
+            # stored snapshot replays instead of being refused for a
+            # token its generation never owed.
+            candidate = _citation_row_candidate(row)
+            outcome = validate_evidence(
+                {
+                    "evidence_schema": CITATION_CHANNEL_SCHEMA,
+                    EVIDENCE_SCHEMA_VERSION_FIELD: EVIDENCE_SCHEMA_VERSION,
+                    "citations": [candidate],
+                },
+                _wire_admission_context([candidate]),
+            )
+            if not outcome.accepted and outcome.refusal is not None:
+                logger.warning(
+                    "turn table: refused stored ledger citation row %d "
+                    "of run %s (%s)",
+                    index,
+                    run.id,
+                    outcome.refusal.code,
+                )
+                rejected_citations.append(
+                    {"citation_index": index, "error": outcome.refusal.code}
+                )
+                continue
+        accepted_citations.append(dumped)
     return {
         "run_id": run.id,
         "question": run.question,
         "status": run.status,
         "status_reason": run.status_reason,
         "answer": run.answer,
-        "citations": list(run.citations),
+        "citations": accepted_citations,
+        "rejected_citations": rejected_citations,
         "thinking_text": run.thinking_text,
         "thinking_duration_ms": run.thinking_duration_ms,
         # T3 shape: one {name, summary, tool_call_id} dict per
@@ -1256,7 +1428,7 @@ def _node_frame_payloads(
     * ``ToolMessage`` -> one ``tool_result`` frame with the
       human-readable summary (never the raw JSON payload), plus —
       for ``compare_facts`` only — one ``comparison`` frame
-      carrying the ``fin.comparison.v1`` envelope (T3). That
+      carrying the ``fin.comparison`` envelope (T3). That
       envelope is the sole structured payload on this wire: it is
       tool-computed data, not model prose, and the live view
       renders it as a table before the answer arrives. A typed
@@ -1520,6 +1692,8 @@ def _stream_run_frames(
                 "assistant_message": user_copy,
                 "status_classified": kind,
                 "thinking_ms": clock.total_ms,
+                "evidence_schema": CITATION_CHANNEL_SCHEMA,
+                EVIDENCE_SCHEMA_VERSION_FIELD: EVIDENCE_SCHEMA_VERSION,
             },
         )
         # Flush pending bounce reset on the terminal empty answer
@@ -1527,7 +1701,7 @@ def _stream_run_frames(
         yield _format_sse(
             "answer", _answer_payload(strip_thinking_from_answer(""))
         )
-        yield _format_sse("citations", _citations_wire_payload([]))
+        yield _format_sse("citations", [])
         clock.close()
         return RunStreamOutcome(
             final_state=None,
@@ -1641,8 +1815,9 @@ def _resume_run_stream(
     payload = _run_to_response_payload(outcome.final_state)
     # ADR 0089: the resumed remainder's visual claims, read off the final
     # state (own channel, not the citation payload) and normalised once so
-    # the row and the frame agree.
-    visual_claims = _visual_claims_wire_payload(
+    # the row and the frame agree; malformed live rows are NAMED (spec
+    # §8-R4), not dropped.
+    visual_claims, visual_refusals = _visual_claims_wire_payload(
         outcome.final_state.get("visual_claims")
     )
     resume_question = (
@@ -1680,6 +1855,8 @@ def _resume_run_stream(
             "status": "refuse",
             "reason": "thread_not_found",
             "assistant_message": "Thread was deleted while the run was resuming.",
+            "evidence_schema": CITATION_CHANNEL_SCHEMA,
+            EVIDENCE_SCHEMA_VERSION_FIELD: EVIDENCE_SCHEMA_VERSION,
         })
         return
     # Terminal frames per spec line 30 (shared emitter). The resume's
@@ -1691,111 +1868,301 @@ def _resume_run_stream(
         thinking_ms=outcome.thinking_ms,
         answer_reset=outcome.answer_reset,
         visual_claims=visual_claims,
+        visual_refusals=visual_refusals,
     )
 
 
-def _citations_wire_payload(citations: list[Any]) -> list[dict[str, Any]]:
-    """Normalise ``payload["citations"]`` into the wire dict shape.
+def _citations_wire_projection(
+    citations: list[Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Project ``payload["citations"]`` onto the wire, naming every refusal.
 
-    ``_run_to_response_payload`` emits plain dicts; older fixtures /
-    callers may carry ``Citation`` dataclasses. Both collapse to the
-    ``CitationPayload`` model-dump shape here so every emitter sends
-    one identical shape (Standards: single source of truth for the
-    wire).
+    Returns ``(rows, refusals)``. ``rows`` is the closed wire shape, and a
+    dict or a ``Citation`` dataclass answers through one rule so the live
+    stream and the history serialization cannot emit two different frames.
+    ``refusals`` mirrors the history read's ``rejected_citations`` entry
+    exactly — original ``citation_index`` plus the §6 code — so a row that
+    cannot be published is a visible, typed, per-record outcome. The old
+    silent drop-with-warning is closed here: the row's identity checks live
+    in the validator home, this boundary only calls it.
 
-    A row whose own ``kind``, ``display`` or source id is absent or
-    outside the closed sets is dropped with a WARNING - the same
-    serve-the-rest-and-log posture the turn table uses for an
-    unreadable side record - because guessing would publish an
-    attachment unit as a company ``page`` citation.
+    The frame-level overflow bound is the home's channel check, evaluated
+    before any row is looked at: an oversize frame yields one named
+    ``citation_overflow`` refusal, never a truncated publish.
+
+    WHY the context is seeded from the rows themselves: thread trust,
+    resolvable locators, and received texts are admission-time facts (E3),
+    and by the time the transport re-emits a row those lanes have already
+    run. A transport re-check cannot see the thread, so it asserts no
+    denial from an empty view of it — seeding the row's own identity keeps
+    those context checks inert while every shape check stays active.
+
+    THIS IS THE EMISSION DOOR, and the distinction is load-bearing rather
+    than descriptive. It has exactly one production caller: the terminal
+    SSE ``citations`` frame in :func:`_terminal_sse_frames`. A frame
+    published right now is an ACTIVE emission, so §2.1's token/version
+    pairing is enforced in full — the mint in
+    :func:`_citation_row_candidate` gives a pre-E5 keyless stored snapshot
+    its frozen pair on the way OUT, and a row that states half a contract
+    (a ``schema_version`` with no ``schema``, or the reverse) is NOT
+    repaired: it reaches ``_validate_snapshot`` as stored and is refused
+    there as ``malformed_evidence_contract`` ("database_row snapshot:
+    missing ['schema']"). Spec §7.5 and ADR 0093 decision 12 say this in
+    the spec's words: the grace applies to stored records, not to fresh
+    producers, and an active frame may not borrow the legacy rule to skip
+    version validation.
+
+    The OTHER door is :func:`_serialize_run`, the history read, and it
+    draws the line elsewhere on purpose: it serves STORED records, which
+    spec §7.1 leaves "exactly as they are", so a pre-E5 keyless snapshot
+    is published verbatim there and the web's replay decode accepts it. The
+    two doors therefore REFUSE different shapes, and the web's
+    ``decodeDatabaseRowSnapshot`` mirrors that split by taking an explicit
+    ``SnapshotReadMode`` (its default is ``"emission"``, this door's mode)
+    rather than sniffing the payload. One input makes the two ends
+    disagree if that split is ever collapsed: a snapshot carrying
+    ``schema_version`` with no ``schema`` is accepted on replay and
+    refused here, and the two ends of the wire must answer alike
+    (operator ruling R5).
     """
-    out: list[dict[str, Any]] = []
-    for c in citations:
-        row = _citation_wire_row(c)
-        if row is None:
-            continue
-        out.append(row.model_dump())
-    return out
-
-
-# The two presentations a frozen unit may claim: a physical PDF page or
-# one opaque unit. No other value is a legitimate wire presentation.
-_CITATION_DISPLAY_VALUES: Final[frozenset[str]] = frozenset({"page", "unit"})
-
-# The wire key set IS the model's field set, so the two cannot drift.
-_CITATION_WIRE_FIELDS: Final[tuple[str, ...]] = tuple(CitationPayload.model_fields)
-
-
-def _citation_wire_row(source: Any) -> CitationPayload | None:
-    """Read one citation row's identity off the row itself.
-
-    Dict and ``Citation`` dataclass answer through the same rule so the
-    two shapes cannot drift; ``None`` means the row cannot carry its own
-    identity and must not be published with a guessed one.
-    """
-    values: dict[str, Any] = {}
-    for name in _CITATION_WIRE_FIELDS:
-        if isinstance(source, dict):
-            value = source.get(name)
-        else:
-            value = getattr(source, name, None)
-        if value is None:
-            logger.warning("citations wire: dropped a row without %s", name)
-            return None
-        values[name] = value
-    kind = values["kind"]
-    if not isinstance(kind, str) or kind not in QUOTABLE_EVIDENCE_KINDS:
-        logger.warning("citations wire: dropped a row of kind %r", kind)
-        return None
-    display = values["display"]
-    if not isinstance(display, str) or display not in _CITATION_DISPLAY_VALUES:
-        logger.warning("citations wire: dropped a row with display %r", display)
-        return None
-    # The source id opens the citation, so it belongs to this row's own
-    # kind; the other id slot staying empty is the company / attachment
-    # pairing, not a missing identity.
-    identity_field = "document_id" if kind == COMPANY_KIND else "attachment_id"
-    if not values[identity_field]:
-        logger.warning(
-            "citations wire: dropped a %s row without its source id", kind
+    rows: list[dict[str, Any]] = []
+    refusals: list[dict[str, Any]] = []
+    candidates = [_citation_row_candidate(source) for source in citations or ()]
+    if len(candidates) > MAX_CITATIONS_PER_RUN:
+        whole = validate_evidence(
+            {
+                "evidence_schema": CITATION_CHANNEL_SCHEMA,
+                EVIDENCE_SCHEMA_VERSION_FIELD: EVIDENCE_SCHEMA_VERSION,
+                "citations": candidates,
+            },
+            _wire_admission_context(candidates),
         )
-        return None
-    return CitationPayload(**values)
+        if not whole.accepted and whole.refusal is not None and whole.refusal.item_index is None:
+            logger.warning(
+                "citations wire: refused the frame as %s: %s",
+                whole.refusal.code,
+                whole.refusal.message,
+            )
+            return [], [{"citation_index": 0, "error": whole.refusal.code}]
+    for index, candidate in enumerate(candidates):
+        outcome = validate_evidence(
+            {
+                "evidence_schema": CITATION_CHANNEL_SCHEMA,
+                EVIDENCE_SCHEMA_VERSION_FIELD: EVIDENCE_SCHEMA_VERSION,
+                "citations": [candidate],
+            },
+            _wire_admission_context([candidate]),
+        )
+        code: str | None = None
+        detail = ""
+        if not outcome.accepted and outcome.refusal is not None:
+            code, detail = outcome.refusal.code, outcome.refusal.message
+        elif _row_names_no_record(candidate):
+            # The record key plus the source are where a ledger citation's
+            # own id lives, and this boundary has always required both: a
+            # snapshot without them names a view, not a record, so the
+            # opened citation would show nothing (spec 8.1).
+            code, detail = MALFORMED_EVIDENCE_CONTRACT, "snapshot names no record"
+        if code is not None:
+            # The home's detail echoes field names, kind values, and schema
+            # tokens — never a row's quote or field contents.
+            logger.warning(
+                "citations wire: refused row %d as %s: %s", index, code, detail
+            )
+            refusals.append({"citation_index": index, "error": code})
+            continue
+        try:
+            # ``CitationPayload`` is the frozen-shape matcher: every stored
+            # generation is read through ``project_stored_citation`` here,
+            # so legacy defaults stay the home's decision, not this loop's.
+            rows.append(CitationPayload(**candidate).model_dump(exclude_none=True))
+        except ValidationError:
+            # Safety net for the serialization-failure class: a row that
+            # survived the home but cannot be built is a named contract
+            # error, visible in the refusals list — never a silently
+            # shorter frame and never a lost stream.
+            logger.warning(
+                "citations wire: refused row %d as %s on serialization",
+                index,
+                MALFORMED_EVIDENCE_CONTRACT,
+            )
+            refusals.append(
+                {"citation_index": index, "error": MALFORMED_EVIDENCE_CONTRACT}
+            )
+    return rows, refusals
 
 
-def _visual_claims_wire_payload(claims: Any) -> list[dict[str, Any]]:
-    """Normalise the run's visual-claim channel into the wire / row shape.
+# The eight slots a wire row states its identity through, plus the one
+# optional ledger sibling. Read off every source — a missing key stays
+# absent so the validator home can name it, never defaulted here.
+_CITATION_REQUIRED_FIELDS: Final[tuple[str, ...]] = tuple(
+    name
+    for name in CitationPayload.model_fields
+    if name != DATABASE_ROW_SNAPSHOT_KEY
+)
+
+
+_ABSENT: Final[object] = object()  # private "key not on the row" sentinel
+
+
+def _read_present(source: Any, name: str) -> Any:
+    """One field of a wire row off a dict OR a dataclass, distinguishing
+    an absent key from a present ``None`` (both read as ``None`` before,
+    which let a corruption look like an older generation)."""
+    if isinstance(source, dict):
+        return source.get(name, _ABSENT)
+    return getattr(source, name, _ABSENT)
+
+
+def _citation_row_candidate(source: Any) -> dict[str, Any]:
+    """Read one row's own fields into the frozen key set for the home.
+
+    This is a projection, not a validation: values pass through as the row
+    states them (wrong types included — the home names them), keys the row
+    does not carry stay absent, and a ledger snapshot gains the §4.4
+    ``schema`` token a fresh E5 frame owes an unversioned stored snapshot.
+    A stored row is never rewritten — the mint is on this emission only.
+    """
+    candidate: dict[str, Any] = {}
+    for name in _CITATION_REQUIRED_FIELDS:
+        value = _read_present(source, name)
+        if value is not _ABSENT:
+            candidate[name] = value
+    kind = candidate.get("kind")
+    raw = _read_present(source, DATABASE_ROW_SNAPSHOT_KEY)
+    if kind == DATABASE_ROW_KIND and (raw is _ABSENT or raw is None):
+        # The live stream's ``Citation`` dataclass holds the row's identity
+        # in flat gate slots, not a nested snapshot; rebuilding the spec's
+        # shape here (the gate family's single assembly owner) is what lets
+        # the same validator read both sources.
+        rebuilt = database_row_snapshot(source)
+        if rebuilt is not None:
+            candidate[DATABASE_ROW_SNAPSHOT_KEY] = _mint_snapshot_schema(rebuilt)
+    elif raw is not _ABSENT and raw is not None:
+        candidate[DATABASE_ROW_SNAPSHOT_KEY] = (
+            _mint_snapshot_schema(dict(raw))
+            if isinstance(raw, Mapping)
+            else raw
+        )
+    return candidate
+
+
+def _mint_snapshot_schema(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Stamp the frozen E5 token and version pair onto a stored snapshot
+    that carries NEITHER marker — the true pre-E5 keyless shape, whose
+    generation owed no marker at all (spec §7.1, §7.2).
+
+    A record that states one marker without the other is NOT repaired.
+    §7.2 is a non-rewrite rule ("legacy rows are never rewritten,
+    back-filled, or migrated in place"), and §7.5 says a record that
+    carries ``schema`` without the ``schema_version`` §2.1 requires
+    beside it is ``malformed_evidence_contract``; §7.3 says a refused
+    record is NAMED per-record, not dropped. So half a contract reaches
+    the validator home exactly as stored and is refused there under the
+    code the home assigns — the mint never launders a broken emission
+    into a wire that looks conforming, and an activity frame cannot
+    borrow the legacy grace to skip a check its own generation owes.
+    The v0 path is left exactly as strict as it was: a record with no
+    ``schema`` at all is the only shape this touches, and it is accepted
+    as legacy v0 with its stored values intact (§7.1, ADR 0093
+    decision 8).
+
+    Both markers present is likewise returned untouched, so an
+    unrecognized token or an unsupported version integer reaches the
+    home and is named ``unsupported_evidence_contract`` there rather
+    than being normalized into an accepted row (ADR 0093 decisions 6
+    and 7).
+    """
+    if "schema" in snapshot or EVIDENCE_SCHEMA_VERSION_FIELD in snapshot:
+        return snapshot
+    return {
+        "schema": DATABASE_ROW_SNAPSHOT_SCHEMA,
+        EVIDENCE_SCHEMA_VERSION_FIELD: EVIDENCE_SCHEMA_VERSION,
+        **snapshot,
+    }
+
+
+def _wire_admission_context(candidates: list[dict[str, Any]]) -> AdmissionContext:
+    """The rows' own identities as validator context. One home for the
+    posture and its never-hash rule: :func:`seed_context_from_rows` (see
+    there for WHY self-seeding keeps the transport re-check shape-only).
+    """
+    return seed_context_from_rows(citation_rows=candidates)
+
+
+def _row_names_no_record(candidate: dict[str, Any]) -> bool:
+    """True iff a ledger candidate's snapshot names no view or no record."""
+    if candidate.get("kind") != DATABASE_ROW_KIND:
+        return False
+    snapshot = candidate.get(DATABASE_ROW_SNAPSHOT_KEY)
+    if not isinstance(snapshot, Mapping):
+        return False
+    return not str(snapshot.get("source") or "") or not snapshot.get("record_key")
+
+
+def _visual_claims_wire_payload(
+    claims: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Normalise the run's visual-claim channel into the wire / row shape,
+    returning ``(rows, refusals)``.
 
     A visual claim is NOT a citation (ADR 0089): it rides its own
     ``visual_claims`` frame and its own ``fin_run`` column, never the
     ``citations`` channel, so the quote the verifier passed and the
     provenance of a generated observation cannot be confused for each
-    other. The row's key set IS :data:`VISUAL_CLAIM_FIELDS`, projected in
-    that fixed order so neither the live wire nor a reload can drift from
-    the SSOT the evidence token mints.
+    other. The row's key set IS :data:`VISUAL_CLAIM_FIELDS` in that fixed
+    order plus the one frozen ``fin.evidence.visual_claim`` token and
+    its ``schema_version`` sibling appended at the E5 versioning
+    cutover (spec 4.2/9), so neither the
+    live wire nor a reload can drift from the SSOT the evidence token
+    mints. Claims stored before the cutover replay byte-identically as
+    legacy v0 (spec 7) — the token is minted on this projection, never
+    back-filled into a stored row.
 
-    A row that is not a dict, whose ``kind`` is not the visual-evidence
-    kind, or that is missing any field is dropped with a WARNING - the
-    same serve-the-rest-and-log posture as the citation wire - because
-    guessing a provenance field would publish a link to a page the run
-    never read. Only the field NAME is logged, never a row's content
-    (filename / image hash are thread-private material).
+    A malformed live row is NAMED, never dropped (spec §8-R4: the
+    grace of §7 is for stored legacy records; a live decoding after
+    E5 refuses): the minted candidate is judged by the validator home
+    and the exact §6 code rides the ``evidence_refusals`` frame beside
+    the row's index. Only the code and field names are logged, never a
+    row's content (filename / image hash are thread-private material).
     """
-    out: list[dict[str, Any]] = []
-    for row in claims or ():
-        if not isinstance(row, dict):
-            logger.warning("visual_claims wire: dropped a non-dict row")
-            continue  # EXIT: a row that is not a mapping carries no fields.
-        if row.get("kind") != VISUAL_EVIDENCE_KIND:
-            logger.warning("visual_claims wire: dropped a non-visual row")
-            continue  # EXIT: only the visual-evidence kind is a claim.
-        if any(name not in row for name in VISUAL_CLAIM_FIELDS):
-            logger.warning(
-                "visual_claims wire: dropped a row missing a claim field"
-            )
-            continue  # EXIT: a partial provenance row would claim an unknown link.
-        out.append({name: row[name] for name in VISUAL_CLAIM_FIELDS})
-    return out
+    rows: list[dict[str, Any]] = []
+    refusals: list[dict[str, Any]] = []
+    claim_rows = list(claims or ())
+    # WHY seeded from the rows' own identities: thread trust and the
+    # stored observation version are admission facts the transport
+    # cannot see; the posture and its never-hash rule live with the
+    # home's ``seed_context_from_rows``.
+    seeded = seed_context_from_rows(visual_claim_rows=claim_rows)
+    for index, row in enumerate(claim_rows):
+        candidate: Any = row
+        if isinstance(row, Mapping) and all(
+            name in row for name in VISUAL_CLAIM_FIELDS
+        ):
+            # The projector is the single normaliser (unchanged SSOT
+            # behavior): onto the frozen 14 keys IN ORDER, extra keys
+            # off, then the E5 cutover mint (spec 4.2: the lane gains
+            # the one ``schema`` field and its ``schema_version``
+            # sibling; spec 7.5: a fresh emission without them is
+            # malformed). A row MISSING any field is passed to the
+            # home verbatim so the refusal names the missing keys
+            # instead of a generic one here.
+            candidate = {name: row[name] for name in VISUAL_CLAIM_FIELDS}
+            candidate["schema"] = VISUAL_CLAIM_SCHEMA
+            candidate[EVIDENCE_SCHEMA_VERSION_FIELD] = EVIDENCE_SCHEMA_VERSION
+        outcome = validate_evidence({"visual_claims": [candidate]}, seeded)
+        if outcome.accepted:
+            projected = {name: candidate[name] for name in VISUAL_CLAIM_FIELDS}
+            projected["schema"] = VISUAL_CLAIM_SCHEMA
+            projected[EVIDENCE_SCHEMA_VERSION_FIELD] = EVIDENCE_SCHEMA_VERSION
+            rows.append(projected)
+            continue
+        code = outcome.refusal.code if outcome.refusal is not None else MALFORMED_EVIDENCE_CONTRACT
+        logger.warning(
+            "visual_claims wire: refused row %d as %s", index, code
+        )
+        refusals.append({"citation_index": index, "error": code})
+    return rows, refusals
 
 
 def _terminal_sse_frames(
@@ -1806,6 +2173,7 @@ def _terminal_sse_frames(
     thinking_ms: int | None = None,
     answer_reset: bool = False,
     visual_claims: Any = None,
+    visual_refusals: list[dict[str, Any]] | None = None,
 ) -> Iterator[str]:
     """Yield the fixed-order terminal frames: ``status`` -> ``answer``
     -> ``visual_claims`` (only when non-empty) -> ``citations``
@@ -1838,6 +2206,12 @@ def _terminal_sse_frames(
         "status": payload["status"],
         "reason": payload["reason"] or None,
         "assistant_message": payload["assistant_message"],
+        # Spec 2.2 rule 2: the terminal frame declares the citation
+        # channel once here, so the citations array keeps its exact
+        # eight-key row shape and a client decodes against a named
+        # version instead of a guess.
+        "evidence_schema": CITATION_CHANNEL_SCHEMA,
+        EVIDENCE_SCHEMA_VERSION_FIELD: EVIDENCE_SCHEMA_VERSION,
     }
     # Soft-Track: expose the graph track so the SPA can render a
     # light research hint without Chat|Research chrome.
@@ -1852,13 +2226,35 @@ def _terminal_sse_frames(
         answer_body["reset"] = True
     yield _format_sse("status", status_body)
     yield _format_sse("answer", answer_body)
-    claim_rows = _visual_claims_wire_payload(visual_claims)
+    claim_rows, recheck_refusals = _visual_claims_wire_payload(visual_claims)
     if claim_rows:
         # Emitted between the answer frames and the terminal ``citations``
         # frame: a visual claim is its own channel, and the citations frame
         # closes the reader so this is the last point the SPA can still see.
         yield _format_sse("visual_claims", {"visual_claims": claim_rows})
-    yield _format_sse("citations", _citations_wire_payload(payload["citations"]))
+    citation_rows, citation_refusals = _citations_wire_projection(
+        payload["citations"]
+    )
+    # Spec §8-R4: the visual lane's named refusals ride the SAME
+    # ``evidence_refusals`` frame as the citation lane's (per-row
+    # ``{citation_index, error}`` entries; the index addresses the
+    # row's position in its own channel) — a dropped malformed live
+    # row is closed there too.
+    refusal_entries = [
+        *(visual_refusals or ()),
+        *recheck_refusals,
+        *citation_refusals,
+    ]
+    if refusal_entries:
+        # A refused row rides its own frame BEFORE the terminal
+        # ``citations`` frame (which closes the reader): the entry shape
+        # mirrors the history read's ``rejected_citations`` so one
+        # refusal vocabulary serves both surfaces, and a mid-stream
+        # loss is named instead of silent.
+        yield _format_sse(
+            "evidence_refusals", {"refusals": refusal_entries}
+        )
+    yield _format_sse("citations", citation_rows)
 
 
 # T4 workflow (#138): the ordinary-person copy a stopped run leaves on
@@ -1890,10 +2286,12 @@ def _stopped_terminal_frames(run_id: str, *, thinking_ms: int) -> Iterator[str]:
             "reason": STOPPED_STATUS_REASON,
             "assistant_message": STOPPED_ASSISTANT_MESSAGE,
             "thinking_ms": thinking_ms,
+            "evidence_schema": CITATION_CHANNEL_SCHEMA,
+            EVIDENCE_SCHEMA_VERSION_FIELD: EVIDENCE_SCHEMA_VERSION,
         },
     )
     yield _format_sse("answer", {"text": "", "reset": True})
-    yield _format_sse("citations", _citations_wire_payload([]))
+    yield _format_sse("citations", [])
 
 
 def _persist_and_close_stopped_run(
@@ -2069,10 +2467,12 @@ def _run_compact_command(
                 "status": "done",
                 "reason": None,
                 "assistant_message": copy,
+                "evidence_schema": CITATION_CHANNEL_SCHEMA,
+                EVIDENCE_SCHEMA_VERSION_FIELD: EVIDENCE_SCHEMA_VERSION,
             },
         )
         yield _format_sse("answer", {"text": copy})
-        yield _format_sse("citations", _citations_wire_payload([]))
+        yield _format_sse("citations", [])
 
     return StreamingResponse(
         event_stream(),
@@ -2143,7 +2543,14 @@ _PUSH_UNAVAILABLE_CODES: Final[frozenset[str]] = frozenset(
 )
 
 
-def _push_error_status(exc: PushError) -> int:
+class _CarriesErrorCode(Protocol):
+    # The table dispatch calls a row's resolver with the matched exception
+    # family, and pyright cannot correlate row-to-resolver per iteration, so
+    # every resolver parameter must accept any table family, not just PushError.
+    code: str
+
+
+def _push_error_status(exc: _CarriesErrorCode) -> int:
     """Push outages are dependency failures (503); the rest are 500."""
     return 503 if exc.code in _PUSH_UNAVAILABLE_CODES else 500
 
@@ -3596,16 +4003,33 @@ def build_router(
         store: ThreadStore = Depends(get_thread_store),
         feedback_store: Any = Depends(get_feedback_store),
     ) -> dict:
-        thread = store.get_thread(thread_id)
+        # WHY the outage is caught around both store reads: a thread
+        # store that cannot be reached is the named
+        # ``persistence_unavailable`` outcome — a typed 503 the SPA can
+        # show — never a crash, and never the empty turn table that
+        # swallowing the failure would masquerade as.
+        try:
+            thread = store.get_thread(thread_id)
+        except PersistenceUnavailableError:
+            logger.warning("get_thread: thread store unreachable", exc_info=True)
+            return cast(dict, JSONResponse(
+                status_code=503, content={"error": "persistence_unavailable"}
+            ))
         if thread is None:
-            return JSONResponse(
+            return cast(dict, JSONResponse(
                 status_code=404, content={"error": "thread_not_found"}
-            )
+            ))
         # T2: existence check wins (404 above); the MCP gate runs right
         # after it, so an unknown id is never masked by this 409.
         if knowledge_mcp_gate_closed():
             raise KnowledgeMCPFaultError()
-        runs = store.list_runs(thread_id)
+        try:
+            runs = store.list_runs(thread_id)
+        except PersistenceUnavailableError:
+            logger.warning("get_thread: run list unreachable", exc_info=True)
+            return cast(dict, JSONResponse(
+                status_code=503, content={"error": "persistence_unavailable"}
+            ))
         # T8: ONE ``list_feedback()`` for the whole turn table (never a
         # query per row), then matched by run id at serialization time.
         # A thumbs outage must not blank the operator's history: the
@@ -3691,9 +4115,9 @@ def build_router(
     ) -> dict:
         existing = store.get_thread(thread_id)
         if existing is None:
-            return JSONResponse(
+            return cast(dict, JSONResponse(
                 status_code=404, content={"error": "thread_not_found"}
-            )
+            ))
         # The thread's attachments are voided first, and their bytes are
         # removed only behind that tombstone. An attachment that outlived its
         # thread would keep searchable text a deleted research thread owned,
@@ -3706,10 +4130,10 @@ def build_router(
                 "delete_thread: attachment cleanup failed for thread_id=%s",
                 thread_id,
             )
-            return JSONResponse(
+            return cast(dict, JSONResponse(
                 status_code=500,
                 content={"error": "attachment_cleanup_failed"},
-            )
+            ))
 
         # Metadata next, then checkpointer. If the checkpointer
         # delete raises we keep the metadata gone - that's the
@@ -3812,9 +4236,12 @@ def build_router(
         # does not implement refuses HERE — before the concurrency
         # probe, before any side effect, and long before a retrieve
         # could be dressed up as the tier the operator asked for. The
-        # code is named per 档 (综述未开 / 真库未接), never collapsed
-        # into one token; lexical/graph fall through to the ordinary run
-        # because 查找 is openable on the default stack today.
+        # code is named per 档 off the one routing table
+        # (``TIER_UNAVAILABLE_CODE``), never collapsed into one token.
+        # That table is EMPTY since A2 opened the sql 档 (spec
+        # search-mode-business-sql-contract §4: fin's change is one
+        # table row), so every closed-set 档 starts its run and this
+        # door only fires again when a future plan slot closes one.
         requested_tier = unavailable_tier(body.tiers)
         if requested_tier is not None:
             return JSONResponse(
@@ -4182,8 +4609,10 @@ def build_router(
             # final state (it is NOT part of the citation payload),
             # normalised ONCE here so the persisted row and the live frame
             # carry the identical rows. Run-scoped, copied before the next
-            # send resets the state channel (ADR 0016).
-            visual_claims = _visual_claims_wire_payload(
+            # send resets the state channel (ADR 0016). Malformed live
+            # rows are NAMED on the evidence_refusals frame, never
+            # dropped (spec §8-R4).
+            visual_claims, visual_refusals = _visual_claims_wire_payload(
                 outcome.final_state.get("visual_claims")
             )
             # T9: the turn's terminal status (done / refuse / step_cap)
@@ -4230,12 +4659,17 @@ def build_router(
                 # so the SPA surfaces the state, then stop. The
                 # turn still ended on a terminal refuse.
                 record_terminal("refuse")
-                yield _format_sse("status", {
-                    "run_id": run_id,
-                    "status": "refuse",
-                    "reason": "thread_not_found",
-                    "assistant_message": "Thread was deleted while the run was in flight.",
-                })
+                yield _format_sse(
+                    "status",
+                    {
+                        "run_id": run_id,
+                        "status": "refuse",
+                        "reason": "thread_not_found",
+                        "assistant_message": "Thread was deleted while the run was in flight.",
+                        "evidence_schema": CITATION_CHANNEL_SCHEMA,
+                        EVIDENCE_SCHEMA_VERSION_FIELD: EVIDENCE_SCHEMA_VERSION,
+                    },
+                )
                 return
             # Terminal frames per spec line 30: status -> answer ->
             # citations. Shared with the T4 resume route so the two
@@ -4249,6 +4683,7 @@ def build_router(
                 thinking_ms=outcome.thinking_ms,
                 answer_reset=outcome.answer_reset,
                 visual_claims=visual_claims,
+                visual_refusals=visual_refusals,
             )
 
         # Dream runs AFTER the stream is exhausted, never inside a graph
@@ -4321,24 +4756,24 @@ def build_router(
         """
         with upload_in_flight.hold(thread_id):
             if store.get_thread(thread_id) is None:
-                return JSONResponse(
+                return cast(dict, JSONResponse(
                     status_code=404, content={"error": "thread_not_found"}
-                )
+                ))
             if _declared_upload_over(request, budgets.max_upload_bytes):
-                return JSONResponse(
+                return cast(dict, JSONResponse(
                     status_code=413, content={"error": "attachment_too_large"}
-                )
+                ))
             body = await _read_bounded_body(
                 request, budgets.max_upload_bytes
             )
             if body is None:
-                return JSONResponse(
+                return cast(dict, JSONResponse(
                     status_code=413, content={"error": "attachment_too_large"}
-                )
+                ))
             if not body:
-                return JSONResponse(
+                return cast(dict, JSONResponse(
                     status_code=400, content={"error": "empty_attachment"}
-                )
+                ))
             try:
                 record = attachments.accept(
                     thread_id=thread_id,
@@ -4350,10 +4785,10 @@ def build_router(
                     "attach_to_thread: durable write failed for thread_id=%s",
                     thread_id,
                 )
-                return JSONResponse(
+                return cast(dict, JSONResponse(
                     status_code=500,
                     content={"error": "attachment_store_failed"},
-                )
+                ))
             return _attachment_wire_record(record)
 
     @router.get("/threads/{thread_id}/attachments")
@@ -4366,9 +4801,9 @@ def build_router(
     ) -> dict:
         """Every attachment this thread owns, with its preparation state."""
         if store.get_thread(thread_id) is None:
-            return JSONResponse(
+            return cast(dict, JSONResponse(
                 status_code=404, content={"error": "thread_not_found"}
-            )
+            ))
         return {
             "attachments": [
                 _attachment_wire_record(record)
@@ -4396,16 +4831,16 @@ def build_router(
         """
         refusal = _locator_refusal(thread_id, attachment_id)
         if refusal is not None:
-            return refusal
+            return cast(dict, refusal)
         if store.get_thread(thread_id) is None:
-            return JSONResponse(
+            return cast(dict, JSONResponse(
                 status_code=404, content={"error": "thread_not_found"}
-            )
+            ))
         record = attachments.status(attachment_id)
         if record is None or record.thread_id != thread_id:
-            return JSONResponse(
+            return cast(dict, JSONResponse(
                 status_code=400, content={"error": "attachment_not_found"}
-            )
+            ))
         return _attachment_wire_record(record)
 
     @router.post("/threads/{thread_id}/attachments/{attachment_id}/retry")
@@ -4440,45 +4875,45 @@ def build_router(
         """
         refusal = _locator_refusal(thread_id, attachment_id)
         if refusal is not None:
-            return refusal
+            return cast(dict, refusal)
         if store.get_thread(thread_id) is None:
-            return JSONResponse(
+            return cast(dict, JSONResponse(
                 status_code=404, content={"error": "thread_not_found"}
-            )
+            ))
         record = attachments.status(attachment_id)
         if record is None or record.thread_id != thread_id:
-            return JSONResponse(
+            return cast(dict, JSONResponse(
                 status_code=400, content={"error": "attachment_not_found"}
-            )
+            ))
         try:
             request = attachments.retry_preparation(thread_id, attachment_id)
             if request.state == "unknown":
                 # EXIT: the row lost a deletion race between the guard
                 # above and the ask; the identity answer is the same
                 # one every other door gives.
-                return JSONResponse(
+                return cast(dict, JSONResponse(
                     status_code=400, content={"error": "attachment_not_found"}
-                )
+                ))
             fresh = attachments.status(attachment_id)
             if fresh is None:
-                return JSONResponse(
+                return cast(dict, JSONResponse(
                     status_code=400, content={"error": "attachment_not_found"}
-                )
+                ))
             return _attachment_wire_record(fresh)
         except AttachmentThreadGoneError:
             # EXIT: the thread was deleted between the check above and the
             # write; the attachment is gone, not the store broken.
-            return JSONResponse(
+            return cast(dict, JSONResponse(
                 status_code=400, content={"error": "attachment_not_found"}
-            )
+            ))
         except AttachmentStoreError:
             logger.exception(
                 "retry_thread_attachment: state write failed for attachment_id=%s",
                 attachment_id,
             )
-            return JSONResponse(
+            return cast(dict, JSONResponse(
                 status_code=500, content={"error": "attachment_store_failed"}
-            )
+            ))
 
     @router.delete("/threads/{thread_id}/attachments/{attachment_id}")
     def delete_thread_attachment(
@@ -4508,11 +4943,11 @@ def build_router(
         """
         refusal = _locator_refusal(thread_id, attachment_id)
         if refusal is not None:
-            return refusal
+            return cast(dict, refusal)
         if store.get_thread(thread_id) is None:
-            return JSONResponse(
+            return cast(dict, JSONResponse(
                 status_code=404, content={"error": "thread_not_found"}
-            )
+            ))
         try:
             attachments.delete_attachment(
                 thread_id=thread_id, attachment_id=attachment_id
@@ -4525,9 +4960,9 @@ def build_router(
             logger.info(
                 "delete_thread_attachment: nothing to void: %s", exc
             )
-            return JSONResponse(
+            return cast(dict, JSONResponse(
                 status_code=400, content={"error": "unknown_locator"}
-            )
+            ))
         except AttachmentCleanupError:
             logger.exception(
                 "delete_thread_attachment: cleanup failed for thread_id=%s "
@@ -4535,9 +4970,9 @@ def build_router(
                 thread_id,
                 attachment_id,
             )
-            return JSONResponse(
+            return cast(dict, JSONResponse(
                 status_code=500, content={"error": "attachment_cleanup_failed"}
-            )
+            ))
         except AttachmentStoreError:
             logger.exception(
                 "delete_thread_attachment: state write failed for "
@@ -4545,9 +4980,9 @@ def build_router(
                 thread_id,
                 attachment_id,
             )
-            return JSONResponse(
+            return cast(dict, JSONResponse(
                 status_code=500, content={"error": "attachment_store_failed"}
-            )
+            ))
         return {"ok": True, "attachment_id": attachment_id}
 
     @router.post("/threads/{thread_id}/resume")
@@ -4730,7 +5165,7 @@ def build_router(
     ) -> Response:
         """Download this thread's comparison or citation bundle.
 
-        Comparison exports bind to ``fin.comparison.v1`` — the same
+        Comparison exports bind to ``fin.comparison`` — the same
         envelopes the turn row persists (``TurnRow.comparisons``) and
         the SSE ``comparison`` frame carried. ``fin.host.export`` owns
         the rendering; this route owns only the HTTP shape.
@@ -4913,7 +5348,7 @@ def build_router(
             _serialize_notice(n)
             for n in watchlist.list_notices(unread_only=unread_only)
         ]
-        return JSONResponse(content=notices, headers=headers)
+        return cast(list[dict], JSONResponse(content=notices, headers=headers))
 
     @router.post("/notices/{notice_id}/read")
     def mark_notice_read(

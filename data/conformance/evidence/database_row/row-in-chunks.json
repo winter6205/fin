@@ -1,0 +1,18 @@
+{
+  "case": "row-in-chunks",
+  "direction": "consumer",
+  "expect": "refuse",
+  "refusal_code": "malformed_evidence_contract",
+  "payload": {
+    "chunks": [
+      {
+        "text": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12",
+        "source_ref": {
+          "document_id": "ledger_ro",
+          "version": "sha256:9c2b8f74514e6d321c0aa9f7e3d5b1089c2b8f74514e6d321c0aa9f7e3d5b108",
+          "unit": 1
+        }
+      }
+    ]
+  }
+}

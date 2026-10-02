@@ -11,23 +11,44 @@ import type { AttachmentSourceRef, Citation, SourceDisplay } from "./types";
  * The locator suffix for a 1-based source unit. Only an explicit
  * ``page`` display may render as a page — a locator from an older peer
  * without a display must not silently claim page numbering.
+ *
+ * A ledger row renders as neither: a record has no page and no
+ * ordinal, so `p.1` / `u.1` would name a position in a document that
+ * does not exist. It shows `record` and the row's own identity beside
+ * it (ADR 0091).
  */
 export function formatUnitLocator(
   display: SourceDisplay | undefined,
   unit: number,
 ): string {
+  if (display === "record") return "record";
   return display === "page" ? `p.${unit}` : `u.${unit}`;
 }
 
 /**
  * The citation's stable identity: an attachment is identified by its
- * attachment_id (the filename is display-only and may repeat), while
- * company rows keep document_id.
+ * attachment_id (the filename is display-only and may repeat), company
+ * rows keep document_id, and a ledger row is identified by the view
+ * that answered plus the record it answered about.
+ *
+ * WHY the third case is an explicit return rather than the old
+ * `attachment ? attachment_id : document_id` tail: that tail defaulted
+ * every unrecognised kind into the document path, so a `database-row`
+ * would have grouped under a `document_id` it does not have. A kind the
+ * host does not send has no identity here, and a stable empty string
+ * keeps it in one bucket instead of inventing one per unknown value
+ * (ADR 0091).
  */
 export function citationSourceId(citation: Citation): string {
-  return citation.kind === "attachment"
-    ? citation.attachment_id
-    : citation.document_id;
+  if (citation.kind === "attachment") return citation.attachment_id;
+  if (citation.kind === "company") return citation.document_id;
+  const row = citation.database_row;
+  if (!row) return "";
+  const key = Object.keys(row.record_key)
+    .sort()
+    .map((name) => `${name}=${row.record_key[name]}`)
+    .join(",");
+  return `${row.source}#${key}`;
 }
 
 /** The attachment's safe display name: the filename the host sent, else
@@ -78,10 +99,14 @@ export function attachmentSourceRef(source: {
   };
 }
 
-/** The safe display name: the attachment's filename, else document_id. */
+/** The safe display name: the attachment's filename, the ledger row's
+ * own view-plus-key identity, else document_id. */
 export function citationSourceLabel(citation: Citation): string {
   if (citation.kind === "attachment") {
     return attachmentDisplayName(citation.attachment_id, citation.filename);
+  }
+  if (citation.kind === "database-row") {
+    return citationSourceId(citation) || citation.kind;
   }
   return citation.document_id;
 }

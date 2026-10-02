@@ -102,7 +102,10 @@ def test_cli_exits_nonzero_when_push_surfaces_unexpected_error():
     assert "KeyError" in report["failures"][0]["error"]
 
 
-def test_cli_requires_explicit_opt_in():
+def test_cli_requires_explicit_opt_in(monkeypatch: pytest.MonkeyPatch):
     from fin.corpus.chunk_and_push import main
+
+    # Environment selection is an explicit opt-in too; this case supplies neither.
+    monkeypatch.delenv("FIN_RETRIEVE_ADAPTER", raising=False)
     with pytest.raises(SystemExit):
         main(["--manifest", str(MANIFEST), "--text-dir", str(TEXT)])

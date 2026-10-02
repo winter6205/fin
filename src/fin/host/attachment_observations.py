@@ -312,7 +312,7 @@ def observation_from_call_result(
         provider=provider,
         model_version=result.model_id,
         scope=result.target.crop,
-        covered_details=covered_details,
+        covered_details=tuple(covered_details),
         attempts=(ObservationAttempt(usage=result.usage, cost=result.cost),),
         answer_text=result.text,
         created_at=created_at,

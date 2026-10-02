@@ -64,7 +64,8 @@ the official CN Chat Completions API receives
 from __future__ import annotations
 
 from contextlib import ExitStack
-from typing import Any, Mapping
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Mapping
 
 import psycopg
 
@@ -81,6 +82,10 @@ from fin.host.memory_port import (
     build_memory_port,
 )
 from fin.host.stream_map import reasoning_preserving_chat_openai
+
+if TYPE_CHECKING:
+    # Type-only import: attachment_vision imports this module at runtime.
+    from fin.host.attachment_prepare import AttachmentPreparationService
 
 
 # ----- public constants -----
@@ -307,7 +312,11 @@ def compile_for_runtime(
     model_name: str | None = None,
     base_url: str | None = None,
     env: Mapping[str, str] | None = None,
-    attachment_service: Any | None = None,
+    attachment_service: (
+        AttachmentPreparationService
+        | Callable[[], AttachmentPreparationService]
+        | None
+    ) = None,
 ) -> Any:
     """Build the durable v1 host graph for CLI / HTTP boot.
 
@@ -451,7 +460,14 @@ def compile_for_runtime(
         # process's attachment service so the grounded route gains the
         # preparation gate; ``None`` (every direct caller today) keeps
         # the gate out of the graph entirely.
-        attachment_service=resolved_attachment_service,
+        # ROOT CAUSE LIVES IN graph.py, not here: ``_PreparationOutcomeView``
+        # / ``_ResolvedAttachmentView`` declare MUTABLE members (``state:
+        # str``), so the checker demands invariant writable attributes and a
+        # frozen dataclass's read-only fields can never satisfy them — even
+        # though the gate only READS these fields. The durable fix is making
+        # those view members read-only (@property) in graph.py; until then
+        # this one call site carries the documented, rule-specific exception.
+        attachment_service=resolved_attachment_service,  # pyright: ignore[reportArgumentType]
         # T3 (thread-attachment-source-read): the same service object is
         # the retrieve tool's attachment search seam — it ships
         # ``search()`` alongside the preparation methods, so the

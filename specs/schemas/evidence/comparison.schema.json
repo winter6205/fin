@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "fin.comparison",
+  "title": "Comparison frame (spec 4.3)",
+  "description": "One comparison frame: the frozen wrapper key holding the thirteen-slot envelope over the column/row grid. The cross-checks the schema cannot state stay with the validator home: hit_count/cell_count must match the walked grid, every hit cell locator must appear in the envelope locators, the grid product bound, and the source-version binding (comparison_source_unverified). See x-bounds.",
+  "type": "object",
+  "required": ["comparison"],
+  "additionalProperties": false,
+  "properties": {
+    "comparison": {
+      "type": "object",
+      "required": [
+        "schema",
+        "schema_version",
+        "kind",
+        "axis",
+        "concept",
+        "unit",
+        "scale",
+        "columns",
+        "rows",
+        "deltas",
+        "missing",
+        "hit_count",
+        "cell_count",
+        "locators"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema": { "const": "fin.comparison" },
+        "schema_version": { "type": "integer", "const": 1 },
+        "kind": { "type": "string" },
+        "axis": { "type": "string" },
+        "concept": { "type": "string" },
+        "unit": { "type": "string" },
+        "scale": { "type": "string" },
+        "columns": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["key", "label"],
+            "additionalProperties": false,
+            "properties": {
+              "key": { "type": "string" },
+              "label": { "type": "string" }
+            }
+          }
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["key", "label", "kind", "cells"],
+            "additionalProperties": false,
+            "properties": {
+              "key": { "type": "string" },
+              "label": { "type": "string" },
+              "kind": { "type": "string" },
+              "cells": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/cell" }
+              }
+            }
+          }
+        },
+        "deltas": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["from", "to", "absolute", "percent", "direction", "display"],
+            "additionalProperties": false,
+            "properties": {
+              "from": { "$ref": "#/$defs/side" },
+              "to": { "$ref": "#/$defs/side" },
+              "absolute": { "type": ["number", "integer"] },
+              "percent": { "type": ["number", "integer"] },
+              "direction": { "type": "string" },
+              "display": { "type": "string" }
+            }
+          }
+        },
+        "missing": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["row", "column", "reason"],
+            "additionalProperties": false,
+            "properties": {
+              "row": { "type": "string" },
+              "column": { "type": "string" },
+              "reason": { "type": "string" }
+            }
+          }
+        },
+        "hit_count": { "type": "integer", "minimum": 0 },
+        "cell_count": { "type": "integer", "minimum": 0 },
+        "locators": {
+          "type": "array",
+          "items": { "$ref": "fin.evidence.business_field#/$defs/document_locator" }
+        }
+      }
+    }
+  },
+  "x-bounds": {
+    "grid": "columns x rows <= MAX_CELLS (comparison_overflow; validator home)",
+    "cell_semantics": "status hit requires a numeric value and a document locator; status missing requires null value and null locator; count fields must match the walked grid"
+  },
+  "$defs": {
+    "cell": {
+      "type": "object",
+      "required": ["row", "column", "status", "value", "display", "unit", "scale", "locator"],
+      "additionalProperties": false,
+      "properties": {
+        "row": { "type": "string" },
+        "column": { "type": "string" },
+        "status": { "enum": ["hit", "missing"] },
+        "value": { "type": ["number", "integer", "null"] },
+        "display": { "type": "string" },
+        "unit": { "type": "string" },
+        "scale": { "type": "string" },
+        "locator": {
+          "oneOf": [
+            { "$ref": "fin.evidence.business_field#/$defs/document_locator" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "side": {
+      "type": "object",
+      "required": ["row", "column"],
+      "additionalProperties": false,
+      "properties": {
+        "row": { "type": "string" },
+        "column": { "type": "string" }
+      }
+    }
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "fin.evidence.citation",
+  "title": "Citation channel (spec 2.1 / 4.1 / 4.4)",
+  "description": "Structural key-set and type contract for one citation channel emission. Semantic rules the schema cannot state stay the validator home's (quote code-point floor/ceiling, locator resolvability, trust, mirror equality, lane-marker exclusivity). Code-point bounds are deliberately NOT encoded as minLength/maxLength: JSON Schema counts UTF-16 code units while spec 2.6 counts code points, and a divergent bound on paper is worse than none. See x-bounds.",
+  "type": "object",
+  "required": ["evidence_schema", "schema_version", "citations"],
+  "additionalProperties": false,
+  "properties": {
+    "evidence_schema": { "const": "fin.evidence.citation" },
+    "schema_version": { "type": "integer", "const": 1 },
+    "citations": {
+      "type": "array",
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/citation" }
+    }
+  },
+  "x-bounds": {
+    "quote": "32..2000 code points (spec 3, citation_overflow)",
+    "per_run": "32 citations (encoded as maxItems above)"
+  },
+  "$defs": {
+    "citation": {
+      "type": "object",
+      "required": [
+        "kind",
+        "document_id",
+        "attachment_id",
+        "version",
+        "unit",
+        "display",
+        "filename",
+        "quote"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["company", "attachment", "database-row"] },
+        "document_id": { "type": "string" },
+        "attachment_id": { "type": "string" },
+        "version": { "type": "string", "minLength": 1 },
+        "unit": { "type": "integer", "minimum": 1 },
+        "display": { "enum": ["page", "unit", "record"] },
+        "filename": { "type": "string" },
+        "quote": { "type": "string" },
+        "database_row": { "$ref": "fin.evidence.database_row_snapshot" }
+      }
+    }
+  }
+}

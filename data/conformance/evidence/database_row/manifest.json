@@ -1,0 +1,210 @@
+{
+  "profile": "database_row",
+  "contract": "specs/enterprise-evidence-contract.md",
+  "cases": [
+    {
+      "case": "valid-ingress-envelope",
+      "file": "valid-ingress-envelope.json",
+      "direction": "producer",
+      "expect": "accept",
+      "refusal_code": null,
+      "class": "valid"
+    },
+    {
+      "case": "valid-egress-citation",
+      "file": "valid-egress-citation.json",
+      "direction": "consumer",
+      "expect": "accept",
+      "refusal_code": null,
+      "class": "valid"
+    },
+    {
+      "case": "database-rows-key-absent",
+      "file": "database-rows-key-absent.json",
+      "direction": "consumer",
+      "expect": "accept",
+      "refusal_code": null,
+      "class": "empty-vs-malformed-vs-missing"
+    },
+    {
+      "case": "zero-rows",
+      "file": "zero-rows.json",
+      "direction": "producer",
+      "expect": "refuse",
+      "refusal_code": "sql_no_matching_rows",
+      "class": "empty-vs-malformed-vs-missing"
+    },
+    {
+      "case": "source-not-provisioned",
+      "file": "source-not-provisioned.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "real_db_not_wired",
+      "class": "empty-vs-malformed-vs-missing"
+    },
+    {
+      "case": "transport-error",
+      "file": "transport-error.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "retrieve_unavailable",
+      "class": "empty-vs-malformed-vs-missing"
+    },
+    {
+      "case": "missing-field-queried-at",
+      "file": "missing-field-queried-at.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "record-key-wrong-type",
+      "file": "record-key-wrong-type.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "database-rows-envelope-wrong-type",
+      "file": "database-rows-envelope-wrong-type.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "unsupported-snapshot-version",
+      "file": "unsupported-snapshot-version.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "unsupported_evidence_contract",
+      "class": "negative",
+      "note": "Recognized token, unsupported schema_version integer: the payload is otherwise shape-valid, so the refusal can only come from the version check (spec section 2.1) and pins that a correct token with a wrong version is unsupported_evidence_contract, not a silent default or an older parser. The name is historical: the case was written when the version could ride the ingress row and became inexpressible once the row dropped its token (ADR 0093 decision 10), which re-pointed it at the envelope's schema_version. Read this case as the envelope-version defect it now is, not as a snapshot-version defect."
+    },
+    {
+      "case": "malformed-timestamp-offset",
+      "file": "malformed-timestamp-offset.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "malformed-timestamp-fraction",
+      "file": "malformed-timestamp-fraction.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "malformed-timestamp-leap-second",
+      "file": "malformed-timestamp-leap-second.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "mirror-mismatch-version",
+      "file": "mirror-mismatch-version.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "egress-missing-snapshot",
+      "file": "egress-missing-snapshot.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "document-kind-carrying-snapshot",
+      "file": "document-kind-carrying-snapshot.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "row-in-chunks",
+      "file": "row-in-chunks.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "snapshot-unknown-field-kind",
+      "file": "snapshot-unknown-field-kind.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "negative"
+    },
+    {
+      "case": "digest-carrier-valid",
+      "file": "digest-carrier-valid.json",
+      "direction": "consumer",
+      "expect": "accept",
+      "refusal_code": null,
+      "class": "snapshot-digest-identity"
+    },
+    {
+      "case": "digest-carrier-mismatch",
+      "file": "digest-carrier-mismatch.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "snapshot-digest-identity"
+    },
+    {
+      "case": "digest-carrier-malformed-hash",
+      "file": "digest-carrier-malformed-hash.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "malformed_evidence_contract",
+      "class": "snapshot-digest-identity"
+    },
+    {
+      "case": "untrusted-view-denied",
+      "file": "untrusted-view-denied.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "sql_query_denied",
+      "class": "untrusted-identity"
+    },
+    {
+      "case": "overflow-rows-21",
+      "file": "overflow-rows-21.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "database_row_overflow",
+      "class": "overflow",
+      "e1_decision": "E1 named the lane overflow code (spec sections 3/6): more than 20 rows reports database_row_overflow; consumer refuses, never truncates (producer page truncation stays SQL contract section 6/9)."
+    },
+    {
+      "case": "overflow-fields-17",
+      "file": "overflow-fields-17.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "database_row_overflow",
+      "class": "overflow",
+      "e1_decision": "E1 named the lane overflow code (spec sections 3/6): more than 16 fields entries reports database_row_overflow; refuse, never truncate."
+    },
+    {
+      "case": "overflow-snapshot-33kib",
+      "file": "overflow-snapshot-33kib.json",
+      "direction": "consumer",
+      "expect": "refuse",
+      "refusal_code": "database_row_overflow",
+      "class": "overflow",
+      "e1_decision": "E1 rule (spec section 3): the 32 KiB serialized-snapshot bound is evaluated before the per-entry bounds, so this payload — which also breaks the 512-char field-text bound — deterministically reports the byte bound as database_row_overflow. The byte bound is a redundant transport guard, not a restatement of a field bound."
+    }
+  ]
+}

@@ -14,8 +14,8 @@
 #   <pdf-path> may be absolute or worktree-relative.
 #
 # Env overrides (names only; no secrets are read or printed anywhere):
-#   G4_WORKTREE, G4_IMAGE, G4_MODEL_CACHE, G4_CEILING_MEMORY,
-#   G4_CEILING_MEMORY_SWAP, G4_CEILING_CPUS
+#   G4_WORKTREE, G4_IMAGE, G4_MODEL_CACHE, G4_MODELS_LOCK, G4_PIN_MODULE,
+#   G4_CEILING_MEMORY, G4_CEILING_MEMORY_SWAP, G4_CEILING_CPUS
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,6 +23,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKTREE="${G4_WORKTREE:-$(cd "${HERE}/../.." && pwd)}"
 IMAGE="${G4_IMAGE:-fin-g4-pipeline:t2a}"
 MODEL_CACHE="${G4_MODEL_CACHE:-$HOME/.cache/fin-g4-docling-models}"
+MODELS_LOCK="${G4_MODELS_LOCK:-${HERE}/models.lock}"
+PIN_MODULE="${G4_PIN_MODULE:-${HERE}/pin.py}"
 CEIL_MEM="${G4_CEILING_MEMORY:-4g}"
 CEIL_SWAP="${G4_CEILING_MEMORY_SWAP:-4g}"
 CEIL_CPUS="${G4_CEILING_CPUS:-4}"
@@ -199,9 +201,67 @@ PY
 # The guard checks the weights themselves, not just the repo directory, because
 # a partial snapshot (configs only) is exactly the failure that broke the first
 # measured run.
+
+# The fetch is bound to models.lock, not to a branch. `docling-tools models
+# download` has no --revision for any model kind, so it cannot express the pin:
+# it fetched whatever `main` pointed at, and a fresh host silently landed
+# somewhere the pin had never seen. The revisions are read out of models.lock
+# through pin.py's own parser, so "a branch is not a pin" is the rule the pin
+# contract suite already holds rather than a second, looser copy of it here.
+#
+# A model kind maps to a set of repos; the same repo pinned at two revisions is
+# fetched once. Reading the plan from the lock is what makes the fetch a
+# function of the declaration: changing a pin changes the fetch, and nothing in
+# the command line can be edited to move it back.
+emit_fetch_plan() {
+    python3 - "${PIN_MODULE}" "${MODELS_LOCK}" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("g4_pipeline_pin", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+# Registered before exec: `pin.py` is dataclasses, and a dataclass resolves its
+# own module through sys.modules while the class body is being created.
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+pins = module.parse_models_lock(open(sys.argv[2], encoding="utf-8").read(), source=sys.argv[2])
+
+# One line per distinct (repo, revision): the lock pins one repo per model kind
+# and the fetch is per repo, so pinning the same repo twice at the same commit
+# is one download, and twice at different commits is a conflict to be named.
+seen = set()
+for pin in pins.values():
+    key = (pin.repo, pin.revision)
+    if key in seen:
+        continue
+    seen.add(key)
+    print(f"{pin.repo}@{pin.revision}:/models/{pin.cache_dir}")
+PY
+}
+
+FETCH_PLAN=""
+if [[ ! -r "${PIN_MODULE}" ]]; then
+    echo "[run] FATAL: pin module not readable at ${PIN_MODULE}; the model fetch would be unbound" >&2
+    exit 65
+fi
+if ! FETCH_PLAN="$(emit_fetch_plan)"; then
+    echo "[run] FATAL: ${MODELS_LOCK} is not a usable model pin (read with ${PIN_MODULE}); the fetch would be unbound" >&2
+    exit 65
+fi
+if [[ -z "${FETCH_PLAN}" ]]; then
+    echo "[run] FATAL: ${MODELS_LOCK} yielded no fetch plan; the model fetch would be unbound" >&2
+    exit 65
+fi
+
+FETCH_ARGS=()
+while IFS= read -r FETCH_SPEC; do
+    [[ -n "${FETCH_SPEC}" ]] || continue
+    FETCH_ARGS+=("${FETCH_SPEC}")
+done <<< "${FETCH_PLAN}"
+
 if [[ ! -f "${MODEL_CACHE}/docling-project--docling-layout-heron/model.safetensors" ||
       ! -f "${MODEL_CACHE}/docling-project--docling-models/model_artifacts/tableformer/accurate/tableformer_accurate.safetensors" ]]; then
-    echo "[run] artifacts cache incomplete -> fetching layout + tableformer into ${MODEL_CACHE}"
+    echo "[run] artifacts cache incomplete -> fetching ${#FETCH_ARGS[@]} pinned repos into ${MODEL_CACHE}"
     FETCH_EXIT=0
     docker run --rm \
         --memory="${CEIL_MEM}" --memory-swap="${CEIL_SWAP}" --cpus="${CEIL_CPUS}" \
@@ -209,9 +269,23 @@ if [[ ! -f "${MODEL_CACHE}/docling-project--docling-layout-heron/model.safetenso
         --env HOME=/tmp --env HF_HOME=/models/hf --env HF_HUB_DISABLE_XET=1 \
         --env HF_HUB_DOWNLOAD_TIMEOUT=180 --env HF_HUB_ETAG_TIMEOUT=120 \
         --volume "${MODEL_CACHE}:/models" \
-        --entrypoint /usr/local/bin/docling-tools \
-        "${IMAGE}" models download --output-dir /models layout tableformer \
+        --entrypoint /usr/local/bin/python \
+        "${IMAGE}" - <<'PY' "${FETCH_ARGS[@]}" \
         > "${RESULTS}/model_fetch.log" 2>&1 || FETCH_EXIT=$?
+# g4-fetch-program: begin
+import sys
+
+from huggingface_hub import snapshot_download
+
+for spec in sys.argv[1:]:
+    repo, rest = spec.split("@", 1)
+    revision, local_dir = rest.split(":", 1)
+    print(f"[fetch] {repo} @ {revision} -> {local_dir}", flush=True)
+    # `revision` is passed explicitly because omitting it makes the Hub resolve
+    # the repo's default branch, which is the defect this replaces.
+    snapshot_download(repo_id=repo, revision=revision, local_dir=local_dir)
+# g4-fetch-program: end
+PY
     if [[ "${FETCH_EXIT}" != "0" ]]; then
         echo "[run] FATAL: model fetch exit=${FETCH_EXIT}, no measurement taken; log=${RESULTS}/model_fetch.log" >&2
         tail -20 "${RESULTS}/model_fetch.log" >&2 || true
@@ -220,6 +294,25 @@ if [[ ! -f "${MODEL_CACHE}/docling-project--docling-layout-heron/model.safetenso
     echo "[run] model fetch ok, log=${RESULTS}/model_fetch.log"
     ls -1 "${MODEL_CACHE}" | sed 's/^/[run] artifacts: /'
 fi
+
+# What arrived is checked against the lock before anything is measured, on every
+# run and not only after a fetch: a cache warmed by an earlier harness, or one a
+# fetched revision drifted away from, is exactly the case that used to reach a
+# full measurement unverified. This is a gate on the cache, not a constraint on
+# the fetch - the revision binding above is the constraint.
+#
+# An absent cache is a failure here, not a skipped check: `verify-models` names
+# the artifact that was never fetched, which is the state a cold host is in.
+# The verifier's own output is redirected to stderr along with this gate's: the
+# driver reserves stdout for the single machine-readable line, and a
+# `[pin] N model artifacts match…` on stdout would sit in the same stream as the
+# record a caller greps for.
+if ! python3 "${PIN_MODULE}" verify-models \
+        --pin "${MODELS_LOCK}" --cache-root "${MODEL_CACHE}" >&2; then
+    echo "[run] FATAL: the model cache does not match ${MODELS_LOCK}; no measurement taken" >&2
+    exit 75
+fi
+echo "[run] model cache verified against ${MODELS_LOCK}" >&2
 
 DOCKER_CMD=(
     docker run --name "${CTR}"
@@ -327,8 +420,8 @@ echo "[run] measured JSON   : ${RUN_DIR}/${BASE}.measured.jsonl"
 echo "[run] page bitmaps    : ${RUN_DIR}/pages"
 
 # A captured JSON line is not a succeeded run: the driver can print its record
-# and still be killed on the way out, and a caller scripting these runs has to be
-# able to tell the two apart from the exit status alone. The record is written
+# and still be killed on the way out, and a caller scripting these runs has to
+# be able to tell the two apart from the exit status alone. The record is written
 # either way, because under this harness a failed measurement is a result.
 if [[ "${RUN_EXIT}" != "0" || ( -n "${STATE_EXIT}" && "${STATE_EXIT}" != "0" ) ]]; then
     echo "[run] FAIL: measured line captured but the run did not succeed" >&2

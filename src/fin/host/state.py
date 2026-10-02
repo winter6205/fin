@@ -360,7 +360,7 @@ class AgentState(TypedDict, total=False):
         the active routing view. ``reset_input_state`` must NOT wipe
         this channel.
     comparisons
-        T3 (enterprise-kb Focus 1): the ``fin.comparison.v1``
+        T3 (enterprise-kb Focus 1): the ``fin.comparison``
         envelopes this run's ``compare_facts`` calls produced, each
         carrying the ``tool_call_id`` that generated it. Structured
         data, not prose — the workspace turn row renders a table off

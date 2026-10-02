@@ -1,9 +1,13 @@
 """The 档 SSOT: the closed tier set and its named-failure tokens.
 
-The routing-time codes for an unopened 档 live here, plus the global
-综述 档's one runtime code (:data:`COMMUNITY_SUMMARY_INDEX_FAILURE`) — it
-belongs with the 档 vocabulary it qualifies even though it is emitted off
-the upstream retrieve error rather than at routing time.
+The routing-time codes for an unopened 档 live here (the table is EMPTY
+since A2 opened ``sql``: no 档 is refused at routing time anymore, and the
+mechanism stays for the next plan slot), plus the global
+综述 档's one runtime code (:data:`COMMUNITY_SUMMARY_INDEX_FAILURE`) and
+the sql 档's producer-side failure vocabulary (:data:
+`SQL_PRODUCER_FAILURE_CODES`) — they belong with the 档 vocabulary they
+qualify even though the runtime codes are emitted off the upstream
+retrieve error rather than at routing time.
 
 A neutral leaf (stdlib imports only) so BOTH sides can depend on it
 without a cycle: :func:`fin.retrieve.port.resolve_search_mode`
@@ -19,14 +23,59 @@ function-level lazy import, a layering inversion the review named
 
 from __future__ import annotations
 
-from typing import Final, Literal
+from typing import Final, Literal, get_args
 
 # The routing-time named failures an unimplemented 档 yields. Public
 # wire tokens (spec ``first-closed-loop`` Open Question 1);
 # ``named_failures`` re-exports them onto the codes surface.
 TIER_NOT_OPEN: Final[str] = "tier_not_open"
 
+# After A2 the routing-time table below has ZERO rows — ``sql`` runs a
+# real arm, so nothing is refused at routing time anymore (spec
+# search-mode-business-sql-contract §4: "fin's change is one table row").
+# The token survives NARROWED: it is the exit the PRODUCER declares when
+# no business ledger is provisioned on its instance — after A2 it means
+# NOT PROVISIONED only, never refused-at-door (spec §7: collapsing the two
+# is the empty-vs-error conflation the port forbids).
 REAL_DB_NOT_WIRED: Final[str] = "real_db_not_wired"
+
+# ----- the sql 档's producer-side failure vocabulary (spec §7) -----
+#
+# These are NOT routing-time refusals: the producer (iknow's business-
+# query module) declares one of them as the structured ``error`` field of
+# an isError retrieve result, and fin's adapter reads the FIELD — never
+# a substring of the message prose (§7.1: an untokened failure is a
+# dead-server reading, so the closed set here is what the adapter will
+# pass through under its own name). Shared tokens with the iknow side.
+SQL_NO_MATCHING_ROWS: Final[str] = "sql_no_matching_rows"
+
+SQL_QUERY_DENIED: Final[str] = "sql_query_denied"
+
+SQL_QUERY_TIMEOUT: Final[str] = "sql_query_timeout"
+
+SQL_AUTHORIZATION_UNVERIFIED: Final[str] = "sql_authorization_unverified"
+
+# The request never reached the permitted query: unknown template, or a
+# window the template cannot bind (missing / malformed / end < start).
+# Refused before any connection — fin mirrors the same name at its own
+# pre-transport seam so the exit is identical on both sides of the wire.
+INVALID_BUSINESS_QUERY: Final[str] = "invalid_business_query"
+
+# The named failures the sql arm can declare on the wire. Membership here
+# is what keeps each exit under its OWN name instead of collapsing into
+# ``retrieve_unavailable``; after A2 ``REAL_DB_NOT_WIRED`` means NOT
+# PROVISIONED only, never refused-at-door (§7 — collapsing the two is the
+# empty-vs-error conflation the port forbids).
+SQL_PRODUCER_FAILURE_CODES: Final[frozenset[str]] = frozenset(
+    {
+        REAL_DB_NOT_WIRED,
+        SQL_QUERY_DENIED,
+        SQL_QUERY_TIMEOUT,
+        SQL_AUTHORIZATION_UNVERIFIED,
+        SQL_NO_MATCHING_ROWS,
+        INVALID_BUSINESS_QUERY,
+    }
+)
 
 # The global 综述 档 is OPEN, so its only remaining refusal is a runtime
 # index fact: the 社区 summary index the report arm reads is not-ready (the
@@ -61,15 +110,24 @@ LASTING_RETRIEVE_TIERS: Final[tuple[str, ...]] = (
 
 RETRIEVE_TIERS: Final[tuple[str, ...]] = LASTING_RETRIEVE_TIERS
 
-RetrieveTier = Literal[*RETRIEVE_TIERS]
+RetrieveTier = Literal["lexical", "graph", "global", "sql"]
 
-# The named failure each unimplemented 档 yields. ``lexical`` 查找 is the
-# lexical fallback the same doc leaves openable, so it is NOT in this
-# table: an 查找 send runs a real arm. Neither is ``graph``: it IS the
-# default 知识问答 档. Nor is ``global``: opening it moved it from a plan
-# slot to a real report arm, so a 综述 send runs and only a runtime
-# index-not-ready fact refuses it (via
-# :data:`COMMUNITY_SUMMARY_INDEX_FAILURE`), never this routing table.
+# A type expression cannot unpack a variable, so the literal is restated;
+# this pin makes drift raise at import. Runtime-raise form because
+# ``python -O`` strips bare asserts.
+if tuple(get_args(RetrieveTier)) != RETRIEVE_TIERS:
+    raise RuntimeError("RetrieveTier literal drifted from RETRIEVE_TIERS")
+
+# The named failure each unimplemented 档 yields — EMPTY since A2, and
+# kept as the mechanism: every refusal seam (the port's pre-transport
+# check, the send door, the cascade's typed fail, the window's opened
+# flag, the inherit filter) reads THIS table, so opening a 档 is one row
+# here and nowhere else (spec §4). ``lexical`` 查找 is the fallback the
+# wayfinder doc leaves openable, ``graph`` IS the default 知识问答 档,
+# ``global`` runs a real report arm — and since A2 so does ``sql``: a
+# ledger request runs against the business database, and its refusals are
+# the producer's runtime facts (:data:`SQL_PRODUCER_FAILURE_CODES`),
+# never this routing table.
 #
 # No retired letter has a row here either. With the word forms the whole
 # closed set, a bare ``A`` / ``B`` / ``C`` / ``D`` is not a 档 spelling at
@@ -77,9 +135,7 @@ RetrieveTier = Literal[*RETRIEVE_TIERS]
 # ``invalid_search_mode`` before this table is consulted. Keeping a row for
 # one would suggest a letter can still be routed, which is the silent
 # mapping the rename forbids.
-TIER_UNAVAILABLE_CODE: Final[dict[str, str]] = {
-    "sql": REAL_DB_NOT_WIRED,
-}
+TIER_UNAVAILABLE_CODE: Final[dict[str, str]] = {}
 
 # Operator-visible names keyed by the lasting token. The choice window
 # renders these and an utterance is READ against them, so the four names
@@ -120,9 +176,15 @@ def normalize_tier_token(raw: object) -> str | None:
 
 __all__ = [
     "COMMUNITY_SUMMARY_INDEX_FAILURE",
+    "INVALID_BUSINESS_QUERY",
     "LASTING_RETRIEVE_TIERS",
     "REAL_DB_NOT_WIRED",
     "RETRIEVE_TIERS",
+    "SQL_AUTHORIZATION_UNVERIFIED",
+    "SQL_NO_MATCHING_ROWS",
+    "SQL_PRODUCER_FAILURE_CODES",
+    "SQL_QUERY_DENIED",
+    "SQL_QUERY_TIMEOUT",
     "TIER_LABELS",
     "TIER_NOT_OPEN",
     "TIER_UNAVAILABLE_CODE",

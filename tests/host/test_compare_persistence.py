@@ -35,6 +35,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from fin.corpus.extracted import load_extracted_tree
 from fin.host import ScriptedChatModel, compile_graph
+from fin.host.evidence_contract import AdmissionContext, validate_evidence
 from fin.host.run_payload import _run_to_response_payload
 from fin.host.thread_store import InMemoryThreadStore, RunRecord
 from fin.host.tools.compare_facts import COMPARISON_SCHEMA
@@ -64,6 +65,36 @@ _READ_ADAPTER = FakeRetrievePort(
 PAGE_SPAN = "UNITED STATES SECURITIES AND EXCHANGE COMMISSION"
 
 COMPARE_QUESTION = "Compare AAPL revenue for Q3 2023 versus Q3 2022."
+COMPARISON_ENVELOPE_FIELDS = frozenset(
+    {
+        "schema",
+        "schema_version",
+        "kind",
+        "axis",
+        "concept",
+        "unit",
+        "scale",
+        "columns",
+        "rows",
+        "deltas",
+        "missing",
+        "hit_count",
+        "cell_count",
+        "locators",
+    }
+)
+
+
+def _comparison_context(compare_seed) -> AdmissionContext:
+    """Context from the two fact sources explicitly seeded for this run."""
+    return AdmissionContext(
+        received_source_versions=frozenset(
+            {
+                (compare_seed.aapl_2022_doc, compare_seed.aapl_2022_version),
+                (compare_seed.aapl_2023_doc, compare_seed.aapl_2023_version),
+            }
+        )
+    )
 
 
 # ----- fixtures -----
@@ -294,7 +325,18 @@ def test_get_thread_turn_row_carries_the_structured_comparison(
     turn = client.get(f"/api/threads/{thread_id}").json()["turns"][0]
     assert turn["status"] == "done"
     comparison = turn["comparisons"][0]
+    assert set(comparison) == COMPARISON_ENVELOPE_FIELDS
     assert comparison["schema"] == COMPARISON_SCHEMA
+    comparison_summary = next(
+        summary
+        for summary in turn["tool_summaries"]
+        if summary["name"] == "compare_facts"
+    )
+    assert comparison_summary["tool_call_id"] == "c-compare"
+    validation = validate_evidence(
+        {"comparison": comparison}, _comparison_context(compare_seed)
+    )
+    assert validation.accepted, validation.refusal
     assert comparison["axis"] == "period"
     assert comparison["concept"] == compare_seed.concept
     assert [c["key"] for c in comparison["columns"]] == [
@@ -370,8 +412,19 @@ def test_send_stream_emits_a_comparison_frame(
     names = [name for name, _ in events]
     frames = [data for name, data in events if name == "comparison"]
     assert len(frames) == 1
+    assert set(frames[0]) == COMPARISON_ENVELOPE_FIELDS
     assert frames[0]["schema"] == COMPARISON_SCHEMA
-    assert frames[0]["tool_call_id"] == "c-compare"
+    tool_results = [
+        data
+        for name, data in events
+        if name == "tool_result" and data["name"] == "compare_facts"
+    ]
+    assert len(tool_results) == 1
+    assert tool_results[0]["tool_call_id"] == "c-compare"
+    validation = validate_evidence(
+        {"comparison": frames[0]}, _comparison_context(compare_seed)
+    )
+    assert validation.accepted, validation.refusal
     # The table lands BEFORE the terminal citations frame closes the
     # reader, so the live view renders it without waiting for a GET.
     assert names.index("comparison") < names.index("citations")

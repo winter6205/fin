@@ -1,15 +1,17 @@
-"""未开/未接 档 是具名失败, 不是文档检索 (T6, spec SC9) — 综述开档后修订版.
+"""未开/未接 档 是具名失败, 不是文档检索 (T6, spec SC9) — sql 开档后修订版.
 
 SC9 原始形态是 "``global`` and ``sql`` remain unused: if invoked, named
 未开/未接, no fake SQL retrieve." fin task 4 把 ``global`` 综述开成了真实的
-综述报告 arm: 它不再是路由期 400, 而是走普通 run。开档后本文件锁定的
-不变量随之位移:
+综述报告 arm; #322 T7 (commit 6e8ed97) 把 ``sql`` 真数据库也开成了真实 arm,
+路由期 400 表 (``TIER_UNAVAILABLE_CODE``) 至此清零。不变量随之位移:
 
-* 路由期具名 400 只剩 ``sql`` 真数据库 一个 plan slot — 真库未接仍是
-  ``real_db_not_wired``, 不得一律 ``unknown_locator`` + 空 citations。
-* ``global`` 综述 现在与 lexical/graph 一样是 OPEN 档: 点名它启动 run,
-  绝不返回 400; 它的运行时 未就绪 exit 是另一个 token
-  (``community_summary_index_failure``, 见下方 T1 段落), 不是「档未开」。
+* 路由期具名 400 一个都不剩: 点名任何 closed 档 (含 ``sql``) 都启动 run,
+  绝不 400。「真库未接」语义收窄为 producer 端的 not-provisioned 结构化
+  token (spec search-mode-business-sql-contract §7), 不再是 send door 的
+  refusal。
+* ``global`` / ``sql`` 现在与 lexical/graph 一样是 OPEN 档: 运行时未就绪
+  exit 是各自的另一个 token (``community_summary_index_failure`` 等),
+  不是「档未开」。
 * 分类输出仍是 closed 档 set (不确定则澄清), 未开档 只按 NAME 询问,
   **禁止开放业务意图桶** — 单纯谈论 summaries/database 不算点名 档。
 
@@ -20,12 +22,12 @@ new 409 token would be reported to the operator as 「还有一轮在运行」,
 a false claim (``web/src/api.ts`` sendConflictError).
 
 ``tier_not_open`` 仍是公开 token (closed vocabulary + 具名失败 distinctness
-guard 保留它), 但开档后它 NO LONGER has a routing-time producer: the send
-door looks the code up in ``TIER_UNAVAILABLE_CODE`` (now ``sql`` only), so
-a 综述 pin can never yield it again.
+guard 保留它), 但自 #322 T7 起它 NO LONGER has a routing-time producer: the
+send door looks the code up in ``TIER_UNAVAILABLE_CODE`` (EMPTY since the
+sql 档 opened), so no closed-set pin can ever yield it again.
 
-lexical 查找 / graph 知识问答 / global 综述 are the open 档 the same doc
-leaves serveable; they are deliberately NOT refused here (see
+lexical 查找 / graph 知识问答 / global 综述 / sql 真数据库 are the open 档
+the same doc leaves serveable; none is refused here (see
 ``fin.host.named_failures.TIER_UNAVAILABLE_CODE``).
 """
 
@@ -116,8 +118,14 @@ def test_a_requested_review_tier_is_no_longer_refused() -> None:
     assert unavailable_tier(["global"]) is None
 
 
-def test_a_requested_real_db_tier_is_unavailable() -> None:
-    assert unavailable_tier(["sql"]) == "sql"
+def test_a_requested_real_db_tier_is_no_longer_refused() -> None:
+    """#322 T7 (commit 6e8ed97) flipped this pin: ``sql`` ran its first
+    real arm, so its row LEFT ``TIER_UNAVAILABLE_CODE`` — naming 真数据库
+    at the door routes like graph/lexical/global. The old pin was
+    ``unavailable_tier(["sql"]) == "sql"``; the helper now names NOTHING
+    for it, and 「真库未接」 survives only as the producer's structured
+    not-provisioned token (spec search-mode-business-sql-contract §7)."""
+    assert unavailable_tier(["sql"]) is None
 
 
 @pytest.mark.parametrize("tier", ["lexical", "graph"])
@@ -200,8 +208,9 @@ def test_community_summary_index_failure_is_not_tier_not_open() -> None:
 
     assert COMMUNITY_SUMMARY_INDEX_FAILURE != TIER_NOT_OPEN
     # It is a runtime not-ready fact, not a routing table entry: the
-    # 档-unavailable map holds only the surviving plan-slot code (sql),
-    # and the 综述 runtime token is never one of them.
+    # 档-unavailable map is EMPTY since #322 T7 opened sql (the mechanism
+    # stays for the next plan slot), and the 综述 runtime token is never
+    # one of them.
     assert COMMUNITY_SUMMARY_INDEX_FAILURE not in TIER_UNAVAILABLE_CODE
     assert COMMUNITY_SUMMARY_INDEX_FAILURE not in TIER_UNAVAILABLE_CODE.values()
 
@@ -339,69 +348,121 @@ def test_naming_tier_global_starts_a_run_not_a_refusal(
     assert detail["turns"], "opening 综述 must let the run start, not refuse it"
 
 
-def test_naming_tier_sql_refuses_real_db_not_wired(
+def test_naming_tier_sql_starts_a_run_not_a_refusal(
     client: TestClient, store, graph
 ) -> None:
+    """Flipped by #322 T7 (commit 6e8ed97): the old pin was a named 400
+    ``{"error": "real_db_not_wired"}`` fired before the run existed. The
+    sql 档 now runs a real arm, so a ``sql`` pin routes exactly like
+    global/graph/lexical — 200, SSE, a turn row, and the audit carries
+    the token itself with no failure code. 「真库未接」 survives only as
+    the producer's structured not-provisioned exit on the wire."""
     thread_id = _new_thread(client)
 
+    # A track-rules-grounded question: the pin is what routes the 档, and
+    # the audit assertion below needs the search-mode cascade to have run
+    # (spec search-mode-host assumption 2 — only grounded turns assign).
     r = client.post(
         f"/api/threads/{thread_id}/messages",
-        json={"question": "How many rows are in the sales table?", "tiers": ["sql"]},
+        json={
+            "question": "What was AAPL net sales in 2023 Q3?",
+            "tiers": ["sql"],
+        },
     )
 
-    assert r.status_code == 400, r.text
-    assert r.json() == {"error": REAL_DB_NOT_WIRED}
+    assert r.status_code == 200, r.text
+    assert "text/event-stream" in r.headers["content-type"], r.headers
+    detail = client.get(f"/api/threads/{thread_id}").json()
+    assert detail["turns"], "opening 真数据库 must let the run start, not refuse it"
+    audit = graph._graph.get_state(
+        {"configurable": {"thread_id": thread_id}}
+    ).values["search_mode_decision"]
+    assert audit["search_mode"] == "sql"
+    assert audit["failure_code"] is None
 
 
 def test_the_global_and_sql_pins_do_not_collapse_to_one_exit(
     client: TestClient, store, graph
 ) -> None:
-    """SC9's distinguishable-facts point survives 综述 being opened, with
-    the reversal the open forces: a ``sql`` pin is STILL a named routing
-    400 (真库未接), while a ``global`` pin is no longer a refusal at all
-    (综述 open). They must not collapse into one answer — one starts a
-    run, the other refuses before any run."""
-    thread_id = _new_thread(client)
+    """SC9's distinguishable-facts point survives with the reversal the
+    sql open forces: both pins now start runs — the distinctness that
+    remains a product fact is that EACH 档 rides its OWN audit token, so
+    a 综述 run and a 真数据库 run never collapse into one another's
+    routing (and neither is ever served by a substitute 档)."""
+    global_thread = _new_thread(client)
+    sql_thread = _new_thread(client)
 
     review = client.post(
-        f"/api/threads/{thread_id}/messages",
-        json={"question": "q", "tiers": ["global"]},
+        f"/api/threads/{global_thread}/messages",
+        json={
+            "question": "What was AAPL net sales in 2023 Q3?",
+            "tiers": ["global"],
+        },
     )
     real_db = client.post(
-        f"/api/threads/{thread_id}/messages",
-        json={"question": "q", "tiers": ["sql"]},
+        f"/api/threads/{sql_thread}/messages",
+        json={
+            "question": "What was AAPL net sales in 2023 Q3?",
+            "tiers": ["sql"],
+        },
     )
 
     assert review.status_code == 200, review.text
     assert "text/event-stream" in review.headers["content-type"], review.headers
-    assert real_db.status_code == 400, real_db.text
-    assert real_db.json() == {"error": REAL_DB_NOT_WIRED}
+    assert real_db.status_code == 200, real_db.text
+    assert "text/event-stream" in real_db.headers["content-type"], real_db.headers
+    global_audit = graph._graph.get_state(
+        {"configurable": {"thread_id": global_thread}}
+    ).values["search_mode_decision"]
+    sql_audit = graph._graph.get_state(
+        {"configurable": {"thread_id": sql_thread}}
+    ).values["search_mode_decision"]
+    assert global_audit["search_mode"] == "global"
+    assert sql_audit["search_mode"] == "sql"
+    assert global_audit["search_mode"] != sql_audit["search_mode"]
 
 
-def test_the_refusal_happens_before_any_run_starts(
+def test_no_closed_set_pin_is_refused_before_a_run_starts(
     client: TestClient, store, graph
 ) -> None:
-    """A refused 档 must not leave a turn row: no run was invoked, so
-    the thread history stays empty. 综述 opened, so the surviving plan
-    slot 真数据库 (``sql``) carries this invariant — its named 400 fires
-    before the graph runs."""
-    thread_id = _new_thread(client)
+    """The invariant the old 「refusal happens before any run starts」
+    test guarded, restated for the emptied table: routing-time refusals
+    have ZERO producers — ``TIER_UNAVAILABLE_CODE`` is empty and neither
+    former refusal token is in it — so every closed-set pin leaves a turn
+    row. What IS still refused before any run starts is the out-of-closed-
+    set selector: the schema gate (422) wins over the run exactly as the
+    400 once did, and the ordering proof stays: no turn row."""
+    assert TIER_UNAVAILABLE_CODE == {}
+    assert REAL_DB_NOT_WIRED not in TIER_UNAVAILABLE_CODE.values()
+    assert "tier_not_open" not in TIER_UNAVAILABLE_CODE.values()
 
-    client.post(
-        f"/api/threads/{thread_id}/messages",
-        json={"question": "How many rows are in the sales table?", "tiers": ["sql"]},
+    for tier in RETRIEVE_TIERS:
+        thread_id = _new_thread(client)
+        r = client.post(
+            f"/api/threads/{thread_id}/messages",
+            json={"question": "What was AAPL net sales in 2023 Q3?", "tiers": [tier]},
+        )
+        assert r.status_code == 200, (tier, r.text)
+        detail = client.get(f"/api/threads/{thread_id}").json()
+        assert detail["turns"], f"{tier} pin must start a run, not refuse it"
+
+    refused_thread = _new_thread(client)
+    bad = client.post(
+        f"/api/threads/{refused_thread}/messages",
+        json={"question": "q", "tiers": ["Z"]},
     )
+    assert bad.status_code == 422, bad.text
+    detail = client.get(f"/api/threads/{refused_thread}").json()
+    assert detail["turns"] == [], "an invalid selector must start no run"
 
-    detail = client.get(f"/api/threads/{thread_id}").json()
-    assert detail["turns"] == []
 
-
-@pytest.mark.parametrize("tier", ["lexical", "graph", "global"])
+@pytest.mark.parametrize("tier", RETRIEVE_TIERS)
 def test_naming_an_open_tier_does_not_refuse(
     tier: str, client: TestClient, store, graph
 ) -> None:
-    """查找、知识问答 and 综述 ride the ordinary send path (the run, not a
-    refusal): an open lasting token is never 档未开."""
+    """查找、知识问答、综述 and — since #322 T7 — 真数据库 ride the ordinary
+    send path (the run, not a refusal): an open lasting token is never
+    档未开."""
     thread_id = _new_thread(client)
 
     r = client.post(

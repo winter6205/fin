@@ -4,7 +4,7 @@ Spec Focus 3 / SC6: "one authenticated-to-local GET or POST from the
 thread returns a file body for citations or comparison; missing run ->
 typed 404."
 
-The comparison export binds to the T3 envelope ``fin.comparison.v1``
+The comparison export binds to the T3 envelope ``fin.comparison``
 (shape SSOT: ``fin.host.tools.compare_facts``). CONTEXT's compare_facts
 entry forbids "computing the delta in the SPA or the export", so every
 test below asserts the file carries the envelope's OWN strings.
@@ -13,6 +13,7 @@ test below asserts the file carries the envelope's OWN strings.
 from __future__ import annotations
 
 import csv
+import io
 import json
 
 import pytest
@@ -32,7 +33,7 @@ THREAD_ID = "t-export"
 
 
 def _comparison_envelope() -> dict:
-    """A real ``fin.comparison.v1`` envelope from the T3 tool.
+    """A real ``fin.comparison`` envelope from the T3 tool.
 
     Built by ``compare_facts`` itself rather than hand-written so the
     export can never drift from the shape the turn row persists.
@@ -152,6 +153,39 @@ ATTACHMENT_CITATION = {
     "display": "unit",
     "filename": "inspection-sheet.pdf",
     "quote": "the odometer reading shown on the inspection sheet",
+}
+
+# A stored ledger citation row, as the workspace projection writes it.
+# It names NEITHER document id: a row has no filing behind it, so the
+# file must open it through the permitted view plus the record key the
+# query returned, and its ``version`` is the round's ``queried_at``.
+DATABASE_ROW_CITATION = {
+    "kind": "database-row",
+    "document_id": "",
+    "attachment_id": "",
+    "version": "2026-03-01T09:14:22Z",
+    "unit": 1,
+    "display": "record",
+    "filename": "",
+    "quote": (
+        "C-2291 Northwind Logistics, expires 2026-03-14, "
+        "notice by 2026-02-12"
+    ),
+    "database_row": {
+        "source": "ledger_ro.contract_expiry",
+        "record_key": {"contract_id": "C-2291"},
+        "queried_at": "2026-03-01T09:14:22Z",
+        "fields": {
+            "counterparty": "Northwind Logistics",
+            "expiry_date": "2026-03-14",
+            "notice_days": "30",
+            "notice_by": "2026-02-12",
+        },
+        "summary": (
+            "C-2291 Northwind Logistics, expires 2026-03-14, "
+            "notice by 2026-02-12"
+        ),
+    },
 }
 
 
@@ -326,6 +360,9 @@ def test_export_of_every_comparison_the_run_produced() -> None:
 
 AWKWARD_COMPARISON = {
     "schema": COMPARISON_SCHEMA,
+    # Stated, as the real ``compare_facts`` envelope does — this fixture
+    # exercises the awkward fallbacks, not the version row's absence.
+    "schema_version": 1,
     "concept": "us-gaap:Revenues",
     "axis": "period",
     "unit": "USD",
@@ -357,7 +394,12 @@ AWKWARD_COMPARISON = {
 BARE_COMPARISON = {"schema": COMPARISON_SCHEMA, "concept": "us-gaap:GrossProfit"}
 
 EXPECTED_CSV = (
-    "schema,fin.comparison.v1\n"
+    # The identity section opens with the token AND its integer version
+    # sibling: the token names the shape, the version numbers it, so a
+    # reader of the CSV can tell two otherwise identical tables apart
+    # (spec 2.1). The BYTE pin is not softened for the new row.
+    "schema,fin.comparison\n"
+    "schema_version,1\n"
     "concept,us-gaap:Revenues\n"
     "axis,period\n"
     "unit,USD\n"
@@ -374,14 +416,6 @@ EXPECTED_CSV = (
     "document_id,version,unit\n"
     "AAPL-2022Q3,a7a0,4\n"
     ",,\n"
-    "\n"
-    "schema,fin.comparison.v1\n"
-    "concept,us-gaap:GrossProfit\n"
-    "axis,\n"
-    "unit,\n"
-    "scale,\n"
-    "\n"
-    "row\n"
 )
 
 
@@ -393,14 +427,166 @@ def test_comparison_csv_is_byte_stable() -> None:
     order, the single blank separator row, the key fallbacks, and the
     quoting — so a refactor of the writer cannot silently reshape a
     file operators already parse downstream.
+
+    PREMISE MOVED (why the second comparison is gone from this run):
+    this test used to pin two envelopes in one document, the second of
+    them ``BARE_COMPARISON`` (a recognized token with no
+    ``schema_version``), and byte-pinned its EMPTY ``schema_version,``
+    cell. That pinned decision 9's leniency half, which ADR 0093
+    decision 12 superseded: a carrier that names a token and omits the
+    number is ``malformed_evidence_contract`` and no component back-fills
+    it, so the export now refuses it and it never reaches a CSV. The
+    pin was therefore not flipped to a new expected string — the state it
+    described is no longer renderable, and inventing a second rendering
+    would assert behavior no ruling supports. Its coverage is preserved
+    and strengthened by the two tests below: the refusal replaces it
+    (``test_a_recognized_token_with_no_version_is_refused_as_malformed``)
+    and the still-renderable absent-IDENTITY-VALUE path — the empty cell
+    a missing ``concept``/``axis``/``unit``/``scale`` produces — is
+    byte-pinned on its own in
+    ``test_an_absent_identity_value_renders_an_empty_cell``. That second
+    pin is what the removed envelope's empty cell was really standing in
+    for; without it the empty-cell rendering would have lost its only
+    coverage, and the docstring's earlier claim that it was "pinned
+    elsewhere in sibling assertions" was false — the surviving rows here
+    are all populated. Authorization: the operator's decision 12
+    supersession, recorded in the ADR's decision 9 annotation.
     """
     export = build_export(
-        runs=[_run("run-1", comparisons=[AWKWARD_COMPARISON, BARE_COMPARISON])],
+        runs=[_run("run-1", comparisons=[AWKWARD_COMPARISON])],
         kind="comparison",
         thread_id=THREAD_ID,
     )
 
     assert export.body == EXPECTED_CSV
+
+
+def test_an_absent_identity_value_renders_an_empty_cell() -> None:
+    """A missing identity VALUE still renders as an empty cell, byte-pinned.
+
+    This is the rendering half of the decision-10 behavior, and it is
+    separate from the acceptance gate: an envelope that STATES the current
+    version is spoken by the export, and its absent ``concept``/``axis``/
+    ``unit``/``scale`` render empty exactly like any other absent identity
+    value, so a reader can still tell "absent" from "present".
+
+    WHY this test exists (coverage restored, not invented): the byte pin in
+    ``test_comparison_csv_is_byte_stable`` used to reach this rendering
+    through ``BARE_COMPARISON``, an envelope with no ``schema_version``.
+    ADR 0093 decision 12 superseded that leniency and the export now
+    refuses such an envelope, so the empty-cell path lost its only
+    coverage. This pin restores it through a shape that is still legal: a
+    token WITH the current version and absent identity VALUES. The
+    ``schema_version`` row is populated here, which is the point — the
+    version cell is never empty, but the identity cells still are.
+    """
+    envelope = {
+        key: value
+        for key, value in AWKWARD_COMPARISON.items()
+        if key not in ("concept", "axis", "unit", "scale")
+    }
+    envelope["schema_version"] = 1
+
+    export = build_export(
+        runs=[_run("run-empty-identity", comparisons=[envelope])],
+        kind="comparison",
+        thread_id=THREAD_ID,
+    )
+
+    assert export.body.splitlines()[:6] == [
+        "schema,fin.comparison",
+        "schema_version,1",
+        "concept,",
+        "axis,",
+        "unit,",
+        "scale,",
+    ]
+
+
+def test_a_recognized_token_with_no_version_is_refused_as_malformed() -> None:
+    """A carrier naming the token and omitting the number is refused.
+
+    ADR 0093 decision 12 (spec §2.1 rule 1): the pairing is atomic at
+    every boundary, so an envelope carrying ``fin.comparison`` with no
+    ``schema_version`` is ``malformed_evidence_contract`` and nothing
+    back-fills it. This is the case the export used to accept and render
+    as an empty cell, on the superseded reading of decision 9; the
+    validator and the web already refuse it, and the shared case file
+    ``data/conformance/evidence/schema_version_cases.json`` declares it
+    ``malformed_evidence_contract`` in the ``version-absent-with-token``
+    case.
+
+    The refusal names the class in its message because the export has one
+    frozen wire ``code`` for both classes; asserting the class here is
+    what keeps a producer's type bug distinguishable from a real version
+    skew (§6).
+    """
+    with pytest.raises(UnsupportedComparisonSchemaError) as exc:
+        build_export(
+            runs=[_run("run-1", comparisons=[BARE_COMPARISON])],
+            kind="comparison",
+            thread_id=THREAD_ID,
+        )
+
+    assert "malformed_evidence_contract" in str(exc.value)
+    assert "unsupported_evidence_contract" not in str(exc.value)
+
+
+def test_a_recognized_token_with_no_version_is_refused_in_the_json_export_too() -> None:
+    """Same refusal on the JSON path — the gate is not a CSV-only rule.
+
+    The absent version must not be waved through and then serialized as
+    a missing key in the JSON body either: a JSON export that omits
+    ``schema_version`` is the same half-contract the CSV would have
+    written, and decision 12's "no back-fill, anywhere" covers it.
+    """
+    with pytest.raises(UnsupportedComparisonSchemaError) as exc:
+        build_export(
+            runs=[_run("run-1", comparisons=[BARE_COMPARISON])],
+            kind="comparison",
+            thread_id=THREAD_ID,
+            fmt="json",
+        )
+
+    assert "malformed_evidence_contract" in str(exc.value)
+
+
+def test_a_record_with_no_schema_at_all_never_reaches_the_csv() -> None:
+    """A record naming no ``schema`` at all is DROPPED by this export.
+
+    Decision 12 superseded only decision 9's *leniency* half. What still
+    stands is that a record carrying NO ``schema`` field at all is left
+    exactly as it is by the CONTRACT and stays accepted as v0 — but that
+    acceptance belongs to the contract's replay read, not to this export.
+    ``_bound_comparisons`` binds only envelopes whose ``schema`` is
+    ``fin.comparison``, so a token-less record is not refused for being
+    malformed: it simply is not a comparison envelope, it is dropped as
+    "another schema", and when that leaves the run with nothing to speak
+    the caller gets ``unsupported_comparison_schema`` naming what was
+    actually found. This export never renders one, so the refusal below
+    is the accurate description — do not read it as the export judging
+    the record's version or shape.
+
+    WHY this test states the refusal instead of pinning an empty cell:
+    decision 10's empty-cell rendering was written for a case that
+    reaches the CSV, and the case it described (a bare recognized token)
+    is refused upstream by decision 12. There is no reachable path in
+    this module that renders an empty ``schema_version`` cell, and
+    asserting one would be asserting an unreachable behavior. The empty
+    cell survives for the OTHER absent identity values, which
+    ``test_comparison_csv_carries_the_envelope_cells_and_deltas`` and the
+    byte pin above still exercise.
+    """
+    legacy = {"concept": "us-gaap:GrossProfit", "schema_version": 1}
+
+    with pytest.raises(UnsupportedComparisonSchemaError) as exc:
+        build_export(
+            runs=[_run("run-1", comparisons=[legacy])],
+            kind="comparison",
+            thread_id=THREAD_ID,
+        )
+
+    assert "fin.comparison" in str(exc.value)
 
 
 def test_an_absent_section_costs_no_blank_row() -> None:
@@ -738,6 +924,157 @@ def test_citations_json_export_is_the_stored_rows_byte_for_byte() -> None:
     )
     assert "source_id" not in export.body
     assert set(json.loads(export.body)["citations"][1]) == {
+        "kind",
+        "document_id",
+        "attachment_id",
+        "version",
+        "unit",
+        "display",
+        "filename",
+        "quote",
+    }
+
+
+# ----- the ledger row's source_id cell -----
+
+
+def test_citations_csv_names_the_view_and_record_key_of_a_row() -> None:
+    """A ledger row names neither document id, so the one key column
+    would download blank for every row citation — the same silent-empty
+    failure the attachment leg already had, now for a third kind.
+
+    The cell carries the permitted view and the record key the query
+    returned, because that is what a reader needs to open the record,
+    and NOT a fabricated ``document_id``.
+    """
+    export = build_export(
+        runs=[_run("run-1", citations=[DATABASE_ROW_CITATION])],
+        kind="citations",
+        thread_id=THREAD_ID,
+    )
+
+    rows = list(csv.reader(io.StringIO(export.body)))
+    assert rows[0] == ["kind", "source_id", "version", "unit", "quote"]
+    assert rows[1] == [
+        "database-row",
+        "ledger_ro.contract_expiry#contract_id=C-2291",
+        "2026-03-01T09:14:22Z",
+        "1",
+        DATABASE_ROW_CITATION["quote"],
+    ]
+
+
+def test_citations_csv_names_the_source_of_all_three_legs_in_one_file() -> None:
+    """A turn that quoted the corpus, an attachment AND a ledger row
+    produces one file whose every row names an openable source."""
+    export = build_export(
+        runs=[
+            _run(
+                "run-1",
+                citations=[
+                    CITATIONS[0],
+                    ATTACHMENT_CITATION,
+                    DATABASE_ROW_CITATION,
+                ],
+            )
+        ],
+        kind="citations",
+        thread_id=THREAD_ID,
+    )
+
+    rows = list(csv.reader(io.StringIO(export.body)))
+    assert rows[0] == ["kind", "source_id", "version", "unit", "quote"]
+    assert [row[0] for row in rows[1:]] == [
+        "company",
+        "attachment",
+        "database-row",
+    ]
+    assert [row[1] for row in rows[1:]] == [
+        CITATIONS[0]["document_id"],
+        ATTACHMENT_CITATION["attachment_id"],
+        "ledger_ro.contract_expiry#contract_id=C-2291",
+    ]
+
+
+def test_a_row_naming_no_record_key_is_a_typed_refusal() -> None:
+    """A stored row with no snapshot opens nothing, so it is refused
+    before a single cell is written — the same posture as an attachment
+    row with no ``attachment_id``.
+
+    A row whose snapshot lost its ``record_key`` is the case that would
+    otherwise export a view name with no record attached, which reads
+    as if one row of that view were the whole answer.
+    """
+    headless = dict(DATABASE_ROW_CITATION, database_row={
+        "source": "ledger_ro.contract_expiry",
+        "queried_at": "2026-03-01T09:14:22Z",
+        "fields": {},
+        "summary": "",
+    })
+
+    with pytest.raises(MalformedCitationRowError) as exc:
+        build_export(
+            runs=[_run("run-1", citations=[headless])],
+            kind="citations",
+            thread_id=THREAD_ID,
+        )
+
+    assert exc.value.code == "malformed_citation_row"
+    assert "row 0" in str(exc.value)
+    assert headless["quote"] not in str(exc.value)
+
+
+def test_a_row_never_borrows_the_document_id_slot() -> None:
+    """Each kind is checked against ITS OWN source field. A ledger row
+    whose snapshot is missing but which names a ``document_id`` is still
+    refused: borrowing the filing slot would open the wrong source under
+    a plausible-looking row.
+    """
+    borrowed = dict(DATABASE_ROW_CITATION, document_id="AAPL-2022Q3")
+    del borrowed["database_row"]
+
+    with pytest.raises(MalformedCitationRowError) as exc:
+        build_export(
+            runs=[_run("run-1", citations=[borrowed])],
+            kind="citations",
+            thread_id=THREAD_ID,
+        )
+
+    assert "row 0" in str(exc.value)
+    assert "database_row" in str(exc.value)
+
+
+def test_a_row_export_keeps_its_snapshot_in_the_json_file() -> None:
+    """The CSV names the row; the JSON carries the whole retained
+    snapshot. That is what makes opening the citation a read of this
+    file and NOT a query against the ledger (spec 8.1), so the snapshot
+    must survive the round-trip verbatim.
+    """
+    export = build_export(
+        runs=[_run("run-1", citations=[DATABASE_ROW_CITATION])],
+        kind="citations",
+        thread_id=THREAD_ID,
+        fmt="json",
+    )
+
+    rows = json.loads(export.body)["citations"]
+    assert rows[0]["database_row"] == DATABASE_ROW_CITATION["database_row"]
+    assert rows[0]["version"] == "2026-03-01T09:14:22Z"
+
+
+def test_a_document_row_gains_no_new_key_in_the_json_file() -> None:
+    """The third kind did not change the stored shape of a document
+    citation: its JSON export is the eight keys and nothing else, so
+    every thread written before the ledger kind existed is byte-equal to
+    what it exports today."""
+    export = build_export(
+        runs=[_run("run-1", citations=[CITATIONS[0]])],
+        kind="citations",
+        thread_id=THREAD_ID,
+        fmt="json",
+    )
+
+    assert set(json.loads(export.body)["citations"][0]) == {
         "kind",
         "document_id",
         "attachment_id",

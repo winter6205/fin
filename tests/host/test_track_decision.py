@@ -289,3 +289,94 @@ def test_decide_track_rejects_langchain_shaped_classify_model() -> None:
             [HumanMessage(content="q")],
             classify_model=object(),  # type: ignore[call-arg]
         )
+
+
+# ----- E2: enterprise-material routing rule (issue #334 step E2) -----
+
+_EXPENSE_PRESENT = (
+    "According to the corporate travel expense policy, what is the"
+    " maximum reimbursable amount for a working business dinner per"
+    " person?"
+)
+_EXPENSE_ABSENT = (
+    "According to the corporate travel expense policy, what is the"
+    " nightly lodging cap for a family member who accompanies an"
+    " employee on a business trip?"
+)
+_EXPENSE_AMOUNT = (
+    "Under the corporate travel expense policy, may an employee"
+    " expense a $95 business dinner, or is the per-person cap"
+    " exceeded?"
+)
+
+
+@pytest.mark.parametrize(
+    "question", [_EXPENSE_PRESENT, _EXPENSE_ABSENT, _EXPENSE_AMOUNT]
+)
+def test_enterprise_material_question_is_grounded_rules_tier(
+    question: str,
+) -> None:
+    """A question anchored to an authorized enterprise document is a
+    knowledge-QA ask: it routes grounded at the rules tier and never
+    reaches the fail-closed gray-zone clarify (spec
+    enterprise-evidence-contract E2; ADR 0090)."""
+    decision = decide_track([HumanMessage(content=question)])
+    assert decision.track == "grounded"
+    assert decision.decision_tier == "rules"
+    assert decision.signals.get("enterprise_material") is True
+    assert "jev_exit" not in decision.signals
+
+
+@pytest.mark.soft_track
+def test_enterprise_material_rule_beats_steal_to_clarify_judge() -> None:
+    """The rules tier owns the enterprise-material ask: a Jev client
+    voting ``clarify`` cannot demote it (precedence, ADR 0080 tier 1
+    over tier 2)."""
+    fake = FakeJevChoice([("clarify", 0.99)])
+    decision = decide_track(
+        [HumanMessage(content=_EXPENSE_ABSENT)], jev_client=fake
+    )
+    assert fake.calls == []
+    assert decision.track == "grounded"
+    assert decision.decision_tier == "rules"
+
+
+def test_off_domain_question_with_expense_policy_word_keeps_off_topic() -> None:
+    """Precedence inside the rules tier: a weather ask that merely
+    contains the phrase is not an enterprise-material request; the
+    earlier off-domain rule still wins."""
+    decision = decide_track(
+        [HumanMessage(content="weather in Seattle and the corporate travel expense policy")]
+    )
+    assert decision.track == "off_topic"
+    assert decision.decision_tier == "rules"
+    assert decision.signals.get("off_domain") is True
+
+
+def test_filing_ask_routing_untouched_by_enterprise_rule() -> None:
+    """Retention: the financial lane routes exactly as before — the
+    enterprise rule is additive and never fires on a filing ask."""
+    decision = decide_track(
+        [HumanMessage(content="What was AAPL net sales in 2022 Q3?")]
+    )
+    assert decision.track == "grounded"
+    assert decision.signals.get("enterprise_material") is None
+    assert decision.signals.get("filing_ask") is True
+
+
+@pytest.mark.parametrize("text", ["", "   ", "policy", "the policy?"])
+def test_enterprise_rule_needs_a_real_utterance_and_a_named_modifier(
+    text: str,
+) -> None:
+    """Empty / whitespace input keeps the conditional-policy residual;
+    a bare "policy" with no enterprise-material modifier (corporate /
+    company / travel / expense / employee) keeps the gray zone — with
+    no client the judge still fail-closes to clarify exactly as before.
+    """
+    decision = decide_track([HumanMessage(content=text)], jev_client=None)
+    if not text.strip():
+        assert decision.track == "dialogue"
+        assert decision.decision_tier == "conditional_policy"
+    else:
+        assert decision.track == "clarify"
+        assert decision.signals.get("jev_exit") == "no_jev_client"

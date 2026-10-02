@@ -1,0 +1,28 @@
+{
+  "case": "overflow-detail-4001",
+  "direction": "consumer",
+  "expect": "refuse",
+  "refusal_code": "visual_claim_overflow",
+  "payload": {
+    "visual_claims": [
+      {
+        "schema": "fin.evidence.visual_claim",
+        "schema_version": 1,
+        "kind": "visual_observation",
+        "attachment_id": "att-7401",
+        "version": "17",
+        "unit": 4,
+        "page": 4,
+        "observation_version": 2,
+        "scope": null,
+        "provider": "configured-vision",
+        "model_version": "vision-model-v1",
+        "page_image_sha256": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809",
+        "detail": "observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell observed table cell o",
+        "filename": "expense-policy.pdf",
+        "reused": false,
+        "outbound_calls": 1
+      }
+    ]
+  }
+}

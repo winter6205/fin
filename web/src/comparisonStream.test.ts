@@ -12,7 +12,11 @@
 //    already reading.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
+import { EVIDENCE_SCHEMA_VERSION } from "./evidenceContract";
 import { useWorkspaceStore } from "./store";
 import { mergeReconciledTurn } from "./turnStream";
 import type { Comparison, ThreadDetail, Turn } from "./types";
@@ -21,7 +25,8 @@ const THREAD_ID = "11111111-1111-4111-8111-111111111111";
 const RUN_ID = "22222222-2222-4222-8222-222222222222";
 
 const COMPARISON: Comparison = {
-  schema: "fin.comparison.v1",
+  schema: "fin.comparison",
+  schema_version: EVIDENCE_SCHEMA_VERSION,
   kind: "table",
   axis: "period",
   concept: "us-gaap:Revenues",
@@ -49,7 +54,6 @@ const COMPARISON: Comparison = {
             document_id: "AAPL-2022Q3",
             version: "a".repeat(64),
             unit: 4,
-            display: "page",
           },
         },
         {
@@ -64,7 +68,6 @@ const COMPARISON: Comparison = {
             document_id: "AAPL-2023Q3",
             version: "b".repeat(64),
             unit: 4,
-            display: "page",
           },
         },
       ],
@@ -88,17 +91,37 @@ const COMPARISON: Comparison = {
       document_id: "AAPL-2022Q3",
       version: "a".repeat(64),
       unit: 4,
-      display: "page",
     },
     {
       document_id: "AAPL-2023Q3",
       version: "b".repeat(64),
       unit: 4,
-      display: "page",
     },
   ],
-  tool_call_id: "c-compare",
 };
+
+const COMPARISON_FIXTURE_DIR = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "data",
+  "conformance",
+  "evidence",
+  "comparison",
+);
+
+interface ComparisonConformanceCase {
+  case: string;
+  expect: "accept" | "refuse";
+  refusal_code: string | null;
+  payload: { comparison: Record<string, unknown> };
+}
+
+function comparisonFixture(file: string): ComparisonConformanceCase {
+  return JSON.parse(
+    readFileSync(join(COMPARISON_FIXTURE_DIR, file), "utf8"),
+  ) as ComparisonConformanceCase;
+}
 
 type Frame = [string, unknown];
 
@@ -198,6 +221,36 @@ describe("sendQuestion comparison fold", () => {
     expect(latestTurn().comparisons).toEqual([COMPARISON]);
   });
 
+  it("surfaces an unknown comparison field while keeping valid neighbors ordered", async () => {
+    seedThread();
+    const validBefore = comparisonFixture("valid-period-table.json");
+    const invalid = comparisonFixture("unknown-field-envelope.json");
+    const validAfter = comparisonFixture("cells-all-missing.json");
+    expect(validBefore.expect).toBe("accept");
+    expect(validAfter.expect).toBe("accept");
+    expect(invalid.expect).toBe("refuse");
+    expect(invalid.refusal_code).toBe("malformed_evidence_contract");
+    stubSseRun([
+      ["comparison", validBefore.payload.comparison],
+      ["comparison", invalid.payload.comparison],
+      ["comparison", validAfter.payload.comparison],
+      ...TERMINAL_FRAMES,
+    ]);
+
+    await useWorkspaceStore
+      .getState()
+      .sendQuestion(THREAD_ID, "对比 AAPL 两期营收");
+
+    expect(latestTurn().comparisons).toEqual([
+      validBefore.payload.comparison,
+      validAfter.payload.comparison,
+    ]);
+    expect(latestTurn().evidence_refusals).toContainEqual({
+      citation_index: 0,
+      error: invalid.refusal_code,
+    });
+  });
+
   it("lands the table before the answer prose", async () => {
     seedThread();
     stubSseRun([...TOOL_FRAMES, ...TERMINAL_FRAMES]);
@@ -252,10 +305,12 @@ describe("sendQuestion comparison fold", () => {
     expect(turn.comparisons).toEqual([COMPARISON]);
   });
 
-  it("ignores a malformed comparison frame", async () => {
+  it("surfaces a comparison frame missing its version as a malformed refusal", async () => {
     seedThread();
+    const versionless = { ...COMPARISON };
+    Reflect.deleteProperty(versionless, "schema_version");
     stubSseRun([
-      ["comparison", { schema: "fin.comparison.v99", rows: [] }],
+      ["comparison", versionless],
       ...TERMINAL_FRAMES,
     ]);
 
@@ -264,6 +319,52 @@ describe("sendQuestion comparison fold", () => {
       .sendQuestion(THREAD_ID, "对比 AAPL 两期营收");
 
     expect(latestTurn().comparisons).toEqual([]);
+    expect(latestTurn().evidence_refusals).toEqual([
+      {
+        citation_index: 0,
+        error: "malformed_evidence_contract",
+      },
+    ]);
+  });
+
+  it("surfaces a comparison frame with a wrong version as an unsupported refusal", async () => {
+    seedThread();
+    stubSseRun([
+      ["comparison", { ...COMPARISON, schema_version: 99 }],
+      ...TERMINAL_FRAMES,
+    ]);
+
+    await useWorkspaceStore
+      .getState()
+      .sendQuestion(THREAD_ID, "对比 AAPL 两期营收");
+
+    expect(latestTurn().comparisons).toEqual([]);
+    expect(latestTurn().evidence_refusals).toEqual([
+      {
+        citation_index: 0,
+        error: "unsupported_evidence_contract",
+      },
+    ]);
+  });
+
+  it("surfaces a legacy comparison token as an unsupported refusal", async () => {
+    seedThread();
+    stubSseRun([
+      ["comparison", { ...COMPARISON, schema: "fin.comparison.v1" }],
+      ...TERMINAL_FRAMES,
+    ]);
+
+    await useWorkspaceStore
+      .getState()
+      .sendQuestion(THREAD_ID, "对比 AAPL 两期营收");
+
+    expect(latestTurn().comparisons).toEqual([]);
+    expect(latestTurn().evidence_refusals).toEqual([
+      {
+        citation_index: 0,
+        error: "unsupported_evidence_contract",
+      },
+    ]);
   });
 
   it("leaves comparisons empty on a run that never compared", async () => {

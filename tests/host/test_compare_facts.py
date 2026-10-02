@@ -3,7 +3,7 @@
 ``compare_facts`` is the comparison surface the research track calls
 instead of authoring a prose table: cross-period (one issuer, several
 periods) and peer (several issuers, one period) both resolve to the
-SAME ``fin.comparison.v1`` envelope, whose numbers come from the
+SAME ``fin.comparison`` envelope, whose numbers come from the
 ingest-built fact table with a locator per cell. The model never
 authors the arithmetic — deltas are computed here.
 

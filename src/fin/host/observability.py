@@ -15,7 +15,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Final, Literal
+from typing import Final, Literal, cast
 
 
 ObservationStatus = Literal["done", "refuse", "step_cap"]
@@ -101,7 +101,9 @@ class ObservabilityCollector:
         """Record one terminal run without retaining sensitive run data."""
         _validate_status(status)
         latency = _validate_latency(latency_ms)
-        sample = Observation(status=status, latency_ms=latency)
+        sample = Observation(
+            status=cast(ObservationStatus, status), latency_ms=latency
+        )
         with self._lock:
             self._counts[status] = self._counts.get(status, 0) + 1
             self._latency_count += 1

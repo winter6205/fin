@@ -357,6 +357,10 @@ def test_tool_wrapper_forwards_search_mode_to_the_port() -> None:
     port = FakeRetrievePort(hits_by_query={"foo": [_chunk("hit")]})
     out = retrieve_tool("foo", search_mode="lexical", adapter=port)
     assert out["chunks"], "the lexical answer is unchanged by the mode"
+    # The call record carries the sql 档's window pair beside the 档 token
+    # (A2 joined them to the port signature); a document send records
+    # them as the ``None`` the caller left unset — the keys exist, the
+    # values say "not sent".
     assert port.calls == [
         {
             "query": "foo",
@@ -367,31 +371,36 @@ def test_tool_wrapper_forwards_search_mode_to_the_port() -> None:
             "filing_date": None,
             "limit": 8,
             "search_mode": "lexical",
+            "sql_window_start": None,
+            "sql_window_end": None,
         }
     ]
 
 
-@pytest.mark.parametrize(
-    ("tier", "code"),
-    [
-        pytest.param("sql", "real_db_not_wired", id="tier-sql"),
-    ],
-)
-def test_fake_refuses_an_unopened_tier_like_the_product_adapter(
-    tier: str, code: str
-) -> None:
-    """Fake is not a 档: it mirrors the named exit rather than quietly
-    answering with its dictionary lookup (spec SC8 — Fake covers the
-    contract, not the ranking). Only ``sql`` remains an unopened 档 after
-    global was opened; the next test pins that global now mirrors the
-    product adapter by ACCEPTING the token."""
-    from fin.retrieve.port import TierUnavailableError
+def test_fake_routes_sql_like_the_product_adapter() -> None:
+    """Fake is not a 档: it mirrors the contract, not the ranking (spec
+    SC8). A2 retired the routing-time refusal, so the fake now mirrors
+    the OPEN tier — the request is routed and recorded on ``calls`` —
+    and mirrors the PRODUCER's named exits: a structured not-provisioned
+    declaration answers under its own token, never a silent dictionary
+    hit dressed as a ledger answer and never a collapsed
+    ``retrieve_unavailable``."""
+    from fin.retrieve.tiers import REAL_DB_NOT_WIRED
 
-    port = FakeRetrievePort(hits_by_query={"foo": [_chunk("hit")]})
-    with pytest.raises(TierUnavailableError) as excinfo:
-        port.retrieve("foo", search_mode=tier)
-    assert excinfo.value.code == code
-    assert port.calls == []
+    port = FakeRetrievePort(
+        hits_by_query={"foo": [_chunk("hit")]},
+        sql_named_failure=REAL_DB_NOT_WIRED,
+    )
+    result = port.retrieve(
+        "foo",
+        search_mode="sql",
+        sql_window_start="2026-01-01",
+        sql_window_end="2026-12-31",
+    )
+    assert result == {"error": REAL_DB_NOT_WIRED}
+    assert port.calls[-1]["search_mode"] == "sql", (
+        "a routed request IS recorded — only refused ones leave no call"
+    )
 
 
 def test_fake_accepts_global_like_the_product_adapter() -> None:
@@ -439,23 +448,32 @@ def test_a_leftover_token_is_refused_by_the_fake_like_the_port(
     )
 
 
-def test_an_unopened_tier_never_degrades_into_an_empty_chunk_answer() -> None:
-    """Exception class: every named 档 exit RAISES, so none of them can be
-    misread as 「语料没东西」 — the ``{"chunks": []}`` success shape is
-    reserved for a request the 档 accepted and the corpus could not answer.
-    Both unopened word forms and retired letters are in that set: the word
-    forms answer ``TierUnavailableError``, the letters
-    ``InvalidSearchModeError``."""
-    from fin.retrieve.port import (
-        InvalidSearchModeError,
-        TierUnavailableError,
-    )
+def test_a_named_sql_exit_never_wears_the_bare_document_miss_shape() -> None:
+    """Exception class, re-pinned for the open sql 档: the retired letters
+    still RAISE (``InvalidSearchModeError``), and an accepted ledger
+    request is never answered with the bare ``{"chunks": []}`` the
+    document 档 use for 「语料没东西」 — an unscripted query mirrors the
+    producer's RECORDED zero-row exit instead, so the host cannot read a
+    database miss as an empty corpus. A2 removed the last routing-refused
+    word form, so only letters remain in the raise set."""
+    from fin.retrieve.port import InvalidSearchModeError
+    from fin.retrieve.tiers import SQL_NO_MATCHING_ROWS
 
     port = FakeRetrievePort(hits_by_query={"foo": [_chunk("hit")]})
-    for token in ("sql", "A", "D"):
-        with pytest.raises((TierUnavailableError, InvalidSearchModeError)):
+    for token in ("A", "D"):
+        with pytest.raises(InvalidSearchModeError):
             port.retrieve("foo", search_mode=token)
-    assert port.calls == []
+    assert port.calls == [], "a refused request must leave no call record"
+
+    result = port.retrieve(
+        "foo",
+        search_mode="sql",
+        sql_window_start="2026-01-01",
+        sql_window_end="2026-12-31",
+    )
+    assert result != {"chunks": []}
+    assert SQL_NO_MATCHING_ROWS in result
+    assert [call["search_mode"] for call in port.calls] == ["sql"]
 
 
 # ----- T3: the five boundary classes under a 档 -----

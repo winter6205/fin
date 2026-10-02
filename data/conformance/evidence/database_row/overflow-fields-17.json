@@ -1,0 +1,43 @@
+{
+  "case": "overflow-fields-17",
+  "direction": "consumer",
+  "expect": "refuse",
+  "refusal_code": "database_row_overflow",
+  "payload": {
+    "chunks": [],
+    "database_rows": {
+      "schema": "fin.evidence.retrieve_rows",
+      "schema_version": 1,
+      "result_count": 1,
+      "rows": [
+        {
+          "source": "ledger_ro.contract_expiry",
+          "record_key": {
+            "contract_id": "C-2291"
+          },
+          "queried_at": "2026-03-01T09:14:22Z",
+          "fields": {
+            "field_00": "value-0",
+            "field_01": "value-1",
+            "field_02": "value-2",
+            "field_03": "value-3",
+            "field_04": "value-4",
+            "field_05": "value-5",
+            "field_06": "value-6",
+            "field_07": "value-7",
+            "field_08": "value-8",
+            "field_09": "value-9",
+            "field_10": "value-10",
+            "field_11": "value-11",
+            "field_12": "value-12",
+            "field_13": "value-13",
+            "field_14": "value-14",
+            "field_15": "value-15",
+            "field_16": "value-16"
+          },
+          "summary": "C-2291 Northwind Logistics, expires 2026-03-14, notice by 2026-02-12"
+        }
+      ]
+    }
+  }
+}
