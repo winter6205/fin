@@ -94,7 +94,8 @@ The retrieve MCP (**iknow-memory**) as the operator-visible dependency of the **
 _Avoid_: Fake as healthy search, dashboard HTTP as this signal, PATH-only as 可达, 能聊不能搜
 
 **retrieve port**:
-The only retrieve dependency fin is allowed to have: `query` (+ optional filters) in, ranked chunks with `source_ref` out — MCP-shaped, transport-agnostic.
+The only retrieve dependency fin is allowed to have: `query` (+ optional filters or a typed structured request) in, authorized corpus results with source attribution out — MCP-shaped, transport-agnostic. Its adapter also carries host-internal evidence reads and invalidation acknowledgements over the same connection, without another model-facing search tool.
+_Stage_: the structured request/result and internal evidence capabilities are specified in the [three structured-corpus contracts](../specs/structured-corpus-query.md); runtime implementation and acceptance remain pending.
 _Avoid_: search API, vector store, conflating with the memory port
 
 **retrieve adapter**:
@@ -192,6 +193,18 @@ _Avoid_: chunk_id, char offset as citation identity, bbox, page as the generic u
 **database-row**:
 A quotable evidence kind for one row returned by the `sql` 档, carrying `{kind: "database-row", source, record_key, queried_at, fields, summary}` — its identity is the `record_key` plus the permitted view named in `source`, and its currency is the `queried_at` of the query that produced it. It travels as a **sibling key on the retrieve envelope, never in `chunks[]`**, and its `source_ref` is never a locator. It verifies against the `record_key` and the `fields` **this round** returned rather than by a text span, so a scalar fact such as a notice period is citable and the span rule of ADR 0046 is scoped to document kinds only (ADR 0091). Re-reading a citation shows the retained snapshot and issues no query; a refresh is a new query that never rewrites a prior answer, and a past snapshot is still withheld when current permissions no longer cover that record.
 _Avoid_: locator, `field=value` text line, substring-matched row, a row shaped as a chunk, a re-query dressed as the original evidence, implying the data is unchanged because no refresh was requested
+
+**source version**:
+An immutable iknow record binding one logical company source's original content and frozen-unit manifest to its source locations. Current publication selects a source version and accepted extraction revision; historical content has finite retention under ADR 0095.
+_Avoid_: content hash as logical source identity, mutable source snapshot, permanent archive
+
+**assertion support**:
+An attributable occurrence linking an entity or relation assertion to one immutable source version, location, and optional span. Current support belongs to the published accepted extraction set; retirement preserves its historical attribution until retention permits collection.
+_Avoid_: occurrence count as truth, single-origin assertion, latest source wins
+
+**structured result evidence**:
+A finite retained snapshot of a structured query row or exact stored-subject count receipt, carried as the separate `structured-result` citation kind. Historical reads preserve the received value while rechecking current authorization and fixed expiry under the structured-corpus evidence contract.
+_Avoid_: database-row, document quote, historical membership manifest, live re-query as old evidence
 
 **citation verifier**:
 A code gate on the **grounded** track path to END: a supporting text span is a contiguous substring of the answer (v1 minimum 32 characters) that appears in text this run received from **retrieve** / **read_source** (ADR 0046); visual claims use a separate typed path requiring current-run **visual evidence** tied to the original attachment page or crop, and a generated observation is never a source quote. Unknown locators refuse immediately; missing or unmatched evidence bounces with a hidden template until the citation-repair cap, then refuses; other tracks skip this gate (ADRs 0082 and 0089). The span rule above governs **document** evidence; a **database-row** verifies by its record key and this round's returned fields instead, which is deliberate and not an exception to clean up (ADR 0091).
