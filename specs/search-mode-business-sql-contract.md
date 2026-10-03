@@ -1,10 +1,12 @@
 # The business SQL 档 contract (A1 decision brief)
 
-Status: **settled — the operator has decided the source class, the division of
-responsibility, the scope of the first delivery, and the evidence shape. A2 may
-start against a synthetic ledger; production stays blocked until a real source
-and its authorization exist.** Nothing in this document changes product behavior
-yet. The `sql` refusal stays exactly as it is until A2 is implemented.
+Status: **historical A1 decision brief — [ADR 0094](../docs/adr/0094-structured-corpus-search-and-knowledge-maintenance.md) supersedes this brief's separate
+enterprise-ledger source and contract-expiry-only primary target.** Its former
+delivery details remain historical context and are not the current structured-
+search contract. ADRs 0091–0093 continue to govern existing database-row evidence
+until a replacement SPEC explicitly decides otherwise. Runtime behavior remains
+unchanged pending that SPEC and implementation; this status update does not waive
+any the tracked change acceptance obligation.
 
 Refs: the tracked change (`plans/post321-real-sql.md` A1), `specs/search-mode-retrieve.md`,
 `specs/search-mode-lexical-sql-tokens.md`, `docs/adr/0046`, `docs/adr/0021`,
