@@ -1,21 +1,23 @@
-"""Soft-Track track decision cascade (rules → Jev → inherit → clarify → policy).
+"""Soft-Track track decision cascade (rules → inherit/clarify → Jev → policy).
 
 ``decide_track`` chooses ``dialogue`` / ``clarify`` / ``off_topic`` /
 ``grounded`` before the host graph executes a leaf.
 
-Tier order (no single global default track):
+Evaluation order (no single global default track):
 
 1. **rules** — high-confidence greeting / off-domain / fully slotted
-   research / strong research cues (never replaced by the judge).
-2. **jev** — only when ambiguous (inherit/clarify would not already
-   decide); one TypeSafe Jev closed-set Choice over the four tracks
+   research / strong research cues; a match returns immediately.
+2. **inherit / clarify candidates** — for the remaining utterances,
+   check whether the latest status snapshot can resolve a short or
+   underspecified follow-up (not across a company change), or whether a
+   filing-shaped ask is missing company and/or period. If both candidates
+   match, ``inherit`` wins.
+3. **jev** — called only for non-empty text when neither candidate
+   decides; one TypeSafe Jev closed-set Choice over the four tracks
    (ADR 0080). Every failure path — missing client, typed exit, low
    confidence — resolves to ``clarify`` (fail-closed, no fallback).
-3. **inherit** — short / underspec follow-up with latest status snapshot
-   research context (not across company change).
-4. **clarify** — filing-shaped ask missing company and/or period.
-5. **conditional_policy** — residual for utterances the judge cannot be
-   asked about (empty text) → ``dialogue``.
+4. **conditional_policy** — empty text has no candidate and cannot be
+   sent to the judge, so the residual resolves to ``dialogue``.
 
 ``snapshot_delta_for_utterance`` builds the append-only
 ``status_snapshots`` delta for classify (company change clears
@@ -360,8 +362,9 @@ def _rules_decision(text: str, signals: dict[str, Any]) -> TrackDecision | None:
     if research_hits and not (
         text and _FILING_ASK_RE.search(text) and _missing_slots(text)
     ):
-        # Underspec filing asks are ambiguous (Jev → inherit → clarify).
-        # Bare ticker/period/tool cues remain high-confidence research.
+        # Underspec filing asks are left for the inherit/clarify checks
+        # before Jev. Bare ticker/period/tool cues remain high-confidence
+        # research.
         if _extract_company(text) and _extract_period(text):
             signals["research_signals"] = research_hits
             return TrackDecision(
