@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 from fin.corpus.chunking import (
     ChunkBlock,
@@ -49,8 +49,16 @@ _CANONICAL_JSON_KWARGS: dict[str, Any] = {
 }
 
 
-def canonical_json_bytes(product: dict[str, Any]) -> bytes:
-    """Serialize one chunking product dict into canonical bytes.
+def canonical_json_bytes(
+    product: dict[str, Any] | Sequence[Sequence[str]],
+) -> bytes:
+    """Serialize one product into canonical bytes.
+
+    Two shapes are really in use, and both end up hashed, so they share one
+    construction instead of growing a second: a chunking-product dict
+    (:func:`chunking_product_sha256`, and the ``source_ref`` serialization in
+    :mod:`fin.corpus.push`) and the ordered ``(source_ref, content identity)``
+    pair list (:func:`fin.corpus.push.idempotency_keys_digest`).
 
     ``sort_keys`` neutralizes key insertion order; JSON arrays keep
     their element order (block order is asserted, not canonicalized).

@@ -168,14 +168,28 @@ uv run pytest -q -m eval               # the nine cases, pass/fail
 uv run python scripts/eval_counts.py   # the same lane, plus done / refuse integers
 ```
 
-### Python type checking (host + retrieve)
+### Python type checking (application source)
 
 ```bash
-uv sync                    # one-time precondition: installs pyright from the locked dev group
-uv run --no-sync pyright   # pyright 1.1.414 from the dev group, config in [tool.pyright]
+uv sync --all-extras --frozen   # one-time precondition: installs pyright (locked dev group) + the optional extras corpus imports
+uv run --no-sync pyright        # pyright 1.1.414 from the dev group, config in [tool.pyright]
 ```
 
-The gate checks exactly two packages, `src/fin/host` and `src/fin/retrieve`, in `standard` type-checking mode against Python 3.12; scope and mode live only in `[tool.pyright]` in `pyproject.toml`. It is a static check on the locked dev toolchain — no global install required, and it never replaces `uv run pytest` runtime validation. The web package keeps its own check (`cd web && npm run typecheck`, i.e. `tsc --noEmit`).
+The gate checks **all application source**, `src/fin` — `host`, `retrieve`, `corpus`, and `eval` — in `standard` type-checking mode against Python 3.12. Scope and mode live only in `[tool.pyright]` in `pyproject.toml`.
+
+`scripts/` and `tests/` are **not** in scope, so this is an application-source check, not a whole-repository check. It is a static check on the locked dev toolchain — no global install required, and it never replaces `uv run pytest` runtime validation. The web package keeps its own check (`cd web && npm run typecheck`, i.e. `tsc --noEmit`).
+
+Use `uv run --no-sync pyright`, never a bare `.venv/bin/pyright`: only `uv run` puts the venv where pyright resolves imports, and running the binary directly reports a wall of bogus `reportMissingImports`.
+
+#### The check also runs on commit
+
+`.husky/pre-commit` runs the complexity check (`lint:s5:staged`) and then the type check (`typecheck:staged` → `scripts/pyright-staged.mjs`). The type check materializes the git **index** into a temp directory and points pyright at that copy, so a commit is gated on the bytes it actually records — fixing an error in the working tree without staging the fix does not get the commit through. Type errors, a missing interpreter, a missing `uv`, or a checker killed before it produced a verdict all fail the commit; the hook never warns and continues.
+
+Scope of that guarantee — read before relying on it:
+
+- It is a **local commit constraint**, not a remote gate. `git commit --no-verify` skips it, and it protects nothing in CI, on force-push, or in another clone.
+- It needs `npm install` once per checkout. That is what runs `husky` and creates `.husky/_/`, which is where git actually looks. Without it `core.hooksPath` points at a directory that does not exist and **no hook runs at all, silently**.
+- It reads the **staged** `pyproject.toml`, so a commit that narrows `[tool.pyright].include` is checked against the narrowed scope. Treat a scope change there as a reviewed change, never as a way to quiet a finding.
 
 ### Live retrieve 评测（opt-in）
 

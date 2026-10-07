@@ -12,7 +12,7 @@ import json
 import threading
 from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
-from typing import Any, Final, NoReturn
+from typing import Any, Final, LiteralString, NoReturn
 
 import psycopg
 from psycopg import errors as psycopg_errors
@@ -48,7 +48,11 @@ from fin.corpus.ingest_state_model import (
     validate_document_id,
 )
 
-_SCHEMA_STATEMENTS: tuple[str, ...] = (
+# ``LiteralString`` is what psycopg's ``Query`` accepts for inline SQL: it is
+# the driver's own guard that a query was written out, not built from a
+# caller-supplied value. Only the annotation changes; these are still the
+# same ``str`` objects at runtime.
+_SCHEMA_STATEMENTS: tuple[LiteralString, ...] = (
     """
 CREATE TABLE IF NOT EXISTS fin_ingest_job (
     document_id TEXT PRIMARY KEY,

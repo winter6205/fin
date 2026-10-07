@@ -53,7 +53,7 @@ from __future__ import annotations
 import hashlib
 import io
 from dataclasses import dataclass, replace
-from typing import Final, Protocol
+from typing import TYPE_CHECKING, Final, Protocol, cast
 
 from fin.corpus.errors import (
     EmptySourceParseError,
@@ -77,6 +77,9 @@ from fin.corpus.parsers._common import (
     freeze_text,
     has_pdf_signature,
 )
+
+if TYPE_CHECKING:
+    from PIL import Image
 
 # Render scale of the page raster every page is kept at. 200 dpi is the
 # scale the pinned pipeline measured at and the scale the figure-crop floor
@@ -351,6 +354,35 @@ class PdfplumberPageSource:
         return len(self._page(page_no).images or [])
 
 
+class _PdfiumBitmap(Protocol):
+    """The pypdfium2 bitmap surface this module consumes."""
+
+    def to_pil(self) -> "Image.Image": ...
+
+
+class _PdfiumPage(Protocol):
+    """The pypdfium2 page-render surface, carrying the library's
+    *documented* parameter type rather than the one a checker infers.
+
+    pypdfium2 5.13.0 ships no type information (no ``py.typed``, no
+    ``.pyi``), so ``PdfPage.render(self, scale = 1, ...)`` is read from
+    its unannotated source and ``scale`` infers as ``int`` from the
+    default. The real contract is a float: it is documented as "scale
+    (float): a factor scaling the number of pixels per PDF canvas unit
+    ... multiply it by the size of 1 canvas unit in inches (usually
+    1/72in)", and the body computes ``math.ceil(self.get_width() *
+    scale)`` — a ``math.ceil`` over an integer product would be a no-op,
+    so the product is meant to be fractional.
+
+    At ``PAGE_RENDER_DPI`` 200 the scale is 2.78, and the crop floor is
+    calibrated against it ("At 200 dpi 160 px is 57 pt"). Narrowing this
+    to the inferred ``int`` would draw every page at 144 dpi, so the
+    declared type is widened here instead.
+    """
+
+    def render(self, *, scale: float = 1.0) -> _PdfiumBitmap: ...
+
+
 class Pypdfium2PageRenderer:
     """``PageRenderPort`` that rasterizes a PDF page with pypdfium2.
 
@@ -375,7 +407,7 @@ class Pypdfium2PageRenderer:
             raise ValueError(f"dpi must be positive, got {dpi}")
         import pypdfium2 as pdfium
 
-        self._scale = dpi / 72.0
+        self._scale: float = dpi / 72.0
         self._closed = False
         try:
             self._doc = pdfium.PdfDocument(source_bytes)
@@ -408,7 +440,8 @@ class Pypdfium2PageRenderer:
                 "this renderer is closed and cannot draw page "
                 f"{page_no}: its document has been released"
             )
-        image = self._doc[page_no - 1].render(scale=self._scale).to_pil()
+        page = cast(_PdfiumPage, self._doc[page_no - 1])
+        image = page.render(scale=self._scale).to_pil()
         buffer = io.BytesIO()
         image.convert("RGB").save(buffer, format="PNG")
         png = buffer.getvalue()

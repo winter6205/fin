@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Literal
 
 # ---------------------------------------------------------------------------
 # Table identity
@@ -120,8 +120,12 @@ class ChunkParams:
 
 
 # Keyed by (doc_type, section, density); ``"*"`` is the in-domain
-# wildcard resolved by the fixed fallback chain below.
-_TABLE: Final[dict[tuple[str, str, int], ChunkParams]] = {
+# wildcard resolved by the fixed fallback chain below. The third slot
+# is therefore a density level *or* the wildcard: only the global
+# default row uses the wildcard there, and a lookup that carries a
+# real density can never reach it — the chain lands on it by name via
+# ``_GLOBAL_DEFAULT_KEY`` below.
+_TABLE: Final[dict[tuple[str, str, int | Literal["*"]], ChunkParams]] = {
     # narrative (财报叙述): prose blocks, sentence boundaries preferred.
     ("narrative", _WILDCARD, DENSITY_PLAIN): ChunkParams(
         target_chars=1200, min_chars=200, max_chars=2400,
@@ -241,7 +245,7 @@ _TABLE: Final[dict[tuple[str, str, int], ChunkParams]] = {
 }
 
 # The fixed fallback-chain terminator.
-_GLOBAL_DEFAULT_KEY: Final[tuple[str, str, int]] = (
+_GLOBAL_DEFAULT_KEY: Final[tuple[str, str, int | Literal["*"]]] = (
     _WILDCARD,
     _WILDCARD,
     _WILDCARD,

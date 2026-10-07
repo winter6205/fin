@@ -899,7 +899,9 @@ class IngestEndpoint:
                 version=version,
                 prior_pointer=prior_pointer,
                 superseded_version=(
-                    prior_pointer.sha256 if replacing else None
+                    prior_pointer.sha256
+                    if replacing and prior_pointer is not None
+                    else None
                 ),
             )
             return IngestSubmission(
