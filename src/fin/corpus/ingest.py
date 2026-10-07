@@ -56,6 +56,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pdfplumber
+from pdfplumber.page import Page
 
 from fin.corpus.errors import (
     IngestMissingError,
@@ -279,7 +280,7 @@ def _run_ocr_engine(
 
 def _process_page_with_ocr(
     *,
-    page: object,
+    page: Page,
     page_num: int,
     document_id: str,
     pdf_path: Path,
@@ -321,7 +322,7 @@ def _process_page_with_ocr(
 
 def _ingest_one_page(
     *,
-    page: object,
+    page: Page,
     page_num: int,
     document_id: str,
     pdf_path: Path,
@@ -669,16 +670,21 @@ def _ingest_one_document(
             existing_doc = (
                 existing_index.get(document_id) if existing_index else None
             )
+            existing_page_count = (
+                existing_doc.get("page_count")
+                if existing_doc is not None
+                else None
+            )
             if (
                 existing_doc is not None
                 and existing_doc.get("version") == expected_sha
-                and isinstance(existing_doc.get("page_count"), int)
+                and isinstance(existing_page_count, int)
             ):
                 index_entry = {
                     "version": expected_sha,
-                    "page_count": int(existing_doc["page_count"]),
+                    "page_count": int(existing_page_count),
                 }
-                pages_total = int(existing_doc["page_count"])
+                pages_total = int(existing_page_count)
                 pages_skipped = pages_total
                 if not reused_ready:
                     state_store.transition(
@@ -753,20 +759,30 @@ def _ingest_one_document(
         existing_doc = (
             existing_index.get(document_id) if existing_index else None
         )
+        existing_page_count = (
+            existing_doc.get("page_count")
+            if existing_doc is not None
+            else None
+        )
+        existing_unit_count = (
+            existing_doc.get("unit_count")
+            if existing_doc is not None
+            else None
+        )
         if (
             existing_doc is not None
             and existing_doc.get("version") == expected_sha
-            and isinstance(existing_doc.get("page_count"), int)
-            and isinstance(existing_doc.get("unit_count"), int)
+            and isinstance(existing_page_count, int)
+            and isinstance(existing_unit_count, int)
             and (doc_dir / "units.json").is_file()
-            and _artifacts_present(doc_dir, int(existing_doc["page_count"]))
+            and _artifacts_present(doc_dir, int(existing_page_count))
         ):
             # Fast-skip: trust the index and existence checks.
-            page_count = int(existing_doc["page_count"])
+            page_count = int(existing_page_count)
             index_entry = {
                 "version": expected_sha,
                 "page_count": page_count,
-                "unit_count": int(existing_doc["unit_count"]),
+                "unit_count": int(existing_unit_count),
             }
             pages_total = page_count
             pages_skipped = page_count

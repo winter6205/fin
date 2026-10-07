@@ -105,6 +105,22 @@ class IngestStateStore(Protocol):
         metadata: Mapping[str, Any] | None = None,
     ) -> NoReturn: ...
 
+    def list_audit(
+        self,
+        # The sentinel value is spelled `...` here, not `ALL_DOCUMENTS`: a
+        # default is evaluated when the class body runs, which is before
+        # ALL_DOCUMENTS exists. This body is a Protocol stub and is never
+        # called, so the real default lives only on the two implementations.
+        document_id: str | None | AllDocuments = ...,
+    ) -> tuple[IngestAuditRow, ...]:
+        """Process-level audit records, unfiltered by default.
+
+        Omitting the argument is the unfiltered read; passing ``None``
+        explicitly is refused by :func:`validate_document_id` like a blank
+        id, so no store can mistake one for the other.
+        """
+        ...
+
 
 @dataclass(frozen=True)
 class IngestAuditRow:
@@ -239,8 +255,16 @@ def coerce_request(request: TransitionRequest) -> TransitionRequest:
     )
 
 
-def validate_document_id(document_id: str) -> None:
-    """The one identity rule every job store shares: a non-blank string."""
+def validate_document_id(document_id: object) -> None:
+    """The one identity rule every job store shares: a non-blank string.
+
+    The parameter is ``object`` because this rule is the *refusal* point,
+    not a restatement of a caller's already-typed argument: ``list_audit``
+    takes ``str | None | AllDocuments`` so an explicit ``None`` is rejected
+    here by name instead of quietly widening the read. The ``isinstance``
+    below is that refusal — a ``str`` annotation would make it dead code
+    the checker flags as unreachable.
+    """
     if not isinstance(document_id, str) or not document_id.strip():
         raise ValueError("document_id must not be empty")
 
@@ -329,7 +353,7 @@ def transition_audit(
         actor=request.resolved_actor(),
         occurred_at=now,
         from_state=job.state,
-        to_state=request.to_state,
+        to_state=coerce_state(request.to_state),
         metadata=request.metadata_snapshot(),
     )
 
@@ -347,7 +371,7 @@ def rejection_audit(
         actor=request.resolved_actor(),
         occurred_at=now,
         from_state=job.state,
-        to_state=request.to_state,
+        to_state=coerce_state(request.to_state),
         error_type=type(error).__name__,
         error_message=str(error),
         metadata=request.metadata_snapshot(),

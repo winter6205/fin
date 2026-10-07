@@ -259,7 +259,9 @@ def _build_live_queries(
     *,
     manifest: Mapping[str, Any],
     text_dir: Path,
-    sample_by_id: Mapping[str, Mapping[str, Any]],
+    # Values are plain dicts: live_eval_set builds this mapping from the
+    # JSON manifest and keeps only entries passing ``isinstance(sample, dict)``.
+    sample_by_id: Mapping[str, dict[str, Any]],
 ) -> tuple[EvalQuery, ...]:
     """Construct :class:`EvalQuery` objects off T1 queries + frozen text.
 

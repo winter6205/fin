@@ -45,7 +45,7 @@ markers = [
 [tool.pyright]
 typeCheckingMode = "standard"
 pythonVersion = "3.12"
-include = ["src/fin/host", "src/fin/retrieve"]
+include = ["src/fin"]
 
 [dependency-groups]
 dev = ["pytest>=8", "pyright==1.1.414"]

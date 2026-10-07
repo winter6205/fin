@@ -82,7 +82,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from fin.corpus.chunking import split_unit
+from fin.corpus.chunking import ChunkBlock, UnitChunking, split_unit
 from fin.corpus.dataset.build import _load_registry, _load_units, project_root
 from fin.corpus.dataset.manifest import is_countable
 from fin.corpus.errors import ManifestShaMismatchError
@@ -320,7 +320,7 @@ class RebuildReport:
         return self.parse_changed or self.params_changed
 
 
-def _block_record(block: object) -> dict:
+def _block_record(block: ChunkBlock) -> dict:
     return {
         "kind": block.kind,
         "block_id": block.block_id,
@@ -332,7 +332,7 @@ def _block_record(block: object) -> dict:
     }
 
 
-def _unit_record(unit_chunking) -> dict:
+def _unit_record(unit_chunking: UnitChunking) -> dict:
     return {
         "locator": unit_chunking.locator.to_dict(),
         "unit_text": unit_chunking.unit_text,

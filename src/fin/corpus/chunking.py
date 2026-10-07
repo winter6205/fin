@@ -445,12 +445,20 @@ class UnitChunking:
     def payloads(self) -> tuple[ChunkPayload, ...]:
         """One push payload per child, parent text riding along."""
         parents_by_id = {p.block_id: p for p in self.parents}
-        return tuple(
-            ChunkPayload(
+
+        def payload_of(child: ChunkBlock) -> ChunkPayload:
+            # Only children are pushed, and ``_child_blocks`` always sets
+            # ``parent_block_id`` from a real parent, so the nullable
+            # field is non-null on this path: SC16 makes a payload a
+            # child plus its parent context, and the push contract types
+            # it ``str`` (``fin.corpus.push``).
+            parent_id = child.parent_block_id
+            assert parent_id is not None, "child block carries no parent"
+            return ChunkPayload(
                 block_id=child.block_id,
                 text=child.text,
-                parent_block_id=child.parent_block_id,
-                parent_text=parents_by_id[child.parent_block_id].text,
+                parent_block_id=parent_id,
+                parent_text=parents_by_id[parent_id].text,
                 locator=self.locator,
                 fmt=self.fmt,
                 doc_type=self.doc_type,
@@ -461,8 +469,8 @@ class UnitChunking:
                 params_table_version=self.params_table_version,
                 normalization_rule_version=NORMALIZATION_RULE_VERSION,
             )
-            for child in self.children
-        )
+
+        return tuple(payload_of(child) for child in self.children)
 
 
 @dataclass(frozen=True)

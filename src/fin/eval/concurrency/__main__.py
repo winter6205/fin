@@ -195,6 +195,7 @@ def _real_full_run_factory() -> Callable[[], Any]:
 
 
 def _l2_smoke_or_run(args: argparse.Namespace):
+    scripted: _ScriptedFullRun | None = None
     if args.llm == "real":
         full_run = _real_full_run_factory()
         mode = "real"
@@ -221,8 +222,11 @@ def _l2_smoke_or_run(args: argparse.Namespace):
         max_requests=args.max_requests,
     )
     report = result.to_dict()
-    if mode == "fake":
-        backend["llm_calls"] = full_run.llm_calls
+    # ``scripted`` is bound in exactly the branch that sets mode="fake",
+    # so the guard is always true here; it narrows the callable union so
+    # the count is read off the object that owns ``llm_calls``.
+    if mode == "fake" and scripted is not None:
+        backend["llm_calls"] = scripted.llm_calls
     report["backend"] = backend
     report["known_gaps"] = _known_gaps()
     report["caveats"] = (

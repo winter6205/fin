@@ -70,6 +70,7 @@ import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import TypeGuard
 
 from fin.corpus.errors import IngestMissingError, MalformedExtractedIndexError
 from fin.corpus.normalization import normalize_frozen_text
@@ -498,6 +499,20 @@ def _read_manifest_payload(manifest_path: Path) -> dict[str, object]:
     return payload
 
 
+def _is_document_rows(value: object) -> TypeGuard[list[dict[str, object]]]:
+    """Type guard for a manifest's ``documents`` list of record dicts.
+
+    :func:`_read_manifest_payload` already enforces this shape before
+    any network call, but its ``dict[str, object]`` return annotation
+    drops it; the guard re-establishes it so the rows stay typed as
+    records rather than as bare ``object`` for
+    :func:`_live_manifest_payload`.
+    """
+    return isinstance(value, list) and all(
+        isinstance(document, dict) for document in value
+    )
+
+
 def _live_manifest_payload(
     *,
     manifest_payload: dict[str, object],
@@ -513,7 +528,10 @@ def _live_manifest_payload(
     A fetch with no prior catalog row gets explicit placeholder values
     for fields that cannot be inferred from the two live-fetch inputs.
     """
-    documents = list(manifest_payload["documents"])
+    raw_documents = manifest_payload["documents"]
+    if not _is_document_rows(raw_documents):
+        raise IngestMissingError("manifest has no 'documents' list of records")
+    documents = list(raw_documents)
     template: dict[str, object] = {}
     for document in documents:
         if document.get("document_id") == accession or document.get(
@@ -611,7 +629,9 @@ def _decode_publish_journal_entries(
         backup = raw_entry.get("backup")
         target_existed = raw_entry.get("target_existed")
         if (
-            not all(isinstance(path, str) for path in (staged, target, backup))
+            not isinstance(staged, str)
+            or not isinstance(target, str)
+            or not isinstance(backup, str)
             or not isinstance(target_existed, bool)
         ):
             raise IngestMissingError(

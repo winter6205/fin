@@ -6,7 +6,9 @@
     "prepare": "husky",
     "lint:s5": "node $HOME/.claude/plugins/marketplaces/arthurpower-local/plugins/arthurpower/scripts/s5-complexity/check.mjs --changed",
     "lint:s5:staged": "node $HOME/.claude/plugins/marketplaces/arthurpower-local/plugins/arthurpower/scripts/s5-complexity/check.mjs --changed --staged",
-    "lint:s5:all": "node $HOME/.claude/plugins/marketplaces/arthurpower-local/plugins/arthurpower/scripts/s5-complexity/check.mjs web/src"
+    "lint:s5:all": "node $HOME/.claude/plugins/marketplaces/arthurpower-local/plugins/arthurpower/scripts/s5-complexity/check.mjs web/src",
+    "typecheck": "uv run --no-sync pyright",
+    "typecheck:staged": "node scripts/pyright-staged.mjs"
   },
   "devDependencies": {
     "eslint": "^10.10.0",

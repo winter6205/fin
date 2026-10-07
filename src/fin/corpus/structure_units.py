@@ -62,6 +62,7 @@ class StructureParser(Protocol):
 
     def parse(self, source: Path) -> Iterable[ParsedSection]:
         """Parse ``source`` into sections in document order."""
+        ...
 
 
 _HEADING_RE = re.compile(
