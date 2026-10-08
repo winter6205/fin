@@ -132,6 +132,7 @@ from fin.retrieve.input_validation import (
 from fin.retrieve.mcp_session import (
     MCPStdioProtocolError,
     MCPStdioSession,
+    default_mcp_timeout_seconds,
 )
 from fin.retrieve.port import (
     DATABASE_ROWS_KEY,
@@ -668,7 +669,7 @@ class MCPRetrieveAdapter:
         command: list[str] | None = None,
         locator_map: dict[str, Locator] | None = None,
         known_document_ids: set[str] | None = None,
-        timeout_seconds: float = 5.0,
+        timeout_seconds: float | None = None,
         mapping_ledger: MappingFailureLedger | None = None,
         input_validation_ledger: InputValidationLedger | None = None,
         session: MCPStdioSession | None = None,
@@ -689,7 +690,18 @@ class MCPRetrieveAdapter:
             if known_document_ids is not None
             else None
         )
-        self._timeout: float = float(timeout_seconds)
+        # Shares the transport-wide budget with the push and index-job
+        # ports: a retrieve that has to run BM25 + vector + rerank over the
+        # corpus is the same order of work as a push, and a 5s ceiling made
+        # this adapter the last MCP call site still reporting a timeout for
+        # a request that only needed longer. Leaving it behind would have
+        # been the half-fix that is worse than none — the same defect under
+        # a different tool name.
+        self._timeout: float = float(
+            timeout_seconds
+            if timeout_seconds is not None
+            else default_mcp_timeout_seconds()
+        )
         self._mapping_ledger = mapping_ledger
         self._input_validation_ledger = input_validation_ledger
         self._session = session

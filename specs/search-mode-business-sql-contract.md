@@ -477,7 +477,7 @@ credentials fin holds.
 | rows returned | 20 | `_LIMIT_CAP` (`src/fin/retrieve/mcp_adapter.py:159`) — no 档 ships a 21st row |
 | rows fetched | 21 | *new* — fetch one past the cap so truncation is observable rather than silent; no existing precedent, by design |
 | result bytes | 32 768 | ADR 0088:8 — "caps text at 8,000 code points and serialized output at 32 KiB"; `src/fin/retrieve/source_read.py:35`, `read_source.ts:54` |
-| `statement_timeout` | 3 s | must be < the 5 s MCP timeout so the *server* answers first with a typed error |
+| `statement_timeout` | 3 s | must be < the MCP per-call budget so the *server* answers first with a typed error. That budget is `DEFAULT_MCP_TIMEOUT_SECONDS` = 60 s (`src/fin/retrieve/mcp_session.py`), raised from 5 s: a measured live push takes ~11 s, so the old 5 s ceiling reported every real push as a transport timeout instead of a result. The ordering this row protects is unchanged (3 s < 60 s). |
 | connect timeout | 2 s | `CONNECT_TIMEOUT_SECONDS` (`src/fin/host/health.py:63`) |
 | `lock_timeout` | 1 s | a read blocked behind a writer must not eat the statement budget |
 

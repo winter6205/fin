@@ -8,6 +8,9 @@ inject this session into the push, retrieve, and invalidation adapters.
 from __future__ import annotations
 
 import json
+import logging
+import math
+import os
 import queue
 import subprocess
 import threading
@@ -15,9 +18,60 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
+logger = logging.getLogger(__name__)
+
 MCP_PROTOCOL_VERSION = "2025-06-18"
 INITIALIZE_REQUEST_ID = 1
 TOOL_REQUEST_ID = 2
+
+# The default per-call budget for an MCP exchange, overridable per operator
+# with ``FIN_MCP_TIMEOUT_SECONDS``.
+#
+# WHY it lives here and is this size: every MCP tool that does real work
+# before it answers — ``push`` (embeds every chunk, writes the rows) and
+# ``submit_index_job`` (hands the graph re-index to a worker) — was built
+# with a 5s ceiling. Measured against the live server, one push took ~11s
+# end to end (0.8s handshake + embed + storage write), so 5s could not
+# distinguish "slow" from "impossible" and reported every one of them as a
+# transport timeout. A budget below the real cost of the work makes the
+# typed failure a lie. This module is the shared transport, so it is where
+# the one authority for the number belongs; the ports that need a different
+# value still take it as a constructor argument.
+DEFAULT_MCP_TIMEOUT_SECONDS: float = 60.0
+
+
+def default_mcp_timeout_seconds() -> float:
+    """Resolve ``FIN_MCP_TIMEOUT_SECONDS``, falling back to the default.
+
+    An unparseable or non-positive override degrades to the default rather
+    than raising: a typo in an operator's ``.env`` must not take the ingest
+    door down at import time. A budget that is merely too small still
+    surfaces as the typed ``*ServiceUnavailableError`` the callers already
+    handle, which is the honest failure for that case.
+    """
+    raw = os.environ.get("FIN_MCP_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_MCP_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+        # `nan <= 0` is False and `inf > 0`, so a bare positivity test lets
+        # both through: NaN then reaches `asyncio.wait_for(timeout=nan)`
+        # and inf silently disables the ceiling this budget exists to
+        # provide. Both are unusable values wearing a valid float's
+        # clothes, so they are rejected here rather than downstream.
+        usable = math.isfinite(value) and value > 0
+    except ValueError:
+        usable = False
+    if not usable:
+        logger.warning(
+            "FIN_MCP_TIMEOUT_SECONDS=%s is not a positive finite number; "
+            "using %.0fs",
+            raw,
+            DEFAULT_MCP_TIMEOUT_SECONDS,
+        )
+        return DEFAULT_MCP_TIMEOUT_SECONDS
+    return value
+
 
 _PROCESS_EOF = object()
 
@@ -139,10 +193,12 @@ class MCPStdioSession:
         command: Sequence[str],
         *,
         cwd: Path | str | None = None,
-        timeout_seconds: float = 5.0,
+        timeout_seconds: float | None = None,
     ) -> None:
         if not command:
             raise ValueError("MCP session command must not be empty")
+        if timeout_seconds is None:
+            timeout_seconds = default_mcp_timeout_seconds()
         if timeout_seconds <= 0:
             raise ValueError(
                 f"MCP session timeout must be positive, got {timeout_seconds}"

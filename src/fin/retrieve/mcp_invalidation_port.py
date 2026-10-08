@@ -53,6 +53,7 @@ from fin.host.compile import DEFAULT_MCP_COMMAND
 from fin.retrieve.mcp_session import (
     MCPStdioProtocolError,
     MCPStdioSession,
+    default_mcp_timeout_seconds,
 )
 from fin.retrieve.invalidation_port import (
     InvalidationEmptyBatchError,
@@ -413,11 +414,18 @@ class MCPInvalidationPort:
         self,
         command: Sequence[str] | None = DEFAULT_MCP_COMMAND,
         *,
-        timeout_seconds: float = 5.0,
+        timeout_seconds: float | None = None,
         session: MCPStdioSession | None = None,
     ) -> None:
         self._command: list[str] | None = list(command) if command else None
-        self._timeout: float = float(timeout_seconds)
+        # Same transport-wide budget as the other three ports: an
+        # invalidation batch writes on the receiving side, so it is the
+        # same order of cost as a push and the same 5s ceiling failed it.
+        self._timeout: float = float(
+            timeout_seconds
+            if timeout_seconds is not None
+            else default_mcp_timeout_seconds()
+        )
         self._session = session
         # ``(source_ref, chunk_id)`` pairs the adapter has already
         # closed. A second call for the same pair returns

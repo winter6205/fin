@@ -129,6 +129,16 @@ Consequence for T2's wording: T2's "**排队中的 job 状态**持久化" **land
 
 Validation that needs no bytes (metadata, format name, doc_type, size) runs **before** the object PUT (see "format / doc_type validation staging"); a metadata rejection therefore persists nothing and needs no compensation.
 
+### Catalog identity on the durable path
+
+The catalog row is `{document_id, company, period, version, page_count}` and `company` is required non-empty, but neither `fin_ingest_job` nor `fin_corpus_object_pointer` has a column for it and the accept path does not persist it. The worker therefore recovers `(company, period)` from a **derived** `{TICKER}-{FYQ}` `document_id` (Decision 1.2) before driving the `on_ingested` hook. Without that recovery the push succeeds and the filing is absent from fin's catalog — searchable in the store, invisible to the product.
+
+The **explicit-`document_id` branch (Decision 1.1) is not served** by this recovery: an EDGAR accession carries no `{TICKER}-{FYQ}` encoding and the supplied pair was discarded at accept. Serving it requires persisting the pair at accept — a schema migration this contract does not yet carry, recorded here as an open gap rather than silently claimed as covered.
+
+### MCP per-call budget
+
+Every MCP tool call that does real work before answering (`push`, `submit_index_job`, retrieve, invalidation) is bounded by one shared budget, `DEFAULT_MCP_TIMEOUT_SECONDS` = **60 s** (`src/fin/retrieve/mcp_session.py`). It was 5 s; a measured live push takes ~11 s, so the old ceiling reported real pushes as transport timeouts rather than results. An operator override `FIN_MCP_TIMEOUT_SECONDS` (a positive finite number of seconds) replaces the default for every port; an unparseable, non-positive, `NaN` or infinite value is logged and degraded to the default rather than raised, because a typo in an operator's env must not take the ingest door down at import time.
+
 ### Upload-size cap
 
 The cap is the existing **50 MiB**, written exactly as **`52428800` bytes**. Both a **declarative** request (`Content-Length == 52428800`) and a **streamed** request measuring exactly `52428800` bytes are **accepted**. A request of `52428801` bytes — declared or streamed — is rejected with the typed overflow error `ingest_upload_too_large` (413-class at the HTTP route). The cap is enforced twice from **one** value: the route's pre-buffer gate and the endpoint's own check (`MAX_INGEST_BYTES`) read the same number, so the two boundaries cannot drift. An over-cap upload is rejected **before** any parse; it is never truncated into a parsed prefix.
