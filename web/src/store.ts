@@ -37,10 +37,10 @@ import { mergeEvidenceRefusals } from "./evidenceContract";
 import {
   closeOpenBursts,
   foldTraceFrame,
-  thinkingPendingItems,
   RUNNING_SUMMARY,
   type TraceFrame,
 } from "./turnTrace";
+import { makeLiveTurn } from "./liveTurn";
 
 interface WorkspaceState {
   threads: ThreadListItem[];
@@ -600,44 +600,13 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // crypto.randomUUID() already satisfies it. The template-literal
     // type is what makes the reconcile-on-status patch typecheck.
     let optimisticRunId: Turn["run_id"] = crypto.randomUUID();
-    const baseTurn: Turn = {
-      run_id: optimisticRunId,
+    // The live row SHAPE lives in ``makeLiveTurn`` so the optimistic
+    // send row and the pick-materialized row cannot drift (see the
+    // pickChoice pending-turn path below).
+    const baseTurn: Turn = makeLiveTurn({
+      runId: optimisticRunId,
       question,
-      status: "done",
-      status_reason: "",
-      answer: "",
-      citations: [],
-      // E6: defined-empty until the ``evidence_refusals`` frame or a
-      // decode refusal lands — the indicator renders from this field on
-      // both doors (stream and GET history), so a reloaded turn shows
-      // the same named codes it showed live.
-      evidence_refusals: [],
-      thinking_text: "",
-      thinking_duration_ms: 0,
-      tool_summaries: [],
-      assistant_message: "",
-      // Mid-flight stream error taxonomy: empty until the
-      // terminal ``status`` SSE frame arrives; the SPA renders
-      // the "原因" label off this field on refuse rows.
-      status_classified: "",
-      // T3 (enterprise-kb Focus 1): filled by ``comparison`` frames
-      // as each ``compare_facts`` call returns, so the table is on
-      // screen while the answer is still being authored.
-      comparisons: [],
-      // The run's visual-claim rows, filled by the
-      // ``visual_claims`` SSE frame. Empty until that frame lands, and
-      // deliberately NOT part of ``citations`` — a generated visual
-      // observation has no quote to place in the answer.
-      visual_claims: [],
-      // T4 (#37): the optimistic turn is LIVE until the terminal
-      // status frame — the thinking region line-clamps and the tool
-      // rows stay open while the run streams, then collapse.
-      in_flight: true,
-      // thinking pending: same 深度思考 chrome until the first
-      // thinking frame (or drop on first tool_call / answer).
-      trace_items: thinkingPendingItems(),
-      created_at: new Date().toISOString(),
-    };
+    });
 
     // Helpers bound to the latest state so ``onEvent`` callbacks
     // always patch the most-recent snapshot of the optimistic
@@ -972,8 +941,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }
     const current = get().activeThread;
     if (!current || current.id !== threadId) return null;
-    const turn = current.turns.find((t) => t.run_id === runId);
-    if (!turn || turn.choice_window === undefined) return null;
+    // Find the row the pick continues, or materialize one from a reloaded
+    // ``pending_turn`` projection (see ``resolvePickTurn``). ``setTo``
+    // installs the materialized row; the ordinary live-turn path passes
+    // ``null`` here, so its behavior is unchanged.
+    const resolved = resolvePickTurn(current, runId);
+    if (resolved === null) return null;
+    const { turn, materialized, setTo } = resolved;
+    if (setTo !== null) set({ activeThread: setTo });
 
     set({ resumingThreadId: threadId });
     // Collapse the window immediately: pick 后窗口收起. An invalid
@@ -1002,6 +977,15 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       finalizeResumedTurn(patches, threadId, fold, result);
       await get().refreshThreads();
       return result;
+    } catch (error) {
+      // The pick failed (409 concurrent_run / 503 ingest_missing /
+      // transport). Roll back only a row THIS call materialized,
+      // re-arming the pre-pick ``pending_turn`` (see
+      // ``rollbackMaterializedPick``); a pre-existing live-path row is
+      // left exactly as it was, matching the behavior before this
+      // rollback existed.
+      rollbackMaterializedPick(threadId, runId, current.pending_turn, materialized);
+      throw error;
     } finally {
       if (get().resumingThreadId === threadId) {
         set({ resumingThreadId: null });
@@ -1337,6 +1321,77 @@ function patchTurnByRunIdOn(
       turns: current.turns.map((t) =>
         t.run_id === runId ? patcher(t) : t,
       ),
+    },
+  });
+}
+
+// search-mode-host T2 pick resolution: the row a pick continues, or — when
+// a reloaded paused turn has no row yet — a fresh row built from the
+// ``pending_turn`` projection. Returns ``null`` when there is nothing to
+// pick: no such run, or an existing row that owns no window. ``setTo`` is
+// the activeThread to install for the materialized case (the appended row
+// and the dropped projection); it is ``null`` for the ordinary live path,
+// whose row already exists. ``materialized`` is ``true`` only when THIS
+// call built the row from ``pending_turn`` — the signal the failure
+// rollback keys on, because a row that already existed must be left
+// exactly as it was.
+function resolvePickTurn(
+  current: ThreadDetail,
+  runId: string,
+): { turn: Turn; materialized: boolean; setTo: ThreadDetail | null } | null {
+  const existing = current.turns.find((t) => t.run_id === runId);
+  if (existing !== undefined) {
+    // A live-path row must own the window; without one there is no pick.
+    if (existing.choice_window === undefined) return null;
+    return { turn: existing, materialized: false, setTo: null };
+  }
+  // A reloaded paused turn has no row yet: the host keeps it OFF
+  // ``turns[]`` and carries it on ``pending_turn`` instead
+  // (ThreadDetail.pending_turn). Materialize the row from that projection
+  // so the resumed stream paints its answer into a row exactly as the
+  // live path does, then drop the projection — the window belongs to the
+  // row now, so a stale thread-level card cannot survive the pick.
+  const pending = current.pending_turn;
+  if (!pending || pending.run_id !== runId) return null;
+  // Same SHAPE as the optimistic send row (makeLiveTurn), plus the window
+  // the pick was waiting on.
+  const turn = makeLiveTurn({
+    runId: pending.run_id,
+    question: pending.question,
+    choice: pending.choice_window,
+  });
+  return {
+    turn,
+    materialized: true,
+    setTo: {
+      ...current,
+      turns: [...current.turns, turn],
+      pending_turn: undefined,
+    },
+  };
+}
+
+// Roll back a pick that failed (409 concurrent_run / 503 ingest_missing /
+// transport). A row THIS call materialized from ``pending_turn`` is not a
+// server record — leaving it would strand a permanently ``in_flight``
+// ghost with a collapsed window and no answer. Drop it and re-arm the
+// ``pending_turn`` projection so the operator is back to the pre-pick
+// state and can pick again. A pre-existing (live-path) row is left exactly
+// as it was, matching the behavior before this rollback existed.
+function rollbackMaterializedPick(
+  threadId: string,
+  runId: string,
+  restorePendingTurn: ThreadDetail["pending_turn"],
+  materialized: boolean,
+): void {
+  if (!materialized) return;
+  const cur = useWorkspaceStore.getState().activeThread;
+  if (!cur || cur.id !== threadId) return;
+  useWorkspaceStore.setState({
+    activeThread: {
+      ...cur,
+      turns: cur.turns.filter((t) => t.run_id !== runId),
+      pending_turn: restorePendingTurn,
     },
   });
 }

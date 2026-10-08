@@ -436,8 +436,9 @@ export interface Turn {
   // search-mode-host T2: the choice window this suspended run is
   // waiting on. Present = the run paused before any terminal frame
   // and the row is NOT done; a pick (or a terminal status frame)
-  // clears it. Live-only: the GET row has no field for it — the
-  // body-less resume re-emits the window (host contract).
+  // clears it. Live-only on THIS row: a reloaded pause has no row yet,
+  // so GET carries the same window on ``ThreadDetail.pending_turn``
+  // instead (the per-turn field stays absent after a reload).
   choice_window?: ChoiceWindow;
   created_at: string;
 }
@@ -465,6 +466,19 @@ export interface ThreadDetail extends ThreadListItem {
   // for a plain crash checkpoint. Mirrors
   // ``fin.host.workspace_http.ThreadDetailResponse.pending_interrupt_kind``.
   pending_interrupt_kind?: string | null;
+  // A choice-window turn paused in the graph checkpoint is NOT a
+  // persisted RunRecord, so a reload cannot find it in ``turns[]``.
+  // The host projects the paused turn's exact checkpoint identity,
+  // original question, and choices here so reopening the thread
+  // restores the prompt WITHOUT synthesising history. Present only
+  // while a choice interrupt is paused and the thread lock is not
+  // held; absent / ``null`` otherwise. Mirrors
+  // ``fin.host.workspace_http.ThreadDetailResponse.pending_turn``.
+  pending_turn?: {
+    run_id: string;
+    question: string;
+    choice_window: ChoiceWindow;
+  } | null;
   // T3 (ADR 0044): token occupancy from the SAME host figure the
   // auto-compact gate computes. Undefined for a thread with no
   // checkpoint — the indicator renders nothing rather than a

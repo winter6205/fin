@@ -298,6 +298,7 @@ from fin.host.graph import (
     ATTACHMENT_PREPARATION_INTERRUPT_KIND,
     ConcurrentRunError,
     KnowledgeMCPFaultError,
+    PendingCheckpointProjectionError,
     analysis_from_tool_message,
     comparison_from_tool_message,
 )
@@ -1108,6 +1109,17 @@ class Occupancy(BaseModel):
     ratio: float
 
 
+_PENDING_QUESTION_UNAVAILABLE_DETAIL = (
+    "Pending question is temporarily unavailable. Retry opening the thread."
+)
+
+
+class PendingTurnResponse(BaseModel):
+    run_id: str
+    question: str
+    choice_window: dict[str, Any]
+
+
 class ThreadDetailResponse(BaseModel):
     id: str
     title: str
@@ -1118,14 +1130,8 @@ class ThreadDetailResponse(BaseModel):
     # after its stream completes). The SPA disables the Composer on
     # this flag even before any turn row appears.
     in_flight: bool = False
-    # T4 fix (code-review H1): a checkpoint with ``next`` nodes is
-    # present AND the lock is NOT held — i.e. the process died
-    # mid-run and the operator should see the Resume banner. The
-    # previous implementation keyed off ``in_flight``, which made
-    # the banner appear during a process-alive refresh (when it is
-    # forbidden) and never appear after a real crash (when it is
-    # needed). ``pending_checkpoint`` derives from
-    # ``pending_nodes(thread_id) and not is_locked``.
+    # T4 fix (code-review H1): the graph projection includes a checkpoint
+    # with pending nodes only when the thread lock is not held.
     pending_checkpoint: bool = False
     # T2f: WHAT a paused run waits for while ``pending_checkpoint`` is
     # true — ``"attachment_preparation"`` (durable prep job owns the
@@ -1134,6 +1140,10 @@ class ThreadDetailResponse(BaseModel):
     # the payload dict, so the response model must declare it or
     # FastAPI filters the key off the wire.
     pending_interrupt_kind: str | None = None
+    # A choice-window turn is not a completed RunRecord. Carry its exact
+    # checkpoint identity, original question, and choices so a reload can
+    # restore the paused prompt without writing synthetic history.
+    pending_turn: PendingTurnResponse | None = None
     # Spec 2.2 rule 2 (E5): the history envelope declares its citation
     # channel once, so a client decodes the turns' citations against a
     # named version rather than a guess. The token names the shape; the
@@ -1161,6 +1171,66 @@ class ThreadDetailResponse(BaseModel):
     # occupancy / context-window figure.
     occupancy: Occupancy | None = None
     turns: list[TurnRow]
+
+
+def _legacy_pending_projection(graph: Any, thread_id: str) -> dict[str, Any]:
+    """Pre-projection pending probes, for graph stand-ins without the seam.
+
+    The single-snapshot ``pending_checkpoint_projection`` seam is a
+    compiled-graph contract; test doubles and older wiring expose only the
+    granular ``pending_nodes`` / ``interrupt_pending`` probes. Reading those
+    keeps the Resume banner working for a stand-in instead of silently
+    reporting nothing pending. The pending-turn provenance
+    (``run_id`` / ``question`` / ``choices``) is available only through the
+    projection seam, so a stand-in degrades to ``pending_turn=None``.
+    """
+    pending_checkpoint = bool(
+        hasattr(graph, "pending_nodes") and graph.pending_nodes(thread_id)
+    )
+    pending_interrupt_kind: str | None = None
+    if pending_checkpoint and hasattr(graph, "interrupt_pending"):
+        payload = graph.interrupt_pending(thread_id)
+        if isinstance(payload, dict):
+            raw_kind = payload.get("kind")
+            if isinstance(raw_kind, str) and raw_kind:
+                pending_interrupt_kind = raw_kind
+    return {
+        "pending_checkpoint": pending_checkpoint,
+        "pending_interrupt_kind": pending_interrupt_kind,
+        "pending_turn": None,
+    }
+
+
+def _pending_checkpoint_wire_projection(
+    graph: Any, thread_id: str, *, is_locked: bool
+) -> dict[str, Any]:
+    projection: dict[str, Any] = {
+        "pending_checkpoint": False,
+        "pending_interrupt_kind": None,
+        "pending_turn": None,
+    }
+    if is_locked:
+        return projection
+    reader = getattr(graph, "pending_checkpoint_projection", None)
+    if not callable(reader):
+        # No projection seam: a graph stand-in (test double / older wiring).
+        # Fall back to the granular probes so the Resume signal survives,
+        # mirroring the ``is_locked`` / ``occupancy`` ``hasattr`` tolerance.
+        return _legacy_pending_projection(graph, thread_id)
+    try:
+        return cast(dict[str, Any], reader(thread_id))
+    except PendingCheckpointProjectionError as exc:
+        # The typed cause (WHY the checkpoint could not be projected) is
+        # logged with its traceback for the operator; the client still gets
+        # only the fixed detail, so no checkpoint / exception text leaks.
+        logger.warning(
+            "get_thread: pending question projection unavailable",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=_PENDING_QUESTION_UNAVAILABLE_DETAIL,
+        ) from exc
 
 
 # ----- helpers -----
@@ -4054,45 +4124,25 @@ def build_router(
         is_locked = False
         if hasattr(graph, "is_locked"):
             is_locked = bool(graph.is_locked(thread_id))
-        # T4 fix (code-review H1): ``pending_checkpoint`` is true
-        # exactly when a checkpoint exists with non-empty ``next``
-        # nodes AND the lock is NOT held — i.e. the prior run died
-        # before reaching a terminal node. The Resume banner keys
-        # off this flag (NOT ``in_flight``, which is the live-lock
-        # signal and must NOT trigger a Resume button).
-        pending_checkpoint = False
-        if (
-            not is_locked
-            and hasattr(graph, "pending_nodes")
-            and bool(graph.pending_nodes(thread_id))
-        ):
-            pending_checkpoint = True
-        # T2f: WHAT a paused run is waiting for, when anything is
-        # pending: ``"attachment_preparation"`` (the durable prep job +
-        # auto-resumer own the resume — no operator action) or
-        # ``"choice_window"`` (the operator's pick resumes). ``null``
-        # when a plain crash checkpoint has no interrupt at all. Read
-        # only while a pause can be observed (same lock probe as the
-        # flag above), through the same defensive ``hasattr`` seam.
-        pending_interrupt_kind: str | None = None
-        if pending_checkpoint and hasattr(graph, "interrupt_pending"):
-            pending_payload = graph.interrupt_pending(thread_id)
-            if isinstance(pending_payload, dict):
-                raw_kind = pending_payload.get("kind")
-                if isinstance(raw_kind, str) and raw_kind:
-                    pending_interrupt_kind = raw_kind
+        # The projection reads checkpoint status, interrupt kind, and
+        # pending-turn provenance from one snapshot after the lock probe.
+        pending_projection = _pending_checkpoint_wire_projection(
+            graph, thread_id, is_locked=is_locked
+        )
         # T3 (ADR 0044): occupancy from the same compactor figure the
-        # gate uses. Defensive ``hasattr`` mirrors the ``is_locked`` /
-        # ``pending_nodes`` wiring-bug tolerance for graph stand-ins
-        # without the seam.
+        # gate uses. Defensive ``hasattr`` mirrors the ``is_locked``
+        # wiring-bug tolerance for graph stand-ins without that seam.
         occupancy = None
         if hasattr(graph, "occupancy"):
             occupancy = graph.occupancy(thread_id)
         return {
             **_serialize_thread(thread),
             "in_flight": is_locked,
-            "pending_checkpoint": pending_checkpoint,
-            "pending_interrupt_kind": pending_interrupt_kind,
+            "pending_checkpoint": pending_projection["pending_checkpoint"],
+            "pending_interrupt_kind": pending_projection[
+                "pending_interrupt_kind"
+            ],
+            "pending_turn": pending_projection["pending_turn"],
             "occupancy": occupancy,
             "turns": [
                 _serialize_run(

@@ -1668,6 +1668,83 @@ describe("decodeThreadDetail", () => {
     expect(detail.turns[0].answer).toBe("a");
     expect(detail.id).toBe("t-1");
   });
+
+  // ----- ThreadDetail.pending_turn (reload of a paused choice) -----
+  //
+  // ``pending_turn`` is a THREAD-DETAIL (transport) field, not an
+  // evidence-contract field: no committed thread-detail fixture exists
+  // (same reason the scaffolding above is hand-built). Its inner
+  // ``choice_window`` mirrors the SSE ``choice_window`` payload, which
+  // ``choiceWindow.test.ts`` also hand-builds because no committed
+  // fixture pins that frame. The MINIMAL valid window is kind + a
+  // non-empty ``options[{id,label}]``; the extra title/prompt/opened
+  // are the additive fields a real host window carries.
+  const pendingWindow = {
+    kind: "choice_window",
+    title: "选择检索档",
+    prompt: "为本次 grounded 提问选择检索档后继续。",
+    options: [
+      { id: "lexical", label: "查找", opened: true },
+      { id: "graph", label: "知识问答", opened: true },
+    ],
+  };
+  const emptyThreadBody = {
+    id: "t-pending",
+    title: "Q",
+    created_at: "2026-01-01T00:00:00Z",
+    turns: [] as unknown[],
+  };
+
+  it("decodes a valid pending_turn with its choice window and keeps turns empty", () => {
+    const detail = decodeThreadDetail({
+      ...structuredClone(emptyThreadBody),
+      pending_turn: {
+        run_id: "r-pending",
+        question: "营收多少？",
+        choice_window: structuredClone(pendingWindow),
+      },
+    });
+    // The paused turn is NOT a turn row (host contract).
+    expect(detail.turns).toEqual([]);
+    expect(detail.pending_turn).toEqual({
+      run_id: "r-pending",
+      question: "营收多少？",
+      choice_window: pendingWindow,
+    });
+  });
+
+  it.each([
+    ["a missing run_id", { question: "q", choice_window: pendingWindow }],
+    ["a blank run_id", { run_id: "   ", question: "q", choice_window: pendingWindow }],
+    ["a non-string run_id", { run_id: 42, question: "q", choice_window: pendingWindow }],
+    ["a blank question", { run_id: "r", question: "  ", choice_window: pendingWindow }],
+    ["a non-string question", { run_id: "r", question: 7, choice_window: pendingWindow }],
+    [
+      "a malformed choice_window",
+      { run_id: "r", question: "q", choice_window: { kind: "choice_window", options: [] } },
+    ],
+    ["a non-record pending_turn", "not a record"],
+  ])("drops pending_turn on %s", (_label, pending) => {
+    const detail = decodeThreadDetail({
+      ...structuredClone(emptyThreadBody),
+      pending_turn: pending,
+    });
+    expect(detail.pending_turn).toBeUndefined();
+  });
+
+  it("keeps pending_turn absent when the field is absent", () => {
+    const detail = decodeThreadDetail(structuredClone(emptyThreadBody));
+    expect("pending_turn" in detail).toBe(false);
+  });
+
+  it("drops a null pending_turn (nothing paused) to absent", () => {
+    const detail = decodeThreadDetail({
+      ...structuredClone(emptyThreadBody),
+      pending_turn: null,
+    });
+    expect(detail.pending_turn).toBeUndefined();
+    expect("pending_turn" in detail).toBe(false);
+  });
 });
 
 // ----- refusal fold helpers (store ordering invariant) -----

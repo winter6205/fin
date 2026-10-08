@@ -6,7 +6,10 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { default as runStreamChecks } from "../scripts/playwright-stream-checks.mjs";
+import {
+  declaredCheckIds,
+  default as runStreamChecks,
+} from "../scripts/playwright-stream-checks.mjs";
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const runner = path.join(workspace, "scripts", "run-stream-checks.mjs");
@@ -27,12 +30,14 @@ if (has("open")) {
 if (has("run-code")) {
   const failedId = process.env.FAKE_FAILED_CHECK_ID;
   const ids = [
-    "1-kb-corpus",
+    "1-home-chrome",
     "2-stream-no-retract",
+    "3-reload-persist",
     "4-dom-separation",
     "5-trace-collapse",
-    "3-reload-persist",
-    "6-status-strip",
+    "6-boot-status",
+    "7-stream-scroll-follow",
+    "8-scroll-follow-lifecycle",
   ];
   const checks = ids.map((id) => ({
     id,
@@ -96,6 +101,22 @@ test("prints a machine-visible FAIL line for a failed check", async () => {
     result.stdout,
     /^\[FAIL\]\s+2-stream-no-retract\b/m,
     `missing protocol FAIL line:\n${result.stdout}\n${result.stderr}`,
+  );
+});
+
+test("requires scroll-follow coverage only when streamed growth is required", () => {
+  assert.equal(declaredCheckIds().includes("7-stream-scroll-follow"), false);
+  assert.equal(
+    declaredCheckIds({ requireStreamGrowth: true }).includes(
+      "7-stream-scroll-follow",
+    ),
+    true,
+  );
+  assert.equal(
+    declaredCheckIds({ requireStreamGrowth: true }).includes(
+      "8-scroll-follow-lifecycle",
+    ),
+    true,
   );
 });
 
@@ -348,6 +369,9 @@ function fakeThreadPage() {
     async goto(url) {
       state.route = new URL(url).pathname;
     },
+    url() {
+      return new URL(state.route, "http://127.0.0.1:1").toString();
+    },
     async reload() {
       /* turns are server state; the route and the bubble stand */
     },
@@ -428,6 +452,19 @@ test("arms the composer on a thread page whose only submit is the composer", asy
     true,
     `2-stream-no-retract must pass on a thread page with a single submit; got ` +
       `${stream.error ?? JSON.stringify(stream.detail)}`,
+  );
+
+  const lifecycle = report.checks.find(
+    (check) => check.id === "8-scroll-follow-lifecycle",
+  );
+  assert.ok(
+    lifecycle,
+    "the required lifecycle check must produce a verdict for the test page",
+  );
+  assert.equal(
+    lifecycle.pass,
+    false,
+    "an incomplete page double must fail explicitly instead of omitting lifecycle coverage",
   );
 });
 

@@ -13,7 +13,7 @@
 // 2. The SPA never invents options or reorders them: the host payload
 //    is the whole contract, and the pick just echoes an option id.
 
-import type { ChoiceOption, ChoiceWindow, Turn } from "./types";
+import type { ChoiceOption, ChoiceWindow, ThreadDetail, Turn } from "./types";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -74,6 +74,18 @@ export function turnHasPendingChoice(turn: Turn): boolean {
 
 export function hasPendingChoiceWindow(turns: readonly Turn[]): boolean {
   return turns.some(turnHasPendingChoice);
+}
+
+/** The ``ThreadDetail``-level sibling of ``hasPendingChoiceWindow``: a
+ * reloaded paused turn is NOT in ``turns[]`` — the host carries it on
+ * ``detail.pending_turn`` (see ``ThreadDetail.pending_turn``), which the
+ * per-turn predicate cannot see. Present = a card can render, so the
+ * CrashResume banner and the empty-thread copy must both yield. */
+export function threadHasPendingChoice(
+  detail: ThreadDetail | null | undefined,
+): boolean {
+  const pending = detail?.pending_turn;
+  return pending !== undefined && pending !== null && pending.choice_window != null;
 }
 
 /** Copy for the re-select hint on a re-issued window. Empty list /

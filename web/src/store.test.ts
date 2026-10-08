@@ -12,7 +12,7 @@ import {
 import { EVIDENCE_SCHEMA_VERSION } from "./evidenceContract";
 import { describeSendFailure } from "./sendFailure";
 import { useWorkspaceStore } from "./store";
-import type { Citation, ThreadDetail, Turn } from "./types";
+import type { ChoiceWindow, Citation, ThreadDetail, Turn } from "./types";
 
 const THREAD_ID = "11111111-1111-4111-8111-111111111111";
 
@@ -973,6 +973,37 @@ describe("openThread GET reconcile", () => {
     expect(turns[0].citations).toEqual([SERVER_CITATION]);
   });
 
+  it("keeps the pending_turn projection on the active thread across the reconcile", async () => {
+    // A reload with a paused choice: no rows, but the projection must
+    // survive reconcileTurnTable so ThreadPage can render the card.
+    seedStreamedThread([]);
+    const window: ChoiceWindow = {
+      kind: "choice_window",
+      options: [
+        { id: "lexical", label: "查找", opened: true },
+        { id: "graph", label: "知识问答", opened: true },
+      ],
+    };
+    stubGetThread(
+      threadWith([], {
+        pending_turn: {
+          run_id: "44444444-4444-4444-8444-444444444444",
+          question: "营收多少？",
+          choice_window: window,
+        },
+      }),
+    );
+
+    await useWorkspaceStore.getState().openThread(THREAD_ID);
+
+    const thread = useWorkspaceStore.getState().activeThread;
+    expect(thread?.turns).toEqual([]);
+    expect(thread?.pending_turn?.run_id).toBe(
+      "44444444-4444-4444-8444-444444444444",
+    );
+    expect(thread?.pending_turn?.choice_window.options).toHaveLength(2);
+  });
+
   it("folds refusals during competing stream/history updates without reordering citations", async () => {
     // A refresh lands WHILE the run is still streaming: the history
     // read carries the server ledger, the stream carries the same
@@ -1286,5 +1317,215 @@ describe("loadStatus 重连 in-flight guard", () => {
     expect(state.loadingStatus).toBe(false);
     expect(state.statusLoaded).toBe(true);
     expect(state.status).toBeNull();
+  });
+});
+
+// search-mode-host T2 reload path: a paused choice has NO turn row (the
+// host keeps it off ``turns[]``; see ThreadDetail.pending_turn). A pick
+// must therefore find the run on ``activeThread.pending_turn`` and let
+// the resumed stream paint its answer into a row — otherwise the pick
+// POSTs but the operator sees nothing until the next unrelated reload.
+describe("pickChoice for a reloaded pending turn", () => {
+  const PENDING_RUN_ID = "44444444-4444-4444-8444-444444444444";
+  const PENDING_WINDOW: ChoiceWindow = {
+    kind: "choice_window",
+    title: "选择检索档",
+    options: [
+      { id: "lexical", label: "查找", opened: true },
+      { id: "graph", label: "知识问答", opened: true },
+    ],
+  };
+
+  function seedPendingThread(): void {
+    useWorkspaceStore.setState({
+      activeThread: threadWith([], {
+        pending_turn: {
+          run_id: PENDING_RUN_ID,
+          question: "营收多少？",
+          choice_window: PENDING_WINDOW,
+        },
+      }),
+      threads: [],
+      sendingQuestion: false,
+      resumingThreadId: null,
+    });
+  }
+
+  /** Stub ``/resume`` with a frame stream, recording each request. */
+  function stubResumeStream(
+    frames: Frame[],
+  ): { url: string; method?: string; body: unknown }[] {
+    const calls: { url: string; method?: string; body: unknown }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : String(input);
+        if (!url.endsWith("/resume")) {
+          return new Response("[]", {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        calls.push({
+          url,
+          method: init?.method,
+          body: typeof init?.body === "string" ? JSON.parse(init.body) : null,
+        });
+        let next = 0;
+        const body = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (next >= frames.length) {
+              controller.close();
+              return;
+            }
+            controller.enqueue(new TextEncoder().encode(sseFrame(frames[next])));
+            next += 1;
+          },
+        });
+        return new Response(body, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      }),
+    );
+    return calls;
+  }
+
+  /** Stub ``/resume`` with a non-OK status (the pick never streams). */
+  function stubResumeReject(status: number, body: unknown): void {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : String(input);
+        if (!url.endsWith("/resume")) {
+          return new Response("[]", {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify(body), {
+          status,
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+  }
+
+  it("POSTs {pick} and folds the streamed answer onto a row", async () => {
+    seedPendingThread();
+    const calls = stubResumeStream([
+      ["thinking", { text: "续跑" }],
+      ["status", { run_id: PENDING_RUN_ID, status: "done", assistant_message: "" }],
+      ["answer", { text: "391.0 亿美元" }],
+      ["citations", []],
+    ]);
+
+    await useWorkspaceStore
+      .getState()
+      .pickChoice(THREAD_ID, PENDING_RUN_ID, "graph");
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe(`/api/threads/${THREAD_ID}/resume`);
+    expect(calls[0].method).toBe("POST");
+    expect(calls[0].body).toEqual({ pick: "graph" });
+
+    const thread = useWorkspaceStore.getState().activeThread;
+    const turns = thread?.turns ?? [];
+    expect(turns).toHaveLength(1);
+    expect(turns[0].run_id).toBe(PENDING_RUN_ID);
+    expect(turns[0].question).toBe("营收多少？");
+    expect(turns[0].answer).toBe("391.0 亿美元");
+    expect(turns[0].in_flight).toBe(false);
+    // The pick collapses the window and clears the pending projection.
+    expect(turns[0].choice_window ?? null).toBeNull();
+    expect(thread?.pending_turn ?? null).toBeNull();
+  });
+
+  it("re-opens the window on an invalid pick against the pending turn", async () => {
+    seedPendingThread();
+    const rejected: ChoiceWindow = {
+      ...PENDING_WINDOW,
+      rejected_picks: ["Z"],
+    };
+    stubResumeStream([["choice_window", rejected]]);
+
+    await useWorkspaceStore
+      .getState()
+      .pickChoice(THREAD_ID, PENDING_RUN_ID, "Q");
+
+    const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+    expect(turns).toHaveLength(1);
+    expect(turns[0].choice_window?.rejected_picks).toEqual(["Z"]);
+    expect(turns[0].in_flight).toBe(true);
+  });
+
+  it("still ignores a pick for a run with no pending window", async () => {
+    // The widened lookup must not start a resume for an ordinary row.
+    seedStreamedThread([watchedTurn()]);
+    const calls = stubResumeStream([]);
+
+    const result = await useWorkspaceStore
+      .getState()
+      .pickChoice(
+        THREAD_ID,
+        "99999999-9999-4999-8999-999999999999",
+        "lexical",
+      );
+
+    expect(result).toBeNull();
+    expect(calls).toHaveLength(0);
+  });
+
+  it("rolls the materialized row back and re-arms pending_turn when /resume rejects", async () => {
+    seedPendingThread();
+    stubResumeReject(409, { error: "concurrent_run" });
+
+    const rejection = await useWorkspaceStore
+      .getState()
+      .pickChoice(THREAD_ID, PENDING_RUN_ID, "graph")
+      .then(() => null)
+      .catch((error: unknown) => error);
+
+    // The rejection still surfaces to the caller (the composer shows it).
+    expect(rejection).toBeInstanceOf(ConcurrentRunError);
+
+    const thread = useWorkspaceStore.getState().activeThread;
+    // The row was never a server record and the pick failed before any
+    // frame, so the thread returns to its prior turns[] — no stuck
+    // in_flight ghost left behind.
+    expect(thread?.turns ?? []).toEqual([]);
+    // The paused projection is re-armed so the operator can pick again.
+    expect(thread?.pending_turn?.run_id).toBe(PENDING_RUN_ID);
+    expect(thread?.pending_turn?.choice_window).toEqual(PENDING_WINDOW);
+    expect(useWorkspaceStore.getState().resumingThreadId).toBeNull();
+  });
+
+  it("does not roll back the ordinary live-turn pick path on rejection", async () => {
+    // A row that already existed before the pick (the live path) is NOT
+    // dropped: only a row THIS call materialized rolls back. This pins
+    // the pre-existing behavior the fix must not disturb.
+    seedStreamedThread([
+      watchedTurn({
+        run_id: PENDING_RUN_ID,
+        choice_window: PENDING_WINDOW,
+        in_flight: true,
+      }),
+    ]);
+    stubResumeReject(409, { error: "concurrent_run" });
+
+    await useWorkspaceStore
+      .getState()
+      .pickChoice(THREAD_ID, PENDING_RUN_ID, "graph")
+      .catch(() => undefined);
+
+    const turns = useWorkspaceStore.getState().activeThread?.turns ?? [];
+    expect(turns).toHaveLength(1);
+    expect(turns[0].run_id).toBe(PENDING_RUN_ID);
+    // The window was collapsed locally before the POST and the failed
+    // resume neither resurrects nor drops the existing row.
+    expect(turns[0].choice_window ?? null).toBeNull();
+    expect(turns[0].in_flight).toBe(true);
+    expect(useWorkspaceStore.getState().activeThread?.pending_turn ?? null).toBeNull();
+    expect(useWorkspaceStore.getState().resumingThreadId).toBeNull();
   });
 });
