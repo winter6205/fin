@@ -16,6 +16,7 @@
 // rebuilt object is what makes "renders only runtime-validated evidence"
 // structural rather than a promise.
 
+import { parseChoiceWindow } from "./choiceWindow";
 import { parseVisualClaim } from "./visualClaims";
 import {
   comparisonShapeRefusal,
@@ -970,6 +971,45 @@ export function decodeVisualClaimRow(
 
 // ----- history seam (ThreadDetail) -----
 
+/** Narrow the wire ``pending_turn`` to the paused choice a reload must
+ * restore, else ``undefined``. The wire is ``unknown``: ``run_id`` and
+ * ``question`` must be non-blank strings and ``choice_window`` must pass
+ * the SAME ``parseChoiceWindow`` boundary the live SSE frame uses, so a
+ * reloaded window renders identically to a streamed one. Any part that
+ * fails narrows the WHOLE pending turn away — a half-built projection
+ * would name a run with no renderable prompt, which is worse than no
+ * card (the operator would see a stuck, unanswerable question). */
+function decodePendingTurn(
+  value: unknown,
+): NonNullable<ThreadDetail["pending_turn"]> | undefined {
+  if (!isRecord(value)) return undefined;
+  const runId = value.run_id;
+  if (!isString(runId) || runId.trim().length === 0) return undefined;
+  const question = value.question;
+  if (!isString(question) || question.trim().length === 0) return undefined;
+  const choice = parseChoiceWindow(value.choice_window);
+  if (choice === null) return undefined;
+  return { run_id: runId, question, choice_window: choice };
+}
+
+/** Assemble the decoded detail: the turn table plus the ``pending_turn``
+ * projection, which rides through untouched ONLY when it narrows; a
+ * malformed or ``null`` value drops to absent so a caller never reads a
+ * half-built paused turn (see ``decodePendingTurn``). ``detail`` still
+ * carries the raw wire key from the blind cast, so it is removed first and
+ * the key is re-added only for a valid narrowed turn — a caller can then
+ * test ``"pending_turn" in detail`` to tell "absent" from "paused". */
+function withPendingTurn(
+  detail: ThreadDetail,
+  turns: Turn[],
+  pendingTurn: NonNullable<ThreadDetail["pending_turn"]> | undefined,
+): ThreadDetail {
+  const decoded: ThreadDetail = { ...detail, turns };
+  delete decoded.pending_turn;
+  if (pendingTurn !== undefined) decoded.pending_turn = pendingTurn;
+  return decoded;
+}
+
 /** Decode a ``GET /api/threads/{id}`` body through the evidence guards.
  *
  * The blind cast this replaces kept ``payload as Citation[]`` valid only
@@ -993,6 +1033,7 @@ export function decodeThreadDetail(body: unknown): ThreadDetail {
     body.schema_version,
   );
   const detail = body as unknown as ThreadDetail;
+  const pendingTurn = decodePendingTurn(body.pending_turn);
   const decodedTurns: Turn[] = [];
   for (const raw of turns) {
     if (!isRecord(raw)) throw new Error("malformed thread detail turn");
@@ -1035,7 +1076,7 @@ export function decodeThreadDetail(body: unknown): ThreadDetail {
       evidence_refusals: refusals,
     });
   }
-  return { ...detail, turns: decodedTurns };
+  return withPendingTurn(detail, decodedTurns, pendingTurn);
 }
 
 // ----- refusal fold (store ordering invariant) -----

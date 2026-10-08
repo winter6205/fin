@@ -83,6 +83,19 @@ export async function getThread(threadId: string): Promise<ThreadDetail> {
   // 缺 / 坏 boot. Surfacing it as a plain 404 would tell the operator
   // the thread is gone when it is not (ADR 0051).
   if (res.status === 409) throw await threadConflictError(res);
+  // A 503 on this route has TWO unrelated causes. The pending-question
+  // projection failure answers a fixed FastAPI ``{"detail": …}`` body
+  // (see ``_PENDING_QUESTION_UNAVAILABLE_DETAIL`` host-side); the thread
+  // EXISTS and a plain transport error would read as not-found. But a
+  // thread-store / run-list outage answers the named
+  // ``{"error": "persistence_unavailable"}`` body — a DIFFERENT truth,
+  // and one the route already reads as not-found. Discriminate on the
+  // wire body (as the 409 branch above does) so a store outage is never
+  // mislabelled as a live thread with an unreadable question. The class
+  // carries the client's own fixed copy — the host refuses to echo
+  // checkpoint internals and neither may this decode.
+  if (res.status === 503 && (await isPendingQuestionRefusal(res.clone())))
+    throw new PendingQuestionUnavailableError();
   // E6: the history body is ``unknown`` at runtime — strict tsc types
   // are compile-time only and never satisfy a decode (spec §6 web row).
   // The blind ``jsonOrThrow<ThreadDetail>`` cast is replaced by the
@@ -332,6 +345,44 @@ export class KnowledgeMcpFaultError extends Error {
   constructor(message: string) {
     super(message || "knowledge_mcp_fault");
     this.name = "KnowledgeMcpFaultError";
+  }
+}
+
+/** The host's fixed copy for the pending-question 503 (mirrors
+ * ``fin.host.workspace_http._PENDING_QUESTION_UNAVAILABLE_DETAIL``). The
+ * SPA renders THIS string, never the wire body: the host deliberately
+ * refuses to leak checkpoint / exception detail, and a client that
+ * echoed the body would reintroduce the leak. */
+export const PENDING_QUESTION_UNAVAILABLE_DETAIL =
+  "Pending question is temporarily unavailable. Retry opening the thread.";
+
+/** A 503 opening a thread whose paused choice-window checkpoint cannot be
+ * projected. A DISTINCT type from a plain transport failure: the thread
+ * still EXISTS and merely cannot be read this moment, so rendering it as
+ * not-found (or echoing server internals) would both be wrong claims.
+ * The caller is told to retry. Mirrors the ``KnowledgeMcpFaultError``
+ * pattern (a named refusal, not a bare ``Error``). */
+export class PendingQuestionUnavailableError extends Error {
+  readonly code = "pending_question_unavailable";
+
+  constructor(message = PENDING_QUESTION_UNAVAILABLE_DETAIL) {
+    super(message);
+    this.name = "PendingQuestionUnavailableError";
+  }
+}
+
+/** True when a 503 body is the pending-question refusal shape. That
+ * refusal rides FastAPI's ``HTTPException``, which serialises as
+ * ``{"detail": …}``; the store-outage 503 answers ``{"error":
+ * "persistence_unavailable"}`` instead and is NOT this shape. Defensive:
+ * an unreadable / non-JSON body reads as not-pending, so the caller's
+ * ordinary transport error still fires rather than a parse error. */
+async function isPendingQuestionRefusal(res: Response): Promise<boolean> {
+  try {
+    const body = (await res.json()) as { detail?: unknown };
+    return typeof body?.detail === "string";
+  } catch {
+    return false;
   }
 }
 

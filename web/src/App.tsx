@@ -77,6 +77,7 @@ function ThreadRoute() {
     return <main className="p-6 text-sm text-gray-500">加载对话中…</main>;
   }
   if (view === "gated") return <GatedThreadNotice />;
+  if (view === "pending_unavailable") return <PendingQuestionNotice />;
   if (view === "missing") return <NotFoundThread />;
   return <ThreadPage />;
 }
@@ -89,9 +90,10 @@ function ThreadRoute() {
 // "404 + back" presentation has visual weight, then point the user
 // home; other threads stay reachable in the sidebar 会话 group.
 //
-// Both /t/{id} refusals (unknown id, and the 知识 MCP gate) use this
-// one card: same shell, different claim. Sharing it keeps the two
-// presentations from drifting apart the way the copy already would.
+// All three /t/{id} refusals (unknown id, the 知识 MCP gate, and the
+// pending-question 503) use this one card: same shell, different claim.
+// Sharing it keeps the three presentations from drifting apart the way
+// the copy already would.
 function ThreadNoticeCard({
   title,
   children,
@@ -122,6 +124,18 @@ function GatedThreadNotice() {
   return (
     <ThreadNoticeCard title={KNOWLEDGE_MCP_FAULT_COPY}>
       这个对话还在，但知识检索服务连不上，暂时打不开。等服务恢复后重试。
+    </ThreadNoticeCard>
+  );
+}
+
+// The pending-question 503: the thread EXISTS but its paused choice could
+// not be read this moment (host fixed detail, never checkpoint internals).
+// The operator is told to retry opening — NOT that the thread is gone.
+function PendingQuestionNotice() {
+  return (
+    <ThreadNoticeCard title="暂时无法打开">
+      这个对话还在，但其中待回答的问题暂时读不出来。请重新打开这个
+      thread 重试。
     </ThreadNoticeCard>
   );
 }

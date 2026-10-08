@@ -69,6 +69,9 @@ KNOWN_IDS = {"AAPL-2022Q3", "AAPL-2023Q1", "MSFT-2023Q1", "AMZN-2023Q1"}
 # Grounded by the track rules tier, unnamed by the 档 rules tier, no
 # inherit on a fresh thread -> the cascade residual ``clarify``.
 AMBIGUOUS = "What was AAPL net sales in 2023 Q3?"
+PENDING_TURN_UNAVAILABLE_DETAIL = (
+    "Pending question is temporarily unavailable. Retry opening the thread."
+)
 
 
 def _cfg(thread_id: str, **configurable: Any) -> dict:
@@ -503,6 +506,403 @@ def test_resume_without_pick_reemits_the_window(
     events = _parse_sse_events(redraw.text)
     assert events[-1][0] == "choice_window"
     assert events[-1][1]["kind"] == "choice_window"
+
+
+def test_get_thread_projects_pending_choice_when_turn_table_is_empty(
+    client: TestClient, store, http_app: FastAPI
+) -> None:
+    """A paused choice is visible after opening the thread again even
+    though it has not become a persisted turn yet."""
+    g = _install_window_graph(http_app, _ANSWER)
+    thread_id = _new_thread(client)
+
+    sent = client.post(
+        f"/api/threads/{thread_id}/messages",
+        json={"question": AMBIGUOUS},
+    )
+    assert sent.status_code == 200
+    events = _parse_sse_events(sent.text)
+    assert events[-1][0] == "choice_window"
+    choice_window = events[-1][1]
+    checkpoint_run_id = g.checkpoint_run_id(thread_id)
+    assert checkpoint_run_id
+    assert store.list_runs(thread_id) == []
+
+    detail_response = client.get(f"/api/threads/{thread_id}")
+    assert detail_response.status_code == 200
+    detail = detail_response.json()
+    assert detail["turns"] == []
+    assert detail["pending_checkpoint"] is True
+    assert detail["pending_interrupt_kind"] == "choice_window"
+    assert detail["pending_turn"] == {
+        "run_id": checkpoint_run_id,
+        "question": AMBIGUOUS,
+        "choice_window": choice_window,
+    }
+    # Rendering a pending projection must not manufacture a terminal row.
+    assert store.list_runs(thread_id) == []
+
+
+def test_get_thread_replaces_pending_projection_after_choice_resume(
+    client: TestClient, store, http_app: FastAPI
+) -> None:
+    """A prior turn does not hide the paused question; after its pick,
+    exactly one persisted row with the checkpoint identity replaces it."""
+    from fin.host.thread_store import RunRecord
+
+    g = _install_window_graph(http_app, _ANSWER)
+    thread_id = _new_thread(client)
+    store.append_run(
+        RunRecord(
+            id="earlier-run",
+            thread_id=thread_id,
+            question="Earlier completed question",
+            status="done",
+            answer="Earlier answer",
+        )
+    )
+
+    sent = client.post(
+        f"/api/threads/{thread_id}/messages",
+        json={"question": AMBIGUOUS},
+    )
+    assert sent.status_code == 200
+    events = _parse_sse_events(sent.text)
+    assert events[-1][0] == "choice_window"
+    choice_window = events[-1][1]
+    checkpoint_run_id = g.checkpoint_run_id(thread_id)
+    assert checkpoint_run_id
+
+    paused = client.get(f"/api/threads/{thread_id}").json()
+    assert [turn["run_id"] for turn in paused["turns"]] == ["earlier-run"]
+    assert [run.id for run in store.list_runs(thread_id)] == ["earlier-run"]
+
+    resumed = client.post(
+        f"/api/threads/{thread_id}/resume", json={"pick": "graph"}
+    )
+    assert resumed.status_code == 200
+    assert _parse_sse_events(resumed.text)[-1][0] == "citations"
+
+    completed = client.get(f"/api/threads/{thread_id}").json()
+    assert [turn["run_id"] for turn in completed["turns"]] == [
+        "earlier-run",
+        checkpoint_run_id,
+    ]
+    current_turns = [
+        turn
+        for turn in completed["turns"]
+        if turn["run_id"] == checkpoint_run_id
+    ]
+    assert len(current_turns) == 1
+    assert current_turns[0]["question"] == AMBIGUOUS
+    assert [run.id for run in store.list_runs(thread_id)] == [
+        "earlier-run",
+        checkpoint_run_id,
+    ]
+    assert completed["pending_turn"] is None
+    assert paused["pending_turn"] == {
+        "run_id": checkpoint_run_id,
+        "question": AMBIGUOUS,
+        "choice_window": choice_window,
+    }
+
+
+def test_get_thread_completed_run_has_no_pending_turn(
+    client: TestClient, store, http_app: FastAPI
+) -> None:
+    _install_window_graph(http_app, _ANSWER)
+    thread_id = _new_thread(client)
+    completed = client.post(
+        f"/api/threads/{thread_id}/messages",
+        json={"question": AMBIGUOUS, "tiers": ["graph"]},
+    )
+    assert completed.status_code == 200
+    assert _parse_sse_events(completed.text)[-1][0] == "citations"
+
+    detail = client.get(f"/api/threads/{thread_id}").json()
+    assert detail["pending_turn"] is None
+    assert len(detail["turns"]) == 1
+
+
+def test_get_thread_plain_crash_checkpoint_has_no_pending_turn(
+    client: TestClient, store, http_app: FastAPI
+) -> None:
+    """A resumable graph checkpoint without a choice interrupt keeps the
+    ordinary crash-resume signal and does not invent a pending question."""
+    from fin.host.http import get_graph
+
+    g = compile_graph(
+        checkpointer=InMemorySaver(),
+        model=ScriptedChatModel(script=[_RETRIEVE_CALL]),
+        known_document_ids=KNOWN_IDS,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+    thread_id = _new_thread(client)
+    run = g.stream(
+        _input(AMBIGUOUS),
+        config=_cfg(thread_id, run_id="plain-crash-run"),
+        stream_mode="values",
+    )
+    try:
+        for state in run:
+            messages = state.get("messages", []) or []
+            if messages and getattr(messages[-1], "tool_calls", None):
+                break
+        else:
+            pytest.fail("script did not checkpoint a completed tool call")
+    finally:
+        run.close()
+
+    assert g.pending_nodes(thread_id)
+    assert g.interrupt_pending(thread_id) is None
+    detail = client.get(f"/api/threads/{thread_id}").json()
+    assert detail["pending_checkpoint"] is True
+    assert detail["pending_interrupt_kind"] is None
+    assert detail["pending_turn"] is None
+
+
+def test_get_thread_live_lock_suppresses_pending_choice_projection(
+    client: TestClient, store, http_app: FastAPI
+) -> None:
+    """The projection is not exposed until the active stream releases its
+    per-thread lock, even after the choice interrupt has been checkpointed."""
+    g = _install_window_graph(http_app, _ANSWER)
+    thread_id = _new_thread(client)
+    run = g.stream(
+        _input(AMBIGUOUS),
+        config=_cfg(thread_id, run_id="live-choice-run"),
+        stream_mode="values",
+    )
+    try:
+        for state in run:
+            if state.get("__interrupt__"):
+                break
+        else:
+            pytest.fail("graph did not reach the pending choice window")
+
+        assert g.is_locked(thread_id) is True
+        assert g.interrupt_pending(thread_id) is not None
+        detail = client.get(f"/api/threads/{thread_id}").json()
+        assert detail["in_flight"] is True
+        assert detail["pending_turn"] is None
+    finally:
+        run.close()
+
+
+def test_get_thread_checkpoint_read_failure_is_actionable_503(
+    client: TestClient, store, http_app: FastAPI, monkeypatch
+) -> None:
+    saver = InMemorySaver()
+    from fin.host.http import get_graph
+
+    g = compile_graph(
+        checkpointer=saver,
+        model=ScriptedChatModel(script=_ANSWER),
+        known_document_ids=KNOWN_IDS,
+        enable_choice_window=True,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+    thread_id = _new_thread(client)
+    sent = client.post(
+        f"/api/threads/{thread_id}/messages",
+        json={"question": AMBIGUOUS},
+    )
+    assert _parse_sse_events(sent.text)[-1][0] == "choice_window"
+
+    def unreadable_checkpoint(_config):
+        raise RuntimeError("CHECKPOINT-SECRET-SENTINEL")
+
+    monkeypatch.setattr(saver, "get_tuple", unreadable_checkpoint)
+    response = TestClient(http_app, raise_server_exceptions=False).get(
+        f"/api/threads/{thread_id}"
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"] == PENDING_TURN_UNAVAILABLE_DETAIL
+    assert "CHECKPOINT-SECRET-SENTINEL" not in response.text
+
+
+@pytest.mark.parametrize("corruption", ["run_id", "original_question"])
+def test_get_thread_rejects_malformed_pending_choice_checkpoint(
+    corruption: str,
+    client: TestClient,
+    store,
+    http_app: FastAPI,
+    monkeypatch,
+) -> None:
+    from copy import deepcopy
+
+    from fin.host.http import get_graph
+
+    saver = InMemorySaver()
+    g = compile_graph(
+        checkpointer=saver,
+        model=ScriptedChatModel(script=_ANSWER),
+        known_document_ids=KNOWN_IDS,
+        enable_choice_window=True,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+    thread_id = _new_thread(client)
+    private_question = f"{AMBIGUOUS} PRIVATE-QUESTION-SENTINEL"
+    sent = client.post(
+        f"/api/threads/{thread_id}/messages",
+        json={"question": private_question},
+    )
+    assert _parse_sse_events(sent.text)[-1][0] == "choice_window"
+
+    original_get_tuple = saver.get_tuple
+
+    def malformed_checkpoint(config):
+        checkpoint_tuple = original_get_tuple(config)
+        assert checkpoint_tuple is not None
+        if corruption == "run_id":
+            metadata = {
+                key: value
+                for key, value in checkpoint_tuple.metadata.items()
+                if key != "run_id"
+            }
+            return checkpoint_tuple._replace(metadata=metadata)
+
+        checkpoint = deepcopy(checkpoint_tuple.checkpoint)
+        checkpoint["channel_values"]["messages"] = []
+        return checkpoint_tuple._replace(checkpoint=checkpoint)
+
+    monkeypatch.setattr(saver, "get_tuple", malformed_checkpoint)
+    response = client.get(f"/api/threads/{thread_id}")
+    assert response.status_code == 503
+    assert response.json()["detail"] == PENDING_TURN_UNAVAILABLE_DETAIL
+    assert "PRIVATE-QUESTION-SENTINEL" not in response.text
+    assert "run_id" not in response.json()
+    assert "question" not in response.json()
+
+
+def test_get_thread_non_string_human_question_is_not_malformed(
+    client: TestClient,
+    store,
+    http_app: FastAPI,
+    monkeypatch,
+) -> None:
+    """LangChain permits non-``str`` (multimodal) human content. The pending
+    projection must read the SAME text the resume route reconciles on
+    (``str(content)``) instead of treating a merely non-string question as
+    malformed and 503-ing the thread."""
+    from copy import deepcopy
+
+    from langchain_core.messages import HumanMessage
+
+    from fin.host.http import get_graph
+
+    saver = InMemorySaver()
+    g = compile_graph(
+        checkpointer=saver,
+        model=ScriptedChatModel(script=_ANSWER),
+        known_document_ids=KNOWN_IDS,
+        enable_choice_window=True,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+    thread_id = _new_thread(client)
+    sent = client.post(
+        f"/api/threads/{thread_id}/messages",
+        json={"question": AMBIGUOUS},
+    )
+    assert _parse_sse_events(sent.text)[-1][0] == "choice_window"
+
+    multimodal = [{"type": "text", "text": AMBIGUOUS}]
+    original_get_tuple = saver.get_tuple
+
+    def non_string_question(config):
+        checkpoint_tuple = original_get_tuple(config)
+        assert checkpoint_tuple is not None
+        checkpoint = deepcopy(checkpoint_tuple.checkpoint)
+        checkpoint["channel_values"]["messages"] = [
+            HumanMessage(content=multimodal)
+        ]
+        return checkpoint_tuple._replace(checkpoint=checkpoint)
+
+    monkeypatch.setattr(saver, "get_tuple", non_string_question)
+    response = client.get(f"/api/threads/{thread_id}")
+    assert response.status_code == 200, response.text
+    detail = response.json()
+    assert detail["pending_checkpoint"] is True
+    assert detail["pending_interrupt_kind"] == "choice_window"
+    assert detail["pending_turn"] is not None
+    # The projection must take the pre-existing helper's path exactly, so a
+    # non-string body degrades to ``str(content)`` rather than ``None``.
+    assert detail["pending_turn"]["question"] == str(multimodal).strip()
+
+
+def test_get_thread_standin_without_projection_seam_keeps_resume_signal(
+    client: TestClient, store, http_app: FastAPI
+) -> None:
+    """A graph stand-in exposing the granular pending probes but not the
+    single-snapshot projection seam must still raise the Resume signal
+    (``pending_checkpoint``) rather than silently reporting nothing pending."""
+    from fin.host.http import get_graph
+
+    class _StandIn:
+        def is_locked(self, thread_id: str) -> bool:
+            return False
+
+        def pending_nodes(self, thread_id: str) -> tuple[str, ...]:
+            return ("mode_choice",)
+
+        def interrupt_pending(self, thread_id: str) -> dict[str, Any]:
+            return {"kind": "choice_window", "options": []}
+
+    http_app.dependency_overrides[get_graph] = lambda: _StandIn()
+    thread_id = _new_thread(client)
+
+    detail = client.get(f"/api/threads/{thread_id}").json()
+    assert detail["pending_checkpoint"] is True
+    assert detail["pending_interrupt_kind"] == "choice_window"
+    assert detail["pending_turn"] is None
+
+
+def test_get_thread_projection_failure_logs_the_typed_cause(
+    client: TestClient,
+    store,
+    http_app: FastAPI,
+    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The typed failure's WHY is observable in the server log while the
+    fixed, non-sensitive client detail stays unchanged."""
+    import logging
+    from copy import deepcopy
+
+    from fin.host.http import get_graph
+
+    saver = InMemorySaver()
+    g = compile_graph(
+        checkpointer=saver,
+        model=ScriptedChatModel(script=_ANSWER),
+        known_document_ids=KNOWN_IDS,
+        enable_choice_window=True,
+    )
+    http_app.dependency_overrides[get_graph] = lambda: g
+    thread_id = _new_thread(client)
+    sent = client.post(
+        f"/api/threads/{thread_id}/messages",
+        json={"question": AMBIGUOUS},
+    )
+    assert _parse_sse_events(sent.text)[-1][0] == "choice_window"
+
+    original_get_tuple = saver.get_tuple
+
+    def question_less_checkpoint(config):
+        checkpoint_tuple = original_get_tuple(config)
+        assert checkpoint_tuple is not None
+        checkpoint = deepcopy(checkpoint_tuple.checkpoint)
+        checkpoint["channel_values"]["messages"] = []
+        return checkpoint_tuple._replace(checkpoint=checkpoint)
+
+    monkeypatch.setattr(saver, "get_tuple", question_less_checkpoint)
+    with caplog.at_level(logging.WARNING, logger="fin.host.workspace_http"):
+        response = client.get(f"/api/threads/{thread_id}")
+    assert response.status_code == 503
+    assert response.json()["detail"] == PENDING_TURN_UNAVAILABLE_DETAIL
+    # The typed cause (the reason) is logged server-side with its traceback.
+    assert "original user question is missing" in caplog.text
+    assert "PendingCheckpointProjectionError" in caplog.text
 
 
 def test_resume_pick_without_pending_choice_is_400(

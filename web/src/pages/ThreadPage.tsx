@@ -1,12 +1,12 @@
 // Chat page for one research thread: turn table + composer. Reload
 // restores turns from GET (no re-invoke).
 
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import { useParams } from "react-router-dom";
 import AnswerWithCitations from "../components/CitationChips";
 import VisualClaims from "../components/VisualClaims";
 import Composer from "../components/Composer";
-import type { Comparison, ToolSummary, Turn } from "../types";
+import type { ChoiceWindow, Comparison, ThreadDetail, ToolSummary, Turn } from "../types";
 import {
   cellTitle,
   comparisonCaption,
@@ -16,10 +16,7 @@ import {
   locatorLabel,
   turnComparisons,
 } from "../comparison";
-import {
-  choiceOptionDisabled,
-  choiceRejectedText,
-} from "../choiceWindow";
+import { choiceOptionDisabled, choiceRejectedText } from "../choiceWindow";
 import { exportAvailability, exportUrl } from "../exportBundle";
 import { resolveTurnTrack, showResearchTrackHint } from "../softTrack";
 import {
@@ -42,6 +39,210 @@ import {
 } from "../turnTrace";
 import { useWorkspaceStore } from "../store";
 import { occupancyPercent, parseThreadOccupancy } from "../threadOccupancy";
+import { threadViewState, type ThreadViewState } from "../threadViewState";
+
+const TRANSCRIPT_BOTTOM_TOLERANCE = 4;
+
+// A wheel burst is one gesture while its ticks stay within this gap; a
+// longer pause starts a new gesture with a new start position.
+const TRANSCRIPT_WHEEL_GESTURE_IDLE_MS = 150;
+
+// Width of the native scrollbar band at the right edge, in CSS pixels: a
+// pointer within this band is on the vertical scrollbar, not on the
+// content. Assumes an LTR layout, so the bar sits at ``bounds.right`` —
+// an RTL transcript would put it at ``bounds.left``.
+const TRANSCRIPT_SCROLLBAR_BAND_PX = 18;
+
+function isAtTranscriptBottom(viewport: HTMLDivElement): boolean {
+  return viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop <=
+    TRANSCRIPT_BOTTOM_TOLERANCE;
+}
+
+function canScrollTranscriptUpFrom(
+  target: EventTarget | null,
+  viewport: HTMLDivElement,
+  positionBeforeGesture: number,
+): boolean {
+  let element = target instanceof HTMLElement ? target : null;
+  while (element && element !== viewport) {
+    const overflowY = window.getComputedStyle(element).overflowY;
+    if (
+      (overflowY === "auto" ||
+        overflowY === "scroll" ||
+        overflowY === "overlay") &&
+      element.scrollHeight > element.clientHeight + 1 &&
+      element.scrollTop > 0
+    ) {
+      return false;
+    }
+    element = element.parentElement;
+  }
+  // Judged against the position the gesture STARTED from, not the live
+  // ``scrollTop``. The live value is unreliable here: a single upward
+  // gesture can already have carried the viewport to the top by the
+  // time this handler runs, reporting 0 and looking like "nothing above
+  // to read" — which would leave follow armed and let the next content
+  // growth snap the viewport back to the tail. How the browser schedules
+  // that scroll (and the ``scroll`` event it fires) relative to this
+  // handler is not guaranteed, so the callers capture the start position
+  // at gesture start and pass it in; this function never reads live
+  // position.
+  return positionBeforeGesture > 0;
+}
+
+function isTranscriptTextEntry(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement &&
+    (target.matches("input, textarea, select") || target.isContentEditable);
+}
+
+function isTranscriptScrollUpKey(event: KeyboardEvent): boolean {
+  return (
+    ["ArrowUp", "PageUp", "Home"].includes(event.key) ||
+    (event.key === " " && event.shiftKey)
+  );
+}
+
+function isTranscriptScrollbarPointer(
+  event: PointerEvent,
+  viewport: HTMLDivElement,
+): boolean {
+  const bounds = viewport.getBoundingClientRect();
+  return event.button === 0 &&
+    viewport.scrollHeight > viewport.clientHeight + 1 &&
+    event.clientX >= bounds.right - TRANSCRIPT_SCROLLBAR_BAND_PX;
+}
+
+function observeTranscriptGrowth(
+  viewport: HTMLDivElement,
+  content: HTMLDivElement,
+  shouldFollow: { current: boolean },
+): () => void {
+  let disposed = false;
+  const followTail = () => {
+    if (!disposed && shouldFollow.current) {
+      viewport.scrollTop = viewport.scrollHeight;
+    }
+  };
+  const observer = new ResizeObserver(followTail);
+  observer.observe(viewport);
+  observer.observe(content);
+  // ResizeObserver runs after layout, once scrollHeight reflects anchoring.
+  followTail();
+
+  return () => {
+    disposed = true;
+    observer.disconnect();
+  };
+}
+
+function observeTranscriptScrollIntent(
+  viewport: HTMLDivElement,
+  shouldFollow: { current: boolean },
+): () => void {
+  let scrollbarPointerId: number | null = null;
+  let previousScrollTop = viewport.scrollTop;
+  // The position the CURRENT wheel gesture started from, captured on the
+  // first tick of a burst and held until the burst goes idle. It is read
+  // from ``previousScrollTop`` (the last position the scroll listener
+  // saw) rather than the live ``scrollTop``, because the live position
+  // may already reflect this burst's own scroll by the time the handler
+  // runs. Holding it for the whole gesture is what keeps a scroll event
+  // the gesture caused from overwriting the start position before the
+  // next tick reads it — see ``canScrollTranscriptUpFrom``. ``null`` =
+  // no wheel gesture in flight.
+  let wheelStartScrollTop: number | null = null;
+  let wheelIdleTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const onScroll = () => {
+    const nextScrollTop = viewport.scrollTop;
+    if (
+      scrollbarPointerId !== null &&
+      nextScrollTop < previousScrollTop
+    ) {
+      shouldFollow.current = false;
+    }
+    previousScrollTop = nextScrollTop;
+    // Scroll events alone cannot distinguish user movement from content
+    // growth or browser anchoring; only an explicit input pauses follow.
+    if (isAtTranscriptBottom(viewport)) shouldFollow.current = true;
+  };
+  const onWheel = (event: WheelEvent) => {
+    if (wheelStartScrollTop === null) {
+      wheelStartScrollTop = previousScrollTop;
+    }
+    if (
+      event.deltaY < 0 &&
+      canScrollTranscriptUpFrom(event.target, viewport, wheelStartScrollTop)
+    ) {
+      shouldFollow.current = false;
+    }
+    // A gap longer than this starts a fresh gesture with a fresh start
+    // position (trackpads and notched wheels both pace bursts this way).
+    if (wheelIdleTimer !== null) clearTimeout(wheelIdleTimer);
+    wheelIdleTimer = setTimeout(() => {
+      wheelStartScrollTop = null;
+      wheelIdleTimer = null;
+    }, TRANSCRIPT_WHEEL_GESTURE_IDLE_MS);
+  };
+  const onKeyDown = (event: KeyboardEvent) => {
+    const target = event.target;
+    if (
+      target instanceof HTMLElement &&
+      !isTranscriptTextEntry(target) &&
+      isTranscriptScrollUpKey(event) &&
+      canScrollTranscriptUpFrom(target, viewport, previousScrollTop)
+    ) {
+      shouldFollow.current = false;
+    }
+  };
+  const onPointerDown = (event: PointerEvent) => {
+    if (isTranscriptScrollbarPointer(event, viewport)) {
+      scrollbarPointerId = event.pointerId;
+    }
+  };
+  const onPointerEnd = (event: PointerEvent) => {
+    if (event.pointerId === scrollbarPointerId) scrollbarPointerId = null;
+  };
+  const controller = new AbortController();
+  const options = { passive: true, signal: controller.signal };
+
+  viewport.addEventListener("scroll", onScroll, options);
+  viewport.addEventListener("wheel", onWheel, options);
+  viewport.addEventListener("keydown", onKeyDown, options);
+  viewport.addEventListener("pointerdown", onPointerDown, options);
+  window.addEventListener("pointerup", onPointerEnd, options);
+  window.addEventListener("pointercancel", onPointerEnd, options);
+
+  return () => {
+    controller.abort();
+    if (wheelIdleTimer !== null) clearTimeout(wheelIdleTimer);
+  };
+}
+
+function observeTranscriptTouchIntent(
+  viewport: HTMLDivElement,
+  shouldFollow: { current: boolean },
+): () => void {
+  let touchY: number | null = null;
+  // A drag emits many touchmove events; only the position at touchstart
+  // is the one the gesture started from.
+  let scrollTopAtTouchStart = 0;
+  const controller = new AbortController();
+  const options = { passive: true, signal: controller.signal };
+  viewport.addEventListener("touchstart", (event: TouchEvent) => {
+    touchY = event.touches[0]?.clientY ?? null;
+    scrollTopAtTouchStart = viewport.scrollTop;
+  }, options);
+  viewport.addEventListener("touchmove", (event: TouchEvent) => {
+    const nextY = event.touches[0]?.clientY ?? null;
+    if (touchY !== null && nextY !== null && nextY > touchY &&
+      canScrollTranscriptUpFrom(event.target, viewport, scrollTopAtTouchStart)) {
+      shouldFollow.current = false;
+    }
+    touchY = nextY;
+  }, options);
+  return () => controller.abort();
+}
 
 // T4 (spec line 38-39): the interrupted-run banner. Shown when
 // the latest turn row reports ``in_flight`` after a reload —
@@ -94,6 +295,12 @@ function OccupancyBadge({
 export default function ThreadPage() {
   const { thread_id } = useParams<{ thread_id: string }>();
   const activeThread = useWorkspaceStore((s) => s.activeThread);
+  const transcriptViewportRef = useRef<HTMLDivElement>(null);
+  const transcriptContentRef = useRef<HTMLDivElement>(null);
+  const shouldFollowTranscriptRef = useRef(true);
+  const transcriptReady = Boolean(
+    thread_id && activeThread && activeThread.id === thread_id,
+  );
 
   // Re-sync from the persisted turn table when we arrive at a
   // thread (reload / switch back). GET only - no graph invoke.
@@ -109,6 +316,32 @@ export default function ThreadPage() {
   // crashed React on every thread navigation with "Rendered more
   // hooks than during the previous render".
   const resumingThreadId = useWorkspaceStore((s) => s.resumingThreadId);
+
+  useLayoutEffect(() => {
+    const viewport = transcriptViewportRef.current;
+    const content = transcriptContentRef.current;
+    if (!thread_id || !transcriptReady || !viewport || !content) return;
+
+    shouldFollowTranscriptRef.current = true;
+    const stopObservingGrowth = observeTranscriptGrowth(
+      viewport,
+      content,
+      shouldFollowTranscriptRef,
+    );
+    const stopObservingScrollIntent = observeTranscriptScrollIntent(
+      viewport,
+      shouldFollowTranscriptRef,
+    );
+    const stopObservingTouchIntent = observeTranscriptTouchIntent(
+      viewport,
+      shouldFollowTranscriptRef,
+    );
+    return () => {
+      stopObservingTouchIntent();
+      stopObservingScrollIntent();
+      stopObservingGrowth();
+    };
+  }, [thread_id, transcriptReady]);
 
   if (!thread_id || !activeThread || activeThread.id !== thread_id) {
     return <main className="p-6 text-sm text-gray-500">加载对话中…</main>;
@@ -126,6 +359,17 @@ export default function ThreadPage() {
   // when a checkpoint is genuinely resumable.
   const pendingCheckpoint = activeThread.pending_checkpoint === true;
   const isResuming = resumingThreadId === thread_id;
+  // search-mode-host T2 reload path: a paused choice has no turn row, so
+  // the host carries it on ``pending_turn``. The composed banner / card /
+  // empty-copy decision lives in ``threadViewState`` (pure, DOM-free) so
+  // it is unit-tested; this component only renders its result.
+  const pendingTurn = activeThread.pending_turn ?? null;
+  const view = threadViewState({
+    pendingCheckpoint,
+    isResuming,
+    pendingTurn,
+    turnCount: activeThread.turns.length,
+  });
 
   return (
     <main className="flex flex-col h-full">
@@ -142,17 +386,81 @@ export default function ThreadPage() {
         <ExportLinks threadId={thread_id} turns={activeThread.turns} />
       </header>
 
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+      <ThreadTranscript
+        threadId={thread_id}
+        turns={activeThread.turns}
+        threadInFlight={activeThread.in_flight === true}
+        isResuming={isResuming}
+        view={view}
+        pendingTurn={pendingTurn}
+        viewportRef={transcriptViewportRef}
+        contentRef={transcriptContentRef}
+      />
+
+      <Composer threadId={thread_id} />
+    </main>
+  );
+}
+
+// The transcript area: the scroll viewport that bottom-follow tracks, plus
+// every thread-level overlay and the turn rows. Lifted out of ``ThreadPage``
+// so the composed render decision (``view``) and its conditionals live in one
+// presentational component, keyed off props only. The viewport / content refs
+// are threaded through as props so ``ThreadPage``'s follow effect keeps
+// observing the same nodes.
+function ThreadTranscript({
+  threadId,
+  turns,
+  threadInFlight,
+  isResuming,
+  view,
+  pendingTurn,
+  viewportRef,
+  contentRef,
+}: {
+  threadId: string;
+  turns: Turn[];
+  threadInFlight: boolean;
+  isResuming: boolean;
+  view: ThreadViewState;
+  pendingTurn: NonNullable<ThreadDetail["pending_turn"]> | null;
+  viewportRef: RefObject<HTMLDivElement>;
+  contentRef: RefObject<HTMLDivElement>;
+}) {
+  return (
+    <div
+      ref={viewportRef}
+      className="flex-1 overflow-y-auto p-4"
+      tabIndex={0}
+    >
+      <div ref={contentRef} className="space-y-4">
         {/* T4: crash banner shown when GET reports a PENDING
             checkpoint (process died mid-run). The lock is no
             longer held; only a checkpoint is left. Resume button
-            drives ``resumeThread`` which POSTs /resume. */}
-        {pendingCheckpoint && !isResuming ? (
-          <CrashResumeBanner threadId={thread_id} />
+            drives ``resumeThread`` which POSTs /resume. A paused
+            CHOICE also leaves a pending checkpoint — but the choice
+            card below owns that case, so ``view`` suppresses the
+            banner. */}
+        {view.showCrashResumeBanner ? (
+          <CrashResumeBanner threadId={threadId} />
         ) : null}
-        {isResuming ? <InterruptedRunBanner threadId={thread_id} /> : null}
+        {isResuming ? <InterruptedRunBanner threadId={threadId} /> : null}
 
-        {activeThread.turns.map((turn, index) => (
+        {/* The reloaded paused choice. It has no turn row yet, so the
+            card mounts at thread level, next to the banners.
+            ``pendingTurn`` here only narrows the type for the render;
+            whether the card shows is ``view.showPendingChoiceCard``. */}
+        {view.showPendingChoiceCard && pendingTurn ? (
+          <div className="max-w-3xl mx-auto">
+            <ChoiceWindowCard
+              threadId={threadId}
+              runId={pendingTurn.run_id}
+              choice={pendingTurn.choice_window}
+            />
+          </div>
+        ) : null}
+
+        {turns.map((turn, index) => (
           // Turn rows are append-only; a stable index key avoids
           // remounting when the server-minted ``run_id`` reconciles.
           // ``TurnView`` is memoized: streaming patches touch one
@@ -166,26 +474,26 @@ export default function ThreadPage() {
             key={index}
             turn={turn}
             isLastTerminalTurn={
-              index === lastTerminalTurnIndex(activeThread.turns)
+              index === lastTerminalTurnIndex(turns)
             }
-            threadId={thread_id}
-            threadInFlight={activeThread.in_flight === true}
+            threadId={threadId}
+            threadInFlight={threadInFlight}
           />
         ))}
 
         {/* Zero-turn thread: a plain empty state. The corpus-card
             grid was retired with the /kb chrome
             (workbench-retrieve-product-seam): the catalog lives
-            outside fin, so the composer is the only entry. */}
-        {activeThread.turns.length === 0 ? (
+            outside fin, so the composer is the only entry. A reloaded
+            paused choice is exactly the zero-turn case — the card
+            speaks for it, so ``view`` yields the copy. */}
+        {view.showEmptyCopy ? (
           <p className="max-w-3xl mx-auto pt-4 text-sm text-gray-500">
             还没有提问。在下方输入框写下你的问题，开始这个 research thread。
           </p>
         ) : null}
       </div>
-
-      <Composer threadId={thread_id} />
-    </main>
+    </div>
   );
 }
 
@@ -223,20 +531,26 @@ function CrashResumeBanner({ threadId }: { threadId: string }) {
 // copy. opened:false options stay visible but disabled (档未开放); a
 // re-issued window after an invalid pick shows the rejected ids. The
 // click drives ``pickChoice`` → POST /resume {"pick": id}.
+//
+// Takes the fields the pick needs, NOT a whole ``Turn``: a reloaded
+// paused turn has no row, so the thread-level mount passes the
+// ``pending_turn`` projection's own ``runId`` / ``choice`` and the
+// per-turn mount passes the row's. One card, both doors — a refactor
+// cannot make the reloaded case render differently from the live one.
 function ChoiceWindowCard({
   threadId,
-  turn,
+  runId,
+  choice,
 }: {
   threadId: string;
-  turn: Turn;
+  runId: string;
+  choice: ChoiceWindow;
 }) {
-  const choice = turn.choice_window;
   const pickChoice = useWorkspaceStore((s) => s.pickChoice);
   // While the pick stream is open the buttons go dead: the window
   // already collapsed on click, but a re-issued window (invalid
   // pick) must not accept a second concurrent pick.
   const busy = useWorkspaceStore((s) => s.resumingThreadId === threadId);
-  if (!choice) return null;
   const rejected = choiceRejectedText(choice);
   return (
     <section
@@ -264,7 +578,7 @@ function ChoiceWindowCard({
               data-testid={`choice-option-${option.id}`}
               disabled={busy || unopened}
               onClick={() => {
-                void pickChoice(threadId, turn.run_id, option.id);
+                void pickChoice(threadId, runId, option.id);
               }}
               className={
                 unopened
@@ -409,7 +723,11 @@ const TurnView = memo(function TurnView({
           is pending; a pick collapses it and the resumed stream
           renders into this same row. */}
       {turn.choice_window ? (
-        <ChoiceWindowCard threadId={threadId} turn={turn} />
+        <ChoiceWindowCard
+          threadId={threadId}
+          runId={turn.run_id}
+          choice={turn.choice_window}
+        />
       ) : null}
       {live && !turn.answer && !turn.assistant_message ? null : (
         <div

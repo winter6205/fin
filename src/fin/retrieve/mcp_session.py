@@ -61,6 +61,11 @@ def default_mcp_timeout_seconds() -> float:
         # clothes, so they are rejected here rather than downstream.
         usable = math.isfinite(value) and value > 0
     except ValueError:
+        # Bind `value` even on the reject path: `usable` is the only
+        # condition guarding the `return value` below, so leaving it
+        # unbound here makes the narrowing unsound (pyright reports it
+        # possibly-unbound) even though the guard is in fact total.
+        value = DEFAULT_MCP_TIMEOUT_SECONDS
         usable = False
     if not usable:
         logger.warning(

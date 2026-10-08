@@ -82,6 +82,7 @@ from typing import (
     Iterable,
     Literal,
     Mapping,
+    NoReturn,
     Protocol,
     TypedDict,
     cast,
@@ -243,6 +244,10 @@ if TYPE_CHECKING:  # ``fin.corpus.facts`` is imported lazily at call time
 
 class HostGraphError(Exception):
     """Base class for host-graph typed errors."""
+
+
+class PendingCheckpointProjectionError(HostGraphError):
+    """A checkpoint cannot safely produce its pending-turn projection."""
 
 
 class ConcurrentRunError(HostGraphError):
@@ -2695,6 +2700,12 @@ def _evaluate_numeric_gate_in_node(messages: list[BaseMessage]):
 # exact string, so it is a wire token, not prose.
 ATTACHMENT_PREPARATION_INTERRUPT_KIND = "attachment_preparation"
 
+# SC2: the choice-window payload's pinned kind. Same wire-token rule as the
+# attachment kind above — the SPA renders on ``kind`` and the pending-turn
+# projection matches on it, so the literal lives here once rather than being
+# respelled at the emit site and every reader.
+CHOICE_WINDOW_INTERRUPT_KIND = "choice_window"
+
 
 class _PreparationOutcomeView(Protocol):
     """What the gate reads off ``request_preparation``'s answer.
@@ -3458,7 +3469,7 @@ def compile_graph(
         rejected: list[str] = []
         while True:
             window: dict[str, Any] = {
-                "kind": "choice_window",
+                "kind": CHOICE_WINDOW_INTERRUPT_KIND,
                 "title": "选择检索档",
                 "prompt": "为本次 grounded 提问选择检索档后继续。",
                 "options": options,
@@ -4652,6 +4663,117 @@ def _make_locked_graph(
     return proxy
 
 
+class PendingTurnProjection(TypedDict):
+    run_id: str
+    question: str
+    choice_window: dict[str, Any]
+
+
+class PendingCheckpointProjection(TypedDict):
+    pending_checkpoint: bool
+    pending_interrupt_kind: str | None
+    pending_turn: PendingTurnProjection | None
+
+
+def _choice_window_payload_is_valid(payload: dict[str, Any]) -> bool:
+    options = payload.get("options")
+    if (
+        payload.get("kind") != CHOICE_WINDOW_INTERRUPT_KIND
+        or not isinstance(options, list)
+    ):
+        return False
+    return bool(options) and all(
+        isinstance(option, dict)
+        and isinstance(option.get("id"), str)
+        and bool(option["id"].strip())
+        and isinstance(option.get("label"), str)
+        and bool(option["label"].strip())
+        for option in options
+    )
+
+
+def _latest_human_text_from_snapshot(snapshot: Any) -> str | None:
+    """Latest ``HumanMessage`` text on a checkpoint snapshot, or ``None``.
+
+    Single source of truth for "the user text this checkpoint was opened
+    with": the resume row reconciles its question against it and the
+    pending-turn projection shows the crashed run's original question.
+    LangChain allows non-``str`` (multimodal) human content, so a
+    non-string body degrades to ``str(content)`` rather than dropping the
+    message — a merely non-string question is NOT a malformed checkpoint.
+    Empty / missing → ``None``.
+    """
+    values = getattr(snapshot, "values", None)
+    messages = values.get("messages") if isinstance(values, Mapping) else None
+    if not messages:
+        return None
+    for message in reversed(messages):
+        if not isinstance(message, HumanMessage):
+            continue
+        content = message.content
+        if isinstance(content, str):
+            text = content.strip()
+        else:
+            text = str(content).strip()
+        return text or None
+    return None
+
+
+def _pending_interrupt_payload(snapshot: Any) -> dict[str, Any] | None:
+    for task in getattr(snapshot, "tasks", ()) or ():
+        for pending in getattr(task, "interrupts", ()) or ():
+            value = getattr(pending, "value", None)
+            if isinstance(value, dict):
+                return value
+    return None
+
+
+def _malformed_pending_checkpoint(reason: str) -> NoReturn:
+    raise PendingCheckpointProjectionError(
+        "pending choice checkpoint is malformed"
+    ) from ValueError(reason)
+
+
+def _pending_checkpoint_projection(
+    snapshot: Any,
+) -> PendingCheckpointProjection:
+    nodes = tuple(getattr(snapshot, "next", ()) or ())
+    projection: PendingCheckpointProjection = {
+        "pending_checkpoint": bool(nodes),
+        "pending_interrupt_kind": None,
+        "pending_turn": None,
+    }
+    if not nodes:
+        return projection
+
+    payload = _pending_interrupt_payload(snapshot)
+    if payload is None:
+        return projection
+    kind = payload.get("kind")
+    if not isinstance(kind, str) or not kind:
+        return projection
+    projection["pending_interrupt_kind"] = kind
+    if kind != CHOICE_WINDOW_INTERRUPT_KIND:
+        return projection
+    if not _choice_window_payload_is_valid(payload):
+        _malformed_pending_checkpoint("choice window payload is incomplete")
+
+    metadata = getattr(snapshot, "metadata", None)
+    run_id = metadata.get("run_id") if isinstance(metadata, Mapping) else None
+    if not isinstance(run_id, str) or not run_id.strip() or run_id.strip() != run_id:
+        _malformed_pending_checkpoint("canonical run id is missing")
+    question = _latest_human_text_from_snapshot(snapshot)
+    if question is None:
+        _malformed_pending_checkpoint("original user question is missing")
+
+    projection["pending_turn"] = {
+        "run_id": run_id,
+        "question": question,
+        CHOICE_WINDOW_INTERRUPT_KIND: payload,
+    }
+    return projection
+
+
 class _LockedGraph:
     """Wraps a compiled ``StateGraph`` with per-thread concurrency.
 
@@ -4800,6 +4922,27 @@ class _LockedGraph:
                     return value
         return None
 
+    def pending_checkpoint_projection(
+        self, thread_id: str
+    ) -> PendingCheckpointProjection:
+        """Read the pending-turn fields from one durable checkpoint snapshot.
+
+        A choice window is projected only with its original user message and
+        canonical run id. Read failures and malformed choice provenance are
+        typed so the workspace can return a fixed, non-sensitive response.
+        """
+        try:
+            snapshot = self._graph.get_state(
+                {"configurable": {"thread_id": thread_id}}
+            )
+            return _pending_checkpoint_projection(snapshot)
+        except PendingCheckpointProjectionError:
+            raise
+        except Exception as exc:
+            raise PendingCheckpointProjectionError(
+                "pending checkpoint projection is unavailable"
+            ) from exc
+
     def checkpoint_run_id(self, thread_id: str) -> str | None:
         """Return the canonical run id stored on the latest checkpoint.
 
@@ -4849,17 +4992,7 @@ class _LockedGraph:
         snapshot = self._graph.get_state(
             {"configurable": {"thread_id": thread_id}}
         )
-        messages = (snapshot.values or {}).get("messages") or []
-        for message in reversed(messages):
-            if not isinstance(message, HumanMessage):
-                continue
-            content = message.content
-            if isinstance(content, str):
-                text = content.strip()
-            else:
-                text = str(content).strip()
-            return text or None
-        return None
+        return _latest_human_text_from_snapshot(snapshot)
 
     def occupancy(self, thread_id: str) -> dict[str, float | int] | None:
         """T3 (ADR 0044): token occupancy for ``thread_id``'s latest
@@ -5163,6 +5296,7 @@ __all__ = [
     "ConcurrentRunError",
     "HostGraphError",
     "KnowledgeMCPFaultError",
+    "PendingCheckpointProjectionError",
     "RetrieveAdapterConfigError",
     "compile_graph",
     "analysis_from_tool_message",

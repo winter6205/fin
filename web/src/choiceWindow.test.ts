@@ -14,6 +14,7 @@ import {
   choiceOptionDisabled,
   hasPendingChoiceWindow,
   parseChoiceWindow,
+  threadHasPendingChoice,
 } from "./choiceWindow";
 import { useWorkspaceStore } from "./store";
 import type { ChoiceWindow, ThreadDetail, Turn } from "./types";
@@ -190,6 +191,36 @@ describe("choice option gating (pure, DOM-free)", () => {
     // A picked turn has its window cleared, not flagged.
     expect(hasPendingChoiceWindow([{ ...windowTurn(window), choice_window: undefined }])).toBe(false);
     expect(hasPendingChoiceWindow([])).toBe(false);
+  });
+
+  it("threadHasPendingChoice reads the reloaded case the turn table cannot", () => {
+    const pendingDetail: ThreadDetail = {
+      id: THREAD_ID,
+      title: "AAPL 10-Q",
+      created_at: "2026-01-01T00:00:00.000Z",
+      turns: [],
+      pending_turn: {
+        run_id: RUN_ID,
+        question: "营收多少？",
+        choice_window: parsedWindow(),
+      },
+    };
+    // The per-turn predicate is blind here: the paused run has no row.
+    expect(hasPendingChoiceWindow(pendingDetail.turns)).toBe(false);
+    expect(threadHasPendingChoice(pendingDetail)).toBe(true);
+  });
+
+  it("threadHasPendingChoice is false without a pending turn", () => {
+    const base: ThreadDetail = {
+      id: THREAD_ID,
+      title: "AAPL 10-Q",
+      created_at: "2026-01-01T00:00:00.000Z",
+      turns: [],
+    };
+    expect(threadHasPendingChoice(base)).toBe(false);
+    expect(threadHasPendingChoice({ ...base, pending_turn: null })).toBe(false);
+    expect(threadHasPendingChoice(null)).toBe(false);
+    expect(threadHasPendingChoice(undefined)).toBe(false);
   });
 });
 

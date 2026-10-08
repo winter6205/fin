@@ -6,9 +6,18 @@
 // second as the first (「对话不存在」 for a thread that was merely
 // refused), so these tests pin the decision, not just the copy.
 
-import { describe, expect, it } from "vitest";
-import { KnowledgeMcpFaultError } from "./api";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  getThread,
+  KnowledgeMcpFaultError,
+  PENDING_QUESTION_UNAVAILABLE_DETAIL,
+  PendingQuestionUnavailableError,
+} from "./api";
 import { classifyThreadOpenFailure, threadEntryView } from "./threadEntry";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe("classifyThreadOpenFailure", () => {
   it("reads the 知识 MCP gate as gated", () => {
@@ -24,6 +33,99 @@ describe("classifyThreadOpenFailure", () => {
     ["a non-error rejection", "nope"],
     ["no error at all", undefined],
   ])("treats %s as missing", (_label, error) => {
+    expect(classifyThreadOpenFailure(error)).toBe("missing");
+  });
+
+  it("reads the pending-question 503 as its own fault, not missing", () => {
+    expect(
+      classifyThreadOpenFailure(
+        new PendingQuestionUnavailableError(PENDING_QUESTION_UNAVAILABLE_DETAIL),
+      ),
+    ).toBe("pending_unavailable");
+  });
+});
+
+describe("openThread on a pending-question 503 (reload refusal)", () => {
+  function stubStatus(status: number, body: unknown): void {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify(body), {
+            status,
+            headers: { "content-type": "application/json" },
+          }),
+      ),
+    );
+  }
+
+  it("classifies GET /api/threads/{id} 503 as PendingQuestionUnavailableError", async () => {
+    stubStatus(503, { detail: PENDING_QUESTION_UNAVAILABLE_DETAIL });
+    const error = await getThread("t").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(PendingQuestionUnavailableError);
+    expect(classifyThreadOpenFailure(error)).toBe("pending_unavailable");
+    expect((error as Error).message).toBe(PENDING_QUESTION_UNAVAILABLE_DETAIL);
+  });
+
+  it("carries only the fixed retry copy, never checkpoint internals", async () => {
+    // A rogue / future host that put internals in the body must not have
+    // them echoed to the operator: the client carries its own fixed copy.
+    stubStatus(503, { detail: "CHECKPOINT-SECRET-SENTINEL" });
+    const error = await getThread("t").catch((e: unknown) => e);
+    expect((error as Error).message).toBe(PENDING_QUESTION_UNAVAILABLE_DETAIL);
+    expect((error as Error).message).not.toContain("SENTINEL");
+  });
+});
+
+// GET /api/threads/{id} has TWO unrelated 503 causes. Only the pending-
+// question projection failure answers the FastAPI ``{"detail": …}`` body;
+// a thread-store / run-list outage answers ``{"error":
+// "persistence_unavailable"}`` (pinned host-side at
+// src/fin/host/workspace_http.py). Before the pending-question branch
+// landed, the store outage fell through to a plain transport error and
+// the route rendered 「对话不存在」 — the store outage must keep exactly
+// that reading, NOT the live-thread 「待回答的问题读不出来」 claim.
+describe("openThread on a thread-store 503 (persistence outage)", () => {
+  function stubStatus(status: number, body: unknown): void {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify(body), {
+            status,
+            headers: { "content-type": "application/json" },
+          }),
+      ),
+    );
+  }
+
+  it("does NOT read the store outage as a pending-question refusal", async () => {
+    stubStatus(503, { error: "persistence_unavailable" });
+    const error = await getThread("t").catch((e: unknown) => e);
+    expect(error).not.toBeInstanceOf(PendingQuestionUnavailableError);
+    const fault = classifyThreadOpenFailure(error);
+    expect(fault).toBe("missing");
+    expect(
+      threadEntryView({ loading: false, fault, threadLoaded: false }),
+    ).toBe("missing");
+  });
+
+  it("keeps the pre-existing transport error for a non-pending 503", async () => {
+    stubStatus(503, { error: "persistence_unavailable" });
+    const error = await getThread("t").catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("503");
+    expect((error as Error).message).toContain("persistence_unavailable");
+  });
+
+  it("does not throw a parse error out of getThread on an unreadable body", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("not json at all", { status: 503 })),
+    );
+    const error = await getThread("t").catch((e: unknown) => e);
+    expect(error).not.toBeInstanceOf(PendingQuestionUnavailableError);
+    expect(error).toBeInstanceOf(Error);
     expect(classifyThreadOpenFailure(error)).toBe("missing");
   });
 });
@@ -83,5 +185,35 @@ describe("threadEntryView", () => {
     expect(
       threadEntryView({ loading: false, fault: "gated", threadLoaded: true }),
     ).toBe("gated");
+  });
+
+  it("shows the retry notice for a pending-question refusal, not not-found", () => {
+    expect(
+      threadEntryView({
+        loading: false,
+        fault: "pending_unavailable",
+        threadLoaded: false,
+      }),
+    ).toBe("pending_unavailable");
+  });
+
+  it("keeps the pending-question refusal ahead of a stale previous thread", () => {
+    expect(
+      threadEntryView({
+        loading: false,
+        fault: "pending_unavailable",
+        threadLoaded: false,
+      }),
+    ).not.toBe("missing");
+  });
+
+  it("does not flash the retry notice while the GET is still loading", () => {
+    expect(
+      threadEntryView({
+        loading: true,
+        fault: "pending_unavailable",
+        threadLoaded: false,
+      }),
+    ).toBe("loading");
   });
 });

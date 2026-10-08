@@ -31,14 +31,20 @@ const BASE_CHECK_IDS = [
 // a bounce would otherwise report a permanent FAIL for a check it was
 // never asked to run.
 const BOUNCE_CHECK_ID = "7-bounce-no-blank";
+const SCROLL_CHECK_ID = "7-stream-scroll-follow";
+const SCROLL_LIFECYCLE_CHECK_ID = "8-scroll-follow-lifecycle";
 
 /** Ids the runner must see a verdict for, given the same options the
  * check function is called with. An id declared here and missing from
  * the report is a failure, never a skip. */
 export function declaredCheckIds(options = {}) {
-  return options.expectBounce
-    ? [...BASE_CHECK_IDS, BOUNCE_CHECK_ID]
-    : [...BASE_CHECK_IDS];
+  return [
+    ...BASE_CHECK_IDS,
+    ...(options.requireStreamGrowth
+      ? [SCROLL_CHECK_ID, SCROLL_LIFECYCLE_CHECK_ID]
+      : []),
+    ...(options.expectBounce ? [BOUNCE_CHECK_ID] : []),
+  ];
 }
 
 export const CHECK_IDS = BASE_CHECK_IDS;
@@ -70,6 +76,7 @@ export default async function runStreamChecks(page, options = {}) {
   };
 
   const checks = [];
+  let scrollLifecycleCheck = null;
   const check = async (id, body) => {
     const startedAt = Date.now();
     try {
@@ -147,6 +154,86 @@ export default async function runStreamChecks(page, options = {}) {
     if ((await node.count()) === 0) return "";
     return ((await node.first().textContent()) ?? "").replace(/\s+/g, " ").trim();
   };
+
+  const activeScrollBox = () =>
+    page
+      .locator("main")
+      .last()
+      .locator("div.flex-1.overflow-y-auto")
+      .first();
+  const scrollMetrics = (box) =>
+    box.evaluate((el) => ({
+      clientHeight: el.clientHeight,
+      scrollHeight: el.scrollHeight,
+      scrollTop: el.scrollTop,
+      bottomGap: Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop),
+    }));
+  const sameScrollMetrics = (left, right) =>
+    !!left &&
+    !!right &&
+    left.clientHeight === right.clientHeight &&
+    left.scrollHeight === right.scrollHeight &&
+    left.scrollTop === right.scrollTop;
+  const scrollToBottom = async (box) => {
+    await box.hover();
+    await page.mouse.wheel(0, 10_000);
+    let metrics = await scrollMetrics(box);
+    for (let i = 0; i < 10 && metrics.bottomGap > 2; i++) {
+      await page.waitForTimeout(100);
+      metrics = await scrollMetrics(box);
+    }
+    return metrics;
+  };
+  const scrollUpForReading = async (box) => {
+    await box.hover();
+    await page.mouse.wheel(0, -10_000);
+    let metrics = await scrollMetrics(box);
+    for (let i = 0; i < 10 && metrics.bottomGap <= 10; i++) {
+      await page.waitForTimeout(100);
+      metrics = await scrollMetrics(box);
+    }
+    return metrics;
+  };
+  const nextAssistantGrowth = async (box, previousLength, doneCountBefore) => {
+    for (let i = 0; i < cfg.pollCount; i++) {
+      await page.waitForTimeout(Math.min(cfg.pollIntervalMs, 100));
+      const [length, metrics, doneCount] = await Promise.all([
+        readAssistantLen(),
+        scrollMetrics(box),
+        page.getByText("完成").count(),
+      ]);
+      const completed = doneCount > doneCountBefore;
+      if (length > previousLength || completed) {
+        return { length, metrics, completed };
+      }
+    }
+    return null;
+  };
+  const waitForMoreArticles = async (previousCount) => {
+    const deadline = Date.now() + cfg.navTimeoutMs;
+    let count = await page.locator("article").count();
+    while (count <= previousCount && Date.now() < deadline) {
+      await page.waitForTimeout(100);
+      count = await page.locator("article").count();
+    }
+    return count > previousCount;
+  };
+  const openNewThread = async (previousRoute) => {
+    await page.getByRole("button", { name: "+ 新建 thread" }).click();
+    await page.waitForURL((url) => url.toString() !== previousRoute, {
+      timeout: cfg.navTimeoutMs,
+    });
+    return page.url();
+  };
+  const readThreadInFlight = async (threadId) =>
+    page.evaluate(async ({ baseUrl, id }) => {
+      const response = await fetch(
+        `${baseUrl}/api/threads/${encodeURIComponent(id)}`,
+      );
+      if (!response.ok) return null;
+      const thread = await response.json();
+      return thread.in_flight === true;
+    }, { baseUrl: cfg.baseUrl, id: threadId });
 
   // specs/workbench-retrieve-product-seam.md SC6/SC7 retired the whole
   // corpus surface: ``/kb`` + its card grid + the ingest control left
@@ -279,6 +366,354 @@ export default async function runStreamChecks(page, options = {}) {
       },
     };
   });
+
+  // The paced lane samples actual streamed growth, so these checks can
+  // distinguish following from a transcript that arrives all at once.
+  if (cfg.requireStreamGrowth) {
+    const recordScrollGrowth = (result, sample) => {
+      const metrics = sample.metrics;
+      result.latestLength = sample.length;
+      result.growthSteps += 1;
+      result.maxScrollHeight = Math.max(result.maxScrollHeight, metrics.scrollHeight);
+      result.maxClientHeight = Math.max(result.maxClientHeight, metrics.clientHeight);
+      const phase = !result.paused
+        ? "bottom"
+        : result.reengaged
+          ? "reengaged"
+          : "reading-older";
+      result.growthSamples.push({
+        growth: result.growthSteps,
+        answerLength: sample.length,
+        ...metrics,
+        phase,
+      });
+      if (metrics.scrollHeight <= metrics.clientHeight + 20) return;
+      if (!result.paused) {
+        result.bottomSamples += 1;
+        if (metrics.bottomGap > 3) result.bottomFollowFailures += 1;
+      } else if (!result.reengaged) {
+        result.pausedGrowths += 1;
+        if (Math.abs(metrics.scrollTop - result.pausedAtTop) > 3) {
+          result.pausedScrollFailures += 1;
+        }
+      } else {
+        result.reengagedGrowths += 1;
+        if (metrics.bottomGap > 3) result.reengagedFollowFailures += 1;
+      }
+    };
+    const transitionScrollPhase = async (result, box) => {
+      if (result.growthSteps === 2) {
+        await scrollToBottom(box);
+        const reading = await scrollUpForReading(box);
+        result.pausedAtLength = result.latestLength;
+        result.pausedAtTop = reading.scrollTop;
+        result.pausedAtGap = reading.bottomGap;
+        result.paused = reading.bottomGap > 10;
+      }
+      if (result.growthSteps === 3) {
+        const resumed = await scrollToBottom(box);
+        result.reengaged = resumed.bottomGap <= 2;
+        result.reengagedAtGrowth = result.growthSteps;
+      }
+    };
+    const collectScrollFollow = async (box, initial, doneCountBefore) => {
+      const result = {
+        latestLength: 0,
+        growthSteps: 0,
+        bottomSamples: 0,
+        bottomFollowFailures: 0,
+        paused: false,
+        pausedAtLength: 0,
+        pausedAtTop: 0,
+        pausedAtGap: 0,
+        pausedGrowths: 0,
+        pausedScrollFailures: 0,
+        reengaged: false,
+        reengagedAtGrowth: 0,
+        reengagedGrowths: 0,
+        reengagedFollowFailures: 0,
+        maxScrollHeight: initial.scrollHeight,
+        maxClientHeight: initial.clientHeight,
+        streamCompleted: false,
+        growthSamples: [],
+      };
+      for (let i = 0; i < cfg.pollCount; i++) {
+        const sample = await nextAssistantGrowth(
+          box,
+          result.latestLength,
+          doneCountBefore,
+        );
+        if (!sample) break;
+        if (sample.length > result.latestLength) {
+          recordScrollGrowth(result, sample);
+          await transitionScrollPhase(result, box);
+        }
+        if (sample.completed) {
+          result.streamCompleted = result.latestLength > 0;
+          break;
+        }
+      }
+      return result;
+    };
+    const scrollFollowVerdict = (initial, articleAppeared, result, errorCount) => {
+      const actualOverflow =
+        result.maxScrollHeight > result.maxClientHeight + 20;
+      const invariants = {
+        actualOverflow,
+        assistantMessageAppeared: articleAppeared,
+        wasAtBottomBeforeSend: initial.bottomGap <= 2,
+        observedMultipleGrowthSteps: result.growthSteps >= 4,
+        stayedAtBottomDuringGrowth:
+          result.bottomSamples >= 2 && result.bottomFollowFailures === 0,
+        manualScrollMovedAwayFromBottom:
+          result.paused && result.pausedAtGap > 10,
+        stayedAtReadingPositionDuringGrowth:
+          result.pausedGrowths >= 1 && result.pausedScrollFailures === 0,
+        reengagedAtBottom: result.reengaged,
+        followedAfterReengaging:
+          result.reengagedGrowths >= 1 &&
+          result.reengagedFollowFailures === 0,
+        streamCompleted: result.streamCompleted,
+        noPageErrors: errorCount === 0,
+      };
+      return {
+        pass: Object.values(invariants).every(Boolean),
+        detail: {
+          invariants,
+          initial,
+          maxScrollHeight: result.maxScrollHeight,
+          maxClientHeight: result.maxClientHeight,
+          growthSteps: result.growthSteps,
+          bottomSamples: result.bottomSamples,
+          bottomFollowFailures: result.bottomFollowFailures,
+          pausedAtLength: result.pausedAtLength,
+          pausedAtTop: result.pausedAtTop,
+          pausedAtGap: result.pausedAtGap,
+          pausedGrowths: result.pausedGrowths,
+          pausedScrollFailures: result.pausedScrollFailures,
+          reengagedAtGrowth: result.reengagedAtGrowth,
+          reengagedGrowths: result.reengagedGrowths,
+          reengagedFollowFailures: result.reengagedFollowFailures,
+          growthSamples: result.growthSamples,
+          pageErrors: errorCount,
+        },
+      };
+    };
+    const recordLifecycleGrowth = (state, sample) => {
+      if (sample.length <= state.latestLength) return;
+      state.latestLength = sample.length;
+      state.growthSteps += 1;
+      const { scrollHeight, clientHeight, bottomGap } = sample.metrics;
+      state.maxScrollHeight = Math.max(state.maxScrollHeight, scrollHeight);
+      state.maxClientHeight = Math.max(state.maxClientHeight, clientHeight);
+      if (scrollHeight <= clientHeight + 20) return;
+      state.overflowSamples += 1;
+      if (bottomGap > 3) state.followFailures += 1;
+    };
+
+    const startLifecycleStream = async (route) => {
+      if (!route) throw new Error("page.url() is required for scroll lifecycle coverage");
+      await page.setViewportSize({ width: 1280, height: 320 });
+      await page.goto(route, { timeout: cfg.navTimeoutMs });
+      await page.waitForSelector("article", { timeout: cfg.navTimeoutMs });
+      const previousRoute = page.url();
+      const previousBox = activeScrollBox();
+      await scrollToBottom(previousBox);
+      const reading = await scrollUpForReading(previousBox);
+      const streamingRoute = await openNewThread(previousRoute);
+      const threadId = streamingRoute.slice(`${cfg.baseUrl}/t/`.length);
+      await fillAndArm(cfg.question);
+      const box = activeScrollBox();
+      const emptyThread = await scrollMetrics(box);
+      const articleCountBefore = await page.locator("article").count();
+      const doneCountBefore = await page.getByText("完成").count();
+      await sendButton().click();
+      const articleAppeared = await waitForMoreArticles(articleCountBefore);
+      const state = {
+        latestLength: 0,
+        growthSteps: 0,
+        overflowSamples: 0,
+        followFailures: 0,
+        maxScrollHeight: emptyThread.scrollHeight,
+        maxClientHeight: emptyThread.clientHeight,
+      };
+      let inFlight = null;
+      for (let i = 0; i < cfg.pollCount; i++) {
+        const sample = await nextAssistantGrowth(
+          box,
+          state.latestLength,
+          doneCountBefore,
+        );
+        if (!sample) break;
+        recordLifecycleGrowth(state, sample);
+        inFlight = await readThreadInFlight(threadId);
+        if (
+          state.growthSteps >= 2 &&
+          state.overflowSamples >= 2 &&
+          inFlight === true
+        ) break;
+        if (sample.completed) break;
+      }
+      return {
+        previousThreadPaused: reading.bottomGap > 10,
+        emptyThread,
+        streamingRoute,
+        threadId,
+        box,
+        articleAppeared,
+        ...state,
+        pendingAtResize: state.growthSteps >= 2 && inFlight === true,
+      };
+    };
+
+    const resizeAndNavigateLifecycleStream = async (stream) => {
+      const viewportBeforeResize = await scrollMetrics(stream.box);
+      const oldScroller = await stream.box.elementHandle();
+      await page.setViewportSize({ width: 1280, height: 400 });
+      const pendingAfterResize = await readThreadInFlight(stream.threadId);
+      const viewportAtResize = await oldScroller.evaluate((el) => ({
+        connected: el.isConnected,
+        clientHeight: el.clientHeight,
+        scrollHeight: el.scrollHeight,
+        scrollTop: el.scrollTop,
+      }));
+      const replacementRoute = await openNewThread(stream.streamingRoute);
+      await fillAndArm(cfg.question);
+      const replacementBox = activeScrollBox();
+      const replacementInitial = await scrollMetrics(replacementBox);
+      const detachedBaseline = await oldScroller.evaluate((el) => ({
+        connected: el.isConnected,
+        scrollTop: el.scrollTop,
+      }));
+      let detachedLatest = detachedBaseline;
+      let replacementCurrent = replacementInitial;
+      let oldStreamSettled = false;
+      let replacementChanged = false;
+      for (let i = 0; i < cfg.pollCount; i++) {
+        const [inFlight, detached, replacement] = await Promise.all([
+          readThreadInFlight(stream.threadId),
+          oldScroller.evaluate((el) => ({
+            connected: el.isConnected,
+            scrollTop: el.scrollTop,
+          })),
+          scrollMetrics(replacementBox),
+        ]);
+        detachedLatest = detached;
+        replacementCurrent = replacement;
+        if (!sameScrollMetrics(replacementInitial, replacement)) {
+          replacementChanged = true;
+        }
+        if (inFlight === false) {
+          oldStreamSettled = true;
+          break;
+        }
+        await page.waitForTimeout(Math.min(cfg.pollIntervalMs, 100));
+      }
+      return {
+        viewportBeforeResize,
+        viewportAtResize,
+        pendingAfterResize,
+        replacementRoute,
+        replacementInitial,
+        replacementCurrent,
+        replacementChanged,
+        detachedBaseline,
+        detachedLatest,
+        oldStreamSettled,
+      };
+    };
+    const lifecycleVerdict = (stream, cleanup, errorCount) => {
+      const detachedScrollStable =
+        cleanup.detachedBaseline.connected === false &&
+        cleanup.detachedLatest.connected === false &&
+        cleanup.detachedBaseline.scrollTop === cleanup.detachedLatest.scrollTop;
+      const invariants = {
+        previousThreadWasDeliberatelyPaused: stream.previousThreadPaused,
+        freshThreadStartedAtBottom: stream.emptyThread.bottomGap <= 2,
+        assistantMessageAppeared: stream.articleAppeared,
+        freshThreadHadActualOverflow:
+          stream.maxScrollHeight > stream.maxClientHeight + 20,
+        freshThreadObservedOngoingGrowth: stream.growthSteps >= 2,
+        freshThreadFollowedWhileAtBottom:
+          stream.overflowSamples >= 2 && stream.followFailures === 0,
+        resizedMountedScrollerWhileStreamWasPending:
+          stream.pendingAtResize &&
+          cleanup.pendingAfterResize &&
+          cleanup.viewportAtResize.connected &&
+          cleanup.viewportAtResize.clientHeight !==
+            cleanup.viewportBeforeResize.clientHeight,
+        navigatedWhileStreamWasPending:
+          stream.pendingAtResize &&
+          cleanup.replacementRoute !== stream.streamingRoute,
+        detachedScrollerStayedAtPostDetachPosition: detachedScrollStable,
+        replacementViewportWasNotMutated:
+          !cleanup.replacementChanged &&
+          sameScrollMetrics(cleanup.replacementInitial, cleanup.replacementCurrent),
+        oldStreamSettledAfterNavigation: cleanup.oldStreamSettled,
+        noPageErrors: errorCount === 0,
+      };
+      return {
+        pass: Object.values(invariants).every(Boolean),
+        detail: {
+          invariants,
+          emptyThread: stream.emptyThread,
+          growthSteps: stream.growthSteps,
+          overflowSamples: stream.overflowSamples,
+          followFailures: stream.followFailures,
+          pendingAtResize: stream.pendingAtResize,
+          viewportBeforeResize: cleanup.viewportBeforeResize,
+          pendingAfterResize: cleanup.pendingAfterResize,
+          viewportAtResize: cleanup.viewportAtResize,
+          detachedBaseline: cleanup.detachedBaseline,
+          detachedLatest: cleanup.detachedLatest,
+          replacementInitial: cleanup.replacementInitial,
+          replacementCurrent: cleanup.replacementCurrent,
+          replacementChanged: cleanup.replacementChanged,
+          oldStreamSettled: cleanup.oldStreamSettled,
+          pageErrors: errorCount,
+        },
+      };
+    };
+
+    await check("7-stream-scroll-follow", async () => {
+      const originalWidth = 1280;
+      const originalHeight = 720;
+      const pageErrors = [];
+      const onPageError = () => pageErrors.push(true);
+      page.on("pageerror", onPageError);
+      try {
+        await page.setViewportSize({ width: originalWidth, height: 320 });
+        const box = activeScrollBox();
+        const initial = await scrollToBottom(box);
+        const articleCountBefore = await page.locator("article").count();
+        const doneCountBefore = await page.getByText("完成").count();
+        await fillAndArm(cfg.question);
+        await sendButton().click();
+        const articleAppeared = await waitForMoreArticles(articleCountBefore);
+        const result = await collectScrollFollow(box, initial, doneCountBefore);
+        return scrollFollowVerdict(initial, articleAppeared, result, pageErrors.length);
+      } finally {
+        page.off("pageerror", onPageError);
+        await page.setViewportSize({ width: originalWidth, height: originalHeight });
+      }
+    });
+
+    const lifecycleRoute =
+      typeof page.url === "function" ? page.url() : null;
+    scrollLifecycleCheck = async () => {
+      const pageErrors = [];
+      const onPageError = () => pageErrors.push(true);
+      page.on("pageerror", onPageError);
+      try {
+        const stream = await startLifecycleStream(lifecycleRoute);
+        const cleanup = await resizeAndNavigateLifecycleStream(stream);
+        return lifecycleVerdict(stream, cleanup, pageErrors.length);
+      } finally {
+        page.off("pageerror", onPageError);
+        await page.setViewportSize({ width: 1280, height: 720 });
+      }
+    };
+  }
 
   await check("4-dom-separation", async () => {
     const domSeparation = await page
@@ -626,6 +1061,10 @@ export default async function runStreamChecks(page, options = {}) {
       },
     };
   });
+
+  if (scrollLifecycleCheck) {
+    await check("8-scroll-follow-lifecycle", scrollLifecycleCheck);
+  }
 
   // T3: the hidden bounce marker arms the generator's pending reset;
   // the retry's first non-empty delta carries `reset: true` in the
