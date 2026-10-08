@@ -61,8 +61,10 @@ from fin.corpus.push import body_content_id as _body_content_id
 from fin.host.compile import DEFAULT_MCP_COMMAND
 from fin.retrieve.input_validation import InputValidationLedger
 from fin.retrieve.mcp_session import (
+    DEFAULT_MCP_TIMEOUT_SECONDS,
     MCPStdioProtocolError,
     MCPStdioSession,
+    default_mcp_timeout_seconds,
     build_handshake_wire,
     build_tools_call_frame,
     parse_jsonrpc_response_lines,
@@ -343,8 +345,17 @@ class MCPPushPort:
         caller sees a typed ``PushServiceUnavailableError`` rather than
         a silent fall-through.
     timeout_seconds
-        Per-call timeout on the JSON-RPC exchange. Default 5s (operator
-        override via constructor).
+        Per-call timeout on the JSON-RPC exchange. Default 60s (operator
+        override via constructor, or ``FIN_MCP_TIMEOUT_SECONDS``).
+
+        WHY 60 and not 5: a push is the only MCP call that does real work
+        before it answers — the receiving side embeds every chunk and
+        writes the rows. Measured against the live server on a
+        single-chunk push, the full exchange takes ~11s (handshake 0.8s +
+        embed + storage write), so the previous 5s ceiling could not
+        distinguish "slow" from "impossible" and reported every push as
+        ``PushServiceUnavailableError`` / ``TimeoutError``. The budget has
+        to clear the real cost of the work or the typed failure lies.
     ledger
         Where invalid-input refusals (e.g. :class:`PushEmptyBatchError`)
         are counted (T21 / SC42). ``None`` (the default) means an
@@ -356,12 +367,22 @@ class MCPPushPort:
         self,
         command: Sequence[str] | None = DEFAULT_MCP_COMMAND,
         *,
-        timeout_seconds: float = 5.0,
+        timeout_seconds: float | None = None,
         ledger: InputValidationLedger | None = None,
         session: MCPStdioSession | None = None,
     ) -> None:
         self._command: list[str] | None = list(command) if command else None
-        self._timeout: float = float(timeout_seconds)
+        # `None` means "no operator choice", which resolves to the env-aware
+        # budget rather than to a fixed literal — the port is constructed
+        # with no arguments in production, so this is the only seam where
+        # FIN_MCP_TIMEOUT_SECONDS can be honoured. Resolved at construction,
+        # like every other port that takes this budget, so a process that
+        # sets the env after import still gets it honoured.
+        self._timeout: float = float(
+            timeout_seconds
+            if timeout_seconds is not None
+            else default_mcp_timeout_seconds()
+        )
         self._ledger: InputValidationLedger | None = ledger
         self._session = session
         # ``(source_ref, body_content_id)`` membership set for envelopes

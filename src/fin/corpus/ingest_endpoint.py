@@ -71,6 +71,7 @@ never reads the environment and never imports FastAPI.
 from __future__ import annotations
 
 import hashlib
+import re
 import threading
 from collections import Counter
 from dataclasses import dataclass, field
@@ -471,6 +472,69 @@ def resolve_document_id(
         "and period are required (e.g. company='aapl', period='2022q3' -> "
         "'AAPL-2022Q3')"
     )
+
+
+# The fiscal label half of a derived ``{TICKER}-{PERIOD}`` id: four
+# digits then either a quarter digit or the fiscal-year marker. Anchored so
+# a longer string that merely starts with a period is not accepted.
+_DERIVED_IDENTITY_RE = re.compile(r"[0-9]{4}(Q[1-4]|FY)")
+
+
+def split_company_period_from_document_id(
+    document_id: str,
+) -> tuple[str | None, str | None]:
+    """Recover ``(company, period)`` from a derived ``{TICKER}-{PERIOD}`` id.
+
+    WHY this exists: the catalog row contract is
+    ``{document_id, company, period, version, page_count}`` and
+    ``company`` is required non-empty, but the DURABLE path accepted an
+    upload without persisting company/period anywhere — the job record and
+    the object pointer both lack the columns. The worker therefore reached
+    the catalog hook with ``company=None`` and every DERIVED-identity
+    upload failed registration with ``CatalogRowError``, leaving the
+    pushed data invisible to search even though the push itself succeeded.
+    That is the whole product path: the corpus door and the SPA behind it
+    send ``company`` + ``period`` and never an explicit id
+    (``web/src/api.ts`` ``ingestCorpus``).
+
+    Splitting the identity back apart is the smallest fix that needs no
+    schema migration and no second source of truth: the id is DERIVED from
+    company+period by :func:`resolve_document_id`, so the pair is already
+    encoded in it, and re-deriving reads that encoding rather than
+    inventing state.
+
+    Returns ``(None, None)`` for any id that is not recognizably a
+    ``{TICKER}-{PERIOD}`` pair, because guessing a company out of an opaque
+    string would put a wrong ticker in the catalog — a wrong company is
+    worse than an absent one, since the filing then becomes searchable
+    under a name that does not own it. The shape test is therefore on BOTH
+    halves: the ticker must be all-uppercase-alphanumeric (a filing's
+    ticker is), and the period must be a fiscal label (``2022Q3`` /
+    ``2023FY``). An SEC accession id like ``0000320193-24-000006`` fails
+    the ticker test rather than being read as company ``0000320193``.
+
+    KNOWN LIMIT — the explicit-``document_id`` branch of
+    ``specs/corpus-serve-ingest.md`` Decision 1.1 (an EDGAR accession
+    with company/period as metadata only) is NOT served here: that id
+    carries no ``{TICKER}-{PERIOD}`` encoding, and the accept path
+    discards the supplied pair, so the worker has nothing to fall back
+    on. Serving it needs the pair persisted at accept (a
+    ``fin_ingest_job`` / ``fin_corpus_object_pointer`` column) — a
+    migration this fix deliberately does not carry. Until then such a
+    filing is pushed and, like before this fix, not catalog-visible.
+    """
+    ticker, separator, period = document_id.partition("-")
+    if not separator:
+        return None, None
+    ticker = ticker.strip()
+    period = period.strip()
+    if not ticker or not period:
+        return None, None
+    if not ticker.isalnum() or ticker != ticker.upper():
+        return None, None
+    if _DERIVED_IDENTITY_RE.fullmatch(period) is None:
+        return None, None
+    return ticker, period
 
 
 def _split(
@@ -1316,10 +1380,22 @@ class IngestEndpoint:
         The authoritative push identities are completed before the
         ``cataloging -> ready`` edge carries the job to ``ready``.
         """
+        # The durable accept persisted the bytes and the identity but not
+        # company/period (no columns exist for them), so they are recovered
+        # from the id `resolve_document_id` derived from them. Without this
+        # the catalog hook receives company=None and every DERIVED-identity
+        # upload is pushed-but-invisible: searchable in the store, absent
+        # from fin's own catalog. The explicit-id branch of Decision 1.1 is
+        # not served here — see the splitter's KNOWN LIMIT.
+        recovered_company, recovered_period = (
+            split_company_period_from_document_id(document_id)
+        )
         result = self.ingest(
             data,
             declared_format=declared_format,
             document_id=document_id,
+            company=recovered_company,
+            period=recovered_period,
             journal=journal,
         )
         identities = self._complete_content_identities(result)

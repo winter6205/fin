@@ -6,9 +6,9 @@ delivery details remain historical context and are not the current structured-
 search contract. ADRs 0091–0093 continue to govern existing database-row evidence
 until a replacement SPEC explicitly decides otherwise. Runtime behavior remains
 unchanged pending that SPEC and implementation; this status update does not waive
-any the tracked change acceptance obligation.
+any pending acceptance obligation.
 
-Refs: the tracked change (`plans/post321-real-sql.md` A1), `specs/search-mode-retrieve.md`,
+Refs: A1, `specs/search-mode-retrieve.md`,
 `specs/search-mode-lexical-sql-tokens.md`, `docs/adr/0046`, `docs/adr/0021`,
 `docs/adr/0059`, `docs/adr/0087`, `docs/adr/0090`.
 
@@ -321,7 +321,7 @@ the parser gap makes `compare_facts` fully functional, which makes a
 filings-sourced SQL 档 *more* redundant, not less. Shipping the parser and then
 opening the SQL 档 on the same corpus would be building the redundant thing.
 This is a recommendation about sequencing across tickets, not a ruling inside
-the tracked change.
+the upstream producer's scope.
 
 ## 4. Settled: ownership and module placement
 
@@ -477,7 +477,7 @@ credentials fin holds.
 | rows returned | 20 | `_LIMIT_CAP` (`src/fin/retrieve/mcp_adapter.py:159`) — no 档 ships a 21st row |
 | rows fetched | 21 | *new* — fetch one past the cap so truncation is observable rather than silent; no existing precedent, by design |
 | result bytes | 32 768 | ADR 0088:8 — "caps text at 8,000 code points and serialized output at 32 KiB"; `src/fin/retrieve/source_read.py:35`, `read_source.ts:54` |
-| `statement_timeout` | 3 s | must be < the 5 s MCP timeout so the *server* answers first with a typed error |
+| `statement_timeout` | 3 s | must be < the MCP per-call budget so the *server* answers first with a typed error. That budget is `DEFAULT_MCP_TIMEOUT_SECONDS` = 60 s (`src/fin/retrieve/mcp_session.py`), raised from 5 s: a measured live push takes ~11 s, so the old 5 s ceiling reported every real push as a transport timeout instead of a result. The ordering this row protects is unchanged (3 s < 60 s). |
 | connect timeout | 2 s | `CONNECT_TIMEOUT_SECONDS` (`src/fin/host/health.py:63`) |
 | `lock_timeout` | 1 s | a read blocked behind a writer must not eat the statement budget |
 

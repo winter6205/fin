@@ -1305,3 +1305,147 @@ def test_reingesting_the_same_bytes_reports_the_same_identities() -> None:
 
     assert second.written == 0
     assert second.content_identities == first.content_identities
+
+
+# ----- recovering company/period for the catalog row (durable path) -----
+#
+# The catalog row contract is {document_id, company, period, version,
+# page_count} and `company` is required non-empty, but the DURABLE accept
+# persisted neither company nor period: `fin_ingest_job` and
+# `fin_corpus_object_pointer` have no columns for them, and
+# `submit_durable` unpacked the validated pair into `_company` /
+# `_period`. The worker therefore drove `ingest()` with no company, the
+# catalog hook received company=None, and EVERY uploaded filing failed
+# registration with CatalogRowError — the data was pushed and searchable in
+# iknow-memory but invisible to fin's own catalog.
+
+
+def test_a_derived_identity_recovers_its_company_and_period() -> None:
+    from fin.corpus.ingest_endpoint import (
+        split_company_period_from_document_id as split_id,
+    )
+
+    assert split_id("MSFT-2023Q1") == ("MSFT", "2023Q1")
+    assert split_id("GOOG-2023FY") == ("GOOG", "2023FY")
+
+
+@pytest.mark.parametrize(
+    "document_id",
+    [
+        # An SEC accession is not a {TICKER}-{PERIOD} pair; reading it as one
+        # would file AAPL's 10-Q under company "0000320193".
+        "0000320193-24-000006",
+        # A caller may pass ANY verbatim id, so an opaque one must not be
+        # guessed at — a wrong company is searchable under a name that does
+        # not own the filing, which is worse than an absent one.
+        "explicit-id-no-dash",
+        "",
+        "AAPL-",           # no period half
+        "-2022Q3",         # no ticker half
+        "aapl-2022Q3",     # lower-case ticker: ids are upper-cased at derive
+        "AAPL-2022Q3-EXTRA",  # trailing content is not a fiscal label
+    ],
+)
+def test_an_unrecognised_identity_yields_no_company(document_id: str) -> None:
+    from fin.corpus.ingest_endpoint import (
+        split_company_period_from_document_id as split_id,
+    )
+
+    assert split_id(document_id) == (None, None)
+
+
+def test_the_durable_run_hands_the_catalog_hook_a_company(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """The end-to-end claim: the recovered pair reaches `record_filings`.
+
+    Driven through the REAL durable landing — ``submit_durable`` then
+    ``run_durable`` — so the assertion is on what the catalog hook is
+    actually handed by the worker. A test that called ``ingest()`` with an
+    already-split pair would stay green if the recovery in
+    ``_complete_and_land`` were deleted, which is exactly the regression
+    this fix exists to prevent.
+
+    The catalog is redirected to ``tmp_path`` so the run leaves the
+    committed ``data/corpus/catalog.json`` untouched.
+    """
+    from pathlib import Path
+
+    import fin.corpus.catalog as catalog_mod
+    from fin.corpus.ingest_endpoint import IngestEndpoint
+    from fin.corpus.ingest_storage import _local_ports
+
+    pdf = Path(__file__).resolve().parents[2] / "data/corpus/pdf/2023_Q1_MSFT.pdf"
+    if not pdf.exists():  # pragma: no cover - corpus fixture is optional
+        pytest.skip("corpus PDF not present")
+
+    catalog_path = Path(tmp_path) / "catalog.json"
+    catalog_path.write_text('{"filings": []}', encoding="utf-8")
+    monkeypatch.setattr(catalog_mod, "DEFAULT_CATALOG_PATH", catalog_path)
+
+    seen: dict[str, object] = {}
+
+    # Deliberately stricter than the production hook
+    # (``workspace_http._record_ingested_filing``), which swallows the
+    # failure and answers 200 with a ``catalog_warning``. Letting it raise
+    # here means a lost company lands the job on ``failed`` — a red test
+    # rather than a silently invisible filing.
+    def hook(doc: object) -> None:
+        seen.update(
+            document_id=doc.document_id,
+            company=doc.company,
+            period=doc.period,
+        )
+        catalog_mod.record_filings(
+            [
+                {
+                    "document_id": doc.document_id,
+                    "company": doc.company,
+                    "period": doc.period,
+                    "version": doc.version,
+                    "page_count": doc.page_count,
+                }
+            ]
+        )
+
+    class RecordingPort:
+        def push(self, envelopes):
+            # The push contract counts one block id per CHUNK.
+            n = sum(len(e.get("chunks") or []) for e in envelopes)
+            return {
+                "written": n,
+                "duplicates": 0,
+                "block_ids": [f"c{i}" for i in range(n)],
+                "content_identities": {},
+                "records": [],
+            }
+
+    ports = _local_ports()
+    endpoint = IngestEndpoint(
+        push_port=RecordingPort(),
+        invalidation_port=type(
+            "I", (), {"invalidate": staticmethod(lambda *a, **k: None)}
+        )(),
+        object_store=ports.objects,
+        metadata_store=ports.pointers,
+        state_store=ports.states,
+        on_ingested=hook,
+    )
+
+    # No company / period is supplied anywhere on this path: the worker has
+    # only the document id, exactly as in production.
+    accepted = endpoint.submit_durable(
+        pdf.read_bytes(),
+        document_id="MSFT-2023Q1",
+        declared_format="pdf",
+    )
+    outcome = endpoint.run_durable(accepted.document_id)
+
+    assert outcome.state.value == "ready"
+    assert seen["document_id"] == "MSFT-2023Q1"
+    assert seen["company"] == "MSFT"
+    assert seen["period"] == "2023Q1"
+    # And the row really landed in the catalog, so the fix is not merely a
+    # value passed to a hook that silently drops it.
+    assert catalog_mod.list_filings(company="MSFT")

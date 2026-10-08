@@ -781,3 +781,85 @@ def test_push_never_sends_an_identity_field_on_the_wire() -> None:
         assert set(item) <= _IKNOW_PUSH_ITEM_KEYS, item
         assert "content_identity" not in item
         assert "body_content_id" not in item
+
+
+# ----- the push budget (FIN_MCP_TIMEOUT_SECONDS) -----
+#
+# A push is the only MCP call that does real work before it answers: the
+# receiving side embeds every chunk and writes the rows. Measured against
+# the live server, one push took ~11s end to end, so the previous 5s
+# ceiling could never succeed and reported every push as a timeout. These
+# tests pin the RESOLUTION of that budget, which is the part that can
+# silently regress — the number itself is a measured fact, not a style.
+
+
+# The slowest observed live push, in seconds, from the timing experiment
+# that replaced the 5s ceiling: the same document answered in 11.02s with a
+# 30s budget and 11.05s with a 120s one, i.e. ~11s is the real cost of the
+# work and the budget above it is not what the number costs.
+_MEASURED_PUSH_SECONDS = 11.05
+
+
+def test_default_budget_clears_a_measured_push() -> None:
+    """The floor must exceed the measured cost of one real push.
+
+    Asserted against the measurement rather than against the shipped 60,
+    so lowering the default fails here and names why — instead of the
+    failure surfacing only as a production timeout. The shipped value is
+    pinned separately so the two cannot be confused: this test says the
+    budget must clear the work, that one says what it currently is.
+    """
+    from fin.retrieve.mcp_push_port import DEFAULT_MCP_TIMEOUT_SECONDS
+
+    assert DEFAULT_MCP_TIMEOUT_SECONDS > _MEASURED_PUSH_SECONDS
+
+
+def test_the_shipped_budget_is_the_documented_value() -> None:
+    """The number itself: 60s, as recorded in the owning spec.
+
+    `specs/corpus-serve-ingest.md` ("MCP per-call budget") and
+    `specs/search-mode-business-sql-contract.md` §6 both name 60 s, so a
+    change here is a change to a settled limit and must be a deliberate
+    spec amendment, not a quiet edit.
+    """
+    from fin.retrieve.mcp_push_port import DEFAULT_MCP_TIMEOUT_SECONDS
+
+    assert DEFAULT_MCP_TIMEOUT_SECONDS == 60.0
+
+
+def test_port_resolves_the_env_budget_when_constructed_with_no_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production builds ``MCPPushPort()`` with NO arguments, so this is
+    the only seam where an operator override can take effect."""
+    monkeypatch.setenv("FIN_MCP_TIMEOUT_SECONDS", "90")
+    assert MCPPushPort()._timeout == 90.0
+
+
+def test_an_explicit_constructor_argument_beats_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller that names a budget owns it; the env is a default, not an
+    override of an explicit choice."""
+    monkeypatch.setenv("FIN_MCP_TIMEOUT_SECONDS", "90")
+    assert MCPPushPort(timeout_seconds=12.0)._timeout == 12.0
+
+
+@pytest.mark.parametrize("raw", ["abc", "", "0", "-5", "nan", "inf", "-inf"])
+def test_an_unusable_env_value_falls_back_instead_of_raising(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    from fin.retrieve.mcp_push_port import DEFAULT_MCP_TIMEOUT_SECONDS
+    """A typo in an operator's `.env` must not take the ingest door down;
+    the port degrades to the default budget, and the caller still sees the
+    same typed PushServiceUnavailableError it already handles if the
+    budget was genuinely too small.
+
+    ``nan`` and ``inf`` are here because they parse as floats and pass a
+    bare ``> 0`` test: ``nan <= 0`` is False and ``inf > 0`` is True, so
+    without an explicit finiteness check they would reach
+    ``asyncio.wait_for(timeout=nan)`` (undefined behaviour) or silently
+    remove the ceiling this budget exists to provide.
+    """
+    monkeypatch.setenv("FIN_MCP_TIMEOUT_SECONDS", raw)
+    assert MCPPushPort()._timeout == DEFAULT_MCP_TIMEOUT_SECONDS

@@ -45,6 +45,7 @@ from fin.retrieve.index_job_port import (
 from fin.retrieve.mcp_session import (
     MCPStdioProtocolError,
     MCPStdioSession,
+    default_mcp_timeout_seconds,
     build_handshake_wire,
     build_tools_call_frame,
     parse_jsonrpc_response_lines,
@@ -89,11 +90,19 @@ class MCPIndexJobPort:
         self,
         command: Sequence[str] | None = DEFAULT_MCP_COMMAND,
         *,
-        timeout_seconds: float = 5.0,
+        timeout_seconds: float | None = None,
         session: MCPStdioSession | None = None,
     ) -> None:
         self._command: list[str] | None = list(command) if command else None
-        self._timeout = float(timeout_seconds)
+        # Shares the push port's budget: `submit_index_job` hands real work
+        # to the same MCP server (the graph re-index), so a 5s ceiling fails
+        # it for the same reason it failed every push — measured, not
+        # assumed. `None` resolves the env-aware default.
+        self._timeout = float(
+            timeout_seconds
+            if timeout_seconds is not None
+            else default_mcp_timeout_seconds()
+        )
         self._session = session
 
     # ----- IndexJobPort surface -----

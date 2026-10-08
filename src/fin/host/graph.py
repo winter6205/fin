@@ -3083,7 +3083,10 @@ def compile_graph(
                 command=mcp_command or ["iknow-memory"],  # 兜底非契约
                 locator_map=locator_map or {},
                 known_document_ids=known_document_ids,
-                timeout_seconds=5.0,
+                # No explicit budget: the adapter resolves the shared
+                # transport default, which is sized against measured work.
+                # Pinning 5.0 here is what made this the one call site the
+                # adapter's own default could not govern.
                 mapping_ledger=mapping_failure_ledger,
             )
 
