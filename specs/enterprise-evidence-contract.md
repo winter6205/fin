@@ -1,31 +1,28 @@
 # Spec: enterprise evidence contract (E1 contract freeze)
 
-> **Status:** E1 decision record — issue #334 step E1. This file freezes the
+> **Status:** E1 decision record. This file freezes the
 > shared evidence representation, versioning policy, per-profile payload rules,
 > bounds, producer/consumer fixture handoff, and legacy policy. E2–E6 implement
 > against it; nothing here claims a producer or validator already conforms.
-> **Refs:** `plans/post321-evidence-schema-route.md`, issue #334, issue #322,
-> `specs/search-mode-business-sql-contract.md` (PR #331 branch — the frozen
-> database-row facts: §6 limits, §7 failure taxonomy, §8/§8.0 row shape),
-> ADR 0021, 0046, 0088, 0089, 0090, 0091, 0093, and the implemented wire shape in
-> commit `d2c3aa0`.
+> **Refs:** `plans/post321-evidence-schema-route.md`,
+> `specs/search-mode-business-sql-contract.md` (database-row constraints in
+> §§6–8), and ADR 0021, 0046, 0088, 0089, 0090, 0091, 0093.
 > **Ownership:** fin owns this contract, its validators, and its fixtures.
-> iknow-memory (#322) owns the SQL producer and must conform to the consumer
-> contract frozen here; fin does not implement the producer or duplicate source
-> mapping.
+> `iknow-memory` owns the SQL producer and must conform to this consumer
+> contract; fin does not implement that producer or duplicate source mapping.
 
 ## 1. Kind vocabulary (decision)
 
 The discriminator is the existing `kind` string. No parallel vocabulary is
 invented; renaming `company` / `attachment` would force a rewrite of every row
 already stored in `fin_run.citations`, which is a migration nothing in Session
-E can do (same constraint `d2c3aa0` records). Frozen closed sets — a kind
+E can do (the existing constraint). Frozen closed sets — a kind
 outside the set for its channel is an `unsupported_evidence_contract` refusal,
 never a default (ADR 0091 consequence):
 
 | Channel | `kind` values | Notes |
 |---|---|---|
-| `citations[]` (quote channel) | `company`, `attachment`, `database-row` | exactly `QUOTABLE_EVIDENCE_KINDS` as shipped in `d2c3aa0` |
+| `citations[]` (quote channel) | `company`, `attachment`, `database-row` | exactly `QUOTABLE_EVIDENCE_KINDS` as shipped |
 | `visual_claims[]` | `visual_observation` | its own typed lane (ADR 0089); never enters `citations[]` |
 | `business_fields[]` | `business_field` | **reserved lane**, §4.5; no producer and no validator exists yet |
 | `comparison` frame | (no `kind` lane; envelope `schema` discriminates) | financial-fact profile, §4.3 — not a citation kind |
@@ -64,7 +61,7 @@ rename of shipped strings.
    (§2.2). Frozen tokens, each with its `schema_version`:
    - `fin.evidence.database_row_snapshot` — the `database_row` object;
    - `fin.evidence.retrieve_rows` — the retrieve-ingress sibling key
-     `database_rows` envelope (§4.4, #322 producer side);
+     `database_rows` envelope (§4.4, producer side);
    - `fin.evidence.citation` — declared once per response / terminal SSE frame
      as `evidence_schema` (§2.2);
    - `fin.evidence.visual_claim` — each `visual_claims[]` element;
@@ -119,7 +116,7 @@ rename of shipped strings.
    version carrying a key outside its frozen set is `malformed_evidence_contract`.
    No silent coercion, invented defaults, empty-result substitution, kind
    coercion, or dropped fields anywhere in this contract.
-   (Reconcile note: `d2c3aa0`'s visual-claim wire currently *drops* malformed
+   (Reconcile note: the current fin wire *drops* malformed visual-claim
    rows with a warning. That posture is superseded at E5 cutover for new turns;
    stored legacy rows fall under §7.)
 5. **Strict timestamps.** Every contract timestamp (`queried_at` and any
@@ -132,7 +129,7 @@ rename of shipped strings.
    **Producer obligation (whole seconds, at the producer).** The SQL producer's
    executor MUST truncate `queried_at` to whole seconds *before the value
    reaches the wire*; the sub-second remainder is the producer's to drop, not
-   fin's. This is a duty of #322, not a fin behavior. **fin MUST NOT normalize,
+   fin's. This is the SQL producer's responsibility, not fin's behavior. **fin MUST NOT normalize,
    round, or coerce a producer's timestamp** — fin accepts exactly the
    §2.5 pattern or refuses with `malformed_evidence_contract`, and a fractional
    or offset value is refused exactly like any other malformed one. §2.4's ban
@@ -162,7 +159,7 @@ rename of shipped strings.
 
 All bounds are E1-chosen; exceeding one at any boundary is a named overflow
 refusal, never truncation by the consumer (the producer-side page truncation
-rule of SQL contract §6/§9 stays #322's).
+rule of SQL contract §6/§9 stays with the SQL producer).
 
 | Contract | Bound |
 |---|---|
@@ -183,7 +180,7 @@ rule of SQL contract §6/§9 stays #322's).
 Overflow is reported by its lane's code (§6): `citation_overflow`,
 `visual_claim_overflow`, `database_row_overflow`, `business_field_overflow`;
 the comparison frame keeps the shipped tool exit `comparison_overflow` (§4.3
-rules unchanged, admission recorded in §6 — the #322 grid bound is the tool's
+rules unchanged, admission recorded in §6 — the SQL producer's grid bound is the tool's
 own). Precedence inside `database_row`: the 32 KiB serialized-snapshot bound is
 evaluated on the snapshot as a whole, before the per-entry bounds; a snapshot
 breaking both reports the byte bound. The per-entry bounds cap a field-legal
@@ -262,7 +259,7 @@ Conforms to the already-frozen facts; none of them is re-decided:
   `malformed_evidence_contract` under §2.4 like any other unknown key. The
   `schema`-bearing snapshot object is the **egress** object (§4.4 egress,
   §2.1 rule 1), where the object travels alone rather than inside a list.
-- **Egress (shipped shape, `d2c3aa0`):** each `database-row` citation carries
+- **Egress (shipped fin wire shape):** each `database-row` citation carries
   the one snapshot under sibling key `database_row` with
   `{source, record_key, queried_at, fields, summary}`. The discriminator is
   the citation `kind`; the snapshot object itself carries no `kind` (see §8,
@@ -272,13 +269,12 @@ Conforms to the already-frozen facts; none of them is re-decided:
 - **`schema` placement:** the egress snapshot object gains
   `schema: "fin.evidence.database_row_snapshot"` alongside its
   `schema_version` at E5 cutover, beside the five identity/value keys of §4.4
-  egress; snapshots minted before it (between `d2c3aa0` merge and E5) are
-  legacy v0 under §7.
+  egress; snapshots minted before the E5 cutover are legacy v0 under §7.
 - **Value text rule:** `record_key` and `fields` values are JSON scalars
   (string / number / boolean / null) at ingress; the consumer renders each to
   text: strings as-is, numbers as shortest round-trip decimal, booleans as
-  lowercase `true`/`false`, `null` as `""`. (`d2c3aa0`'s
-  `citation_gate._plain_text` implements this with Python `str()` for
+  lowercase `true`/`false`, `null` as `""`. (fin's current
+  `citation_gate._plain_text` implementation uses Python `str()` for
   numbers — correct — but renders booleans `True`/`False`; E3 aligns that to
   the canonical lowercase. See §8, R5.) This is a declared normalization rule,
   not silent coercion: the text form is the contract's canonical value
@@ -299,7 +295,7 @@ Conforms to the already-frozen facts; none of them is re-decided:
   "record"`. `unit = 1` is a documented placeholder because the incumbent row
   type requires an integer; no consumer may derive meaning from it. This is
   recorded here precisely so it is never mistaken for an invented default.
-- **Zero rows:** `sql_no_matching_rows`, decided in #322 (SQL contract §7). It is a
+- **Zero rows:** `sql_no_matching_rows`, specified by the SQL producer (SQL contract §7). It is a
   run-level named refusal with its own copy (names the database and window,
   never ingest/corpus); it produces no evidence item; it is distinct from
   malformed, denied, timeout, untrusted-context, and unavailable.
@@ -308,11 +304,11 @@ Conforms to the already-frozen facts; none of them is re-decided:
   evidence item (new `queried_at`, new digest) and never rewrites the prior
   answer; reading historical evidence re-checks **current** authorization
   (SQL contract §8.1) — a denial there is the permission-denial class, code owned by
-  #322's source-side check. A well-formed identity/context proves neither
+  SQL producer's source-side check. A well-formed identity/context proves neither
   trust nor authorization.
 - **Verifiers stay separate:** shape (this spec), claim-vs-`fields`
   verification (ADR 0091, `unsupported_database_claim`), and
-  identity/authorization (#322 database enforcement) are three checks; schema
+  identity/authorization (SQL producer's database enforcement) are three checks; schema
   validity never grants access.
 
 ### 4.5 Business field observation (`business_field`) — bounded, reserved
@@ -342,7 +338,7 @@ Conforms to the already-frozen facts; none of them is re-decided:
 ## 5. Producer / consumer conformance-fixture handoff (decision)
 
 - **Canonical schemas:** `specs/schemas/evidence/*.schema.json`, one file per
-  §2.1 token, fin-owned. #322 consumes the files directly; it must not
+  §2.1 token, fin-owned. SQL producer consumes the files directly; it must not
   maintain an independently defined copy.
 - **Fixtures:** `data/conformance/evidence/<profile>/<case>.json` with
   profiles `citation`, `visual_claim`, `database_row`, `business_field`,
@@ -353,13 +349,13 @@ Conforms to the already-frozen facts; none of them is re-decided:
 - Each fixture file is one JSON object:
   `{"case": "<id>", "direction": "producer|consumer", "expect":
   "accept|refuse", "refusal_code": "<code or null>", "payload": {...}}`.
-  `direction: "producer"` fixtures describe what a conforming #322 emission
+  `direction: "producer"` fixtures describe what a conforming SQL producer emission
   looks like (its producer tests assert it can emit exactly these payloads);
   `direction: "consumer"` fixtures drive fin's E3 decoder tests.
 - Fixtures are generated against the schema files; a fixture and its schema
-  disagreeing is a fin defect, fixed in fin before #322 is asked to consume.
+  disagreeing is a fin defect, fixed in fin before the SQL producer consumes.
 - These fixtures prove fin's consumer contract only. Nothing here or in the
-  fixtures claims the #322 producer exists or conforms.
+  fixtures claims the SQL producer exists or conforms.
 
 ## 6. Typed outcomes and boundary map (decision)
 
@@ -371,9 +367,9 @@ empty success:
 | malformed input | `malformed_evidence_contract` | wrong type/shape/timestamp/hash, unknown field, mirror mismatch |
 | unsupported contract | `unsupported_evidence_contract` | unrecognized `schema` token name, unsupported `schema_version` for a recognized name, unknown `kind` for its channel |
 | bound overflow | `citation_overflow`, `visual_claim_overflow`, `database_row_overflow`, `business_field_overflow`; comparison keeps the shipped tool exit `comparison_overflow` | one code per lane for every §3 bound that lane carries; refused, never truncated; `database_row` byte-bound precedence per §3; `comparison_overflow` keeps its shipped name (§4.3 rules unchanged — admitted, not re-minted) |
-| missing data | `corpus_not_ready` (document), `sql_no_matching_rows` (database, #322), visual exits (`attachment_unavailable`, `observation_stale`, …), `insufficient_evidence` (E2 route-level, business_field status `missing`) | distinct per source; empty ≠ malformed ≠ absent source |
-| permission denial | `sql_query_denied`; `citation_trust_denied`, `visual_claim_trust_denied`, `business_field_trust_denied` for the document / visual-claim / business-field lanes; historical-snapshot open denial (code owned by #322's source-side check) | shape-valid ≠ authorized at every lane (§4.4 principle): a well-formed but untrusted identity/subject is a named per-item refusal, never a silent eligibility drop (§2.4); current-authorization check on replay |
-| unverified context | `comparison_source_unverified` | a comparison frame names the exact source version (§4.3) this run did not receive, so the binding cannot be established — "could not verify", kept distinct from denial's "checked and the answer is no" (the split #322 settled in SQL contract §7) |
+| missing data | `corpus_not_ready` (document), `sql_no_matching_rows` (database, SQL producer), visual exits (`attachment_unavailable`, `observation_stale`, …), `insufficient_evidence` (E2 route-level, business_field status `missing`) | distinct per source; empty ≠ malformed ≠ absent source |
+| permission denial | `sql_query_denied`; `citation_trust_denied`, `visual_claim_trust_denied`, `business_field_trust_denied` for the document / visual-claim / business-field lanes; historical-snapshot open denial (code owned by SQL producer's source-side check) | shape-valid ≠ authorized at every lane (§4.4 principle): a well-formed but untrusted identity/subject is a named per-item refusal, never a silent eligibility drop (§2.4); current-authorization check on replay |
+| unverified context | `comparison_source_unverified` | a comparison frame names the exact source version (§4.3) this run did not receive, so the binding cannot be established — "could not verify", kept distinct from denial's "checked and the answer is no" (the split recorded in SQL contract §7) |
 | capability unavailable | `retrieve_unavailable`, `tier_not_open`, `visual_lane_unwired`, `real_db_not_wired` (= "not provisioned" only, never "refused") | |
 | infrastructure failure | transport: `retrieve_unavailable`; persistence: `persistence_unavailable` (named at E4 — the store itself cannot be read or written; distinct code, same posture as the transport exit; the per-record §7 compatibility refusal is NOT this class, it rides `unsupported_evidence_contract`); serialization failure: named contract error, never an empty `done` | |
 
@@ -392,7 +388,7 @@ contract):
 
 | Boundary | Applies |
 |---|---|
-| MCP/retrieve ingress | all six classes; trust denial is ingress-time and source-side (#322), shape/semantic are fin's separate checks |
+| MCP/retrieve ingress | all six classes; trust denial is ingress-time and source-side (SQL producer), shape/semantic are fin's separate checks |
 | persistence write + replay | all six; plus §7 legacy compatibility failure as its own named exit under "unsupported contract" |
 | HTTP + SSE | all six; serialization exception → named error frame policy, never empty `done`; oversize frame → overflow refusal |
 | web runtime decode | malformed, unsupported contract, overflow, missing (displayed per class); TypeScript types are compile-time only and never satisfy decode |
@@ -412,13 +408,13 @@ class is not artificially applicable there, not that it is untested.
 | exception | applies: producer/transport error → `retrieve_unavailable`, kept distinct from every contract failure | applies: persistence exception → named persistence failure, not empty history | applies: transport/serialization exception never becomes an empty `done` | applies: fetch/decode exception surfaces its class; no empty-success fallback |
 
 The SQL request/execute classes (parameter validation, database errors,
-timeouts at the source) are #322's producer-side matrix and are not fin's to
+timeouts at the source) are producer-side matrix owned by the SQL producer and are not fin's to
 test here.
 
 ## 7. Saved-turn legacy compatibility (decision)
 
 Records stored before the §2 cutover (every citation row in `fin_run` today;
-snapshots minted between `d2c3aa0` and E5; visual rows before E5) are
+snapshots minted before E5 cutover; visual rows before E5) are
 **legacy v0**.
 
 **What makes a record v0 (not the token string).** Legacy status is decided by
@@ -482,53 +478,53 @@ borrow the legacy rule to skip version validation: the token is present, so the
    `malformed_evidence_contract` — the grace applies to stored records, not
    to fresh producers.
 
-## 8. Reconcile notes — PR #331 spec vs `d2c3aa0` (flagged, not silently picked)
+## 8. Reconcile notes — current wire shape versus SQL contract (flagged, not silently picked)
 
 - **R1 — `kind` placement.** SQL contract §8's example shows a standalone object with
-  `"kind": "database-row"` inside the row payload; `d2c3aa0` puts the
+  `"kind": "database-row"` inside the row payload; fin's current wire puts the
   discriminator on the citation envelope and ships a snapshot with no `kind`.
   Ruling here: envelope discriminates, snapshot carries no `kind` (matches
-  shipped egress). The §8 example should be corrected when #322 next touches
+  shipped egress). The §8 example should be corrected when the SQL producer next edits
   that file — this spec does not edit it.
 - **R2 — `fields` value types.** SQL contract §8's example carries a JSON number
-  (`"notice_days": 30`); `web/src/types.ts` at `d2c3aa0` types
+  (`"notice_days": 30`); the current frontend types
   `fields`/`record_key` as `Record<string, string>`. Under §4.4's text rule
   both render identically at the gate, but the web decoder must accept JSON
   scalars or the producer must pre-stringify — one of the two will violate the
   other otherwise. Ruling here: ingress scalars are legal (§4.4); E6 must
-  widen the web decode typing to scalars-plus-text or a #322 producer
-  stringification rule must be agreed. Flagged for #322; not resolved by
+  widen the web decode typing to scalars-plus-text or producer-side
+  stringification must be agreed. Flagged for the SQL producer; not resolved by
   fiat from fin.
   **Resolved at E6 planning on the fin side only:** E6 widens the web
   decoder to scalars-plus-text (superset acceptance, §4.4 render rule);
-  this asks nothing of #322 and does not pre-stringify anything the wire
+  this requires no producer change and does not pre-stringify anything the wire
   does not already require.
 - **R3 — sibling-key level.** SQL contract §8.0 places the optional sibling key on
-  the retrieve envelope; `d2c3aa0` implements a sibling key per citation
+  the retrieve envelope; fin's current wire carries a sibling key per citation
   (`database_row`). Both are "sibling, not `chunks[]`" as required; §4.4
   freezes ingress (`database_rows`) and egress (`database_row`) names
   separately so the two are one contract, not two accidents.
-- **R4 — warning-drop posture.** `d2c3aa0`'s visual-claim wire drops
-  malformed rows with a log warning; §2.4 requires named refusal. §7 scopes
+- **R4 — warning-drop posture.** the current fin wire drops malformed visual claims
+  with a log warning; §2.4 requires named refusal. §7 scopes
   the grace to stored legacy records; live decoding after E5 must not drop.
-- **R5 — bool text form.** `d2c3aa0`'s `_plain_text` renders Python booleans
+- **R5 — bool text form.** fin's current `_plain_text` implementation renders Python booleans
   via `str()` as `True`/`False`; the canonical text rule (§4.4) is lowercase
   `true`/`false`, matching JSON and the TypeScript side. Ruling here: the
   contract is lowercase; E3 aligns the gate. Flagged because the digest and
   claim-matching both read the text form, so the two spellings must not ship
   on both sides of a persisted snapshot.
 - **R6 — no zero-row or limits contradiction.** §6 limits (20 rows / 32 KiB /
-  3 s) and `sql_no_matching_rows` are adopted verbatim from #322; E1 does not
+  3 s) and `sql_no_matching_rows` are adopted verbatim from SQL producer; E1 does not
   re-decide them.
 
 ## 9. Deferred with named owners
 
 | Item | Owner |
 |---|---|
-| #322 producer conformance to §4.4/§5 (ingress `database_rows` envelope — wrap the bare array under the frozen `rows` member, carry `result_count`, snapshot emission) | #322 |
-| SQL request/execute input-class tests (producer side) | #322 |
-| historical-snapshot open-denial code name | #322 source-side check |
-| web decode widening for R2 | E6 — decided: fin-side decoder widening, no #322 change required |
+| SQL producer conformance to §4.4/§5 (ingress `database_rows` envelope — wrap the bare array under the frozen `rows` member, carry `result_count`, snapshot emission) | SQL producer |
+| SQL request/execute input-class tests (producer side) | SQL producer |
+| historical-snapshot open-denial code name | SQL producer source-side check |
+| web decode widening for R2 | E6 — decided: fin-side decoder widening, no SQL producer change required |
 | ~~`evidence_schema` + its `schema_version` on responses/frames, `schema` + `schema_version` on live snapshot/visual emissions~~ — **DELIVERED (E5)**: shipped on the response / terminal SSE frame, the egress `database_row` snapshot, the `visual_claims[]` element, the `business_fields[]` element, and the `comparison` envelope, with the strict no-back-fill rule in force on both the server and the web decode (ADR 0093 decisions 8, 12) | delivered — no owner outstanding |
 | validator implementations + fixture generation | E3 |
 | expense-policy routing slice | E2 |

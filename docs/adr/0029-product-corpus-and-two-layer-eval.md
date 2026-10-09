@@ -1,8 +1,8 @@
-# 0029. Product corpus is live official HTML; eval fixture is a pipeline pin
+# 0029. Product corpus and two-layer evaluation
 
 Date: 2026-08-25
 Status: accepted
 
-The private fixture source 12-PDF freeze is no longer product or eval SSOT (ADR 0004 superseded). One locator contract (ADR 0028): official 10-Q and 10-K primary HTML. `fin-serve` reads the operator-selected **product corpus** on local disk. Default CI reads a git-pinned **eval fixture** produced by the same ingest CLI (not a pdfplumber bypass, not live EDGAR in pytest). Ingest is CLI-only; the ask path does not fetch. Contract eval (scripted, fixture) must cover HTML-unit cite pass, unknown locator refuse, catalog miss, and cross-period; nine v1 gold cases are not the ceiling (ADR 0012 superseded). Capability eval is opt-in/nightly on the product tree plus a live model.
+The historical private fixture set is no longer the product or evaluation SSOT (ADR 0004, superseded). The locator contract is recorded in ADR 0028. `fin-serve` reads the operator-selected product corpus from local storage. Contract evaluation uses fixture artifacts produced by the ingest CLI; these artifacts are not included in the public distribution and must be supplied by maintainers when running corpus-dependent checks. Ingest remains CLI-only, and the ask path does not fetch raw source files. Contract evaluation covers HTML-unit citation pass, unknown-locator refusal, catalog miss, and cross-period behavior; the nine v1 gold cases are not the ceiling (ADR 0012, superseded). Capability evaluation is opt-in or nightly against the configured product corpus and a live model.
 
-Considered Options: keep PDF-12 as eternal eval SSOT (demo grain forever); gold against the network (non-deterministic, fair-access); S&P 500 backfill as the ingest default (too wide before the CLI exists). First eval fixture pin: AAPL and TSLA, official 10-Q and 10-K, two periods each, produced by the ingest CLI.
+Considered options were keeping the initial small fixture set as the permanent evaluation SSOT, evaluating against a live source at test time, and using a broad corpus as the ingest default. The first eval fixture contained four documents across two periods and was produced by the ingest CLI.

@@ -143,7 +143,7 @@ The JSON envelope `compare_facts` returns and the workspace persists on the turn
 _Avoid_: a markdown table on the wire, re-parsing the answer prose for structure, per-surface variant shapes
 
 **XBRL**:
-The tagged-numbers format inside official 10-Q/10-K iXBRL. Not a website; SEC.gov is the filing host.
+The tagged-numbers format embedded in official 10-Q/10-K iXBRL filings; it is not a separate website.
 _Avoid_: using XBRL as a product or hostname, conflating it with iknow-memory retrieve
 
 **read_source**:
@@ -324,10 +324,6 @@ _Avoid_: HTTP-only first ship, separate graphs per transport, treating plan-appr
 LangGraph `interrupt` may be compiled into the host graph. Durability is crash resume of the in-flight run. **Choice window** is the v1 interrupt UX for Soft-Track / search-mode clarify (structured options, operator pick, then execute). Plan-approval and tool-approval UI stay out of v1.
 _Avoid_: declarative plan-mode as v1, Studio as the required v1 interface, free-text clarify with no options as the only confirm path
 
-**reference checkout**:
-Read-only sibling clone of the reference implementation (workspace folder, not fin git). Consulted, never edited as fin source.
-_Avoid_: vendoring under fin/, copying that tree into src/fin
-
 **Jev**:
 TypeSafe System One for host closed-set **Choice**: Soft-Track's four **track** leaves, then (only after **grounded**) 检索档 `A|graph|global|D`. Product path only (ADR 0080 / 0081); default pytest injects Fake Choice; live Jev is required to land; no MiniMax fallback.
 _Avoid_: v1 model, retrieve rerank, MiniMax JSON classify, MiniMax as Jev fallback, Fake as the product classifier, counting a Fake pass as live, four retrieve nodes
@@ -346,24 +342,24 @@ _Avoid_: raw vendor HTTP as the v1 client, treating LangGraph as the chat SDK, `
 
 **loop skeleton**:
 v1's host graph is authored in fin: model node, tool node, citation verifier, caps. It does not copy a research or RAG product repository into `src/fin`.
-_Avoid_: gpt-researcher, open_deep_research, blank-file StateGraph as the required path, forking a finance-agent demo
+_Avoid_: copying an external research-agent product or code tree into `src/fin`, requiring a particular graph-construction starting point
 
 ### Corpus and eval
 
 **product corpus**:
 The operator-selected filings after ingest: fin parses source text into **冻结单元**, then deterministically **切分**s and pushes its chunks to the retrieve backend. Serve-time `retrieve` / `read_source` / the citation verifier use this-run tool payloads (ADR 0046), not a second on-disk tree as company-corpus SSOT.
-_Avoid_: private fixture source 12 as product SSOT, unofficial PDF as live identity, S&P 500 backfill as the ingest default, a second PDF-page product path
+_Avoid_: the historical private fixture set as product SSOT, unofficial PDF as live identity, broad index backfill as the ingest default, a second PDF-page product path
 
 **eval fixture**:
-A git-pinned snapshot of **ingest** output, same locator contract as **product corpus**. Default CI contract eval reads only this tree.
-_Avoid_: pdfplumber-only test ingest, live EDGAR in default pytest, treating the private fixture source 12 PDFs as eval SSOT
+A maintainer-held snapshot of **ingest** output, with the same locator contract as **product corpus**. Fixture-dependent tests receive it separately from the public checkout.
+_Avoid_: pdfplumber-only test ingest, live source downloads in default pytest, treating a historical private fixture set as the current eval SSOT
 
 **v1 corpus**:
-Historical private fixture source 12-PDF freeze (ADR 0004, superseded by 0029). Not the product or eval SSOT.
+Historical private 12-PDF fixture freeze (ADR 0004, superseded by 0029), covering 2022 Q3 and 2023 Q1–Q3. It is not distributed with the public checkout and is not the product or current eval SSOT.
 _Avoid_: current catalog, gold SSOT, demo FAQ
 
 **ingest**:
-The CLI/job (and the product **ingest endpoint**) that parses filings, **切分**s, and **入库推送** to the retrieve backend. The ask path does not fetch EDGAR or open source filings.
+The CLI/job (and the product **ingest endpoint**) that parses filings, **切分**s, and **入库推送** to the retrieve backend. The ask path does not perform ingestion or access raw filings.
 _Avoid_: extract-on-query, host-graph ingest node, putting filing bytes in the checkpointer database, 切分 as a research-track tool
 
 **资料主体**:
@@ -379,7 +375,7 @@ MinIO/S3-compatible storage for raw filing (and later multi-format) bytes. Postg
 _Avoid_: Postgres bytea as the primary raw store, putting raw PDFs in the checkpointer, treating object keys as citation locators
 
 **contract eval**:
-Default CI harness: scripted model, **eval fixture** only. Required classes: HTML-unit citation pass, unknown locator refuse, catalog miss, cross-period on the fixture. Nine v1 gold cases are not the ceiling.
+Scripted-model harness against the separately supplied **eval fixture**. Required classes: HTML-unit citation pass, unknown locator refuse, catalog miss, and a cross-period case. Nine v1 gold cases are not the ceiling.
 _Avoid_: live LLM in default pytest, FinanceBench in default pytest
 
 **capability eval**:
@@ -387,7 +383,7 @@ Opt-in or nightly harness on **product corpus** plus a live model; records cover
 _Avoid_: web-search text as citations, making this the only eval
 
 **v1 eval slice**:
-Historical nine hand-authored cases against the private fixture source 12 (ADR 0012, superseded by 0029).
+Historical nine hand-authored cases against the private 12-document fixture set (ADR 0012, superseded by 0029). Running them requires maintainer-supplied fixtures.
 _Avoid_: 40-question matrix as a v1 commitment, treating nine cases as the current ceiling
 
 **冻结单元**:

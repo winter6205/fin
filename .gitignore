@@ -41,6 +41,12 @@ data/workspace/
 .ipynb_checkpoints/
 *.log
 
+# Private corpus material and generated evaluation output are maintained outside
+# the public source distribution.
+data/corpus
+data/upstream/
+scripts/g4_pipeline/results/
+
 # OS / copy artifacts
 .DS_Store
 *:Zone.Identifier
