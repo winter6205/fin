@@ -1,12 +1,14 @@
 # Spec: soft-track
 
+> **Historical fixture note:** this spec preserves the Soft-Track acceptance contract. The public distribution omits private corpus and eval fixtures; corpus-dependent tests require a maintainer-supplied fixture set outside the checkout. This document does not claim the full suite passes without those fixtures.
+
 ## Objective
 
 Ship **Soft-Track** turn orchestration on fin's existing **host graph** so the workspace research thread behaves as a normal conversational agent: greetings, clarification, and off-topic soft replies are first-class; only the **research track** binds tools and runs the **citation verifier**. Operators stop seeing greeting → bounce → flicker. Success is one compiled graph, four tracks, durable status-snapshot history, auditable `track_decision` on each run, and five opt-in scripted Soft-Track contracts that pass before merge.
 
-Quoted from `docs/CONTEXT.md`:
+Historical glossary excerpt (Soft-Track planning):
 
-- **fin**: A normal conversational agent whose durable runtime is a LangGraph host graph: each turn is routed to a **track**; only the **research track** specializes in the frozen 10-Q corpus with tools and the citation verifier. Retrieve ranking stays off-graph behind the retrieve port.
+- **fin**: A normal conversational agent whose durable runtime is a LangGraph host graph: each turn is routed to a **track**; only the **research track** specializes in the v1 filing fixture contract with tools and the citation verifier. Retrieve ranking stays off-graph behind the retrieve port.
 - **track**: The per-turn contract on the host graph: `dialogue`, `clarify`, `off_topic`, or `grounded`. Chosen in-graph before execution; tools and the citation verifier bind only to `grounded`.
 - **Soft-Track**: The v1 turn-orchestration shape: one compiled host graph, multi-track routing, tiered track decision (rules → ambiguous LLM → inherit → grounded clarify → conditional policy), flat graph until upgrade triggers in ADR 0027.
 - **status snapshot**: One append-only per-turn record of research working context (e.g. company, period, document ids, active track cues) stored on `AgentState` in the checkpointer. History is retained; the latest snapshot is the active view for routing; dependent fields may be empty on a new snapshot.
@@ -16,7 +18,7 @@ Quoted from `docs/CONTEXT.md`:
 - **workspace**: A local web UI server: create, list, open, resume, and delete a research thread; **thinking fold** and **tool fold** stream then collapse (`specs/turn-trace-folds.md`); citations sit on the assistant turn (inline chips plus a sources list); research turns may show a light track hint without a mode picker. Streaming HTTP is that UI's transport on the same compiled graph; GET history is turn rows; thinking on/off is the model `extra_body.thinking` knob; crash resume continues the in-flight run from the last complete host-graph node.
 - **host graph**: LangGraph compiled around the agent loop plus code gates (verifier, caps, interrupt). It is the durable runtime, not a hand-drawn retrieve → generate flowchart.
 - **run**: One graph `invoke` or `stream` on a thread (`run_id`): `done` / `refuse` / `step_cap` end the run; a follow-up is a new run on the same `thread_id` that resets run-scoped evidence and caps. Crash resume continues that in-flight `run_id` from the last complete host-graph node; at most one run is active per thread.
-- **v1 corpus**: The frozen private fixture source SEC 10-Q slice in this repository: AAPL, MSFT, AMZN; periods 2022 Q3 and 2023 Q1–Q3 (12 PDFs). Upstream commit `547f132`. Cross-period questions use 2023 Q1–Q3 only.
+- **v1 corpus**: The historical private 12-document 10-Q fixture set, covering periods 2022 Q3 and 2023 Q1–Q3. It is omitted from the public distribution. Cross-period questions use 2023 Q1–Q3 only.
 
 ## Boundaries
 
@@ -26,7 +28,7 @@ Quoted from `docs/CONTEXT.md`:
   - Four tracks: `dialogue`, `clarify`, `off_topic`, `grounded`.
   - **research**: bind `list_files` / `retrieve` / `read_file`; existing agent loop; **citation verifier** on path to END; bounce / refuse / step_cap unchanged in kind.
   - **dialogue** / **off_topic**: no tool binding; no citation verifier; call-scoped system prompt; terminal `status == "done"` with `citations` empty allowed.
-  - **clarify**: dedicated thin path; ask for missing slots using options grounded in the frozen-12 manifest (and current snapshot gaps); no tools; no citation verifier; `done` with empty citations; next user turn is a new **run**.
+  - **clarify**: dedicated thin path; ask for missing slots using options grounded in the historical 12-document fixture manifest (and current snapshot gaps); no tools; no citation verifier; `done` with empty citations; next user turn is a new **run**.
   - **off_topic**: model-generated soft refuse under call-scoped capability bounds; not `refuse` status; not a fixed redirect string as the only runtime reply.
   - Per-track call-scoped system prompts (prepend at model call time; not written into checkpoint messages).
   - **status snapshot** history on `AgentState` in the checkpointer (SSOT). Full `messages` / turn rows / citations remain fully retained. Append when research working context is set or changes (including company change → new snapshot with dependent fields cleared); latest is the active routing view. Dialogue/off_topic need not append a snapshot every turn. Do not dual-write snapshot SSOT into `thread_store`.
@@ -46,7 +48,7 @@ Quoted from `docs/CONTEXT.md`:
 
 ## Success Criteria
 
-- `uv run pytest -q` still exits 0 without selecting Soft-Track opt-in marks (existing non-Soft-Track suite green; Soft-Track cases deselected by default). Default (non-opt-in) tests that encoded pre-Soft-Track “no tools → always citation bounce” must be narrowed to `track=grounded` so the default suite stays green after Soft-Track lands.
+- With required maintainer fixtures supplied, the historical default-suite contract is that `uv run pytest -q` exits 0 without selecting Soft-Track opt-in marks; Soft-Track cases are deselected by default. Default (non-opt-in) tests that encoded pre-Soft-Track “no tools → always citation bounce” must be narrowed to `track=grounded` so the default suite stays green after Soft-Track lands.
 - Soft-Track opt-in suite (exact mark name fixed in plan) collects ≥5 MUST suites **and ≥2 boundary cases per suite** (including the 5-class matrix in Boundaries) and exits 0 under ScriptedChatModel + InMemorySaver: (1) greeting → `track=dialogue`, no tool calls, no citation bounce, `status=done`, empty citations; (2) underspecified filing ask → `track=clarify`, no tools, `done`, empty citations; (3) off-domain ask → `track=off_topic`, soft reply, `status=done` (not `refuse`), empty citations; (4) true 10-Q fact ask with scripted tools+span → `track=grounded`, citation verifier path, `done` with ≥1 citation when script supplies a passing span; (5) prior research snapshot present + short follow-up → inherit to `grounded` without requiring re-stated company/period in the utterance.
 - Scripted run that would formerly bounce a greeting (no tools → citation gate) no longer enters the citation verifier on `dialogue` / `clarify` / `off_topic`.
 - After a non-research Soft-Track run, checkpointed `messages` do not contain that track’s call-scoped system prompt as a durable `SystemMessage` (prepend-at-call only).
@@ -64,7 +66,7 @@ Quoted from `docs/CONTEXT.md`:
 
 ## Inherits / Changes
 
-**Inherits:** Python 3.12 + uv + pytest; `src/fin/host/graph.py` model/tools/citation_gate; `AgentState` + `reset_input_state` (run-scoped reset must not wipe snapshot history or accumulated messages); `citation_gate.verify_citations`; `agent_instructions.messages_for_model` call-scoped pattern; `thread_store.RunRecord` / workspace SSE from `specs/workspace.md` + ADR 0026; ScriptedChatModel; PostgresSaver / InMemorySaver (ADR 0015); FIN_MODEL / FIN_BASE_URL (ADR 0022); frozen-12 corpus + manifest; ADR 0013 same graph; ADR 0021 citations-from-verifier; ADR 0027 Soft-Track decisions; CONTEXT terms quoted above.
+**Inherits:** Python 3.12 + uv + pytest; `src/fin/host/graph.py` model/tools/citation_gate; `AgentState` + `reset_input_state` (run-scoped reset must not wipe snapshot history or accumulated messages); `citation_gate.verify_citations`; `agent_instructions.messages_for_model` call-scoped pattern; `thread_store.RunRecord` / workspace SSE from `specs/workspace.md` + ADR 0026; ScriptedChatModel; PostgresSaver / InMemorySaver (ADR 0015); FIN_MODEL / FIN_BASE_URL (ADR 0022); historical private 12-document fixture contract and manifest (files omitted from public distribution); ADR 0013 same graph; ADR 0021 citations-from-verifier; ADR 0027 Soft-Track decisions; historical CONTEXT glossary excerpt above.
 
 **Supersedes (grounded-track scoping):** `specs/v1-host-agent.md` Success Criterion that a scripted run with no retrieve/read_file and a non-refuse answer must bounce / eventually `refuse` with `citation_repair_cap` applies **only on `track=grounded`** after Soft-Track. Non-grounded tracks may `done` with empty citations and must not enter the citation verifier. Default (non-opt-in) tests that encoded the pre-Soft-Track universal gate must be narrowed accordingly so `uv run pytest -q` stays green.
 
