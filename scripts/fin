@@ -22,7 +22,7 @@
 # operate on instead of the one discovered from the current directory. It
 # selects WHICH checkout's scripts run — `status` still inspects the
 # server on the local port, of which there is at most one:
-#   fin status /home/winner/projects/fin-wt-search-mode-retrieve
+#   fin status ~/projects/fin-wt-search-mode-retrieve
 # `down` takes only its own flags and acts on the checkout under $PWD:
 #   fin down --keep-infra
 #

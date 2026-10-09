@@ -4,7 +4,7 @@
 **Approach:** Local ingest first so catalog and facts exist without SEC. Then filters and MCP retrieve can proceed in parallel. OCR and the fact tool hang off ingest. Contract remaining (unavailable EXITs, overlapping retrieve) lands with those bullets, not a leftover “polish” ticket.
 **Spec link:** `specs/s1-corpus-retrieve.md`
 **Parent map:** the tracked change
-**Tracker:** GitHub `winter6205/fin` (main path). Spec the tracked change ; T1–T5 are #74–#78 with native blocking edges (T2/T3/T4/T5 ← T1).
+**Tracker:** GitHub `the private organisation/fin` (main path). Spec the tracked change ; T1–T5 are #74–#78 with native blocking edges (T2/T3/T4/T5 ← T1).
 **ACR:** all-yes after spec patch (copied below; writing-plans owns commit split)
 
 bounded-context-guardian: yes — filing freeze/catalog/facts stay in `corpus`; ranking client stays behind retrieve port in `retrieve`; graph bind stays in `host`; iknow-memory remains a sibling MCP, no `src/fin` vendoring; no `controllers/`/`services/` layer packages.

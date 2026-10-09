@@ -3,7 +3,7 @@
 **Goal:** Operator can ingest-frozen corpus, ask on CLI (and HTTP), and get `done` with code-filled citations or `refuse` / `step_cap`.
 **Approach:** Stand up the package, freeze extracted pages, then three parallel tool/gate slices, then one host-graph slice that wires them, then CLI / Postgres / HTTP in parallel, then the opt-in eval mark. No MCP, no HITL UI, no live LLM in default pytest.
 **Spec link:** `specs/v1-host-agent.md`
-**Tracker:** GitHub `winter6205/fin` (main path). Spec the tracked change ; T1–T10 are #10–#19 with native blocking edges.
+**Tracker:** GitHub `the private organisation/fin` (main path). Spec the tracked change ; T1–T10 are #10–#19 with native blocking edges.
 **ACR:** all-yes (copied from spec)
 
 bounded-context-guardian: yes — three capability packages (`corpus`, `retrieve`, `host`); retrieve stays behind the port; HTTP/CLI are host surfaces; no technical-layer top-level dirs.

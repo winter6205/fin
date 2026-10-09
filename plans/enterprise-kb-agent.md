@@ -4,7 +4,7 @@
 **Approach:** 粗颗粒度五波，对齐 spec 五个 Focus：Trust 与 Corpus 不互相阻塞；Grounded answers 可与它们并行；Workflow 的导出依赖对比工具；Fan-out 先接受 ADR 0034 再改 **host graph**。每波一条可演示竖切（API + UI 如需要 + 测试）。默认 `uv run pytest -q` 不碰 live SEC / live memory。BM25 保持归档（ADR 0032）。
 **Spec link:** `specs/enterprise-kb-agent.md`
 **Map:** fin wayfinder: enterprise knowledge-base Agent
-**Tracker:** GitHub `winter6205/fin` 主路径。spec: enterprise-kb-agent；T1 the tracked change；T2 the tracked change；T3 the tracked change；T4 the tracked change blocked by T3；T5 the tracked change；T6 the tracked change blocked by T5+T3。
+**Tracker:** GitHub `the private organisation/fin` 主路径。spec: enterprise-kb-agent；T1 the tracked change；T2 the tracked change；T3 the tracked change；T4 the tracked change blocked by T3；T5 the tracked change；T6 the tracked change blocked by T5+T3。
 **Per-ticket loop (all bullets, header 声明一次):** test-driven-development → typecheck+tests（`uv run pytest -q`；触及 Soft-Track 时加 `-m soft_track`；eval 弹加 `-m eval`；web：`npx tsc --noEmit`）→ verification-before-completion → one commit on the ticket branch
 **End-of-round:** 五波都落地后对整轮 diff 做一次 code-review（Standards + Spec）；单弹 loop 不重复整轮 review。
 **待写入:** empty — 术语均引用 CONTEXT / spec；ADR 0034 由 T5 从 proposed 标为 accepted，不新开词条。

@@ -3,7 +3,7 @@
 **Goal:** 操作者在中文主界面下能清楚区分 Corpus 加载 / 未 ingest / 已就绪，阅读分组折叠的 Sources，主动回到 Corpus 首页而不被 `fin.lastThread` 弹走，并使用美化后的 Thinking 开关。
 **Approach:** 先落文案与语言约定（决策子弹），再按用户心智拆四条垂直切片：Corpus 三态首屏、Sources 分组折叠、T5 会话级 restore 细化、全局中文化 + Thinking 开关。不改 host graph / SSE 契约；citation gate 粒度不变，只改呈现。Soft Brutalism 视觉 token 不动。
 **Spec link:** `specs/workspace.md`（本增量为其 UX 抛光，无新 spec 文件）
-**Tracker:** GitHub `winter6205/fin` — parent the tracked change; T1 the tracked change · T2 the tracked change · T3 the tracked change · T4 the tracked change · T5 the tracked change
+**Tracker:** GitHub `the private organisation/fin` — parent the tracked change; T1 the tracked change · T2 the tracked change · T3 the tracked change · T4 the tracked change · T5 the tracked change
 **ACR:** all-yes（web-only 抛光；无新 bounded context）
 
 bounded-context-guardian: yes — 改动限于 `web/` SPA；corpus/retrieve/host graph 契约不变；无 `controllers/` / `services/` 等技术层目录。

@@ -4,7 +4,7 @@
 **Approach:** Four conversation-shaped bullets (the tracked change coarse grain — not T7/T9 one-shot surfaces). First a thread you can actually send on; then follow-up as a new **run**; then thinking/tools/citations as specified; then node-complete crash resume. `/ask` and the CLI stay eval adapters. ADR 0026 already records the streaming/resume decision — no extra `[decision]` bullet.
 **Spec link:** `specs/workspace.md`
 **Parent map:** the tracked change
-**Tracker:** GitHub `winter6205/fin` (main path). Spec the tracked change ; T1–T4 are #28–#31 with native blocking edges.
+**Tracker:** GitHub `the private organisation/fin` (main path). Spec the tracked change ; T1–T4 are #28–#31 with native blocking edges.
 **ACR:** all-yes (copied from spec)
 
 bounded-context-guardian: yes — workspace is a **host** surface (HTTP + `web/` SPA) on the existing host graph; corpus/retrieve stay behind their packages; no `controllers/` / `services/` / `repositories/` / `models/` top-level dirs; `web/` is the UI of workspace, not a second agent.

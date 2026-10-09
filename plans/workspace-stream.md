@@ -5,7 +5,7 @@
 **Spec link:** `specs/workspace.md`
 **Parent map:** the tracked change
 **Parent plan:** `plans/workspace.md` (T1–T4 #28–#31). This file is the remainder of that spec’s stream-then-collapse contract, not a second product.
-**Tracker:** GitHub `winter6205/fin` (main path). Spec the tracked change ; remainder T1–T5 are #33–#37 with native blocking edges (#36 and #37 blocked by #33).
+**Tracker:** GitHub `the private organisation/fin` (main path). Spec the tracked change ; remainder T1–T5 are #33–#37 with native blocking edges (#36 and #37 blocked by #33).
 **ACR:** all-yes (this remainder slice; copied shape from spec)
 
 bounded-context-guardian: yes — workspace stays a **host** surface (HTTP + `web/` SPA); corpus/retrieve stay behind their packages; no `controllers/` / `services/` / `repositories/` / `models/` top-level dirs; `web/` remains the UI of workspace, not a second agent.

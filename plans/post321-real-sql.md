@@ -2,7 +2,7 @@
 
 **Goal:** Make `search_mode=sql` answer one contract-expiry question through the existing grounded retrieval path with bounded read access and database-row evidence; keep production binding blocked until an approved enterprise ledger exists.
 **Approach:** The A1 contract in PR permits implementation and mechanism tests against an isolated PostgreSQL with a versioned synthetic ledger. A2 builds that vertical path, A3a proves the mechanism on the real database engine, and A3b separately proves it against the approved enterprise source when one exists. Browser-level interaction belongs to B3 in `plans/post321-parallel-program.md`.
-**Spec links:** `specs/search-mode-retrieve.md`; `specs/search-mode-lexical-sql-tokens.md`; `docs/CONTEXT.md`; [that pull request business SQL contract at the reviewed head](https://github.com/winter6205/fin/blob/a5a21be2928c1ffd8bdeabd069279e36635c24da/specs/search-mode-business-sql-contract.md). The latter is a proposed tracked spec, not a file present on this local baseline.
+**Spec links:** `specs/search-mode-retrieve.md`; `specs/search-mode-lexical-sql-tokens.md`; `docs/CONTEXT.md`; that pull request business SQL contract at the reviewed head. The latter is a proposed tracked spec, not a file present on this local baseline.
 **Per-ticket loop (A2):** tdd → relevant typecheck/tests → one required code-review phase after the implementation slice → (GATE BLOCKED → review-report-repair) → verification-before-completion. A3 adds live-boundary evidence; it does not replace B3.
 
 ## Architecture gate for this planning delivery

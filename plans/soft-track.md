@@ -4,7 +4,7 @@
 **Approach:** Five conversation-shaped bullets. First cut non-research off the gate (the #49 flicker root). Then dedicated clarify, snapshot inherit, ambiguous classify EXITs, and finally wire `track_decision` into RunRecord/SSE/UI plus the opt-in Soft-Track ship suite. Flat graph only; no subgraph, no Chat|Research chrome. ADR 0027 already records the architecture — no extra `[decision]` bullet.
 **Spec link:** `specs/soft-track.md`
 **Parent map:** the tracked change
-**Tracker:** GitHub `winter6205/fin` (main path). Spec the tracked change ; plan the tracked change ; T1–T5 are #52–#56 with native blocking edges (T2/T3/T4 ← T1; T5 ← T2,T3,T4).
+**Tracker:** GitHub `the private organisation/fin` (main path). Spec the tracked change ; plan the tracked change ; T1–T5 are #52–#56 with native blocking edges (T2/T3/T4 ← T1; T5 ← T2,T3,T4).
 **ACR:** all-yes (copied from spec)
 
 bounded-context-guardian: yes — Soft-Track stays in `host` capability (+ light `web/` hint); retrieve/corpus ports unchanged; snapshot SSOT on AgentState not dual-written to `thread_store`; no technical-layer top-level packages.

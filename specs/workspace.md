@@ -15,7 +15,7 @@ Quoted from `docs/CONTEXT.md`:
 - **workspace**: A local web UI server: list, open, resume, and delete a research thread; thinking (when the model emits it) and tool calls stream on the turn then collapse; citations sit on the assistant message. Streaming HTTP is this UI's transport on the same compiled graph, not a second product.
 - **run**: One graph `invoke` on a thread (`run_id`): done / refuse / `step_cap` end the run; a follow-up is a new run on the same `thread_id`; crash resume continues the in-flight run; at most one run is active per thread.
 - **host graph**: LangGraph compiled around the agent loop plus code gates (verifier, caps, interrupt). It is the durable runtime, not a hand-drawn retrieve → generate flowchart.
-- **v1 corpus**: The frozen private fixture source SEC 10-Q slice at `/home/winner/projects/fin`: AAPL, MSFT, AMZN; periods 2022 Q3 and 2023 Q1–Q3 (12 PDFs). Upstream commit `547f132`. Cross-period questions use 2023 Q1–Q3 only.
+- **v1 corpus**: The frozen private fixture source SEC 10-Q slice in this repository: AAPL, MSFT, AMZN; periods 2022 Q3 and 2023 Q1–Q3 (12 PDFs). Upstream commit `547f132`. Cross-period questions use 2023 Q1–Q3 only.
 
 ## Boundaries
 
