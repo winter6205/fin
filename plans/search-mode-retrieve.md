@@ -33,7 +33,7 @@ empty — `community_summary_index_failure` is a wire token in `named_failures`,
    - **Surface:** `fin.retrieve` adapter / retrieve tool
    - **Acceptance:** Fake or recorded MCP call includes `filters.search_mode` when host set a 档; invalid 档 from a pin still uses `tier_not_open` / `real_db_not_wired` without starting a silent C retrieve.
    - `[blocks: T1]`
-   - Cross-plan blocker lifted 2026-09-20: `plans/search-mode-host.md` T1 (live retrieve flag — host assigns 档 before retrieve) merged [PR #280](https://github.com/winter6205/fin/pull/280) (`d09db62`). This lift alone does not close the bullet; the file's own `[blocks:]` markers and `Status` lines stay as they are.
+   - Cross-plan blocker lifted 2026-09-20: `plans/search-mode-host.md` T1 (live retrieve flag — host assigns 档 before retrieve) merged [PR #280](https://github.com/oocang/fin/pull/280) (`d09db62`). This lift alone does not close the bullet; the file's own `[blocks:]` markers and `Status` lines stay as they are.
    - Status: [x] done — #286/#287 + graph-global T4: port closed set resolve_search_mode (src/fin/retrieve/port.py:105/:129-141), wire write only when a mode is effective (src/fin/retrieve/mcp_adapter.py:836-843), host hop search_mode=assigned_retrieve_mode (src/fin/host/graph.py:645) forwarding the audit verbatim (search_mode_decision.py:561-583); assigned 档 reaches the port per run (tests/host/test_assigned_mode_reaches_port.py:269/:281); pinned retired letter = named exit, routes nothing (tests/host/test_search_mode_before_port.py:271)
 
 3. **Five-class Fake contract** — tag: `[implementation]`

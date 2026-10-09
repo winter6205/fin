@@ -7,7 +7,7 @@
 **Out of this plan (explicit):** inventing a skill concept; any "% of context window" telemetry; reopening `plans/workspace-stream.md` or its shipped bullets; fixing the iknow-memory retrieve envelope mismatch (flagged, not entered — it belongs to that repo's release train).
 
 **Spec link:** `specs/workspace.md` (T5 amends it; until T5 lands, Playwright lanes are out-of-spec and T6–T8 must not start)
-**Parent map:** https://github.com/winter6205/fin/issues/22
+**Parent map:** https://github.com/oocang/fin/issues/22
 **Sibling plan:** `plans/workspace-stream.md` — shipped 2026-08-23 via PR #38; this plan is the fidelity follow-up on the same contract, not a reopen.
 **Tracker:** local markdown fallback — `gh` in this agent environment is authenticated read-only (issue creation is blocked), so no tracker issues or native blocking edges exist yet. This file is the tracker SSOT; an operator with write `gh` can publish T1–T10 per `writing-plans` `references/tracker.md` (label `ready-for-agent`, blockers first, GraphQL `addBlockedBy` edges) without changing the bullets.
 **ACR:** all-yes — peer review bc-678c6de2 (claude-fable-5-thinking-high, 2026-08-25); verdict block copied verbatim below.

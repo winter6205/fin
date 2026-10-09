@@ -1,6 +1,6 @@
 # Issue 318: host cache identity and attachment test wiring
 
-Basis: https://github.com/winter6205/fin/issues/318.
+Basis: https://github.com/oocang/fin/issues/318.
 Base: PR #316 tip `0f65d6f6d496a66c3c0c1c8240f68af8d058d18b`.
 
 ## Scope and root cause

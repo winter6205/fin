@@ -1,9 +1,9 @@
 # Issue 318 repair and issue 319 merge recommendations
 
 Date: 2026-09-28.
-Basis: [issue #318](https://github.com/winter6205/fin/issues/318) and the
+Basis: [issue #318](https://github.com/oocang/fin/issues/318) and the
 requested merge/follow-up analysis of
-[issue #319](https://github.com/winter6205/fin/issues/319).
+[issue #319](https://github.com/oocang/fin/issues/319).
 Repair plan: [318-host-test-wiring.md](../../plans/318-host-test-wiring.md).
 Branch: `fix/318-host-test-wiring`, based on PR #316 tip
 `0f65d6f6d496a66c3c0c1c8240f68af8d058d18b`.

@@ -3,9 +3,9 @@
 **Goal:** Resolve the material T5 gaps and produce an evidence-based merge recommendation for PR #321.
 **Approach:** Establish the attachment preparation failure's cause, deliver reliable region inspection, then exercise the visual lane through real boundaries. Reconcile the acceptance record without treating incomplete G4 obligations as delivered.
 **Spec:** [Thread attachment source read](../specs/thread-attachment-source-read.md), items 10/10a of [the implementation plan](thread-attachment-source-read.md), ADRs [0088](../docs/adr/0088-thread-private-attachment-retrieval.md) and [0089](../docs/adr/0089-lazy-page-region-attachment-preparation.md).
-**PR:** <https://github.com/winter6205/fin/pull/321>
+**PR:** <https://github.com/oocang/fin/pull/321>
 **Read baseline:** PR head `42ebed4b4ab8bfe1c4bdc9e5ca382667cc4a5683`; base `231493b`. Verify the current head before executing; do not assume it is unchanged.
-**Evidence source:** [The validation record at the read baseline](https://github.com/winter6205/fin/blob/42ebed4b4ab8bfe1c4bdc9e5ca382667cc4a5683/docs/validation/2026-09-29-g4-t5-unit-citation-legacy-removal.md). Its test results are prior-session evidence, not runs performed while writing this plan.
+**Evidence source:** [The validation record at the read baseline](https://github.com/oocang/fin/blob/42ebed4b4ab8bfe1c4bdc9e5ca382667cc4a5683/docs/validation/2026-09-29-g4-t5-unit-citation-legacy-removal.md). Its test results are prior-session evidence, not runs performed while writing this plan.
 
 ## Execution constraints
 

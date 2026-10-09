@@ -2,7 +2,7 @@
 
 ## Objective
 
-Harden the already-merged vertical slice — ask filings → evidence → cited answer → reliable **workspace** UX — on execution map [#91](https://github.com/winter6205/fin/issues/91), standing on merged PR #57 (Soft-Track) and PR #79 (S1 corpus-retrieve). This is a harden/close-leftover increment, not a new epic: the **host graph** does not change; new reliability lands as tool/adapter contracts, typed error surfacing, and workspace copy/UX fixes. The user is the operator running the local workspace against the frozen corpus with the Fake retrieve port by default, and optionally a real MCP adapter. Success is: every known contract gap in the retrieve seam has a green test, every known error state renders as ordinary-person copy (never a blank crash card or a silent "0 hits"), and an opt-in MCP 2.0 protocol smoke exists against a fixture server — with default `uv run pytest -q` staying green with no live SEC and no live memory server.
+Harden the already-merged vertical slice — ask filings → evidence → cited answer → reliable **workspace** UX — on execution map [#91](https://github.com/oocang/fin/issues/91), standing on merged PR #57 (Soft-Track) and PR #79 (S1 corpus-retrieve). This is a harden/close-leftover increment, not a new epic: the **host graph** does not change; new reliability lands as tool/adapter contracts, typed error surfacing, and workspace copy/UX fixes. The user is the operator running the local workspace against the frozen corpus with the Fake retrieve port by default, and optionally a real MCP adapter. Success is: every known contract gap in the retrieve seam has a green test, every known error state renders as ordinary-person copy (never a blank crash card or a silent "0 hits"), and an opt-in MCP 2.0 protocol smoke exists against a fixture server — with default `uv run pytest -q` staying green with no live SEC and no live memory server.
 
 The Does foci mirror the NOW four-focus table of the 2026-08 SEC-research workbench research note `009-optimized-agent-first-path` (archived 2026-09-06 and no longer in the repo; identity SSOT is `docs/CONTEXT.md`, not that note): Soft-Track × research tools; Host tools + retrieve port; Citation UX; optional MCP protocol smoke.
 
@@ -53,7 +53,7 @@ Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
 - **Out of this spec:**
   - Reopening the S1 / EDGAR epic; rewriting the **host graph**; any new track or subgraph.
   - Reviving BM25 as product or fallback (stays archived per ADR 0032); hybrid/RRF inside fin; ranking work in this repo; re-splitting pushed chunk text in the retrieval service (ADR 0037 — chunking is owned by fin).
-  - Institutional memory / live **iknow-memory** integration ([#92](https://github.com/winter6205/fin/issues/92) is a non-blocker); requiring a live memory server or live SEC in default pytest; lockstep releases with the memory repo.
+  - Institutional memory / live **iknow-memory** integration ([#92](https://github.com/oocang/fin/issues/92) is a non-blocker); requiring a live memory server or live SEC in default pytest; lockstep releases with the memory repo.
   - S2+ fog: cross-period redline, peer matrix, watchlist, charts, reports, multi-agent, SSO/RBAC, conversation image attach.
   - Weakening the **citation verifier** in any way; extending it beyond the research track (it binds only to research; this spec only strengthens surrounding UX and error surfacing).
   - Live EventSource / token-stream reconnect; Stop / cancel button; queued follow-up (still out per `specs/workspace.md`).

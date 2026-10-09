@@ -50,7 +50,7 @@ minimal-change-verifier: yes — the dependency must be justified by F1 evidence
 
 ## Parallelism and tracker handoff
 
-[Issue #335](https://github.com/winter6205/fin/issues/335) owns Session F with F1 and F2 as ordered internal tracer bullets. Keep it independent from #330 and Session E. Do not open one issue per tracer bullet. F1 can run while the existing SQL, document-ingest, and reproducibility sessions proceed; F2 starts once F1 is recorded. Each source correction should remain a separately reviewable logical change within the issue.
+[Issue #335](https://github.com/oocang/fin/issues/335) owns Session F with F1 and F2 as ordered internal tracer bullets. Keep it independent from #330 and Session E. Do not open one issue per tracer bullet. F1 can run while the existing SQL, document-ingest, and reproducibility sessions proceed; F2 starts once F1 is recorded. Each source correction should remain a separately reviewable logical change within the issue.
 
 ## Completion evidence and limits
 

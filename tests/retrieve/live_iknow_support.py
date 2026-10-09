@@ -35,6 +35,9 @@ from fin.retrieve.mcp_push_port import MCPPushPort
 from fin.retrieve.mcp_session import MCPStdioSession
 
 
+# The producer lives in a sibling checkout, the same layout ``.mcp.json`` uses,
+# so the default resolves on any clone instead of on one operator's home path.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 # WHY the override exists: the word-form 档 rename is a stacked cross-repo PR
 # pair, so fin's live legs have to be able to drive the iknow BRANCH build (the
 # one whose ``dist`` carries ``lexical``/``sql``) during the merge window. Unset,
@@ -42,7 +45,7 @@ from fin.retrieve.mcp_session import MCPStdioSession
 # the default harness is byte-for-byte what it was. Once both PRs merge the
 # variable is dropped and main's build is the only target again.
 IKNOW_ROOT = Path(
-    os.environ.get("FIN_LIVE_IKNOW_ROOT") or "/home/winner/projects/iknow-memory"
+    os.environ.get("FIN_LIVE_IKNOW_ROOT") or _REPO_ROOT.parent / "iknow-memory"
 )
 IKNOW_ENTRY = IKNOW_ROOT / "dist" / "index.js"
 # Both worktree roots have collapsed back to the main checkout: the surfaces
@@ -282,7 +285,7 @@ def _node_executable() -> str:
     candidates = [
         configured,
         shutil.which("node"),
-        "/home/winner/.bun/bin/bun",
+        str(Path.home() / ".bun" / "bin" / "bun"),
         shutil.which("node.exe"),
         "/mnt/f/software/nodejs/node.exe",
     ]

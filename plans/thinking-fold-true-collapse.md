@@ -5,7 +5,7 @@
 **Spec link:** `specs/turn-trace-folds.md` (T1 amendment)
 **ACR:** all-yes (block below)
 **Per-ticket loop (all bullets):** tdd → typecheck+tests → code-review → verification-before-completion → one commit on the ticket branch
-**Tracker:** GitHub. Spec: [spec: thinking fold true collapse + thinking pending](https://github.com/winter6205/fin/issues/254). Tickets: [T1 SSOT](https://github.com/winter6205/fin/issues/255), [T2 header-only collapse](https://github.com/winter6205/fin/issues/256) (blocked by T1), [T3 thinking pending](https://github.com/winter6205/fin/issues/257) (blocked by T2).
+**Tracker:** GitHub. Spec: [spec: thinking fold true collapse + thinking pending](https://github.com/oocang/fin/issues/254). Tickets: [T1 SSOT](https://github.com/oocang/fin/issues/255), [T2 header-only collapse](https://github.com/oocang/fin/issues/256) (blocked by T1), [T3 thinking pending](https://github.com/oocang/fin/issues/257) (blocked by T2).
 **Worktree:** `.worktrees/thinking-fold-true-collapse` on `feat/thinking-fold-true-collapse`
 
 > T1 reopened ADR-0025’s burst-grain sentence (was “tail preview on collapsed thinking”). Grain stays burst-scoped folds; collapsed thinking is header-only; **thinking pending** is named. CONTEXT and the amended spec are the SSOT.

@@ -1,12 +1,12 @@
 # Plan: host-prompt-assembly (Wave B / #242)
 
-**Status:** ready — Wave A merged ([PR #244](https://github.com/winter6205/fin/pull/244), `main` @ f5d57a5+). **Next wave.**
+**Status:** ready — Wave A merged ([PR #244](https://github.com/oocang/fin/pull/244), `main` @ f5d57a5+). **Next wave.**
 
 **Goal:** Host system prompts are identity → soul → usage → **user profile** → **memory existence pointer**; persona no longer hard-codes the 12-filing SEC list, tool field caps, or verifier numbers.
 **Approach:** Fixtures first, then split the four **track** prompts, then re-pin. Do not touch inject seam / `default_workspace_root` / catalog / thread APIs.
 **Spec link:** `specs/workbench-operator-workspace.md` (Focus 5, SC10–SC13)
 **Worktree:** **new** from current `main` — e.g. `git worktree add ../fin-wt-host-prompt-assembly -b feat/host-prompt-assembly`. Do not reuse `wave-a-workspace-bind` (that branch is merged).
-**Tracker:** [#242](https://github.com/winter6205/fin/issues/242). Do not open a second prompt issue.
+**Tracker:** [#242](https://github.com/oocang/fin/issues/242). Do not open a second prompt issue.
 **Out of this worktree:** `/api/workspaces` or left-rail 工作区 picker; `fin_thread.project_root`; retrieve ranking; citation span length / repair cap; Soft-Track track names.
 **Per-ticket loop (all bullets, header 声明一次):** test-driven-development → `uv run pytest -q` → verification-before-completion → one commit on this branch
 **End-of-round:** after all bullets, one code-review (Standards + Spec) on the wave diff.

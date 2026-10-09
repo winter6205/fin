@@ -237,7 +237,7 @@ Closed by runs 17–26, so they are no longer open questions:
   *collects* 11 cases, not 12; the "12" in runs 9 and 20 was this file's 11 plus
   `test_live_host_graph_hop.py`'s 1. The repair was a rebuild of the read-only
   sibling's `dist/`, which the operator authorized for this ticket.
-- **B6 closed on its own PR, [#299](https://github.com/winter6205/fin/pull/299)**
+- **B6 closed on its own PR, [#299](https://github.com/oocang/fin/pull/299)**
   — the default suite's `$HOME` leak is fixed at the shared boundary: an autouse
   `tests/conftest.py` fixture points `HOME` at an empty per-run directory,
   following the file's existing `_strip_operator_llm_and_mcp_cwd_env` convention
@@ -298,7 +298,7 @@ Still open, with the reason:
   contradictory contracts — is indistinguishable from a violated wire contract.
   Fix is recorded build provenance asserted before launch, not a freshness
   comparison. Owner: `tests/retrieve/live_iknow_support.py`, and it belongs on
-  the already-open [#276](https://github.com/winter6205/fin/issues/276), whose
+  the already-open [#276](https://github.com/oocang/fin/issues/276), whose
   prerequisites section currently asks a human to "先确认主 checkout 已 pull +
   rebuild" — the mechanical assertion is exactly what that issue lacks. This
   attachment ticket does not own it and has not opened a new issue for it.

@@ -5,7 +5,7 @@
 **Spec link:** `specs/turn-trace-folds.md`
 **ACR:** all-yes (block below)
 **Per-ticket loop (all bullets):** tdd → typecheck+tests → code-review → verification-before-completion → one commit on the ticket branch
-**Tracker:** GitHub. Spec: [spec: turn trace folds](https://github.com/winter6205/fin/issues/248). Tickets: [T1 SSE and persist tool one-liners share args](https://github.com/winter6205/fin/issues/249), [T2 Thinking fold and tool fold on the live timeline](https://github.com/winter6205/fin/issues/250) (blocked by T1), [T3 Last-turn SVG thumbs](https://github.com/winter6205/fin/issues/251) (parallel).
+**Tracker:** GitHub. Spec: [spec: turn trace folds](https://github.com/oocang/fin/issues/248). Tickets: [T1 SSE and persist tool one-liners share args](https://github.com/oocang/fin/issues/249), [T2 Thinking fold and tool fold on the live timeline](https://github.com/oocang/fin/issues/250) (blocked by T1), [T3 Last-turn SVG thumbs](https://github.com/oocang/fin/issues/251) (parallel).
 
 ## ACR
 

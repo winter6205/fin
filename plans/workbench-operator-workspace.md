@@ -4,7 +4,7 @@
 **Approach:** Same branch `feat/workbench-operator-workspace`. Discard uncommitted T3 WIP first. Then two remaining tracers: inject the one default + drop compile-time cwd bake; unship T2 multi-root `/api/workspaces` bind/create. Do not rewrite host identity/soul/usage here (Wave B / #242).
 **Spec link:** `specs/workbench-operator-workspace.md` (Foci 1–4, SC1–SC8, SC14; Round 3 ACR)
 **Worktree:** existing `feat/workbench-operator-workspace` / `wave-a-workspace-bind`. Do not use the #242 prompt branch.
-**Tracker:** [#243](https://github.com/winter6205/fin/issues/243). Bullets are commits, not extra issues. Do not fold into #242.
+**Tracker:** [#243](https://github.com/oocang/fin/issues/243). Bullets are commits, not extra issues. Do not fold into #242.
 **Out of this worktree:** host prompt split; `12 SEC` / `page_limit` / 32-char copy; iknow code; per-工作区 catalog; `graph.py` importing `thread_store`; left rail; `fin_thread.project_root`.
 **Per-ticket loop (all bullets, header 声明一次):** test-driven-development → `uv run pytest -q` (and `npx tsc --noEmit` in `web/` when a bullet touches it) → verification-before-completion → one commit on this branch
 **End-of-round:** after remaining bullets, one code-review (Standards + Spec) on the wave diff; not per commit.
@@ -12,7 +12,7 @@
 
 **Already on this branch (keep):** T1 copy (`475ab62`); T2 `default_workspace_root` + never-cwd + one 知识库 (`424e76a`). T2 also landed multi-root registry/HTTP — T4 unships that half.
 
-**Next session:** only after this wave merges. Then `plans/host-prompt-assembly.md` + [#242](https://github.com/winter6205/fin/issues/242).
+**Next session:** only after this wave merges. Then `plans/host-prompt-assembly.md` + [#242](https://github.com/oocang/fin/issues/242).
 
 ## ACR（自 spec Round 3 原样粘贴）
 

@@ -30,7 +30,7 @@ spare call for a retried full-page scan and `88` must rise before T2e can retry
 one (*Leftovers* 9, T2e). Both facts belong to whoever lowers these numbers, so
 they are stated in the `.env.example` block as well as here.
 
-### Decision follow-up — 2026-09-27 ([issue #308](https://github.com/winter6205/fin/issues/308))
+### Decision follow-up — 2026-09-27 ([issue #308](https://github.com/oocang/fin/issues/308))
 
 This follow-up supersedes the open T2e decisions below; the original `88` value
 and calculations remain the historical T2a record.

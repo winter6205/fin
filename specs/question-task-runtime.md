@@ -4,7 +4,7 @@
 > **Architecture review:** Passed decision-level review; see the review record below. This is not implementation approval.
 > **Integration:** One of four module specifications. Issue #392 remains the only integrated product-acceptance contract.
 
-**Decision basis:** [issue map #386](https://github.com/winter6205/fin/issues/386) and its approved QE-01–QE-06 decisions.
+**Decision basis:** [issue map #386](https://github.com/oocang/fin/issues/386) and its approved QE-01–QE-06 decisions.
 
 ## Objective
 
@@ -19,41 +19,41 @@ alignment for a later contract-freezing step before parallel implementation.
 
 1. **Existing host state remains the only task authority.** The current LangGraph AgentState and configured checkpointer hold the authoritative task
    state; ThreadStore terminal rows, run status, and research snapshots are projections or separate concerns. Provenance: [issue #390 task-state
-   decision](https://github.com/winter6205/fin/issues/390#issuecomment-6059300396); [ADR 0002](../docs/adr/0002-langgraph-runtime.md), [ADR
+   decision](https://github.com/oocang/fin/issues/390#issuecomment-6059300396); [ADR 0002](../docs/adr/0002-langgraph-runtime.md), [ADR
    0005](../docs/adr/0005-agent-loop-verifier-langgraph-durability.md), and [ADR 0015](../docs/adr/0015-postgres-checkpointer.md).
 2. **A thread has one current task and may keep locatable archived tasks.** Switching preserves a historical task snapshot and its run/evidence
    references. Explicit restore rechecks current conditions, source authority, versions, and evidence applicability. Provenance: [issue
-   #390](https://github.com/winter6205/fin/issues/390#issuecomment-6059300396); [ADR 0026](../docs/adr/0026-workspace-streaming-resume.md).
+   #390](https://github.com/oocang/fin/issues/390#issuecomment-6059300396); [ADR 0026](../docs/adr/0026-workspace-streaming-resume.md).
 3. **Task and input changes have distinct versions.** Every accepted message, valid clarification reply, or explicit restore request advances input
    history once. A task version changes only when its goal, expected result, or necessary conditions materially change. A revision mismatch alone does
-   not invalidate unchanged work. Provenance: [issue #390](https://github.com/winter6205/fin/issues/390#issuecomment-6059300396); [issue #392
-   J13–J18](https://github.com/winter6205/fin/issues/392#issuecomment-6061003025).
+   not invalidate unchanged work. Provenance: [issue #390](https://github.com/oocang/fin/issues/390#issuecomment-6059300396); [issue #392
+   J13–J18](https://github.com/oocang/fin/issues/392#issuecomment-6061003025).
 4. **Every accepted input receives one semantic reconciliation before dependent work.** The model proposes the decision; the host validates and
    persists a consistent task transition, reconciliation marker, and execution disposition together. No separate classifier or second task store is
-   introduced. Provenance: [issue #390](https://github.com/winter6205/fin/issues/390#issuecomment-6059300396); existing routing in
+   introduced. Provenance: [issue #390](https://github.com/oocang/fin/issues/390#issuecomment-6059300396); existing routing in
    [graph.py](../src/fin/host/graph.py).
 5. **Clarification is for actionable user-held information, not operational failure.** Preserve the full question and choices, provide an Other path,
    and retain the selected choice and any original free text. Dismissal supplies no answer; obsolete replies cannot revive another task. Provenance:
-   [issue #389](https://github.com/winter6205/fin/issues/389#issuecomment-6059301489); [issue #392
-   J07](https://github.com/winter6205/fin/issues/392#issuecomment-6061003025).
+   [issue #389](https://github.com/oocang/fin/issues/389#issuecomment-6059301489); [issue #392
+   J07](https://github.com/oocang/fin/issues/392#issuecomment-6061003025).
 6. **Task outcome and turn outcome are separate.** A turn may end with an answer, partial result, clarification, cancellation, or system failure while
    a task remains active. A run ending successfully does not by itself establish task completion. Provenance: [issue
-   #389](https://github.com/winter6205/fin/issues/389#issuecomment-6059301489); [issue
-   #390](https://github.com/winter6205/fin/issues/390#issuecomment-6060725856); [issue #392
-   J12/J19/J20](https://github.com/winter6205/fin/issues/392#issuecomment-6061003025).
+   #389](https://github.com/oocang/fin/issues/389#issuecomment-6059301489); [issue
+   #390](https://github.com/oocang/fin/issues/390#issuecomment-6060725856); [issue #392
+   J12/J19/J20](https://github.com/oocang/fin/issues/392#issuecomment-6061003025).
 7. **Source selection and grounded assessment belong to peer modules.** Runtime consumes the source-scope decision and the evidence-grounding
    assessment, but does not redefine their meaning, duplicate their policy, or treat a saved source selection as current permission. Provenance:
-   [issue #390 responsibility decision](https://github.com/winter6205/fin/issues/390#issuecomment-6060725856);
+   [issue #390 responsibility decision](https://github.com/oocang/fin/issues/390#issuecomment-6060725856);
    [source-scope spec](question-source-scope.md); [grounded-answer spec](question-grounded-answer.md).
 8. **Host application integration has one owner.** The host integration owner wires graph compilation, HTTP entry points, prompts, stream/payload
    mapping, and history projections. Peer module development returns decisions or proposals and does not co-edit those integration files. Provenance:
    approved four-module ownership decision in this task.
 9. **The four module specs are independently developed; integration is covered by #392.** There is no fifth integration-acceptance spec. Concrete
    shared wire contracts must be frozen downstream before parallel implementation. Provenance: user's direction in this task and [issue
-   #392](https://github.com/winter6205/fin/issues/392#issuecomment-6061003025).
+   #392](https://github.com/oocang/fin/issues/392#issuecomment-6061003025).
 10. **No new provider, retrieval backend, service target, or numeric execution budget is selected here.** Continue to respect existing host
-    capabilities and limits. Provenance: [issue #390](https://github.com/winter6205/fin/issues/390#issuecomment-6060725856); [issue
-    #392](https://github.com/winter6205/fin/issues/392#issuecomment-6061003025).
+    capabilities and limits. Provenance: [issue #390](https://github.com/oocang/fin/issues/390#issuecomment-6060725856); [issue
+    #392](https://github.com/oocang/fin/issues/392#issuecomment-6061003025).
 
 ## Boundaries
 
@@ -153,7 +153,7 @@ task store.
    operations preserve the last consistent checkpoint and do not become user clarification.
 9. Runtime is independently verified against its mapped issue #392 cases J06/J07 and J11–J20, including J12's applicable variants. This module does
    not claim full product acceptance. At final four-module integration, the complete H/M/B matrix from [issue
-   #392](https://github.com/winter6205/fin/issues/392#issuecomment-6061003025) is required: H for J01–J22; M for the 19 mapped cases, with J12
+   #392](https://github.com/oocang/fin/issues/392#issuecomment-6061003025) is required: H for J01–J22; M for the 19 mapped cases, with J12
    requiring M only when a real responding model owns failure interpretation; B for J01–J21, with J22 browser inspection covered through J08/J21. J17
    and J19 require H+B. No fifth integration spec is added.
 

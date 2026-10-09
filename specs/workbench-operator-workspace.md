@@ -2,18 +2,18 @@
 
 ## Assumption gate (confirmed 2026-09-06; amended 2026-09-06)
 
-Operator confirmed the program in-thread (issue [#242](https://github.com/winter6205/fin/issues/242) as Focus 5, not as the first knife). Amendment 2026-09-06 confirmed via Wave A freeze: one global default 工作区; no `workspaces/<slug>`; no left-rail 指定/新建. These are in force:
+Operator confirmed the program in-thread (issue [#242](https://github.com/oocang/fin/issues/242) as Focus 5, not as the first knife). Amendment 2026-09-06 confirmed via Wave A freeze: one global default 工作区; no `workspaces/<slug>`; no left-rail 指定/新建. These are in force:
 
-1. Product is **fin**, an enterprise **knowledge-QA** entry point (the 入口, not the 库; [ADR 0090](../docs/adr/0090-product-identity-knowledge-qa-entry-point.md)). Product copy and identity must not call fin a research agent. SEC filings are the first corpus seed, not the product name ([#130](https://github.com/winter6205/fin/issues/130)).
+1. Product is **fin**, an enterprise **knowledge-QA** entry point (the 入口, not the 库; [ADR 0090](../docs/adr/0090-product-identity-knowledge-qa-entry-point.md)). Product copy and identity must not call fin a research agent. SEC filings are the first corpus seed, not the product name ([#130](https://github.com/oocang/fin/issues/130)).
 2. Three names, one each: **工作台** = the local web UI; **工作区** = the one global default directory `$HOME/.fin/default`; **知识库** = the one shared corpus behind retrieve / `list_files` / ingest. There is no sidebar control that creates a 工作区 or a second 知识库.
 3. Every **research thread** lives in that one 工作区. Multiplicity is threads, not filesystem folders. No left rail 指定/新建. No `$HOME/.fin/workspaces/<slug>`. Future many-libraries / tenants / collections is out of this spec.
 4. Do not add `fin_thread.project_root` as a product column. Do not scope `GET /api/threads` by directory. In-flight Wave A T3 WIP that added per-thread roots is discarded, not completed.
 5. **知识库** stays one process-wide catalog (`catalog_path` / ingest tree / **retrieve port**). **user profile** is `$HOME/.fin/user.md` only. **memory fact** workspace key is the one default path (tests inject home).
 6. Boot never treats `Path.cwd()` as the implicit 工作区. `compile_for_runtime` / `compile_graph` do **not** bake a process-wide `workspace_root` (not cwd, not default). HTTP/CLI inject `configurable.workspace_root` = resolved `$HOME/.fin/default` (tests inject home). `graph.py` does **not** import `thread_store`. Profile read and memory tools read the key from that configurable per call. Omit / empty at call time → typed `WorkspaceRootMissingError` (name implementer-open), **EXIT**, never `Path.cwd()`, never a silent default inside the graph. The `_IDEMPOTENCE_CACHE` key drops `workspace_root_key`.
-7. Host system prefix follows `docs/guides/prompt-development.md`: 说明书不是闸; system 无全库目录; prefix bytes stable inside a thread. Assembly order: identity → soul → usage → **user profile** → **memory existence pointer**. Four **track**s share identity/soul and swap usage only. Tool field caps (`page_limit`) and citation-gate numbers (32-character span, repair cap) stay in schema / **citation verifier**, not in persona prose. [#242](https://github.com/winter6205/fin/issues/242) is Focus 5 and runs after Foci 1–4 so identity is written once against the real roots.
+7. Host system prefix follows `docs/guides/prompt-development.md`: 说明书不是闸; system 无全库目录; prefix bytes stable inside a thread. Assembly order: identity → soul → usage → **user profile** → **memory existence pointer**. Four **track**s share identity/soul and swap usage only. Tool field caps (`page_limit`) and citation-gate numbers (32-character span, repair cap) stay in schema / **citation verifier**, not in persona prose. [#242](https://github.com/oocang/fin/issues/242) is Focus 5 and runs after Foci 1–4 so identity is written once against the real roots.
 8. Code may keep the parameter name `workspace_root` for the 工作区 directory (avoid a shotgun rename). It must not mean the UI. This spec is fin-only (no iknow / iknow-memory edits).
 9. Default `uv run pytest -q` stays green with no live SEC and no live memory server. Prompt gold sets re-pin; behavior of retrieve / verifier / Soft-Track track names does not change.
-10. Tracker: this file is the program contract. Focus 5 tracer is [#242](https://github.com/winter6205/fin/issues/242). Foci 1–4 stay on [#243](https://github.com/winter6205/fin/issues/243). T2 already landed default-root + never-cwd **and** a multi-root `/api/workspaces` bind/create registry; the remaining wave keeps the former and unships the latter.
+10. Tracker: this file is the program contract. Focus 5 tracer is [#242](https://github.com/oocang/fin/issues/242). Foci 1–4 stay on [#243](https://github.com/oocang/fin/issues/243). T2 already landed default-root + never-cwd **and** a multi-root `/api/workspaces` bind/create registry; the remaining wave keeps the former and unships the latter.
 
 → These are in force for this spec.
 
@@ -59,7 +59,7 @@ Quoted from `docs/CONTEXT.md` (exact copy, not redefinition):
   **Focus 4 — 钉语料**
   - `GET /api/corpus`, ingest doors (ADR 0047), and `list_files` stay one 知识库 for the process. Empty catalog is empty (no fallback to a hardcoded 12-filing SEC list). Repo `data/corpus/` may seed the first-run library; it is not identity text.
 
-  **Focus 5 — 钉说明书** ([#242](https://github.com/winter6205/fin/issues/242))
+  **Focus 5 — 钉说明书** ([#242](https://github.com/oocang/fin/issues/242))
   - Split host prompts: identity (Name / Kind = fin, enterprise **knowledge-QA** agent — the 入口, not the 库) → soul (how to speak / refuse; parametric memory is not evidence) → usage (tool _choice_ and citation _behavior_ per **track**) → **user profile** → **memory existence pointer**.
   - Identity does not name 10-Q, frozen-12, `cwd`, or “`$HOME/.fin` is the home of sessions”. Usage may say answers are grounded in this 知识库 via tools. Clarify options are not a hardcoded AAPL/MSFT/AMZN quarter list in all four prompts; research usage does not restate `page_limit` or “32 or more characters”.
   - Fixtures first, then copy (`docs/guides/prompt-development.md`). Adjacent turns in one thread: system prefix deep-equal (profile block may change if the file changed; identity/soul/usage/pointer bytes do not). Existing prompt tests re-pin.
@@ -132,7 +132,7 @@ minimal-change-verifier: yes — discard uncommitted T3 project_root WIP; remain
 
 **OVERALL: PASS — writing-plans may amend Wave A.** Spec path: `specs/workbench-operator-workspace.md`.
 
-Sequencing: two session-waves: Wave A = Foci 1–4 (`plans/workbench-operator-workspace.md`); Wave B = Focus 5 / [#242](https://github.com/winter6205/fin/issues/242) (`plans/host-prompt-assembly.md`). Do not fold Wave A into the #242 prompt branch.
+Sequencing: two session-waves: Wave A = Foci 1–4 (`plans/workbench-operator-workspace.md`); Wave B = Focus 5 / [#242](https://github.com/oocang/fin/issues/242) (`plans/host-prompt-assembly.md`). Do not fold Wave A into the #242 prompt branch.
 
 Affected surfaces (declared):
 

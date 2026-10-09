@@ -40,7 +40,7 @@ Quoted from `docs/CONTEXT.md`:
     - overflow: retrieve `limit` still hard-capped at 20 (existing port).
     - concurrent: two overlapping `retrieve` calls on one adapter instance each return the port/error dict shape without raising; two overlapping `get_xbrl_fact` lookups are read-only and independent. Ingest/OCR: **N/A single-writer** — concurrent writers on the same extracted tree are undefined; default suite does not claim a lock.
     - exception: UA unset (no SEC request); `retrieve_unavailable`; `sec_http_fail`; `ocr_required_unavailable`. Workspace 409 stays an existing host contract, not a substitute for these classes.
-- **Confirms with human:** none remaining (wayfinder map [fin S1 wayfinder: real EDGAR corpus you can ask and cite](https://github.com/winter6205/fin/issues/58) cleared 2026-08-25; operator ordered spec+plan+push).
+- **Confirms with human:** none remaining (wayfinder map [fin S1 wayfinder: real EDGAR corpus you can ask and cite](https://github.com/oocang/fin/issues/58) cleared 2026-08-25; operator ordered spec+plan+push).
 - **Out of this spec:**
   - Universal multi-format parse (PDF/Word/PPT/Excel) in this increment — per ADR 0037, parse and chunking are owned by fin (see specs/corpus-retrieval.md), not iknow-memory ingest.
   - Compile-time coupling or vendoring iknow-memory / a different repo named iknow into `src/fin`.

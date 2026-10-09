@@ -1,11 +1,11 @@
 # Plan: session-compaction
 
-**Status（2026-09-05）：** PR [#236](https://github.com/winter6205/fin/pull/236) 已合入 `main`。下方 T1–T3 已闭合。
+**Status（2026-09-05）：** PR [#236](https://github.com/oocang/fin/pull/236) 已合入 `main`。下方 T1–T3 已闭合。
 
 **Goal:** 研究线程按会话额度占用自动压缩；`/compact` 走同一闸；占用可映射到当前 thread。
 **Approach:** 先把占用计量和自动压接到 host（checkpoint `messages`），再并行做发送前拦截 `/compact` 与 thread 占用条。不改 `thread_store` 回合表，不上 `GET /api/status`。本文件是 MDP Task 4 的执行计划；`plans/memory-dialogue-platform.md` 已把 T4 划出其 worktree。以 ADR 0044 为准，取代条数窗。
 **Spec link:** `specs/memory-dialogue-platform.md` Focus 2 / SC5；合同 SSOT `docs/adr/0044-session-compaction-token-occupancy.md`
-**Map:** [fin wayfinder: memory-dialogue-platform](https://github.com/winter6205/fin/issues/144)（本计划不挂新 GitHub tracer）
+**Map:** [fin wayfinder: memory-dialogue-platform](https://github.com/oocang/fin/issues/144)（本计划不挂新 GitHub tracer）
 **Tracker:** FALLBACK — 本地 `plans/session-compaction.md`。操作者要求不 `gh issue create`。
 **Per-ticket loop (all bullets, header 声明一次):** test-driven-development → typecheck+tests（`uv run pytest -q`；触及 Soft-Track 时加 `-m soft_track`；web：`npx tsc --noEmit`）→ verification-before-completion → one commit on this worktree branch
 **End-of-round:** 三弹都落地后对整轮 diff 做一次 code-review（Standards + Spec）

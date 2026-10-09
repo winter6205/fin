@@ -53,12 +53,12 @@ After each execution, report the issue number, PR/commit, independently expected
 
 | Session | Issue | When to execute | Internal work |
 | --- | --- | --- | --- |
-| A — SQL | [#322](https://github.com/winter6205/fin/issues/322) | Start now, parallel with B/C/E/F | A1 contract landing, A2 implementation on synthetic PostgreSQL, A3a mechanism acceptance, then A3b approved-ledger acceptance when the source exists |
-| B — stability | [#323](https://github.com/winter6205/fin/issues/323) | Start now, parallel with A/C | B1 OCR isolation and B2 live-gate stability; one session owns the work, with disjoint modules if it delegates internally |
-| C — pipeline | [#324](https://github.com/winter6205/fin/issues/324) | C1 and VM pipeline gold now; dedicated-device measurement in the later deployment phase | Reproducible build and pipeline gold; retain C2 target-device evidence as deferred |
-| D — real user journey | [#330](https://github.com/winter6205/fin/issues/330) | Q1 starts now; B3 closure waits for A3b, B1/B2, C1 and VM pipeline gold, E and #276 | Q1 crop ruling, then B3 real-model browser/MCP/SQL/storage acceptance |
-| E — evidence and route | [#334](https://github.com/winter6205/fin/issues/334) | Start contract/routing work now; producer conformance in B3 waits for A2 | Versioned per-kind evidence schema, public-boundary tests, and domain-neutral source-backed QA |
-| F — Python type checker | [#335](https://github.com/winter6205/fin/issues/335) | Start now independently | Tool selection, measured baseline, scoped static-analysis gate |
+| A — SQL | [#322](https://github.com/oocang/fin/issues/322) | Start now, parallel with B/C/E/F | A1 contract landing, A2 implementation on synthetic PostgreSQL, A3a mechanism acceptance, then A3b approved-ledger acceptance when the source exists |
+| B — stability | [#323](https://github.com/oocang/fin/issues/323) | Start now, parallel with A/C | B1 OCR isolation and B2 live-gate stability; one session owns the work, with disjoint modules if it delegates internally |
+| C — pipeline | [#324](https://github.com/oocang/fin/issues/324) | C1 and VM pipeline gold now; dedicated-device measurement in the later deployment phase | Reproducible build and pipeline gold; retain C2 target-device evidence as deferred |
+| D — real user journey | [#330](https://github.com/oocang/fin/issues/330) | Q1 starts now; B3 closure waits for A3b, B1/B2, C1 and VM pipeline gold, E and #276 | Q1 crop ruling, then B3 real-model browser/MCP/SQL/storage acceptance |
+| E — evidence and route | [#334](https://github.com/oocang/fin/issues/334) | Start contract/routing work now; producer conformance in B3 waits for A2 | Versioned per-kind evidence schema, public-boundary tests, and domain-neutral source-backed QA |
+| F — Python type checker | [#335](https://github.com/oocang/fin/issues/335) | Start now independently | Tool selection, measured baseline, scoped static-analysis gate |
 
 All session issues carry `ready-for-agent`. #330 has native blockers #322, #323, #324, existing #276, and Session E for final integrated acceptance. Under the phase ruling above, #324's current B3 prerequisite covers C1 and VM pipeline gold; dedicated-device evidence remains a later requirement. Remote issue content and metadata are unchanged by this local clarification. Its Q1 decision can start despite those blockers. Session F remains an independent quality lane. Internal ordering remains in the session bodies and lane plans; it is not projected as extra issues.
 

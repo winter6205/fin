@@ -3,8 +3,8 @@
 **Goal:** S1 research increment: ingest-owned official HTML corpus, EDGAR-shaped catalog, MCP retrieve, ingest OCR, and XBRL fact lookup with a numeric gate — default pytest still fake-port, no second ranking stack in fin.
 **Approach:** Local ingest first so catalog and facts exist without SEC. Then filters and MCP retrieve can proceed in parallel. OCR and the fact tool hang off ingest. Contract remaining (unavailable EXITs, overlapping retrieve) lands with those bullets, not a leftover “polish” ticket.
 **Spec link:** `specs/s1-corpus-retrieve.md`
-**Parent map:** https://github.com/winter6205/fin/issues/58
-**Tracker:** GitHub `winter6205/fin` (main path). Spec https://github.com/winter6205/fin/issues/73 ; T1–T5 are #74–#78 with native blocking edges (T2/T3/T4/T5 ← T1).
+**Parent map:** https://github.com/oocang/fin/issues/58
+**Tracker:** GitHub `oocang/fin` (main path). Spec https://github.com/oocang/fin/issues/73 ; T1–T5 are #74–#78 with native blocking edges (T2/T3/T4/T5 ← T1).
 **ACR:** all-yes after spec patch (copied below; writing-plans owns commit split)
 
 bounded-context-guardian: yes — filing freeze/catalog/facts stay in `corpus`; ranking client stays behind retrieve port in `retrieve`; graph bind stays in `host`; iknow-memory remains a sibling MCP, no `src/fin` vendoring; no `controllers/`/`services/` layer packages.

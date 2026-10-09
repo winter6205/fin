@@ -1,10 +1,10 @@
 # Plan: Question Workspace Completion
 
-**Tracker:** [#414](https://github.com/winter6205/fin/issues/414). This issue contains the complete plan; T1–T5 are internal tasks.
+**Tracker:** [#414](https://github.com/oocang/fin/issues/414). This issue contains the complete plan; T1–T5 are internal tasks.
 **Goal:** The research-thread workspace presents authoritative task, source, clarification, and input outcomes and restores archived work only after Runtime proves adoption.
 **Approach:** Close the remaining Workspace gaps from #410 by first freezing how the existing authoritative projection and operation results reach the UI, then completing source/task visibility, clarification lifecycle, active input, and archive restore in the existing thread surface. Workspace implementation may proceed against the frozen Runtime T1 seam; integrated acceptance waits for the specific Runtime, Source Scope, and Grounded Answer facts each behavior consumes. Runtime remains the task authority and owns the single final #392 integration gate.
 **Spec link:** [specs/question-workspace.md](../specs/question-workspace.md)
-**Related issues:** [#411 — archive restore state machine](https://github.com/winter6205/fin/issues/411), [#412 — active input decision and notices](https://github.com/winter6205/fin/issues/412)
+**Related issues:** [#411 — archive restore state machine](https://github.com/oocang/fin/issues/411), [#412 — active input decision and notices](https://github.com/oocang/fin/issues/412)
 **Related plans:** [Runtime completion (#406)](question-task-runtime-completion.md), [Source Scope completion (#405)](question-source-scope-completion.md), [Grounded Answer completion (#413)](question-grounded-answer-completion.md)
 **Implementation entry vs integrated acceptance:** Freeze the original Runtime T1 shared seam before Workspace implementation. Do not wait for all Runtime or Source Scope completion work before implementing the Workspace against that seam. Each bullet states its producer prerequisites for integrated acceptance separately; these dependencies do not make Workspace a prerequisite of Runtime or Source Scope.
 **Per-bullet loop (implementation bullets):** TDD → relevant scoped typecheck/tests → verification-before-completion.

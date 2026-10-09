@@ -2,7 +2,7 @@
 
 **Enterprise knowledge-QA agent** (企业知识问答助手) — the 入口, not the 库: the operator asks in a **research thread** on the **工作台**; each turn is a **track**; tools and the **citation verifier** bind only to the **grounded** track. The first corpus is operator-held filings behind the **retrieve port** — a **source**, not the product. Citation checks run in code; LangGraph is the durable runtime (checkpoint / resume), not a retrieve-then-generate flowchart.
 
-Product identity is SSOT'd in [`docs/CONTEXT.md`](docs/CONTEXT.md) and ruled in [ADR 0090](docs/adr/0090-product-identity-knowledge-qa-entry-point.md); the program contract is [`specs/enterprise-kb-agent.md`](specs/enterprise-kb-agent.md), mapped by [wayfinder #130](https://github.com/winter6205/fin/issues/130).
+Product identity is SSOT'd in [`docs/CONTEXT.md`](docs/CONTEXT.md) and ruled in [ADR 0090](docs/adr/0090-product-identity-knowledge-qa-entry-point.md); the program contract is [`specs/enterprise-kb-agent.md`](specs/enterprise-kb-agent.md), mapped by [wayfinder #130](https://github.com/oocang/fin/issues/130).
 
 This repository is the SSOT. Do not keep parallel copies under `projects/test`.
 
@@ -26,7 +26,7 @@ The archived 2026-08 「SEC 财报研究工作台」 research is session-only �
 
 v1 host-agent ships: ingest artifacts are in git; CLI (`python -m fin`) and HTTP `POST /ask` share one compiled host graph. Default model is `MiniMax-M3` via `FIN_MODEL` + official MiniMax Chat Completions `FIN_BASE_URL` (ADR 0022). Soft-Track (ADR 0027, PR #57) routes each turn to `dialogue` / `clarify` / `off_topic` / `grounded`; only the grounded track binds tools and the citation verifier. Opt-in contracts: `uv run pytest -q -m soft_track`.
 
-**NOW (2026-08-30):** the destination is **fin as an enterprise knowledge-QA agent** — [wayfinder #130](https://github.com/winter6205/fin/issues/130), contracted by `specs/enterprise-kb-agent.md` in five foci:
+**NOW (2026-08-30):** the destination is **fin as an enterprise knowledge-QA agent** — [wayfinder #130](https://github.com/oocang/fin/issues/130), contracted by `specs/enterprise-kb-agent.md` in five foci:
 
 1. **Grounded answers in the workspace** — comparisons and numbers come from host tools, not free-prose tables; the citation verifier still gates any prose answer.
 2. **Operable corpus on Corpus 首页** — grow the library past the frozen 12 — a local GOOG `10-K` fixture is the first such addition, then `8-K`, more issuers — through `list_files` filters and ingest.
@@ -34,7 +34,7 @@ v1 host-agent ships: ingest artifacts are in git; CLI (`python -m fin`) and HTTP
 4. **Multi-issuer synthesize** — fan out in the host graph, then synthesize; every surviving claim still passes the verifier; over-cap is a typed overflow.
 5. **Trust in the workspace** — `evidence_locators` persisted on the run row, `GET /health`, and the eval count command.
 
-The **工作台** web UI is the only product entry; SEC filings are the first corpus, not the product name. [#91](https://github.com/winter6205/fin/issues/91) and [#125](https://github.com/winter6205/fin/issues/125) stay useful as **workstream** notes (vertical slice, quality loop) and are superseded as the product destination. Naming rule from [ADR 0090](docs/adr/0090-product-identity-knowledge-qa-entry-point.md): the internal track enum is `grounded` (ADR 0061); product copy and `docs/CONTEXT.md` must not call fin a research agent. Opt-in eval: `uv run pytest -q -m eval` (9 gold cases).
+The **工作台** web UI is the only product entry; SEC filings are the first corpus, not the product name. [#91](https://github.com/oocang/fin/issues/91) and [#125](https://github.com/oocang/fin/issues/125) stay useful as **workstream** notes (vertical slice, quality loop) and are superseded as the product destination. Naming rule from [ADR 0090](docs/adr/0090-product-identity-knowledge-qa-entry-point.md): the internal track enum is `grounded` (ADR 0061); product copy and `docs/CONTEXT.md` must not call fin a research agent. Opt-in eval: `uv run pytest -q -m eval` (9 gold cases).
 
 ## Running the workspace server (T1)
 

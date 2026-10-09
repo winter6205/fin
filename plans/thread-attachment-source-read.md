@@ -106,7 +106,7 @@ OVERALL: PASS
    - **Surface:** the observation contract, vision-call budgets, provider configuration, and the fin attachment preparation port.
    - **Decision:** the executable observation predicate, conservative unknown handling, one run-wide retry reserve (`80 + 8 + 1 = 89`), and the separate vision port reusing `FIN_MODEL` / `FIN_BASE_URL` / `FIN_API_KEY` are recorded in the spec. A per-turn monetary ceiling is explicitly deferred; it is not a T2e prerequisite, while provider-reported usage/cost remains part of run accounting.
    - `[parallel]` with T2c and T2d; this decision does not wait for their code.
-   - Status: [x] decided — [issue #308](https://github.com/winter6205/fin/issues/308) decision questions resolved 2026-09-27. T2e remains blocked by T2d only; the 89-call configuration and runtime enforcement are implementation obligations of T2e.
+   - Status: [x] decided — [issue #308](https://github.com/oocang/fin/issues/308) decision questions resolved 2026-09-27. T2e remains blocked by T2d only; the 89-call configuration and runtime enforcement are implementation obligations of T2e.
 
 6. **T2e — Persist reusable full-page and crop observations** — tag: `[implementation]`
    - **Inherits:** spec and ADR 0089: fin's configured vision provider scans each rendered full page; a later detail request inspects the stored original page/crop only when its observation lacks that detail; observations are versioned derived material with original-image provenance.

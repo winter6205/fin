@@ -66,6 +66,14 @@ data/workspace/
 # corpus rebuild products (T13, rebuildable via fin.corpus.rebuild)
 data/corpus/blocks/
 
+# Ingest runtime state, written beside the corpus by `fin.corpus.index_job`,
+# `fin.corpus.pushed_records` and the ingest worker. These record the operator's
+# own pushes for the current checkout, so a `git add -A` would commit several
+# megabytes of per-run churn straight into the frozen golden dataset directory.
+data/corpus/index_jobs.jsonl
+data/corpus/pushed_records.jsonl
+data/corpus/ingest_worker_journals/
+
 # ablation eval products (T22, rebuildable via `python -m fin.eval.ablation run`;
 # carries per-run latency numbers, so committing it would churn every run)
 data/eval/
@@ -76,6 +84,10 @@ web/node_modules
 
 # Local git worktrees registered under the repo dir (see .claude/worktrees too)
 .worktrees/
+
+# Checkouts the iknow task runner registers beside this repo's own worktrees;
+# machine-local scaffolding, never a product artifact.
+.iknow/
 
 # Docs local-only (keep on disk). Product SSOT stays tracked:
 # docs/CONTEXT.md, docs/adr/, specs/, active plans/, docs/guides/prompt-development.md

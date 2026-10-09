@@ -5,7 +5,7 @@
 **Spec link:** `specs/operator-console-host-contract.md`
 **Pair plan:** iknow-memory `plans/operator-console.md` (T3 envelope / T4 `read_source` must exist before a live MCP run; Fake tests do not wait)
 **Tracker:** **local markdown fallback** — operator: 本程序不开 GitHub issue tracker；票以本文件 Tasks 编号为准。
-**Map (memory repo):** [操作员完整控制台：同一权威源上的检视、喂数与图投影](https://github.com/winter6205/iknow-memory/issues/201)
+**Map (memory repo):** [操作员完整控制台：同一权威源上的检视、喂数与图投影](https://github.com/oocang/iknow-memory/issues/201)
 **ACR:** all-yes (copied from spec · 2026-09-10)
 **Per-ticket loop (all bullets):** tdd → typecheck+tests (`uv run pytest -q`) → verification-before-completion → one commit on the ticket branch
 **End-of-round:** 全部子弹落地后对整轮 diff 做一次 code-review（Standards + Spec）

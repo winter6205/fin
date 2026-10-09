@@ -3,8 +3,8 @@
 **Goal:** 操作者只在 **workspace** 里把 fin 当企业知识问答入口用（**knowledge-QA** entry point，不是知识库；`docs/CONTEXT.md` **fin**、ADR 0090）：问得到带引用的答案、库能看能扩、问完能盯/导出/停、多家合成仍过 citation gate、每轮可审计且进程健康。
 **Approach:** 粗颗粒度五波，对齐 spec 五个 Focus：Trust 与 Corpus 不互相阻塞；Grounded answers 可与它们并行；Workflow 的导出依赖对比工具；Fan-out 先接受 ADR 0034 再改 **host graph**。每波一条可演示竖切（API + UI 如需要 + 测试）。默认 `uv run pytest -q` 不碰 live SEC / live memory。BM25 保持归档（ADR 0032）。
 **Spec link:** `specs/enterprise-kb-agent.md`
-**Map:** [fin wayfinder: enterprise knowledge-base Agent](https://github.com/winter6205/fin/issues/130)
-**Tracker:** GitHub `winter6205/fin` 主路径。[spec: enterprise-kb-agent](https://github.com/winter6205/fin/issues/134)；T1 [#135](https://github.com/winter6205/fin/issues/135)；T2 [#136](https://github.com/winter6205/fin/issues/136)；T3 [#137](https://github.com/winter6205/fin/issues/137)；T4 [#138](https://github.com/winter6205/fin/issues/138) blocked by T3；T5 [#139](https://github.com/winter6205/fin/issues/139)；T6 [#140](https://github.com/winter6205/fin/issues/140) blocked by T5+T3。
+**Map:** [fin wayfinder: enterprise knowledge-base Agent](https://github.com/oocang/fin/issues/130)
+**Tracker:** GitHub `oocang/fin` 主路径。[spec: enterprise-kb-agent](https://github.com/oocang/fin/issues/134)；T1 [#135](https://github.com/oocang/fin/issues/135)；T2 [#136](https://github.com/oocang/fin/issues/136)；T3 [#137](https://github.com/oocang/fin/issues/137)；T4 [#138](https://github.com/oocang/fin/issues/138) blocked by T3；T5 [#139](https://github.com/oocang/fin/issues/139)；T6 [#140](https://github.com/oocang/fin/issues/140) blocked by T5+T3。
 **Per-ticket loop (all bullets, header 声明一次):** test-driven-development → typecheck+tests（`uv run pytest -q`；触及 Soft-Track 时加 `-m soft_track`；eval 弹加 `-m eval`；web：`npx tsc --noEmit`）→ verification-before-completion → one commit on the ticket branch
 **End-of-round:** 五波都落地后对整轮 diff 做一次 code-review（Standards + Spec）；单弹 loop 不重复整轮 review。
 **待写入:** empty — 术语均引用 CONTEXT / spec；ADR 0034 由 T5 从 proposed 标为 accepted，不新开词条。
@@ -44,7 +44,7 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
    - **Surface:** host（thread_store / workspace HTTP）+ tests/eval
    - **Acceptance:** GET 历史含 `evidence_locators`；follow-up 的本轮 evidence 不含上一轮 page；`GET /health` 两种 degraded 可观察；文档化命令对 `-m eval` 打出两个整数；`uv run pytest -q` exits 0。
    - **Completion:** 列名、health 探测实现、计数脚本位置由 implementer 选。
-   - Status: [ ] pending — [#135](https://github.com/winter6205/fin/issues/135)
+   - Status: [ ] pending — [#135](https://github.com/oocang/fin/issues/135)
    - [parallel]
 
 2. **Corpus: form types on catalog and Corpus 首页** — tag: `[implementation]`
@@ -52,7 +52,7 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
    - **Surface:** corpus + host catalog tool + web Corpus 首页
    - **Acceptance:** 负例空列表、正例有行、首页/API 能看见 form；`uv run pytest -q` exits 0；`web/` `tsc --noEmit` exits 0。
    - **Completion:** 是否扩展现有 `form` filter 键、卡片字段名由 implementer 选。
-   - Status: [ ] pending — [#136](https://github.com/winter6205/fin/issues/136)
+   - Status: [ ] pending — [#136](https://github.com/oocang/fin/issues/136)
    - [parallel]
 
 3. **Grounded answers: comparison tools in the thread** — tag: `[implementation]`
@@ -60,7 +60,7 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
    - **Surface:** host tools + stream/turn table + web thread
    - **Acceptance:** scripted research 周转对比工具后 GET 含结构化对比；只编数字的答案非 `done`；既有 refuse/step_cap 空 citations 仍绿。
    - **Completion:** 一个工具还是两个、UI 是 table 还是 diff，由 implementer 选。
-   - Status: [ ] pending — [#137](https://github.com/winter6205/fin/issues/137)
+   - Status: [ ] pending — [#137](https://github.com/oocang/fin/issues/137)
    - [parallel]
 
 4. **Workflow: watchlist, in-app notice, stop, export** — tag: `[implementation]`
@@ -68,7 +68,7 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
    - **Surface:** host workspace HTTP + web
    - **Acceptance:** watchlist 重启后仍在；Stop 与 409 可观察；export 有文件 body、缺 run 404；有 watched filing 进本地 catalog 时工作台能看到 notice。
    - **Completion:** 存储与路由拼写开放；export 绑定「本 thread 上一对比」只要 T3 已提供对比结果形状。
-   - Status: [ ] pending — [#138](https://github.com/winter6205/fin/issues/138)
+   - Status: [ ] pending — [#138](https://github.com/oocang/fin/issues/138)
    - [blocks: T3]
 
 5. **Accept issuer fan-out topology (ADR 0034)** — tag: `[decision]`
@@ -76,7 +76,7 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
    - **Surface:** `docs/adr/0034-host-graph-issuer-fanout.md`
    - **Acceptance:** 该 ADR Status 为 `accepted`；正文仍禁止无界并行、禁止无 join 的 per-issuer verifier、禁止在 fan-out 节点做 hybrid retrieve。
    - **Completion:** 是否补一句 cap 的推荐默认值由 implementer/决策作者选，不阻塞 Status 翻转。
-   - Status: [ ] pending — [#139](https://github.com/winter6205/fin/issues/139)
+   - Status: [ ] pending — [#139](https://github.com/oocang/fin/issues/139)
    - [parallel]
 
 6. **Multi-issuer synthesize with cap** — tag: `[implementation]`
@@ -84,5 +84,5 @@ minimal-change-verifier: yes — this spec is **one logical program**, not one c
    - **Surface:** host graph + workspace 转述
    - **Acceptance:** scripted 满 cap 合成带齐 citation；超 cap typed overflow；`uv run pytest -q` exits 0。
    - **Completion:** N 的数字、Send vs 其它 fan-out API 在 ADR 已约束形状下由 implementer 选。
-   - Status: [ ] pending — [#140](https://github.com/winter6205/fin/issues/140)
+   - Status: [ ] pending — [#140](https://github.com/oocang/fin/issues/140)
    - [blocks: T5, T3]

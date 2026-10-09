@@ -63,6 +63,16 @@ from test_ledger_readonly_boundary import (
     VISIBLE_THROUGH_VIEW,
 )
 
+# Same reason as above: ``live_iknow_support`` owns the ``FIN_LIVE_IKNOW_ROOT``
+# contract, so this leg resolves the producer checkout the same way the ``mcp``
+# legs do rather than re-declaring the default.
+from live_iknow_support import IKNOW_ROOT
+
+# Same reasoning for the producer root: ``live_iknow_support`` owns how
+# ``FIN_LIVE_IKNOW_ROOT`` resolves, so this leg cannot drift onto a different
+# iknow build than the other live legs drive.
+from live_iknow_support import IKNOW_ROOT
+
 pytestmark = pytest.mark.sql_live
 
 HERE = Path(__file__).parent
@@ -71,8 +81,6 @@ SCHEMA_SQL = (FIXTURES / "001_schema.sql").read_text()
 SEED_SQL = (FIXTURES / "002_seed.sql").read_text()
 
 READER_URL = os.environ.get("FIN_SQL_READER_URL", "")
-IKNOW_ROOT = Path(os.environ.get("FIN_LIVE_IKNOW_ROOT")
-                  or "/home/winner/projects/iknow-memory")
 IKNOW_DIST = IKNOW_ROOT / "dist"
 DB_CONTAINER = os.environ.get("FIN_SQL_DB_CONTAINER", "fin-sql-business-db")
 

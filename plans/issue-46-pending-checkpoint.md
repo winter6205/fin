@@ -29,4 +29,4 @@ After persisting mid-flight refuse `RunRecord`, finalize checkpoint via new `_Lo
 3. [x] done — Extend `test_scripted_model_raises_emits_terminal_status` + add resume 204 assertion
 4. [x] done — Regression: crash resume test still has `pending_checkpoint: true`
 
-**Shipped:** [PR #47](https://github.com/winter6205/fin/pull/47) on `main`.
+**Shipped:** [PR #47](https://github.com/oocang/fin/pull/47) on `main`.

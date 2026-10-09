@@ -373,10 +373,10 @@ planning; old lost origins cannot be reconstructed by assumption.
 
 ### Follow-up issues
 
-- [#353: derived-store revision reconciliation](https://github.com/winter6205/fin/issues/353)
-- [#354: current-data/storage capacity and admission policy](https://github.com/winter6205/fin/issues/354)
-- [#355: backup erasure and safe restore](https://github.com/winter6205/fin/issues/355)
-- [#356: explicit semantic entity merge/split workflows](https://github.com/winter6205/fin/issues/356)
+- [#353: derived-store revision reconciliation](https://github.com/oocang/fin/issues/353)
+- [#354: current-data/storage capacity and admission policy](https://github.com/oocang/fin/issues/354)
+- [#355: backup erasure and safe restore](https://github.com/oocang/fin/issues/355)
+- [#356: explicit semantic entity merge/split workflows](https://github.com/oocang/fin/issues/356)
 
 These issues do not defer the immediate visibility guard, finite GC contract,
 or stable identity requirements defined here.

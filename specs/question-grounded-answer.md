@@ -83,7 +83,7 @@ numeric checks, reports truthful capabilities and failures, and enforces executi
 assertion under its existing contract. The model cannot verify its own evidence, claim a host check passed, or commit task state.
 
 Existing evidence serialization remains authoritative in [enterprise-evidence-contract.md](enterprise-evidence-contract.md) and [issue
-#334](https://github.com/winter6205/fin/issues/334). Citation verification remains code-only under
+#334](https://github.com/oocang/fin/issues/334). Citation verification remains code-only under
 [ADR 0082](../docs/adr/0082-citation-verifier-code-only.md). These checks establish mechanical identity, structure, quote/row, or numeric validity;
 they do not establish semantic support, applicability, complete goal coverage, or task completion. In particular, a quote check passing does not mean
 the evidence answers the asked question.
@@ -126,22 +126,22 @@ decisions.
 ### Confirmed inherited assumptions
 
 1. fin remains an enterprise knowledge-QA entry point; finance is the first corpus domain, not the product boundary. **Confirmed by** [ADR
-   0090](../docs/adr/0090-product-identity-knowledge-qa-entry-point.md) and [QE-01, issue #387](https://github.com/winter6205/fin/issues/387).
+   0090](../docs/adr/0090-product-identity-knowledge-qa-entry-point.md) and [QE-01, issue #387](https://github.com/oocang/fin/issues/387).
 2. Representative goals include fact/rule lookup, comparison or synthesis, and judgments with user-specific conditions. **Confirmed by** [QE-01, issue
-   #387](https://github.com/winter6205/fin/issues/387), [QE-04, issue #390](https://github.com/winter6205/fin/issues/390), and [QE-05, issue
-   #391](https://github.com/winter6205/fin/issues/391).
+   #387](https://github.com/oocang/fin/issues/387), [QE-04, issue #390](https://github.com/oocang/fin/issues/390), and [QE-05, issue
+   #391](https://github.com/oocang/fin/issues/391).
 3. Model semantics and host guarantees are separate: the model judges support, applicability, coverage, and useful next steps; the host enforces
    permissions, identity/version, mechanical verification, limits, and persistence. **Confirmed by** [QE-04, issue
-   #390](https://github.com/winter6205/fin/issues/390) and [QE-05, issue #391](https://github.com/winter6205/fin/issues/391).
+   #390](https://github.com/oocang/fin/issues/390) and [QE-05, issue #391](https://github.com/oocang/fin/issues/391).
 4. Runtime owns task/input state and transitions; Source Scope owns current source permission/restriction; Workspace owns presentation and
-   interaction. This module consumes those decisions without a second state or permission authority. **Confirmed by** [issue #388](https://github.com/winter6205/fin/issues/388),
-   [issue #389](https://github.com/winter6205/fin/issues/389), and [issue #390](https://github.com/winter6205/fin/issues/390).
+   interaction. This module consumes those decisions without a second state or permission authority. **Confirmed by** [issue #388](https://github.com/oocang/fin/issues/388),
+   [issue #389](https://github.com/oocang/fin/issues/389), and [issue #390](https://github.com/oocang/fin/issues/390).
 5. Evidence serialization and admission remain under the existing [enterprise evidence contract](enterprise-evidence-contract.md); citation
    verification stays code-only under [ADR 0082](../docs/adr/0082-citation-verifier-code-only.md). A mechanical pass does not decide semantic
-   sufficiency. **Confirmed by** [issue #334](https://github.com/winter6205/fin/issues/334), ADR 0082, and
-   [QE-04/#390](https://github.com/winter6205/fin/issues/390).
+   sufficiency. **Confirmed by** [issue #334](https://github.com/oocang/fin/issues/334), ADR 0082, and
+   [QE-04/#390](https://github.com/oocang/fin/issues/390).
 6. The minimum representative journey set and independent H/M/B boundaries are defined by [QE-06, issue
-   #392](https://github.com/winter6205/fin/issues/392). They are requirements, not evidence of implementation success.
+   #392](https://github.com/oocang/fin/issues/392). They are requirements, not evidence of implementation success.
 
 ### Existing vocabulary
 

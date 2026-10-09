@@ -1,7 +1,7 @@
 # Spec: operator-console-host-contract
 
 > **Status:** assumption gate confirmed in-thread 2026-09-10. Pair spec: iknow-memory worktree `specs/operator-console.md`.
-> **Map (memory repo):** [操作员完整控制台：同一权威源上的检视、喂数与图投影](https://github.com/winter6205/iknow-memory/issues/201)
+> **Map (memory repo):** [操作员完整控制台：同一权威源上的检视、喂数与图投影](https://github.com/oocang/iknow-memory/issues/201)
 
 ## Objective
 

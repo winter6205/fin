@@ -25,7 +25,7 @@ observation clause (`specs/thread-attachment-source-read.md:56`), the T2a
 record (the four bounds, the `88 = 80 + 8` floor it could not price a retry
 into — *Leftovers* 2, 9, 10), the T2d record (page/region core, the refusal
 door and the wiring it assigned to T2e), and the T2e0 decision recorded at
-plan item 5a ([issue #308](https://github.com/winter6205/fin/issues/308)):
+plan item 5a ([issue #308](https://github.com/oocang/fin/issues/308)):
 one run-wide retry reserve `80 + 8 + 1 = 89`, the vision port reusing
 `FIN_MODEL` / `FIN_BASE_URL` / `FIN_API_KEY`, and a monetary ceiling
 explicitly deferred.
@@ -604,7 +604,7 @@ with no key value recorded.
    half of A9's clause is therefore unmet until **T2f**'s run record exists —
    R1 made a run *shareable* (leftover 1), not durable.
 5. **The monetary ceiling stays deferred**, per the T2e0 decision recorded at
-   plan item 5a ([issue #308](https://github.com/winter6205/fin/issues/308)),
+   plan item 5a ([issue #308](https://github.com/oocang/fin/issues/308)),
    and nothing here smuggles one in: `test_no_ceiling_is_enforced_here:395`
    pins that the port prices nothing, and the ledger counts calls, never
    money. What this ticket makes possible is the reading T2a *Leftovers* 2
