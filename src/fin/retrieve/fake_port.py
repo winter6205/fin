@@ -43,6 +43,8 @@ from fin.retrieve.input_validation import (
 from fin.retrieve.port import (
     DATABASE_ROWS_KEY,
     Chunk,
+    STRUCTURED_SEARCH_UNAVAILABLE_CODE,
+    _structured_query_refusal_code,
     new_database_rows,
     resolve_search_mode,
     RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY,
@@ -249,6 +251,7 @@ class FakeRetrievePort:
         filing_date: str | None = None,
         limit: int = 8,
         search_mode: str | None = None,
+        structured_request: Mapping[str, Any] | None = None,
         sql_window_start: str | None = None,
         sql_window_end: str | None = None,
     ) -> dict[str, Any]:
@@ -309,6 +312,26 @@ class FakeRetrievePort:
         ledger = self.input_validation_failures
         validate_query(query, ledger=ledger)
         effective_search_mode = resolve_search_mode(search_mode)
+        refusal = _structured_query_refusal_code(
+            structured_request,
+            search_mode=effective_search_mode,
+            has_outer_filters=any(
+                value is not None
+                for value in (
+                    document_id,
+                    cik,
+                    form,
+                    ticker,
+                    filing_date,
+                    sql_window_start,
+                    sql_window_end,
+                )
+            ),
+        )
+        if refusal is not None:
+            return {"error": refusal}
+        if structured_request is not None:
+            return {"error": STRUCTURED_SEARCH_UNAVAILABLE_CODE}
         validate_filters(
             document_id=document_id,
             cik=cik,
@@ -333,10 +356,20 @@ class FakeRetrievePort:
             }
         )
 
-        # Unknown document_id filter: the call is well-formed
-        # but the corpus has no such document. ``None`` (the
-        # default) means "no membership test" so the filter
-        # passes through.
+        configured = self._configured_outcome(query, effective_search_mode)
+        if configured is not None:
+            return configured
+        return self._ordinary_hits(
+            query,
+            {"document_id": document_id, "cik": cik, "form": form,
+             "ticker": ticker, "filing_date": filing_date},
+            limit,
+        )
+
+    def _configured_outcome(
+        self, query: str, search_mode: str | None,
+    ) -> dict[str, Any] | None:
+        """Resolve recorded index outcomes before ordinary document hits."""
         if self._fast_graph_empty:
             # The recorded Fast job fact: an empty entity-relation
             # graph can cite no chunk, so the hit table is deliberately
@@ -355,7 +388,7 @@ class FakeRetrievePort:
                 "chunks": [],
                 RETRIEVE_OUTCOME_COMMUNITY_SUMMARY_UNREADY: True,
             }
-        if effective_search_mode == "sql":
+        if search_mode == "sql":
             # The sql 档's own answer shape (spec §7/§8.0), mirroring the
             # real producer's three outcomes: a DECLARED failure keeps
             # its own token as a typed EXIT dict; scripted rows ride the
@@ -364,19 +397,31 @@ class FakeRetrievePort:
             # RECORDED named empty — the same job fact the MCP adapter
             # records off the wire, never the silent document-miss
             # envelope the host would read as 语料未就绪.
-            if self._sql_named_failure is not None:
-                return {"error": self._sql_named_failure}
-            rows = self._database_rows.get(query)
-            if rows:
-                return {
-                    "chunks": [],
-                    DATABASE_ROWS_KEY: new_database_rows(rows),
-                }
-            return {
-                "chunks": [],
-                DATABASE_ROWS_KEY: new_database_rows([]),
-                RETRIEVE_OUTCOME_SQL_NO_MATCHING_ROWS: True,
-            }
+            return self._scripted_sql(query)
+        return None
+
+    def _scripted_sql(self, query: str) -> dict[str, Any]:
+        if self._sql_named_failure is not None:
+            return {"error": self._sql_named_failure}
+        rows = self._database_rows.get(query)
+        if rows:
+            return {"chunks": [], DATABASE_ROWS_KEY: new_database_rows(rows)}
+        return {
+            "chunks": [],
+            DATABASE_ROWS_KEY: new_database_rows([]),
+            RETRIEVE_OUTCOME_SQL_NO_MATCHING_ROWS: True,
+        }
+
+    def _ordinary_hits(
+        self,
+        query: str,
+        filters: Mapping[str, str | None],
+        limit: int,
+    ) -> dict[str, Any]:
+        document_id = filters.get("document_id")
+        cik, form = filters.get("cik"), filters.get("form")
+        ticker, filing_date = filters.get("ticker"), filters.get("filing_date")
+        # An unknown document is a legal miss; None leaves membership unfiltered.
         if (
             document_id is not None
             and self._known_doc_ids is not None

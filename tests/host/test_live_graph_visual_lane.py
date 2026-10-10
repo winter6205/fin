@@ -35,6 +35,12 @@ Not real, and said so rather than hidden: the run's *plan* is a
 takes, not the planner that chooses to take it. Every face the visual lane
 itself reaches — provider, bytes, store, renderer — is real.
 
+One leg is a refusal leg, and it is the reason the witnesses exist: a visual
+ask the current source scope refuses must refuse before the bucket is opened,
+before the renderer runs, and before the provider is asked, so that leg counts
+stored-object reads, renderer draws, provider calls, and the run's ledger
+charge through wrappers that only observe the real faces they forward to.
+
 Opt-in
 ------
 ``pytestmark = pytest.mark.mcp`` keeps this out of the default hermetic run.
@@ -74,6 +80,7 @@ from fin.host.attachment_store import (
 from fin.host.attachment_vision import VisionCallResult
 from fin.host.citation_gate import QUOTABLE_EVIDENCE_KINDS
 from fin.host.evidence_contract import EVIDENCE_SCHEMA_VERSION
+from fin.host.source_scope import SCOPE_ATTACHMENT_NOT_PERMITTED, ScopeRestriction
 from fin.host.state import reset_input_state
 from fin.host.thread_store import PostgresThreadStore
 from fin.host.visual_evidence import (
@@ -397,6 +404,46 @@ class _RecordingVision:
         return resolve_vision_model_config().model_id
 
 
+class _CountingObjects:
+    """The configured bucket, wrapped so a read of stored bytes stays observable.
+
+    The wrapper only records the key it was asked for and forwards the real
+    read: the bytes returned are the ones SeaweedFS holds, so a leg that
+    asserts "no object was read" is asserting about the real door rather than a
+    substitute for it.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+        self.reads: list[str] = []
+
+    def get(self, key: str) -> bytes:
+        self.reads.append(key)
+        return self.inner.get(key)
+
+    def __getattr__(self, name: str) -> Any:  # every other door, unchanged
+        return getattr(self.inner, name)
+
+
+class _RecordingRenderer:
+    """The production page renderer, wrapped so a draw is countable.
+
+    The draw itself stays the real pypdfium2 render of the stored original
+    bytes; this only remembers which pages were asked for, so a refusal that
+    drew nothing means nothing was rastered, not that the raster was stubbed.
+    """
+
+    def __init__(self) -> None:
+        import fin.host.graph as graph_module
+
+        self._real = graph_module._visual_page_raster
+        self.drawn: list[int] = []
+
+    def __call__(self, payload: bytes, page: int) -> Any:
+        self.drawn.append(page)
+        return self._real(payload, page)
+
+
 def _budgets(deployed: dict[str, str]) -> AttachmentBudgets:
     from fin.host.attachment_budgets import from_environ
 
@@ -419,11 +466,43 @@ def _recording_service(
     return service, vision
 
 
+def _witnessed_service(
+    store: PostgresAttachmentStore,
+    deployed: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[_LiveService, _RecordingVision, _CountingObjects, _RecordingRenderer]:
+    """Every expensive face of the lane, wrapped so "never reached" is countable.
+
+    A refusal that must cost nothing has four separate prices — a stored object
+    read, a page drawn, a provider called, a ceiling charged — and a run can
+    only be shown to have paid none of them if each door reports its own
+    traffic. The byte face and the renderer are therefore wrapped here, next to
+    the port, so one leg counts all of them on one wiring.
+    """
+    service, vision = _recording_service(store, deployed)
+    objects = _CountingObjects(service.objects)
+    service.objects = objects
+    renderer = _RecordingRenderer()
+    monkeypatch.setattr(
+        "fin.host.graph._visual_page_raster", renderer, raising=True
+    )
+    return service, vision, objects, renderer
+
+
 def _compile(
     store: PostgresAttachmentStore,
     service: _LiveService,
     script: list[AIMessage],
+    *,
+    scope_restriction: ScopeRestriction | None = None,
 ):
+    """The shipped graph, wired the way a scoped run is wired.
+
+    ``scope_restriction`` is handed through exactly as Runtime hands it, so a
+    refusal leg below is refused by the graph a deployment compiles rather
+    than by a gate built for the test. The default of ``None`` keeps every
+    other leg in this module running the unrestricted graph it always ran.
+    """
     model = ScriptedChatModel(script=script)
     return compile_graph(
         checkpointer=InMemorySaver(),
@@ -434,6 +513,7 @@ def _compile(
         attachment_source_reader_factory=(
             lambda bound: AttachmentSourceReader(store, bound)
         ),
+        scope_restriction=scope_restriction,
     )
 
 
@@ -1168,17 +1248,55 @@ def test_a_real_exhausted_budget_refuses_before_the_provider_is_asked(
     assert len(live.store.observations(attachment_id, 1, 3, 3)) == ceiling
 
 
+def _assert_the_lane_was_never_reached(
+    state: dict[str, Any],
+    *,
+    vision: _RecordingVision,
+    objects: _CountingObjects,
+    renderer: _RecordingRenderer,
+    ledger: VisionCallLedger,
+    reason: str,
+) -> None:
+    """Every expensive door reported nothing, for one refused ask.
+
+    Four separate witnesses, because a refusal that reads the page anyway is a
+    different product from the refusal the scope gate promises: the bucket was
+    not opened, no page was rastered, no request left the process, the run's own
+    ceiling was not charged, and nothing was claimed.
+    """
+    assert state["visual_claims"] == [], f"{reason}: a refusal claims nothing"
+    assert objects.reads == [], f"{reason}: a refusal must not read stored bytes"
+    assert renderer.drawn == [], f"{reason}: a refusal must not draw a page"
+    assert vision.calls == [], f"{reason}: a refusal must not call the provider"
+    assert (
+        ledger.calls_spent,
+        ledger.full_page_calls_spent,
+        ledger.crop_calls_spent,
+        ledger.retries_spent,
+    ) == (0, 0, 0, 0), f"{reason}: a refusal must not spend the run's ceiling"
+
+
 def test_another_thread_and_a_tombstoned_row_are_invisible_live(
     live: _Live,
     deployed_bounds: dict[str, str],
     ledgers: _MintedLedgers,
     live_sql_rows: Callable[..., list[Any]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Cross-thread and tombstone refusals, against real rows and real bytes.
 
     Both are live because both are rows the real store holds: another
     thread's attachment, and one this thread has just voided. Neither may be
     rendered, and neither may be claimed.
+
+    The refusal each one gets is the scope gate's own code,
+    ``scope_attachment_not_permitted``, not the lane's narrower
+    ``attachment_unavailable``: an id this thread does not currently hold is
+    outside the effective selection, so the ask is answered before the lane is
+    entered at all. The hermetic graph-level twins of both legs — a run asking
+    for another thread's row, and a run asking after ``delete_for_thread`` voided
+    its own — pin the same code and the same zero spend, so the codes below are
+    transferred from proven behavior rather than guessed.
     """
     from fin.corpus.object_store import create_object_store
 
@@ -1188,7 +1306,9 @@ def test_another_thread_and_a_tombstoned_row_are_invisible_live(
 
     other = live.threads.create_thread(title="T3 other thread").id
     try:
-        service, vision = _recording_service(live.store, deployed_bounds)
+        service, vision, objects, renderer = _witnessed_service(
+            live.store, deployed_bounds, monkeypatch
+        )
         # One graph per case: ``ScriptedChatModel`` consumes its script, so a
         # second run on the same graph would have no plan left to emit and
         # would prove nothing about the lane.
@@ -1204,9 +1324,15 @@ def test_another_thread_and_a_tombstoned_row_are_invisible_live(
             other,
             ledgers,
         )
-        assert _tool_payload(foreign) == {"error": "attachment_unavailable"}
-        assert foreign["visual_claims"] == []
-        assert vision.calls == [], "another thread's page must not be drawn or sent"
+        assert _tool_payload(foreign) == {"error": SCOPE_ATTACHMENT_NOT_PERMITTED}
+        _assert_the_lane_was_never_reached(
+            foreign,
+            vision=vision,
+            objects=objects,
+            renderer=renderer,
+            ledger=ledgers.last(),
+            reason="another thread's attachment",
+        )
 
         # Void this thread's own attachment: the bytes stay owed, the row goes.
         keys = live.store.delete_for_thread(live.thread_id)
@@ -1225,9 +1351,15 @@ def test_another_thread_and_a_tombstoned_row_are_invisible_live(
             live.thread_id,
             ledgers,
         )
-        assert _tool_payload(voided) == {"error": "attachment_unavailable"}
-        assert voided["visual_claims"] == []
-        assert vision.calls == [], "a tombstoned row must not be drawn or sent"
+        assert _tool_payload(voided) == {"error": SCOPE_ATTACHMENT_NOT_PERMITTED}
+        _assert_the_lane_was_never_reached(
+            voided,
+            vision=vision,
+            objects=objects,
+            renderer=renderer,
+            ledger=ledgers.last(),
+            reason="a voided row",
+        )
 
         # The tombstone really exists in real Postgres and really owns the key.
         url = str(os.environ["FIN_CHECKPOINT_URL"]).strip()
@@ -1248,3 +1380,85 @@ def test_another_thread_and_a_tombstoned_row_are_invisible_live(
         live.store.confirm_cleanup(attachment_id=attachment_id)
     finally:
         live.threads.delete_thread(other)
+
+
+def test_a_selection_that_excludes_the_target_refuses_before_the_bucket_is_opened_live(
+    live: _Live,
+    deployed_bounds: dict[str, str],
+    ledgers: _MintedLedgers,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The scope decision, taken with real bytes on both sides of the door.
+
+    A thread holds two real attachments and the accepted selection names one of
+    them. The refused ask is the attachment the selection excludes: the answer is
+    the gate's code and NO expensive door opened — no byte came out of the
+    bucket, pypdfium2 drew nothing, the model was never asked, and the run's
+    minted ceiling is untouched. The permitted ask then runs on the same wiring
+    and the same witnesses, and every one of them moves, so the zeros above are
+    a refusal and not a lane that could not have run.
+
+    This is the leg the hermetic boundary suites cannot close: they prove the
+    host refuses before it spends, against fixture bytes and a recording port.
+    Here the selection, the exclusion, the stored bytes, the render, and the
+    provider call are all the real ones.
+    """
+    held_id = "att-t3-scoped-held"
+    excluded_id = "att-t3-scoped-excluded"
+    _upload(live, held_id, "g4-mixed-chart-001.pdf", MIXED_PDF)
+    _mark_ready_pdf(live, held_id, pages=3, region=GOLD_CHART_REGION)
+    _upload(live, excluded_id, "g4-mixed-chart-001.pdf", MIXED_PDF)
+    _mark_ready_pdf(live, excluded_id, pages=3, region=GOLD_CHART_REGION)
+
+    service, vision, objects, renderer = _witnessed_service(
+        live.store, deployed_bounds, monkeypatch
+    )
+    selection = ScopeRestriction((held_id,), "explicit")
+
+    refused = _run(
+        _compile(
+            live.store,
+            service,
+            [
+                _visual_call(_detail_args(excluded_id, 3)),
+                AIMessage(content=ANSWER_SCRIPT),
+            ],
+            scope_restriction=selection,
+        ),
+        live.thread_id,
+        ledgers,
+    )
+    assert _tool_payload(refused) == {"error": SCOPE_ATTACHMENT_NOT_PERMITTED}
+    _assert_the_lane_was_never_reached(
+        refused,
+        vision=vision,
+        objects=objects,
+        renderer=renderer,
+        ledger=ledgers.last(),
+        reason="an attachment the accepted selection excludes",
+    )
+    # The exclusion is a fact about this run's selection, not about the row:
+    # the excluded attachment is ready, this thread's own, and its bytes are in
+    # the bucket. A refusal that only looked at readiness would have drawn it.
+    assert live.store.get(excluded_id) is not None
+    assert objects.reads == []
+
+    granted = _run(
+        _compile(
+            live.store,
+            service,
+            [
+                _visual_call(_detail_args(held_id, 3)),
+                AIMessage(content=ANSWER_SCRIPT),
+            ],
+            scope_restriction=selection,
+        ),
+        live.thread_id,
+        ledgers,
+    )
+    assert "observations" in _tool_payload(granted), _tool_payload(granted)
+    assert objects.reads, "the permitted leg must open the real bucket"
+    assert renderer.drawn == [3], "the permitted leg must draw the real page"
+    assert len(vision.calls) == 1, "the permitted leg must ask the real provider"
+    assert ledgers.last().calls_spent == 1
+

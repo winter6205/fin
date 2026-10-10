@@ -196,6 +196,19 @@ class _FakeCompanyAdapter(_NoLegAdapter):
         return self.reader.read_slice(source_ref, position)
 
 
+def _fixed(reader: Any) -> Any:
+    """A company-leg resolver that always answers ``reader``.
+
+    ``_make_read_source_tool`` takes the company leg as a PER-CALL resolver, so
+    the graph can bind it to the run's own identity (P2-I2) instead of to the
+    process-level adapter. The cases below are about the ``read_source``
+    contract — the cap, thread scoping, the typed-miss reader — and none of them
+    involve an identity, so each pins a fixed reader. The identity binding of
+    that leg is covered in ``test_evidence_session_registry.py``.
+    """
+    return lambda _config: reader
+
+
 def _invoke_tool(
     tool: Any,
     *,
@@ -374,7 +387,7 @@ def test_every_deeper_validation_stays_in_the_leg() -> None:
 
 def test_success_slice_yields_exactly_one_mapped_evidence_item() -> None:
     leg = _SlicingReader(UNIT_TEXT)
-    tool = _make_read_source_tool(leg, None)
+    tool = _make_read_source_tool(_fixed(leg), None)
 
     command = _invoke_tool(tool, source_ref=_company_ref())
     update = _command_update(command)
@@ -400,7 +413,7 @@ def test_slice_text_shorter_than_the_unit_is_what_evidence_carries() -> None:
     quote from an unread later slice stays unadmissible."""
     text = "x" * 20000
     leg = _SlicingReader(text)
-    tool = _make_read_source_tool(leg, None)
+    tool = _make_read_source_tool(_fixed(leg), None)
 
     command = _invoke_tool(tool, source_ref=_company_ref())
     item = _command_update(command)["evidence"][0]
@@ -414,7 +427,7 @@ def test_attachment_slice_maps_the_attachment_identity() -> None:
     ``document_id`` slot stays empty and the attachment id, version and
     unit are what a citation will repeat."""
     leg = _AttachmentLeg("t-run")
-    tool = _make_read_source_tool(None, lambda thread_id: leg)
+    tool = _make_read_source_tool(_fixed(None), lambda thread_id: leg)
 
     command = _invoke_tool(tool, source_ref=_attachment_ref())
     item = _command_update(command)["evidence"][0]
@@ -439,7 +452,7 @@ def test_attachment_citation_presentation_comes_from_the_record_filename(
     other kind as units; the presentation is derived from the trusted
     record's safe name, never from the model's wording."""
     leg = _AttachmentLeg("t-run", filename=filename)
-    tool = _make_read_source_tool(None, lambda thread_id: leg)
+    tool = _make_read_source_tool(_fixed(None), lambda thread_id: leg)
 
     command = _invoke_tool(tool, source_ref=_attachment_ref())
     item = _command_update(command)["evidence"][0]
@@ -469,7 +482,7 @@ def test_typed_error_produces_no_evidence_and_reaches_the_model(
     error: dict[str, Any],
 ) -> None:
     leg = _ScriptedReader(error)
-    tool = _make_read_source_tool(leg, None)
+    tool = _make_read_source_tool(_fixed(leg), None)
 
     command = _invoke_tool(tool, source_ref=_company_ref())
 
@@ -481,7 +494,7 @@ def test_terminal_empty_slice_admits_no_evidence() -> None:
     """``position == len(text)`` is a legal slice with no text; there is
     nothing to quote, and empty text would trip the gate's
     malformed-evidence check."""
-    tool = _make_read_source_tool(_SlicingReader("short text"), None)
+    tool = _make_read_source_tool(_fixed(_SlicingReader("short text")), None)
 
     command = _invoke_tool(tool, source_ref=_company_ref(), position=10)
 
@@ -546,7 +559,7 @@ def test_the_gate_rejects_the_ordinal_the_admission_refused() -> None:
 
 
 def test_unwired_leg_reports_the_miss_through_the_tool() -> None:
-    tool = _make_read_source_tool(_MissSourceReader(), None)
+    tool = _make_read_source_tool(_fixed(_MissSourceReader()), None)
 
     command = _invoke_tool(tool, source_ref=_company_ref())
 
@@ -577,7 +590,7 @@ def test_company_slice_fitting_the_cap_is_emitted_within_the_cap(
     text: str,
 ) -> None:
     leg = _SlicingReader(text)
-    tool = _make_read_source_tool(leg, None)
+    tool = _make_read_source_tool(_fixed(leg), None)
 
     command = _invoke_tool(tool, source_ref=_company_ref())
     content = _tool_message(command).content
@@ -597,7 +610,7 @@ def test_company_slice_fitting_the_cap_is_emitted_within_the_cap(
 def test_attachment_slice_fitting_the_cap_is_emitted_within_the_cap(
     text: str,
 ) -> None:
-    tool = _make_read_source_tool(None, lambda thread_id: _SlicingReader(text))
+    tool = _make_read_source_tool(_fixed(None), lambda thread_id: _SlicingReader(text))
 
     command = _invoke_tool(tool, source_ref=_attachment_ref())
     content = _tool_message(command).content
@@ -616,7 +629,7 @@ def test_attachment_leg_receives_the_runs_thread_id() -> None:
         seen.append(thread_id)
         return _SlicingReader(UNIT_TEXT)
 
-    tool = _make_read_source_tool(None, factory)
+    tool = _make_read_source_tool(_fixed(None), factory)
 
     _invoke_tool(tool, source_ref=_attachment_ref(), thread_id="t-trusted")
 
@@ -628,7 +641,8 @@ def test_model_supplied_thread_id_cannot_widen_the_scope() -> None:
     ``source_ref``."""
     seen: list[str] = []
     tool = _make_read_source_tool(
-        None, lambda thread_id: seen.append(thread_id) or _SlicingReader(UNIT_TEXT)
+        _fixed(None),
+        lambda thread_id: seen.append(thread_id) or _SlicingReader(UNIT_TEXT),
     )
 
     _invoke_tool(
@@ -642,7 +656,7 @@ def test_model_supplied_thread_id_cannot_widen_the_scope() -> None:
 
 def test_run_without_a_thread_id_has_no_attachment_leg() -> None:
     leg = _SlicingReader(UNIT_TEXT)
-    tool = _make_read_source_tool(None, lambda thread_id: leg)
+    tool = _make_read_source_tool(_fixed(None), lambda thread_id: leg)
 
     command = tool.invoke(
         {
@@ -661,7 +675,7 @@ def test_run_without_a_thread_id_has_no_attachment_leg() -> None:
 def test_tool_arguments_expose_only_source_ref_and_position() -> None:
     """No thread id, no path, no store handle — the model-facing schema
     is the two contract fields (spec SC4 / SC11)."""
-    tool = _make_read_source_tool(_MissSourceReader(), None)
+    tool = _make_read_source_tool(_fixed(_MissSourceReader()), None)
 
     assert set(tool.args) == {"source_ref", "position"}
     schema = tool.tool_call_schema.model_json_schema()

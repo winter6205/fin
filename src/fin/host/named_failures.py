@@ -464,6 +464,43 @@ def unavailable_tier(requested_tiers: Iterable[str] | None) -> str | None:
     return None
 
 
+# ----- the task-runtime family -----
+#
+# Question/task runtime T2-T6. Defined in
+# :mod:`fin.host.task_runtime_types` and re-exported HERE so the whole
+# named-failure vocabulary keeps ONE import surface, exactly as the
+# retrieve-side codes are defined in :mod:`fin.retrieve.tiers` and
+# re-exported above. Import them from this module; importing them from
+# the types module directly is what produced two authorities.
+#
+# They are DISTINCT exits, not rewrites: ``corpus_not_ready`` says the
+# 资料集合 was empty, while ``task_insufficient_evidence`` says the
+# gathered evidence does not support the asked goal, and
+# ``task_permission_denied`` says a current permission fact refuses the
+# operation rather than a source being unbound. Re-labelling one with
+# another is what ADR 0008 forbids.
+from fin.host.task_runtime_types import (  # noqa: E402
+    TASK_ALREADY_RECONCILED,
+    TASK_APPLICABILITY_UNRESOLVED,
+    TASK_CAPABILITY_UNAVAILABLE,
+    TASK_CAPABILITY_UNSUPPORTED,
+    TASK_CHECKPOINT_FAILED,
+    TASK_DEPENDENCY_FAILURE,
+    TASK_EXECUTION_LIMIT,
+    TASK_FAILURE_KINDS,
+    TASK_HISTORY_FAILED,
+    TASK_INPUT_INVALID,
+    TASK_INPUT_UNRECONCILED,
+    TASK_INSUFFICIENT_EVIDENCE,
+    TASK_INTENT_MISSING,
+    TASK_PERMISSION_DENIED,
+    TASK_REPLY_EXPIRED,
+    TASK_REPLY_UNKNOWN,
+    TASK_RESTORE_NOT_ADOPTED,
+    TASK_RESTORE_UNKNOWN,
+)
+
+
 __all__ = [
     "COMMUNITY_SUMMARY_INDEX_FAILURE",
     "CORPUS_NOT_READY",
@@ -492,4 +529,22 @@ __all__ = [
     "retrieve_blocking_failure",
     "retrieve_outcomes_delta",
     "unavailable_tier",
+    "TASK_ALREADY_RECONCILED",
+    "TASK_APPLICABILITY_UNRESOLVED",
+    "TASK_CAPABILITY_UNAVAILABLE",
+    "TASK_CAPABILITY_UNSUPPORTED",
+    "TASK_CHECKPOINT_FAILED",
+    "TASK_DEPENDENCY_FAILURE",
+    "TASK_EXECUTION_LIMIT",
+    "TASK_FAILURE_KINDS",
+    "TASK_HISTORY_FAILED",
+    "TASK_INPUT_INVALID",
+    "TASK_INPUT_UNRECONCILED",
+    "TASK_INSUFFICIENT_EVIDENCE",
+    "TASK_INTENT_MISSING",
+    "TASK_PERMISSION_DENIED",
+    "TASK_REPLY_EXPIRED",
+    "TASK_REPLY_UNKNOWN",
+    "TASK_RESTORE_NOT_ADOPTED",
+    "TASK_RESTORE_UNKNOWN",
 ]

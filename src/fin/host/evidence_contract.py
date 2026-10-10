@@ -69,6 +69,15 @@ BUSINESS_FIELD_TRUST_DENIED: Final[str] = "business_field_trust_denied"
 COMPARISON_SOURCE_UNVERIFIED: Final[str] = "comparison_source_unverified"
 RETRIEVE_UNAVAILABLE: Final[str] = "retrieve_unavailable"
 
+# The structured-result lane's exits (structured-corpus-evidence §"Replay
+# and failure"). They live here, not in the lane module, so this stays the
+# one registry every typed refusal is checked against.
+EVIDENCE_TOO_LARGE: Final[str] = "evidence_too_large"
+EVIDENCE_EXPIRED: Final[str] = "evidence_expired"
+EVIDENCE_UNAVAILABLE: Final[str] = "evidence_unavailable"
+ACCESS_DENIED: Final[str] = "access_denied"
+UNSUPPORTED_SOURCE_BINDING: Final[str] = "unsupported_source_binding"
+
 # Delegated verifier exits (spec §6 note): named by the citation gate,
 # surfaced here because ingress routes them, not because this module
 # re-implements the verifier.
@@ -97,6 +106,11 @@ CONTRACT_REFUSAL_CODES: Final[frozenset[str]] = frozenset(
         RETRIEVE_UNAVAILABLE,
         UNKNOWN_LOCATOR,
         CITATION_REPAIR_CAP,
+        EVIDENCE_TOO_LARGE,
+        EVIDENCE_EXPIRED,
+        EVIDENCE_UNAVAILABLE,
+        ACCESS_DENIED,
+        UNSUPPORTED_SOURCE_BINDING,
     }
 )
 
@@ -1347,6 +1361,7 @@ def validate_evidence(payload: Any, ctx: AdmissionContext) -> ContractValidation
 
 
 __all__: Final[tuple[str, ...]] = (
+    "ACCESS_DENIED",
     "AdmissionContext",
     "BUSINESS_FIELD_OVERFLOW",
     "BUSINESS_FIELD_TRUST_DENIED",
@@ -1358,13 +1373,17 @@ __all__: Final[tuple[str, ...]] = (
     "CONTRACT_REFUSAL_CODES",
     "ContractValidation",
     "DATABASE_ROW_OVERFLOW",
+    "EVIDENCE_EXPIRED",
     "EVIDENCE_SCHEMA_VERSION",
     "EVIDENCE_SCHEMA_VERSION_FIELD",
+    "EVIDENCE_TOO_LARGE",
+    "EVIDENCE_UNAVAILABLE",
     "EvidenceRefusal",
     "INSUFFICIENT_EVIDENCE",
     "MALFORMED_EVIDENCE_CONTRACT",
     "SQL_QUERY_DENIED",
     "UNSUPPORTED_EVIDENCE_CONTRACT",
+    "UNSUPPORTED_SOURCE_BINDING",
     "UNKNOWN_LOCATOR",
     "VISUAL_CLAIM_OVERFLOW",
     "VISUAL_CLAIM_TRUST_DENIED",

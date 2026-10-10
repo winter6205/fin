@@ -1,8 +1,9 @@
 """Injectable empty-hit rewrite retry for the research tool loop (T9).
 
 This helper retries only the retrieve contract's explicit empty-hit shape
-``{"chunks": []}``.  Typed retrieve errors and memory recall results are
-returned unchanged.  The result contains no citation or evidence field:
+``{"chunks": []}``.  Typed retrieve errors, memory recall results, and
+structured results are returned unchanged; a structured zero-count receipt
+is still an exact answer. The result contains no citation or evidence field:
 memory recall therefore cannot accidentally become citation evidence.
 
 The helper does not choose tools or build a retrieve pipeline.  Callers
@@ -16,7 +17,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Final
 
-from fin.retrieve.port import DATABASE_ROWS_KEY, database_rows_of
+from fin.retrieve.port import (
+    DATABASE_ROWS_KEY,
+    database_rows_of,
+    structured_result_of,
+)
 
 MAX_REWRITE_RETRIES: Final[int] = 3
 
@@ -143,6 +148,10 @@ def _is_empty_hit(result: Mapping[str, object]) -> bool:
     if "error" in result:
         return False
     if "chunks" not in result or result["chunks"]:
+        return False
+    # A zero-count receipt is a successful structured answer, not a miss
+    # that can be changed by rewriting its descriptive query.
+    if structured_result_of(result) is not None:
         return False
     # The sql 档's row sibling (spec search-mode-business-sql-contract
     # §8.0, E1 envelope contract §4.4): rows ARE results, so an

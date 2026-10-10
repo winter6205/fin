@@ -74,6 +74,13 @@ os.environ.pop("FIN_MODEL", None)
 os.environ.pop("FIN_BASE_URL", None)
 os.environ.pop("FIN_API_KEY", None)
 os.environ.pop("FIN_JEV_API_KEY", None)
+# The structured-evidence identity is operator configuration read at boot. A
+# developer .env that fills it in would otherwise change what `serve()` compiles,
+# so every test that stubs `compile_for_http` with a zero-argument lambda would
+# take a branch it does not assert. Strip it: the identity has its own test file.
+for _identity_var in tuple(os.environ):
+    if _identity_var.startswith("FIN_EVIDENCE_"):
+        os.environ.pop(_identity_var, None)
 os.environ.pop("FIN_JEV_MODEL", None)
 os.environ.pop("FIN_JEV_BASE_URL", None)
 os.environ.pop("TYPESAFE_API_KEY", None)

@@ -364,7 +364,7 @@ The closed query error set is:
 | `result_too_large` | no | Required response data cannot fit within 32 KiB |
 | `count_unavailable` | yes | Complete count could not finish; no partial count is returned |
 | `query_timeout` | yes | Read exceeded its 60-second execution lease |
-| `structured_search_unavailable` | yes | Structured query backend failed |
+| `structured_search_unavailable` | yes | Valid request whose execution path is not wired on the bound tier, or backend capability unavailable or structured backend fails during execution |
 | `maintenance_status_unavailable` | yes | Required same-scope status could not be read consistently |
 
 No-match is a successful empty list or a zero count receipt. Every incomplete,
@@ -420,7 +420,7 @@ owned by this contract; no duplicate operational glossary or query ADR is needed
 
 Hand these three paths to a later `writing-plans` session. Runtime implementation
 and acceptance remain pending; the real corpus/ID mapping/oracle must be frozen,
-and existing the tracked change obligations remain separate. This session writes no
+and existing acceptance obligations remain separate. This session writes no
 implementation plan or runtime code.
 
 ## Architecture review

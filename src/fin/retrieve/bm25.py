@@ -67,8 +67,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any, Mapping, Protocol, SupportsFloat
 
 from rank_bm25 import BM25Okapi  # type: ignore[import-untyped]
+
 
 from fin.corpus.extracted import ExtractedPage, Locator
 from fin.retrieve.input_validation import (
@@ -76,7 +78,16 @@ from fin.retrieve.input_validation import (
     validate_filters,
     validate_query,
 )
-from fin.retrieve.port import Chunk, resolve_search_mode
+from fin.retrieve.port import (
+    STRUCTURED_SEARCH_UNAVAILABLE_CODE,
+    Chunk,
+    _structured_query_refusal_code,
+    resolve_search_mode,
+)
+
+
+class _ScoreValues(Protocol):
+    def __getitem__(self, index: int, /) -> SupportsFloat: ...
 
 
 # A small hardcoded set of ~30 English stopwords. Stripped at
@@ -252,9 +263,10 @@ class BM25Adapter:
         filing_date: str | None = None,
         limit: int = 8,
         search_mode: str | None = None,
+        structured_request: Mapping[str, Any] | None = None,
         sql_window_start: str | None = None,
         sql_window_end: str | None = None,
-    ) -> dict[str, list[Chunk]]:
+    ) -> dict[str, Any]:
         """Return ``{"chunks": [...]}`` ranked descending by BM25 score.
 
         Parameters
@@ -302,7 +314,27 @@ class BM25Adapter:
         # on the adapter's ledger, and never the miss shape.
         ledger = self.input_validation_failures
         validate_query(query, ledger=ledger)
-        resolve_search_mode(search_mode)
+        effective_search_mode = resolve_search_mode(search_mode)
+        refusal = _structured_query_refusal_code(
+            structured_request,
+            search_mode=effective_search_mode,
+            has_outer_filters=any(
+                value is not None
+                for value in (
+                    document_id,
+                    cik,
+                    form,
+                    ticker,
+                    filing_date,
+                    sql_window_start,
+                    sql_window_end,
+                )
+            ),
+        )
+        if refusal is not None:
+            return {"error": refusal}
+        if structured_request is not None:
+            return {"error": STRUCTURED_SEARCH_UNAVAILABLE_CODE}
         validate_filters(
             document_id=document_id,
             cik=cik,
@@ -317,12 +349,7 @@ class BM25Adapter:
         # spec "empty hits not exceptions"). Catch them early —
         # before the empty-corpus short-circuit so that the caller
         # sees the empty contract regardless of corpus state.
-        if (
-            cik == ""
-            or form == ""
-            or ticker == ""
-            or filing_date == ""
-        ):
+        if any(value == "" for value in (cik, form, ticker, filing_date)):
             return {"chunks": []}
 
         # Empty corpus: nothing to score against. Return the empty
@@ -344,6 +371,21 @@ class BM25Adapter:
         # same order as the corpus we passed at construction time.
         query_tokens = _tokenize(query)
         raw_scores = self._bm25.get_scores(query_tokens)
+        return {"chunks": self._ranked_chunks(
+            raw_scores,
+            {"document_id": document_id, "cik": cik, "form": form,
+             "ticker": ticker, "filing_date": filing_date},
+            effective_limit,
+        )}
+
+    def _ranked_chunks(
+        self,
+        raw_scores: _ScoreValues,
+        filters: Mapping[str, str | None],
+        limit: int,
+    ) -> list[Chunk]:
+        """Rank only corpus entries that satisfy the validated exact filters."""
+        document_id = filters.get("document_id")
 
         # Enumerate (index, score) pairs, drop the document_id filter
         # case, AND-evaluate the EDGAR-shaped metadata filters, and
@@ -358,7 +400,11 @@ class BM25Adapter:
             ):
                 continue
             if not self._passes_metadata(
-                indexed.document_id, cik, form, ticker, filing_date
+                indexed.document_id,
+                filters.get("cik"),
+                filters.get("form"),
+                filters.get("ticker"),
+                filters.get("filing_date"),
             ):
                 continue
             scored.append((idx, float(raw_scores[idx])))
@@ -366,7 +412,7 @@ class BM25Adapter:
         scored.sort(key=lambda pair: pair[1], reverse=True)
 
         chunks: list[Chunk] = []
-        for idx, score in scored[:effective_limit]:
+        for idx, score in scored[:limit]:
             base = self._indexed[idx].chunk
             chunks.append(
                 Chunk(
@@ -375,7 +421,7 @@ class BM25Adapter:
                     score=score,
                 )
             )
-        return {"chunks": chunks}
+        return chunks
 
 
 __all__ = ["BM25Adapter"]

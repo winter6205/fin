@@ -489,6 +489,13 @@ export interface ThreadDetail extends ThreadListItem {
     budget_tokens: number;
     ratio: number;
   };
+  // question-workspace W1/W4: the authoritative thread-scoped task
+  // envelope Runtime persists. Present on every GET from a host that
+  // carries the projection; ``undefined`` on an older peer, which
+  // reads as TASKLESS rather than as a broken task (the contract's
+  // own posture: "an absent envelope is genuinely empty"). Deliberately
+  // NOT derived from ``turns`` — see ``TaskRuntimeView``.
+  task_runtime?: TaskRuntimeView;
 }
 
 // ----- T4 workflow (the tracked change): watchlist + in-app notices -----
@@ -708,4 +715,147 @@ export interface ThreadAttachment {
   unit_count: number;
   searchable: boolean;
   failure_reason?: AttachmentFailureReason | string | null;
+}
+
+// ----- question-workspace: the task runtime wire projection -----
+//
+// SSOT: specs/question-task-runtime-contract.md. Mirrors
+// ``fin.host.workspace_http.TaskRuntimeView`` — every spelling below is
+// the frozen one, and this surface NEVER derives a task fact from a
+// turn fact: ``TaskRuntimeView`` is deliberately a SEPARATE field from
+// ``turns`` and ``status``, because a turn can end with an answer while
+// its task stays active (contract §Representation).
+//
+// WHAT THIS SURFACE MAY NOT DO (contract §Ownership): change task state
+// without an explicit user action, treat a saved restriction as a live
+// grant, or infer task completion from a citation / run end / lookup.
+
+/** ``fin.host.task_runtime_types.TASK_OUTCOMES``. ``null`` = taskless. */
+export type TaskOutcome = "active" | "complete" | "cancelled";
+
+/** The current task, as Runtime reports it. Mirrors
+ * ``task_runtime.current_task`` (``current_task_summary``). */
+export interface CurrentTask {
+  task_id: string;
+  goal: string;
+  expected_result: string;
+  task_version: number;
+  necessary_conditions: string[];
+  outcome: TaskOutcome;
+  outcome_reason: string;
+  created_at_input_version: number;
+  /** The clarification bound to this task, when one is pending. */
+  pending_question?: PendingQuestionView | null;
+  /** Runtime's task-level outcome. Distinct from ``outcome``, which is
+   * the task record's own field; they agree by construction and are
+   * carried separately because the contract publishes both. */
+  task_outcome?: TaskOutcome | null;
+}
+
+/** One locatable archive. Mirrors ``archived_task_summaries``.
+ *
+ * ``outcome`` is the archived task's OWN outcome as of archiving — an
+ * archive of a still-active task reports ``active``, because archiving
+ * is separate from completing or cancelling (W5). Optional so an older
+ * host that omits it still decodes; the surface then reads "未记录"
+ * rather than guessing. */
+export interface ArchivedTaskSummary {
+  archive_id: string;
+  task_id: string;
+  goal: string;
+  task_version: number;
+  archived_at_input_version: number;
+  run_id: string | null;
+  evidence_refs: string[];
+  outcome?: TaskOutcome;
+  outcome_reason?: string;
+}
+
+/** The still-pending clarification. Mirrors
+ * ``task_runtime.pending_question`` (``pending_question_payload``).
+ *
+ * ``choices`` already carries exactly one trailing ``"other"`` — the
+ * host appends it, so this surface never adds a second Other and never
+ * has to guess which option was Other. */
+export interface PendingQuestionView {
+  question_id: string;
+  task_id: string;
+  task_version: number;
+  /** The COMPLETE question, authored by the host. Shown before the
+   * options; never truncated, never replaced by a summary. */
+  prompt: string;
+  choices: string[];
+  input_version: number;
+}
+
+/** The committed decision about one accepted input. Mirrors
+ * ``reconcile_marker``; before the first reconciliation it is ``null``,
+ * not a fabricated decision. */
+export interface ReconciliationView {
+  reconciled_input_version: number;
+  task_id: string | null;
+  task_version: number | null;
+  disposition: string;
+  reason: string;
+}
+
+/** One entry of the bounded ORIGINAL-input window. Mirrors
+ * ``bounded_input_history``. ``payload: null`` means the original was
+ * never recoverable — the surface must NOT reconstruct it. */
+export interface AcceptedInputRow {
+  input_version: number;
+  kind: "message" | "reply" | "restore";
+  payload: string | null;
+  provenance: string;
+  question_id: string | null;
+  archive_id: string | null;
+  choice_id: string | null;
+  run_id: string | null;
+}
+
+/**
+ * The closed named-failure vocabulary of the task runtime (contract
+ * §Named failures; SSOT ``fin.host.task_runtime_types.TASK_FAILURE_KINDS``).
+ *
+ * A task door can refuse a request two ways, and both must read as a
+ * refusal rather than as a transport hiccup: BEFORE any run, as an HTTP
+ * 400/409 whose body is ``{"detail": {"error": <kind>}}``; and MID-STREAM,
+ * as a terminal ``status`` frame carrying ``refuse`` with the same token in
+ * ``reason`` / ``status_classified``. Listing the set here is what lets a
+ * caller tell those two apart from an ordinary run refusal.
+ */
+export const TASK_FAILURE_KINDS: ReadonlySet<string> = new Set([
+  "task_input_invalid",
+  "task_input_unreconciled",
+  "task_already_reconciled",
+  "task_permission_denied",
+  "task_dependency_failure",
+  "task_capability_unavailable",
+  "task_capability_unsupported",
+  "task_insufficient_evidence",
+  "task_applicability_unresolved",
+  "task_intent_missing",
+  "task_execution_limit",
+  "task_checkpoint_failed",
+  "task_history_failed",
+  "task_reply_expired",
+  "task_reply_unknown",
+  "task_restore_unknown",
+  "task_restore_not_adopted",
+]);
+
+/** Whether a terminal stream outcome names a task-door refusal. */
+export function isTaskFailureKind(value: string | null | undefined): boolean {
+  return typeof value === "string" && TASK_FAILURE_KINDS.has(value);
+}
+
+/** The thread-scoped task envelope on ``GET /api/threads/{id}``. */
+export interface TaskRuntimeView {
+  current_task: CurrentTask | null;
+  archived_tasks: ArchivedTaskSummary[];
+  pending_question: PendingQuestionView | null;
+  reconciliation: ReconciliationView | null;
+  task_outcome: TaskOutcome | null;
+  input_version: number;
+  input_history: AcceptedInputRow[];
 }

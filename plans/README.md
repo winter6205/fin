@@ -6,6 +6,8 @@
 
 **总计划（阶段表，不再当实施队列）：** [`retrieval-upgrade.md`](retrieval-upgrade.md)
 
+**结构化语料落地（P0 执行计划 + P1–P3 续篇，验收权在 specs）：** P0 执行计划 [`structured-corpus-completion-execution.md`](structured-corpus-completion-execution.md)；续篇 **P1 查询生产：** [`structured-corpus-query-production-p1.md`](structured-corpus-query-production-p1.md) · **P2 证据生命周期：** [`structured-corpus-evidence-lifecycle-p2.md`](structured-corpus-evidence-lifecycle-p2.md) · **P3 维护收集与终验：** [`structured-corpus-maintenance-gc-p3.md`](structured-corpus-maintenance-gc-p3.md) · **P3 前置登记册（开工前必读）：** [`structured-corpus-p3-prerequisites.md`](structured-corpus-p3-prerequisites.md)
+
 **已闭合（本树近期）：** [`workbench-sidebar-rail.md`](workbench-sidebar-rail.md)（that pull request）；[`workbench-chrome.md`](workbench-chrome.md)（that pull request）；[`corpus-serve-ingest.md`](corpus-serve-ingest.md)（that pull request）；[`session-compaction.md`](session-compaction.md)（that pull request）。MDP 见 [`memory-dialogue-platform.md`](memory-dialogue-platform.md)——T1–T4 / T7–T9 已闭合；T5/T6 按 ADR 0045 非入库必做波。
 
 **仍开着的工作台 prompt（本程序）：** Wave A 已合入（the tracked pull request / the tracked change closed）。**下一刀：** [`host-prompt-assembly.md`](host-prompt-assembly.md)（Wave B / the tracked change）。

@@ -237,6 +237,16 @@ def _extract_company(text: str) -> str | None:
     return _normalize_company(match.group(1))
 
 
+def company_of_utterance(text: str) -> str | None:
+    """The canonical company this utterance names, if any.
+
+    Public seam for the task runtime, so company identity stays decided
+    by this module's single extractor rather than a second pattern
+    elsewhere.
+    """
+    return _extract_company(text)
+
+
 def _extract_period(text: str) -> str | None:
     specific = _PERIOD_SPECIFIC_RE.search(text or "")
     if specific:

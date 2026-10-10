@@ -41,13 +41,14 @@ standalone refactor so its diff never mixes with contract work.
 from __future__ import annotations
 
 import copy
+import json
 import threading
 import uuid
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Iterator, Literal, Protocol
+from typing import Any, Iterator, Literal, Protocol, Sequence
 
 import psycopg
 
@@ -59,11 +60,13 @@ from fin.host.evidence_contract import (
     DATABASE_ROW_OVERFLOW,
     EVIDENCE_SCHEMA_VERSION,
     EVIDENCE_SCHEMA_VERSION_FIELD,
+    MALFORMED_EVIDENCE_CONTRACT,
     AdmissionContext,
     VISUAL_CLAIM_OVERFLOW,
     seed_context_from_rows,
     validate_evidence,
 )
+from fin.host.structured_evidence import project_stored_structured_evidence
 from fin.host.visual_evidence import VISUAL_CLAIM_FIELDS, VISUAL_EVIDENCE_KIND
 
 # WHY the §7 frozen-shape grace at the durable write does NOT cover these:
@@ -346,6 +349,78 @@ class RunRecord:
     # the round-trip needs no codec; ``[]`` (never ``None``) when the run
     # produced none, so consumers never branch on absence.
     visual_claims: list[dict[str, Any]] = field(default_factory=list)
+    # structured-corpus-evidence: the run's bounded structured snapshots,
+    # one per cited row or count receipt, each a
+    # ``fin.evidence.structured_snapshot`` value plus its recomputable
+    # digest. Kept SEPARATE from ``citations`` for the same reason visual
+    # claims are: a structured value supports a structured claim and can
+    # never authorize a quotation, so it must not ride the quote channel.
+    # ``[]`` (never ``None``) so a consumer never branches on absence.
+    structured_evidence: list[dict[str, Any]] = field(default_factory=list)
+
+
+# ----- EP9/EP10 invalidation checkpoint state -----
+
+
+@dataclass(frozen=True)
+class EvidenceInvalidationCheckpoint:
+    """One consumer's durable position in the EP8 invalidation stream.
+
+    ``applied_checkpoint`` (P2-D1 §2.4 ``applied_checkpoint``) is the cursor
+    covering events whose local scrub has COMMITTED; it advances atomically
+    with the scrub and never from an acknowledgement. ``acked_checkpoint`` is
+    the cursor the backend accepted, so a crash between the two redelivers
+    from the right place instead of skipping or replaying from the start.
+    ``last_seq`` is the per-consumer gapless sequence D1 §2.2 orders the
+    stream by, kept as the decidable form of "did I miss something" that an
+    opaque checkpoint cannot express. Empty/zero mean "never drained", never
+    a fabricated position.
+    """
+
+    consumer_id: str
+    acked_checkpoint: str = ""
+    applied_checkpoint: str = ""
+    last_seq: int = 0
+
+
+@dataclass(frozen=True)
+class EvidenceRecoveryState:
+    """Whether this consumer's retained evidence is currently withheld.
+
+    T33's gate. It is DURABLE and it lives on the same row as the watermark,
+    for two reasons that are properties rather than preferences:
+
+    * **Durable, because a restart is the case.** The withhold exists to cover
+      the window between discovering an event/ack gap and finishing recovery. A
+      process-local flag would be lost exactly when it is needed most — a
+      restart after a gap would clear the withhold and re-expose the very
+      snapshots recovery was supposed to protect.
+    * **On the watermark row, so the invariant is checkable in one place.** A
+      consumer that is ``withheld`` has, by construction, an un-advanced
+      acknowledgement: the drain refuses a stale cursor and never writes
+      ``acked_checkpoint`` from a gap, and only the sweep clears this flag.
+
+    ``reason`` is the human-readable cause recorded when the gate closed. It is
+    diagnostic text, never an input to a decision.
+    """
+
+    consumer_id: str
+    withheld: bool = False
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class EvidenceScrubOutcome:
+    """What storage removed, plus the confirmation the EP9 ack depends on.
+
+    ``remaining_entries`` is read back INSIDE the same transaction as
+    the scrub: a non-zero count means storage could not confirm the
+    payload is gone, so the caller must refuse rather than acknowledge.
+    """
+
+    scrubbed_entries: int
+    scrubbed_runs: int
+    remaining_entries: int
 
 
 # ----- enum + validation -----
@@ -477,12 +552,114 @@ class ThreadStore(Protocol):
         """
         ...
 
+    # -- EP9/EP10 invalidation checkpoint (structured_corpus_evidence) --
+
+    def read_invalidation_checkpoint(self, consumer_id: str) -> EvidenceInvalidationCheckpoint:
+        """This consumer's durable stream position, empty strings for a
+        consumer that has never drained. A lookup miss is NOT an error:
+        "no checkpoint yet" is the normal first-drain state.
+        """
+        ...
+
+    def scrub_structured_evidence_payloads(
+        self,
+        *,
+        consumer_id: str,
+        evidence_refs: Sequence[str],
+        next_checkpoint: str,
+        last_seq: int,
+    ) -> EvidenceScrubOutcome:
+        """Remove every stored ``structured_evidence`` entry whose snapshot
+        names one of ``evidence_refs``, then advance the watermark — all in
+        ONE transaction, so a failure leaves both untouched.
+
+        The write is scoped to the evidence column on purpose: routing it
+        through a whole-row rewrite would re-run the durable write guard
+        over the entire run record and could refuse (or mangle) an
+        unrelated lane's payload.
+        """
+        ...
+
+    def advance_invalidation_acknowledgement(
+        self, consumer_id: str, checkpoint: str
+    ) -> None:
+        """Record that the backend accepted ``checkpoint``. Called only
+        AFTER the scrub committed, never inside the same transaction.
+        """
+        ...
+
+    # -- EP10 recovery gate (T33) --
+
+    def read_recovery_state(self, consumer_id: str) -> EvidenceRecoveryState:
+        """This consumer's recovery gate; never withheld for a consumer that
+        has never seen a gap.
+
+        A lookup miss is NOT an error, for the same reason the checkpoint's is
+        not: "no gate yet" is the normal pre-gap state, and it is the SAFE one
+        because it means no gap has been observed.
+        """
+        ...
+
+    def set_recovery_withheld(self, consumer_id: str, reason: str) -> None:
+        """Close the gate: every retained reference for this consumer is
+        unavailable until a sweep releases it.
+
+        Idempotent, and it does NOT touch either watermark. The gap has already
+        been refused by the time this is called, so the resume cursor must stay
+        exactly where the previous acknowledgement left it — a stale position
+        may never advance acknowledgement, and closing a gate is not a reason to
+        move one.
+        """
+        ...
+
+    def set_recovery_released(self, consumer_id: str) -> None:
+        """Open the gate. Called by the revalidation sweep and by nothing else,
+        after storage confirmed the denied payloads are gone.
+        """
+        ...
+
+    def scrub_retained_evidence_payloads(
+        self, evidence_refs: Sequence[str]
+    ) -> EvidenceScrubOutcome:
+        """Remove every stored ``structured_evidence`` entry naming one of
+        ``evidence_refs``, and confirm it — WITHOUT touching any watermark.
+
+        WHY this is separate from :meth:`scrub_structured_evidence_payloads`:
+        that method is half of ADR 0099's two-phase machine, and its
+        ``next_checkpoint`` / ``last_seq`` arguments are the batch's own
+        watermark values. A recovery sweep has no batch, so it has no
+        checkpoint to write and no ``seq`` it can honestly claim to have
+        applied. Reusing that method here would mean inventing a cursor and
+        advancing a watermark the sweep never earned — the exact defect T33
+        forbids. Scrubbing is the only half the sweep needs, and taking only
+        that half is what leaves the acknowledgement entirely in the drain's
+        hands.
+        """
+        ...
+
 
 # ----- in-memory implementation -----
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _stored_evidence_ref(row: Any) -> str | None:
+    """The ``evidence_ref`` one stored structured row names, else ``None``.
+
+    Read BY SHAPE, not through ``project_stored_structured_evidence``:
+    a corrupt row (wrong digest, off-shape selector) must still be
+    scrubbable by an invalidation event, and projecting it would return
+    ``None`` for exactly the rows an invalidation most needs to remove.
+    """
+    if not isinstance(row, Mapping):
+        return None
+    snapshot = row.get("snapshot")
+    if not isinstance(snapshot, Mapping):
+        return None
+    ref = snapshot.get("evidence_ref")
+    return ref if isinstance(ref, str) and ref else None
 
 
 class InMemoryThreadStore:
@@ -497,6 +674,8 @@ class InMemoryThreadStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._threads: dict[str, _MutableThread] = {}
+        self._invalidation_checkpoints: dict[str, EvidenceInvalidationCheckpoint] = {}
+        self._recovery_states: dict[str, EvidenceRecoveryState] = {}
 
     # -- threads --
 
@@ -612,6 +791,144 @@ class InMemoryThreadStore:
                 raise ThreadNotFoundError(f"unknown thread {thread_id!r}")
             return [copy.deepcopy(run) for run in thread.runs]
 
+    # -- EP9/EP10 invalidation checkpoint --
+
+    def read_invalidation_checkpoint(self, consumer_id: str) -> EvidenceInvalidationCheckpoint:
+        with self._lock:
+            stored = self._invalidation_checkpoints.get(consumer_id)
+        if stored is None:
+            return EvidenceInvalidationCheckpoint(consumer_id=consumer_id)
+        return stored
+
+    def scrub_structured_evidence_payloads(
+        self,
+        *,
+        consumer_id: str,
+        evidence_refs: Sequence[str],
+        next_checkpoint: str,
+        last_seq: int,
+    ) -> EvidenceScrubOutcome:
+        targets = set(evidence_refs)
+        # WHY plan-then-apply: the durable path does this inside one
+        # transaction, and a mid-apply failure here must not leave a
+        # half-scrubbed store either. Nothing is mutated until every
+        # run row has been inspected.
+        plan: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]] = []
+        scrubbed_entries = 0
+        scrubbed_runs = 0
+        with self._lock:
+            for thread in self._threads.values():
+                for run in thread.runs:
+                    kept: list[dict[str, Any]] = []
+                    removed = 0
+                    for row in run.structured_evidence:
+                        ref = _stored_evidence_ref(row)
+                        if ref is not None and ref in targets:
+                            removed += 1
+                            continue
+                        kept.append(row)
+                    if removed:
+                        plan.append((run.structured_evidence, kept))
+                        scrubbed_entries += removed
+                        scrubbed_runs += 1
+            for current, kept in plan:
+                current[:] = kept
+            # WHY zero without a re-read: ``kept`` was built by dropping every
+            # row whose ref is a target, so nothing matching can survive the
+            # apply above. Only the durable store can fail to confirm, which is
+            # why it re-counts inside the transaction.
+            remaining_entries = 0
+            previous = self._invalidation_checkpoints.get(consumer_id)
+            # WHY max() on last_seq: a crash between the two phases makes the
+            # backend redeliver events whose seq is already applied. The drain
+            # refuses a batch ending behind this watermark, so this only
+            # defends the orderable column against a caller that bypassed it;
+            # ``applied_checkpoint`` is opaque and cannot be ordered here at
+            # all.
+            self._invalidation_checkpoints[consumer_id] = EvidenceInvalidationCheckpoint(
+                consumer_id=consumer_id,
+                acked_checkpoint=previous.acked_checkpoint if previous is not None else "",
+                applied_checkpoint=next_checkpoint,
+                last_seq=max(last_seq, previous.last_seq if previous is not None else 0),
+            )
+        return EvidenceScrubOutcome(
+            scrubbed_entries=scrubbed_entries,
+            scrubbed_runs=scrubbed_runs,
+            remaining_entries=remaining_entries,
+        )
+
+    def advance_invalidation_acknowledgement(
+        self, consumer_id: str, checkpoint: str
+    ) -> None:
+        with self._lock:
+            previous = self._invalidation_checkpoints.get(consumer_id)
+            self._invalidation_checkpoints[consumer_id] = EvidenceInvalidationCheckpoint(
+                consumer_id=consumer_id,
+                acked_checkpoint=checkpoint,
+                applied_checkpoint=previous.applied_checkpoint if previous is not None else "",
+                last_seq=previous.last_seq if previous is not None else 0,
+            )
+
+    # -- EP10 recovery gate (T33) --
+
+    def read_recovery_state(self, consumer_id: str) -> EvidenceRecoveryState:
+        with self._lock:
+            stored = self._recovery_states.get(consumer_id)
+        if stored is None:
+            return EvidenceRecoveryState(consumer_id=consumer_id)
+        return stored
+
+    def set_recovery_withheld(self, consumer_id: str, reason: str) -> None:
+        with self._lock:
+            self._recovery_states[consumer_id] = EvidenceRecoveryState(
+                consumer_id=consumer_id, withheld=True, reason=reason
+            )
+
+    def set_recovery_released(self, consumer_id: str) -> None:
+        with self._lock:
+            self._recovery_states[consumer_id] = EvidenceRecoveryState(
+                consumer_id=consumer_id, withheld=False, reason=""
+            )
+
+    def scrub_retained_evidence_payloads(
+        self, evidence_refs: Sequence[str]
+    ) -> EvidenceScrubOutcome:
+        """Delete the named payloads and confirm. No watermark is read or
+        written here — see the protocol docstring for why the sweep may not
+        touch one.
+        """
+
+        targets = set(evidence_refs)
+        plan: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]] = []
+        scrubbed_entries = 0
+        scrubbed_runs = 0
+        with self._lock:
+            for thread in self._threads.values():
+                for run in thread.runs:
+                    kept: list[dict[str, Any]] = []
+                    removed = 0
+                    for row in run.structured_evidence:
+                        ref = _stored_evidence_ref(row)
+                        if ref is not None and ref in targets:
+                            removed += 1
+                            continue
+                        kept.append(row)
+                    if removed:
+                        plan.append((run.structured_evidence, kept))
+                        scrubbed_entries += removed
+                        scrubbed_runs += 1
+            for current, kept in plan:
+                current[:] = kept
+        return EvidenceScrubOutcome(
+            scrubbed_entries=scrubbed_entries,
+            scrubbed_runs=scrubbed_runs,
+            # WHY zero without a re-read: ``kept`` was built by dropping every
+            # entry whose ref is a target, so nothing matching survives the
+            # apply above. Only the durable store can fail to confirm, which is
+            # why it re-counts inside its own transaction.
+            remaining_entries=0,
+        )
+
 
 @dataclass
 class _MutableThread:
@@ -668,8 +985,37 @@ CREATE TABLE IF NOT EXISTS fin_run (
     analysis_results  JSONB NOT NULL DEFAULT '[]'::jsonb,
     -- ADR 0089: the run's visual claims, kept off the citations channel
     -- (a visual observation is never a source quote).
-    visual_claims     JSONB NOT NULL DEFAULT '[]'::jsonb
+    visual_claims     JSONB NOT NULL DEFAULT '[]'::jsonb,
+    -- structured-corpus-evidence: the run's bounded structured-result
+    -- snapshots, kept off the citations channel for the same reason
+    -- visual claims are.
+    structured_evidence JSONB NOT NULL DEFAULT '[]'::jsonb
 );
+
+-- structured-corpus-evidence EP9/EP10: the per-consumer position in the
+-- backend invalidation stream. ``applied_checkpoint`` is P2-D1 §2.4's
+-- watermark and moves only with a committed scrub; ``acked_checkpoint`` is
+-- the cursor the backend accepted, which is the resume point after a crash
+-- between the two phases; ``last_seq`` carries D1 §2.2's per-consumer
+-- gapless order so a skipped window is decidable without parsing an opaque
+-- checkpoint.
+CREATE TABLE IF NOT EXISTS fin_evidence_invalidation_checkpoint (
+    consumer_id         TEXT PRIMARY KEY,
+    applied_checkpoint  TEXT NOT NULL DEFAULT '',
+    applied_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seq            BIGINT NOT NULL DEFAULT 0,
+    acked_checkpoint    TEXT NOT NULL DEFAULT ''
+);
+
+-- T33 column migration: the recovery gate. A gap closes it and only the
+-- revalidation sweep opens it, so it rides the same row as the watermark it
+-- constrains. The default is FALSE (not withheld) because "never drained" is
+-- not "mid-recovery": a consumer that has not seen a gap has nothing to
+-- withhold.
+ALTER TABLE fin_evidence_invalidation_checkpoint
+    ADD COLUMN IF NOT EXISTS recovery_withheld BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE fin_evidence_invalidation_checkpoint
+    ADD COLUMN IF NOT EXISTS recovery_reason TEXT NOT NULL DEFAULT '';
 
 -- T2 column migration: add ``assistant_message`` to existing
 -- ``fin_run`` tables without breaking fresh boots. ``ADD COLUMN
@@ -721,6 +1067,11 @@ ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS analysis_results JSONB NOT NULL DEF
 -- "no claim" is the only honest value. ``[]`` (not NULL) keeps every
 -- consumer free of an absence branch.
 ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS visual_claims JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+-- structured-corpus-evidence: same rule as visual_claims — a pre-lane row
+-- reads back as ``[]``, which is the only honest value for "this run
+-- carried no structured snapshot".
+ALTER TABLE fin_run ADD COLUMN IF NOT EXISTS structured_evidence JSONB NOT NULL DEFAULT '[]'::jsonb;
 """
 
 
@@ -753,6 +1104,34 @@ def _is_pre_e5_visual_row(row: Any) -> bool:
     )
 
 
+def _jsonb_list(row: Sequence[object], index: int) -> list[Any]:
+    """One JSONB list column, decoded, deep-copied, never ``None``.
+
+    Four list columns share this shape, and they previously each carried
+    their own copy of the same nine lines. The two branches are both
+    needed: a fake driver yields a JSON string, psycopg yields an already
+    decoded list. A short row from a pre-migration SELECT that did not
+    know the column reads as ``[]``; an existing column with a NULL or
+    non-list value is persisted corruption, not evidence that the run
+    carried none.
+    """
+    if len(row) <= index:
+        # EXIT: legacy SELECT tuples omit columns added after their schema cutover.
+        return []
+    raw = row[index]
+    try:
+        decoded: Any = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError) as exc:
+        raise PersistenceUnavailableError(
+            f"list runs: JSONB list column at row index {index} could not be decoded"
+        ) from exc
+    if not isinstance(decoded, list):
+        raise PersistenceUnavailableError(
+            f"list runs: JSONB list column at row index {index} is not an array"
+        )
+    return copy.deepcopy(decoded)
+
+
 def _outgoing_evidence_error(record: "RunRecord") -> "EvidenceContractWriteError | None":
     """Validate the run's evidence at the durable boundary before storage.
 
@@ -765,6 +1144,16 @@ def _outgoing_evidence_error(record: "RunRecord") -> "EvidenceContractWriteError
     poison every later replay.
     """
     ctx = _store_admission_context(record)
+    for validator in (_outgoing_citation_error, _outgoing_visual_error):
+        error = validator(record, ctx)
+        if error is not None:
+            return error
+    return _outgoing_structured_error(record)
+
+
+def _outgoing_citation_error(
+    record: "RunRecord", ctx: AdmissionContext,
+) -> "EvidenceContractWriteError | None":
     for index, row in enumerate(record.citations):
         result = validate_evidence(
             {
@@ -792,6 +1181,12 @@ def _outgoing_evidence_error(record: "RunRecord") -> "EvidenceContractWriteError
         return EvidenceContractWriteError(
             result.refusal.code, f"citation {index}: {result.refusal.message}"
         )
+    return None
+
+
+def _outgoing_visual_error(
+    record: "RunRecord", ctx: AdmissionContext,
+) -> "EvidenceContractWriteError | None":
     for index, row in enumerate(record.visual_claims):
         result = validate_evidence({"visual_claims": [row]}, ctx)
         if result.accepted:
@@ -805,6 +1200,30 @@ def _outgoing_evidence_error(record: "RunRecord") -> "EvidenceContractWriteError
             raise RuntimeError(f"visual claim {index}: refused outcome carries no code")
         return EvidenceContractWriteError(
             result.refusal.code, f"visual claim {index}: {result.refusal.message}"
+        )
+    # The structured lane has no grace path: a stored snapshot whose digest
+    # does not recompute is corruption, and a corrupted snapshot must never
+    # reach a replay that would present it as retained evidence.
+    for index, row in enumerate(record.structured_evidence):
+        if project_stored_structured_evidence(row) is not None:
+            continue
+        return EvidenceContractWriteError(
+            MALFORMED_EVIDENCE_CONTRACT,
+            f"structured evidence {index}: stored snapshot is not the frozen shape",
+        )
+    return None
+
+
+def _outgoing_structured_error(record: "RunRecord") -> "EvidenceContractWriteError | None":
+    # The structured lane has no grace path: a stored snapshot whose digest
+    # does not recompute is corruption, and a corrupted snapshot must never
+    # reach a replay that would present it as retained evidence.
+    for index, row in enumerate(record.structured_evidence):
+        if project_stored_structured_evidence(row) is not None:
+            continue
+        return EvidenceContractWriteError(
+            MALFORMED_EVIDENCE_CONTRACT,
+            f"structured evidence {index}: stored snapshot is not the frozen shape",
         )
     return None
 
@@ -920,47 +1339,18 @@ class PostgresThreadStore:
             status_classified=(row[14] or "") if len(row) > 14 else "",
             # T3: ``[]`` when the row predates the migration or the
             # run never called ``compare_facts``.
-            comparisons=copy.deepcopy(
-                (
-                    json.loads(row[15])
-                    if isinstance(row[15], str)
-                    else list(row[15] or [])
-                )
-                if len(row) > 15
-                else []
-            ),
+            comparisons=_jsonb_list(row, 15),
             # Trust (the tracked change): empty list when pre-migration / the run
             # touched no locator.
-            evidence_locators=copy.deepcopy(
-                (
-                    json.loads(row[16])
-                    if isinstance(row[16], str)
-                    else list(row[16] or [])
-                )
-                if len(row) > 16
-                else []
-            ),
-            analysis_results=copy.deepcopy(
-                (
-                    json.loads(row[17])
-                    if isinstance(row[17], str)
-                    else list(row[17] or [])
-                )
-                if len(row) > 17
-                else []
-            ),
+            evidence_locators=_jsonb_list(row, 16),
+            analysis_results=_jsonb_list(row, 17),
             # ADR 0089: empty list when pre-migration / the run produced
             # no visual claim. Coerced to ``[]`` (never ``None``) so the
             # citations-vs-claims separation holds for every reader.
-            visual_claims=copy.deepcopy(
-                (
-                    json.loads(row[18])
-                    if isinstance(row[18], str)
-                    else list(row[18] or [])
-                )
-                if len(row) > 18
-                else []
-            ),
+            visual_claims=_jsonb_list(row, 18),
+            # Same rule as visual_claims: a pre-lane or claim-free row
+            # reads back as ``[]``, never ``None``.
+            structured_evidence=_jsonb_list(row, 19),
         )
 
     # -- threads --
@@ -1091,9 +1481,9 @@ class PostgresThreadStore:
                     "tool_summaries, assistant_message, created_at, in_flight, "
                     "thinking_duration_ms, track_decision, status_classified, "
                     "comparisons, evidence_locators, analysis_results, "
-                    "visual_claims) "
+                    "visual_claims, structured_evidence) "
                     "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-                    "%s, %s, %s, %s, %s)",
+                    "%s, %s, %s, %s, %s, %s)",
                     (
                         record.id,
                         record.thread_id,
@@ -1115,6 +1505,7 @@ class PostgresThreadStore:
                         json.dumps(record.evidence_locators),
                         json.dumps(record.analysis_results),
                         json.dumps(record.visual_claims),
+                        json.dumps(record.structured_evidence),
                     ),
                 )
                 conn.commit()
@@ -1146,7 +1537,7 @@ class PostgresThreadStore:
                 "assistant_message, created_at, in_flight, "
                 "thinking_duration_ms, track_decision, status_classified, "
                 "comparisons, evidence_locators, analysis_results, "
-                "visual_claims "
+                "visual_claims, structured_evidence "
                 "FROM fin_run WHERE thread_id = %s ORDER BY created_at ASC",
                 (thread_id,),
             ).fetchall()
@@ -1155,6 +1546,226 @@ class PostgresThreadStore:
             # track_decision / comparisons / evidence_locators), so
             # one outer deepcopy per row is enough.
             return [copy.deepcopy(self._row_to_run(r)) for r in rows]
+
+    # -- EP9/EP10 invalidation checkpoint --
+
+    def read_invalidation_checkpoint(self, consumer_id: str) -> EvidenceInvalidationCheckpoint:
+        with self._guarded("read invalidation checkpoint") as conn:
+            row = conn.execute(
+                "SELECT consumer_id, acked_checkpoint, applied_checkpoint, last_seq "
+                "FROM fin_evidence_invalidation_checkpoint WHERE consumer_id = %s",
+                (consumer_id,),
+            ).fetchone()
+        if row is None:
+            return EvidenceInvalidationCheckpoint(consumer_id=consumer_id)
+        return EvidenceInvalidationCheckpoint(
+            consumer_id=row[0],
+            acked_checkpoint=row[1] or "",
+            applied_checkpoint=row[2] or "",
+            last_seq=int(row[3] or 0),
+        )
+
+    def scrub_structured_evidence_payloads(
+        self,
+        *,
+        consumer_id: str,
+        evidence_refs: Sequence[str],
+        next_checkpoint: str,
+        last_seq: int,
+    ) -> EvidenceScrubOutcome:
+        refs = list(evidence_refs)
+        with self._guarded("scrub structured evidence") as conn:
+            # WHY these statements share one transaction: the scrub, its
+            # confirmation read, and the watermark advance are one unit. A
+            # leftover matching entry means storage could not confirm, and
+            # then the watermark must NOT move — the caller refuses and the
+            # backend redelivers.
+            # WHY scoped to the evidence column: a whole-row rewrite would
+            # drag every other lane's JSONB through this statement, and the
+            # durable write guard has no business here either.
+            entries_before = self._matching_entry_count(conn, refs)
+            runs_before = self._matching_run_count(conn, refs)
+            conn.execute(
+                "UPDATE fin_run AS r "
+                "   SET structured_evidence = COALESCE("
+                "         (SELECT jsonb_agg(elem)"
+                "            FROM jsonb_array_elements(r.structured_evidence) AS elem"
+                "           WHERE NOT (elem->'snapshot'->>'evidence_ref' = ANY(%s))),"
+                "         '[]'::jsonb)"
+                " WHERE EXISTS (SELECT 1"
+                "                 FROM jsonb_array_elements(r.structured_evidence) AS elem"
+                "                WHERE elem->'snapshot'->>'evidence_ref' = ANY(%s))",
+                (refs, refs),
+            )
+            remaining_entries = self._matching_entry_count(conn, refs)
+            if remaining_entries == 0:
+                self._upsert_checkpoint(
+                    conn, consumer_id=consumer_id, applied=next_checkpoint, last_seq=last_seq
+                )
+            conn.commit()
+        return EvidenceScrubOutcome(
+            scrubbed_entries=entries_before - remaining_entries,
+            scrubbed_runs=runs_before,
+            remaining_entries=remaining_entries,
+        )
+
+    @staticmethod
+    def _matching_entry_count(conn: Any, refs: Sequence[str]) -> int:
+        return int(
+            conn.execute(
+                "SELECT count(*) FROM fin_run AS r, "
+                "LATERAL jsonb_array_elements(r.structured_evidence) AS elem "
+                "WHERE elem->'snapshot'->>'evidence_ref' = ANY(%s)",
+                (list(refs),),
+            ).fetchone()[0]
+        )
+
+    @staticmethod
+    def _matching_run_count(conn: Any, refs: Sequence[str]) -> int:
+        return int(
+            conn.execute(
+                "SELECT count(*) FROM fin_run AS r WHERE EXISTS ("
+                "SELECT 1 FROM jsonb_array_elements(r.structured_evidence) AS elem "
+                "WHERE elem->'snapshot'->>'evidence_ref' = ANY(%s))",
+                (list(refs),),
+            ).fetchone()[0]
+        )
+
+    def _upsert_checkpoint(
+        self, conn: Any, *, consumer_id: str, applied: str = "", last_seq: int = 0
+    ) -> None:
+        # WHY upsert and not UPDATE-then-INSERT: a first drain has no row
+        # yet, and two drains racing must not lose a watermark.
+        #
+        # WHY the conflict branch never writes ``acked_checkpoint``: this runs
+        # BEFORE the backend acknowledgement exists, so it must keep the resume
+        # cursor the previous acknowledgement left. The acknowledgement path has
+        # its own statement.
+        #
+        # WHY ``GREATEST(last_seq, ...)``: a crash between the two phases makes
+        # the backend redeliver events whose seq is already applied. The drain
+        # refuses a batch ending behind the stored watermark, so this only
+        # defends the orderable column against a caller that bypassed it.
+        #
+        # WHY ``applied_checkpoint`` is written as-is: it is opaque, so SQL
+        # cannot order it and no conflict clause can refuse a regression on it.
+        # Its monotonicity rests entirely on the drain's ``last_seq`` guard,
+        # which runs before this write.
+        conn.execute(
+            "INSERT INTO fin_evidence_invalidation_checkpoint "
+            "(consumer_id, applied_checkpoint, applied_at, last_seq, acked_checkpoint) "
+            "VALUES (%s, %s, now(), %s, '') "
+            "ON CONFLICT (consumer_id) DO UPDATE SET "
+            "applied_checkpoint = EXCLUDED.applied_checkpoint, "
+            "last_seq = GREATEST("
+            "    fin_evidence_invalidation_checkpoint.last_seq, EXCLUDED.last_seq), "
+            "applied_at = now()",
+            (consumer_id, applied, last_seq),
+        )
+
+    def advance_invalidation_acknowledgement(
+        self, consumer_id: str, checkpoint: str
+    ) -> None:
+        with self._guarded("advance invalidation acknowledgement") as conn:
+            row = conn.execute(
+                "INSERT INTO fin_evidence_invalidation_checkpoint "
+                "(consumer_id, applied_checkpoint, applied_at, last_seq, acked_checkpoint) "
+                "VALUES (%s, '', now(), 0, %s) ON CONFLICT (consumer_id) DO UPDATE SET "
+                "acked_checkpoint = EXCLUDED.acked_checkpoint, applied_at = now() "
+                "RETURNING consumer_id",
+                (consumer_id, checkpoint),
+            ).fetchone()
+            conn.commit()
+            if row is None:
+                raise PersistenceUnavailableError(
+                    "advance invalidation acknowledgement: INSERT ... RETURNING yielded no row"
+                )
+
+    # -- EP10 recovery gate (T33) --
+
+    def read_recovery_state(self, consumer_id: str) -> EvidenceRecoveryState:
+        with self._guarded("read recovery state") as conn:
+            row = conn.execute(
+                "SELECT recovery_withheld, recovery_reason "
+                "FROM fin_evidence_invalidation_checkpoint WHERE consumer_id = %s",
+                (consumer_id,),
+            ).fetchone()
+        if row is None:
+            return EvidenceRecoveryState(consumer_id=consumer_id)
+        return EvidenceRecoveryState(
+            consumer_id=consumer_id, withheld=bool(row[0]), reason=row[1] or ""
+        )
+
+    def set_recovery_withheld(self, consumer_id: str, reason: str) -> None:
+        # WHY this statement names NO watermark column: closing the gate must
+        # leave the resume cursor exactly where the last acknowledgement put it.
+        # A stale position is the reason the drain refused; advancing it here
+        # would be the defect T33 forbids.
+        with self._guarded("set recovery withheld") as conn:
+            conn.execute(
+                "INSERT INTO fin_evidence_invalidation_checkpoint "
+                "(consumer_id, applied_checkpoint, applied_at, last_seq, "
+                " acked_checkpoint, recovery_withheld, recovery_reason) "
+                "VALUES (%s, '', now(), 0, '', TRUE, %s) "
+                "ON CONFLICT (consumer_id) DO UPDATE SET "
+                "recovery_withheld = TRUE, recovery_reason = EXCLUDED.recovery_reason",
+                (consumer_id, reason),
+            )
+            conn.commit()
+
+    def set_recovery_released(self, consumer_id: str) -> None:
+        with self._guarded("set recovery released") as conn:
+            conn.execute(
+                "INSERT INTO fin_evidence_invalidation_checkpoint "
+                "(consumer_id, applied_checkpoint, applied_at, last_seq, "
+                " acked_checkpoint, recovery_withheld, recovery_reason) "
+                "VALUES (%s, '', now(), 0, '', FALSE, '') "
+                "ON CONFLICT (consumer_id) DO UPDATE SET "
+                "recovery_withheld = FALSE, recovery_reason = ''",
+                (consumer_id,),
+            )
+            conn.commit()
+
+    def scrub_retained_evidence_payloads(
+        self, evidence_refs: Sequence[str]
+    ) -> EvidenceScrubOutcome:
+        """Delete the named payloads and re-count, in one transaction.
+
+        No checkpoint statement appears here at all, on purpose: the sweep has
+        no batch, so it has no cursor to apply and no ``seq`` to claim. The
+        acknowledgement stays entirely the drain's to write.
+        """
+
+        refs = list(evidence_refs)
+        if not refs:
+            return EvidenceScrubOutcome(
+                scrubbed_entries=0, scrubbed_runs=0, remaining_entries=0
+            )
+        with self._guarded("scrub retained structured evidence") as conn:
+            entries_before = self._matching_entry_count(conn, refs)
+            runs_before = self._matching_run_count(conn, refs)
+            conn.execute(
+                "UPDATE fin_run AS r "
+                "   SET structured_evidence = COALESCE("
+                "         (SELECT jsonb_agg(elem)"
+                "            FROM jsonb_array_elements(r.structured_evidence) AS elem"
+                "           WHERE NOT (elem->'snapshot'->>'evidence_ref' = ANY(%s))),"
+                "         '[]'::jsonb)"
+                " WHERE EXISTS (SELECT 1"
+                "                 FROM jsonb_array_elements(r.structured_evidence) AS elem"
+                "                WHERE elem->'snapshot'->>'evidence_ref' = ANY(%s))",
+                (refs, refs),
+            )
+            # The confirmation read is INSIDE the same transaction as the
+            # delete, so a non-zero count means the scrub could not be backed
+            # and the caller must not open the gate.
+            remaining_entries = self._matching_entry_count(conn, refs)
+            conn.commit()
+        return EvidenceScrubOutcome(
+            scrubbed_entries=entries_before - remaining_entries,
+            scrubbed_runs=runs_before,
+            remaining_entries=remaining_entries,
+        )
 
 
 # ----- env-based default selection -----
@@ -1203,6 +1814,8 @@ def default_thread_store(env: Any = None) -> ThreadStore:
 # Re-exported so callers can ``isinstance`` without importing psycopg.
 __all__ = [
     "EvidenceContractWriteError",
+    "EvidenceInvalidationCheckpoint",
+    "EvidenceScrubOutcome",
     "InMemoryThreadStore",
     "PersistenceUnavailableError",
     "PostgresThreadStore",

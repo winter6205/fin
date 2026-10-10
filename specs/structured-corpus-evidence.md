@@ -226,6 +226,17 @@ by the transport, never by the model or a stored scope token. The action union i
 | `invalidations` | nullable `checkpoint`, `limit` in 1..20 (default 20) | content-free `events`, `next_checkpoint`, boolean `gap` |
 | `ack` | `checkpoint` | acknowledged `checkpoint` |
 
+A separate host-internal method token `corpus_collection_outcome` on the same
+connection carries the backend's collection outcome. It is not a fifth action of
+`iknow.evidence_request`, so the union above is unchanged. Request
+`iknow.collection_outcome_request`, response `iknow.collection_outcome_result`,
+both `schema_version: 1`; request `evidence_refs` of 1..20 non-empty strings;
+response `outcomes` of `{evidence_ref, state, observed_at, schema_version}` with
+`state` in `collected`, `expired`, `protected`, `purged`, `unknown`, under the same
+32 KiB envelope and 60-second bound as every other action. It is transport
+identity-bound and never model-supplied, it reports absence rather than inferring
+it, and it may only remove a fin claim — never create one.
+
 `context` has subject, operation, query digest, scope binding, read revision,
 query time, evidence expiry, coverage, and the original maintenance summary.
 `read` returns exactly the stored row/count rather than running a query.

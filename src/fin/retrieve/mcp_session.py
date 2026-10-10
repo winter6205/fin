@@ -81,6 +81,26 @@ def default_mcp_timeout_seconds() -> float:
 _PROCESS_EOF = object()
 
 
+#: Variables an allowlisted child still inherits from its parent.
+#:
+#: This list is the whole of what survives when a caller passes ``env=``. It
+#: holds process start-up necessities and nothing an authority could travel in:
+#: a path, a home for runtime caches, a locale and a temporary directory. Any
+#: variable outside this list and outside the caller's mapping stops being
+#: inherited, which is the property the private Evidence route depends on — an
+#: identity that the host did not inject cannot arrive by inheritance.
+INHERITED_ENV_ALLOWLIST: tuple[str, ...] = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "TZ",
+    "SYSTEMROOT",
+    "COMSPEC",
+)
+
+
 class MCPStdioTransportError(OSError):
     """The shared MCP process could not be reached or stopped answering."""
 
@@ -191,6 +211,15 @@ class MCPStdioSession:
     possible without blocking the adapter's event loop.  The process is
     deliberately lazy so constructing an opt-in adapter never starts a
     service during the default test run.
+
+    ``env`` decides what the child inherits.  ``None`` keeps the historical
+    whole-parent inheritance, which is what the ordinary tool adapters need.
+    Passing a mapping switches the child to a **closed allowlist**: a small
+    fixed base set carried from the parent, plus exactly the variables named in
+    the mapping, and nothing else.  That is the seam the private Evidence route
+    uses, because whole-parent inheritance made every session in a host process
+    share one identity, which made the authorized subset a process-wide
+    constant.
     """
 
     def __init__(
@@ -199,6 +228,7 @@ class MCPStdioSession:
         *,
         cwd: Path | str | None = None,
         timeout_seconds: float | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> None:
         if not command:
             raise ValueError("MCP session command must not be empty")
@@ -208,9 +238,22 @@ class MCPStdioSession:
             raise ValueError(
                 f"MCP session timeout must be positive, got {timeout_seconds}"
             )
+        if env is not None:
+            for name, value in env.items():
+                if not isinstance(name, str) or not name:
+                    raise ValueError(
+                        f"MCP session env names must be non-empty strings, got "
+                        f"{name!r}"
+                    )
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"MCP session env value for {name!r} must be a string, "
+                        f"got {type(value).__name__}"
+                    )
         self._command = tuple(str(part) for part in command)
         self._cwd = str(cwd) if cwd is not None else None
         self._timeout = float(timeout_seconds)
+        self._explicit_env = dict(env) if env is not None else None
         self._process: subprocess.Popen[bytes] | None = None
         self._responses: queue.Queue[object] = queue.Queue()
         self._io_lock = threading.RLock()
@@ -221,11 +264,46 @@ class MCPStdioSession:
         self._requests: list[dict[str, Any]] = []
 
     @property
+    def child_env(self) -> dict[str, str] | None:
+        """The exact child environment, or ``None`` when inheriting.
+
+        ``None`` is the whole-parent case.  A mapping is the closed allowlist,
+        returned verbatim so a caller can assert what stopped being inherited
+        without launching a process.
+        """
+
+        return dict(self._explicit_env) if self._explicit_env is not None else None
+
+    @property
     def requests(self) -> tuple[dict[str, Any], ...]:
         """Requests sent on this session, for opt-in wire assertions."""
 
         with self._io_lock:
             return tuple(self._requests)
+
+    @property
+    def is_spent(self) -> bool:
+        """Whether this session can no longer serve a call — reported, not reset.
+
+        ``_closed`` and ``_failed`` are terminal BY DESIGN: a failed session is
+        never revived in place, because the failure that set the flag is the
+        evidence that this child (or this launch) is unusable.  A caller that
+        OWNS the session lifecycle therefore needs to be able to ASK whether an
+        entry it is holding is still alive, so it can drop it and launch a fresh
+        child for the next call instead of answering every later call with the
+        same dead transport.
+
+        This property only reads the three signals that already decide the
+        session's fate: explicitly closed, marked failed, or a child that has
+        exited.  It clears nothing, so observing it cannot revive a session and
+        cannot change this class's terminal-on-failure contract.
+        """
+
+        with self._io_lock:
+            if self._closed or self._failed:
+                return True
+            process = self._process
+            return process is not None and process.poll() is not None
 
     def call(
         self,
@@ -280,6 +358,28 @@ class MCPStdioSession:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
+    def _resolve_env(self) -> dict[str, str] | None:
+        """Build the child environment for the allowlisted case.
+
+        The base list is intentionally short and contains nothing an identity
+        could be smuggled through: process start-up needs a path, a home for
+        runtime caches, a locale and a temp directory.  Every other variable the
+        child sees has to be named in the mapping the caller passed, so a host
+        that forgets to inject an identity gets a child with **no** identity
+        variable rather than one that inherited it from the parent.
+        """
+
+        explicit = self._explicit_env
+        if explicit is None:
+            return None
+        env: dict[str, str] = {}
+        for name in INHERITED_ENV_ALLOWLIST:
+            value = os.environ.get(name)
+            if value is not None:
+                env[name] = value
+        env.update(explicit)
+        return env
+
     def _ensure_started(self, timeout: float) -> None:
         if self._closed:
             raise MCPStdioTransportError("MCP session is closed")
@@ -299,6 +399,7 @@ class MCPStdioSession:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 bufsize=0,
+                env=self._resolve_env(),
             )
         except (OSError, ValueError) as exc:
             self._failed = True

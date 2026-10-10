@@ -946,7 +946,10 @@ def test_postgres_run_sql_round_trips_visual_claims_jsonb(monkeypatch) -> None:
     params = captured_params[0]
     # The written column is the LAST INSERT parameter, serialized as JSON.
     assert json.loads(params[18]) == [claim]
-    assert len(params) == 19
+    # ``structured_evidence`` is column 20, appended after ``visual_claims``
+    # so every earlier index keeps its meaning.
+    assert json.loads(params[19]) == []
+    assert len(params) == 20
 
     parsed = store._row_to_run(rows_back[0])
     assert parsed.visual_claims == [claim]

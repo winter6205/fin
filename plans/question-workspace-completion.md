@@ -27,7 +27,7 @@
    - **Completion:** A second implementer may choose a different internal state shape if it preserves thread/operation association and the same authoritative restore proof.
    - **Depends on:** The original Runtime T1 shared contract.
    - [blocks: T2, T3, T4, T5]
-   - **Status:** [ ] pending
+   - **Status:** [x] done
 
 2. **T2 — Use one active-input decision for the composer and submission notices** — tag: `[implementation]`
    - **Inherits:** “While work is active, the operator can submit compatible progress, added context, task-change, or cancellation input through Runtime's serialized acceptance path.” “Keep input available and reflect Runtime's acceptance outcome. Do not start concurrent graph work for the same thread or automatically cancel current work whenever new input arrives. Runtime decides whether unaffected work continues or affected work is interrupted.”
@@ -36,7 +36,7 @@
    - **Completion:** A second implementer may arrange the computation and rendering differently while Composer and the task region share one decision and do not infer host outcomes.
    - **Depends on:** T1 and the original Runtime T1 shared contract for implementation. Integrated SC-5 acceptance additionally requires Runtime completion T2–T4, including T3's active-run sequencing tracked by the tracked change.
    - [blocks: T3, T5]
-   - **Status:** [ ] pending
+   - **Status:** [x] implemented; integrated acceptance waits on the producers named in **Depends on**
 
 3. **T3 — Keep clarification replies bound to their question through reload and refusal** — tag: `[implementation]`
    - **Inherits:** “Preserve the exact text, selected option, and association with the original question and its originating basis.” “A rejected stale reply does not mutate, reactivate, or answer another task. Preserve the original question association and the user's draft; never silently rebase the old reply onto a new question.”
@@ -44,7 +44,7 @@
    - **Acceptance:** The full question and all options remain available with no preselected answer; Other text stays within the selected Other option. Dismissal submits no answer. A pending reply is not shown as accepted or answered; an accepted reply is reflected only after the authoritative projection clears that question. A stale refusal stays attached to the original question, preserves its draft, and cannot overwrite a newer question. Reload restores the authoritative pending question without an empty or bodyless resume request.
    - **Completion:** A second implementer may use a different card/store arrangement as long as the original association and draft survive refusal and reload with no optimistic answer.
    - **Depends on:** T1 and T2. Full SC-3/SC-4 acceptance additionally requires Runtime completion T2; the active-run reply variant also requires Runtime T3.
-   - **Status:** [ ] pending
+   - **Status:** [x] implemented; integrated acceptance waits on the producers named in **Depends on**
 
 4. **T4 — Present task, source, answer-support, and gap facts from their owners** — tag: `[implementation]`
    - **Inherits:** “The current task goal, latest task outcome, latest turn result, and material unresolved gaps as reported by Runtime.” “The user's current source restriction and the host's freshly evaluated effective source set and actual operation capabilities.” “The sources actually attached to the current answer, separately from sources merely eligible to be searched.”
@@ -54,7 +54,7 @@
    - **Depends on:** T1 and the original Runtime T1 projection seam for implementation. Integrated SC-1/SC-2 acceptance additionally requires current authority, capability, and effective-selection facts from Source Scope completion T2–T4. Task-completion display additionally requires the Grounded Answer assessment producer and Runtime completion T5.
    - [parallel] — may proceed alongside T2 and T3 after T1.
    - [blocks: T5]
-   - **Status:** [ ] pending
+   - **Status:** [x] implemented; integrated acceptance waits on the producers named in **Depends on**
 
 5. **T5 — Render archive restore from a correlated Runtime decision** — tag: `[implementation]`
    - **Inherits:** “Restore is explicit; Runtime rechecks current permission, versions, and evidence applicability before making it current. Until Runtime confirms restoration, keep showing the existing current task. Historical text and citations remain historical evidence and are not promoted to current support by restoration.”
@@ -62,7 +62,19 @@
    - **Acceptance:** The production archive surface consumes the shared restore decision. It offers restore only for a listed, restorable archive and sends only an explicit user action. While Runtime checks, the existing current task remains visible. Only the correlated fresh-projection proof selected in T1 marks the archive restored; a durable request acceptance alone does not. A current refusal wins over stale confirmation, a request Runtime can no longer hear is refused, and historical answers/citations remain historical. Refusals and unresolved projection refreshes are visible without claiming adoption. Repeated requests and thread switches cannot make one archive's status appear on another operation or thread.
    - **Completion:** A second implementer may choose a different view/store composition as long as adoption requires the same correlated Runtime fact and all non-adopted states keep the current task and history truthful.
    - **Depends on:** T1, T2, and T4 for the shared operation result and current-task presentation. Workspace implementation may use the frozen seam before upstream completion; integrated SC-6 restore acceptance additionally requires Runtime completion T2/T6 and Source Scope's current permission, capability, and effective-selection facts from T2–T4.
-   - **Status:** [ ] pending
+   - **Status:** [x] implemented; integrated acceptance waits on the producers named in **Depends on**
+
+## T1 frozen seam
+
+**Operation identity.** Each user-intent submission is recorded per thread with a browser-minted attempt counter used as a DISPLAY-ONLY correlation key: it is never sent to the host and never used to derive task truth, because the wire carries no operation id, request id, revision, or sequence. A result belongs to an operation only when it names that thread's current attempt, alongside the Runtime-owned facts the projection already carries (`task_id`, `question_id`, `archive_id`, `run_id`). A result is written to the record of the thread it names and is displayable only while that thread is open, so a thread switch or a late answer cannot repaint another operation's state.
+
+**Restore adoption proof.** Adoption is proven by the existing authoritative projection alone: after a fresh projection reload for the same thread, `current_task.task_id` equals the `task_id` of the archive row the operator selected AND that `archive_id` is absent from `archived_tasks`. A durable request acceptance NEVER proves adoption — an accepted restore request reports only the request's own state. Both fields are already carried by the projection, so no additional producer fact is owed to Runtime T6 before restore acceptance is claimed.
+
+**Precedence.** A refusal for the current attempt outranks an older confirmation: once a refusal is recorded for an attempt, a later accepted verdict cannot turn it into a confirmation, while a refusal arriving after a confirmation replaces it. Results whose thread or attempt is not the current one are dropped. A failed, unreadable, or refresh-failed projection stays `unresolved` and keeps the existing current task visible.
+
+**Ownership.** Every fact is Runtime-owned; Workspace gains no task authority. Any fact the projection does not carry — material gaps, fresh source evaluation — is reported as unreported or unavailable and is never inferred.
+
+**Portability and placement.** A second implementer may choose a different internal state shape provided it preserves this thread/attempt association and the same authoritative restore proof. The browser side of the seam is implemented in `web/src/workspaceOperation.ts` (identity and association only); the projection read stays in `web/src/taskRuntime.ts` and restore adoption stays with Runtime.
 
 ## Contract and acceptance coverage
 

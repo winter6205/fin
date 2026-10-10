@@ -31,8 +31,9 @@
 // `scripts/`, is reached only by the command above, and starts its own
 // server on a free port.
 
+import { execFile } from "node:child_process";
 import path from "node:path";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -170,6 +171,46 @@ function parseEnvFile(text) {
     pairs.set(key, value);
   }
   return pairs;
+}
+
+// `git rev-parse --git-common-dir` prints the main checkout's `.git`.
+// Its parent is that checkout. A linked worktree's own root has no
+// `.env`; the closest file still wins when this checkout has one.
+function gitCommonDir(repoRoot) {
+  return new Promise((resolve) => {
+    execFile(
+      "git",
+      ["-C", repoRoot, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+      { encoding: "utf8" },
+      (error, stdout) => {
+        if (error) {
+          resolve(null);
+          return;
+        }
+        const text = String(stdout ?? "").trim();
+        resolve(text ? path.resolve(repoRoot, text) : null);
+      },
+    );
+  });
+}
+
+async function isRegularFile(target) {
+  try {
+    return (await stat(target)).isFile();
+  } catch {
+    return false;
+  }
+}
+
+async function resolveDotenvPath() {
+  if (await exists(DOTENV)) return DOTENV;
+  const commonDir = await gitCommonDir(REPO_ROOT);
+  if (commonDir === null) return DOTENV;
+  const parent = path.dirname(commonDir);
+  if (path.resolve(parent) === path.resolve(REPO_ROOT)) return DOTENV;
+  const mainEnv = path.join(parent, ".env");
+  if (await isRegularFile(mainEnv)) return mainEnv;
+  return DOTENV;
 }
 
 // Read the file once: the credential gate and the child environment
@@ -535,8 +576,10 @@ async function main(argv) {
   }
 
   // FIRST, before any port, any build, any process: the credential.
-  const dotenv = await readDotenv();
-  const credential = resolveCredential(CREDENTIAL_VAR, { dotenv });
+  // Both the gate and the server child read this same resolved file.
+  const dotenvPath = await resolveDotenvPath();
+  const dotenv = await readDotenv(dotenvPath);
+  const credential = resolveCredential(CREDENTIAL_VAR, { dotenv, dotenvPath });
   if (!credential.present) return abortMissingCredential();
   log(`${CREDENTIAL_VAR} found in ${credential.source} — value not printed`);
 

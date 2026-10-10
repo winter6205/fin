@@ -68,7 +68,9 @@ def find_env_file(*, start: Path | None = None) -> Path | None:
 
     The closest ``.env`` wins. Walking stops at the first directory
     that contains ``pyproject.toml`` so a stray ``~/.env`` is never
-    loaded because the operator launched from a nested cwd.
+    loaded because the operator launched from a nested cwd. When that
+    root is a linked worktree with no ``.env``, the main checkout's
+    ``.env`` is used instead.
     """
     current = (start or Path.cwd()).resolve()
     while True:
@@ -76,11 +78,50 @@ def find_env_file(*, start: Path | None = None) -> Path | None:
         if candidate.is_file():
             return candidate
         if (current / "pyproject.toml").is_file():
-            return None
+            return _worktree_main_dotenv(current)
         parent = current.parent
         if parent == current:
             return None
         current = parent
+
+
+def _worktree_main_dotenv(project_root: Path) -> Path | None:
+    import subprocess
+
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "rev-parse",
+                "--path-format=absolute",
+                "--show-toplevel",
+                "--git-dir",
+                "--git-common-dir",
+            ],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None  # EXIT: git is not executable
+    lines = completed.stdout.splitlines()
+    if completed.returncode != 0 or len(lines) != 3:
+        return None
+    toplevel = Path(lines[0])
+    git_dir = Path(lines[1])
+    common = Path(lines[2])
+    if not common.is_absolute() or git_dir == common:
+        return None
+    if toplevel.resolve() != project_root.resolve():
+        return None
+    main = common.parent.resolve()
+    if main == project_root.resolve():
+        return None
+    env_file = main / ".env"
+    if env_file.is_file():
+        return env_file
+    return None
 
 
 def apply_dotenv(

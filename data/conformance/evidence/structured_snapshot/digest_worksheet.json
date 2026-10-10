@@ -1,0 +1,440 @@
+{
+  "purpose": "Byte-level golden vectors for the type-preserving canonical encoding of fin.evidence.structured_snapshot v1 (specs/structured-corpus-evidence.md, Type-preserving digest). Python and TypeScript must reproduce canonical_json and digest byte-for-byte from the same snapshot. These vectors are a NEW profile: ADR 0092's legacy textified digest lives in data/conformance/evidence/database_row/digest_worksheet.json and is unchanged.",
+  "digest_form": "lowercase hexadecimal SHA-256 of the UTF-8 canonical_json bytes; no algorithm prefix. The legacy profile prefixes 'sha256:' and the two spellings are deliberately distinct.",
+  "encoding_rules": [
+    "types stay distinct: null/true/false/string/array/object/number never collide",
+    "numbers: reject non-finite, fractional, and outside +/- (2**53 - 1); accepted integers normalize to base-10 text, zero encodes as 0",
+    "object keys sort by UTF-8 bytes at every level; array order is preserved; no whitespace",
+    "strings: escape \" and \\ only; U+0000-U+001F as lowercase six-character \\u00xx; every other scalar emitted directly in UTF-8; no Unicode normalization",
+    "null, true and false are literal",
+    "an unpaired surrogate is refused, not repaired"
+  ],
+  "snapshot_key_set": [
+    "coverage",
+    "evidence_ref",
+    "expires_at",
+    "kind",
+    "maintenance",
+    "operation",
+    "queried_at",
+    "query_digest",
+    "read_revision",
+    "schema",
+    "schema_version",
+    "scope_binding",
+    "subject",
+    "value"
+  ],
+  "snapshots": [
+    {
+      "case": "structured_snapshot/row-minimal",
+      "note": "A production-shaped list row: the frozen key set with a validated row value.",
+      "snapshot": {
+        "schema": "fin.evidence.structured_snapshot",
+        "schema_version": 1,
+        "kind": "structured-result",
+        "subject": "entity",
+        "operation": "list",
+        "query_digest": "sha256:0f1e2d3c",
+        "scope_binding": "scope-fin-tenant-7",
+        "read_revision": "rev-118",
+        "queried_at": "2026-10-03T00:00:00Z",
+        "expires_at": "2027-10-03T00:00:00Z",
+        "evidence_ref": "evref-0001",
+        "value": {
+          "result_id": "r-1",
+          "name": "Northwind Logistics",
+          "unit_count": 3
+        },
+        "coverage": "stored_structured_subjects",
+        "maintenance": {}
+      },
+      "canonical_json": "{\"coverage\":\"stored_structured_subjects\",\"evidence_ref\":\"evref-0001\",\"expires_at\":\"2027-10-03T00:00:00Z\",\"kind\":\"structured-result\",\"maintenance\":{},\"operation\":\"list\",\"queried_at\":\"2026-10-03T00:00:00Z\",\"query_digest\":\"sha256:0f1e2d3c\",\"read_revision\":\"rev-118\",\"schema\":\"fin.evidence.structured_snapshot\",\"schema_version\":1,\"scope_binding\":\"scope-fin-tenant-7\",\"subject\":\"entity\",\"value\":{\"name\":\"Northwind Logistics\",\"result_id\":\"r-1\",\"unit_count\":3}}",
+      "digest": "1694b60872dbcf804c9db7a027b4d1ba8cda3ca204f296109621f15355c412b4"
+    },
+    {
+      "case": "structured_snapshot/count-zero",
+      "note": "A zero count receipt: count metadata is part of the digest like any other value.",
+      "snapshot": {
+        "schema": "fin.evidence.structured_snapshot",
+        "schema_version": 1,
+        "kind": "structured-result",
+        "subject": "entity",
+        "operation": "count",
+        "query_digest": "sha256:0f1e2d3c",
+        "scope_binding": "scope-fin-tenant-7",
+        "read_revision": "rev-118",
+        "queried_at": "2026-10-03T00:00:00Z",
+        "expires_at": "2027-10-03T00:00:00Z",
+        "evidence_ref": "evref-0001",
+        "value": {
+          "count": 0,
+          "receipt": {
+            "query_digest": "sha256:0f1e2d3c",
+            "read_revision": "rev-118"
+          }
+        },
+        "coverage": "stored_structured_subjects",
+        "maintenance": {}
+      },
+      "canonical_json": "{\"coverage\":\"stored_structured_subjects\",\"evidence_ref\":\"evref-0001\",\"expires_at\":\"2027-10-03T00:00:00Z\",\"kind\":\"structured-result\",\"maintenance\":{},\"operation\":\"count\",\"queried_at\":\"2026-10-03T00:00:00Z\",\"query_digest\":\"sha256:0f1e2d3c\",\"read_revision\":\"rev-118\",\"schema\":\"fin.evidence.structured_snapshot\",\"schema_version\":1,\"scope_binding\":\"scope-fin-tenant-7\",\"subject\":\"entity\",\"value\":{\"count\":0,\"receipt\":{\"query_digest\":\"sha256:0f1e2d3c\",\"read_revision\":\"rev-118\"}}}",
+      "digest": "ca4929f26b7dd9eb911b5951c8dfffe8665b5b058e7f87d66bbaf4453a42508c"
+    },
+    {
+      "case": "structured_snapshot/type-distinctness",
+      "note": "1, \"1\" and true must not collide; the legacy textified profile collapses all three.",
+      "snapshot": {
+        "schema": "fin.evidence.structured_snapshot",
+        "schema_version": 1,
+        "kind": "structured-result",
+        "subject": "entity",
+        "operation": "list",
+        "query_digest": "sha256:0f1e2d3c",
+        "scope_binding": "scope-fin-tenant-7",
+        "read_revision": "rev-118",
+        "queried_at": "2026-10-03T00:00:00Z",
+        "expires_at": "2027-10-03T00:00:00Z",
+        "evidence_ref": "evref-0001",
+        "value": {
+          "a": 1,
+          "b": "1",
+          "c": true,
+          "d": null,
+          "e": [
+            1
+          ],
+          "f": {
+            "1": 1
+          }
+        },
+        "coverage": "stored_structured_subjects",
+        "maintenance": {}
+      },
+      "canonical_json": "{\"coverage\":\"stored_structured_subjects\",\"evidence_ref\":\"evref-0001\",\"expires_at\":\"2027-10-03T00:00:00Z\",\"kind\":\"structured-result\",\"maintenance\":{},\"operation\":\"list\",\"queried_at\":\"2026-10-03T00:00:00Z\",\"query_digest\":\"sha256:0f1e2d3c\",\"read_revision\":\"rev-118\",\"schema\":\"fin.evidence.structured_snapshot\",\"schema_version\":1,\"scope_binding\":\"scope-fin-tenant-7\",\"subject\":\"entity\",\"value\":{\"a\":1,\"b\":\"1\",\"c\":true,\"d\":null,\"e\":[1],\"f\":{\"1\":1}}}",
+      "digest": "bd0410a43bd676bfe5a2aad65bbe6a3c6fa36fe8907ab20a9de21eed47ca1c0e"
+    },
+    {
+      "case": "structured_snapshot/schema-version-integer-spelling",
+      "note": "ADR 0093: the integer spelling of the version. Paired with the float case below; the two digests MUST be equal.",
+      "pair_with": "structured_snapshot/schema-version-float-spelling",
+      "snapshot": {
+        "schema": "fin.evidence.structured_snapshot",
+        "schema_version": 1,
+        "kind": "structured-result",
+        "subject": "entity",
+        "operation": "list",
+        "query_digest": "sha256:0f1e2d3c",
+        "scope_binding": "scope-fin-tenant-7",
+        "read_revision": "rev-118",
+        "queried_at": "2026-10-03T00:00:00Z",
+        "expires_at": "2027-10-03T00:00:00Z",
+        "evidence_ref": "evref-0001",
+        "value": {
+          "unit_count": 1
+        },
+        "coverage": "stored_structured_subjects",
+        "maintenance": {}
+      },
+      "canonical_json": "{\"coverage\":\"stored_structured_subjects\",\"evidence_ref\":\"evref-0001\",\"expires_at\":\"2027-10-03T00:00:00Z\",\"kind\":\"structured-result\",\"maintenance\":{},\"operation\":\"list\",\"queried_at\":\"2026-10-03T00:00:00Z\",\"query_digest\":\"sha256:0f1e2d3c\",\"read_revision\":\"rev-118\",\"schema\":\"fin.evidence.structured_snapshot\",\"schema_version\":1,\"scope_binding\":\"scope-fin-tenant-7\",\"subject\":\"entity\",\"value\":{\"unit_count\":1}}",
+      "digest": "a2278388827f6271241c6ace71ede83c55d73a703009038be8601e66fa8289e5"
+    },
+    {
+      "case": "structured_snapshot/schema-version-float-spelling",
+      "note": "ADR 0093: 1.0 and 1 are the same version, so this digest MUST equal the integer-spelling case's digest.",
+      "pair_with": "structured_snapshot/schema-version-integer-spelling",
+      "snapshot": {
+        "schema": "fin.evidence.structured_snapshot",
+        "schema_version": 1.0,
+        "kind": "structured-result",
+        "subject": "entity",
+        "operation": "list",
+        "query_digest": "sha256:0f1e2d3c",
+        "scope_binding": "scope-fin-tenant-7",
+        "read_revision": "rev-118",
+        "queried_at": "2026-10-03T00:00:00Z",
+        "expires_at": "2027-10-03T00:00:00Z",
+        "evidence_ref": "evref-0001",
+        "value": {
+          "unit_count": 1
+        },
+        "coverage": "stored_structured_subjects",
+        "maintenance": {}
+      },
+      "canonical_json": "{\"coverage\":\"stored_structured_subjects\",\"evidence_ref\":\"evref-0001\",\"expires_at\":\"2027-10-03T00:00:00Z\",\"kind\":\"structured-result\",\"maintenance\":{},\"operation\":\"list\",\"queried_at\":\"2026-10-03T00:00:00Z\",\"query_digest\":\"sha256:0f1e2d3c\",\"read_revision\":\"rev-118\",\"schema\":\"fin.evidence.structured_snapshot\",\"schema_version\":1,\"scope_binding\":\"scope-fin-tenant-7\",\"subject\":\"entity\",\"value\":{\"unit_count\":1}}",
+      "digest": "a2278388827f6271241c6ace71ede83c55d73a703009038be8601e66fa8289e5"
+    },
+    {
+      "case": "structured_snapshot/control-escapes",
+      "note": "U+0000-U+001F encode as lowercase \\u00xx, never as \\n/\\t/\\b short escapes.",
+      "snapshot": {
+        "schema": "fin.evidence.structured_snapshot",
+        "schema_version": 1,
+        "kind": "structured-result",
+        "subject": "entity",
+        "operation": "list",
+        "query_digest": "sha256:0f1e2d3c",
+        "scope_binding": "scope-fin-tenant-7",
+        "read_revision": "rev-118",
+        "queried_at": "2026-10-03T00:00:00Z",
+        "expires_at": "2027-10-03T00:00:00Z",
+        "evidence_ref": "evref-0001",
+        "value": {
+          "v": "a\nb\tc\u0000d\u001fe"
+        },
+        "coverage": "stored_structured_subjects",
+        "maintenance": {}
+      },
+      "canonical_json": "{\"coverage\":\"stored_structured_subjects\",\"evidence_ref\":\"evref-0001\",\"expires_at\":\"2027-10-03T00:00:00Z\",\"kind\":\"structured-result\",\"maintenance\":{},\"operation\":\"list\",\"queried_at\":\"2026-10-03T00:00:00Z\",\"query_digest\":\"sha256:0f1e2d3c\",\"read_revision\":\"rev-118\",\"schema\":\"fin.evidence.structured_snapshot\",\"schema_version\":1,\"scope_binding\":\"scope-fin-tenant-7\",\"subject\":\"entity\",\"value\":{\"v\":\"a\\u000ab\\u0009c\\u0000d\\u001fe\"}}",
+      "digest": "54062d2b29d23d259bfa636b10933b71fcdbf8ab119e01510a7a5d194c49d311"
+    },
+    {
+      "case": "structured_snapshot/direct-utf8-scalars",
+      "note": "Only U+0000-U+001F escape; U+007F and every other scalar is emitted directly in UTF-8.",
+      "snapshot": {
+        "schema": "fin.evidence.structured_snapshot",
+        "schema_version": 1,
+        "kind": "structured-result",
+        "subject": "entity",
+        "operation": "list",
+        "query_digest": "sha256:0f1e2d3c",
+        "scope_binding": "scope-fin-tenant-7",
+        "read_revision": "rev-118",
+        "queried_at": "2026-10-03T00:00:00Z",
+        "expires_at": "2027-10-03T00:00:00Z",
+        "evidence_ref": "evref-0001",
+        "value": {
+          "v": "é中😀"
+        },
+        "coverage": "stored_structured_subjects",
+        "maintenance": {}
+      },
+      "canonical_json": "{\"coverage\":\"stored_structured_subjects\",\"evidence_ref\":\"evref-0001\",\"expires_at\":\"2027-10-03T00:00:00Z\",\"kind\":\"structured-result\",\"maintenance\":{},\"operation\":\"list\",\"queried_at\":\"2026-10-03T00:00:00Z\",\"query_digest\":\"sha256:0f1e2d3c\",\"read_revision\":\"rev-118\",\"schema\":\"fin.evidence.structured_snapshot\",\"schema_version\":1,\"scope_binding\":\"scope-fin-tenant-7\",\"subject\":\"entity\",\"value\":{\"v\":\"é中😀\"}}",
+      "digest": "9ec67e0fff92509972dd85c071fccea8aaa0b377cf815b0a1673be42d751cb7d"
+    },
+    {
+      "case": "structured_snapshot/quote-and-backslash",
+      "note": "Escaped as \\\" and \\\\ only; a forward slash is never escaped.",
+      "snapshot": {
+        "schema": "fin.evidence.structured_snapshot",
+        "schema_version": 1,
+        "kind": "structured-result",
+        "subject": "entity",
+        "operation": "list",
+        "query_digest": "sha256:0f1e2d3c",
+        "scope_binding": "scope-fin-tenant-7",
+        "read_revision": "rev-118",
+        "queried_at": "2026-10-03T00:00:00Z",
+        "expires_at": "2027-10-03T00:00:00Z",
+        "evidence_ref": "evref-0001",
+        "value": {
+          "v": "he said \"hi\" \\ / done"
+        },
+        "coverage": "stored_structured_subjects",
+        "maintenance": {}
+      },
+      "canonical_json": "{\"coverage\":\"stored_structured_subjects\",\"evidence_ref\":\"evref-0001\",\"expires_at\":\"2027-10-03T00:00:00Z\",\"kind\":\"structured-result\",\"maintenance\":{},\"operation\":\"list\",\"queried_at\":\"2026-10-03T00:00:00Z\",\"query_digest\":\"sha256:0f1e2d3c\",\"read_revision\":\"rev-118\",\"schema\":\"fin.evidence.structured_snapshot\",\"schema_version\":1,\"scope_binding\":\"scope-fin-tenant-7\",\"subject\":\"entity\",\"value\":{\"v\":\"he said \\\"hi\\\" \\\\ / done\"}}",
+      "digest": "d6ffde98bbc6b05e25dab97a5ddab8dde40dca60a3d449f123fa33fb27ccb931"
+    },
+    {
+      "case": "structured_snapshot/key-byte-order",
+      "note": "Keys sort by UTF-8 bytes at every level; a nested object is ordered too.",
+      "snapshot": {
+        "schema": "fin.evidence.structured_snapshot",
+        "schema_version": 1,
+        "kind": "structured-result",
+        "subject": "entity",
+        "operation": "list",
+        "query_digest": "sha256:0f1e2d3c",
+        "scope_binding": "scope-fin-tenant-7",
+        "read_revision": "rev-118",
+        "queried_at": "2026-10-03T00:00:00Z",
+        "expires_at": "2027-10-03T00:00:00Z",
+        "evidence_ref": "evref-0001",
+        "value": {
+          "b": 1,
+          "a": 2,
+          "é": 3,
+          "Z": 4,
+          "A": 5,
+          "中": 6,
+          "n": {
+            "z": 1,
+            "a": 2
+          }
+        },
+        "coverage": "stored_structured_subjects",
+        "maintenance": {}
+      },
+      "canonical_json": "{\"coverage\":\"stored_structured_subjects\",\"evidence_ref\":\"evref-0001\",\"expires_at\":\"2027-10-03T00:00:00Z\",\"kind\":\"structured-result\",\"maintenance\":{},\"operation\":\"list\",\"queried_at\":\"2026-10-03T00:00:00Z\",\"query_digest\":\"sha256:0f1e2d3c\",\"read_revision\":\"rev-118\",\"schema\":\"fin.evidence.structured_snapshot\",\"schema_version\":1,\"scope_binding\":\"scope-fin-tenant-7\",\"subject\":\"entity\",\"value\":{\"A\":5,\"Z\":4,\"a\":2,\"b\":1,\"n\":{\"a\":2,\"z\":1},\"é\":3,\"中\":6}}",
+      "digest": "661e59e603a12458c5550ce83ede8dd8026c4ce3e4c2e65ed1abe28bd2deaa6a"
+    },
+    {
+      "case": "structured_snapshot/array-order-preserved",
+      "note": "Array order is never sorted; a support array's stable UUID order survives the digest.",
+      "snapshot": {
+        "schema": "fin.evidence.structured_snapshot",
+        "schema_version": 1,
+        "kind": "structured-result",
+        "subject": "entity",
+        "operation": "list",
+        "query_digest": "sha256:0f1e2d3c",
+        "scope_binding": "scope-fin-tenant-7",
+        "read_revision": "rev-118",
+        "queried_at": "2026-10-03T00:00:00Z",
+        "expires_at": "2027-10-03T00:00:00Z",
+        "evidence_ref": "evref-0001",
+        "value": {
+          "v": [
+            3,
+            1,
+            2,
+            "b",
+            "a",
+            null,
+            true,
+            false
+          ]
+        },
+        "coverage": "stored_structured_subjects",
+        "maintenance": {}
+      },
+      "canonical_json": "{\"coverage\":\"stored_structured_subjects\",\"evidence_ref\":\"evref-0001\",\"expires_at\":\"2027-10-03T00:00:00Z\",\"kind\":\"structured-result\",\"maintenance\":{},\"operation\":\"list\",\"queried_at\":\"2026-10-03T00:00:00Z\",\"query_digest\":\"sha256:0f1e2d3c\",\"read_revision\":\"rev-118\",\"schema\":\"fin.evidence.structured_snapshot\",\"schema_version\":1,\"scope_binding\":\"scope-fin-tenant-7\",\"subject\":\"entity\",\"value\":{\"v\":[3,1,2,\"b\",\"a\",null,true,false]}}",
+      "digest": "addb9715e7430caa758c546e3b77b3149d0b59ad7f8cfe6a53a4ef2e868b5348"
+    },
+    {
+      "case": "structured_snapshot/integer-normalization",
+      "note": "Accepted integers normalize to base-10 text; -0.0 and 0 both encode as 0.",
+      "snapshot": {
+        "schema": "fin.evidence.structured_snapshot",
+        "schema_version": 1,
+        "kind": "structured-result",
+        "subject": "entity",
+        "operation": "list",
+        "query_digest": "sha256:0f1e2d3c",
+        "scope_binding": "scope-fin-tenant-7",
+        "read_revision": "rev-118",
+        "queried_at": "2026-10-03T00:00:00Z",
+        "expires_at": "2027-10-03T00:00:00Z",
+        "evidence_ref": "evref-0001",
+        "value": {
+          "a": -0.0,
+          "b": 0,
+          "c": -42,
+          "d": 1.0,
+          "e": 9007199254740991
+        },
+        "coverage": "stored_structured_subjects",
+        "maintenance": {}
+      },
+      "canonical_json": "{\"coverage\":\"stored_structured_subjects\",\"evidence_ref\":\"evref-0001\",\"expires_at\":\"2027-10-03T00:00:00Z\",\"kind\":\"structured-result\",\"maintenance\":{},\"operation\":\"list\",\"queried_at\":\"2026-10-03T00:00:00Z\",\"query_digest\":\"sha256:0f1e2d3c\",\"read_revision\":\"rev-118\",\"schema\":\"fin.evidence.structured_snapshot\",\"schema_version\":1,\"scope_binding\":\"scope-fin-tenant-7\",\"subject\":\"entity\",\"value\":{\"a\":0,\"b\":0,\"c\":-42,\"d\":1,\"e\":9007199254740991}}",
+      "digest": "5dcd23101411973d47c675792255a0bb25cd2b5bc114a0077e2c1e0b90c0d6ea"
+    },
+    {
+      "case": "structured_snapshot/nested-maintenance",
+      "note": "Rule 4 recurses into maintenance and count metadata; nothing is exempt.",
+      "snapshot": {
+        "schema": "fin.evidence.structured_snapshot",
+        "schema_version": 1,
+        "kind": "structured-result",
+        "subject": "entity",
+        "operation": "list",
+        "query_digest": "sha256:0f1e2d3c",
+        "scope_binding": "scope-fin-tenant-7",
+        "read_revision": "rev-118",
+        "queried_at": "2026-10-03T00:00:00Z",
+        "expires_at": "2027-10-03T00:00:00Z",
+        "evidence_ref": "evref-0001",
+        "value": {
+          "count": 7,
+          "receipt": {
+            "query_digest": "d",
+            "read_revision": "r"
+          }
+        },
+        "coverage": "stored_structured_subjects",
+        "maintenance": {
+          "generation": 12,
+          "accepted_source_versions": [
+            "v2",
+            "v1"
+          ],
+          "retired_since": null,
+          "eligible_at": "2027-01-01T00:00:00Z"
+        }
+      },
+      "canonical_json": "{\"coverage\":\"stored_structured_subjects\",\"evidence_ref\":\"evref-0001\",\"expires_at\":\"2027-10-03T00:00:00Z\",\"kind\":\"structured-result\",\"maintenance\":{\"accepted_source_versions\":[\"v2\",\"v1\"],\"eligible_at\":\"2027-01-01T00:00:00Z\",\"generation\":12,\"retired_since\":null},\"operation\":\"list\",\"queried_at\":\"2026-10-03T00:00:00Z\",\"query_digest\":\"sha256:0f1e2d3c\",\"read_revision\":\"rev-118\",\"schema\":\"fin.evidence.structured_snapshot\",\"schema_version\":1,\"scope_binding\":\"scope-fin-tenant-7\",\"subject\":\"entity\",\"value\":{\"count\":7,\"receipt\":{\"query_digest\":\"d\",\"read_revision\":\"r\"}}}",
+      "digest": "b37cfa5e14f72000f2ef4635965c455bc899a42f74289875e20d1c5f26bac064"
+    }
+  ],
+  "refusals": [
+    {
+      "case": "structured_snapshot/refuse-nan",
+      "construction": {
+        "kind": "float",
+        "value": "nan"
+      },
+      "reason": "number is not finite"
+    },
+    {
+      "case": "structured_snapshot/refuse-inf",
+      "construction": {
+        "kind": "float",
+        "value": "inf"
+      },
+      "reason": "number is not finite"
+    },
+    {
+      "case": "structured_snapshot/refuse-negative-inf",
+      "construction": {
+        "kind": "float",
+        "value": "-inf"
+      },
+      "reason": "number is not finite"
+    },
+    {
+      "case": "structured_snapshot/refuse-fractional",
+      "construction": {
+        "kind": "float",
+        "value": "1.5"
+      },
+      "reason": "number has a fractional decoded value"
+    },
+    {
+      "case": "structured_snapshot/refuse-safe-integer-overflow",
+      "construction": {
+        "kind": "int",
+        "value": 9007199254740992
+      },
+      "reason": "number is outside the safe integer range"
+    },
+    {
+      "case": "structured_snapshot/refuse-huge-float",
+      "construction": {
+        "kind": "float",
+        "value": "1e300"
+      },
+      "reason": "number is outside the safe integer range"
+    },
+    {
+      "case": "structured_snapshot/refuse-unpaired-surrogate",
+      "construction": {
+        "kind": "surrogate_string"
+      },
+      "reason": "string carries an unpaired surrogate"
+    },
+    {
+      "case": "structured_snapshot/refuse-unsupported-type",
+      "construction": {
+        "kind": "unsupported_type"
+      },
+      "reason": "unsupported value type: set"
+    },
+    {
+      "case": "structured_snapshot/refuse-non-string-key",
+      "construction": {
+        "kind": "non_string_key"
+      },
+      "reason": "object key is not a string: int"
+    }
+  ]
+}
