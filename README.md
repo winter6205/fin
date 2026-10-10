@@ -1,8 +1,8 @@
 # fin
 
-fin is an enterprise knowledge-QA agent for questions over an operator-provided corpus. Its durable LangGraph host graph routes research threads through retrieval and source-reading tools. A code-level citation verifier accepts cited evidence only when it was returned during the current run. fin is the operator-facing entry point; the configured retrieval backend holds and serves the corpus.
+fin is an enterprise knowledge-QA agent for questions over an operator-provided corpus. The operator asks in a research thread on the workspace, and Soft-Track orchestration on a durable LangGraph host graph routes each turn to one of four tracks: `dialogue`, `clarify`, `off_topic`, or `grounded`. Corpus tools and the code-level citation verifier bind only to the `grounded` track, and the verifier accepts cited evidence only when it was returned during the current run. The corpus is served through fin's retrieve port by the `iknow-memory` MCP server.
 
-The host uses LangChain `ChatOpenAI` with a configurable model (`FIN_MODEL`, default `MiniMax-M3`) and a LangGraph `PostgresSaver` for durable runs. Retrieval can use the `iknow-memory` MCP server behind fin's retrieve port. The workspace UI is served locally by the same FastAPI process as the host API.
+The host uses LangChain `ChatOpenAI` with a configurable model (`FIN_MODEL`, default `MiniMax-M3`) and a LangGraph `PostgresSaver` for durable runs. The workspace UI is served locally by the same FastAPI process as the host API.
 
 ## Repository map
 
@@ -18,6 +18,8 @@ The host uses LangChain `ChatOpenAI` with a configurable model (`FIN_MODEL`, def
 Prerequisites: Python 3.12, `uv`, Node.js, a running Docker daemon, and an `iknow-memory` checkout (set `FIN_IKNOW_ROOT` if it is not beside this checkout). Put provider credentials such as `FIN_API_KEY` in your local environment or ignored `.env` file; do not commit secrets.
 
 ```bash
+git clone https://github.com/winter6205/fin.git
+cd fin
 uv sync --all-extras --frozen
 (cd web && npm ci && npm run build)
 bash scripts/fin check

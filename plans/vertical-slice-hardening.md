@@ -129,4 +129,4 @@ minimal-change-verifier: yes — 单一逻辑增量（收口 009 NOW 四焦点�
 
 ## End-of-round: code review phase（一次，非每弹）
 
-全部 12 弹落地后，对整轮 diff 做一次 **code-review**（Standards + Spec 双轴，依 `.cursor/skills/code-review/SKILL.md` 并行两个 reviewer subagent）；review 基准为 `specs/vertical-slice-hardening.md` 的 18 条 Success Criteria 与仓库 Standards。每弹自身的 loop 只到 verification-before-completion + one commit，不重复 per-bullet review。
+全部 12 弹落地后，对整轮 diff 做一次 **code-review**（Standards + Spec 双轴，并行两个 reviewer subagent）；review 基准为 `specs/vertical-slice-hardening.md` 的 18 条 Success Criteria 与仓库 Standards。每弹自身的 loop 只到 verification-before-completion + one commit，不重复 per-bullet review。

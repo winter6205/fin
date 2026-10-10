@@ -134,3 +134,9 @@ docs/会话备份.txt
 # open them. Thread-private user bytes: this project auto-commits, so a staged
 # upload would otherwise land in the repository history.
 .fin-heron-staging/
+
+# Global arthurpower skills stay outside this tree. Do not restore
+# .cursor/skills, .cursor/vendor, or scripts/sync-arthurpower-cursor.sh
+# on a source sync. The pre-commit hook keeps typecheck:staged only.
+.cursor/skills/
+.cursor/vendor/
