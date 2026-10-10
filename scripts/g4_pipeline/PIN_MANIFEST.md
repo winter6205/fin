@@ -298,7 +298,7 @@ check the cache against `models.lock` before any measurement.
 
 ## 5. Heron / TableFormer artifact pins (host-mounted cache, never baked into the image)
 
-Host cache root: `/home/winner/.cache/fin-g4-docling-models` → mounted read-write at
+Host cache root: `<host-model-cache>` (a local directory such as `$HOME/.cache/fin-g4-docling-models`) → mounted read-write at
 `/models` (`DOCLING_ARTIFACTS_PATH=/models`, `HF_HOME=/models/hf`).
 Measured size of the cache after a complete fetch: **701,236,013 bytes** (`du -sb`),
 **70 files**, `670M` on disk (`du -sh`).
@@ -368,7 +368,7 @@ against `models.lock`):
 docker run --rm --memory=4g --memory-swap=4g --cpus=4 --user 1000:1000 --env HOME=/tmp \
   --env HF_HOME=/models/hf --env DOCLING_ARTIFACTS_PATH=/models \
   --env HF_HUB_DISABLE_XET=1 --env HF_HUB_DOWNLOAD_TIMEOUT=180 --env HF_HUB_ETAG_TIMEOUT=120 \
-  --volume /home/winner/.cache/fin-g4-docling-models:/models \
+  --volume <host-model-cache>:/models \
   --entrypoint /usr/local/bin/python fin-g4-pipeline:t2a - \
   docling-project/docling-layout-heron@8f39ad3c0b4c58e9c2d2c84a38465abf757272d8:/models/docling-project--docling-layout-heron \
   docling-project/docling-models@fc0f2d45e2218ea24bce5045f58a389aed16dc23:/models/docling-project--docling-models \
@@ -422,9 +422,9 @@ docker run \
   --env HF_HUB_DISABLE_TELEMETRY=1 \
   --env HF_HUB_DISABLE_XET=1 \
   --env PYTHONPATH=/worktree/src \
-  --volume /home/winner/projects/fin-wt-g4-attachment:/worktree:ro \
+  --volume <fin-checkout>:/worktree:ro \
   --volume <...>/scripts/g4_pipeline/results/<run>:/out \
-  --volume /home/winner/.cache/fin-g4-docling-models:/models \
+  --volume <host-model-cache>:/models \
   --entrypoint python fin-g4-pipeline:t2a \
   /worktree/scripts/g4_pipeline/driver.py --pdf <pdf> --artifacts /models --write-images --image-dir /out/pages
 ```

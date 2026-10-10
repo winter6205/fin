@@ -44,5 +44,5 @@ plus a one-line overall verdict: `OVERALL: PASS` only if all 4 PASS; otherwise `
 
 ## Reference
 
-- Rule source: `~/.claude/plugins/marketplaces/arthurpower-local/plugins/arthurpower/skills/error-handling-enforcer/SKILL.md`
+- Rule source: external arthurpower error-handling-enforcer skill (not vendored in this repository).
 - Common LLM failure mode: large volumes of empty-catch swallowing, return-null/-1 instead of throw, and ad-hoc fallback branches added to lower complexity (branches almost never covered by production tests).
