@@ -23,7 +23,7 @@ state.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 from fin.retrieve.port import RetrievePort
 
@@ -38,6 +38,7 @@ def retrieve(
     filing_date: str | None = None,
     limit: int = 8,
     search_mode: str | None = None,
+    structured_request: Mapping[str, Any] | None = None,
     sql_window_start: str | None = None,
     sql_window_end: str | None = None,
     adapter: RetrievePort | None = None,
@@ -75,6 +76,10 @@ def retrieve(
         (``fin.retrieve.port.resolve_sql_window``) names a missing or
         malformed bound pair ``invalid_business_query`` before anything
         reaches the wire, and the wrapper does not duplicate that gate.
+    structured_request
+        Optional typed structured-query object. It is passed through
+        unchanged to the adapter when present and omitted from legacy
+        calls to preserve their existing adapter contract.
     adapter
         The shared ``RetrievePort`` implementation. The host graph
         (T6) constructs one adapter per run and threads it through
@@ -96,18 +101,21 @@ def retrieve(
             "the host graph (T6) must construct one retrieve port per "
             "run and share it across all calls."
         )
-    return adapter.retrieve(
-        query=query,
-        document_id=document_id,
-        cik=cik,
-        form=form,
-        ticker=ticker,
-        filing_date=filing_date,
-        limit=limit,
-        search_mode=search_mode,
-        sql_window_start=sql_window_start,
-        sql_window_end=sql_window_end,
-    )
+    arguments: dict[str, Any] = {
+        "query": query,
+        "document_id": document_id,
+        "cik": cik,
+        "form": form,
+        "ticker": ticker,
+        "filing_date": filing_date,
+        "limit": limit,
+        "search_mode": search_mode,
+        "sql_window_start": sql_window_start,
+        "sql_window_end": sql_window_end,
+    }
+    if structured_request is not None:
+        arguments["structured_request"] = structured_request
+    return adapter.retrieve(**arguments)
 
 
 __all__ = ["retrieve"]

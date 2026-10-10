@@ -1,0 +1,23 @@
+{
+  "source": "fin.host.task_runtime_types.TASK_FAILURE_KINDS",
+  "generated_by": "uv run python -c 'import json; from fin.host.task_runtime_types import TASK_FAILURE_KINDS; print(json.dumps({...}, indent=2))' > web/src/taskFailureKinds.golden.json (regenerate when the Python vocabulary changes)",
+  "kinds": [
+    "task_already_reconciled",
+    "task_applicability_unresolved",
+    "task_capability_unavailable",
+    "task_capability_unsupported",
+    "task_checkpoint_failed",
+    "task_dependency_failure",
+    "task_execution_limit",
+    "task_history_failed",
+    "task_input_invalid",
+    "task_input_unreconciled",
+    "task_insufficient_evidence",
+    "task_intent_missing",
+    "task_permission_denied",
+    "task_reply_expired",
+    "task_reply_unknown",
+    "task_restore_not_adopted",
+    "task_restore_unknown"
+  ]
+}

@@ -159,6 +159,27 @@ def test_typed_retrieve_error_is_preserved_without_rewrite() -> None:
     assert calls == ["annual sales"]
 
 
+def test_structured_zero_count_result_is_not_rewritten() -> None:
+    calls: list[str] = []
+    structured = {
+        "schema": "iknow.structured_result",
+        "schema_version": 1,
+        "operation": "count",
+        "count_receipt": {"count": 0},
+    }
+
+    result = retrieve_with_rewrite_retry(
+        "count matching entities",
+        retrieve=lambda query: calls.append(query)
+        or {"chunks": [], "structured_result": structured},
+        rewrite=lambda _: pytest.fail("a structured zero count is a successful result"),
+        max_retries=1,
+    )
+
+    assert result.result == {"chunks": [], "structured_result": structured}
+    assert calls == ["count matching entities"]
+
+
 def test_memory_recall_shape_is_not_an_empty_retrieve_hit_or_evidence() -> None:
     result = retrieve_with_rewrite_retry(
         "what did I say?",

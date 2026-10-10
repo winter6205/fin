@@ -1,5 +1,12 @@
 # Plan: Incremental structured corpus maintenance
 
+**Integration update, 2026-10-04:** The delivered durable-work foundation covers
+job identity, attempts, retries, and lease fencing. Its strict real-PostgreSQL
+driver passes nine foundation cases; these are not all M1–M20. Source publication,
+withdrawal, conflict/status integration, derived serving guards, collection, and
+all-owner purge remain open. See the [integration evidence record](../docs/validation/2026-10-04-structured-corpus-integration.md)
+for exact input revisions and observed verification.
+
 **Goal:** Publish, check, withdraw, and collect versioned structured knowledge without serving stale or unauthorized results or losing retained evidence.
 **Approach:** Keep lifecycle authority inside iknow's existing TypeScript package and ship it as bounded, recoverable transitions. The plan exports three backend milestones—accepted current-set publication, a same-scope maintenance summary, and a local purge primitive—for the Query and Evidence plans to consume through their existing shared package / retrieve-port boundaries. It does not create a scheduler, a new package, or a second fin-side corpus store.
 **Spec link:** [structured corpus maintenance](../specs/structured-corpus-maintenance.md)

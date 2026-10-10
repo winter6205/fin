@@ -1,5 +1,12 @@
 # Plan: Structured corpus query
 
+**Integration update, 2026-10-04:** The delivered branch implements QP3/QP4
+foundations, not successful list/count/cursor execution or full Q1–Q13
+acceptance. Real PostgreSQL identity and request/MCP regressions have run; QP1,
+QP2, QP10, QP11, and the downstream runtime remain open. See the
+[integration evidence record](../docs/validation/2026-10-04-structured-corpus-integration.md)
+for pinned inputs, observed commands, repairs, and independent review findings.
+
 **Goal:** Add bounded entity and relation-assertion search over iknow's ingested corpus through fin's existing retrieve boundary, with stable identity, exact list/count semantics, finite evidence, and no legacy-ledger fallback.
 **Approach:** Freeze the shared real-corpus oracle and compatibility decision once for all three plans. Export persistent result identity before evidence support persistence; then consume the Evidence and Maintenance milestones for current list, cursor, count, and fin routing. fin remains the host and adapter, while iknow owns query validation and execution.
 **Spec link:** [specs/structured-corpus-query.md](../specs/structured-corpus-query.md)
@@ -48,7 +55,7 @@ Sibling plans own the external milestones below. The integrated dependency table
     - **Acceptance:** Freeze actual public originals and hashes, source units, parser/extraction inputs and revisions, and independently checked expected facts, locators, and lifecycle outcomes, including multiple origins, replacement, conflicts, zero results, and more than one page. Record the operator/oracle approval. Expected facts and locators are authored from originals, without using backend query output. Backend-assigned IDs and measured resources are separately owned by QP10 and QP11 after those capabilities exist.
     - **Completion:** A reviewer can reproduce every expected fact, locator, and lifecycle outcome from the approved original-input record without needing newly generated backend IDs.
     - **Dependencies:** None. This is the input/oracle gate before behavior tests; it does not require implementation, ingest, or the later ID/resource records.
-    - **Status:** [ ] pending — corpus and independent oracle are not frozen or approved.
+    - **Status:** accepted 2026-10-06 — the operator `winter6205` approved the packet, and an independent non-human re-derivation confirmed it with 0 High findings. Frozen originals and hashes, units, parser/extraction revisions, expected facts, locators, multiple origins, replacement, conflict, zero-result and over-page-cap cases are recorded in `../docs/validation/2026-10-06-structured-corpus-qp1-freeze-record.md`. Two limits are recorded there and are not closed by this acceptance: S1 — 4 of the 8 multi-origin pairs are not independent, so genuinely independent origins is **3**; and the `accept` outcomes for `has_chair` / `holds_role_at` / `affiliated_with` are a recorded compatibility position, not a vocabulary edit, so a consumer restricted to the legacy vocabulary still sees 18 of 45 assertions.
 
 2. <a id="qp2"></a> **QP2 — Decide opt-in compatibility, migration, re-ingest, and rollback** — [decision]
     - **ID:** QP2
@@ -213,7 +220,7 @@ Every row below is a future implementation acceptance case, not evidence already
 
 ## Typed-error ownership
 
-The Query SPEC owns each code and its retryable flag. These trigger cases must be observable at the named ticket boundary and preserved by QP8 through fin; they never become prose-only or empty-success fallback.
+The Query SPEC owns each code and its retryable flag. Ownership is per trigger, not per code: one code may appear on more than one row when it covers distinct triggers. These trigger cases must be observable at the named ticket boundary and preserved by QP8 through fin; they never become prose-only or empty-success fallback.
 
 | Code | Trigger to verify | Owner |
 |---|---|---|
@@ -233,7 +240,8 @@ The Query SPEC owns each code and its retryable flag. These trigger cases must b
 | `result_too_large` | Mandatory response cannot fit | QP5, QP6, QP7 |
 | `count_unavailable` | Complete count cannot finish; no partial result | QP7 |
 | `query_timeout` | Reader exceeds the 60-second execution lease | QP5, QP6, QP7 |
-| `structured_search_unavailable` | Backend capability unavailable or structured backend fails | QP5, QP7, QP8 |
+| `structured_search_unavailable` | Valid request whose execution path is not wired on the bound tier; never a legacy-ledger fallback | QP4 |
+| `structured_search_unavailable` | Backend capability unavailable or structured backend fails during execution | QP5, QP7, QP8 |
 | `maintenance_status_unavailable` | Required scope summary is missing or inconsistent | QP5, QP7 |
 
 ## Existing regression checks and unrun acceptance

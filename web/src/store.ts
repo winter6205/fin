@@ -11,6 +11,7 @@ import { submitFeedback, type FeedbackValue } from "./feedback";
 import { forgetLastThreadIf, rememberLastThread } from "./lastThread";
 import {
   hasPendingChoiceWindow,
+  threadHasPendingChoice,
 } from "./choiceWindow";
 import type {
   ChoiceWindow,
@@ -19,11 +20,13 @@ import type {
   IngestResult,
   JobStatus,
   Notice,
+  PendingQuestionView,
   ThreadAttachment,
   ThreadDetail,
   ThreadListItem,
   ToolSummary,
   Turn,
+  ArchivedTaskSummary,
   WatchEntry,
   WorkspaceStatus,
 } from "./types";
@@ -41,6 +44,85 @@ import {
   type TraceFrame,
 } from "./turnTrace";
 import { makeLiveTurn } from "./liveTurn";
+// question-workspace: the task-door decision seam. The store owns only
+// the wiring — which request went out and what the host answered — while
+// every judgement (is this reply still the current question? did the
+// task change?) lives in these pure modules so it is testable without a
+// DOM.
+import {
+  decideActiveInput,
+  heldRefusalFor,
+  type ActiveInputDecision,
+  type ActiveInputFacts,
+} from "./activeInput";
+import {
+  applyWorkspaceOperationResult,
+  beginWorkspaceOperation,
+  currentWorkspaceOperation,
+  EMPTY_WORKSPACE_OPERATIONS,
+  isWorkspaceOperationDisplayable,
+  type WorkspaceOperation,
+  type WorkspaceOperationClass,
+  type WorkspaceOperationLedger,
+  type WorkspaceOperationResult,
+} from "./workspaceOperation";
+import {
+  restoreIsListed,
+  type RestoreDecisionInput,
+  type RestoreRequestRef,
+} from "./archiveRestore";
+import {
+  CLARIFICATION_DRAFT_STORAGE_KEY,
+  draftRecords,
+  parseDraftRecords,
+  restoreDraftText,
+  type ClarificationDraftRecords,
+} from "./clarificationReply";
+import {
+  applyRefusal,
+  dismissClarification,
+  isSubmittable,
+  reopenClarification,
+  selectChoice,
+  setOtherText,
+  submitPayload,
+  type ClarificationDraft,
+} from "./clarificationReply";
+import {
+  decodeThreadTaskRuntime,
+  type TaskRuntimeDecodeRefusal,
+} from "./taskRuntime";
+import type { SubmissionNotice } from "./taskState";
+import { isTaskFailureKind, type TaskRuntimeView } from "./types";
+
+/** The refusal the thread's current operation carries, with the door that
+ * recorded it. A failure kind is only meaningful against its own door's
+ * copy (a ``task_reply_expired`` is a clarification-reply fact, not a
+ * restore fact), so the door travels with the kind and a surface may render
+ * only its own door's refusals. Derived from the operation record, never
+ * stored beside it: one association vocabulary, one source. */
+export interface WorkspaceOperationRefusal {
+  kind: string;
+  questionId: string | null;
+  door: WorkspaceOperationClass;
+}
+
+/** The thread's own record of an archive restore the operator asked for.
+ *
+ * It owns the host's answer about THAT restore (``refusalKind``) as well as
+ * the request's own progress: the operation ledger keeps at most one current
+ * operation per thread, so a restore's verdict read from there would be
+ * erased by the next door the operator opens.
+ *
+ * Beyond the printable request facts it also carries ``seenSinceSend``:
+ * whether a projection read landed AFTER this request went out and neither
+ * failed on the wire nor failed to decode. That is the whole of what "fresh"
+ * means to ``restoreDecision`` — the read's own success, not the mere
+ * passage of time — and it is a store fact because only the store knows the
+ * order of its own reads. */
+interface RestoreRequestRecord extends RestoreRequestRef {
+  seenSinceSend: boolean;
+}
 
 interface WorkspaceState {
   threads: ThreadListItem[];
@@ -79,6 +161,93 @@ interface WorkspaceState {
   // ``true`` while a Stop request for the active thread is in flight,
   // so the button cannot be pressed twice before the wire closes.
   stoppingThreadId: string | null;
+
+  // ----- question-workspace (W1-W5): the task projection seam -----
+  //
+  // Everything below is derived from the HOST's authoritative
+  // ``task_runtime`` envelope and re-read after every task door. The
+  // workspace never infers a task fact locally: an operation opens
+  // ``pending`` in the per-thread ledger, and only the host's answer moves
+  // the projection (specs/question-workspace.md §"Input ordering and
+  // module seams").
+  //
+  // The task slice is per-thread keyed rather than a single object so a
+  // switch cannot leave one thread's task state painted on another,
+  // matching the existing turn-table guards.
+  taskRuntime: Record<string, TaskRuntimeView | undefined>;
+  // The clarification draft currently being composed, keyed by
+  // ``question_id``. A draft belongs to its own question id: it survives a
+  // rejected reply with that association intact (SC-4) and survives a reload
+  // when it was persisted, and nothing ever re-labels it onto another
+  // question — a draft is dropped only when its own question is answered or
+  // replaced, never because a later read looks different.
+  clarificationDrafts: Record<string, ClarificationDraft>;
+  // Per-thread submission ledger: at most the CURRENT operation of each
+  // thread, its minted attempt, and the host's verdict on that attempt.
+  // A thread with no entry has nothing outstanding. This replaces the
+  // single shared submission slot, which a thread switch or a late result
+  // could repaint across threads.
+  workspaceOperations: WorkspaceOperationLedger;
+  // Per-thread restore request, snapshotted at click time from the listing
+  // the row was picked from (after adoption that row is gone, so no later
+  // read can restate the archive→task id mapping). It is the only place the
+  // host's answer about that restore is kept, so it is retained past the
+  // answer — never cleared by the send, and replaced only by a newer request
+  // on the same thread.
+  restoreRequests: Record<string, RestoreRequestRecord | undefined>;
+  // Per-thread decode refusal from the last task-projection read
+  // (openThread / reloadTaskProjection). The malformed envelope still
+  // decodes to the empty view, so without this the broken channel is
+  // indistinguishable from a taskless thread. Read by ArchiveList to
+  // render the projection-refusal copy; keep in sync with that
+  // consumer (pages/ThreadPage.tsx mounts <ArchiveList/> at its
+  // TaskRegion, so the refusal is visible wherever the archive surface
+  // is). Cleared when a later read of the SAME thread decodes cleanly.
+  taskProjectionRefusal: Record<string, TaskRuntimeDecodeRefusal | undefined>;
+  // Per-thread marker that the last projection RE-READ failed on the
+  // wire (the decode never ran). Distinct from ``taskProjectionRefusal``:
+  // that names unreadable CONTENT, this names an unreachable HOST — copy
+  // must not claim the task record is broken when only the refresh
+  // failed. Cleared on the next successful read;
+  // ``openThread`` does not write it (its failure surfaces as the
+  // thread-open fault, App.tsx).
+  taskProjectionRefreshFailed: Record<string, boolean | undefined>;
+
+  /** W2: open a draft for the thread's pending clarification. A no-op
+   * when a draft already exists, so a re-render cannot clobber a typed
+   * draft with a fresh empty one. */
+  openTaskClarification: (threadId: string) => void;
+  /** W2: select a choice (or the reserved Other) on a draft. */
+  selectTaskChoice: (threadId: string, choiceId: string) => void;
+  /** W2: write free text inside the selected Other option. */
+  setTaskOtherText: (threadId: string, text: string) => void;
+  /** W2: collapse the card. Presentation-only: it supplies no answer
+   * and leaves the question pending (question-workspace.md). */
+  dismissTaskClarification: (threadId: string) => void;
+  /** Clears a collapsed card's collapse only; never changes the draft's
+   * answer. W2. */
+  reopenTaskClarification: (threadId: string) => void;
+  /** Submit the reply. Resolves once the host has answered; a refusal
+   * is recorded on the thread's operation and the draft is preserved.
+   * A task door resolves on EVERY lane instead of rejecting: the card
+   * states each outcome from the recorded verdict (its own refusal
+   * sentence, the unknown-outcome sentence), and nothing dispatching a
+   * task door awaits it — a rethrow here would float as an unhandled
+   * rejection rather than reach a notice. The message door is the
+   * opposite case and keeps rejecting, because the Composer puts the
+   * draft back and renders that error itself. */
+  submitTaskReply: (threadId: string) => Promise<void>;
+  /** Ask the host to restore one listed archive. Explicit only, and
+   * disposed exactly like the reply door above. */
+  restoreArchivedTask: (threadId: string, archiveId: string) => Promise<void>;
+  /** Re-read the authoritative task projection for a thread. Every task
+   * door calls this after the host answers, because the host owns the
+   * resulting state and this surface never infers it. A read failure is
+   * not rethrown (the projection is presentation; a task read that
+   * fails must not break the thread surface around it) but it IS
+   * recorded on ``taskProjectionRefreshFailed`` rather than silently
+   * ignored. */
+  reloadTaskProjection: (threadId: string) => Promise<void>;
 
   refreshThreads: () => Promise<void>;
   loadCorpus: () => Promise<void>;
@@ -203,6 +372,467 @@ interface WorkspaceState {
     runId: string,
     value: FeedbackValue,
   ) => Promise<void>;
+}
+
+// ----- question-workspace: task-projection helpers -----
+
+/** The store's own ``set``, spelled once: every helper below writes one
+ * slice of it, and the two argument shapes zustand accepts must stay
+ * available to them. */
+type StoreSetter = (
+  partial:
+    | Partial<WorkspaceState>
+    | ((s: WorkspaceState) => Partial<WorkspaceState>),
+) => void;
+
+/** The thread's still-pending clarification, or null.
+ *
+ * Read from the per-thread ``taskRuntime`` map — the single source every
+ * task surface reads — and guarded on the active thread, so a thread
+ * switch cannot leave one thread's pending question offered on another.
+ * The envelope's top-level ``pending_question`` is the authoritative
+ * record; ``current_task``'s nested copy carries the same value and is
+ * deliberately not consulted, so there is one source rather than two
+ * that could disagree. */
+function pendingQuestionFor(
+  state: Pick<WorkspaceState, "activeThread" | "taskRuntime">,
+  threadId: string,
+): PendingQuestionView | null {
+  if (state.activeThread?.id !== threadId) return null;
+  return state.taskRuntime[threadId]?.pending_question ?? null;
+}
+
+/** Write one draft under its own question id and persist the recoverable
+ * half. The draft is the operator's input, not derived state, so a reload
+ * must not lose it (specs/question-workspace.md "preserve … the user's
+ * draft"); the question it belongs to stays the host's. */
+function setDraft(
+  set: StoreSetter,
+  get: () => WorkspaceState,
+  questionId: string,
+  draft: ClarificationDraft,
+): void {
+  set((s) => ({
+    clarificationDrafts: { ...s.clarificationDrafts, [questionId]: draft },
+  }));
+  persistClarificationDrafts(get().clarificationDrafts);
+}
+
+/** Apply a pure draft transition to the thread's pending question.
+ *
+ * No-ops when the thread moved on or the question is no longer pending:
+ * a stale card must not keep editing a draft the host has already
+ * replaced, and the switch-thread guard matches every other action in
+ * this store. */
+function patchDraft(
+  set: StoreSetter,
+  get: () => WorkspaceState,
+  threadId: string,
+  transition: (draft: ClarificationDraft) => ClarificationDraft,
+): void {
+  const question = pendingQuestionFor(get(), threadId);
+  if (question === null) return;
+  const draft = get().clarificationDrafts[question.question_id];
+  if (!draft) return;
+  const next = transition(draft);
+  if (next === draft) return;
+  setDraft(set, get, question.question_id, next);
+}
+
+// ----- draft durability -----
+
+/** Store the draft's own pick and free text, keyed by its question id —
+ * the same key the in-memory map uses, so a reload cannot shift an answer
+ * onto a different question. Unavailable storage only loses the resume. */
+function persistClarificationDrafts(
+  drafts: Record<string, ClarificationDraft>,
+): void {
+  try {
+    window.localStorage.setItem(
+      CLARIFICATION_DRAFT_STORAGE_KEY,
+      JSON.stringify(draftRecords(drafts)),
+    );
+  } catch {
+    /* storage unavailable - nothing to carry across a reload. */
+  }
+}
+
+/** The persisted drafts, as far as they can be trusted. A blob that is not
+ * JSON, or entries that are not draft records, read as none rather than as
+ * a half-parsed answer: a corrupted record must never become a pick the
+ * operator did not make. */
+function readPersistedDraftRecords(): ClarificationDraftRecords {
+  try {
+    const raw = window.localStorage.getItem(CLARIFICATION_DRAFT_STORAGE_KEY);
+    return parseDraftRecords(JSON.parse(raw ?? "{}"));
+  } catch {
+    return {};
+  }
+}
+
+// ----- the seams a surface reads -----
+
+/** The open thread's CURRENT operation, or ``null``.
+ *
+ * Two guards, one per half of the display rule: the thread must be the one
+ * on screen, and the record must name that same thread. Together they make
+ * an operation recorded for thread A unrenderable while thread B is open,
+ * which is what a single shared slot could not express. */
+export function displayableWorkspaceOperation(
+  state: Pick<WorkspaceState, "activeThread" | "workspaceOperations">,
+  threadId: string,
+): WorkspaceOperation | null {
+  if (state.activeThread?.id !== threadId) return null;
+  const operation = currentWorkspaceOperation(
+    state.workspaceOperations,
+    threadId,
+  );
+  return isWorkspaceOperationDisplayable(operation, threadId) ? operation : null;
+}
+
+/** The stable store slices a task surface derives from.
+ *
+ * Selecting the slices rather than a derived object is a zustand rule, not
+ * a style choice: a selector that rebuilt an object would fail the
+ * ``Object.is`` comparison on every notification and re-render the thread
+ * forever. So a surface reads references the store itself holds and derives
+ * the decisions in its render body, through the helpers below. */
+export type TaskSurfaceFacts = Pick<
+  WorkspaceState,
+  | "activeThread"
+  | "pendingUploads"
+  | "restoreRequests"
+  | "taskProjectionRefusal"
+  | "taskProjectionRefreshFailed"
+  | "taskRuntime"
+  | "workspaceOperations"
+>;
+
+/** The refusal a surface may render. It is derived from the operation record,
+ * not a second slot beside it: it exists only while the record does, is
+ * invisible once a newer attempt replaces it, and names the door that
+ * produced it so a surface renders only its own door's copy. A rejected
+ * verdict with no named reason names nothing, so it yields no refusal. */
+export function operationRefusal(
+  operation: WorkspaceOperation | null,
+): WorkspaceOperationRefusal | null {
+  if (operation === null || operation.state !== "rejected") return null;
+  if (operation.reason === null) return null;
+  return {
+    kind: operation.reason,
+    questionId: operation.questionId,
+    door: operation.door,
+  };
+}
+
+/** The one set of active-input facts for one thread.
+ *
+ * Computed once and read by both halves of the send door — the store's
+ * guard and the composer's notice — so a disabled box and a silently
+ * dropped POST cannot disagree. The pending-choice fact is ONE fact from
+ * two sources: the in-memory turn table and the projection's reloaded
+ * ``pending_turn``, ORed because a thread reloaded mid-window has no live
+ * turns to read. ``transportFailed`` is ``false`` because the store keeps
+ * no separate transport flag: a send that never got an answer is recorded
+ * as that operation's own ``failed`` verdict, which the ledger already
+ * reports through ``submission``. */
+export function activeInputFactsFor(
+  state: Pick<
+    WorkspaceState,
+    "activeThread" | "pendingUploads" | "workspaceOperations"
+  >,
+  threadId: string,
+): ActiveInputFacts {
+  const detail = state.activeThread;
+  const operation = displayableWorkspaceOperation(state, threadId);
+  const onThread = detail !== null && detail.id === threadId;
+  return {
+    pendingChoiceWindow:
+      onThread &&
+      (hasPendingChoiceWindow(detail.turns) || threadHasPendingChoice(detail)),
+    uploadInFlight: hasUploadInFlight(state.pendingUploads),
+    submission: operation?.state ?? "idle",
+    transportFailed: false,
+    refusalKind: operation?.reason ?? null,
+  };
+}
+
+/** The thread's single active-input decision. */
+export function activeInputFor(
+  state: Pick<
+    WorkspaceState,
+    "activeThread" | "pendingUploads" | "workspaceOperations"
+  >,
+  threadId: string,
+): ActiveInputDecision {
+  return decideActiveInput(activeInputFactsFor(state, threadId));
+}
+
+/** The task panel's submission row: the notice the thread's one active-input
+ * decision produced. Presentation-only — the submission's outcome says what
+ * happened to what was sent and claims nothing about the task. ``null`` when
+ * the thread has no operation, so the row renders nothing rather than an
+ * empty state. */
+export function submissionNoticeFor(
+  state: Pick<
+    WorkspaceState,
+    "activeThread" | "pendingUploads" | "workspaceOperations"
+  >,
+  threadId: string,
+): SubmissionNotice | null {
+  const decision = activeInputFor(state, threadId);
+  if (decision.submission === "idle" || decision.notice === null) return null;
+  return { state: decision.submission, text: decision.notice };
+}
+
+/** Whether this thread's task projection can be read right now: the last
+ * re-READ failed on the wire, or the envelope it returned was refused.
+ * Either way an absent task is UNKNOWN, not "no task yet". */
+export function projectionUnreadableFor(
+  state: Pick<
+    WorkspaceState,
+    "taskProjectionRefusal" | "taskProjectionRefreshFailed"
+  >,
+  threadId: string,
+): boolean {
+  return (
+    state.taskProjectionRefreshFailed[threadId] === true ||
+    state.taskProjectionRefusal[threadId] !== undefined
+  );
+}
+
+/** The archive list this thread's projection offers. No read yet offers
+ * nothing — that is the absent thing, not an empty list to send against. */
+function offeredArchives(
+  state: Pick<WorkspaceState, "taskRuntime">,
+  threadId: string,
+): ArchivedTaskSummary[] {
+  return state.taskRuntime[threadId]?.archived_tasks ?? [];
+}
+
+/** The restore door's facts for one thread, read off the store's own
+ * records.
+ *
+ * Only the request record and the projection are consulted — never the
+ * thread's current operation. A restore's verdict lives on the restore, so
+ * an operation the operator opened afterwards cannot change what this
+ * surface is allowed to say about it.
+ *
+ * ``fresh`` is the load-bearing field and it means exactly one thing: a
+ * projection read landed AFTER this request was sent and it neither failed
+ * on the wire nor failed to decode. ``seenSinceSend`` is the store's
+ * ordering fact and ``readable`` is the store's verdict on that read; both
+ * are needed because a later wire failure must take an already-accepted
+ * request back to ``unresolved``, keeping the current task visible instead
+ * of confirming nothing. */
+export function restoreFactsFor(
+  state: Pick<
+    WorkspaceState,
+    | "restoreRequests"
+    | "taskProjectionRefusal"
+    | "taskProjectionRefreshFailed"
+    | "taskRuntime"
+  >,
+  threadId: string,
+): RestoreDecisionInput {
+  const request = state.restoreRequests[threadId] ?? null;
+  const readable =
+    state.taskProjectionRefreshFailed[threadId] !== true &&
+    state.taskProjectionRefusal[threadId] === undefined;
+  const view = state.taskRuntime[threadId];
+  return {
+    threadId,
+    request,
+    projection:
+      view === undefined
+        ? null
+        : {
+            currentTaskId: view.current_task?.task_id ?? null,
+            archived: view.archived_tasks,
+            fresh: request === null ? readable : request.seenSinceSend && readable,
+          },
+  };
+}
+
+/** The request as it was offered: the clicked archive, the task THAT row
+ * named, and the listing snapshotted at click time. The snapshot is what
+ * keeps adoption provable — the host removes the adopted row from the
+ * listing, so after a successful restore no later read can restate the
+ * archive→task mapping. The host has named no verdict yet on a request the
+ * operator only just made. */
+function restoreRequestFor(
+  archiveId: string,
+  taskId: string,
+  offered: readonly ArchivedTaskSummary[],
+): RestoreRequestRecord {
+  return {
+    archiveId,
+    taskId,
+    offered,
+    accepted: false,
+    failedToSend: false,
+    refusalKind: null,
+    seenSinceSend: false,
+  };
+}
+
+/** Move one field of this thread's restore request. A patch for a thread
+ * with no open request describes nothing, so nothing is written: a record
+ * is never manufactured by an update. */
+function patchRestoreRequest(
+  set: StoreSetter,
+  threadId: string,
+  patch: Partial<RestoreRequestRecord>,
+): void {
+  set((s) => {
+    const current = s.restoreRequests[threadId];
+    if (current === undefined) return {};
+    return {
+      restoreRequests: {
+        ...s.restoreRequests,
+        [threadId]: { ...current, ...patch },
+      },
+    };
+  });
+}
+
+/** Mark that THIS thread's projection read landed readable. Only a read
+ * that both happened after the send and decoded cleanly makes the
+ * projection fresh for the request open on this thread. */
+function markRestoreProjectionSeen(
+  set: StoreSetter,
+  threadId: string,
+  readable: boolean,
+): void {
+  if (!readable) return;
+  patchRestoreRequest(set, threadId, { seenSinceSend: true });
+}
+
+/** The archive the clicked row holds. Adoption is proven against THIS id
+ * and never against whatever is current later, so a row that cannot name
+ * its task is not an offered action. */
+function listedRestoreTarget(
+  archives: readonly ArchivedTaskSummary[],
+  archiveId: string,
+): string | null {
+  if (!restoreIsListed(archives, archiveId)) return null;
+  const taskId = archives.find(
+    (archive) => archive.archive_id === archiveId,
+  )?.task_id;
+  return taskId === undefined || taskId.trim() === "" ? null : taskId;
+}
+
+/** Refuse a restore the surface cannot see through, BEFORE it goes on the
+ * wire: the host would answer ``task_restore_unknown`` for an id it never
+ * listed, and an action offered by nothing must not look like an action
+ * taken. The refusal is recorded as this thread's own rejected operation
+ * AND on the request record, because that record is where a restore's
+ * verdict is kept: the ledger holds only the thread's current operation, so
+ * a verdict stored nowhere else would be replaced by the next door opened.
+ * The record names no task id — a row the listing does not offer cannot
+ * name one, and nothing can be adopted against an empty id. */
+function recordUnlistedRestoreRefusal(
+  set: StoreSetter,
+  get: () => WorkspaceState,
+  threadId: string,
+  archiveId: string,
+): void {
+  const opened = beginWorkspaceOperation(get().workspaceOperations, {
+    threadId,
+    door: "restore",
+    kind: "restore",
+    archiveId,
+  });
+  if (opened.operation === null) return;
+  const archives = offeredArchives(get(), threadId);
+  set((s) => ({
+    workspaceOperations: opened.ledger,
+    restoreRequests: {
+      ...s.restoreRequests,
+      [threadId]: restoreRequestFor(archiveId, "", archives),
+    },
+  }));
+  patchRestoreRequest(set, threadId, { refusalKind: "task_restore_unknown" });
+  recordOperationVerdict(set, {
+    threadId,
+    attempt: opened.operation.attempt,
+    state: "rejected",
+    reason: "task_restore_unknown",
+    archiveId,
+  });
+}
+
+/** The restore door's own identity: which thread, which attempt, which
+ * archive, which task. Every verdict the door writes carries all four, so
+ * a result can only ever be applied to the record that asked for it. */
+interface RestoreDoorFacts {
+  threadId: string;
+  attempt: number;
+  archiveId: string;
+  taskId: string;
+}
+
+/** What a restore RESPONSE means for the request. A named mid-stream
+ * refusal outranks the acceptance — a restore refused at reconciliation was
+ * never adopted — and otherwise the request is durably recorded, which
+ * moves exactly ONE field (``accepted``). Neither lane clears the request:
+ * it is the only place the archive→task id mapping survives once the host
+ * adopts the row, and it is where this restore's own verdict is kept, so
+ * dropping it when the response arrives would strand both. */
+function recordRestoreOutcome(
+  set: StoreSetter,
+  facts: RestoreDoorFacts,
+  refusal: string | null,
+): void {
+  if (refusal !== null) {
+    patchRestoreRequest(set, facts.threadId, { refusalKind: refusal });
+    recordOperationVerdict(set, {
+      ...facts,
+      state: "rejected",
+      reason: refusal,
+    });
+    return;
+  }
+  patchRestoreRequest(set, facts.threadId, { accepted: true });
+  recordOperationVerdict(set, { ...facts, state: "accepted" });
+}
+
+/** The host's own named answer, when a thrown error IS one. Every task door
+ * reads its failure through here so ``instanceof`` cannot be asked
+ * differently in one door than in another: a named refusal is the host's word
+ * about a request that reached it, anything else is no answer at all, which
+ * the doors record as a failure or an unheard send. */
+function namedTaskRefusal(
+  error: unknown,
+): { kind: string; questionId: string | null } | null {
+  return error instanceof api.TaskInputRefusedError
+    ? { kind: error.kind, questionId: error.questionId }
+    : null;
+}
+
+/** The restore door's two failure lanes, in one place: a NAMED refusal is
+ * the host's word about a request that DID reach it, and it is kept on that
+ * request record; anything else means no authoritative answer arrived at
+ * all, which the request records as ``failedToSend``. The existing current
+ * task keeps rendering either way, and the request survives both. */
+function recordRestoreFailure(
+  set: StoreSetter,
+  facts: RestoreDoorFacts,
+  error: unknown,
+): void {
+  const refusal = namedTaskRefusal(error);
+  if (refusal !== null) {
+    patchRestoreRequest(set, facts.threadId, { refusalKind: refusal.kind });
+    recordOperationVerdict(set, {
+      ...facts,
+      state: "rejected",
+      reason: refusal.kind,
+      questionId: refusal.questionId,
+    });
+    return;
+  }
+  patchRestoreRequest(set, facts.threadId, { failedToSend: true });
+  recordOperationVerdict(set, { ...facts, state: "failed" });
 }
 
 // turn-trace-folds (#250): fold one wire frame into the turn's burst
@@ -454,6 +1084,134 @@ function finalizeResumedTurn(
   }));
 }
 
+/** The task-door refusal a TERMINAL stream frame carried, if any. Both
+ * door streams (reply and restore) can be durably accepted and then
+ * refused at reconciliation, which arrives as a ``refuse`` frame on a
+ * 200 stream rather than as an HTTP error — reading only the status
+ * would call that an accepted door action. One resolver, shared by both
+ * doors, so the two cannot drift apart on which frame field names the
+ * failure (the reason first, then the stream-engine taxonomy). */
+function midStreamTaskRefusal(result: api.SendResult): string | null {
+  if (isTaskFailureKind(result.reason ?? undefined)) {
+    return result.reason ?? null;
+  }
+  if (isTaskFailureKind(result.status_classified)) {
+    return result.status_classified ?? null;
+  }
+  return null;
+}
+
+/** The projection read's decode refusal, made observable per thread. A
+ * malformed or unsupported envelope still decodes to the empty view, so
+ * without this record a broken task channel looks IDENTICAL to a taskless
+ * thread — an honest "unrecorded" must be distinguishable from "nothing to
+ * record" (taskRuntime.ts: a refusal is always accompanied by the
+ * unrecorded reading, never by invented content). Cleared when the later
+ * decode of the SAME thread succeeds. A reply- or restore-door refusal is
+ * NEVER touched here: it lives on that door's own operation record, and the
+ * projection re-read that follows a refused door decodes cleanly, so wiping
+ * the door's fresh refusal would hide the operator's rejection. */
+function recordProjectionRefusal(
+  set: StoreSetter,
+  threadId: string,
+  refusal: TaskRuntimeDecodeRefusal | null,
+): void {
+  set((s) => ({
+    taskProjectionRefusal: {
+      ...s.taskProjectionRefusal,
+      // ``null`` (a clean decode) clears the key rather than storing a
+      // third state: the record means "threads whose LAST decode was
+      // refused", so clean is absent, same as never-refused.
+      [threadId]: refusal ?? undefined,
+    },
+  }));
+}
+
+/** Move one thread's operation to the verdict the host gave the attempt
+ * that opened it. One writer, so no door can bypass the ledger's own
+ * rules: a verdict for a superseded attempt is dropped, and a recorded
+ * refusal stays final. */
+function recordOperationVerdict(
+  set: StoreSetter,
+  result: WorkspaceOperationResult,
+): void {
+  set((s) => ({
+    workspaceOperations: applyWorkspaceOperationResult(
+      s.workspaceOperations,
+      result,
+    ),
+  }));
+}
+
+/** Record the reply door's refusal in one place: the draft is reconciled
+ * by ``applyRefusal`` (association kept, card re-opened, SC-4) and the
+ * thread's own operation moves to ``rejected`` carrying the named reason.
+ * The identical sequence used to be written out twice inside
+ * ``submitTaskReply`` (mid-stream and HTTP lanes) — one copy here so the
+ * SC-4 rules cannot diverge between them. The attempt stamp is what makes
+ * a late refusal harmless: it is written only to the operation that opened
+ * it, so an operator who already moved on never sees it repaint. */
+function recordReplyRefusal(
+  set: StoreSetter,
+  get: () => WorkspaceState,
+  input: {
+    threadId: string;
+    attempt: number;
+    draftQuestionId: string;
+    refusal: { kind: string; questionId: string | null };
+  },
+): void {
+  const draft = get().clarificationDrafts[input.draftQuestionId];
+  if (draft) {
+    setDraft(set, get, input.draftQuestionId, applyRefusal(draft, input.refusal).draft);
+  }
+  recordOperationVerdict(set, {
+    threadId: input.threadId,
+    attempt: input.attempt,
+    state: "rejected",
+    reason: input.refusal.kind,
+    questionId: input.refusal.questionId,
+  });
+}
+
+/** What a reply door's thrown error means for the thread's operation, the
+ * same two lanes the restore door has. A named refusal keeps the reply's
+ * question association and its draft (SC-4): routing through
+ * ``recordReplyRefusal`` is what leaves the question id unwritten, the choice
+ * and free text intact, and a collapsed card re-opened, and it is an answer
+ * about a request that reached the host — so the host still owns the state on
+ * screen and its projection is re-read rather than guessed. Anything else is
+ * a send whose outcome the browser never learned: a failure verdict, draft
+ * untouched, and nothing to re-read. */
+async function settleReplyFailure(
+  set: StoreSetter,
+  get: () => WorkspaceState,
+  input: {
+    threadId: string;
+    attempt: number;
+    questionId: string;
+    error: unknown;
+  },
+): Promise<void> {
+  const refusal = namedTaskRefusal(input.error);
+  if (refusal === null) {
+    recordOperationVerdict(set, {
+      threadId: input.threadId,
+      attempt: input.attempt,
+      state: "failed",
+      questionId: input.questionId,
+    });
+    return;
+  }
+  recordReplyRefusal(set, get, {
+    threadId: input.threadId,
+    attempt: input.attempt,
+    draftQuestionId: input.questionId,
+    refusal,
+  });
+  await get().reloadTaskProjection(input.threadId);
+}
+
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   threads: [],
   corpus: [],
@@ -471,6 +1229,16 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   filingMonitorStatus: "healthy",
   filingMonitorError: null,
   stoppingThreadId: null,
+  // question-workspace: empty until a thread GET projects an envelope.
+  // An ABSENT key decodes to the empty envelope, so a taskless thread
+  // and a legacy thread read identically (contract §Inventory: no
+  // backfill, read as empty).
+  taskRuntime: {},
+  clarificationDrafts: {},
+  workspaceOperations: EMPTY_WORKSPACE_OPERATIONS,
+  restoreRequests: {},
+  taskProjectionRefusal: {},
+  taskProjectionRefreshFailed: {},
   attachments: [],
   pendingUploads: {},
   ingestJobId: null,
@@ -539,6 +1307,18 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     // had already watched arrive token-by-token and repainted the
     // persisted text over it.
     set((s) => ({ activeThread: reconcileTurnTable(s.activeThread, detail) }));
+    // question-workspace W4: the GET is the recovery path. The task
+    // projection, the pending clarification and the archive list come
+    // back from authoritative state, so a reload restores them WITHOUT
+    // submitting empty input and WITHOUT re-invoking the graph —
+    // display recovery is separate from resuming execution
+    // (question-workspace.md: "Reopening a pending question does not
+    // require an empty or bodyless resume request").
+    const decoded = decodeThreadTaskRuntime(detail);
+    set((s) => ({
+      taskRuntime: { ...s.taskRuntime, [threadId]: decoded.view },
+    }));
+    recordProjectionRefusal(set, threadId, decoded.refusal);
   },
 
   async createThread(firstMessage: string | null) {
@@ -572,23 +1352,36 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 
   async sendQuestion(threadId, question, thinkingOn = true, attachmentIds) {
     if (!question.trim()) return null; // Empty submit is a no-op.
-    if (get().sendingQuestion) return null; // No queue in T1.
-    // search-mode-host T2: while a choice window is pending the run
-    // holds the thread — the host answers 409 concurrent_run, so the
-    // SPA rejects with the SAME typed error instead of firing a
-    // doomed POST. Surfacing it (not a silent no-op) keeps the
-    // composer's notice + draft-restoration path honest.
-    const gate = get().activeThread;
-    if (gate && gate.id === threadId && hasPendingChoiceWindow(gate.turns)) {
-      throw new api.ConcurrentRunError("concurrent_run");
-    }
-    // Upload gate: no conversation sends while ANY composer upload is in
-    // flight, including a file the question does not name (its record
-    // does not exist yet). This client scope is the stricter one: the
-    // composer is global, so it holds for every thread's upload, while
-    // the host refuses only the thread its own upload is landing in.
-    // Deciding it here keeps a doomed POST off the wire.
-    refuseUploadInFlight(get().pendingUploads);
+    // The one send decision for the open thread, computed once from
+    // ``activeInputFactsFor`` and refused from. Two rules changed here,
+    // both deliberate:
+    //
+    // * A held send RAISES the typed refusal instead of returning
+    //   ``null``. A silent swallow left the operator with a button press
+    //   that produced nothing at all — no notice, no draft restore, no
+    //   error path — while the composer was already telling them the
+    //   thread holds. Refusing out loud keeps the notice and the
+    //   draft-restoration path honest.
+    // * An in-flight send is NOT a hold. Compatible follow-up input stays
+    //   available while work is running (SC-5); whether it is queued,
+    //   accepted, or interrupted is Runtime's call, not a client guess.
+    //
+    // The pending-choice half is one fact from both sources — the live turn
+    // table AND a projection-reloaded ``pending_turn`` — so a thread opened
+    // mid-window refuses exactly like a window watched live, instead of
+    // firing a POST the host answers 409.
+    const decision = activeInputFor(get(), threadId);
+    if (decision.holdReason !== null) throw heldRefusalFor(decision.holdReason);
+    // The message door opens its own attempt, so its verdict lands on this
+    // thread's record and a superseded send cannot repaint it.
+    const opened = beginWorkspaceOperation(get().workspaceOperations, {
+      threadId,
+      door: "message",
+      kind: "message",
+    });
+    if (opened.operation === null) return null;
+    set({ workspaceOperations: opened.ledger });
+    const attempt = opened.operation.attempt;
     set({ sendingQuestion: true });
 
     // T3: optimistic turn the SSE frames thread into. Allocated
@@ -829,6 +1622,23 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         startAttachmentPolling(threadId, ATTACHMENT_POLL_INTERVAL_MS, true);
       }
       await get().refreshThreads();
+      // The send can change the task envelope (e.g. an ordinary message
+      // that starts or completes work): the same settle point as the
+      // thread list refresh also re-reads the projection, so the panel
+      // and the archive list cannot keep a stale current task. The
+      // read failure stays non-fatal (reloadTaskProjection records it).
+      // What the host said about the REQUEST is recorded at that same
+      // settle point, before the re-read: a stream that carried a task
+      // refusal was never accepted, and whether the task advanced stays
+      // the projection's word rather than this record's.
+      const streamRefusal = midStreamTaskRefusal(result);
+      recordOperationVerdict(set, {
+        threadId,
+        attempt,
+        state: streamRefusal === null ? "accepted" : "rejected",
+        reason: streamRefusal,
+      });
+      await get().reloadTaskProjection(threadId);
       return result;
     } catch (error) {
       // The send failed (409 concurrent_run / 503 ingest_missing /
@@ -858,6 +1668,27 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         }));
       } else {
         dropTurnByRunId(threadId, optimisticRunId);
+      }
+      // The attempt the message door opened still needs the host's answer,
+      // or the ledger would keep reporting a send that never settled: a
+      // named refusal is the host's rejection of THIS message, and anything
+      // else (409 concurrent run, 503, transport) is a send whose outcome
+      // the browser never learned. Both are written against this attempt,
+      // so a superseded send cannot repaint the current operation.
+      if (error instanceof api.TaskInputRefusedError) {
+        recordOperationVerdict(set, {
+          threadId,
+          attempt,
+          state: "rejected",
+          reason: error.kind,
+          questionId: error.questionId,
+        });
+      } else {
+        recordOperationVerdict(set, {
+          threadId,
+          attempt,
+          state: "failed",
+        });
       }
       throw error;
     } finally {
@@ -976,6 +1807,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       );
       finalizeResumedTurn(patches, threadId, fold, result);
       await get().refreshThreads();
+      // Same post-settle re-read as sendQuestion: a pick can change the
+      // task envelope, and the panel must not keep the pre-pick
+      // projection.
+      await get().reloadTaskProjection(threadId);
       return result;
     } catch (error) {
       // The pick failed (409 concurrent_run / 503 ingest_missing /
@@ -1058,6 +1893,220 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       if (get().stoppingThreadId === threadId) {
         set({ stoppingThreadId: null });
       }
+    }
+  },
+
+  // ----- question-workspace: the task doors -----
+
+  openTaskClarification(threadId) {
+    const question = pendingQuestionFor(get(), threadId);
+    // A draft already exists for this question: a re-render must not
+    // replace a typed draft with a fresh empty one. The operator's text
+    // is their own input, not derived state (specs/question-workspace.md
+    // "Preserve … the user's draft").
+    if (question === null) return;
+    if (get().clarificationDrafts[question.question_id]) return;
+    // A missing draft is recovered from storage under THIS question's id,
+    // so the association cannot shift onto another question. Only the
+    // operator's own pick and free text come back: the prompt, the choices
+    // and their order stay authoritative from the projection, and a pick
+    // the host no longer offers is dropped rather than sent.
+    const record = readPersistedDraftRecords()[question.question_id];
+    setDraft(set, get, question.question_id, restoreDraftText(question, record));
+  },
+
+  selectTaskChoice(threadId, choiceId) {
+    patchDraft(set, get, threadId, (draft) => selectChoice(draft, choiceId));
+  },
+
+  setTaskOtherText(threadId, text) {
+    patchDraft(set, get, threadId, (draft) => setOtherText(draft, text));
+  },
+
+  dismissTaskClarification(threadId) {
+    // Presentation-only. The question stays PENDING on the host and
+    // remains recoverable from the authoritative projection, so this
+    // never submits anything (question-workspace.md).
+    patchDraft(set, get, threadId, dismissClarification);
+  },
+
+  reopenTaskClarification(threadId) {
+    // Presentation-only, and the inverse of the dismiss above: it clears
+    // only the collapse so a typed answer survives. It deliberately does
+    // NOT go through ``selectChoice``, which would make a card the reader
+    // never answered look answered (SC-3).
+    patchDraft(set, get, threadId, reopenClarification);
+  },
+
+  async submitTaskReply(threadId) {
+    const question = pendingQuestionFor(get(), threadId);
+    if (question === null) return;
+    const draft = get().clarificationDrafts[question.question_id];
+    if (!draft || !isSubmittable(draft)) return;
+    // The payload is built from the draft, which carries the ORIGINAL
+    // question association. Building it once and posting that exact
+    // object is what makes a retry identical rather than merely
+    // similar (spec: a transport retry resends the identical reply with
+    // its original question association).
+    const payload = submitPayload(draft);
+    if (payload === null) return;
+    // The reply door opens its OWN attempt on THIS thread. Everything the
+    // host then says is written against that attempt number, so a verdict
+    // for a reply the operator has already superseded is dropped by the
+    // ledger instead of repainting the operation now on screen.
+    const opened = beginWorkspaceOperation(get().workspaceOperations, {
+      threadId,
+      door: "reply",
+      kind: "reply",
+      questionId: payload.questionId,
+    });
+    if (opened.operation === null) return;
+    set({ workspaceOperations: opened.ledger });
+    const attempt = opened.operation.attempt;
+    try {
+      const result = await api.sendMessage(threadId, {
+        question: payload.freeText ?? "",
+        question_id: payload.questionId,
+        choice_id: payload.choiceId,
+        ...(payload.freeText !== null ? { free_text: payload.freeText } : {}),
+      });
+      // The same mid-stream refusal the restore door can answer: the
+      // reply was durably accepted and then refused at reconciliation.
+      // Treating that as acceptance would show the operator an answered
+      // clarification that was never adopted.
+      const streamRefusal = midStreamTaskRefusal(result);
+      if (streamRefusal !== null) {
+        recordReplyRefusal(set, get, {
+          threadId,
+          attempt,
+          draftQuestionId: payload.questionId,
+          refusal: { kind: streamRefusal, questionId: payload.questionId },
+        });
+        await get().reloadTaskProjection(threadId);
+        return;
+      }
+      // Accepted: the host owns the resulting state, so re-read it
+      // rather than assuming the clarification closed. The accepted
+      // verdict is the host's word about the REQUEST only — whether the
+      // question is answered comes from the projection read below, never
+      // from this record.
+      recordOperationVerdict(set, {
+        threadId,
+        attempt,
+        state: "accepted",
+        questionId: payload.questionId,
+      });
+      await get().reloadTaskProjection(threadId);
+    } catch (error) {
+      await settleReplyFailure(set, get, {
+        threadId,
+        attempt,
+        questionId: payload.questionId,
+        error,
+      });
+    }
+  },
+
+  async restoreArchivedTask(threadId, archiveId) {
+    // Explicit only: nothing on this surface ever proposes a restore from
+    // message text (specs/question-workspace.md §"Active work, outcomes,
+    // and history"), and nothing is sent for an archive this thread's
+    // projection does not offer.
+    const archives = offeredArchives(get(), threadId);
+    const taskId = listedRestoreTarget(archives, archiveId);
+    if (taskId === null) {
+      recordUnlistedRestoreRefusal(set, get, threadId, archiveId);
+      return;
+    }
+    const opened = beginWorkspaceOperation(get().workspaceOperations, {
+      threadId,
+      door: "restore",
+      kind: "restore",
+      archiveId,
+      taskId,
+    });
+    if (opened.operation === null) return;
+    set((s) => ({
+      workspaceOperations: opened.ledger,
+      // The request is remembered as the row was OFFERED, listing included.
+      // While the host rechecks, the EXISTING current task stays current:
+      // the request is a record of intent, never a change of state.
+      restoreRequests: {
+        ...s.restoreRequests,
+        [threadId]: restoreRequestFor(archiveId, taskId, archives),
+      },
+    }));
+    const attempt = opened.operation.attempt;
+    const facts: RestoreDoorFacts = { threadId, attempt, archiveId, taskId };
+    try {
+      const result = await api.sendMessage(threadId, {
+        question: "",
+        restore_archive_id: archiveId,
+      });
+      // A task door can refuse MID-STREAM: the acceptance succeeded (the
+      // restore is durably recorded) and the reconciliation then refuses
+      // it, which arrives as a terminal ``refuse`` frame carrying the
+      // named failure rather than as an HTTP error. Reading only the HTTP
+      // status would call that an accepted restore and show nothing to the
+      // operator, so the named failure is checked here too — through the
+      // same resolver the reply door uses, so the two cannot drift.
+      recordRestoreOutcome(set, facts, midStreamTaskRefusal(result));
+      await get().reloadTaskProjection(threadId);
+    } catch (error) {
+      const named = namedTaskRefusal(error) !== null;
+      recordRestoreFailure(set, facts, error);
+      // The refusal is the host's own answer about a request that reached
+      // it, so the host still owns the state on screen: re-read rather
+      // than leave the archive listing as it was at click time. A
+      // transport failure has no such answer to read, and the request
+      // already records it as unpaid.
+      if (named) await get().reloadTaskProjection(threadId);
+    }
+  },
+
+  async reloadTaskProjection(threadId) {
+    try {
+      const detail = await api.getThread(threadId);
+      const decoded = decodeThreadTaskRuntime(detail);
+      // Only the task projection is replaced. ``activeThread`` keeps its
+      // streamed turns — a task re-read must never repaint the turn
+      // table the operator is watching arrive (the same reconcile-not-
+      // replace rule ``openThread`` follows).
+      set((s) => ({
+        taskRuntime: { ...s.taskRuntime, [threadId]: decoded.view },
+      }));
+      recordProjectionRefusal(set, threadId, decoded.refusal);
+      // A successful read also clears the wire-failure marker a previous
+      // re-read left: the marker names the LAST read, not the worst one.
+      set((s) => ({
+        taskProjectionRefreshFailed: {
+          ...s.taskProjectionRefreshFailed,
+          [threadId]: undefined,
+        },
+      }));
+      // This read is the one a pending restore request gets judged
+      // against — but only if it actually landed readable. A decode refusal
+      // leaves the request owed rather than answered, so the archive stays
+      // ``unresolved`` with the current task visible instead of being
+      // confirmed by a read that read nothing.
+      markRestoreProjectionSeen(set, threadId, decoded.refusal === null);
+    } catch {
+      // EXIT: presentation-only refresh — the GET failed (transport /
+      // 5xx / host restart), but the caller is a post-door refresh or a
+      // mount effect, not the operator's direct action, so rethrowing
+      // would fail an already-answered door or crash an effect. Instead
+      // the previous projection STAYS, and the unavailability itself is
+      // recorded observably (``taskProjectionRefreshFailed``) rather
+      // than swallowed: a stale-but-kept panel must not read as "the
+      // host confirmed this is current". Not a decode refusal (nothing
+      // was read), so the projection refusal slot is deliberately
+      // untouched.
+      set((s) => ({
+        taskProjectionRefreshFailed: {
+          ...s.taskProjectionRefreshFailed,
+          [threadId]: true,
+        },
+      }));
     }
   },
 
@@ -1727,11 +2776,12 @@ function forgetPersistedIngestJobIdIf(jobId: string): void {
  * for every thread, whereas the host only ever holds the thread its own
  * upload is landing in. It reads the store's ``pendingUploads`` slice,
  * not the attachment list: during that window the record does not exist
- * yet, so the list cannot answer. The three client surfaces share it —
- * ``sendQuestion`` / ``createThread`` refuse with the named
- * ``attachment_upload_in_progress`` failure, and the Composer holds the
- * send on it separately from ``busy``, so the button and Enter are
- * blocked, not only the picker.
+ * yet, so the list cannot answer. It is one half of the single
+ * active-input decision (``activeInputFactsFor`` →
+ * ``decideActiveInput``), shared by ``sendQuestion``, ``createThread`` and
+ * the Composer's control, so the button, Enter and the POST cannot
+ * disagree about whether a send is held — and a held send raises the named
+ * refusal instead of returning nothing.
  * A file the question never mentions still blocks the send, because the
  * gate is about the upload, not about the reference.
  */
@@ -1741,13 +2791,23 @@ export function hasUploadInFlight(
   return Object.values(pendingUploads).some((count) => count > 0);
 }
 
-/** One throw for both doors, so the refusal cannot drift between them. */
+/** One throw for both doors, so the refusal cannot drift between them. It
+ * asks the SAME decision a send asks (``decideActiveInput``) with only the
+ * upload half populated: a new conversation has no open thread yet, so the
+ * pending-choice lock cannot apply and the submission has no state to
+ * report. The refusal raised is therefore the upload one, named exactly as
+ * the send door names it. */
 function refuseUploadInFlight(
   pendingUploads: Readonly<Record<string, number>>,
 ): void {
-  if (hasUploadInFlight(pendingUploads)) {
-    throw new api.AttachmentUploadInProgressError();
-  }
+  const decision = decideActiveInput({
+    pendingChoiceWindow: false,
+    uploadInFlight: hasUploadInFlight(pendingUploads),
+    submission: "idle",
+    transportFailed: false,
+    refusalKind: null,
+  });
+  if (decision.holdReason !== null) throw heldRefusalFor(decision.holdReason);
 }
 
 /**

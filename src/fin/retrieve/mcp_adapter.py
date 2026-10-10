@@ -107,6 +107,7 @@ test surface is hermetic (no live MCP server).
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 from typing import Any, Mapping
@@ -142,11 +143,15 @@ from fin.retrieve.port import (
     SEARCH_MODE_FILTER_KEY,
     SQL_WINDOW_END_FILTER_KEY,
     SQL_WINDOW_START_FILTER_KEY,
+    STRUCTURED_RESULT_KEY,
+    STRUCTURED_SEARCH_UNAVAILABLE_CODE,
     TierUnavailableError,
+    _structured_query_refusal_code,
     database_rows_of,
     new_database_rows,
     resolve_search_mode,
     resolve_sql_window,
+    structured_result_of,
 )
 from fin.retrieve.read_port import validate_company_source_ref
 from fin.retrieve.source_read import (
@@ -563,6 +568,61 @@ def _structured_is_error_code(result: dict[str, Any]) -> str | None:
     return None
 
 
+_STRUCTURED_QUERY_ERROR_CODES = frozenset({
+    "malformed_structured_query", "unsupported_structured_schema",
+    "unsupported_subject", "unsupported_operation", "unsupported_field",
+    "unsupported_operator", "invalid_value", "request_too_large",
+    "authorization_denied", "invalid_cursor", "cursor_expired",
+    "cursor_revision_mismatch", "read_revision_mismatch", "result_too_large",
+    "count_unavailable", "query_timeout", STRUCTURED_SEARCH_UNAVAILABLE_CODE,
+    "maintenance_status_unavailable",
+})
+
+
+def _structured_query_error_body_code(body: object) -> str | None:
+    if not isinstance(body, Mapping):
+        return None
+    version = body.get("schema_version")
+    if (
+        body.get("schema") != "iknow.structured_error"
+        or type(version) not in (int, float)
+        or version != 1
+    ):
+        return None
+    error = body.get("error")
+    if not isinstance(error, Mapping):
+        return None
+    code = error.get("code")
+    if (
+        not isinstance(code, str)
+        or code not in _STRUCTURED_QUERY_ERROR_CODES
+        or type(error.get("retryable")) is not bool
+    ):
+        return None
+    return code
+
+
+def _structured_query_error_code(result: dict[str, Any]) -> str | None:
+    """Read only a schema-v1 structured-query refusal from MCP content."""
+    if result.get("isError") is not True:
+        return None
+    content = result.get("content")
+    if not isinstance(content, list):
+        return None
+    for block in content:
+        if not isinstance(block, Mapping) or block.get("type") != "text":
+            continue
+        text = block.get("text")
+        if not isinstance(text, str):
+            continue
+        try:
+            body = json.loads(text)
+        except ValueError:
+            return None
+        return _structured_query_error_body_code(body)
+    return None
+
+
 def _is_community_summary_not_ready(result: dict[str, Any]) -> bool:
     """Whether an MCP ``tools/call`` result is the global 综述 report arm's
     typed community-summary not-ready refusal.
@@ -708,6 +768,21 @@ class MCPRetrieveAdapter:
 
     # ----- public surface -----
 
+    def with_session(self, session: MCPStdioSession) -> MCPRetrieveAdapter:
+        """A copy of this adapter whose transport is ``session``.
+
+        The identity that authorizes a read belongs to the *connection*, not to
+        the adapter, and the host builds one adapter per process. Rebinding
+        therefore shares this adapter's locator map and both ledgers — which the
+        graph injected once and every identity must keep counting into — and
+        changes only which child process the call rides. A copy rather than a
+        rebuild is what keeps the rebind free of cross-identity ledger drift.
+        """
+
+        rebound = copy.copy(self)
+        rebound._session = session
+        return rebound
+
     @property
     def input_validation_failures(self) -> InputValidationLedger:
         """The「输入校验失败」count for this adapter (T21 / SC42).
@@ -748,6 +823,7 @@ class MCPRetrieveAdapter:
         filing_date: str | None = None,
         limit: int = 8,
         search_mode: str | None = None,
+        structured_request: Mapping[str, Any] | None = None,
         sql_window_start: str | None = None,
         sql_window_end: str | None = None,
     ) -> dict[str, Any]:
@@ -781,6 +857,7 @@ class MCPRetrieveAdapter:
                     filing_date=filing_date,
                     limit=limit,
                     search_mode=search_mode,
+                    structured_request=structured_request,
                     sql_window_start=sql_window_start,
                     sql_window_end=sql_window_end,
                 )
@@ -893,6 +970,7 @@ class MCPRetrieveAdapter:
         filing_date: str | None = None,
         limit: int = 8,
         search_mode: str | None = None,
+        structured_request: Mapping[str, Any] | None = None,
         sql_window_start: str | None = None,
         sql_window_end: str | None = None,
     ) -> dict[str, Any]:
@@ -904,11 +982,12 @@ class MCPRetrieveAdapter:
         ``InvalidSearchModeError`` and an unopened one raises
         ``TierUnavailableError`` — both BEFORE any round trip, so an
         illegal or unopened 档 never starts a silent default-B
-        retrieve. A ``sql`` 档 request without a bindable window
+        retrieve. A legacy ``sql`` request without a bindable window
         raises ``InvalidBusinessQueryError`` at the same pre-transport
         seam — the producer refuses the same name before it connects,
         and a window fin invented would be a query the operator never
-        asked.
+        asked. A structured request instead requires the host-bound
+        ``sql`` mode and refuses legacy outer filters.
 
         Tests subclass and override ``_call_mcp`` for scripted
         transport. The default transport launches a subprocess.
@@ -922,14 +1001,32 @@ class MCPRetrieveAdapter:
         # round-trip like every other invalid input (the raise is the
         # named EXIT; ``retrieve`` maps the 未开 codes to error dicts).
         effective_search_mode = resolve_search_mode(search_mode)
-        # The sql 档's expiry window: required for sql, absent for every
-        # document 档 (which resolves to None and never learns the filter
-        # keys). Refused before the transport for the same reason the
-        # producer refuses: without a bindable window the permitted
-        # query cannot be built at all, and a defaulted window would be
-        # a question the operator never asked.
-        effective_window = resolve_sql_window(
-            effective_search_mode, sql_window_start, sql_window_end
+        refusal = _structured_query_refusal_code(
+            structured_request,
+            search_mode=effective_search_mode,
+            has_outer_filters=any(
+                value is not None
+                for value in (
+                    document_id,
+                    cik,
+                    form,
+                    ticker,
+                    filing_date,
+                    sql_window_start,
+                    sql_window_end,
+                )
+            ),
+        )
+        if refusal is not None:
+            return {"error": refusal}
+        # Structured requests use their own typed predicates and never
+        # carry or require the legacy business expiry window.
+        effective_window = (
+            None
+            if structured_request is not None
+            else resolve_sql_window(
+                effective_search_mode, sql_window_start, sql_window_end
+            )
         )
         # Empty / whitespace document_id filter: miss shape.
         if document_id is not None and not document_id.strip():
@@ -973,7 +1070,7 @@ class MCPRetrieveAdapter:
         # here is a real filter; a ``None`` means "unset" and must
         # NOT be sent as an explicit ``null`` the server would try
         # to match on.
-        filters: dict[str, str] = {}
+        filters: dict[str, Any] = {}
         if document_id is not None:
             filters["document_id"] = document_id
         for key, value in (
@@ -997,6 +1094,8 @@ class MCPRetrieveAdapter:
         if effective_window is not None:
             filters[SQL_WINDOW_START_FILTER_KEY] = effective_window[0]
             filters[SQL_WINDOW_END_FILTER_KEY] = effective_window[1]
+        if structured_request is not None:
+            filters["structured_query"] = dict(structured_request)
         if filters:
             arguments["filters"] = filters
 
@@ -1086,7 +1185,20 @@ class MCPRetrieveAdapter:
         #     advice for a denied read differs from an outage's, and an
         #     untokened prose error matches no set here and stays the
         #     ``retrieve_unavailable`` reading it is.
-        named_refusal = _structured_is_error_code(result)
+        if structured_request is not None:
+            structured_error = _structured_query_error_code(result)
+            if structured_error is not None:
+                return {"error": structured_error}
+            if result.get("isError") is True:
+                return {"error": STRUCTURED_SEARCH_UNAVAILABLE_CODE}
+            # A legacy SQL refusal cannot answer a structured query. It is
+            # evidence that the structured capability is absent, not a
+            # structured no-match or permission result.
+            if _structured_is_error_code(result) is not None:
+                return {"error": STRUCTURED_SEARCH_UNAVAILABLE_CODE}
+            named_refusal = None
+        else:
+            named_refusal = _structured_is_error_code(result)
         if named_refusal == COMMUNITY_SUMMARY_INDEX_FAILURE:
             return {
                 "chunks": [],
@@ -1123,6 +1235,13 @@ class MCPRetrieveAdapter:
                         ) from exc
                     if isinstance(inner, dict):
                         result = inner
+        if (
+            structured_request is not None
+            and structured_result_of(result) is None
+        ):
+            return {"error": STRUCTURED_SEARCH_UNAVAILABLE_CODE}
+        if structured_request is not None and DATABASE_ROWS_KEY in result:
+            return {"error": STRUCTURED_SEARCH_UNAVAILABLE_CODE}
         signal = _degradation_of_response(
             response,
             business_result=result,
@@ -1140,6 +1259,7 @@ class MCPRetrieveAdapter:
         # fallback. When both are present, ``chunks`` wins.
         canonical_chunks = result.get("chunks")
         legacy_hits = result.get("hits")
+        raw_structured_result = structured_result_of(result)
         if isinstance(canonical_chunks, list):
             # Map canonical chunks: each carries ``source_ref`` as
             # the B4 fin locator serialization. Unmappable chunks
@@ -1151,6 +1271,10 @@ class MCPRetrieveAdapter:
                 limit=effective_limit,
                 ledger=self.mapping_failures,
             )
+        elif raw_structured_result is not None:
+            # Structured results may have no lexical chunks. Keep the
+            # normal retrieve envelope shape without invoking legacy hits.
+            chunks = ()
         elif isinstance(legacy_hits, list):
             # Map iknow ids → fin locators; drop unmapped, and count
             # every drop on the ledger (T17 / SC22: the drop must
@@ -1169,7 +1293,12 @@ class MCPRetrieveAdapter:
                 f"chunks={canonical_chunks!r}, hits={legacy_hits!r}",
                 signal,
             )
-        if signal.degraded and not chunks and not _rows_present(result):
+        if (
+            signal.degraded
+            and not chunks
+            and not _rows_present(result)
+            and raw_structured_result is None
+        ):
             raise _unavailable(
                 "MCP returned a degraded response without usable chunks",
                 signal,
@@ -1204,6 +1333,8 @@ class MCPRetrieveAdapter:
             if refused is not None:
                 return {"error": refused}
             envelope[DATABASE_ROWS_KEY] = dict(raw_rows)
+        if raw_structured_result is not None:
+            envelope[STRUCTURED_RESULT_KEY] = dict(raw_structured_result)
         return envelope
 
     # ----- transport (test seam) -----
@@ -1426,4 +1557,3 @@ def _slice_of_read_response(
             SOURCE_BACKEND_CONTRACT_ERROR, reason="result_over_byte_cap"
         )
     return result
-

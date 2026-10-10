@@ -72,6 +72,47 @@ def test_find_env_file_walks_up_to_project_root(tmp_path: Path) -> None:
     assert found == env
 
 
+def _git(cwd: Path, *args: str) -> None:
+    import os
+    import subprocess
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "Fin Test",
+            "GIT_AUTHOR_EMAIL": "fin-test@example.com",
+            "GIT_COMMITTER_NAME": "Fin Test",
+            "GIT_COMMITTER_EMAIL": "fin-test@example.com",
+        }
+    )
+    subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_find_env_file_returns_main_checkout_dotenv_for_a_worktree(
+    tmp_path: Path,
+) -> None:
+    main = tmp_path / "main"
+    main.mkdir()
+    (main / "pyproject.toml").write_text("[project]\nname='x'\n")
+    env = main / ".env"
+    env.write_text("FIN_FROM_MAIN=1\n")
+    _git(main, "init")
+    _git(main, "add", "pyproject.toml")
+    _git(main, "commit", "-m", "init")
+    worktree = tmp_path / "worktree"
+    _git(main, "worktree", "add", "--detach", str(worktree))
+    nested = worktree / "pkg"
+    nested.mkdir()
+    assert find_env_file(start=nested) == env
+
+
 def test_apply_dotenv_missing_file_is_noop(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
     monkeypatch.chdir(tmp_path)

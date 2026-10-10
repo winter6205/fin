@@ -155,6 +155,68 @@ def new_database_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+# The structured-corpus-evidence lane's own sibling. It is NOT a
+# ``database_rows`` sibling and not a ``chunks`` entry: it carries a typed
+# entity/assertion result or an exact count receipt with its own finite
+# evidence reference, and it never travels in ``chunks[]``. ABSENT (never
+# an empty sibling) on every lane that did not run a structured query, so
+# a document envelope stays byte-identical.
+STRUCTURED_RESULT_KEY: Final[str] = "structured_result"
+
+# QP8 keeps structured-query refusals distinct from empty results and the
+# legacy SQL ledger's zero-row outcome.
+MALFORMED_STRUCTURED_QUERY_CODE: Final[str] = "malformed_structured_query"
+STRUCTURED_SEARCH_UNAVAILABLE_CODE: Final[str] = "structured_search_unavailable"
+
+# The producer's token for that sibling and its explicit integer version
+# (ADR 0093: the token is the stable name, never a versioned suffix).
+STRUCTURED_RESULT_SCHEMA_FIELD: Final[str] = "schema"
+STRUCTURED_RESULT_SCHEMA_VERSION_FIELD: Final[str] = "schema_version"
+STRUCTURED_RESULT_ROWS_FIELD: Final[str] = "rows"
+STRUCTURED_RESULT_COUNT_FIELD: Final[str] = "count"
+STRUCTURED_RESULT_RECEIPT_FIELD: Final[str] = "count_receipt"
+
+
+def structured_result_of(sibling: object) -> Mapping[str, Any] | None:
+    """The one ``STRUCTURED_RESULT_KEY`` sibling value, or ``None``.
+
+    ``None`` means "no structured result applicable" — the key is absent,
+    or it carries a non-object this consumer cannot read. Reading stays
+    permissive about the contents; the exact key set, version and bounds
+    are the structured lane validator's boundary in
+    :mod:`fin.host.structured_evidence`, not this reader's. The retrieve
+    adapter and host use this accessor to preserve the sibling without
+    interpreting its result fields.
+    """
+    if not isinstance(sibling, Mapping):
+        return None
+    value = sibling.get(STRUCTURED_RESULT_KEY)
+    if not isinstance(value, Mapping):
+        return None
+    return value
+
+
+def _structured_query_refusal_code(
+    structured_request: object,
+    *,
+    search_mode: str | None,
+    has_outer_filters: bool,
+) -> str | None:
+    """Return the fin-side refusal for a structured request it cannot bind.
+
+    Query fields and predicates remain the structured backend's concern.
+    """
+    if structured_request is None:
+        return None
+    if (
+        not isinstance(structured_request, Mapping)
+        or search_mode != "sql"
+        or has_outer_filters
+    ):
+        return MALFORMED_STRUCTURED_QUERY_CODE
+    return None
+
+
 # The sql 档's expiry-window routing filters (the iknow retrieve schema
 # reads both keys inside ``filters`` and strips them before matching;
 # ``mode-d-arm`` binds them as parameters and the executor alone decides
@@ -350,6 +412,7 @@ class RetrievePort(Protocol):
         filing_date: str | None = None,
         limit: int = 8,
         search_mode: str | None = None,
+        structured_request: Mapping[str, Any] | None = None,
         sql_window_start: str | None = None,
         sql_window_end: str | None = None,
     ) -> dict[str, Any]:
@@ -393,13 +456,19 @@ class RetrievePort(Protocol):
         sql_window_start / sql_window_end
             The ``sql`` 档's inclusive expiry window (YYYY-MM-DD),
             forwarded to the wire as the ``SQL_WINDOW_*_FILTER_KEY``
-            filter pair. Both are REQUIRED together with
-            ``search_mode="sql"`` and are validated pre-transport by
-            :func:`resolve_sql_window` — a missing or malformed bound
-            raises ``InvalidBusinessQueryError`` rather than traveling
-            with an invented default. Non-sql 档 must not pass them;
+            filter pair for legacy business queries. Both are REQUIRED
+            together with ``search_mode="sql"`` and are validated
+            pre-transport by :func:`resolve_sql_window` — a missing or
+            malformed bound raises ``InvalidBusinessQueryError`` rather
+            than traveling with an invented default. Structured requests
+            do not use this legacy window. Non-sql 档 must not pass them;
             :func:`resolve_sql_window` returns ``None`` for those and
             the keys never reach the wire.
+        structured_request
+            Optional typed structured-query object. The host cascade
+            binds it to the ``sql`` 档; the adapter carries it as the
+            object-valued ``filters.structured_query`` field. It cannot
+            be combined with legacy outer filters or expiry windows.
 
         Returns
         -------
@@ -408,10 +477,8 @@ class RetrievePort(Protocol):
             ``{"chunks": [Chunk, ...]}`` in descending score order,
             each ``Chunk`` carrying ``text``, ``source_ref`` (Locator),
             and ``score``. A ``sql`` run may additionally carry the
-            ``DATABASE_ROWS_KEY`` sibling — the E1 row object
-            ``{schema, schema_version, rows, result_count}`` — never
-            inside ``chunks``. A recorded zero-row sql exit carries the
-            structured failure under the named outcome keys above.
+            ``DATABASE_ROWS_KEY`` or independent ``STRUCTURED_RESULT_KEY``
+            sibling; neither is stored inside ``chunks``.
             A named exit (spec §7) is ``{"error": <code>}`` with no
             ``chunks`` key at all.
         """
@@ -426,6 +493,15 @@ __all__ = [
     "DATABASE_ROWS_SCHEMA_FIELD",
     "DATABASE_ROWS_SCHEMA_VERSION",
     "DATABASE_ROWS_SCHEMA_VERSION_FIELD",
+    "STRUCTURED_RESULT_COUNT_FIELD",
+    "STRUCTURED_RESULT_KEY",
+    "MALFORMED_STRUCTURED_QUERY_CODE",
+    "STRUCTURED_RESULT_RECEIPT_FIELD",
+    "STRUCTURED_RESULT_ROWS_FIELD",
+    "STRUCTURED_RESULT_SCHEMA_FIELD",
+    "STRUCTURED_RESULT_SCHEMA_VERSION_FIELD",
+    "STRUCTURED_SEARCH_UNAVAILABLE_CODE",
+    "structured_result_of",
     "Chunk",
     "InvalidBusinessQueryError",
     "InvalidSearchModeError",

@@ -317,6 +317,7 @@ def compile_for_runtime(
         | Callable[[], AttachmentPreparationService]
         | None
     ) = None,
+    evidence: Any | None = None,
 ) -> Any:
     """Build the durable v1 host graph for CLI / HTTP boot.
 
@@ -357,6 +358,18 @@ def compile_for_runtime(
         as the ``retrieve`` tool's attachment search seam (it ships
         ``search()`` next to the preparation methods), so one injected
         service serves the preparation gate and the thread-scoped read.
+    evidence
+        Optional
+        :class:`~fin.host.evidence_session_registry.EvidenceSessionBinding`,
+        which bundles the registry owning one persistent session per run
+        identity with the resolver that selects that identity from a run's
+        config (P2-I2). The two travel as ONE parameter because neither is
+        usable alone: a registry with no resolver can never bind, and a
+        resolver with no registry has nowhere to put the identity it resolved.
+        ``None`` (the default) compiles the graph without the Evidence lane,
+        which is the pre-P2-I2 envelope shape. When it IS wired, a run whose
+        resolver selects nothing is REFUSED with a closed §6 code rather than
+        answered under the shared adapter.
 
     Returns
     -------
@@ -476,6 +489,20 @@ def compile_for_runtime(
         # caller today that does not inject a service) keeps the
         # attachment branch out of the ``retrieve`` envelope entirely.
         attachment_retriever=resolved_attachment_service,
+        # P2-I2: the identity-bound Evidence session is INJECTED, never built
+        # here. The host holds no trusted source for the authority facts a
+        # binding needs (owner scope, reader, authorization revision) — the only
+        # scope it can see is the untrusted ``structured_result`` sibling, and
+        # identity never comes off the message channel. Defaulting them here
+        # would be the process-level fallback and default scope ADR B1 forbids,
+        # so an unwired boot keeps the Evidence lane out of the retrieve path
+        # rather than answering under an invented identity.
+        #
+        # The registry's own teardown needs nothing from this root: it
+        # registers an ``atexit`` drain when constructed, so a child it
+        # launched is closed at process exit without a caller remembering to
+        # call ``close_all``.
+        evidence=evidence,
     )
 
     # Step 6: keep the stack alive for process lifetime. We do

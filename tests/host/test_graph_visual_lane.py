@@ -597,7 +597,14 @@ def test_another_thread_sees_no_page_and_draws_nothing(
     assert state["visual_claims"] == []
     assert vision.calls == []
     assert rasterizer.drawn == []
-    assert _tool_payload(state) == {"error": "attachment_unavailable"}
+    # The scope gate now refuses BEFORE the lane runs (spec SC-3: the
+    # model-supplied id is gated before any vision call is spent). The
+    # refusal moved from the lane's unified ``attachment_unavailable`` to
+    # the gate's own typed code; the security property this test pins —
+    # nothing is claimed, no vision call, no page drawn — is unchanged and
+    # the code is now the more specific scope denial. A foreign-thread id is
+    # outside the effective selection, exactly like an unknown id.
+    assert _tool_payload(state) == {"error": "scope_attachment_not_permitted"}
 
 
 # ----- the two plain-data exits the tool must never guess about ----------

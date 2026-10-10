@@ -10,6 +10,10 @@ claim CAS in the job stores is what keeps two processes safe; the
 singleton guard here is what keeps one process from running two loops
 over the same seams.
 
+The interval is a bound on the *period* — sweep to sweep — and the loop
+schedules against an absolute deadline so it is honoured however long a
+sweep takes; see :class:`DrainCadence`.
+
 This module was extracted from what had become three hand-rolled copies
 of that same block (the ingest worker's module globals in
 ``workspace_http``, this module's prep loop, and the attachment
@@ -25,7 +29,9 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Final
 
 from fin.host.attachment_prepare import AttachmentPreparationService
@@ -35,6 +41,37 @@ logger = logging.getLogger(__name__)
 ATTACHMENT_PREP_WORKER_CHECK_INTERVAL_SECONDS: Final[float] = 30.0
 
 ATTACHMENT_PREP_WORKER_THREAD_NAME: Final[str] = "fin-attachment-prep-worker"
+
+#: The loop's clock: given the stop event and the interval, block until the
+#: interval elapses or a stop is requested, and answer whether a stop was
+#: requested. Signature-compatible with ``threading.Event.wait``, which is the
+#: default — a test substitutes a fake clock instead of sleeping.
+Waiter = Callable[[threading.Event, float], bool]
+
+#: A monotonic reading of the clock ``Waiter`` blocks on, defaulting to
+#: ``time.monotonic``. Paired with :class:`DrainCadence` so a test can read
+#: elapsed time without sleeping through it.
+Monotonic = Callable[[], float]
+
+
+@dataclass(frozen=True)
+class DrainCadence:
+    """How often the loop sweeps, and the clock that schedules it.
+
+    ``interval_s`` bounds the *period* — sweep to sweep — not the sleep
+    between two sweeps. The loop schedules against an absolute deadline, so
+    the time a sweep costs is spent out of its own interval rather than added
+    to the gap between two of them; a sweep that costs more than one interval
+    runs again as soon as it returns. ``wait`` and ``monotonic`` are the two
+    halves of the loop's clock seam (both ``threading``/``time`` by default),
+    injectable for the same reason ``decideGrantRead`` takes the caller's
+    ``at``: a cadence contract is only testable if a test can move the clock
+    instead of sleeping through it.
+    """
+
+    interval_s: float
+    wait: Waiter = threading.Event.wait
+    monotonic: Monotonic = time.monotonic
 
 
 class AttachmentPrepWorkerStoppingError(RuntimeError):
@@ -53,18 +90,31 @@ class AttachmentPrepWorkerStoppingError(RuntimeError):
 def drain_periodically(
     sweep: Callable[[], object],
     stop_event: threading.Event,
-    interval_s: float,
+    cadence: DrainCadence,
     *,
     worker_logger: logging.Logger,
     log_label: str,
 ) -> None:
     """Run ``sweep`` once at startup, then re-check until stopped.
 
+    The cadence is scheduled against an absolute deadline — the next sweep is
+    due ``cadence.interval_s`` after the previous one was *due* — so drain to
+    drain is the interval plus at most the sweep that overran it, never the
+    interval plus every sweep's cost on top. Sweep-then-sleep would make the
+    gap ``interval + sweep``, which for a sweep that costs anything is already
+    past a ceiling stated as "at least once per minute", and the overshoot
+    would accumulate rather than amortize.
+
+    An overrun is not a backlog: the loop advances the deadline one interval
+    per iteration and never replays the intervals it slept through, so
+    downtime is not replayed as a storm of sweeps.
+
     ``worker_logger`` / ``log_label`` belong to the owning module, not
     to this plumbing: a failure must be attributed in the logs to the
     worker that owns the sweep (its log name and message prefix), so
     two workers sharing this loop stay distinguishable in one log file.
     """
+    deadline = cadence.monotonic() + cadence.interval_s
     while True:
         try:
             sweep()
@@ -77,12 +127,17 @@ def drain_periodically(
             worker_logger.exception(
                 "%s: drain failed; continuing to the next check", log_label
             )
-        if stop_event.wait(interval_s):
+        remaining = deadline - cadence.monotonic()
+        # A sweep that overran its interval leaves nothing to wait out; the
+        # zero-time wait is still asked, because it is also where a stop
+        # requested during the sweep is observed.
+        if cadence.wait(stop_event, remaining if remaining > 0.0 else 0.0):
             # EXIT: the only exit — a stop was requested; return once
             # the in-flight sweep settles, because a half-run durable
             # job is exactly what the next boot's startup sweep
             # re-adopts.
             return
+        deadline += cadence.interval_s
 
 
 class PeriodicDrainWorker:
@@ -98,15 +153,15 @@ class PeriodicDrainWorker:
     def __init__(
         self,
         sweep: Callable[[], object],
+        cadence: DrainCadence,
         *,
-        interval_s: float,
         thread_name: str,
         stopping_error: type[RuntimeError],
         log_label: str,
         worker_logger: logging.Logger | None = None,
     ) -> None:
         self._sweep = sweep
-        self._interval_s = interval_s
+        self._cadence = cadence
         self._thread_name = thread_name
         self._stopping_error = stopping_error
         self._log_label = log_label
@@ -121,7 +176,7 @@ class PeriodicDrainWorker:
         drain_periodically(
             self._sweep,
             stop_event,
-            self._interval_s,
+            self._cadence,
             worker_logger=self._worker_logger,
             log_label=self._log_label,
         )
@@ -199,7 +254,7 @@ def _drain_attachment_queue(
     drain_periodically(
         lambda: service.drain_attachment_jobs(),
         stop_event,
-        check_interval_seconds,
+        DrainCadence(check_interval_seconds),
         worker_logger=logger,
         log_label="attachment prep worker",
     )
@@ -223,7 +278,7 @@ class AttachmentPrepWorker(PeriodicDrainWorker):
     ) -> None:
         super().__init__(
             lambda: service.drain_attachment_jobs(),
-            interval_s=interval_s,
+            DrainCadence(interval_s),
             thread_name=ATTACHMENT_PREP_WORKER_THREAD_NAME,
             stopping_error=AttachmentPrepWorkerStoppingError,
             log_label="attachment prep worker",
@@ -235,6 +290,9 @@ __all__ = [
     "ATTACHMENT_PREP_WORKER_THREAD_NAME",
     "AttachmentPrepWorker",
     "AttachmentPrepWorkerStoppingError",
+    "DrainCadence",
+    "Monotonic",
     "PeriodicDrainWorker",
+    "Waiter",
     "drain_periodically",
 ]

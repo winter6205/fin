@@ -387,7 +387,53 @@ async function isPendingQuestionRefusal(res: Response): Promise<boolean> {
 }
 
 /** The ``error`` token of a 409 body, or ``""`` when unreadable. */
-async function conflictToken(res: Response): Promise<[string, string]> {
+// question-workspace W2/W5: the typed task refusal the send door
+// raises before any run starts (``_task_input_http_error``). Two facts
+// this surface must be able to keep apart, which a bare HTTP error
+// cannot carry: WHICH question the rejected reply belonged to, and
+// WHICH named failure refused it. The kind rides
+// ``TASK_FAILURE_KINDS`` (specs/question-task-runtime-contract.md), so
+// a stale reply is never rendered as a transport hiccup.
+export class TaskInputRefusedError extends Error {
+  readonly kind: string;
+  /** ``detail.question_id`` — the question the rejected reply named,
+   * preserved so a stale reply stays associated with its ORIGINAL
+   * question instead of being rebased onto whatever is current now. */
+  readonly questionId: string | null;
+
+  constructor(kind: string, questionId: string | null = null) {
+    super(`task input refused: ${kind}`);
+    this.name = "TaskInputRefusedError";
+    this.kind = kind;
+    this.questionId = questionId;
+  }
+}
+
+/** True when a 400/409 body is the task-door refusal shape: FastAPI's
+ * ``HTTPException`` serialises as ``{"detail": {"error": <kind>}}``,
+ * which is a DIFFERENT shape from the plain ``{"error": …}`` the lock
+ * and 知识 MCP refusals use. Returns the refusal or ``null``, so the
+ * caller keeps its historical handling of every other status. */
+async function readTaskRefusal(
+  res: Response,
+): Promise<TaskInputRefusedError | null> {
+  try {
+    const body = (await res.json()) as {
+      detail?: { error?: unknown; question_id?: unknown };
+    };
+    const detail = body?.detail;
+    if (typeof detail?.error !== "string") return null;
+    const questionId = detail.question_id;
+    return new TaskInputRefusedError(
+      detail.error,
+      typeof questionId === "string" ? questionId : null,
+    );
+  } catch {
+    return null;
+  }
+}
+
+/** The ``error`` token of a 409 body, or ``""`` when unreadable. */async function conflictToken(res: Response): Promise<[string, string]> {
   try {
     const body = (await res.json()) as { error?: unknown; message?: unknown };
     return [
@@ -439,6 +485,26 @@ export interface SendRequest {
   // host. This is the attach door's only
   // downstream — the attach path must never touch /api/corpus/ingest.
   attachment_ids?: string[];
+
+  // question-workspace W2: answer the thread's still-pending
+  // clarification. ``question_id`` names WHICH question is being
+  // answered so the reply keeps its ORIGINAL association — the host
+  // refuses a reply to a superseded question as ``task_reply_expired``
+  // rather than answering whatever is current, so this is never
+  // optionalised away by "the current one". ``choice_id`` is a real
+  // choice id, and the reserved ``"other"`` token is one of them
+  // rather than a sentinel; ``free_text`` carries what the operator
+  // typed alongside Other, preserved verbatim. All three are absent on
+  // an ordinary message.
+  question_id?: string;
+  choice_id?: string;
+  free_text?: string;
+
+  // question-workspace W5: an EXPLICIT restore of a listed archive.
+  // Restore is never inferred from message text on this surface — the
+  // archived results stay historical until the host's recheck passes,
+  // and until the host confirms the current task is simply unchanged.
+  restore_archive_id?: string;
 }
 
 /**
@@ -448,6 +514,42 @@ export interface SendRequest {
  * tool_result) via the optional ``onEvent`` callback so the SPA
  * can render the tools region + scratchpad while the run is live.
  */
+/** The pre-SSE named refusals of the send door, checked in wire order:
+ * 409 (task refusal first, then lock/gate), 503 (ingest missing), 400
+ * (task refusal first, then the pre-T2f still-parsing attachment).
+ * Returns the error to throw, or null when the status needs the caller's
+ * generic handling (204 no-op / non-OK transport error). Extracted from
+ * ``sendMessage`` so the door's branch order stays one family. */
+async function sendPreSseError(res: Response): Promise<Error | null> {
+  // Error paths happen BEFORE any SSE frame per spec. The 409 body
+  // carries the token: ``knowledge_mcp_fault`` on a 缺 / 坏 boot is a
+  // different refusal from a held run and must not read as one.
+  if (res.status === 409) {
+    // question-workspace W2/W5: a refused clarification reply or an
+    // un-adoptable restore rides the SAME status as a held run, so the
+    // body discriminates them. Checked BEFORE the lock/gate reading so
+    // a stale reply is never reported as 「还有一轮在运行」.
+    const refusal = await readTaskRefusal(res.clone());
+    if (refusal) return refusal;
+    return sendConflictError(res);
+  }
+  if (res.status === 503) return new IngestMissingError("ingest_missing");
+  // Attach door: the pre-T2f refusal of a run that requires a
+  // still-parsing attachment is this one named pre-SSE refusal; every
+  // other 400 keeps the generic transport error below. The task-door
+  // refusal is the OTHER named 400, so it is read first and by shape:
+  // an expired or malformed reply must never be reported as a
+  // still-parsing attachment.
+  if (res.status === 400) {
+    const refusal = await readTaskRefusal(res.clone());
+    if (refusal) return refusal;
+    if ((await namedErrorCode(res)) === "attachment_not_ready") {
+      return new AttachmentNotReadyError();
+    }
+  }
+  return null;
+}
+
 export async function sendMessage(
   threadId: string,
   request: SendRequest,
@@ -462,20 +564,8 @@ export async function sendMessage(
     },
   );
 
-  // Error paths happen BEFORE any SSE frame per spec. The 409 body
-  // carries the token: ``knowledge_mcp_fault`` on a 缺 / 坏 boot is a
-  // different refusal from a held run and must not read as one.
-  if (res.status === 409) throw await sendConflictError(res);
-  if (res.status === 503) throw new IngestMissingError("ingest_missing");
-  // Attach door: the pre-T2f refusal of a run that requires a
-  // still-parsing attachment is this one named pre-SSE refusal; every
-  // other 400 keeps the generic transport error below.
-  if (
-    res.status === 400 &&
-    (await namedErrorCode(res.clone())) === "attachment_not_ready"
-  ) {
-    throw new AttachmentNotReadyError();
-  }
+  const preSseError = await sendPreSseError(res);
+  if (preSseError) throw preSseError;
   if (res.status === 204) {
     // Empty submit no-op; caller should not have called this.
     // No SSE frames arrive on a 204, so there is no server-minted

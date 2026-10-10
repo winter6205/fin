@@ -364,7 +364,7 @@ The closed query error set is:
 | `result_too_large` | no | Required response data cannot fit within 32 KiB |
 | `count_unavailable` | yes | Complete count could not finish; no partial count is returned |
 | `query_timeout` | yes | Read exceeded its 60-second execution lease |
-| `structured_search_unavailable` | yes | Structured query backend failed |
+| `structured_search_unavailable` | yes | Valid request whose execution path is not wired on the bound tier, or backend capability unavailable or structured backend fails during execution |
 | `maintenance_status_unavailable` | yes | Required same-scope status could not be read consistently |
 
 No-match is a successful empty list or a zero count receipt. Every incomplete,

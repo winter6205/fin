@@ -98,6 +98,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.tools import InjectedToolArg, InjectedToolCallId, tool
+
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.prebuilt import InjectedState, ToolNode
@@ -134,6 +135,19 @@ from fin.host.session_compaction import (
     SessionSummaryError,
     count_tokens_approximately,
     session_budget_tokens,
+)
+from fin.host.source_scope import (
+    SCOPE_ATTACHMENT_UNKNOWN,
+    SCOPE_DEPENDENCY_FAILED,
+    SCOPE_EXPRESSIBLE_OPERATIONS,
+    AttachmentAuthority,
+    AuthorityFacts,
+    EffectiveScope,
+    ScopeDecision,
+    ScopeGate,
+    ScopeRestriction,
+    resolve_scope,
+    scope_denied_error,
 )
 from fin.host.user_profile import (
     GLOBAL_FILENAME,
@@ -187,9 +201,23 @@ from fin.host.tools.issuer_fanout import (
     plan_issuer_fanout,
 )
 from fin.host.track_decision import (
+    company_of_utterance,
     decide_track,
     normalize_track,
     snapshot_delta_for_utterance,
+)
+from fin.host.task_runtime import apply_assessment, decide as decide_task, is_reconciled
+from fin.host.task_runtime_types import (
+    INPUT_REPLY,
+    INPUT_RESTORE,
+    AcceptedInput,
+    GroundingAssessment,
+    HostGates,
+    PendingQuestion,
+    ReconciliationProposal,
+    TaskRuntimeError,
+    TaskRuntimeState,
+    _accepted_from_dict,
 )
 from fin.host.search_mode_decision import (
     apply_operator_pick,
@@ -205,6 +233,11 @@ from fin.host.extract_method_proposal import (
     propose_window_payload,
     proposal_is_pending,
 )
+from fin.host.evidence_session_registry import (
+    EvidenceBindingRefusal,
+    EvidenceSessionBinding,
+)
+from fin.host.structured_evidence_admission import admit_structured_evidence
 from fin.retrieve import MCPRetrieveAdapter, FakeRetrievePort
 from fin.retrieve.degradation import (
     DegradationLedger,
@@ -212,7 +245,15 @@ from fin.retrieve.degradation import (
 )
 from fin.retrieve.hit_mapping import MappingFailureLedger, ledger_from_env
 from fin.retrieve.input_validation import InputValidationError
-from fin.retrieve.port import DATABASE_ROWS_KEY, RetrievePort, database_rows_of
+from fin.retrieve.port import (
+    DATABASE_ROWS_KEY,
+    STRUCTURED_RESULT_KEY,
+    STRUCTURED_SEARCH_UNAVAILABLE_CODE,
+    RetrievePort,
+    _structured_query_refusal_code,
+    database_rows_of,
+    structured_result_of,
+)
 from fin.retrieve.source_read import (
     ATTACHMENT_KIND,
     UNKNOWN_LOCATOR,
@@ -244,6 +285,26 @@ if TYPE_CHECKING:  # ``fin.corpus.facts`` is imported lazily at call time
 
 class HostGraphError(Exception):
     """Base class for host-graph typed errors."""
+
+
+class TaskReconciliationError(HostGraphError):
+    """A task reconciliation was refused and dependent work must not run.
+
+    The typed carrier for the runtime's refusal (question/task runtime
+    T2, SC-1/SC-8). It exists because the alternative — returning an
+    empty update and letting the lane continue — starts retrieval, tools,
+    and answer formation on an input that carries NO committed
+    reconciliation, which is precisely what the contract forbids.
+
+    ``kind`` is the named failure from ``fin.host.named_failures``, so
+    the ordinary system-failure path can persist it as the turn's
+    ``status_reason`` and an operational failure stays distinguishable
+    instead of being reported as a degraded retrieve lane.
+    """
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 class PendingCheckpointProjectionError(HostGraphError):
@@ -436,7 +497,12 @@ def _format_bounce_template(template: str) -> str:
 # ----- tool wrappers -----
 
 
-def _make_list_files_tool(catalog_path: Path):
+def _make_list_files_tool(
+    catalog_path: Path,
+    *,
+    attachment_service: Any = None,
+    scope_restriction: ScopeRestriction | None = None,
+):
     """Build the ``list_files`` host tool.
 
     Returns a LangChain ``BaseTool`` whose function calls T3's
@@ -446,6 +512,12 @@ def _make_list_files_tool(catalog_path: Path):
     contribute evidence — it returns catalog metadata only.
     The tool's registered name is ``list_files`` (matching the
     ADR 0009 contract) so the model can call it by name.
+
+    Enumeration is itself a source boundary: the catalog is the company
+    branch, so a restriction the operator declared exclusive is answered with
+    the gate's typed refusal BEFORE any row is listed, and a restriction that
+    only names attachments leaves the catalog readable (ADR 0088:10). A graph
+    with nothing in force lists exactly as it did before scope existed.
     """
 
     @tool("list_files")
@@ -469,6 +541,14 @@ def _make_list_files_tool(catalog_path: Path):
         empty or missing catalog table all return
         ``{"filings": []}``.
         """
+        refusal = _company_scope_refusal(
+            attachment_service, scope_restriction, "list_files"
+        )
+        if refusal is not None:
+            # EXIT: the typed refusal returns before the catalog is enumerated —
+            # enumeration is itself a source boundary, so an excluded company
+            # branch is never rendered to the model as an empty corpus.
+            return refusal
         return list_files(
             company=company,
             period=period,
@@ -660,6 +740,37 @@ def _attachment_reader_for_run(
     return attachment_reader_factory(thread_id)
 
 
+def _identity_bound_adapter(
+    adapter: RetrievePort,
+    evidence: "EvidenceSessionBinding | None",
+    config: Any,
+) -> RetrievePort:
+    """The adapter this call must ride, given the run's own identity (P2-I2).
+
+    Read per invocation, from the same host-bound ``configurable`` channel
+    ``thread_id`` uses and never from a model argument, because
+    ``compile_graph`` builds the adapter once: a session bound at build time
+    would give every caller in the process one shared identity.
+
+    ``evidence is None`` returns ``adapter`` unchanged, and that is the ONLY
+    unbound answer: it means **no registry is configured for this boot**, so
+    the graph keeps the pre-P2-I2 transport and the Evidence lane is simply not
+    in the retrieve path. It is not a default scope and not a fallback.
+
+    A configured registry whose resolver selects nothing REFUSES
+    (:class:`~fin.host.evidence_session_registry.EvidenceBindingRefusal`).
+    Returning the shared adapter in that case would be a silent identity
+    default: the run would answer under the process-level transport — which
+    relaunches a child per call, and answers as nobody it selected — instead of
+    refusing. That is the outcome ADR B1 clause 4 forbids, and the caller maps
+    the refusal onto the retrieve envelope's own error frame.
+    """
+
+    if evidence is None:
+        return adapter
+    return evidence.sessions.bind(evidence.resolve(config)).adapter_for(adapter)
+
+
 def _display_lookup_for(reader: Any) -> Callable[[str, int | None], tuple[str, str] | None] | None:
     """Trust the run's own leg for citation identity.
 
@@ -684,9 +795,342 @@ def _display_lookup_for(reader: Any) -> Callable[[str, int | None], tuple[str, s
     return lookup
 
 
+@dataclass(frozen=True, slots=True)
+class _RunScope:
+    """One run's resolved scope and the gate that enforces it.
+
+    Bundled so every boundary reads the SAME resolution: ``gate`` decides an
+    operation, ``facts`` is the trusted authority it was built from (a
+    model-named id with no version resolves through it), and ``effective`` is
+    the resolved selection the retrieve branch narrows to. Nothing here is
+    persisted — the scope is recomputed from live facts at each run entry.
+    """
+
+    gate: ScopeGate
+    facts: AuthorityFacts
+    effective: EffectiveScope
+
+
+def _adapter_capability(operation: str) -> bool:
+    """Whether a wired adapter is known to express the restriction for this op.
+
+    Capability is a derived fact about the adapters this graph actually wires,
+    never a default grant: the proven set is the most any authority can claim,
+    so an operation nothing expresses is refused instead of passing.
+    """
+    return operation in SCOPE_EXPRESSIBLE_OPERATIONS
+
+
+def _scope_authority(
+    thread_id: str, attachment_service: Any
+) -> AuthorityFacts | None:
+    """Build the trusted scope facts from the wired attachment seam.
+
+    Every callable is derived from the frame's OWN store and the host-bound
+    ``thread_id`` — never from a model argument — so ADR 0088's trusted-thread
+    ownership stays the sole authority behind an attachment id. Returns
+    ``None`` when no attachment service (or no store on it) is wired, so an
+    unwired graph keeps every boundary's pre-scope behavior byte for byte: a
+    boundary with no injectable authority cannot enforce one and must not
+    pretend to.
+
+    ``resolve_attachment`` answers current identity and version ONLY for a row
+    the store still holds under THIS thread; a foreign-thread, tombstoned, or
+    unknown id answers ``None``, which the gate reads as a denial rather than
+    widening the scope. ``attachment_ready`` reads the record's own
+    ``searchable`` promise (``ready`` plus a usable index) at the version the
+    authority resolved. ``list_attachments`` enumerates the thread's own ids.
+    ``operation_capable`` answers from the proven expressibility set instead of
+    assuming a grant, so an operation no wired adapter is known to express is
+    refused rather than passed; it stays a callable so a real capability probe
+    has one injection point and never a silent allow-list inside a boundary.
+    """
+    store = getattr(attachment_service, "store", None)
+    if store is None:
+        return None
+
+    def resolve(attachment_id: str) -> AttachmentAuthority | None:
+        record = store.get(attachment_id)
+        if record is None or record.thread_id != thread_id:
+            # EXIT: an id the trusted store does not hold for THIS thread
+            # (unknown, foreign-thread, tombstoned, re-prepared) grants no
+            # authority. The check is never widened to the whole store.
+            return None
+        return AttachmentAuthority(attachment_id, record.version)
+
+    def is_ready(attachment_id: str, _version: int) -> bool:
+        record = store.get(attachment_id)
+        # Readiness is a SEPARATE fact from eligibility and never a grant:
+        # it only decides whether an already-authorized id can answer yet.
+        return record is not None and record.searchable
+
+    def list_ids() -> tuple[str, ...]:
+        return tuple(
+            record.attachment_id for record in store.list_for_thread(thread_id)
+        )
+
+    return AuthorityFacts(
+        thread_id=thread_id,
+        resolve_attachment=resolve,
+        attachment_ready=is_ready,
+        operation_capable=_adapter_capability,
+        list_attachments=list_ids,
+    )
+
+
+class _ScopeAuthorityAbsent(RuntimeError):
+    """No attachment authority exists to consult for a restriction in force."""
+
+
+def _absent_authority(thread_id: str) -> AuthorityFacts:
+    """The facts of a graph with no attachment authority to consult.
+
+    Every source read raises, so resolution records a FAULT instead of an
+    answered "nothing": a restriction in force over an absent authority is
+    enforced as a dependency failure rather than released into the pre-scope
+    broad path. Capability is deliberately not one of those reads — it is a
+    fact about the adapters this graph does wire, so an absent attachment
+    store faults the attachment branch without faking an outage for the
+    company branch.
+    """
+
+    def unconsultable(*_args: Any) -> NoReturn:
+        raise _ScopeAuthorityAbsent("no attachment authority is wired")
+
+    return AuthorityFacts(
+        thread_id=thread_id,
+        resolve_attachment=unconsultable,
+        attachment_ready=unconsultable,
+        operation_capable=_adapter_capability,
+        list_attachments=unconsultable,
+    )
+
+
+def _authority_or_absent(
+    thread_id: str,
+    attachment_service: Any,
+    scope_restriction: ScopeRestriction | None,
+) -> AuthorityFacts | None:
+    """The facts to enforce with, or ``None`` when nothing needs enforcing.
+
+    An unwired graph with no restriction in force yields ``None``, so every
+    boundary keeps its pre-scope behavior byte for byte. A restriction in
+    force never yields ``None``: an absent authority is a fault to report, not
+    a licence to skip the gate.
+    """
+    facts = _scope_authority(thread_id, attachment_service)
+    if facts is not None:
+        return facts
+    if scope_restriction is None or not scope_restriction.in_force:
+        # EXIT: nothing is in force, so there is no selection to widen and the
+        # graph keeps its pre-scope behavior — never a licence to skip the gate.
+        return None
+    # EXIT: a restriction in force over an absent authority resolves to a fault
+    # at every boundary, rather than falling through to the broad path.
+    return _absent_authority(thread_id)
+
+
+def _scope_for_run(
+    config: Mapping[str, Any] | None,
+    attachment_service: Any,
+    scope_restriction: ScopeRestriction | None,
+) -> _RunScope | None:
+    """Resolve this run's effective scope, or ``None`` when nothing is enforced.
+
+    The thread comes from ``configurable`` (never a model argument), the
+    restriction from the compile-time in-force intent, and the authority from
+    the wired store. ``resolve_scope`` is pure and never raises.
+    """
+    facts = _authority_or_absent(
+        _bound_thread_id(config), attachment_service, scope_restriction
+    )
+    if facts is None:
+        # EXIT: no gate for this run because nothing is in force; a restriction
+        # in force always reaches here with facts, faulting ones included.
+        return None
+    effective = resolve_scope(scope_restriction, facts)
+    return _RunScope(
+        gate=ScopeGate(effective=effective, facts=facts),
+        facts=facts,
+        effective=effective,
+    )
+
+
+def _named_attachment_decision(
+    scope: _RunScope, operation: str, attachment_id: str
+) -> ScopeDecision:
+    """The gate's ruling on a model-named id that carries no version.
+
+    The retrieve narrowing and the visual ask name an attachment id but no
+    version, so the host resolves the CURRENT authorized version and passes it
+    to the gate — the version check is then against what the trusted store
+    holds, not what the model said. A resolver that faults is the gate's own
+    ``dependency_failed`` (a distinct outcome from a denial), never a silent
+    pass. An id IN the effective selection that authority no longer stands
+    behind is the race the direct path answers :data:`SCOPE_ATTACHMENT_UNKNOWN`
+    for — answered directly here, not the unreadable-ref shape a versionless
+    locator would otherwise produce. An id OUTSIDE the effective selection
+    (unknown, foreign-thread) still flows through the gate, whose membership
+    check answers the same ``not_permitted`` the direct path gives.
+    """
+    try:
+        authority = scope.facts.resolve_attachment(attachment_id)
+    except Exception:
+        # EXIT: the authority itself faulted — a distinct outcome, so a
+        # transient outage is not read as a permission answer.
+        return ScopeDecision("dependency_failed", SCOPE_DEPENDENCY_FAILED)
+    if authority is None and attachment_id in scope.effective.attachment_ids:
+        # EXIT: in scope at resolution, but no current authority stands behind
+        # it now — the same distinct "unknown" the direct path answers, not a
+        # versionless-ref "unreadable".
+        return ScopeDecision("denied", SCOPE_ATTACHMENT_UNKNOWN)
+    source_ref: dict[str, Any] = {
+        "kind": ATTACHMENT_KIND,
+        "attachment_id": attachment_id,
+    }
+    if authority is not None:
+        source_ref["version"] = authority.version
+    return scope.gate.check(operation, source_ref=source_ref)
+
+
+def _company_scope_refusal(
+    attachment_service: Any,
+    scope_restriction: ScopeRestriction | None,
+    operation: str,
+) -> dict[str, Any] | None:
+    """The typed refusal for a company-source operation, or ``None``.
+
+    A fact table, a comparison, and a corpus search all sit on the company
+    branch, which a restriction that only NAMES attachments leaves eligible
+    (ADR 0088:10) and which a restriction the operator declared exclusive
+    removes. The thread is irrelevant to that ruling, which is why this closure
+    needs no per-run config; a graph with no restriction in force answers
+    ``None`` and every company tool keeps its pre-scope behavior.
+
+    A refusal is produced by the gate's own codes, so a company read is
+    refused before its implementation runs and the reason stays distinguishable:
+    an excluded branch is ``denied``, an operation no adapter expresses is
+    ``unsupported``, and an unconsultable authority is
+    :data:`SCOPE_DEPENDENCY_FAILED` rather than a silent pass. That refusal
+    exists only while a restriction is in force: Runtime alone accepts and
+    persists a scope change (spec decision 9), and this seam enforces exactly
+    the restriction it is handed.
+    """
+    facts = _authority_or_absent("", attachment_service, scope_restriction)
+    if facts is None:
+        # EXIT: nothing wired AND nothing in force — the pre-scope answer. A
+        # restriction in force always gets facts, so this None is never a
+        # denial quietly skipped past.
+        return None
+    gate = ScopeGate(effective=resolve_scope(scope_restriction, facts), facts=facts)
+    decision = gate.check(operation)
+    if decision.reason in ScopeGate.DENIAL_CODES:
+        # EXIT: the closed denial code rides the envelope, so an excluded
+        # branch or a faulted authority is never consumed downstream as a
+        # successful empty result.
+        return scope_denied_error(decision)
+    # EXIT: the gate's own permitted/empty ruling, so the company
+    # implementation runs — a decision made here, never a gate bypassed.
+    return None
+
+
+def _read_source_scope_refusal(
+    scope: _RunScope | None, source_ref: Any, tool_call_id: str
+) -> Command | None:
+    """The scope refusal for a model-supplied locator, or ``None``.
+
+    Gated BEFORE the leg reads: an attachment locator outside the effective
+    selection, at a stale version, or not ready is answered with the gate's
+    typed code and NO text is read. A company locator follows the branch
+    decision — eligible under a restriction that only names attachments
+    (ADR 0088:10), refused under one the operator declared exclusive — and a
+    graph with nothing in force skips the gate entirely.
+    """
+    if scope is None or not isinstance(source_ref, Mapping):
+        return None
+    decision = scope.gate.check("read_source", source_ref=source_ref)
+    if decision.reason not in ScopeGate.DENIAL_CODES:
+        return None
+    return Command(
+        update={
+            "messages": [
+                ToolMessage(
+                    content=serialize_result(scope_denied_error(decision)),
+                    tool_call_id=tool_call_id,
+                    name="read_source",
+                )
+            ],
+            "evidence": [],
+        }
+    )
+
+
+def _visual_scope_refusal(
+    scope: _RunScope | None, attachment_id: str, tool_call_id: str
+) -> Command | None:
+    """The scope refusal for a visual ask, or ``None``.
+
+    Gated BEFORE the ledger is touched or a page is drawn: an attachment
+    outside the effective selection, gone, or not ready answers the gate's
+    typed code and no vision call is spent. An unwired graph (``scope``
+    ``None``) skips the gate.
+    """
+    if scope is None:
+        return None
+    decision = _named_attachment_decision(scope, "read_visual_detail", attachment_id)
+    if decision.reason not in ScopeGate.DENIAL_CODES:
+        return None
+    return Command(
+        update={
+            "messages": [
+                ToolMessage(
+                    content=serialize_result(scope_denied_error(decision)),
+                    tool_call_id=tool_call_id,
+                    name="read_visual_detail",
+                )
+            ],
+            "visual_claims": [],
+        }
+    )
+
+
+def _company_refusal_command(
+    attachment_service: Any,
+    scope_restriction: ScopeRestriction | None,
+    operation: str,
+    tool_name: str,
+    tool_call_id: str,
+) -> Command | None:
+    """The typed company-refusal Command, or ``None`` when permitted.
+
+    Wraps :func:`_company_scope_refusal` into the ``Command`` shape the company
+    tools return, so a refusal reaches the model as the gate's typed code
+    WITHOUT the underlying implementation running. A graph with no restriction
+    in force answers ``None`` here and the tool reads exactly as it did before
+    scope existed.
+    """
+    refusal = _company_scope_refusal(attachment_service, scope_restriction, operation)
+    if refusal is None:
+        return None
+    return Command(
+        update={
+            "messages": [
+                ToolMessage(
+                    content=json.dumps(refusal, default=str),
+                    tool_call_id=tool_call_id,
+                    name=tool_name,
+                )
+            ]
+        }
+    )
+
+
 def _make_read_source_tool(
-    company_reader: Any,
+    company_reader_for_run: Callable[[Any], Any],
     attachment_reader_factory: Callable[[str], Any] | None,
+    *,
+    attachment_service: Any = None,
+    scope_restriction: ScopeRestriction | None = None,
 ):
     """Build the ``read_source`` host tool (ADR 0087 / 0088).
 
@@ -696,6 +1140,14 @@ def _make_read_source_tool(
     returned text. Every typed error contributes nothing and reaches the
     model as the tool result.
 
+    The company leg is resolved PER CALL through
+    ``company_reader_for_run``, from the run's own ``config``, for the same
+    reason the attachment leg below is: the reader is the bound adapter, and
+    when a registry is configured the adapter that authorizes a read belongs to
+    THIS call's identity rather than to the process. A read that resolved a
+    different identity from the retrieve that produced its locator would make
+    the citation rest on a body the run's own identity never authorized.
+
     The attachment leg is bound PER CALL to the run's trusted
     ``configurable.thread_id`` — the same source
     ``ensure_attachment_ready`` reads — so a model-supplied thread id in
@@ -703,6 +1155,15 @@ def _make_read_source_tool(
     ``attachment_reader_factory`` ``None`` (or a run with no thread id)
     means no attachment leg is wired, and an attachment slice whose
     trusted record cannot be reached contributes no evidence.
+
+    Scope enforcement (spec SC-3 / decision 5): when the attachment seam
+    is wired, the model's OWN ``source_ref`` is gated BEFORE the leg reads
+    it, so a known locator cannot bypass the current scope. An attachment
+    locator outside the effective selection, at a stale version, or not
+    ready is answered with the gate's typed code and NO text is read; a
+    company locator is read while the company branch is eligible and refused
+    under an exclusive restriction. A graph with no restriction in force skips
+    the gate entirely and keeps the pre-scope behavior byte for byte.
 
     The tool's registered name is ``read_source``.
     """
@@ -724,13 +1185,50 @@ def _make_read_source_tool(
         ``position`` is a zero-based code-point offset within that unit
         and defaults to 0. Each slice carries at most 8000 code points
         and ``next_position`` says where to continue (``null`` at end).
-        Unknown ids, stale versions, and another thread's attachment
-        answer ``{"error": "unknown_locator"}`` and contribute no
-        evidence; so do invalid positions and unavailable sources.
+        When the attachment seam is wired the current scope decides first,
+        and a refused attachment locator answers the gate's typed code
+        (``scope_attachment_not_permitted`` outside the effective selection,
+        ``scope_attachment_version_stale`` at a superseded version,
+        ``scope_attachment_unknown`` when authority no longer stands behind
+        the id, ``scope_attachment_not_ready`` when it is authorized but not
+        yet usable) and contributes no evidence. An unwired graph keeps the
+        leg's own answer instead, and invalid positions and unavailable
+        sources contribute nothing.
         """
         attachment_reader = _attachment_reader_for_run(
             attachment_reader_factory, config
         )
+        scope = _scope_for_run(config, attachment_service, scope_restriction)
+        refusal = _read_source_scope_refusal(scope, source_ref, tool_call_id)
+        if refusal is not None:
+            # SC-3: the locator the MODEL supplied was gated BEFORE the leg is
+            # allowed to read it; a refusal reads nothing.
+            return refusal
+        try:
+            # A callable is the per-run identity factory. A reader instance,
+            # including None, is the direct company leg the scope tests and
+            # the pre-identity call sites pass in.
+            company_reader = (
+                company_reader_for_run(config)
+                if callable(company_reader_for_run)
+                else company_reader_for_run
+            )
+        except EvidenceBindingRefusal as exc:
+            # The typed-EXIT frame the read contract already speaks, carrying
+            # the closed §6 code: this run selected no identity, so the body
+            # source is not merely empty — it was never authorized. Answering
+            # ``unknown_locator`` would blame the locator for a refusal.
+            return Command(
+                update={
+                    "messages": [
+                        ToolMessage(
+                            content=json.dumps({"error": exc.code}),
+                            tool_call_id=tool_call_id,
+                            name="read_source",
+                        )
+                    ]
+                }
+            )
         result = read_source(
             source_ref,
             position,
@@ -878,6 +1376,9 @@ def _run_vision_ledger(config: Mapping[str, Any] | None) -> Any | None:
 
 def _make_read_visual_detail_tool(
     faces_factory: Callable[[str, Any], Any] | None,
+    *,
+    attachment_service: Any = None,
+    scope_restriction: ScopeRestriction | None = None,
 ):
     """Build the ``read_visual_detail`` host tool (ADR 0089).
 
@@ -888,6 +1389,12 @@ def _make_read_visual_detail_tool(
     observation has no such span, so routing it through ``evidence`` would
     either fabricate a quote or refuse an honest answer. It travels its own
     channel instead.
+
+    Scope enforcement (spec SC-3 / decision 5): the model-supplied
+    ``attachment_id`` is gated BEFORE any vision call is spent — an id
+    outside the effective selection, gone, or not ready answers the gate's
+    typed code and draws nothing. An unwired graph (``attachment_service``
+    ``None``) skips the gate and keeps the pre-scope behavior.
 
     The tool's registered name is ``read_visual_detail``.
     """
@@ -917,13 +1424,21 @@ def _make_read_visual_detail_tool(
         A page already observed for this exact target answers from the
         stored observation and charges nothing; anything else inspects the
         page once. The answer is derived, not a quote, so it can never be
-        cited as source text. Unknown or another thread's attachment
-        answers ``{"error": "attachment_unavailable"}``; refusals are
-        ``page_unavailable``, ``detail_target_invalid``,
-        ``crop_scope_invalid``, ``vision_budget_exceeded``,
-        ``vision_call_failed``, ``observation_stale``,
-        ``visual_lane_unwired``.
+        cited as source text. An attachment outside the current scope is
+        refused by the gate before any page is drawn; other refusals are
+        ``attachment_unavailable``, ``page_unavailable``,
+        ``detail_target_invalid``, ``crop_scope_invalid``,
+        ``vision_budget_exceeded``, ``vision_call_failed``,
+        ``observation_stale``, ``visual_lane_unwired``.
         """
+        scope_resolution = _scope_for_run(
+            config, attachment_service, scope_restriction
+        )
+        refusal = _visual_scope_refusal(scope_resolution, attachment_id, tool_call_id)
+        if refusal is not None:
+            # EXIT: refused before the ledger is touched or a page is drawn —
+            # no vision call is spent on an out-of-scope ask.
+            return refusal
         payload, claim_rows = _visual_read_result(
             faces_factory, attachment_id, page, chart, series, category, scope, config
         )
@@ -990,6 +1505,87 @@ def _default_empty_hit_rewrite(query: str) -> str:
     return f"{query} (broadened)"
 
 
+def _scoped_search_ids(
+    scope: _RunScope | None, attachment_ids: list[str] | None
+) -> tuple[list[str] | None, dict[str, Any] | None]:
+    """The ids the attachment branch may search, or the refusal to answer.
+
+    Returns ``(search_ids, refusal)``; when ``refusal`` is set the caller
+    answers it and searches NOTHING. With no scope the model's own ids pass
+    through unchanged (``scope is None``), which happens only when nothing is
+    in force — a restriction over an absent authority still resolves to a
+    faulting scope, so it can never reach this pass-through. With a scope, a
+    call that names ids re-checks each one and refuses the whole call if any is
+    outside the effective selection — dropping it and searching the rest would
+    be the silent broadening the spec forbids. A call naming no ids narrows to
+    the effective selection through the gate's broad check, so an answered-but-
+    empty authority yields the truthful empty and a faulted enumeration yields
+    the distinct ``dependency_failed`` the gate names, never a successful
+    empty.
+    """
+    if scope is None:
+        return attachment_ids, None
+    if attachment_ids is not None:
+        for attachment_id in attachment_ids:
+            decision = _named_attachment_decision(
+                scope, "search_attachments", attachment_id
+            )
+            if decision.reason in ScopeGate.DENIAL_CODES:
+                return None, scope_denied_error(decision)
+        return attachment_ids, None
+    broad = scope.gate.check("search_attachments")
+    if broad.reason in ScopeGate.DENIAL_CODES:
+        return None, scope_denied_error(broad)
+    return list(scope.effective.attachment_ids), None
+
+
+def _admit_attachment_hit(
+    scope: _RunScope | None,
+    source_ref: Mapping[str, Any],
+    text: str,
+    grant: Any,
+) -> EvidenceItem | None:
+    """The evidence one attachment hit earns, or ``None`` when refused.
+
+    The admission boundary, gated a SECOND time (spec: no post-fetch evidence
+    for an unauthorized source): a hit whose id or version current authority no
+    longer stands behind reaches the model as display text but is never
+    admitted as evidence, so it cannot ground a citation.
+    """
+    if scope is not None:
+        admit = scope.gate.check("admit_evidence", source_ref=source_ref)
+        if admit.reason in ScopeGate.DENIAL_CODES:
+            return None
+    return attachment_evidence_from_ref(source_ref, text, grant=grant)
+
+
+def _attachment_branch_result(
+    hits: Any, scope: _RunScope | None, grant: Any
+) -> tuple[dict[str, Any], list[EvidenceItem]]:
+    """This call's ``attachment_chunks`` envelope and admitted evidence.
+
+    Every hit is published as display text; only a hit the current scope still
+    stands behind earns evidence (see :func:`_admit_attachment_hit`). A clean
+    run publishes its own key even when empty: "looked, found nothing" is a
+    different fact from "did not look".
+    """
+    envelope_chunks: list[dict[str, Any]] = []
+    evidence: list[EvidenceItem] = []
+    for hit in hits:
+        source_ref = hit.source_ref.as_source_ref()
+        envelope_chunks.append(
+            {
+                "text": hit.text,
+                "source_ref": source_ref,
+                "score": hit.score,
+            }
+        )
+        item = _admit_attachment_hit(scope, source_ref, hit.text, grant)
+        if item is not None:
+            evidence.append(item)
+    return {"attachment_chunks": envelope_chunks}, evidence
+
+
 def _make_retrieve_tool(
     adapter: RetrievePort,
     *,
@@ -999,6 +1595,9 @@ def _make_retrieve_tool(
     retry_observer: Callable[[RewriteRetryResult], None] | None = None,
     attachment_retriever: "AttachmentSearchPort | None" = None,
     attachment_reader_factory: Callable[[str], Any] | None = None,
+    evidence: "EvidenceSessionBinding | None" = None,
+    attachment_service: Any = None,
+    scope_restriction: ScopeRestriction | None = None,
 ):
     """Build the ``retrieve`` host tool.
 
@@ -1062,6 +1661,20 @@ def _make_retrieve_tool(
     The tool's registered name is ``retrieve`` so the model can
     call it by name.
 
+    Evidence identity (P2-I2): ``evidence`` bundles the registry that owns one
+    persistent session per run identity together with the resolver that reads
+    that identity out of the run's own config — the same host-bound
+    ``configurable`` channel ``thread_id`` uses, never a model argument. The
+    binding is resolved ONCE PER CALL, because ``compile_graph`` builds this
+    tool once and a session frozen at build time would give every caller in the
+    process one shared identity. Two things follow, and both are load-bearing:
+    a call whose resolver selects nothing is REFUSED with the closed §6 code
+    rather than answered under the shared adapter, and both port attempts of the
+    empty-hit rewrite ride the one binding this call resolved. With
+    ``evidence is None`` — no registry configured for this boot — the call's
+    adapter is untouched, so the envelope stays byte-identical to the pre-P2-I2
+    shape.
+
     Attachment branch (G4 T3 / spec thread-attachment-source-read
     decisions 1 + 7): when an ``attachment_retriever`` is wired, the same
     call also searches the ACTIVE thread's ready attachments and publishes
@@ -1083,6 +1696,17 @@ def _make_retrieve_tool(
     behind the id, so a hit whose attachment the thread no longer owns at
     that version publishes display text but never a citation. With no
     retriever wired the envelope is byte-identical to the pre-T3 shape.
+
+    Scope enforcement (spec SC-2 / decision 5): when the attachment seam is
+    wired, the effective scope bounds this branch BEFORE the search runs.
+    An ``attachment_ids`` entry outside the effective selection is refused
+    with the gate's typed code — never dropped so the call searches broadly,
+    which would be the silent broadening the spec forbids. When the model
+    names no ids, the branch searches only the effective selection, so an
+    in-force restriction is never widened by omission. A permitted hit is
+    re-gated before its evidence is admitted, so text a stale authority no
+    longer stands behind cannot ground a citation. An unwired graph skips all
+    of this and keeps the pre-T3 envelope byte for byte.
     """
     ledger = (
         mapping_ledger if mapping_ledger is not None else ledger_from_env()
@@ -1118,6 +1742,7 @@ def _make_retrieve_tool(
             "date the user stated. Pass it together with sql_window_start or "
             "omit both; a single bound or a malformed date is refused.",
         ] = None,
+        structured_request: Mapping[str, Any] | None = None,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
         state: Annotated[Any, InjectedState()] = None,
         config: Annotated[RunnableConfig, InjectedToolArg()] = cast(
@@ -1163,17 +1788,68 @@ def _make_retrieve_tool(
         ``invalid_business_query``. Both arguments ride the document
         retrieve untouched and are ignored unless this run's cascade
         assigned ``sql``.
+
+        ``structured_request`` carries exact entity or relation predicates
+        on this same retrieve tool. The host cascade assigns its ``sql``
+        mode; the model cannot choose the mode or add legacy business,
+        document, or date filters around the structured predicates.
         """
-        def _port_call(retry_query: str) -> dict[str, Any]:
+        # P2-I2: this call's identity, resolved ONCE and above the retry
+        # helper, so the empty-hit rewrite's second attempt cannot land on a
+        # different identity. Two resolutions would be a bug, not a saving: the
+        # binding carries its own ``deadline_at``, so a second resolve could
+        # mint a fresh grant between the two attempts. ``_counted_port_call``
+        # reads ``on`` by closure, so the assignment may sit after that
+        # function is defined as long as it precedes every call to it.
+        try:
+            on = _identity_bound_adapter(adapter, evidence, config)
+            binding_refusal: str | None = None
+        except EvidenceBindingRefusal as exc:
+            on = adapter
+            binding_refusal = exc.code
+
+        def _port_call(retry_query: str, on: RetrievePort) -> dict[str, Any]:
             """One adapter-bound retrieve call for the retry helper.
+
+            The company branch is gated BEFORE the transport is reached: an
+            excluded corpus returns the typed refusal here, so no corpus text
+            crosses the boundary and the retry helper never sees an empty hit it
+            could rewrite.
 
             The ``InputValidationError`` envelope is built HERE, before
             the retry helper can see it: a named input error is NOT an
             empty hit, so it must flow through as an error dict and
             never trigger a rewrite (T21 contract, unchanged).
             """
+            search_mode = assigned_retrieve_mode(state)
+            scope_refusal = _company_scope_refusal(
+                attachment_service, scope_restriction, "search_corpus"
+            )
+            if scope_refusal is not None:
+                # EXIT: the refusal is returned instead of reaching the retrieve
+                # transport, so the corpus is never asked under an excluded
+                # branch and the retry helper sees an error, not an empty hit.
+                return scope_refusal
+            structured_refusal = _structured_query_refusal_code(
+                structured_request,
+                search_mode=search_mode,
+                has_outer_filters=any(
+                    value is not None
+                    for value in (
+                        document_id,
+                        cik,
+                        form,
+                        ticker,
+                        filing_date,
+                        sql_window_start,
+                        sql_window_end,
+                    )
+                ),
+            )
+            if structured_refusal is not None:
+                return {"error": structured_refusal}
             try:
-                return retrieve(
+                result = retrieve(
                     query=retry_query,
                     document_id=document_id,
                     cik=cik,
@@ -1185,12 +1861,20 @@ def _make_retrieve_tool(
                     # existing single port call. Resolved here (per
                     # invocation), not at compile time — the graph is
                     # cached and shared across runs.
-                    search_mode=assigned_retrieve_mode(state),
+                    search_mode=search_mode,
+                    structured_request=structured_request,
                     # ``resolve_sql_window`` is the one gate for the pair.
                     sql_window_start=sql_window_start,
                     sql_window_end=sql_window_end,
-                    adapter=adapter,
+                    adapter=on,
                 )
+                if (
+                    structured_request is not None
+                    and "error" not in result
+                    and structured_result_of(result) is None
+                ):
+                    return {"error": STRUCTURED_SEARCH_UNAVAILABLE_CODE}
+                return result
             except InputValidationError as exc:
                 # Invalid input (T21 / §B2 第 5 条). The port already named
                 # and counted it; the tool's contract is an envelope, so the
@@ -1211,7 +1895,7 @@ def _make_retrieve_tool(
         def _counted_port_call(retry_query: str) -> dict[str, Any]:
             nonlocal port_calls
             port_calls += 1
-            return _port_call(retry_query)
+            return _port_call(retry_query, on)
 
         def _record_retry(outcome: RewriteRetryResult) -> None:
             """Record one performed rewrite on the retry observer.
@@ -1249,12 +1933,24 @@ def _make_retrieve_tool(
                 # forbids, so the branch stays out and the company hits
                 # answer alone.
                 return {}, []
+            # The scope bounds the branch BEFORE the search: the effective
+            # selection is the narrower of current authority, the in-force
+            # restriction, and what the call names. An unwired graph
+            # (``_scope_for_run`` ``None``) passes the model's own ids
+            # through unchanged, byte-identical to pre-scope behavior.
+            scope = _scope_for_run(config, attachment_service, scope_restriction)
+            search_ids, refusal = _scoped_search_ids(scope, attachment_ids)
+            if refusal is not None:
+                # EXIT: the call named an id outside the effective scope, or
+                # the enumeration could not be consulted; either way the
+                # branch answers the typed code and searches nothing.
+                return {"attachment_error": refusal}, []
             typed_failure = _attachment_retrieval_error_type()
             try:
                 hits = attachment_retriever.search(
                     thread_id=thread_id,
                     query=query,
-                    attachment_ids=attachment_ids,
+                    attachment_ids=search_ids,
                     limit=limit,
                 )
             except typed_failure as exc:
@@ -1263,9 +1959,6 @@ def _make_retrieve_tool(
                 # tell the model the thread holds nothing when the index
                 # never answered.
                 return {"attachment_error": exc.as_dict()}, []
-            # A clean run publishes its own key even when empty: "looked,
-            # found nothing" is a different fact from "did not look".
-            #
             # The identity grant is the run's own thread-bound leg, looked
             # up per hit: a hit the store no longer answers for at that
             # version still reaches the model as text but earns no
@@ -1273,21 +1966,7 @@ def _make_retrieve_tool(
             grant = _display_lookup_for(
                 _attachment_reader_for_run(attachment_reader_factory, config)
             )
-            envelope_chunks: list[dict[str, Any]] = []
-            evidence: list[EvidenceItem] = []
-            for hit in hits:
-                source_ref = hit.source_ref.as_source_ref()
-                envelope_chunks.append(
-                    {
-                        "text": hit.text,
-                        "source_ref": source_ref,
-                        "score": hit.score,
-                    }
-                )
-                item = attachment_evidence_from_ref(source_ref, hit.text, grant=grant)
-                if item is not None:
-                    evidence.append(item)
-            return {"attachment_chunks": envelope_chunks}, evidence
+            return _attachment_branch_result(hits, scope, grant)
 
         # T3 (spec SC4–SC5): the drops this call caused are measured on
         # the ledger's PER-THREAD counter, read before and after the
@@ -1311,6 +1990,31 @@ def _make_retrieve_tool(
         # The retry helper may call the port twice (one rewrite); both
         # attempts belong to this call, and both are counted here.
         failures_before = ledger.count_on_this_thread()
+
+        if binding_refusal is not None:
+            # A run whose resolver selected no identity is REFUSED, never
+            # answered under the process-level transport. It takes the same
+            # frame every typed EXIT below takes — the closed §6 code on the
+            # envelope, the thread's attachments still searched, evidence
+            # carried by what that leg returned — because the attachment leg
+            # is a different source and a company-leg refusal must not hide it.
+            # What it never does is call the port, or answer ``{"chunks": []}``,
+            # which would claim the corpus is empty for a call never askable.
+            envelope = {"error": binding_refusal}
+            attachment_envelope, attachment_evidence = _attachment_leg()
+            envelope.update(attachment_envelope)
+            return Command(
+                update={
+                    "messages": [
+                        ToolMessage(
+                            content=json.dumps(envelope, default=str),
+                            tool_call_id=tool_call_id,
+                            name="retrieve",
+                        )
+                    ],
+                    "evidence": attachment_evidence,
+                }
+            )
 
         retry_outcome: RewriteRetryResult | None = None
         degraded_to_empty_hit = False
@@ -1357,6 +2061,21 @@ def _make_retrieve_tool(
             if degraded_to_empty_hit or retry_outcome is None
             else dict(retry_outcome.result)
         )
+        if not (isinstance(result, dict) and "error" in result):
+            # The company text-admission boundary, gated BEFORE any chunk is
+            # admitted (decision 5). A restriction that only names attachments
+            # leaves this branch eligible (ADR 0088:10) and an exclusive one
+            # refuses it, so admitted company text always carries the branch
+            # ruling. A refusal becomes a company error envelope rather than an
+            # empty hit set, which would misreport a refusal as "nothing
+            # found". The company leg's own typed error already skips this.
+            admission_scope = _scope_for_run(
+                config, attachment_service, scope_restriction
+            )
+            if admission_scope is not None:
+                admission = admission_scope.gate.check("admit_evidence")
+                if admission.reason in ScopeGate.DENIAL_CODES:
+                    result = scope_denied_error(admission)
         if isinstance(result, dict) and "error" in result:
             # Typed EXIT: surface the port's error dict verbatim.
             # Building evidence / a chunks envelope here would
@@ -1446,6 +2165,14 @@ def _make_retrieve_tool(
         # pre-sql envelope.
         if isinstance(raw_rows, dict):
             envelope[DATABASE_ROWS_KEY] = dict(raw_rows)
+        structured_result = structured_result_of(result)
+        if structured_result is not None:
+            envelope[STRUCTURED_RESULT_KEY] = dict(structured_result)
+        admission = admit_structured_evidence(structured_result)
+        if admission.refusal is not None:
+            _LOG.warning(
+                "structured admission refused: %s", admission.refusal.code
+            )
         _consume_into_envelope(envelope, result, ledger=degradations)
         attachment_envelope, attachment_evidence = _attachment_leg()
         envelope.update(attachment_envelope)
@@ -1479,6 +2206,10 @@ def _make_retrieve_tool(
                     [call_outcome],
                     baseline=failures_before,
                 ),
+                # EP6: the stored structured records this same-turn result
+                # earned. The channel is additive, so only THIS call's
+                # records ride here; a refusal publishes none.
+                "structured_evidence": admission.as_dicts(),
             }
         )
 
@@ -1510,7 +2241,12 @@ def _consume_into_envelope(
     )
 
 
-def _make_get_xbrl_fact_tool(facts_root: Path):
+def _make_get_xbrl_fact_tool(
+    facts_root: Path,
+    *,
+    attachment_service: Any = None,
+    scope_restriction: ScopeRestriction | None = None,
+):
     """Build the ``get_xbrl_fact`` host tool (T5 / ADR 0031).
 
     Returns a LangChain ``BaseTool`` whose function calls T5's
@@ -1528,6 +2264,16 @@ def _make_get_xbrl_fact_tool(facts_root: Path):
     return the typed ``{"error": "fact_not_found", ...}`` dict so
     the agent loop never sees a typed exception out of the
     ToolNode (spec § Boundaries: "empty hits not exceptions").
+
+    Scope seam (decision 5): the fact table is a company source, so the
+    wrapper consults the company operation's gate BEFORE the implementation
+    reads, and a refusal reaches the model as the gate's typed code without any
+    fact row being touched. A restriction that only NAMES attachments leaves
+    that branch readable (ADR 0088:10); a restriction the operator declared
+    exclusive denies it, and an operation no adapter expresses or an authority
+    that cannot be consulted is reported rather than passed. A graph with
+    nothing in force answers ``permitted`` and reads as it did before scope
+    existed.
     """
 
     @tool("get_xbrl_fact")
@@ -1547,6 +2293,15 @@ def _make_get_xbrl_fact_tool(facts_root: Path):
         typed ``{"error": "fact_not_found"}`` dict on miss. Never
         raises.
         """
+        refusal = _company_refusal_command(
+            attachment_service,
+            scope_restriction,
+            "get_xbrl_fact",
+            "get_xbrl_fact",
+            tool_call_id,
+        )
+        if refusal is not None:
+            return refusal
         from fin.host.tools.get_xbrl_fact import get_xbrl_fact
 
         result = get_xbrl_fact(
@@ -1742,6 +2497,11 @@ class _LocatorToolSpec:
     impl_attr: str
     factory_kwargs: Mapping[str, Any]
     coerce_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+    # Scope enforcement (decision 5): a company-source operation gates here
+    # BEFORE the implementation reads anything. ``authorize`` returns the
+    # typed refusal dict, or ``None`` when the operation is permitted; a spec
+    # with no company-source read leaves it ``None`` and the wrapper skips it.
+    authorize: Callable[[], dict[str, Any] | None] | None = None
 
 
 def _extract_param_names(signature: str) -> list[str]:
@@ -1798,6 +2558,9 @@ def _make_locator_tool(spec: _LocatorToolSpec) -> Any:
     )
     source = (
         f"def _wrapped({spec.signature}) -> dict:\n"
+        "    refusal = authorize() if authorize is not None else None\n"
+        "    if refusal is not None:\n"
+        "        return refusal\n"
         "    forwarded = dict(factory_kwargs)\n"
         f"{forward_lines}"
         f"{coerce_line}"
@@ -1811,6 +2574,7 @@ def _make_locator_tool(spec: _LocatorToolSpec) -> Any:
         "impl_attr": spec.impl_attr,
         "factory_kwargs": dict(spec.factory_kwargs),
         "coerce_fn": spec.coerce_fn,
+        "authorize": spec.authorize,
     }
     exec(compile(source, f"<locator-tool:{spec.name}>", "exec"), namespace)
     wrapped = namespace["_wrapped"]
@@ -1876,7 +2640,12 @@ _STATEMENT_DESCRIPTION = (
 )
 
 
-def _make_compare_facts_tool(facts_root: Path):
+def _make_compare_facts_tool(
+    facts_root: Path,
+    *,
+    attachment_service: Any = None,
+    scope_restriction: ScopeRestriction | None = None,
+):
     """Build the ``compare_facts`` host tool (T3 / spec Focus 1).
 
     Cross-period and peer comparison is a HOST TOOL result, not a
@@ -1892,7 +2661,24 @@ def _make_compare_facts_tool(facts_root: Path):
     lifts the ``comparison`` envelope onto ``AgentState`` for the
     turn row, and the numeric gate reads its columns as
     ``(concept, period)`` claims.
+
+    Scope seam (decision 5): the fact table is a company source, so the
+    wrapper consults the company operation's gate BEFORE the implementation
+    reads and answers the gate's typed code without touching a fact row. A
+    restriction that only NAMES attachments leaves that branch readable
+    (ADR 0088:10); one the operator declared exclusive denies it. A graph with
+    nothing in force answers ``permitted`` and compares exactly as it did
+    before scope existed.
     """
+    def authorize() -> dict[str, Any] | None:
+        # Always consulted, never conditional on the attachment service: an
+        # exclusive restriction with no store to ask is still a restriction, and
+        # ``_company_scope_refusal`` answers the refusal from an absent
+        # authority rather than skipping the gate.
+        return _company_scope_refusal(
+            attachment_service, scope_restriction, "compare_facts"
+        )
+
     return _make_locator_tool(
         _LocatorToolSpec(
             name="compare_facts",
@@ -1907,12 +2693,24 @@ def _make_compare_facts_tool(facts_root: Path):
             impl_attr="compare_facts",
             factory_kwargs={"facts_root": facts_root},
             coerce_fn=_coerce_compare_facts,
+            authorize=authorize,
         )
     )
 
 
-def _make_redline_tool(manifest_path: Path, extracted_root: Path):
-    """Build the locator-bound paragraph redline host tool."""
+def _make_redline_tool(
+    manifest_path: Path,
+    extracted_root: Path,
+    *,
+    attachment_service: Any = None,
+    scope_restriction: ScopeRestriction | None = None,
+):
+    """Build the locator-bound paragraph redline host tool.
+
+    A redline opens two frozen company bodies, so it is a company source
+    boundary: the branch ruling is consulted BEFORE either one is read, and a
+    refusal contributes no text and no evidence.
+    """
     return _make_locator_tool(
         _LocatorToolSpec(
             name="redline",
@@ -1929,12 +2727,25 @@ def _make_redline_tool(manifest_path: Path, extracted_root: Path):
                 "manifest_path": manifest_path,
                 "extracted_root": extracted_root,
             },
+            authorize=lambda: _company_scope_refusal(
+                attachment_service, scope_restriction, "redline"
+            ),
         )
     )
 
 
-def _make_table_extract_tool(manifest_path: Path, extracted_root: Path):
-    """Build the locator-bound unit table extraction tool."""
+def _make_table_extract_tool(
+    manifest_path: Path,
+    extracted_root: Path,
+    *,
+    attachment_service: Any = None,
+    scope_restriction: ScopeRestriction | None = None,
+):
+    """Build the locator-bound unit table extraction tool.
+
+    Extraction reads one frozen company unit, so the branch ruling is
+    consulted BEFORE the body is opened rather than filtering rows after.
+    """
     return _make_locator_tool(
         _LocatorToolSpec(
             name="extract_tables",
@@ -1950,12 +2761,25 @@ def _make_table_extract_tool(manifest_path: Path, extracted_root: Path):
                 "manifest_path": manifest_path,
                 "extracted_root": extracted_root,
             },
+            authorize=lambda: _company_scope_refusal(
+                attachment_service, scope_restriction, "extract_tables"
+            ),
         )
     )
 
 
-def _make_statement_tool(facts_root: Path):
-    """Build the XBRL-backed three-year statement tool."""
+def _make_statement_tool(
+    facts_root: Path,
+    *,
+    attachment_service: Any = None,
+    scope_restriction: ScopeRestriction | None = None,
+):
+    """Build the XBRL-backed three-year statement tool.
+
+    The statement is assembled from the same company fact table
+    ``get_xbrl_fact`` and ``compare_facts`` read, so it carries the same branch
+    ruling: a refusal returns before a fact row is touched.
+    """
     return _make_locator_tool(
         _LocatorToolSpec(
             name="three_year_statement",
@@ -1969,6 +2793,9 @@ def _make_statement_tool(facts_root: Path):
             impl_attr="three_year_statement",
             factory_kwargs={"facts_root": facts_root},
             coerce_fn=_coerce_statement,
+            authorize=lambda: _company_scope_refusal(
+                attachment_service, scope_restriction, "three_year_statement"
+            ),
         )
     )
 
@@ -2146,6 +2973,171 @@ def _uncited_contributors(
         return []
     cited = {_issuer_of(citation.document_id) for citation in citations}
     return [issuer for issuer in contributing if issuer not in cited]
+
+
+def _accepted_task_input_from_config(
+    config: RunnableConfig,
+) -> AcceptedInput | None:
+    """The accepted input the send door durably recorded for this run.
+
+    Carried as run config (``configurable.accepted_task_input``) rather
+    than as state on purpose: acceptance happens BEFORE the graph is
+    invoked, so the config is the only channel present on the first pass.
+    """
+    configurable = dict((config or {}).get("configurable") or {})
+    raw = configurable.get("accepted_task_input")
+    if not isinstance(raw, Mapping):
+        return None
+    return _accepted_from_dict(raw)
+
+
+def _unreconciled_accepted_input(
+    runtime: TaskRuntimeState,
+) -> AcceptedInput | None:
+    """The newest accepted input that still has no committed decision.
+
+    This is the resume path's half. A choice-window turn pauses BEFORE
+    ``reconcile_task`` and resumes with no run config, so without this
+    lookup the accepted input would advance ``input_version`` and then
+    reach the grounded leaf with no reconciliation at all — the exact
+    "dependent work started before the input was reconciled" failure the
+    contract forbids.
+
+    It reads the committed envelope rather than inventing anything: the
+    send door already wrote the original payload and provenance there.
+    Returning ``None`` for an already-reconciled input is what makes the
+    node idempotent on replay.
+    """
+    marker = runtime.reconciliation
+    for accepted in reversed(runtime.input_history):
+        if marker is None or accepted.input_version > marker.reconciled_input_version:
+            return accepted
+    return None
+
+
+def _task_proposal_for_track(
+    *,
+    state: AgentState,
+    runtime: TaskRuntimeState,
+    accepted: AcceptedInput,
+    config: RunnableConfig,
+) -> ReconciliationProposal:
+    """Turn the already-decided track into a task proposal.
+
+    No model call happens here and none may be added: the track decision
+    is this host's existing single classifier, and a second semantic
+    pass would be exactly the second classifier the runtime contract
+    forbids. So the goal and expected result are derived from what the
+    run already established — the utterance for a first task, the prior
+    task's basis when the input is progress, and the track's own slots
+    when it is a clarification.
+
+    Switch detection reuses the EXISTING company-change signal from
+    ``snapshot_delta_for_utterance`` rather than inventing a second one:
+    a turn that moves the work to another company is asking for a
+    different task, and that fact is already decided by this host.
+    """
+    track = normalize_track(state.get("track"))
+    kind = accepted.kind
+    if kind == INPUT_REPLY:
+        # A reply resolves the question it names; it never opens a new
+        # task and never changes the goal on its own.
+        return ReconciliationProposal(
+            kind=kind,
+            reason=f"track={track}; clarification reply",
+        )
+    current = runtime.current_task
+    if kind == INPUT_RESTORE:
+        # A restore naming an archive reaches here with NO ``recheck``, and
+        # ``decide`` refuses it as ``task_applicability_unresolved``. That
+        # is the intended refusal, not a gap: the four rechecks are CURRENT
+        # facts owned by the source-authority seam, and this node may not
+        # answer them from the archive it is being asked to restore.
+        return ReconciliationProposal(
+            kind=kind,
+            archive_id=_pending_restore_archive_id(config) or accepted.archive_id,
+            reason=f"track={track}; awaiting current source-authority rechecks",
+        )
+
+    slots = _clarify_missing_slots(state) if track == "clarify" else []
+    question = (
+        _clarification_from_slots(slots, track) if track == "clarify" else None
+    )
+    company = company_of_utterance(accepted.payload or "")
+    switched = _is_task_switch(runtime, accepted, company)
+    opens_task = switched or current is None
+    prior_goal = current.goal if current is not None else ""
+    prior_expected = current.expected_result if current is not None else ""
+    return ReconciliationProposal(
+        kind=kind,
+        taskless=track in ("dialogue", "off_topic") and current is None,
+        switch=switched,
+        goal=(accepted.payload or "") if opens_task else prior_goal,
+        expected_result="" if opens_task else prior_expected,
+        necessary_conditions=(company,) if switched and company else (),
+        changed=("goal",) if switched else (),
+        question=None if switched else question,
+        run_id=accepted.run_id,
+        reason=f"track={track}",
+    )
+
+
+def _is_task_switch(
+    runtime: TaskRuntimeState, accepted: AcceptedInput, company: str | None
+) -> bool:
+    """Whether this input asks for a DIFFERENT task rather than progress.
+
+    The comparison is between the company this utterance names and the
+    company the COMMITTED current task was opened for — read from that
+    task's own goal, which is the utterance that opened it.
+
+    Reconstructing the prior company from ``status_snapshots`` instead
+    was tried and rejected: ``classify`` has already appended this
+    turn's rows by the time the reconcile node runs, and it may append
+    MORE than one (a search-mode patch copies the company forward), so
+    "drop the last row" both misses real switches and invents them. The
+    committed task is the one fact that cannot have been rewritten by
+    the turn being judged.
+
+    A task opened for an utterance naming no company compares against
+    ``None`` and therefore never switches: wrongly archiving a task the
+    user meant as progress would lose work they can see.
+    """
+    if runtime.current_task is None or not company:
+        return False
+    opened_for = company_of_utterance(runtime.current_task.goal)
+    return opened_for is not None and company != opened_for
+
+
+def _clarification_from_slots(
+    slots: list[str], track: str
+) -> PendingQuestion | None:
+    """Build a clarification ONLY for user-held information the operator
+    still owes.
+
+    A clarification is actionable information, not an operational
+    failure, so it is derived from the track's own missing research
+    slots. When the slots are empty there is nothing the user can
+    usefully be asked, so no question is opened — an empty prompt would
+    be a clarification that no answer could satisfy.
+    """
+    if track != "clarify" or not slots:
+        return None
+    return PendingQuestion(
+        question_id=f"slots-{'-'.join(slots)}",
+        task_id="",
+        task_version=1,
+        prompt="请补充：" + "、".join(slots),
+        choices=tuple(slots),
+        input_version=0,
+    )
+
+
+def _pending_restore_archive_id(config: RunnableConfig) -> str | None:
+    """The archive an explicit restore request names, if any."""
+    configurable = dict((config or {}).get("configurable") or {})
+    value = configurable.get("restore_archive_id")
+    return value if isinstance(value, str) and value else None
 
 
 def _clarify_missing_slots(state: AgentState) -> list[str]:
@@ -2338,19 +3330,20 @@ def _fold_tool_update(raw_update: Any) -> dict[str, list[Any]]:
     and must keep every channel the tools wrote.
 
     Only ``messages`` / ``evidence`` / ``retrieve_outcomes`` /
-    ``visual_claims`` are copied, which is exactly the set the wrapped
-    tools (``read_source``, ``retrieve``, ``read_visual_detail``) write and
-    the wrapper re-emits. An unknown key would
-    be silently dropped, so a tool that grows a new state channel must
-    be added here too — the fold is the single place that knows the
-    ToolNode return shape, so the node body does not restate it per
-    branch.
+    ``visual_claims`` / ``structured_evidence`` are copied, which is
+    exactly the set the wrapped tools (``read_source``, ``retrieve``,
+    ``read_visual_detail``) write and the wrapper re-emits. An unknown
+    key would be silently dropped, so a tool that grows a new state
+    channel must be added here too — the fold is the single place that
+    knows the ToolNode return shape, so the node body does not restate
+    it per branch.
     """
     merged: dict[str, list[Any]] = {
         "messages": [],
         "evidence": [],
         "retrieve_outcomes": [],
         "visual_claims": [],
+        "structured_evidence": [],
     }
     if isinstance(raw_update, dict):
         merged["messages"].extend(raw_update.get("messages", []))
@@ -2368,6 +3361,9 @@ def _fold_tool_update(raw_update: Any) -> dict[str, list[Any]]:
                     payload.get("retrieve_outcomes", [])
                 )
                 merged["visual_claims"].extend(payload.get("visual_claims", []))
+                merged["structured_evidence"].extend(
+                    payload.get("structured_evidence", [])
+                )
             elif isinstance(item, dict):
                 merged["messages"].extend(item.get("messages", []))
             elif isinstance(item, BaseMessage):
@@ -2814,6 +3810,8 @@ def compile_graph(
     attachment_service: _AttachmentPreparationService | None = None,
     attachment_retriever: "AttachmentSearchPort | None" = None,
     attachment_source_reader_factory: Callable[[str], Any] | None = None,
+    evidence: "EvidenceSessionBinding | None" = None,
+    scope_restriction: ScopeRestriction | None = None,
 ) -> "_LockedGraph":
     """Build the v1 host graph (T6).
 
@@ -3042,6 +4040,24 @@ def compile_graph(
         answer ``{"error": "unknown_locator"}``. The company leg needs no
         parameter — it is the bound retrieve adapter's own
         ``read_slice`` when present, otherwise a typed-miss reader.
+    scope_restriction
+        Spec ``question-source-scope`` decisions 3-5 / SC-2: the in-force
+        source intent the run's effective scope must not widen. ``None`` (the
+        default) means no restriction, so the effective scope is every
+        attachment current authority stands behind. Naming attachments narrows
+        the ATTACHMENT branch only and leaves the company corpus eligible (ADR
+        0088:10); a restriction the operator declared exclusive removes the
+        company branch too. Enforcement covers both branches BEFORE data
+        crosses each wired boundary: the ``read_source`` locator of either
+        kind, the ``retrieve`` attachment branch (the pre-search narrowing and
+        the per-hit evidence admission), the ``retrieve`` company leg and its
+        chunk admission, the visual read, the ``list_files`` catalog
+        enumeration, and the ``get_xbrl_fact`` / ``compare_facts`` fact reads.
+        A restriction in force is never skipped because no store was wired: the
+        absent authority resolves as a fault and is answered
+        ``dependency_failed`` rather than falling back to the pre-scope broad
+        path. With nothing in force every boundary keeps its pre-scope
+        behavior.
 
     Returns
     -------
@@ -3110,11 +4126,18 @@ def compile_graph(
     # defaults to one derived from the wired attachment service's store,
     # and an explicit factory (a test or a different composition root)
     # wins.
-    company_reader: Any = (
-        adapter
-        if callable(getattr(adapter, "read_slice", None))
-        else _MissSourceReader()
-    )
+    #
+    # P2-I2: the company leg is chosen PER CALL, through the same
+    # ``_identity_bound_adapter`` seam the retrieve tool uses, so a slice and
+    # the retrieve that produced its locator are read under ONE identity. The
+    # capability test is on the process-level adapter, which is where the
+    # ``read_slice`` face is grown; a rebound copy of it carries that face too.
+    has_company_leg = callable(getattr(adapter, "read_slice", None))
+
+    def _company_reader_for_run(config: Any) -> Any:
+        on = _identity_bound_adapter(adapter, evidence, config)
+        return on if has_company_leg else _MissSourceReader()
+
     if attachment_source_reader_factory is None:
         attachment_source_reader_factory = _attachment_source_reader_factory(
             attachment_service
@@ -3125,28 +4148,60 @@ def compile_graph(
     fpath = _resolve_path(facts_root, _DEFAULT_FACTS_ROOT)
     cpath = _resolve_path(catalog_path, _DEFAULT_CATALOG_PATH)
 
-    list_files_tool = _make_list_files_tool(cpath)
+    list_files_tool = _make_list_files_tool(
+        cpath,
+        attachment_service=attachment_service,
+        scope_restriction=scope_restriction,
+    )
     retrieve_tool = _make_retrieve_tool(
         adapter,
         mapping_ledger=mapping_failure_ledger,
         degradation_ledger=degradation_ledger,
         attachment_retriever=attachment_retriever,
         attachment_reader_factory=attachment_source_reader_factory,
+        evidence=evidence,
+        attachment_service=attachment_service,
+        scope_restriction=scope_restriction,
     )
-    get_xbrl_fact_tool = _make_get_xbrl_fact_tool(fpath)
+    get_xbrl_fact_tool = _make_get_xbrl_fact_tool(
+        fpath,
+        attachment_service=attachment_service,
+        scope_restriction=scope_restriction,
+    )
     # T3 (spec Focus 1): bound LAST so the four prior tools keep
     # their positions — LangChain's tool binding is order-sensitive
     # and existing tests assert those indices.
-    compare_facts_tool = _make_compare_facts_tool(fpath)
+    compare_facts_tool = _make_compare_facts_tool(
+        fpath,
+        attachment_service=attachment_service,
+        scope_restriction=scope_restriction,
+    )
     # T6 (spec Focus 4): bound last, and bound ONLY to the model — the
     # ToolNode below deliberately does not receive it (see
     # ``_make_research_issuers_tool``).
     research_issuers_tool = _make_research_issuers_tool(issuer_cap)
-    redline_tool = _make_redline_tool(mpath, rpath)
-    table_extract_tool = _make_table_extract_tool(mpath, rpath)
-    statement_tool = _make_statement_tool(fpath)
+    redline_tool = _make_redline_tool(
+        mpath,
+        rpath,
+        attachment_service=attachment_service,
+        scope_restriction=scope_restriction,
+    )
+    table_extract_tool = _make_table_extract_tool(
+        mpath,
+        rpath,
+        attachment_service=attachment_service,
+        scope_restriction=scope_restriction,
+    )
+    statement_tool = _make_statement_tool(
+        fpath,
+        attachment_service=attachment_service,
+        scope_restriction=scope_restriction,
+    )
     read_source_tool = _make_read_source_tool(
-        company_reader, attachment_source_reader_factory
+        _company_reader_for_run,
+        attachment_source_reader_factory,
+        attachment_service=attachment_service,
+        scope_restriction=scope_restriction,
     )
     # ADR 0089: a visual read is offered only when the wired attachment
     # service really can inspect a page. An unwired deployment leaves the
@@ -3158,7 +4213,11 @@ def compile_graph(
     read_visual_detail_tool = (
         None
         if visual_faces_factory is None
-        else _make_read_visual_detail_tool(visual_faces_factory)
+        else _make_read_visual_detail_tool(
+            visual_faces_factory,
+            attachment_service=attachment_service,
+            scope_restriction=scope_restriction,
+        )
     )
     # A ceiling is only worth minting for a run that can spend it: with no
     # page lane the tool is unbound, so the per-entry ledger would be an
@@ -3343,6 +4402,61 @@ def compile_graph(
                     *sm_update["snapshot_patch"],
                 ]
         return update
+
+    def reconcile_task_node(
+        state: AgentState, config: RunnableConfig
+    ) -> dict[str, Any]:
+        """Reconcile this turn's accepted input against the current task.
+
+        Question/task runtime T2. Runs on the existing lane between
+        ``classify`` and the compaction gate, so it adds no second
+        classifier, no second task store, and no new graph topology
+        beyond one node: ``decide_track`` already said whether the turn
+        is research-bearing, and this node turns that answer into a
+        committed task transition.
+
+        The node is idempotent by construction, and it resolves its input
+        from two sources in order. The first pass carries the accepted
+        record on run config; a choice-window pause skips this node and
+        its resume carries no config, so the node falls back to the
+        committed envelope's newest unreconciled input. Either way, when
+        there is nothing left to reconcile it returns ``{}`` and the lane
+        proceeds unchanged — which is what stops a later model or tool
+        iteration, or a replayed node, from reconciling twice.
+        """
+        runtime = TaskRuntimeState.from_state_dict(state.get("task_runtime"))
+        accepted = _accepted_task_input_from_config(config)
+        if accepted is None:
+            accepted = _unreconciled_accepted_input(runtime)
+        if accepted is None:
+            return {}
+        if is_reconciled(runtime, accepted.input_version):
+            return {}
+        proposal = _task_proposal_for_track(
+            state=state,
+            runtime=runtime,
+            accepted=accepted,
+            config=config,
+        )
+        try:
+            committed = decide_task(runtime, accepted, proposal)
+        except TaskRuntimeError as exc:
+            # Fail CLOSED. The last consistent envelope stays authoritative
+            # because this node returns nothing; the run ends as a typed
+            # system outcome instead of starting retrieval, tools, or
+            # answer formation on an input that was never reconciled.
+            #
+            # It is deliberately NOT converted into a clarification: an
+            # operational failure that asks the user a question keeps the
+            # run alive by asking something no answer can fix.
+            _LOG.warning(
+                "task reconciliation refused: kind=%s input_version=%s",
+                exc.kind,
+                accepted.input_version,
+                exc_info=True,
+            )
+            raise TaskReconciliationError(exc.kind, str(exc)) from exc
+        return {"task_runtime": committed.to_state_dict()}
 
     def _select_unbound_model(config: RunnableConfig) -> Any:
         configurable = dict((config or {}).get("configurable") or {})
@@ -3853,6 +4967,12 @@ def compile_graph(
         # restating the prior list, which the reducer would concat again.
         if merged["visual_claims"]:
             update["visual_claims"] = merged["visual_claims"]
+        # EP6: same additive shape as ``visual_claims`` above — this node
+        # returns ONLY the records this tool step admitted, so a run that
+        # retrieved no structured result omits the key rather than
+        # restating the prior list, which the reducer would concat again.
+        if merged["structured_evidence"]:
+            update["structured_evidence"] = merged["structured_evidence"]
         return update
 
     def _fanout_tool_update(
@@ -3938,7 +5058,9 @@ def compile_graph(
             update["status_reason"] = "issuer_overflow"
         return update
 
-    def issuer_research_node(state: IssuerTask) -> dict[str, Any]:
+    def issuer_research_node(
+        state: IssuerTask, config: RunnableConfig
+    ) -> dict[str, Any]:
         """Research ONE issuer through the retrieve port.
 
         This is the fan-out branch ADR 0034 permits. It calls the port
@@ -3950,12 +5072,45 @@ def compile_graph(
 
         The first parameter is named ``state`` because LangGraph's node
         protocols declare that name; the runtime value is the
-        ``IssuerTask`` payload the ``Send`` carries.
+        ``IssuerTask`` payload the ``Send`` carries. ``config`` is the
+        node's own run config, and it exists for P2-I2 alone: the branch
+        resolves this run's identity through the same
+        ``_identity_bound_adapter`` seam the retrieve tool and the
+        ``read_source`` company leg use, so fan-out evidence is read under
+        the same identity as the run that planned it. A branch that rode the
+        process-level adapter would contribute evidence the run's own
+        identity never selected.
+
+        The company scope is consulted BEFORE the port is reached, so a
+        restriction the operator declared exclusive refuses every branch
+        instead of fanning a corpus read out around the gate.
         """
         issuer = str(state.get("issuer") or "").strip().upper()
         query = str(state.get("query") or "")
         if not issuer or not query:
             return {}
+
+        branch_refusal = _company_scope_refusal(
+            attachment_service, scope_restriction, "search_corpus"
+        )
+        if branch_refusal is not None:
+            # EXIT: a fan-out branch is a retrieval consumption point like any
+            # other, so the branch ruling is consulted BEFORE the port is
+            # reached. The code rides on ``error`` because the join folds an
+            # unknown status into ``empty`` — a denial named only by status
+            # would be rendered as a successful miss.
+            return _issuer_finding(
+                issuer, STATUS_UNAVAILABLE, error=str(branch_refusal.get("error"))
+            )
+
+        try:
+            on = _identity_bound_adapter(adapter, evidence, config)
+        except EvidenceBindingRefusal as exc:
+            # Same typed unavailable row every other failure on this branch
+            # takes, carrying the closed §6 code: one issuer's missing identity
+            # must not take the join down, and it must be reported as the
+            # refusal it is rather than as an empty result.
+            return _issuer_finding(issuer, STATUS_UNAVAILABLE, error=exc.code)
 
         try:
             result = retrieve(
@@ -3965,7 +5120,7 @@ def compile_graph(
                 # assigned for this run — carried on the payload the
                 # router stamped, not re-read from anywhere else.
                 search_mode=state.get("search_mode"),
-                adapter=adapter,
+                adapter=on,
             )
         except InputValidationError as exc:
             # Invalid input on one branch (T21). The blank-query guard
@@ -4234,7 +5389,7 @@ def compile_graph(
 
     def from_classify(
         state: AgentState,
-    ) -> Literal["extract_method_choice", "mode_choice", "compaction_gate"]:
+    ) -> Literal["extract_method_choice", "mode_choice", "reconcile_task"]:
         """Route EVERY track through the compaction gate (ADR 0044).
 
         The gate must run before EVERY LLM call — the research
@@ -4269,18 +5424,18 @@ def compile_graph(
             return "extract_method_choice"
         if _clarify_window_pending(state):
             return "mode_choice"
-        return "compaction_gate"
+        return "reconcile_task"
 
     def from_extract_method(
         state: AgentState,
-    ) -> Literal["mode_choice", "compaction_gate"]:
+    ) -> Literal["mode_choice", "reconcile_task"]:
         """Continue normal classify-time routing after the propose
         window resolved: a clarify 档 still owed opens ``mode_choice``
         next; otherwise proceed to the leaf path. The just-resolved
         proposal is no longer pending, so this edge cannot loop."""
         if _clarify_window_pending(state):
             return "mode_choice"
-        return "compaction_gate"
+        return "reconcile_task"
 
     def from_compaction_gate(
         state: AgentState,
@@ -4380,20 +5535,97 @@ def compile_graph(
             for issuer in issuers
         ]
 
-    def from_gate(state: AgentState) -> Literal["compaction_gate", "__end__"]:
-        # Status-based routing out of the citation gate. Done /
-        # refuse / step_cap all END; ``"running"`` (after a bounce)
-        # routes back through the compaction gate so the next LLM
-        # call sees a possibly-compacted history.
+    def task_outcome_node(state: AgentState) -> dict[str, Any]:
+        """Apply the grounded-answer peer's assessment to the current task.
+
+        Question/task runtime T6. This is the OUTCOME boundary: a turn
+        has ended (the citation gate reached its terminal status) and
+        only NOW may the task's outcome change — which is the whole point
+        of keeping task outcome and turn outcome separate.
+
+        The assessment is peer-owned and OPTIONAL. With no peer wired
+        there is no assessment, so the task stays ACTIVE: a finished turn
+        is not a finished task, and this node is the only place that
+        distinction becomes state. Host mechanics alone certify nothing,
+        so a task reaches ``complete`` only through
+        :func:`apply_assessment`, and only when the assessment supports
+        the goal with no material gap and every host gate passes.
+        """
+        runtime = TaskRuntimeState.from_state_dict(state.get("task_runtime"))
+        if runtime.current_task is None:
+            return {}
+        assessment = _grounded_assessment_from_state(state)
+        gates = _host_gates_from_state(state)
+        try:
+            committed = apply_assessment(runtime, assessment, gates)
+        except TaskRuntimeError as exc:
+            # Without a current task to apply to, or against a cancelled
+            # one, there is nothing truthful to record. The turn's own
+            # terminal status already stands; the task simply keeps the
+            # outcome it had.
+            _LOG.warning(
+                "task outcome not applied: kind=%s", exc.kind, exc_info=True
+            )
+            return {}
+        return {"task_runtime": committed.to_state_dict()}
+
+    def _grounded_assessment_from_state(state: AgentState) -> GroundingAssessment:
+        """Read the peer assessment this run recorded, or a conservative
+        non-assessment.
+
+        The grounded-answer module owns whether evidence supports the
+        goal; this host never decides that itself. When the peer has
+        recorded nothing, the fallback reports ``supported=False`` — the
+        honest default, because treating silence as support would let an
+        unwired peer complete every task.
+        """
+        recorded = state.get("grounding_assessment")
+        if isinstance(recorded, Mapping):
+            gaps = recorded.get("material_gaps")
+            return GroundingAssessment(
+                supported=bool(recorded.get("supported")),
+                material_gaps=tuple(str(gap) for gap in gaps or []),
+                turn_outcome=str(recorded.get("turn_outcome") or ""),
+                source_scope_version=int(recorded.get("source_scope_version") or 0),
+            )
+        return GroundingAssessment(supported=False)
+
+    def _host_gates_from_state(state: AgentState) -> HostGates:
+        """The host hard gates for this turn.
+
+        A gate the host cannot positively observe is treated as FAILED,
+        never as passed. ``receipts`` is the one gate this host has a
+        fact for — the citation gate's own verdict. The remaining three
+        belong to the source-scope and workspace seams; until a seam
+        records them they are ``False``, so an unwired peer can never
+        complete a task by silence.
+        """
+        status = str(state.get("status") or "")
+        return HostGates(
+            permission=False,
+            source_identity_version=False,
+            receipts=status == "done",
+            persistence=False,
+        )
+
+    def from_gate(state: AgentState) -> Literal["compaction_gate", "task_outcome"]:
+        # Status-based routing out of the citation gate. ``"running"``
+        # (after a bounce) routes back through the compaction gate so the
+        # next LLM call sees a possibly-compacted history; a TERMINAL
+        # status visits the task-outcome boundary exactly once.
         status = state.get("status", "running")
         if status in ("done", "refuse", "step_cap"):
-            return _END_TOKEN
+            return "task_outcome"
         return "compaction_gate"
 
     # ----- assemble the graph -----
 
     graph = StateGraph(AgentState)
     graph.add_node("classify", classify_node)
+    # Question/task runtime T2: one reconciliation node on the SAME lane,
+    # between classify and the compaction gate. No second classifier and no
+    # second task store — it commits into the one AgentState envelope.
+    graph.add_node("reconcile_task", reconcile_task_node)
     graph.add_node("dialogue", dialogue_node)
     graph.add_node("clarify", clarify_node)
     graph.add_node("off_topic", off_topic_node)
@@ -4408,10 +5640,10 @@ def compile_graph(
         graph.add_conditional_edges(
             "extract_method_choice",
             from_extract_method,
-            ["mode_choice", "compaction_gate"],
+            ["mode_choice", "reconcile_task"],
         )
         graph.add_node("mode_choice", mode_choice_node)
-        graph.add_edge("mode_choice", "compaction_gate")
+        graph.add_edge("mode_choice", "reconcile_task")
     graph.add_node("model", model_node)
     # ADR 0044 / plan T1: the compaction gate is a SEPARATE graph
     # node (NOT nested inside ``model_node``). It runs before every
@@ -4434,6 +5666,10 @@ def compile_graph(
     graph.add_node("issuer_research", issuer_research_node, input_schema=IssuerTask)
     graph.add_node("issuer_join", issuer_join_node)
     graph.add_node("citation_gate", citation_gate_node)
+    # Question/task runtime T6: the outcome boundary. Reached ONLY on a
+    # terminal turn, because a task's outcome may change only after the
+    # turn that produced the assessment has ended.
+    graph.add_node("task_outcome", task_outcome_node)
     if attachment_service is not None:
         # T2f: the preparation gate is a PAUSE/EXIT node between the
         # compaction gate and the grounded leaf; with the seam unwired
@@ -4446,6 +5682,8 @@ def compile_graph(
         )
 
     graph.add_edge(START, "classify")
+    graph.add_edge("reconcile_task", "compaction_gate")
+    graph.add_edge("task_outcome", END)
     # Explicit path map: with the HITL lane OFF ``mode_choice`` (T2) and
     # ``extract_method_choice`` (T4) are not nodes on this graph, and
     # LangGraph would reject the branch return annotation's unknown
@@ -4453,9 +5691,9 @@ def compile_graph(
     graph.add_conditional_edges(
         "classify",
         from_classify,
-        ["extract_method_choice", "mode_choice", "compaction_gate"]
+        ["extract_method_choice", "mode_choice", "reconcile_task"]
         if enable_choice_window
-        else ["compaction_gate"],
+        else ["reconcile_task"],
     )
     graph.add_edge("dialogue", END)
     graph.add_edge("clarify", END)
@@ -4513,6 +5751,11 @@ def compile_graph(
         # earlier in the envelope's life.
         attachment_retriever=attachment_retriever,
         attachment_source_reader_factory=attachment_source_reader_factory,
+        # decision 5: the in-force restriction decides which attachment ids
+        # every boundary permits, so two compiles differing only in it are
+        # two different graphs. It is a value object, so it rides the cache
+        # key by value (two equal restrictions share one entry).
+        scope_restriction=scope_restriction,
         # T2 (ADR 0044): the SAME compactor instance the graph gate
         # uses, so ``/compact`` and the >=90% auto path share one
         # eviction unit walker, one summarizer seam, one floor.
@@ -4606,6 +5849,7 @@ def _make_locked_graph(
     attachment_service: Any | None = None,
     attachment_retriever: Any | None = None,
     attachment_source_reader_factory: Any | None = None,
+    scope_restriction: "ScopeRestriction | None" = None,
 ) -> "_LockedGraph":
     key = (
         _IdentityKey(checkpointer),
@@ -4647,6 +5891,12 @@ def _make_locked_graph(
         # later factory at a recycled address cannot hit a stale
         # wired compile.
         _IdentityKey(attachment_source_reader_factory),
+        # decision 5: the in-force attachment restriction changes which ids
+        # every source and evidence boundary permits, so it is part of the
+        # compiled graph's behavior. It is a frozen value object, so it
+        # rides the key by VALUE — two compiles with an equal restriction
+        # are one graph (``None`` is the no-restriction default).
+        scope_restriction,
     )
     cached = _IDEMPOTENCE_CACHE.get(key)
     if cached is not None:
@@ -4994,6 +6244,27 @@ class _LockedGraph:
         )
         return _latest_human_text_from_snapshot(snapshot)
 
+    def task_runtime_state(self, thread_id: str) -> TaskRuntimeState:
+        """The thread-scoped task envelope stored on the checkpoint.
+
+        Read-only, like the probes above: it does NOT acquire the
+        per-thread lock, so a reader may observe the last CONSISTENT
+        committed envelope while a run is in flight, rather than a
+        half-written one. A thread whose checkpoint predates the envelope
+        simply has no ``task_runtime`` key and reads as the empty default
+        — no backfill migration.
+
+        Returns the decoded value object rather than the raw dict so a
+        caller cannot accidentally treat a stored dict as authoritative
+        without going through :func:`TaskRuntimeState.from_state_dict`.
+        """
+        snapshot = self._graph.get_state(
+            {"configurable": {"thread_id": thread_id}}
+        )
+        values = getattr(snapshot, "values", None)
+        raw = values.get("task_runtime") if isinstance(values, Mapping) else None
+        return TaskRuntimeState.from_state_dict(raw if isinstance(raw, Mapping) else None)
+
     def occupancy(self, thread_id: str) -> dict[str, float | int] | None:
         """T3 (ADR 0044): token occupancy for ``thread_id``'s latest
         checkpoint, from the SAME figure the compaction gate computes.
@@ -5240,10 +6511,17 @@ class _LockedGraph:
             if not self.pending_nodes(thread_id):
                 return
             config = {"configurable": {"thread_id": thread_id}}
+            # ``as_node="task_outcome"`` is deliberate: it closes the run
+            # at the END of the outcome boundary, so the terminal status
+            # lands AND the graph finishes. Routing from ``citation_gate``
+            # instead would queue ``task_outcome`` as pending work — the
+            # abandoned run has no assessment to apply, and a pending node
+            # here is exactly the Resume banner over a terminal turn this
+            # method exists to prevent.
             self._graph.update_state(
                 config,
                 {"status": status, "status_reason": status_reason},
-                as_node="citation_gate",
+                as_node="task_outcome",
             )
         finally:
             self._release_thread(lock)
@@ -5296,6 +6574,7 @@ __all__ = [
     "ConcurrentRunError",
     "HostGraphError",
     "KnowledgeMCPFaultError",
+    "TaskReconciliationError",
     "PendingCheckpointProjectionError",
     "RetrieveAdapterConfigError",
     "compile_graph",

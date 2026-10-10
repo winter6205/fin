@@ -46,6 +46,19 @@ describe("describeSendFailure", () => {
     expect(notice.message).not.toContain("concurrent_run");
   });
 
+  it("does not order the operator to wait for a run to finish", () => {
+    // An active run alone does not hold input, so no shipped line may
+    // state the opposite rule. The copy names what Runtime refused for
+    // THIS send and what the operator still has (the draft).
+    const message = describeSendFailure(
+      new ConcurrentRunError("concurrent_run"),
+    ).message;
+    expect(message).not.toMatch(/等它结束|结束后再发送|运行结束/);
+    expect(message).toContain("Runtime");
+    expect(message).toContain("放回输入框");
+    expect(message).not.toContain("concurrent_run");
+  });
+
   it("gives 503 copy distinct from the 409 copy", () => {
     const concurrent = describeSendFailure(new ConcurrentRunError(""));
     const ingest = describeSendFailure(new IngestMissingError(""));

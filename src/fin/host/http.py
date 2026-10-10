@@ -220,7 +220,13 @@ def compile_for_http(
                 # raises on a missing URL or a patched factory never
                 # pays an attachment-store or database construction.
                 _http_graph_singleton = compile_for_runtime(
-                    attachment_service=default_attachment_service
+                    attachment_service=default_attachment_service,
+                    # Forwarded, and only on this branch, because this is the
+                    # PRODUCT path: without it ``serve()``'s configured Evidence
+                    # identity would reach a factory that drops it and the
+                    # retrieve leg would silently stay unbound. ``None`` when no
+                    # identity was configured, which is this call unchanged.
+                    evidence=kwargs.get("evidence"),
                 )
             return _http_graph_singleton
     return compile_graph(
@@ -378,6 +384,20 @@ def get_observability_collector() -> ObservabilityCollector:
 # under its own name so tests can override the seam in one place
 # (``app.dependency_overrides[get_workspace_root]``) for both the
 # ``/ask`` route and the workspace send / resume routes.
+
+# The operator's structured-evidence identity (P2-I2). Imported at module load
+# like the workspace block below it: it adds nothing to this module's import
+# surface (``fin.host.graph`` already pulls the evidence session machinery), and
+# ``serve()`` must be able to name the loader when it reads the boot config.
+from fin.host.evidence_session_registry import (  # noqa: E402
+    EvidenceSessionBinding,
+    EvidenceSessionRegistry,
+)
+from fin.host.structured_evidence_identity import (  # noqa: E402
+    StructuredEvidenceIdentity,
+    StructuredEvidenceIdentityConfigError,
+    load_structured_evidence_identity,
+)
 from fin.host.workspace_http import (  # noqa: E402
     _visual_claims_wire_payload,
     default_attachment_service,
@@ -385,9 +405,11 @@ from fin.host.workspace_http import (  # noqa: E402
     mount as _mount_workspace_routes,
     start_attachment_prep_worker,
     start_attachment_resume_worker,
+    start_invalidation_drain_worker,
     start_ingest_worker,
     stop_attachment_prep_worker,
     stop_attachment_resume_worker,
+    stop_invalidation_drain_worker,
     stop_ingest_worker,
 )
 
@@ -724,7 +746,45 @@ def serve() -> None:
     # gate share. A missing / unhealthy MCP is a WARNING (logged inside
     # ``publish_knowledge_mcp``) — never a boot failure.
     publish_knowledge_mcp()
-    graph = compile_for_http()
+    # P2-I2: the Evidence identity is operator configuration, read here — after
+    # ``apply_dotenv``, so a ``.env`` is part of the boot — and INJECTED into the
+    # compile rather than defaulted inside it (ADR B1: no process-level fallback,
+    # no default scope). An unconfigured host keeps the pre-P2-I2 graph: the bare
+    # call below is the only answer that host ever takes, so nothing about its
+    # behaviour, its logging, or its zero-argument ``compile_for_http`` shape
+    # changes. A configured one gets a session registry plus the resolver that
+    # hands out that identity, which is the pair ``compile_graph`` demands.
+    #
+    # A MISCONFIGURED identity is reported and the host still boots. Refusing to
+    # start would mean a half-filled .env takes fin down entirely to fix an
+    # optional subsystem, and ``load_jev_config`` — the precedent this module
+    # follows — never raises for a value it is willing to default. Serving without
+    # the identity leaves structured evidence unavailable, which is a degradation
+    # the operator is told about, not a stale-read hazard.
+    try:
+        identity: StructuredEvidenceIdentity | None = load_structured_evidence_identity()
+    except StructuredEvidenceIdentityConfigError as exc:
+        logger.warning("structured evidence identity is misconfigured; serving without it: %s", exc)
+        identity = None
+    if identity is None:
+        graph = compile_for_http()
+    else:
+        # Lazy for the same reason ``preflight_ingest_storage`` is: the launch
+        # command is ``fin.host.compile``'s, and this module does not import it
+        # at load time. It is the same iknow server every other MCP adapter in
+        # this repo spawns, so the Evidence read rides the corpus the retrieve
+        # leg is already talking to.
+        from fin.host.compile import DEFAULT_MCP_COMMAND
+
+        graph = compile_for_http(
+            evidence=EvidenceSessionBinding(
+                sessions=EvidenceSessionRegistry(
+                    DEFAULT_MCP_COMMAND,
+                    transport_env=identity.child_storage_env(),
+                ),
+                resolve=identity.resolver(),
+            )
+        )
     # The durable ingest queue's execution side starts here, once per
     # process: the drain does a startup sweep (queued/failed/interrupted
     # jobs resume from durable state, no re-upload) and then re-checks
@@ -746,11 +806,19 @@ def serve() -> None:
         service=attachment_service,
         workspace_root=get_workspace_root(),
     )
+    # The evidence invalidation drain's cadence (spec: "drains at least once
+    # per minute while online"). Started last and stopped first, the
+    # reverse-order posture the workers above establish: every other writer
+    # is already running when its first sweep goes out, and no drain begins
+    # once the store it scrubs is going away. A no-op until P3's producer
+    # binds the transport.
+    start_invalidation_drain_worker(store=default_thread_store())
     import uvicorn
 
     try:
         uvicorn.run("fin.host.http:app", host="0.0.0.0", port=8000, log_level="info")
     finally:
+        stop_invalidation_drain_worker()
         stop_attachment_resume_worker()
         stop_attachment_prep_worker()
         stop_ingest_worker()

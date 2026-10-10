@@ -1,7 +1,7 @@
 // Ordinary-person copy for a send that never produced a run.
 //
-// The composer clears the draft the moment the operator hits Enter,
-// so a swallowed rejection looked like the question evaporated. The
+// The draft is discarded only once the transport took the send, so a
+// rejection can never read as the question evaporating. The
 // send route's typed EXITs (specs/workspace.md: 409
 // ``{error: concurrent_run}`` / 409 ``{error: knowledge_mcp_fault}``
 // / 503 ``{error: ingest_missing}``, all decided BEFORE any SSE
@@ -41,11 +41,15 @@ export function classifySendFailure(error: unknown): SendFailureKind {
   return "unknown";
 }
 
-// The draft is always put back on failure (see Composer.submit): the
-// operator's textarea held the only copy of the question, and every
+// A failed send leaves the question in the textarea (see Composer.submit):
+// the draft is discarded only once the transport took the send, and every
 // kind below is retryable once its cause clears.
+// The 409 line names what Runtime refused for THIS send. It must not
+// state a standing "wait for the run to finish" rule: an active run alone
+// does not hold input (activeInput.ts is the single policy), and the
+// operator keeps the question either way.
 const CONCURRENT_RUN_COPY =
-  "这个对话还有一轮在运行，等它结束后再发送。你的问题已经放回输入框。";
+  "这次发送 Runtime 没有接受：这个对话上还有一轮在占用。你的问题已经放回输入框，可以直接重试。";
 const INGEST_MISSING_COPY =
   "语料还没 ingest（提取树缺失），先运行 ingest 再提问。你的问题已经放回输入框。";
 // 缺 / 坏 boot: the knowledge MCP cannot answer, so the question never

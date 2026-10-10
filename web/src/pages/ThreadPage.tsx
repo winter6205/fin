@@ -6,7 +6,30 @@ import { useParams } from "react-router-dom";
 import AnswerWithCitations from "../components/CitationChips";
 import VisualClaims from "../components/VisualClaims";
 import Composer from "../components/Composer";
-import type { ChoiceWindow, Comparison, ThreadDetail, ToolSummary, Turn } from "../types";
+// question-workspace: the task surfaces. Each renders one pure module's
+// decision, so the judgement stays unit-tested in plain code.
+import ArchiveList from "../components/ArchiveList";
+import ClarificationCard, {
+  RefusedClarificationNotice,
+} from "../components/ClarificationCard";
+import TaskPanel from "../components/TaskPanel";
+import {
+  clarificationRegion,
+  type ClarificationRegion,
+} from "../clarificationRegion";
+import {
+  restoreDecision,
+  type RestoreDecision,
+} from "../archiveRestore";
+import { taskState, type TaskStateView } from "../taskState";
+import type {
+  ChoiceWindow,
+  Comparison,
+  PendingQuestionView,
+  ThreadDetail,
+  ToolSummary,
+  Turn,
+} from "../types";
 import {
   cellTitle,
   comparisonCaption,
@@ -37,7 +60,15 @@ import {
   thinkingFoldVisibleText,
   traceItemsFromTurn,
 } from "../turnTrace";
-import { useWorkspaceStore } from "../store";
+import {
+  useWorkspaceStore,
+  displayableWorkspaceOperation,
+  operationRefusal,
+  projectionUnreadableFor,
+  restoreFactsFor,
+  submissionNoticeFor,
+  type TaskSurfaceFacts,
+} from "../store";
 import { occupancyPercent, parseThreadOccupancy } from "../threadOccupancy";
 import { threadViewState, type ThreadViewState } from "../threadViewState";
 
@@ -370,6 +401,51 @@ export default function ThreadPage() {
     pendingTurn,
     turnCount: activeThread.turns.length,
   });
+  // The task region reads the SAME per-thread projection the task doors
+  // write, so reload recovery and live answers cannot disagree about the
+  // current task. The slices below are selected as references because a
+  // selector that rebuilt a derived object would re-render this page on
+  // every store notification; the decisions are composed once here and
+  // every surface below only renders their result.
+  const taskRuntime = useWorkspaceStore((s) => s.taskRuntime);
+  const workspaceOperations = useWorkspaceStore((s) => s.workspaceOperations);
+  const restoreRequests = useWorkspaceStore((s) => s.restoreRequests);
+  const taskProjectionRefusal = useWorkspaceStore(
+    (s) => s.taskProjectionRefusal,
+  );
+  const taskProjectionRefreshFailed = useWorkspaceStore(
+    (s) => s.taskProjectionRefreshFailed,
+  );
+  const pendingUploads = useWorkspaceStore((s) => s.pendingUploads);
+  const clarificationDrafts = useWorkspaceStore((s) => s.clarificationDrafts);
+  const surface: TaskSurfaceFacts = {
+    activeThread,
+    taskRuntime,
+    workspaceOperations,
+    restoreRequests,
+    taskProjectionRefusal,
+    taskProjectionRefreshFailed,
+    pendingUploads,
+  };
+  // One operation record per thread, and the refusal it carries. Every
+  // consumer below reads this same pair, so a reply's pending/accepted/
+  // rejected state cannot be re-derived differently by two surfaces.
+  const operation = displayableWorkspaceOperation(surface, thread_id);
+  const pendingQuestion = taskRuntime[thread_id]?.pending_question ?? null;
+  const region = clarificationRegion({
+    pendingQuestion,
+    drafts: clarificationDrafts,
+    submission: operation,
+    refusal: operationRefusal(operation),
+  });
+  const taskView = taskState({
+    taskRuntime: taskRuntime[thread_id] ?? undefined,
+    turns: activeThread.turns,
+    inFlight: activeThread.in_flight === true,
+    projectionUnreadable: projectionUnreadableFor(surface, thread_id),
+    submission: submissionNoticeFor(surface, thread_id),
+  });
+  const restore = restoreDecision(restoreFactsFor(surface, thread_id));
 
   return (
     <main className="flex flex-col h-full">
@@ -397,8 +473,75 @@ export default function ThreadPage() {
         contentRef={transcriptContentRef}
       />
 
+      {/* The task surfaces sit between the transcript and the composer,
+          not inside the scrolled transcript: the current task, the
+          pending clarification and the archive list are persistent
+          chrome for the thread, and putting them in the scroll area
+          would hide the pending question below the fold (the one thing
+          the operator must not miss). */}
+      <TaskRegion
+        threadId={thread_id}
+        taskView={taskView}
+        region={region}
+        restore={restore}
+        pendingQuestion={pendingQuestion}
+      />
+
       <Composer threadId={thread_id} />
     </main>
+  );
+}
+
+// The task panel, the pending clarification card, and the archive list, in
+// that order — the clarification sits between them because a question
+// awaiting an answer outranks a summary of what has already happened. Every
+// fact this region renders is already associated with THIS thread by the
+// page: a pending question from the projection, an operation from the
+// ledger, a restore from its own request record.
+function TaskRegion({
+  threadId,
+  taskView,
+  region,
+  restore,
+  pendingQuestion,
+}: {
+  threadId: string;
+  taskView: TaskStateView;
+  region: ClarificationRegion;
+  restore: RestoreDecision;
+  pendingQuestion: PendingQuestionView | null;
+}) {
+  const openTaskClarification = useWorkspaceStore(
+    (s) => s.openTaskClarification,
+  );
+
+  // Opening the draft is a store write, so it belongs in an effect rather
+  // than in the render body. It is idempotent — the store keeps an
+  // existing draft — so re-running it cannot overwrite typed text.
+  useEffect(() => {
+    if (pendingQuestion) openTaskClarification(threadId);
+  }, [threadId, pendingQuestion, openTaskClarification]);
+
+  return (
+    <div className="shrink-0 space-y-2 border-t border-black bg-page px-4 py-2 max-h-72 overflow-y-auto">
+      {region.card.draft ? (
+        <ClarificationCard
+          threadId={threadId}
+          draft={region.card.draft}
+          submitting={region.card.submitting}
+          refusalKind={region.card.refusalKind}
+        />
+      ) : null}
+      {region.refused ? (
+        <RefusedClarificationNotice
+          prompt={region.refused.draft.prompt}
+          refusalKind={region.refused.refusalKind}
+          outcome={region.refused.outcome}
+        />
+      ) : null}
+      <TaskPanel state={taskView} />
+      <ArchiveList threadId={threadId} decision={restore} />
+    </div>
   );
 }
 

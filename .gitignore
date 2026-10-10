@@ -1,5 +1,9 @@
 # Python
+# The bare names are listed too: a worktree may point `.venv` at a shared
+# virtualenv with a symlink, and a trailing slash does not match a symlink.
+.venv
 .venv/
+venv
 venv/
 __pycache__/
 *.py[cod]
@@ -140,3 +144,18 @@ docs/会话备份.txt
 # on a source sync. The pre-commit hook keeps typecheck:staged only.
 .cursor/skills/
 .cursor/vendor/
+
+# Private evaluation datasets, campaign drivers, and recorded results.
+# They stay in the private source checkout. Do not force-add them here.
+# Ignore rules do not untrack files already in history.
+docs/validation/
+data/grounded_assessment/
+data/conformance/journey_acceptance/
+tests/acceptance/
+scripts/grounded_live_probe.py
+scripts/grounded_live_probe_prompt.py
+scripts/measure_structured_corpus_state.py
+scripts/mutate_structured_evidence_recovery.py
+scripts/mutate_structured_evidence_replay.py
+scripts/structured-env-check.sh
+scripts/structured-live-env.sh

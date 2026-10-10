@@ -181,6 +181,34 @@ def _visual_claims_reducer(
     return list(left or []) + list(right)
 
 
+@dataclass(frozen=True)
+class StructuredEvidenceReset:
+    """Sentinel value: replace ``AgentState["structured_evidence"]`` with ``[]``.
+
+    Same shape and the same reason as :class:`VisualClaimsReset`.
+    """
+
+
+STRUCTURED_EVIDENCE_RESET: Final[StructuredEvidenceReset] = StructuredEvidenceReset()
+
+
+def _structured_evidence_reducer(
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]] | StructuredEvidenceReset,
+) -> list[dict[str, Any]]:
+    """Reducer for ``AgentState["structured_evidence"]``.
+
+    Mirrors :func:`_visual_claims_reducer`: the sentinel clears, an empty
+    list is a no-op, and a non-empty list concats. The reducer MUST NOT
+    mutate either operand.
+    """
+    if isinstance(right, StructuredEvidenceReset):
+        return []
+    if not right:
+        return list(left or [])
+    return list(left or []) + list(right)
+
+
 # ----- closed run-status enum -----
 
 # Allowed values of ``AgentState["status"]``. The graph factory and the
@@ -511,6 +539,41 @@ class AgentState(TypedDict, total=False):
     # rather than ``[]``: the writer (``tool_node_with_summaries``) returns
     # ONLY the new rows, exactly like ``evidence``.
     visual_claims: Annotated[list[dict[str, Any]], _visual_claims_reducer]
+    # structured-corpus-evidence: the stored structured snapshots this run
+    # admitted, one ``{snapshot, digest, selector}`` row per cited row or
+    # count receipt, on their OWN channel (never ``citations`` — a
+    # structured value supports a structured claim and can never authorize
+    # a quotation).
+    #
+    # WHY additive and not overwrite-style: several retrieve calls in one
+    # run are several admitted result sets, and the writer returns ONLY the
+    # records this tool call produced — so a prior call's records would be
+    # overwritten by the next call's. The same reason makes ``[]`` useless
+    # as a reset (an empty right operand is a no-op under this reducer,
+    # not a clear), which is why clearing takes the sentinel instead.
+    structured_evidence: Annotated[list[dict[str, Any]], _structured_evidence_reducer]
+    # Question/task runtime T2–T4: the thread-scoped task envelope
+    # (``fin.host.task_runtime_types.TaskRuntimeState``), stored as its
+    # one state dict. Thread-scoped and therefore OMITTED from
+    # ``reset_input_state`` below, exactly like ``status_snapshots``:
+    # a run-scoped reset, a resume, and a compaction all preserve task
+    # history.
+    #
+    # ONE key rather than sibling channels because the task transition,
+    # its reconciliation marker, its pending question, and its execution
+    # disposition commit together — separate keys would let a partial
+    # write look like a committed decision. Overwrite semantics: a single
+    # writer returns the whole next envelope, and ``{}`` genuinely clears
+    # it. A thread whose checkpoint predates this field simply has no
+    # key and reads as empty (no backfill migration).
+    task_runtime: dict[str, Any]
+    # The grounded-answer peer's verdict for THIS turn, read only by the
+    # task-outcome boundary. Declared here because an undeclared key is
+    # silently dropped by the checkpointer, which would leave the peer
+    # channel unreadable rather than merely unwired. Run-scoped: the
+    # verdict is about one turn's evidence and must not survive into the
+    # next.
+    grounding_assessment: dict[str, Any]
 
 
 def reset_input_state(
@@ -597,6 +660,18 @@ def reset_input_state(
         # stored observation no longer describes these pixels. The
         # channel is additive, so clearing it takes the sentinel.
         "visual_claims": VISUAL_CLAIMS_RESET,
+        # structured-corpus-evidence: a stored snapshot belongs to the run
+        # whose same-turn result proved it, so a follow-up send starts with
+        # none. The channel is additive, so clearing it takes the sentinel.
+        "structured_evidence": STRUCTURED_EVIDENCE_RESET,
+        # Task runtime T6: the grounded-answer verdict is about ONE
+        # turn's evidence, so a follow-up send starts with none — a
+        # stale ``supported`` assessment would complete the NEXT task
+        # on evidence gathered for a different question.
+        "grounding_assessment": {},
+        # task_runtime is deliberately OMITTED: it is thread-scoped task
+        # history, and a run-scoped reset must not erase it. Same reason
+        # ``status_snapshots`` is omitted above.
     }
 
 
@@ -610,6 +685,7 @@ __all__ = [
     "REPAIR_CAP",
     "RECURSION_LIMIT",
     "STEP_CAP",
+    "STRUCTURED_EVIDENCE_RESET",
     "Status",
     "StatusSnapshot",
     "TERMINAL_STATUSES",
@@ -618,6 +694,7 @@ __all__ = [
     "VisualClaimsReset",
     "_evidence_reducer",
     "_issuer_findings_reducer",
+    "_structured_evidence_reducer",
     "_visual_claims_reducer",
     "reset_input_state",
 ]

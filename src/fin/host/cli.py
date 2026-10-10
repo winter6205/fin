@@ -58,7 +58,12 @@ from langchain_core.messages import AIMessage, HumanMessage
 from fin.corpus.errors import IngestMissingError
 from fin.host import ConcurrentRunError, WorkspaceRootMissingError
 from fin.host.citation_gate import strip_hidden_bounce_marker
+from fin.host.evidence_session_registry import EvidenceSessionBinding, EvidenceSessionRegistry
 from fin.host.operator_env import apply_dotenv
+from fin.host.structured_evidence_identity import (
+    StructuredEvidenceIdentityConfigError,
+    load_structured_evidence_identity,
+)
 from fin.host.run_payload import ordinary_person_copy
 from fin.host.state import EVIDENCE_RESET, reset_input_state
 from fin.host.workspace_registry import default_workspace_root
@@ -350,6 +355,29 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _structured_evidence_binding() -> Any | None:
+    """The operator-configured evidence identity, or None when unconfigured."""
+    try:
+        identity = load_structured_evidence_identity()
+        if identity is None:
+            return None
+        from fin.host.compile import DEFAULT_MCP_COMMAND
+
+        return EvidenceSessionBinding(
+            sessions=EvidenceSessionRegistry(
+                DEFAULT_MCP_COMMAND,
+                transport_env=identity.child_storage_env(),
+            ),
+            resolve=identity.resolver(),
+        )
+    except StructuredEvidenceIdentityConfigError as exc:
+        print(
+            f"structured evidence identity is misconfigured; continuing without it: {exc}",
+            file=sys.stderr,
+        )
+        return None
+
+
 # ----- prod graph resolution (lazy) -----
 
 
@@ -371,7 +399,15 @@ def _default_graph_factory() -> Any:
             "fin.host.compile.compile_for_runtime (ticket T8) is "
             "required to build the durable graph"
         ) from exc
-    return compile_for_runtime()
+    # Same identity the serve path gets, for the same reason: an operator-configured
+    # structured-evidence identity applies to the product graph wherever it is
+    # built, and a graph compiled without it silently loses structured evidence
+    # while every other signal still works. Misconfigured is reported, not fatal —
+    # the CLI must still answer `--help` and its other subcommands.
+    evidence = _structured_evidence_binding()
+    if evidence is None:
+        return compile_for_runtime()
+    return compile_for_runtime(evidence=evidence)
 
 
 # ----- main -----

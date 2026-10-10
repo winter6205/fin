@@ -170,6 +170,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Final, Iterator, Literal, Protocol, cast
 
@@ -240,6 +241,7 @@ from fin.host.attachment_layout import (
 from fin.host.attachment_prep_worker import (
     ATTACHMENT_PREP_WORKER_CHECK_INTERVAL_SECONDS,
     AttachmentPrepWorker,
+    DrainCadence,
     PeriodicDrainWorker,
     drain_periodically,
 )
@@ -311,6 +313,24 @@ from fin.host.knowledge_mcp import (
 from fin.host.memory_dream import run_dream_after_turn
 from fin.host.memory_port import build_memory_port
 from fin.host.named_failures import (
+    TASK_ALREADY_RECONCILED,
+    TASK_APPLICABILITY_UNRESOLVED,
+    TASK_CAPABILITY_UNAVAILABLE,
+    TASK_CAPABILITY_UNSUPPORTED,
+    TASK_CHECKPOINT_FAILED,
+    TASK_DEPENDENCY_FAILURE,
+    TASK_EXECUTION_LIMIT,
+    TASK_FAILURE_KINDS,
+    TASK_HISTORY_FAILED,
+    TASK_INPUT_INVALID,
+    TASK_INPUT_UNRECONCILED,
+    TASK_INSUFFICIENT_EVIDENCE,
+    TASK_INTENT_MISSING,
+    TASK_PERMISSION_DENIED,
+    TASK_REPLY_EXPIRED,
+    TASK_REPLY_UNKNOWN,
+    TASK_RESTORE_NOT_ADOPTED,
+    TASK_RESTORE_UNKNOWN,
     TIER_UNAVAILABLE_CODE,
     RetrieveTier,
     unavailable_tier,
@@ -331,6 +351,27 @@ from fin.host.stream_map import (
 )
 from fin.host.run_control import RunControl, StopToken
 from fin.host.state import reset_input_state
+from fin.host.structured_evidence_drain_worker import (
+    INVALIDATION_DRAIN_CONSUMER_ID,
+    InvalidationDrainTransport,
+    StructuredInvalidationDrainWorker,
+)
+from fin.host.task_runtime_types import (
+    INPUT_MESSAGE,
+    INPUT_REPLY,
+    INPUT_RESTORE,
+    AcceptedInput,
+    TaskRuntimeError,
+    TaskRuntimeState,
+)
+from fin.host.task_runtime import (
+    accept_input as accept_task_input,
+    archived_task_summaries,
+    bounded_input_history,
+    current_task_summary,
+    pending_question_payload,
+    reconcile_marker,
+)
 from fin.host.thread_store import (
     PersistenceUnavailableError,
     RunRecord,
@@ -432,6 +473,32 @@ _STREAM_FAILURE_USER_COPY: Final[dict[str, str]] = {
     "not_found": "模型或接口路径不存在（404）。检查 FIN_MODEL 和 FIN_BASE_URL 是否拼写正确。",
     "server": "模型服务内部错误（5xx）。请稍后重试。",
     "unknown": "未预期的错误。请把 server 日志贴出来排查。",
+}
+
+# Question/task runtime T2: ordinary-person copy for a refused task
+# reconciliation. Grouped by the FACT each failure names rather than
+# listed one per token — the operator cannot act on most of them, so
+# telling them which one it was would be noise. None of these asks the
+# user a question: an operational failure is a system outcome, never a
+# clarification.
+_TASK_REFUSAL_USER_COPY: Final[dict[str, str]] = {
+    TASK_INPUT_INVALID: "这次输入无法处理，当前任务未改变。请重试。",
+    TASK_INPUT_UNRECONCILED: "这次输入尚未确认，当前任务未改变。请重试。",
+    TASK_ALREADY_RECONCILED: "这次输入已经处理过了。",
+    TASK_PERMISSION_DENIED: "当前没有执行这项操作的权限。",
+    TASK_DEPENDENCY_FAILURE: "依赖服务出错，当前任务未改变。请稍后重试。",
+    TASK_CAPABILITY_UNAVAILABLE: "所需能力当前不可用。",
+    TASK_CAPABILITY_UNSUPPORTED: "当前来源版本不支持这项操作。",
+    TASK_INSUFFICIENT_EVIDENCE: "证据不足，任务保持进行中。",
+    TASK_APPLICABILITY_UNRESOLVED: "适用条件尚未确认，任务保持进行中。",
+    TASK_INTENT_MISSING: "缺少可确认的用户意图，任务未改变。",
+    TASK_EXECUTION_LIMIT: "已达到执行上限，任务保持进行中。",
+    TASK_CHECKPOINT_FAILED: "保存进度失败，当前任务保持上一个一致状态。",
+    TASK_HISTORY_FAILED: "读取历史失败，当前任务保持上一个一致状态。",
+    TASK_REPLY_EXPIRED: "这条回复对应的提问已经过期，当前任务未改变。",
+    TASK_REPLY_UNKNOWN: "当前没有待回答的提问。",
+    TASK_RESTORE_UNKNOWN: "找不到对应的历史任务，当前任务未改变。",
+    TASK_RESTORE_NOT_ADOPTED: "按当前条件不能恢复该历史任务，当前任务未改变。",
 }
 
 
@@ -781,6 +848,20 @@ class SendMessageRequest(BaseModel):
     # attachments=...)`` as turn-scoped context and never enters the
     # corpus/ingest path.
     attachment_ids: list[str] = Field(default_factory=list)
+    # Question/task runtime T3: answer the thread's still-pending
+    # clarification. ``question_id`` names WHICH question is being
+    # answered, so a reply to a superseded question is refused as
+    # ``task_reply_expired`` instead of answering whatever is current.
+    # ``choice_id`` is the submitted choice — the reserved ``other`` token
+    # is a real choice, not a sentinel — and ``free_text`` carries what
+    # the user typed alongside it, preserved verbatim.
+    question_id: str | None = None
+    choice_id: str | None = None
+    free_text: str | None = None
+    # Question/task runtime T4: an EXPLICIT restore of a listed archived
+    # task. Restore is never inferred from an unrelated message, and the
+    # archived results stay historical until the current recheck passes.
+    restore_archive_id: str | None = None
     # The explicit 检索档 selector. Empty (the default) is the ordinary
     # send — the model resolves the track as it always has. A caller that
     # NAMES a still-unimplemented 档 (sql 真数据库) gets the named 400
@@ -1033,6 +1114,12 @@ class TurnRow(BaseModel):
     # ``[]`` when the run produced none (never absent), mirroring
     # ``evidence_locators``.
     visual_claims: list[dict[str, Any]] = Field(default_factory=list)
+    # EP6: this run's admitted structured snapshots, on their own field for
+    # the same reason as ``visual_claims`` — a structured value grounds a
+    # claim, it is never a quotation, so it must not ride ``citations``.
+    # Stored as the frozen record (snapshot + digest + selector); EP7's
+    # replay reads it back against the original snapshot (T30).
+    structured_evidence: list[dict[str, Any]] = Field(default_factory=list)
     # T8: the operator's latest thumb for this run (``"up"`` /
     # ``"down"``). ``None`` when no thumb was ever set — additive and
     # nullable, so pre-T8 clients that ignore the field keep working.
@@ -1095,6 +1182,34 @@ class WorkspaceStatusResponse(BaseModel):
     bound_collection_name: str
 
 
+class InvalidationCheckpointResponse(BaseModel):
+    """One consumer's durable position in the invalidation stream (ADR 0097 §2.4).
+
+    The two checkpoints stay separate fields because they are separate
+    facts, and collapsing them on the wire is the silent-error this
+    table exists to prevent: ``applied_checkpoint`` covers events whose
+    local scrub COMMITTED and moves only with that commit, while
+    ``acked_checkpoint`` is the cursor the backend ACCEPTED. The gap
+    between them is precisely the "scrubbed but not yet acknowledged"
+    window a crash redelivers from, so a reader that cannot tell them
+    apart cannot tell a finished drain from a half-finished one.
+
+    ``last_seq`` is the orderable half (ADR 0097 §2.4): the opaque
+    checkpoint cannot be compared, so a skipped window is only decidable
+    against the gapless per-consumer sequence. It moves with
+    ``applied_checkpoint`` and NEVER with ``acked_checkpoint``, and is
+    exposed beside both where a reader could plausibly pair it with the
+    wrong one. Empty strings and zero mean "never drained", never a
+    fabricated position — which is why they are rendered, not omitted,
+    and not turned into a 404.
+    """
+
+    consumer_id: str
+    acked_checkpoint: str
+    applied_checkpoint: str
+    last_seq: int
+
+
 class Occupancy(BaseModel):
     """Thread-detail token occupancy (ADR 0044 T3).
 
@@ -1112,6 +1227,136 @@ class Occupancy(BaseModel):
 _PENDING_QUESTION_UNAVAILABLE_DETAIL = (
     "Pending question is temporarily unavailable. Retry opening the thread."
 )
+
+
+class TaskRuntimeView(BaseModel):
+    """The thread's task state as readers see it (question/task runtime
+    T4), kept SEPARATE from the turn table and from ``status``.
+
+    ``current_task`` and ``archived_tasks`` are the task/turn split the
+    spec requires: a turn can end with an answer while its task stays
+    active, so neither is derivable from the other's row. ``None`` /
+    ``[]`` means taskless, never "unknown".
+    """
+
+    current_task: dict[str, Any] | None = None
+    archived_tasks: list[dict[str, Any]] = Field(default_factory=list)
+    pending_question: dict[str, Any] | None = None
+    reconciliation: dict[str, Any] | None = None
+    task_outcome: str | None = None
+    input_version: int = 0
+    # The spec requires readers to be able to obtain bounded ORIGINAL
+    # input history, not only the current task. Bounded at the reader so
+    # asking for more cannot widen the window; an unrecoverable original
+    # reads as ``payload: null`` rather than being reconstructed.
+    input_history: list[dict[str, Any]] = Field(default_factory=list)
+
+
+def _task_runtime_wire_projection(graph: Any, thread_id: str) -> dict[str, Any]:
+    """Project the checkpointed task envelope onto the wire.
+
+    Returns the EMPTY view when the graph exposes no ``task_runtime_state``
+    seam: a stand-in or an unwired graph must not make a taskless thread
+    look like a broken one, and an absent envelope is genuinely empty
+    rather than unknown.
+    """
+    reader = getattr(graph, "task_runtime_state", None)
+    if not callable(reader):
+        return _empty_task_runtime_view()
+    state = cast(TaskRuntimeState, reader(thread_id))
+    return {
+        "current_task": current_task_summary(state),
+        "archived_tasks": archived_task_summaries(state),
+        "pending_question": pending_question_payload(state),
+        "reconciliation": reconcile_marker(state),
+        "task_outcome": state.task_outcome,
+        "input_version": state.input_version,
+        "input_history": bounded_input_history(state),
+    }
+
+
+def _empty_task_runtime_view() -> dict[str, Any]:
+    return {
+        "current_task": None,
+        "archived_tasks": [],
+        "pending_question": None,
+        "reconciliation": None,
+        "task_outcome": None,
+        "input_version": 0,
+        "input_history": [],
+    }
+
+
+def _accepted_input_kind(body: SendMessageRequest) -> str:
+    """Which of the three accepted-input doors this send uses.
+
+    Restore wins over reply because it names a concrete archive to adopt,
+    and a reply only makes sense against a pending question. Both are
+    EXPLICIT — neither is ever inferred from the message text, so an
+    ordinary message can never be mistaken for a restore.
+    """
+    if body.restore_archive_id:
+        return INPUT_RESTORE
+    if body.question_id:
+        return INPUT_REPLY
+    return INPUT_MESSAGE
+
+
+def _accept_at_send_door(
+    runtime_state: TaskRuntimeState,
+    body: SendMessageRequest,
+    *,
+    kind: str,
+    run_id: str,
+) -> tuple[TaskRuntimeState, AcceptedInput]:
+    """Accept this send as the input kind it names, or refuse it typed.
+
+    A refusal is a typed 409/400 BEFORE any run starts, not a silent
+    drop: an expired reply must not look like a message that was merely
+    ignored. The envelope is left exactly as it was, so the last
+    consistent task state stays authoritative.
+    """
+    try:
+        return accept_task_input(
+            runtime_state,
+            kind=kind,
+            payload=body.question or body.free_text,
+            provenance="workspace_send",
+            question_id=body.question_id,
+            choice_id=body.choice_id,
+            archive_id=body.restore_archive_id,
+            run_id=run_id,
+        )
+    except TaskRuntimeError as exc:
+        raise _task_input_http_error(exc) from exc
+
+
+def _task_input_http_error(exc: TaskRuntimeError) -> HTTPException:
+    """The typed refusal as an HTTP status the SPA can branch on.
+
+    ``400`` for a malformed or stale input (the caller sent something
+    this thread cannot accept) and ``409`` for a state conflict (a reply
+    naming no pending question). The named failure rides the body so a
+    client distinguishes them without parsing prose.
+    """
+    conflict = exc.kind in (TASK_REPLY_UNKNOWN, TASK_REPLY_EXPIRED)
+    return HTTPException(
+        status_code=409 if conflict else 400,
+        detail={"error": exc.kind},
+    )
+
+
+def _accepted_task_runtime_state(graph: Any, thread_id: str) -> TaskRuntimeState:
+    """Read the committed task envelope to accept the next input against.
+
+    Falls back to the EMPTY envelope when the graph exposes no
+    ``task_runtime_state`` seam, so a stand-in accepts input 1 rather
+    than refusing every send on an unwired graph.
+    """
+    reader = getattr(graph, "task_runtime_state", None)
+    if not callable(reader):
+        return TaskRuntimeState()
+    return cast(TaskRuntimeState, reader(thread_id))
 
 
 class PendingTurnResponse(BaseModel):
@@ -1170,6 +1415,11 @@ class ThreadDetailResponse(BaseModel):
     # surface ONLY: ADR 0033 keeps ``GET /api/status`` free of any
     # occupancy / context-window figure.
     occupancy: Occupancy | None = None
+    # Question/task runtime T4: the thread-scoped task envelope. Declared
+    # here (not only in the route dict) because FastAPI filters any key the
+    # response model does not declare — the same reason ``pending_turn`` and
+    # ``pending_interrupt_kind`` are declared.
+    task_runtime: TaskRuntimeView = Field(default_factory=TaskRuntimeView)
     turns: list[TurnRow]
 
 
@@ -1259,6 +1509,43 @@ def _serialize_thread(thread: ThreadRecord) -> dict[str, str]:
         "title": thread.title,
         "created_at": thread.created_at.isoformat(),
     }
+
+
+def _structured_evidence_wire_payload(rows: Any) -> list[dict[str, Any]]:
+    """Project stored snapshots for the turn row, withholding expired ones.
+
+    The answer stays in history after expiry; the citation is marked
+    unavailable (spec§"Retention contract"). The deadline is fin's own and
+    is read off the frozen snapshot, so it needs no backend outcome --
+    MP15 must never become an input to it (docs/decisions/p2-d2).
+    """
+    from fin.host.evidence_contract import EVIDENCE_EXPIRED
+
+    now = datetime.now(timezone.utc)
+    payload: list[dict[str, Any]] = []
+    for row in rows or []:
+        expires_at = ((row.get("snapshot") or {}) if isinstance(row, dict) else {}).get(
+            "expires_at"
+        )
+        try:
+            expired = expires_at is not None and datetime.fromisoformat(
+                str(expires_at).replace("Z", "+00:00")
+            ) <= now
+        except ValueError:
+            # An unparseable deadline is not a licence to serve the payload.
+            expired = True
+        if expired:
+            payload.append(
+                {
+                    "snapshot": {},
+                    "digest": row.get("digest"),
+                    "selector": row.get("selector") or {},
+                    "error": EVIDENCE_EXPIRED,
+                }
+            )
+            continue
+        payload.append(copy.deepcopy(row))
+    return payload
 
 
 def _serialize_run(
@@ -1385,6 +1672,12 @@ def _serialize_run(
         # flat but the ``scope`` region nests a list, so a shallow copy
         # would still share it with the store). Kept off ``citations``.
         "visual_claims": copy.deepcopy(list(run.visual_claims or [])),
+        # EP6: the admitted structured snapshots, deep-copied for the same
+        # reason — each row nests (snapshot + selector), so a shallow copy
+        # would share the inner objects with the store.
+        "structured_evidence": _structured_evidence_wire_payload(
+            run.structured_evidence
+        ),
         # T8: the latest thumb for this run (``None`` when unset).
         "feedback": feedback,
     }
@@ -1745,6 +2038,18 @@ def _stream_run_frames(
         raw_reason = f"stream raised mid-flight: {type(exc).__name__}: {exc}"
         sanitized = _sanitize_reason_text(raw_reason)
         reason = f"{sanitized} (kind={kind})" if sanitized else f"stream raised mid-flight: {type(exc).__name__} (kind={kind})"
+        # Question/task runtime T2: a refused reconciliation names a real
+        # product fact, so it must not collapse into the generic "server"
+        # bucket. Its named failure IS the reason, and the copy says the
+        # run could not continue — never a question to the user, because an
+        # operational failure is not something an answer can fix.
+        refusal = getattr(exc, "kind", None)
+        if isinstance(refusal, str) and refusal in TASK_FAILURE_KINDS:
+            kind = refusal
+            user_copy = _TASK_REFUSAL_USER_COPY.get(
+                refusal, _STREAM_FAILURE_USER_COPY["server"]
+            )
+            reason = refusal
         logger.exception(
             "run stream raised mid-flight",
             extra={
@@ -1917,6 +2222,11 @@ def _resume_run_stream(
                 evidence_locators=list(payload["evidence_locators"]),
                 # ADR 0089: the RESUMED remainder's visual claims.
                 visual_claims=visual_claims,
+                # EP6: the RESUMED remainder's admitted snapshots. The
+                # crashed prefix's row keeps its own.
+                structured_evidence=list(
+                    outcome.final_state.get("structured_evidence") or []
+                ),
             )
         )
     except ThreadNotFoundError:
@@ -3900,7 +4210,7 @@ def _check_attachment_resume_waits(
             workspace_root=workspace_root,
         ),
         stop_event,
-        check_interval_seconds,
+        DrainCadence(check_interval_seconds),
         worker_logger=logger,
         log_label="attachment resume worker",
     )
@@ -3951,7 +4261,7 @@ def start_attachment_resume_worker(
                     control,
                     workspace_root=workspace_root,
                 ),
-                interval_s=(
+                DrainCadence(
                     check_interval_seconds
                     if check_interval_seconds is not None
                     else ATTACHMENT_RESUME_WORKER_CHECK_INTERVAL_SECONDS
@@ -3978,6 +4288,111 @@ def stop_attachment_resume_worker(*, timeout: float = 60.0) -> None:
     """
     with _attachment_resume_worker_lock:
         worker = _attachment_resume_worker
+    if worker is not None:
+        worker.stop(timeout=timeout)
+
+
+# The invalidation drain's cadence: the spec's "drains at least once per
+# minute while online" clause finally has a caller. Same posture as the three
+# workers above — one process-wide executor, started only from the boot path,
+# daemon thread, stopped in the boot ``finally``. The transport pair is bound
+# by P3's producer (the IK invalidations channel is not answerable from this
+# repo yet), so the boot start is a no-op until that binding exists: a drain
+# with no transport would poll a channel that answers nothing and log a
+# refusal every interval forever. The pair's type is declared beside the
+# worker that calls it (structured_evidence_drain_worker) and imported here
+# rather than redeclared, so the binder and the drain name one type.
+_invalidation_drain_worker: StructuredInvalidationDrainWorker | None = None
+_invalidation_drain_transport: InvalidationDrainTransport | None = None
+_invalidation_drain_worker_lock = threading.Lock()
+
+
+def bind_invalidation_drain_transport(
+    fetch: Callable[[str | None], object],
+    acknowledge: Callable[[str], None],
+) -> None:
+    """Bind the ``(fetch, acknowledge)`` pair the invalidation drain calls.
+
+    The one place the drain's transport enters the process, so P3's producer
+    binds here rather than the boot path growing a second lifecycle. A start
+    already reading a live worker keeps the seams it was built with — the
+    binding takes effect at the next start, never by mutating a running
+    drain's callables underneath it.
+    """
+    global _invalidation_drain_transport
+    with _invalidation_drain_worker_lock:
+        _invalidation_drain_transport = (fetch, acknowledge)
+
+
+def default_invalidation_drain_transport() -> InvalidationDrainTransport | None:
+    """The bound invalidation transport, or ``None`` when none is bound.
+
+    ``None`` is the honest answer on this build: the backend half of the
+    invalidations channel lands with P3, so until it is bound there is
+    nothing for the drain to call.
+    """
+    with _invalidation_drain_worker_lock:
+        return _invalidation_drain_transport
+
+
+def start_invalidation_drain_worker(
+    *,
+    store: ThreadStore | None = None,
+    consumer_id: str = INVALIDATION_DRAIN_CONSUMER_ID,
+    transport: InvalidationDrainTransport | None = None,
+    cadence: DrainCadence | None = None,
+) -> threading.Thread | None:
+    """Start the process's single invalidation drain, or return the live one.
+
+    Returns ``None`` when no transport is bound — the boot path calls this
+    unconditionally, and a build without P3's producer must not acquire a
+    thread whose every interval ends in the same refusal.
+
+    ``cadence`` carries the interval and the loop's clock together, so a test
+    drives the whole cadence contract — the period, not just the sleep — on a
+    fake clock instead of a real minute. It defaults to
+    :func:`~fin.host.structured_evidence_drain_worker.default_cadence`: the
+    spec's minute on the real clock.
+
+    Rebuilt — honoring freshly passed seams — only once the previous thread's
+    exit is confirmed, the same restart-after-clean-stop rule the resume
+    sweep uses.
+    """
+    global _invalidation_drain_worker
+    pair = (
+        transport if transport is not None else default_invalidation_drain_transport()
+    )
+    if pair is None:
+        return None
+    # WHY lazy: a caller with no bound transport returns above without ever
+    # calling this, so a build whose drain never runs never opens the
+    # Postgres pool behind ``default_thread_store``. It is a lazy CALL, not a
+    # lazy import — this module already imports ``thread_store`` at its top.
+    from fin.host.thread_store import default_thread_store
+
+    with _invalidation_drain_worker_lock:
+        worker = _invalidation_drain_worker
+        if worker is None or not worker.is_live():
+            worker = StructuredInvalidationDrainWorker(
+                store if store is not None else default_thread_store(),
+                pair,
+                consumer_id=consumer_id,
+                cadence=cadence,
+            )
+            _invalidation_drain_worker = worker
+        return worker.start()
+
+
+def stop_invalidation_drain_worker(*, timeout: float = 60.0) -> None:
+    """Stop the process's invalidation drain. Idempotent.
+
+    The in-flight batch finishes its current phase first: a scrub that
+    committed without its acknowledgement is exactly the state the next
+    process's startup sweep reconciles, so a half-run drain is recoverable
+    and must not be cut mid-transaction.
+    """
+    with _invalidation_drain_worker_lock:
+        worker = _invalidation_drain_worker
     if worker is not None:
         worker.stop(timeout=timeout)
 
@@ -4144,6 +4559,7 @@ def build_router(
             ],
             "pending_turn": pending_projection["pending_turn"],
             "occupancy": occupancy,
+            "task_runtime": _task_runtime_wire_projection(graph, thread_id),
             "turns": [
                 _serialize_run(
                     r,
@@ -4257,7 +4673,20 @@ def build_router(
         """
         # Empty question is a no-op per spec (composer guard):
         # 204 with no body, no graph invoke, no SSE.
-        if not body.question or not body.question.strip():
+        #
+        # The two EXPLICIT task doors are exempt. A restore names a
+        # concrete archive and a reply names a concrete question; neither
+        # carries message text, so requiring one would silently drop the
+        # operator's request as an empty submit — a restore would look
+        # like it had done nothing, which is the false impression W5
+        # forbids. A door that names nothing at all is still an empty
+        # submit and still answers 204.
+        if not (
+            body.question
+            and body.question.strip()
+            or body.restore_archive_id
+            or body.question_id
+        ):
             return Response(status_code=204)
 
         # Unknown thread -> 404 BEFORE any graph invoke (the graph
@@ -4491,6 +4920,34 @@ def build_router(
             body.question,
             attachments=resolved_attachments,
         )
+        # Question/task runtime T2: the send door is the only place an
+        # ordinary message is durably accepted, and acceptance happens
+        # BEFORE the graph runs, so the original payload and provenance
+        # are already recoverable when any dependant work starts.
+        #
+        # The accepted record rides the run CONFIG and the committed
+        # envelope rides the input state, because the two have opposite
+        # lifetimes: the config is per-invocation (a resume carries none,
+        # so a resumed execution never manufactures another accepted
+        # input), while the envelope is thread-scoped and must survive
+        # the run-scoped reset above.
+        runtime_state = _accepted_task_runtime_state(graph, thread_id)
+        accepted_kind = _accepted_input_kind(body)
+        runtime_state, accepted_task_input = _accept_at_send_door(
+            runtime_state,
+            body,
+            kind=accepted_kind,
+            run_id=run_id,
+        )
+        config["configurable"]["accepted_task_input"] = (
+            accepted_task_input.to_state_dict()
+        )
+        if body.restore_archive_id:
+            # The graph node reads the archive from run config, so an
+            # explicit restore reaches the same reconciliation boundary
+            # an ordinary message does.
+            config["configurable"]["restore_archive_id"] = body.restore_archive_id
+        input_state["task_runtime"] = runtime_state.to_state_dict()
         if body.propose_extract_method is not None:
             seed: dict[str, Any] = {"proposed": body.propose_extract_method}
             # The apply target rides the SAME run-scoped channel; a
@@ -4701,6 +5158,12 @@ def build_router(
                         # ADR 0089: this run's visual claims, their own
                         # channel (never merged into ``citations``).
                         visual_claims=visual_claims,
+                        # EP6: this turn's admitted structured snapshots,
+                        # read from the final state BEFORE the next send
+                        # resets the additive channel (T29).
+                        structured_evidence=list(
+                            outcome.final_state.get("structured_evidence") or []
+                        ),
                     )
                 )
             except ThreadNotFoundError:
@@ -5639,6 +6102,75 @@ def build_router(
         payload = collector.snapshot()
         payload["rewrite_retry"] = collector.retry_snapshot()
         return payload
+
+    @router.get(
+        "/structured-evidence/invalidation-checkpoint",
+        response_model=InvalidationCheckpointResponse,
+    )
+    def structured_invalidation_checkpoint(
+        consumer_id: str,
+        store: ThreadStore = Depends(get_thread_store),
+    ) -> dict:
+        """This consumer's durable position in the invalidation stream.
+
+        The checkpoint is written by the drain worker, which runs on a
+        cadence inside one process; until a reader can cross that
+        boundary the only way to learn the drain's position is to be
+        the drain, so a stalled drain and a drain that never started are
+        the same 200 everywhere else. Read it, do not infer it.
+
+        ``consumer_id`` is REQUIRED rather than defaulted to
+        ``INVALIDATION_DRAIN_CONSUMER_ID``. That constant is a contract,
+        not a configuration surface (see
+        :mod:`fin.host.structured_evidence_drain_worker`), so a copy
+        of it here would be a second identity that goes quietly stale
+        and answers for a consumer nothing drains.
+
+        What requiring it does NOT do is protect against a caller naming the
+        wrong one: the store answers a miss with empty strings and zero, so a
+        misspelled or renamed consumer gets that same "never drained" body
+        back. The parameter forces the caller to state which identity it means,
+        which makes a rename a mismatch somebody can see — it is not a guard.
+
+        A lookup miss is NOT a 404 — "no checkpoint yet" is the normal
+        first-drain state, and an unknown consumer is indistinguishable
+        from one that has never drained, so both render the empty
+        position. A blank or whitespace-only id is a client error
+        (400) rather than a silent normalisation: an all-whitespace id
+        trimmed to empty is an operator's typo, and answering it about
+        the empty consumer would look like a real answer.
+
+        A store that cannot be reached is the same typed
+        ``persistence_unavailable`` 503 ``GET /api/threads/{thread_id}``
+        answers with — never a bare 500, and never the empty position,
+        which would read as "never drained" for a deployment that has
+        been draining for days.
+        """
+        normalized_consumer_id = consumer_id.strip()
+        if not normalized_consumer_id:
+            return cast(dict, JSONResponse(
+                status_code=400, content={"error": "invalid_consumer_id"}
+            ))
+        try:
+            checkpoint = store.read_invalidation_checkpoint(normalized_consumer_id)
+        except PersistenceUnavailableError:
+            logger.warning(
+                "structured_invalidation_checkpoint: thread store unreachable",
+                exc_info=True,
+            )
+            return cast(dict, JSONResponse(
+                status_code=503, content={"error": "persistence_unavailable"}
+            ))
+        # WHY the four fields are spelled out instead of dumped: the two
+        # checkpoints are only distinguishable if a reader is told which
+        # is which, and ``dataclasses.asdict`` would publish the store's
+        # internal names as a wire contract without that framing.
+        return {
+            "consumer_id": checkpoint.consumer_id,
+            "acked_checkpoint": checkpoint.acked_checkpoint,
+            "applied_checkpoint": checkpoint.applied_checkpoint,
+            "last_seq": checkpoint.last_seq,
+        }
 
     return router
 

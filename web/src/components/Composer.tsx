@@ -1,6 +1,7 @@
-// Composer: textarea; Enter sends, Shift+Enter newline; disabled while
-// the active run is in flight or while an attachment upload is still
-// running; empty submit is a no-op (server also enforces 204).
+// Composer: textarea; Enter sends, Shift+Enter newline; held only by the
+// single active-input decision (a host choice window or an in-flight
+// upload), never by a live run; empty submit is a no-op (server also
+// enforces 204).
 //
 // ADRs 0047/0089: the thread-attach door lives
 // here — a file picker button AND a drop on the composer both upload
@@ -23,24 +24,18 @@ import {
   type AttachFailureNotice,
 } from "../attachFailure";
 import { AttachFailedError } from "../api";
+import { sendControlLabel, type ActiveInputDecision } from "../activeInput";
 import { describeSendFailure, type SendFailureNotice } from "../sendFailure";
-import { attachmentsForSend, hasUploadInFlight, useWorkspaceStore } from "../store";
+import {
+  activeInputFor,
+  attachmentsForSend,
+  hasUploadInFlight,
+  useWorkspaceStore,
+} from "../store";
 import type { ThreadAttachment } from "../types";
 
 interface ComposerProps {
   threadId: string;
-}
-
-/**
- * Why the send is unavailable, and what the control says about it.
- *
- * ``busy`` alone means a RUN is live (it drives Stop and the 运行中
- * label); an upload holding the door is not a running turn and must not
- * read as one.
- */
-function sendGate(busy: boolean, uploadInFlight: boolean) {
-  if (uploadInFlight) return { held: true, label: "上传中…" };
-  return { held: busy, label: busy ? "运行中…" : "发送" };
 }
 
 // The attach door: this file's own upload, or any upload the store is
@@ -216,13 +211,166 @@ export function AttachmentDeleteNotice({
   );
 }
 
+/** The lock the composer states out loud. An upload is excluded: it already
+ * has its own paragraph below, so one outcome is never narrated from two
+ * places. */
+function HeldLockLine({ decision }: { decision: ActiveInputDecision }) {
+  if (!decision.held || decision.holdReason === "upload_in_flight") {
+    return null;
+  }
+  return (
+    <p data-testid="composer-held-copy" className="mb-2 text-xs text-gray-600">
+      {decision.holdCopy}
+    </p>
+  );
+}
+
+/** The rows the send's reference rule left out, named so a withheld
+ * attachment can never read as silently dropped. */
+function WithheldAttachmentLine({
+  attachments,
+}: {
+  attachments: ThreadAttachment[];
+}) {
+  if (attachments.length === 0) return null;
+  return (
+    <p data-testid="attachment-withheld" className="mb-2 text-xs text-gray-600">
+      {`本轮不会引用：${attachments
+        .map((a) => `${a.filename}（${describeAttachmentStatus(a)}）`)
+        .join("、")}。就绪后它会自动随后续问题带上。`}
+    </p>
+  );
+}
+
+/** The thinking preference's switch and the line naming what switching it
+ * off costs this run. */
+function ThinkingSwitch({
+  on,
+  onToggle,
+}: {
+  on: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={on}
+        onClick={onToggle}
+        className="flex items-center gap-2 text-xs text-gray-700 select-none"
+      >
+        <span
+          className={`relative inline-flex h-5 w-9 shrink-0 items-center border border-black p-0.5 ${
+            on ? "bg-[#2563EB]/10" : "bg-card"
+          }`}
+        >
+          <span
+            className={`block h-3.5 w-3.5 border border-black transition-transform ${
+              on ? "translate-x-4 bg-[#2563EB]" : "translate-x-0 bg-page"
+            }`}
+          />
+        </span>
+        Thinking（推理）
+      </button>
+      {!on ? <span className="text-xs text-gray-500">本轮将跳过推理轨迹</span> : null}
+    </>
+  );
+}
+
+/**
+ * ADR 0047: the attach door's picker. This control is attach ONLY — corpus
+ * ingest lives in the home corpus area and is never reachable from the
+ * composer. ``held`` is the same predicate ``attach()`` tests, so an
+ * enabled picker can never meet a bailed upload.
+ */
+function AttachFilePicker({
+  busy,
+  held,
+  onPick,
+}: {
+  busy: boolean;
+  held: boolean;
+  onPick: (file: File) => void;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  return (
+    <span className="flex items-center gap-2">
+      <input
+        ref={inputRef}
+        type="file"
+        className="hidden"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          e.target.value = "";
+          if (file) onPick(file);
+        }}
+      />
+      <button
+        type="button"
+        data-testid="attach-file"
+        disabled={held}
+        title="上传附件（本对话内持续可引用，不入库）"
+        onClick={() => inputRef.current?.click()}
+        className="border border-black bg-card px-2 py-0.5 text-xs hover:bg-tool disabled:opacity-50"
+      >
+        {busy ? "上传中…" : "附加文件…"}
+      </button>
+      <span className="text-xs text-gray-400">
+        本对话内持续可引用，不入库
+      </span>
+    </span>
+  );
+}
+
+/** Stop ends the in-flight run on this thread. Shown only while something
+ * is running: the host answers 204 on an idle thread, so a stale click is
+ * harmless, but a permanently visible Stop reads as if a run were always
+ * live. */
+function StopRunButton({
+  runVisible,
+  stopping,
+  onStop,
+}: {
+  runVisible: boolean;
+  stopping: boolean;
+  onStop: () => void;
+}) {
+  if (!runVisible) return null;
+  return (
+    <button
+      type="button"
+      data-testid="stop-run"
+      disabled={stopping}
+      onClick={onStop}
+      className="border border-black bg-card px-4 py-1.5 text-sm font-medium hover:bg-black hover:text-white disabled:opacity-50"
+    >
+      {stopping ? "停止中…" : "停止"}
+    </button>
+  );
+}
+
+/** The box after a send resolves. Handing the question over is what
+ * consumes it — ``submit`` empties the box at that moment — so this only
+ * decides whether a send that was refused before it started puts the text
+ * back. Anything the operator typed since then is theirs, never the
+ * discarded question. */
+export function draftAfterSend(
+  current: string,
+  submitted: string,
+  reachedTransport: boolean,
+): string {
+  if (reachedTransport) return current;
+  return current === "" ? submitted : current;
+}
+
 export default function Composer({ threadId }: ComposerProps) {
   const sendQuestion = useWorkspaceStore((s) => s.sendQuestion);
   const sending = useWorkspaceStore((s) => s.sendingQuestion);
-  // T4 (spec line 38): disable the composer while the thread's
-  // per-run lock is held (live GET signal) or while a resume is
-  // streaming. ``in_flight`` covers both the pre-first-turn window
-  // (thread-level) and the latest-turn window (turn-level).
+  // A live run is REPORTED here and never a hold: compatible follow-up
+  // input stays available while work is visibly active, and Runtime decides
+  // what happens to it. ``busy`` therefore feeds only the button's line and
+  // the Stop control — it cannot disable the box.
   const threadInFlight = useWorkspaceStore(
     (s) => s.activeThread?.id === threadId && s.activeThread.in_flight === true,
   );
@@ -230,21 +378,22 @@ export default function Composer({ threadId }: ComposerProps) {
     (s) => s.resumingThreadId === threadId,
   );
   const busy = sending || threadInFlight || resumingThis;
-  // The upload gate is store state, not local picker state: it holds
-  // for a file the question never mentions, and it is the ONE predicate
-  // ``sendQuestion`` / ``createThread`` refuse with — so the control and
-  // the store can never disagree about who is blocked. Its scope is
-  // deliberately wider than the host's: this door holds the composer for
-  // an upload on ANY thread because the composer itself is global, while
-  // the host refuses only the thread its own upload is landing in.
-  const uploadInFlight = useWorkspaceStore((s) =>
-    hasUploadInFlight(s.pendingUploads),
+  // Both halves of the send door — this control and the store's own guard —
+  // read ONE decision over the store's state, so an enabled box can never
+  // meet a POST the store swallows and a held box never fires a doomed one.
+  // The upload gate is store state, not local picker state: it holds for a
+  // file the question never mentions, and its scope is deliberately wider
+  // than the host's because the composer itself is global while the host
+  // refuses only the thread its own upload is landing in.
+  const activeThread = useWorkspaceStore((s) => s.activeThread);
+  const pendingUploads = useWorkspaceStore((s) => s.pendingUploads);
+  const workspaceOperations = useWorkspaceStore((s) => s.workspaceOperations);
+  const decision = activeInputFor(
+    { activeThread, pendingUploads, workspaceOperations },
+    threadId,
   );
-  const { held, label: sendLabel } = sendGate(busy, uploadInFlight);
-  // T4 workflow (#138): Stop ends the in-flight run on this thread.
-  // Shown only while something is running — the host answers 204 on an
-  // idle thread, so a stale click is harmless, but a permanently
-  // visible Stop button reads as if a run were always live.
+  const uploadInFlight = hasUploadInFlight(pendingUploads);
+  // Stop ends the in-flight run on this thread.
   const stopRun = useWorkspaceStore((s) => s.stopRun);
   const stopping = useWorkspaceStore((s) => s.stoppingThreadId === threadId);
   // T3 (#34): the operator's GLOBAL thinking preference. Defaults
@@ -263,6 +412,13 @@ export default function Composer({ threadId }: ComposerProps) {
   // Rendered above the textarea until the next submit clears it.
   const [failure, setFailure] = useState<SendFailureNotice | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const { held } = decision;
+  const sendLabel = sendControlLabel({
+    held,
+    holdReason: decision.holdReason,
+    runInFlight: busy,
+  });
 
   // ----- ADR 0086: the persistent attachment list -----
   // The thread's records live in the store (they outlive one send and
@@ -290,7 +446,6 @@ export default function Composer({ threadId }: ComposerProps) {
   // One predicate for both doors, so the picker can never be enabled while
   // `attach()` would bail.
   const attachHeld = attachHeldWhile(attachBusy, uploadInFlight);
-  const attachInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     void loadAttachments(threadId);
@@ -340,13 +495,13 @@ export default function Composer({ threadId }: ComposerProps) {
   };
 
   const submit = async () => {
-    const q = draft.trim();
+    const submitted = draft;
+    const q = submitted.trim();
     if (!q) return; // Empty submit no-op.
     // Guarded here, not only by the disabled control: Enter on the
     // textarea reaches ``submit`` directly, and a send started while an
     // upload is still writing its bytes is refused by the store anyway.
     if (held) return;
-    setDraft("");
     setFailure(null);
     // The store owns the one reference rule. Every durable record the
     // host accepts rides the send: READY ones are citable now, and an
@@ -355,13 +510,19 @@ export default function Composer({ threadId }: ComposerProps) {
     // on their account and nothing has to be resent. What stays out
     // (a failed record) is rendered below.
     const { ids } = attachmentsForSend(attachments);
+    // Handing the question over empties the box here rather than on the
+    // answer: a grounded run streams for a long time and the operator's
+    // only copy of the question must not sit in the box the whole time.
+    // A send the store refused before it started puts it back below.
+    setDraft("");
     try {
-      await sendQuestion(threadId, q, thinkingOn, ids);
+      const sent = await sendQuestion(threadId, q, thinkingOn, ids);
+      setDraft((current) => draftAfterSend(current, submitted, sent !== null));
     } catch (error) {
-      // The draft was cleared optimistically and the textarea held
-      // the only copy of the question — put it back so the operator
-      // can retry once the cause clears. An attachment refusal
-      // (parsing reference) is ATTACHMENT copy, not send copy.
+      // The textarea still holds the question unless the operator emptied
+      // it while the request was in flight — put it back either way so the
+      // retry is not a retype. An attachment refusal (parsing reference) is
+      // ATTACHMENT copy, not send copy.
       if (error instanceof AttachFailedError) {
         setAttachFailure(describeAttachFailure(error));
       } else {
@@ -403,21 +564,13 @@ export default function Composer({ threadId }: ComposerProps) {
         notice={failure}
         onDismiss={() => setFailure(null)}
       />
+      <HeldLockLine decision={decision} />
       <AttachmentDeleteNotice
         failure={deleteFailure}
         onDismiss={() => setDeleteFailure(null)}
       />
       <AttachmentChipList attachments={attachments} door={chipDoor} />
-      {withheld.length > 0 ? (
-        <p
-          data-testid="attachment-withheld"
-          className="mb-2 text-xs text-gray-600"
-        >
-          {`本轮不会引用：${withheld
-            .map((a) => `${a.filename}（${describeAttachmentStatus(a)}）`)
-            .join("、")}。就绪后它会自动随后续问题带上。`}
-        </p>
-      ) : null}
+      <WithheldAttachmentLine attachments={withheld} />
       {uploadInFlight ? (
         <p
           data-testid="attach-upload-pending"
@@ -451,60 +604,12 @@ export default function Composer({ threadId }: ComposerProps) {
       />
       <div className="mt-2 flex items-end justify-between gap-3">
         <div className="flex flex-col gap-1">
-          <button
-            type="button"
-            role="switch"
-            aria-checked={thinkingOn}
-            onClick={toggleThinking}
-            className="flex items-center gap-2 text-xs text-gray-700 select-none"
-          >
-            <span
-              className={`relative inline-flex h-5 w-9 shrink-0 items-center border border-black p-0.5 ${
-                thinkingOn ? "bg-[#2563EB]/10" : "bg-card"
-              }`}
-            >
-              <span
-                className={`block h-3.5 w-3.5 border border-black transition-transform ${
-                  thinkingOn
-                    ? "translate-x-4 bg-[#2563EB]"
-                    : "translate-x-0 bg-page"
-                }`}
-              />
-            </span>
-            Thinking（推理）
-          </button>
-          {!thinkingOn ? (
-            <span className="text-xs text-gray-500">本轮将跳过推理轨迹</span>
-          ) : null}
-          {/* ADR 0047: the attach door's picker.
-              This button is attach ONLY — corpus ingest lives in the
-              home corpus area and is never reachable from the
-              composer. */}
-          <span className="flex items-center gap-2">
-            <input
-              ref={attachInputRef}
-              type="file"
-              className="hidden"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                e.target.value = "";
-                if (file) void attach(file);
-              }}
-            />
-            <button
-              type="button"
-              data-testid="attach-file"
-              disabled={attachHeld}
-              title="上传附件（本对话内持续可引用，不入库）"
-              onClick={() => attachInputRef.current?.click()}
-              className="border border-black bg-card px-2 py-0.5 text-xs hover:bg-tool disabled:opacity-50"
-            >
-              {attachBusy ? "上传中…" : "附加文件…"}
-            </button>
-            <span className="text-xs text-gray-400">
-              本对话内持续可引用，不入库
-            </span>
-          </span>
+          <ThinkingSwitch on={thinkingOn} onToggle={toggleThinking} />
+          <AttachFilePicker
+            busy={attachBusy}
+            held={attachHeld}
+            onPick={(file) => void attach(file)}
+          />
           {/* Advice on how to work one filing at a time — not a bound.
               Nothing caps how many attachments a turn may carry, and the
               server owns every byte / page / call limit, so this copy
@@ -516,19 +621,11 @@ export default function Composer({ threadId }: ComposerProps) {
         <span className="text-xs text-gray-500">
           Enter 发送 · Shift+Enter 换行
         </span>
-        {busy ? (
-          <button
-            type="button"
-            data-testid="stop-run"
-            disabled={stopping}
-            onClick={() => {
-              void stopRun(threadId);
-            }}
-            className="border border-black bg-card px-4 py-1.5 text-sm font-medium hover:bg-black hover:text-white disabled:opacity-50"
-          >
-            {stopping ? "停止中…" : "停止"}
-          </button>
-        ) : null}
+        <StopRunButton
+          runVisible={busy}
+          stopping={stopping}
+          onStop={() => void stopRun(threadId)}
+        />
         <button
           type="submit"
           data-testid="composer-send"
