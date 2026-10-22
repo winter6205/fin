@@ -49,6 +49,7 @@ CI 不构成合入门禁：本仓为私有仓库，当前账号套餐不提供 b
 | `.claude/rules/test-storage.md` | 读写匹配 paths 时（`src/fin/host/*_store.py`、`src/fin/corpus/`、`tests/conftest.py` 等） | store、PostgreSQL、`~/.fin`、语料入库 |
 | `.claude/rules/test-model-visible.md` | 读写匹配 paths 时（`src/fin/host/tools/`、`src/fin/eval/`、`tests/eval/` 等） | prompt、工具描述、eval 与记忆黄金集；另读 `docs/guides/prompt-development.md` |
 | `.claude/rules/test-web.md` | 读写匹配 paths 时（`web/`） | 前端改动与 vitest |
+| `.claude/rules/open-source-publish.md` | 发布同步或改写已发布历史时 | 公开镜像同步、历史清洗、发布前验收 |
 
 ## 按需查阅
 

@@ -23,4 +23,4 @@ test -r "${RELEASES_DIR:?}/internal-patterns.txt" && git grep -n -I -i -E -f "${
 rg -n -uu -P --glob '!.git/' --glob '!**/node_modules/**' --glob '!.venv/' 'projects/release[s]|/home/(?!operator/)[A-Za-z0-9._-]+/|/Users/[A-Za-z0-9._-]+/|/mnt/(?!c/)[a-z]/|\b[A-Z]:\\' .
 ```
 
-- 发布前在发布工作区再跑：上面第一条、`git rev-list --all | xargs -r -n 100 git grep -l -I -E -f "${RELEASES_DIR:?}/internal-patterns.txt"`（历史）、`ls -a | rg '^\.env' | rg -v '\.env\.(example|sample)$'`，任一有输出即停止发布，把结果附在批准请求里。
+- 发布前在发布工作区再跑：上面第一条、`git rev-list --all | xargs -r -n 100 git grep -l -I -E -f "${RELEASES_DIR:?}/internal-patterns.txt"`（历史）、`ls -a | rg '^\.env' | rg -v '\.env\.(example|sample)$'`，任一有输出即停止发布，把结果附在批准请求里；发布流程、引用卫生、强制推送与验收口径见 `.claude/rules/open-source-publish.md`。
