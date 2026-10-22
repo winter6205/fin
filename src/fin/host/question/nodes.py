@@ -71,6 +71,36 @@ class _OperatorPick(Protocol):
 
 
 @dataclass(frozen=True)
+class ClarifyToolCall:
+    """One accepted clarify tool call and the identities it carries.
+
+    The execution attempt counts the DISPATCHES of the logical call, not
+    the model attempts that produced it; the logical call id and the
+    model attempt are the identity the ledger files the facts under.
+    """
+
+    name: str
+    args: dict
+    tool_call_id: str
+    logical_call_id: str
+    model_attempt: int
+    execution_attempt: int
+
+
+@dataclass(frozen=True)
+class ClarifyToolValidation:
+    """The outcome of validating one clarify turn's pending tool calls.
+
+    ``accepted`` are the calls the canonical contract allows to run;
+    ``refusals`` are the value-free answers the rejected calls get, in
+    the order the model emitted them.
+    """
+
+    accepted: list[ClarifyToolCall]
+    refusals: list[tuple[str, BaseMessage]]
+
+
+@dataclass(frozen=True)
 class QuestionNodeDeps:
     """Everything the QUESTION nodes need from the host composition root.
 
@@ -87,6 +117,20 @@ class QuestionNodeDeps:
     read_profile_text: Callable[[], str]
     clarify_binding: _ClarifyBinding
     clarify_tool_dispatcher: ToolNode
+    #: The validation of the clarify lane's pending tool calls, run by
+    #: the composition root against the canonical contracts. The rejected
+    #: calls are answered with the value-free payload the ordinary tool
+    #: lane uses, never with a raw-kwargs rendering.
+    validate_clarify_tool_calls: Callable[
+        [RunnableConfig, AgentState, list[tuple[str, dict, str]]],
+        ClarifyToolValidation,
+    ]
+    #: The terminal facts of the clarify lane's dispatch, recorded after
+    #: the tools answered.
+    record_clarify_tool_execution: Callable[
+        [RunnableConfig, Sequence[ClarifyToolCall], Sequence[BaseMessage]],
+        None,
+    ]
     list_files_tool: BaseTool
     step_cap: int
     cpath: Path
@@ -199,6 +243,50 @@ def _non_research_leaf(
     }
 
 
+def _only_tool_calls(message: AIMessage, call_ids: set[str]) -> AIMessage:
+    """The message with only the accepted tool calls declared.
+
+    The rejected calls are answered by the host, so the dispatcher must
+    not see them: a rejected call that reached the tool body would run
+    with arguments the canonical contract already refused.
+    """
+    return message.model_copy(
+        update={
+            "tool_calls": [
+                call
+                for call in message.tool_calls
+                if str(call.get("id") or "") in call_ids
+            ]
+        }
+    )
+
+
+def _tool_messages_in_call_order(
+    pending: Sequence[tuple[str, dict, str]],
+    dispatched: Sequence[BaseMessage],
+) -> list[BaseMessage]:
+    """The tool answers in the order the model emitted the calls.
+
+    A real result and a validation refusal answer the same call id, so
+    the order follows the calls, not the arrival of the messages.
+    """
+    by_call: dict[str, list[BaseMessage]] = {}
+    extra: list[BaseMessage] = []
+    for message in dispatched:
+        call_id = str(getattr(message, "tool_call_id", "") or "")
+        if call_id:
+            by_call.setdefault(call_id, []).append(message)
+        else:
+            extra.append(message)
+    ordered: list[BaseMessage] = []
+    for _, _, call_id in pending:
+        ordered.extend(by_call.pop(call_id, []))
+    for leftover in by_call.values():
+        ordered.extend(leftover)
+    ordered.extend(extra)
+    return ordered
+
+
 def _clarify_leaf(
     deps: QuestionNodeDeps,
     state: AgentState,
@@ -260,9 +348,40 @@ def _clarify_leaf(
             **cast("dict[str, Any]", state),
             "messages": [*list(state.get("messages") or []), first],
         }
-        raw_update: Any = deps.clarify_tool_dispatcher.invoke(pending_state)
-        merged = deps.fold_tool_update(raw_update)
-        messages = [*messages, *merged["messages"]]
+        # The pending call is validated against its canonical contract
+        # BEFORE the dispatcher sees it: a rejected call is answered with
+        # the value-free payload the ordinary tool lane uses, so the
+        # model never reads a raw-kwargs rendering of its own arguments.
+        validation = deps.validate_clarify_tool_calls(
+            config,
+            state,
+            deps.pending_tool_calls(cast(AgentState, pending_state)),
+        )
+        accepted_ids = {call.tool_call_id for call in validation.accepted}
+        if validation.accepted:
+            dispatch_state: dict[str, Any] = {
+                **cast("dict[str, Any]", state),
+                "messages": [
+                    *list(state.get("messages") or []),
+                    _only_tool_calls(first, accepted_ids),
+                ],
+            }
+            raw_update: Any = deps.clarify_tool_dispatcher.invoke(
+                dispatch_state
+            )
+            merged = deps.fold_tool_update(raw_update)
+            tool_messages = _tool_messages_in_call_order(
+                deps.pending_tool_calls(cast(AgentState, pending_state)),
+                [*merged["messages"], *(m for _, m in validation.refusals)],
+            )
+        else:
+            tool_messages = [
+                message for _, message in validation.refusals
+            ]
+        deps.record_clarify_tool_execution(
+            config, validation.accepted, tool_messages
+        )
+        messages = [*messages, *tool_messages]
         step += 1
         if step >= deps.step_cap:
             return {
@@ -292,7 +411,7 @@ def _clarify_leaf(
         # ``_model_messages()`` built.
         stream = stream_model_call(
             bound,
-            _model_messages() + [first, *list(merged["messages"])],
+            _model_messages() + [first, *tool_messages],
         )
         final = assemble_final_ai_message(stream)
         if deps.has_provider_policy_refusal(final):
@@ -792,6 +911,8 @@ def build_document_choice_interrupt_node(
 
 
 __all__ = [
+    "ClarifyToolCall",
+    "ClarifyToolValidation",
     "QuestionNodeDeps",
     "build_catalog_overview_node",
     "build_clarify_node",

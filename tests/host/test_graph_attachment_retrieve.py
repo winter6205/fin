@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import sys
 import types
+import uuid
 from dataclasses import dataclass
 from typing import Any, Iterator
 
@@ -210,7 +211,14 @@ def _run(graph: Any, thread_id: str, args: dict[str, Any] | None = None) -> dict
         graph.test_model.script = _script(args)
     return graph.invoke(
         reset_input_state(GROUNDED),
-        config={"configurable": {"thread_id": thread_id}},
+        # A fresh run id keeps the process-local tool-correction registry
+        # from carrying one test's correction state into another's run.
+        config={
+            "configurable": {
+                "thread_id": thread_id,
+                "run_id": f"test-run-{uuid.uuid4()}",
+            }
+        },
     )
 
 
@@ -399,20 +407,26 @@ def test_a_model_supplied_thread_id_cannot_redirect_scope() -> None:
     )
     graph = _compile(attachment_retriever=retriever)
 
-    envelope = _envelope(
-        _run(
-            graph,
-            _THREAD_A,
-            args={"query": GROUNDED, "thread_id": _THREAD_B},
-        )
+    out = _run(
+        graph,
+        _THREAD_A,
+        args={"query": GROUNDED, "thread_id": _THREAD_B},
     )
 
-    ids = [c["source_ref"]["attachment_id"] for c in envelope["attachment_chunks"]]
-    assert ids == ["att-a"]
-    assert retriever.calls[0]["thread_id"] == _THREAD_A
-    serialized = json.dumps(envelope)
-    assert "B only text" not in serialized
-    assert "att-b" not in serialized
+    # P3 T2: the forged key is not a declared argument, so the canonical
+    # schema refuses the call BEFORE the port is reached.
+    messages = [
+        message
+        for message in out["messages"]
+        if isinstance(message, ToolMessage)
+        and getattr(message, "name", None) == "retrieve"
+    ]
+    assert len(messages) == 1, messages
+    payload = json.loads(str(messages[0].content))
+    assert payload["error"] == "invalid_tool_arguments"
+    assert "thread_id" in payload["feedback"]
+    assert _THREAD_B not in str(messages[0].content)
+    assert retriever.calls == []
 
 
 # ---------------------------------------------------------------------------

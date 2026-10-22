@@ -13,7 +13,7 @@
 
 - 模块地图（context map）是 `docs/context-map.md`，术语以 `docs/CONTEXT.md` 为准；新代码放进对应现有上下文，新建上下文或改依赖方向先给计划，确认后同步更新这两份文档。
 - host 按业务能力成包：`src/fin/host/{application,attachment,evidence,grounded,question,session,task}/`；能力包不 import `fin.host.http`、`fin.host.application` 与图编译入口，能力之间的依赖边必须与 `scripts/check_capability_boundaries.py` 登记的一致。
-- 上一条里的"能力包"指 attachment、evidence、grounded、question、session、task 六个能力包。`src/fin/host/application/` 是应用边界，拥有应用组装与生命周期，按计划 T3 它要 import 图组装入口（`src/fin/host/application/composition.py` 从 `fin.host.graph` import `compile_graph`），因此豁免"不 import 图编译入口"这一条；其余六个能力包不豁免，也不得 import `fin.host.application`。
+- 上一条里的"能力包"指 attachment、evidence、grounded、question、runtime、session、task 七个能力包。`src/fin/host/application/` 是应用边界，拥有应用组装与生命周期，按计划 T3 它要 import 图组装入口（`src/fin/host/application/composition.py` 从 `fin.host.graph` import `compile_graph`），因此豁免"不 import 图编译入口"这一条；其余七个能力包不豁免，也不得 import `fin.host.application`。
 - 环境变量读取分散在多个文件，没有统一配置模块；新代码读环境变量要有默认值或缺失时明确报错，不新建配置模块（除非用户要求）。
 - 运行期开发数据落在 `~/.fin/` 和 `data/corpus/`；路径一律可注入，新代码不直接回退到 `$HOME`。
 

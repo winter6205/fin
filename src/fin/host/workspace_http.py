@@ -358,6 +358,17 @@ from fin.host.grounded.route_intent import (
     normalize_route_source,
 )
 from fin.host.run_control import RunAdmission, RunControl, StopToken
+from fin.host.runtime.admission import RuntimeCoordinator
+from fin.host.runtime.schema import (
+    AcceptanceRecord,
+    AttemptLease,
+    ClaimOutcome,
+    InvalidOperation,
+    OperationConflict,
+    QueueCapacityExceeded,
+    RuntimeStoreError,
+    payload_digest,
+)
 from fin.host.turn_receipts import TurnReceiptProjector, default_receipts
 from fin.host.run_execution import (
     ResumeRunRequest,
@@ -610,6 +621,11 @@ class CreateThreadResponse(BaseModel):
 
 class SendMessageRequest(BaseModel):
     question: str
+    # P1 RT-1: the client's stable identity for this intent. Omitted (the
+    # default) lets the door key the durable operation on the run id it
+    # mints, so a pre-P1 client keeps working; a supplied id makes a lost
+    # response a replay instead of a second run.
+    operation_id: str | None = None
     # T3 (spec line 27): operator's "Think step by step" toggle.
     # ``True`` (or omitted, the default) routes to ``adaptive`` thinking;
     # ``False`` flips the model to ``disabled`` for this run. The route
@@ -714,6 +730,9 @@ class ResumeRequest(BaseModel):
 
     pick: str | None = None
     free_text: str | None = None
+    # P1 RT-1: stable client identity for this resume intent; omitted keys
+    # the durable operation on the resumed run id.
+    operation_id: str | None = None
 
 
 class CreateWatchRequest(BaseModel):
@@ -2314,6 +2333,149 @@ def _format_sse(event: str, data: Any) -> str:
 
 
 
+#: One worker identity per process. Every claim this door makes names the
+#: same worker, which is what lets PostgreSQL fence two processes apart
+#: without this module inventing a per-request identity.
+_RUNTIME_WORKER_ID: Final[str] = f"workspace-http-{os.getpid()}"
+
+
+def _runtime_of(graph: Any) -> RuntimeCoordinator | None:
+    """The durable coordinator a production compile carries; ``None`` in tests."""
+    return getattr(graph, "runtime", None)
+
+
+def _runtime_send_input(body: SendMessageRequest) -> dict[str, Any]:
+    """The accepted-input subset of a send. No resolved attachment text."""
+    return {
+        "question": body.question,
+        "free_text": body.free_text,
+        "choice_id": body.choice_id,
+        "question_id": body.question_id,
+        "origin_run_id": body.origin_run_id,
+        "attachment_ids": list(body.attachment_ids or []),
+        "tiers": list(body.tiers or []),
+        "thinking": body.thinking,
+        "restore_archive_id": body.restore_archive_id,
+        "propose_extract_method": body.propose_extract_method,
+        "propose_document_id": body.propose_document_id,
+        "propose_version": body.propose_version,
+    }
+
+
+def _runtime_resume_input(body: "ResumeRequest | None") -> dict[str, Any]:
+    return {
+        "pick": body.pick if body is not None else None,
+        "free_text": body.free_text if body is not None else None,
+    }
+
+
+def _derived_operation_id(
+    run_id: str, kind: str, accepted_input: Mapping[str, Any]
+) -> str:
+    """The durable key of one intent on a run, derived from its input.
+
+    A paused run may be resumed or replied to more than once, so the key
+    carries the digest of the accepted input: an identical retry replays
+    under the same key and a distinct intent gets its own operation instead
+    of colliding with the first one.
+    """
+    return f"{run_id}:{kind}:{payload_digest(accepted_input)}"
+
+
+def _runtime_error_response(exc: RuntimeStoreError) -> JSONResponse:
+    """The typed admission refusal, before any SSE header is written."""
+    if isinstance(exc, OperationConflict):
+        return JSONResponse(
+            status_code=409, content={"error": "operation_conflict"}
+        )
+    if isinstance(exc, QueueCapacityExceeded):
+        return JSONResponse(
+            status_code=429, content={"error": "queue_capacity_exceeded"}
+        )
+    if isinstance(exc, InvalidOperation):
+        if exc.field == "run_id" and exc.reason == "terminal":
+            # A reply or resume named a run that already ended. That is a
+            # conflict with the durable state, not malformed input.
+            return JSONResponse(
+                status_code=409, content={"error": "run_terminal"}
+            )
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_operation", "field": exc.field},
+        )
+    return JSONResponse(
+        status_code=503, content={"error": "runtime_unavailable"}
+    )
+
+
+def _runtime_replay_response(record: AcceptanceRecord) -> JSONResponse:
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "replayed",
+            "run_id": record.run_id,
+            "fifo_position": record.fifo_position,
+            "state": record.state,
+            "result": record.result,
+        },
+    )
+
+
+def _runtime_claim_response(claim: ClaimOutcome) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={"error": "run_not_claimable", "reason": claim.reason},
+    )
+
+
+def _accept_runtime_operation(
+    runtime: RuntimeCoordinator,
+    *,
+    operation_id: str,
+    thread_id: str,
+    accepted_input: Mapping[str, object],
+    run_id: str,
+) -> AcceptanceRecord | JSONResponse:
+    """Commit the operation before any receipt or run work."""
+    try:
+        return runtime.accept(
+            operation_id=operation_id,
+            thread_id=thread_id,
+            accepted_input=accepted_input,
+            notification_intent={"kind": "assistant_stream"},
+            run_id=run_id,
+        )
+    except RuntimeStoreError as exc:
+        return _runtime_error_response(exc)
+
+
+def _claim_runtime_run(
+    runtime: RuntimeCoordinator, *, thread_id: str, run_id: str
+) -> AttemptLease | JSONResponse:
+    """Claim the accepted run as this process's worker attempt."""
+    claim = runtime.claim(
+        thread_id=thread_id,
+        worker_id=_RUNTIME_WORKER_ID,
+        run_id=run_id,
+    )
+    if not claim.claimed or claim.lease is None:
+        return _runtime_claim_response(claim)
+    return claim.lease
+
+
+def _runtime_stream_error_frame(run_id: str, reason: str) -> Iterator[str]:
+    """One terminal frame for a background run that never started."""
+    yield _format_sse(
+        "status",
+        {
+            "run_id": run_id,
+            "status": "refuse",
+            "reason": reason,
+            "assistant_message": "",
+        },
+    )
+
+
 def _resume_run_stream(
     graph: Any,
     store: ThreadStore,
@@ -2325,6 +2487,7 @@ def _resume_run_stream(
     resume_config: dict[str, Any],
     receipts: TurnReceiptProjector | None = None,
     attachments: AttachmentPreparationService | None = None,
+    operation_input: Mapping[str, object] | None = None,
 ) -> Iterator[str]:
     """Drive one background resumed run to its turn row, discarding the wire.
 
@@ -2342,12 +2505,55 @@ def _resume_run_stream(
     turn's receipt rather than starting a projection of its own.
     """
 
+    runtime = _runtime_of(graph)
+    attempt: AttemptLease | None = None
+    if runtime is not None:
+        accepted_input: Mapping[str, object] = (
+            operation_input
+            if operation_input is not None
+            else {"kind": "resume", "resume": str(resume_input)}
+        )
+        record = _accept_runtime_operation(
+            runtime,
+            # Distinct from the operator resume's key (which carries the
+            # reply body): the auto-resumer's own intent must not conflict
+            # with the same run's operator acceptance, and the digest keeps
+            # a repeated notification on the same operation.
+            operation_id=_derived_operation_id(
+                run_id, "auto-resume", accepted_input
+            ),
+            thread_id=thread_id,
+            accepted_input=accepted_input,
+            run_id=run_id,
+        )
+        if isinstance(record, JSONResponse):
+            logger.warning(
+                "background resume of run %s was not accepted", run_id
+            )
+            return _runtime_stream_error_frame(run_id, "runtime_unavailable")
+        if record.replay:
+            # A duplicate notification must not drive the same resume twice.
+            logger.info("background resume of run %s is a replay; skipped", run_id)
+            return iter(())
+        claimed = _claim_runtime_run(
+            runtime, thread_id=thread_id, run_id=record.run_id
+        )
+        if isinstance(claimed, JSONResponse):
+            # The paused run still holds a reservation this process could
+            # not take; running unfenced would write checkpoints it does
+            # not own. Leave the durable acceptance for a later worker.
+            logger.warning(
+                "background resume of run %s could not claim the run", run_id
+            )
+            return _runtime_stream_error_frame(run_id, "run_not_claimable")
+        attempt = claimed
     executor = RunExecutor(
         graph=graph,
         store=store,
         run_control=run_control,
         receipts=receipts,
         publication_warnings=_publication_warnings(attachments),
+        runtime=runtime,
     )
     return _sse_frames(
         executor.resume(
@@ -2356,6 +2562,7 @@ def _resume_run_stream(
                 run_id=run_id,
                 resume_input=resume_input,
                 resume_config=resume_config,
+                attempt=attempt,
             )
         )
     )
@@ -4498,6 +4705,10 @@ def _resume_one_attachment_wait(
         resume_config=resume_config,
         receipts=receipts,
         attachments=service,
+        operation_input={
+            "kind": "resume",
+            "attachment_ids": [str(a) for a in payload.get("attachment_ids") or ()],
+        },
     ):
         pass
     return True
@@ -5047,6 +5258,23 @@ def build_router(
         admission = run_control.admit(thread_id)
         try:
             ensure_thread_occupancy(graph, thread_id)
+            # P1: fence the durable Runtime before any metadata or history
+            # is removed, so a late worker cannot recreate state for a
+            # thread this delete is retiring.
+            runtime = _runtime_of(graph)
+            if runtime is not None:
+                try:
+                    runtime.tombstone_thread(thread_id=thread_id)
+                except RuntimeStoreError:
+                    logger.exception(
+                        "delete_thread: runtime tombstone failed for "
+                        "thread_id=%s",
+                        thread_id,
+                    )
+                    return cast(dict, JSONResponse(
+                        status_code=500,
+                        content={"error": "thread_delete_failed"},
+                    ))
             # The thread's attachments are voided first, and their bytes are
             # removed only behind that tombstone. An attachment that outlived its
             # thread would keep searchable text a deleted research thread owned,
@@ -5164,6 +5392,9 @@ def build_router(
         request raises ``ConcurrentRunError`` -> plain 409
         ``application/json`` BEFORE any event-stream headers.
         """
+        # Resolved once per request: a production boot carries the durable
+        # coordinator, a test graph carries none and keeps the old path.
+        runtime = _runtime_of(graph)
         # Empty question is a no-op per spec (composer guard):
         # 204 with no body, no graph invoke, no SSE.
         #
@@ -5342,7 +5573,7 @@ def build_router(
             collector=collector,
             receipts=receipts,
             publication_warnings=_publication_warnings(attachments),
-
+            runtime=runtime,
         )
         # ONE serialized admission section per thread: read pending state,
         # decide what this send is, accept its input, and run — with no
@@ -5403,6 +5634,44 @@ def build_router(
             )
             continued = reply_plan.continued
             if continued is not None:
+                # P1 RT-1: the reply is its own durable operation before the
+                # receipt projects it. The continued run is claimed as this
+                # process's new fenced attempt.
+                attempt: AttemptLease | None = None
+                send_input = _runtime_send_input(body)
+                if runtime is not None:
+                    record = _accept_runtime_operation(
+                        runtime,
+                        # A reply is its own intent on the paused run. The
+                        # original send defaulted its key to the run id, so
+                        # reusing it here would resubmit a different payload
+                        # under that key and conflict; the digest suffix
+                        # keeps a retried reply a replay and a second,
+                        # different reply its own operation.
+                        operation_id=(
+                            body.operation_id
+                            if body.operation_id is not None
+                            else _derived_operation_id(
+                                continued.run_id, "reply", send_input
+                            )
+                        ),
+                        thread_id=thread_id,
+                        accepted_input=send_input,
+                        run_id=continued.run_id,
+                    )
+                    if isinstance(record, JSONResponse):
+                        admission.release()
+                        return record
+                    if record.replay:
+                        admission.release()
+                        return _runtime_replay_response(record)
+                    claimed = _claim_runtime_run(
+                        runtime, thread_id=thread_id, run_id=record.run_id
+                    )
+                    if isinstance(claimed, JSONResponse):
+                        admission.release()
+                        return claimed
+                    attempt = claimed
                 # The reply is already accepted by Task Runtime; this is
                 # the receipt's projection of that one acceptance, on the
                 # SAME turn the paused run already owns.
@@ -5438,6 +5707,7 @@ def build_router(
                                 resume_config=continued.resume_config,
                                 admission=admission,
                                 stop_token=continued_token,
+                                attempt=attempt,
                             )
 
                         )
@@ -5468,6 +5738,35 @@ def build_router(
             # ``concurrent_run`` answer — placed BEFORE the attachment
             # consumption below, so a rejected send keeps its attachments.
             executor.assert_no_pending_choice(thread_id)
+
+            # P1 RT-1: the operation is durably accepted BEFORE the receipt
+            # and before any graph work. A lost response resubmitted with
+            # the same identity replays the prior result instead of
+            # starting a second run; a same-key/different-payload intent
+            # conflicts. The claim below is what turns the accepted run
+            # into this process's worker attempt.
+            attempt: AttemptLease | None = None
+            if runtime is not None:
+                record = _accept_runtime_operation(
+                    runtime,
+                    # An explicit empty id is refused by the store as
+                    # invalid instead of being replaced by the run id.
+                    operation_id=(
+                        body.operation_id
+                        if body.operation_id is not None
+                        else run_id
+                    ),
+                    thread_id=thread_id,
+                    accepted_input=_runtime_send_input(body),
+                    run_id=run_id,
+                )
+                if isinstance(record, JSONResponse):
+                    admission.release()
+                    return record
+                if record.replay:
+                    admission.release()
+                    return _runtime_replay_response(record)
+                run_id = record.run_id
 
             # T2: the input state ALWAYS resets the run-scoped fields
             # (``reset_input_state`` clears ``evidence`` — impossible
@@ -5567,6 +5866,17 @@ def build_router(
                 turn_question = _clarify_reply_turn_question(
                     pending_clarify, accepted_task_input, committed_runtime
                 )
+            if runtime is not None:
+                # Claimed after every synchronous refusal and before the
+                # receipt exists: a refused claim leaves the durable
+                # acceptance intact for a later worker and starts nothing.
+                claimed = _claim_runtime_run(
+                    runtime, thread_id=thread_id, run_id=run_id
+                )
+                if isinstance(claimed, JSONResponse):
+                    admission.release()
+                    return claimed
+                attempt = claimed
             receipts.begin(
                 thread_id=thread_id,
                 turn_id=run_id,
@@ -5624,6 +5934,7 @@ def build_router(
                             thinking_type=thinking_type,
                             admission=admission,
                             stop_token=stop_token,
+                            attempt=attempt,
                         )
                     )
                 )
@@ -6009,12 +6320,14 @@ def build_router(
         # exception handler emit 409 with application/json. The same
         # serialized claim the send door takes, so a resume cannot be
         # admitted where a send would be refused.
+        runtime = _runtime_of(graph)
         executor = RunExecutor(
             graph=graph,
             store=store,
             run_control=run_control,
             receipts=receipts,
             publication_warnings=_publication_warnings(attachments),
+            runtime=runtime,
         )
         admission = run_control.admit(thread_id, stop_pending=True)
         try:
@@ -6136,6 +6449,40 @@ def build_router(
             else (Command(resume=pick) if pick is not None else None)
         )
 
+        # P1 RT-1: the resume is its own durable operation keyed on the
+        # resumed run id, and the run is claimed as a new fenced attempt
+        # before the stream is created.
+        runtime = _runtime_of(graph)
+        attempt: AttemptLease | None = None
+        if runtime is not None:
+            # The resume intent needs its own key: the original send used
+            # the run id, and a resume carries a different payload. The
+            # digest lets a second, different resume of the same run take
+            # its own operation. A supplied client identity still wins.
+            resume_accepted_input = _runtime_resume_input(body)
+            operation_id = (
+                body.operation_id
+                if body is not None and body.operation_id is not None
+                else _derived_operation_id(run_id, "resume", resume_accepted_input)
+            )
+            record = _accept_runtime_operation(
+                runtime,
+                operation_id=operation_id,
+                thread_id=thread_id,
+                accepted_input=resume_accepted_input,
+                run_id=run_id,
+            )
+            if isinstance(record, JSONResponse):
+                return refuse(record)
+            if record.replay:
+                return refuse(_runtime_replay_response(record))
+            claimed = _claim_runtime_run(
+                runtime, thread_id=thread_id, run_id=record.run_id
+            )
+            if isinstance(claimed, JSONResponse):
+                return refuse(claimed)
+            attempt = claimed
+
         resume_token = run_control.begin(
             thread_id, run_id, admission=admission
         )
@@ -6160,6 +6507,7 @@ def build_router(
                         resume_config=resume_config,
                         admission=admission,
                         stop_token=resume_token,
+                        attempt=attempt,
                     )
                 )
             )

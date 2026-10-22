@@ -92,6 +92,7 @@ from fin.host.tools.issuer_fanout import (
     MAX_ISSUERS,
     issuer_query,
 )
+from fin.host.tools.validation import validate_tool_arguments
 from fin.retrieve import Chunk
 from fin.retrieve.fake_port import FakeRetrievePort
 from fin.retrieve.source_read import ATTACHMENT_KIND
@@ -1375,10 +1376,19 @@ def test_a_locator_tool_gate_refusal_short_circuits_the_impl() -> None:
     shape — the refusal with no corpus narrowing — which is what the wrapper
     forwards unchanged.
     """
+    # ``_make_locator_tool`` binds the registered canonical contract's args
+    # model (fail-closed for an unregistered name), so the probe must carry a
+    # real tool name and the full model's parameters, and its call must pass
+    # that model. The subject is still the gate's short-circuit.
     spec = _LocatorToolSpec(
-        name="probe_scope",
+        name="compare_facts",
         description="probe",
-        signature="concept: str = ''",
+        signature=(
+            "concept: str, "
+            "periods: list[str], "
+            "document_ids: list[str] | None = None, "
+            "issuers: list[str] | None = None"
+        ),
         impl_module="fin.host.tools.compare_facts",
         impl_attr="__no_such_impl_so_a_read_would_raise__",
         factory_kwargs={},
@@ -1387,9 +1397,9 @@ def test_a_locator_tool_gate_refusal_short_circuits_the_impl() -> None:
 
     tool = _make_locator_tool(spec)
 
-    assert tool.invoke({"concept": "us-gaap:Revenues"}) == {
-        "error": SCOPE_DEPENDENCY_FAILED
-    }
+    assert tool.invoke(
+        {"concept": "us-gaap:Revenues", "periods": ["FY2023"]}
+    ) == {"error": SCOPE_DEPENDENCY_FAILED}
 
 
 def test_the_company_seam_answers_the_branch_ruling_it_promised() -> None:
@@ -1892,32 +1902,42 @@ def test_an_empty_selection_is_honored_and_never_broadened() -> None:
 
 def test_a_locator_that_names_no_resolvable_source_is_refused_as_unreadable() -> None:
     """Invalid input on the read surface: a name or version no authority can
-    honor is refused as unreadable, and no read is attempted for any shape.
+    honor is refused, and no read is attempted for any shape.
 
-    Whitespace and a non-string name no attachment carries, and a negative,
-    non-canonical, or absent version, are all input that cannot address a
-    source — distinct from a denial, which would mean the host could have
-    named a permitted source and chose not to.
+    P3 makes the canonical contract the single validation boundary, so a
+    malformed ref is refused there (the model receives
+    ``invalid_tool_arguments``) before the tool body runs — the same "no read
+    for any shape" contract, proved at the boundary that now owns it. A blank
+    name is shape-VALID (the schema owns shape; naming a source is the body's
+    own rule), so it still reaches the body's typed unreadable refusal and
+    keeps that semantic path covered. Both remain distinct from a denial,
+    which would mean the host could have named a permitted source and chose
+    not to.
     """
     _threads, store, thread_id = _store_with_ready("att-1")
     leg = _RecordingReader()
     tool = _make_read_source_tool(
         None, lambda bound: leg, attachment_service=_Service(store)
     )
-    invalid = [
-        {**_attachment_ref("att-1"), "attachment_id": "   "},
+    # Whitespace passes the schema's length bound but names no source.
+    blank_name = {**_attachment_ref("att-1"), "attachment_id": "   "}
+    blank = _read_source_payload(
+        _invoke_read_source(tool, source_ref=blank_name, thread_id=thread_id)
+    )
+    # A non-string name no attachment carries, and a negative, non-canonical,
+    # or absent version, are all refused by the canonical contract.
+    shape_violations = [
         {**_attachment_ref("att-1"), "attachment_id": 1234},
         _attachment_ref("att-1", version=-1),
         _attachment_ref("att-1", version="01"),
         _attachment_ref("att-1", version="+1"),
         _attachment_ref("att-1", version=None),
     ]
-
-    payloads = [
-        _read_source_payload(
-            _invoke_read_source(tool, source_ref=ref, thread_id=thread_id)
+    refusals = [
+        validate_tool_arguments(
+            "read_source", {"source_ref": ref, "position": 0}
         )
-        for ref in invalid
+        for ref in shape_violations
     ]
     # The well-formed locator on the same wiring still reads, so the refusals
     # above cannot be an always-refuse artifact.
@@ -1927,7 +1947,10 @@ def test_a_locator_that_names_no_resolvable_source_is_refused_as_unreadable() ->
         )
     )
 
-    assert payloads == [{"error": SCOPE_SOURCE_REF_UNREADABLE}] * len(invalid)
+    assert blank == {"error": SCOPE_SOURCE_REF_UNREADABLE}
+    assert [result.ok for result in refusals] == [False] * len(shape_violations)
+    assert all(result.args is None for result in refusals)
+    assert all("source_ref" in (result.feedback or "") for result in refusals)
     assert "error" not in readable
     assert len(leg.calls) == 1
 

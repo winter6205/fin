@@ -32,15 +32,18 @@ disagree with the outcome.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import re
+import threading
 import time
 from contextlib import nullcontext
 from collections.abc import Callable, Generator, Iterator, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Final, cast
+from typing import Any, Final, TYPE_CHECKING, cast
 
 from langchain_core.messages import AIMessage, AIMessageChunk, SystemMessage, ToolMessage
 
@@ -114,6 +117,15 @@ from fin.host.turn_receipts import (
     failure_token,
 )
 from fin.host.evidence.visual_evidence import VISUAL_CLAIM_FIELDS
+from fin.host.runtime.schema import (
+    AttemptLease,
+    CheckpointOwnershipLost,
+    RunEndOutcome,
+    RuntimeStoreError,
+)
+
+if TYPE_CHECKING:
+    from fin.host.runtime.admission import RuntimeCoordinator
 
 
 logger = logging.getLogger(__name__)
@@ -1291,6 +1303,11 @@ class RunRequest:
     # response object is built would reopen the very window it closed.
     admission: RunAdmission | None = None
     stop_token: StopToken | None = None
+    # P1 T2: the worker attempt the door already claimed for this run. The
+    # door owns acceptance and the claim; the executor only consumes the
+    # lease and injects its identity into the graph config. ``None`` keeps
+    # every pre-P1 caller on the process-local path.
+    attempt: AttemptLease | None = None
 
 
 @dataclass(frozen=True)
@@ -1311,6 +1328,108 @@ class ResumeRunRequest:
     # As on ``RunRequest``: the door's claim, released with the stream.
     admission: RunAdmission | None = None
     stop_token: StopToken | None = None
+    # As on ``RunRequest``: the fenced worker attempt for this execution.
+    attempt: AttemptLease | None = None
+
+
+def _runtime_identity_config(
+    config: dict[str, Any], attempt: AttemptLease
+) -> dict[str, Any]:
+    """Copy one request config and add the worker attempt's identity.
+
+    The checkpointer's fencing adapter reads exactly these four keys off
+    ``configurable``. The request's own config is copied rather than
+    mutated: a caller may hand the same dict to a later call, and the
+    identity belongs to THIS attempt.
+    """
+    copied = dict(config)
+    configurable = dict(copied.get("configurable") or {})
+    configurable["runtime_run_id"] = attempt.run_id
+    configurable["runtime_attempt_id"] = attempt.attempt_id
+    configurable["runtime_attempt_generation"] = attempt.attempt_generation
+    configurable["thread_generation"] = attempt.thread_generation
+    copied["configurable"] = configurable
+    return copied
+
+
+def _renew_interval_seconds(attempt: AttemptLease) -> float:
+    """Renew at a third of the lease this claim observed, never under 1s.
+
+    The lease row was written by the claim a moment ago, so its remaining
+    time is the configured lease. A later claim whose clock says less
+    renews more often, which is safe; the coordinator's own setting is
+    what the renewal extends by.
+    """
+    remaining = (
+        attempt.lease_expires_at - datetime.now(timezone.utc)
+    ).total_seconds()
+    return max(1.0, max(remaining, 0.0) / 3.0)
+
+
+def _json_safe(value: Any) -> Any:
+    """A JSON-shaped copy of one durable document.
+
+    ``evidence`` is a list of dataclasses (``EvidenceItem`` with its own
+    ``Locator``), which the store's JSON binding cannot take directly.
+    The projection is the same information in its wire shape, not a
+    second authority.
+    """
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _json_safe(dataclasses.asdict(value))
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, Enum):
+        return value.value
+    return value
+
+
+class _LeaseKeepalive:
+    """Renew one worker attempt while its graph run is still working.
+
+    The lease is what fences a concurrent takeover: if this thread cannot
+    renew, it stops trying and the worker's next terminal commit is
+    rejected by the store. It never invents a successful renewal.
+    """
+
+    def __init__(
+        self, runtime: "RuntimeCoordinator", attempt: AttemptLease
+    ) -> None:
+        self._runtime = runtime
+        self._attempt = attempt
+        self._interval = _renew_interval_seconds(attempt)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._beat,
+            name=f"runtime-lease-{attempt.attempt_id}",
+            daemon=True,
+        )
+
+    def start(self) -> "_LeaseKeepalive":
+        self._thread.start()
+        return self
+
+    def _beat(self) -> None:
+        while not self._stop.wait(self._interval):
+            try:
+                renewed = self._runtime.renew(
+                    attempt_id=self._attempt.attempt_id
+                )
+            except Exception:
+                logger.warning(
+                    "run %s: lease renewal failed; stopping the keepalive",
+                    self._attempt.run_id,
+                    exc_info=True,
+                )
+                return
+            if not renewed.renewed:
+                return
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=5.0)
 
 
 def ensure_thread_occupancy(graph: Any, thread_id: str) -> None:
@@ -1378,6 +1497,7 @@ class RunExecutor:
         budgets: RunBudgets | None = None,
         receipts: TurnReceiptProjector | None = None,
         publication_warnings: Callable[[str], int] | None = None,
+        runtime: "RuntimeCoordinator | None" = None,
     ) -> None:
         self._graph = graph
         self._store = store
@@ -1386,6 +1506,7 @@ class RunExecutor:
         self._budgets = budgets
         self._receipts = receipts
         self._publication_warnings = publication_warnings
+        self._runtime = runtime
 
     # ----- admission -----
 
@@ -1420,15 +1541,152 @@ class RunExecutor:
         """
         return self._run_control.admit(thread_id) if admission is None else admission
 
+    def _runtime_attempt(
+        self, request: RunRequest | ResumeRunRequest
+    ) -> AttemptLease | None:
+        return request.attempt if self._runtime is not None else None
+
+    def _start_keepalive(
+        self, request: RunRequest | ResumeRunRequest
+    ) -> _LeaseKeepalive | None:
+        runtime = self._runtime
+        attempt = self._runtime_attempt(request)
+        if runtime is None or attempt is None:
+            return None
+        return _LeaseKeepalive(runtime, attempt).start()
+
+    def _end_runtime_run(
+        self,
+        request: RunRequest | ResumeRunRequest,
+        outcome: RunEndOutcome,
+    ) -> None:
+        """End the durable run; a stale worker's failure must escape."""
+        runtime = self._runtime
+        attempt = self._runtime_attempt(request)
+        if runtime is None or attempt is None:
+            return
+        runtime.end(
+            run_id=request.run_id,
+            outcome=outcome,
+            attempt_id=attempt.attempt_id,
+            attempt_generation=attempt.attempt_generation,
+        )
+
+    def _interrupt_runtime_run(
+        self, request: RunRequest | ResumeRunRequest
+    ) -> None:
+        """Best-effort interrupted end for a run that established nothing.
+
+        A run whose terminal was already committed has ended; ending it a
+        second time must not rewrite that terminal, and a transport failure
+        here must not replace the outcome the run actually reported. The
+        attempt identity is what stops a worker that lost its lease from
+        ending the NEW owner's run.
+        """
+        runtime = self._runtime
+        attempt = self._runtime_attempt(request)
+        if runtime is None or attempt is None:
+            return
+        try:
+            if runtime.store.read_terminal(request.run_id) is not None:
+                return
+            runtime.end(
+                run_id=request.run_id,
+                outcome="interrupted",
+                attempt_id=attempt.attempt_id,
+                attempt_generation=attempt.attempt_generation,
+            )
+        except CheckpointOwnershipLost as exc:
+            # EXIT: this worker no longer owns the run (a takeover moved the
+            # attempt generation), so it must not change the new owner's
+            # state; only the local cleanup continues.
+            logger.warning(
+                "run %s: stale worker could not record the interrupted end (%s)",
+                request.run_id,
+                exc.reason,
+            )
+        except RuntimeStoreError:
+            logger.warning(
+                "run %s: could not record the interrupted end",
+                request.run_id,
+                exc_info=True,
+            )
+
+    def _wait_runtime_attempt(
+        self, request: RunRequest | ResumeRunRequest
+    ) -> None:
+        """Release the worker lease while keeping the thread reservation."""
+        runtime = self._runtime
+        attempt = self._runtime_attempt(request)
+        if runtime is None or attempt is None:
+            return
+        runtime.wait(attempt_id=attempt.attempt_id)
+
+    def _commit_durable_terminal(
+        self,
+        *,
+        run_id: str,
+        attempt: AttemptLease | None,
+        payload: Mapping[str, Any],
+        technical_result: str,
+        semantic_result: str | None,
+        final_state: Mapping[str, Any] | None,
+    ) -> None:
+        """Commit projection, sequence and outbox before the turn row.
+
+        This is the durable terminal the S2 publisher and a restarted
+        process read. It runs before the transcript row and before the
+        terminal event is yielded, so neither can exist without it.
+        ``CheckpointOwnershipLost`` is deliberately not caught: a fenced
+        worker must not persist a row as if it still owned the run.
+        """
+        runtime = self._runtime
+        if runtime is None or attempt is None:
+            return
+        evidence = (
+            final_state.get("evidence") or [] if final_state is not None else []
+        )
+        runtime.store.commit_terminal(
+            run_id=run_id,
+            technical_result=technical_result,
+            semantic_result=semantic_result,
+            payload=dict(payload),
+            evidence={"items": _json_safe(evidence)},
+            projection={
+                "kind": "answer",
+                "status": payload["status"],
+                "answer": payload["answer"],
+                "citations": payload["citations"],
+                "assistant_message": payload["assistant_message"],
+            },
+            outbox_payload={"run_id": run_id, "kind": "terminal"},
+            attempt_id=attempt.attempt_id,
+            attempt_generation=attempt.attempt_generation,
+        )
+
+    def _abandon_outcome(
+        self, request: RunRequest | ResumeRunRequest
+    ) -> None:
+        """End a durable run whose execution produced no outcome.
+
+        The checkpoint is deliberately left pending: an abandoned stream
+        (client disconnect, process teardown) is exactly what crash resume
+        exists for. Only the durable run state stops claiming "running".
+        """
+        self._interrupt_runtime_run(request)
+
     def _finish_run(
         self,
         request: RunRequest | ResumeRunRequest,
         claim: RunAdmission,
         stop_token: StopToken | None,
         outcome: RunOutcome | None,
+        keepalive: _LeaseKeepalive | None = None,
     ) -> None:
         """Release run control and admission even if an earlier release fails."""
         try:
+            if outcome is None:
+                self._abandon_outcome(request)
             if stop_token is not None:
                 self._run_control.end(stop_token)
         finally:
@@ -1441,7 +1699,11 @@ class RunExecutor:
                 ):
                     self._run_control.finished(request.thread_id, request.run_id)
             finally:
-                claim.release()
+                try:
+                    claim.release()
+                finally:
+                    if keepalive is not None:
+                        keepalive.stop()
 
     def send(self, request: RunRequest) -> Generator[RunEvent, None, RunOutcome]:
         """Run one new question turn and finalize it."""
@@ -1449,15 +1711,22 @@ class RunExecutor:
         claim = self._claim(request.thread_id, request.admission)
         stop_token: StopToken | None = None
         outcome: RunOutcome | None = None
+        keepalive: _LeaseKeepalive | None = None
         try:
             stop_token = request.stop_token or self._run_control.begin(
                 request.thread_id, request.run_id
+            )
+            keepalive = self._start_keepalive(request)
+            config = (
+                _runtime_identity_config(request.config, request.attempt)
+                if request.attempt is not None
+                else request.config
             )
             outcome = yield from self._drive(
                 request.thread_id,
                 request.run_id,
                 request.input_value,
-                request.config,
+                config,
                 stop_token=stop_token,
             )
             if outcome.technical_result is RunTechnicalResult.STOPPED:
@@ -1466,6 +1735,9 @@ class RunExecutor:
                 self._record_terminal(
                     turn_started, "refuse", run_id=request.run_id
                 )
+                # The durable run ended as cancelled BEFORE its row is
+                # written; a stale worker's end failure escapes here.
+                self._end_runtime_run(request, "cancelled")
                 yield from self._persist_stopped_run(request, outcome)
                 return outcome
 
@@ -1478,6 +1750,9 @@ class RunExecutor:
                 self._record_pause(
                     request.thread_id, request.run_id, "clarify", outcome
                 )
+                # Keep the thread reservation, release only the worker
+                # lease: the resumed execution claims a new attempt.
+                self._wait_runtime_attempt(request)
                 return outcome
 
             if outcome.document_choice is not None:
@@ -1491,6 +1766,7 @@ class RunExecutor:
                 self._record_pause(
                     request.thread_id, request.run_id, "clarify", outcome
                 )
+                self._wait_runtime_attempt(request)
                 return outcome
 
             if outcome.attachment_wait is not None:
@@ -1499,6 +1775,7 @@ class RunExecutor:
                 # close; the auto-resumer drives the SAME checkpoint run_id
                 # to completion once the durable job settles.
                 self._record_pause(request.thread_id, request.run_id, None, outcome)
+                self._wait_runtime_attempt(request)
                 return outcome
 
             if outcome.final_state is None:
@@ -1514,10 +1791,13 @@ class RunExecutor:
                 thinking_type=request.thinking_type,
                 deleted_copy=THREAD_DELETED_IN_FLIGHT_COPY,
                 turn_started=turn_started,
+                attempt=request.attempt,
             )
             return outcome
         finally:
-            self._finish_run(request, claim, stop_token, outcome)
+            self._finish_run(
+                request, claim, stop_token, outcome, keepalive
+            )
 
     def resume(
         self, request: ResumeRunRequest
@@ -1533,10 +1813,12 @@ class RunExecutor:
         claim = self._claim(request.thread_id, request.admission)
         stop_token: StopToken | None = None
         outcome: RunOutcome | None = None
+        keepalive: _LeaseKeepalive | None = None
         try:
             stop_token = request.stop_token or self._run_control.begin(
                 request.thread_id, request.run_id
             )
+            keepalive = self._start_keepalive(request)
             if self._receipts is not None:
                 self._receipts.resume_started(
                     thread_id=request.thread_id, turn_id=request.run_id
@@ -1544,11 +1826,16 @@ class RunExecutor:
             self._reconcile_receipt_input_history(
                 request.thread_id, request.run_id
             )
+            resume_config = (
+                _runtime_identity_config(request.resume_config, request.attempt)
+                if request.attempt is not None
+                else request.resume_config
+            )
             outcome = yield from self._drive(
                 request.thread_id,
                 request.run_id,
                 request.resume_input,
-                request.resume_config,
+                resume_config,
                 stop_token=stop_token,
             )
             if outcome.technical_result is RunTechnicalResult.STOPPED:
@@ -1558,6 +1845,7 @@ class RunExecutor:
                         turn_id=request.run_id,
                         cancellation_reason=outcome.cancellation_reason,
                     )
+                self._end_runtime_run(request, "cancelled")
                 # No row: the original send's row already tells the story, and
                 # one row per stopped Resume click would spam the turn table
                 # (same policy as this path's mid-flight refuse branch).
@@ -1577,6 +1865,9 @@ class RunExecutor:
                 self._record_pause(
                     request.thread_id, request.run_id, "clarify", outcome
                 )
+                # Keep the thread reservation, release only the worker
+                # lease: the resumed execution claims a new attempt.
+                self._wait_runtime_attempt(request)
                 return outcome
 
             if outcome.document_choice is not None:
@@ -1589,6 +1880,7 @@ class RunExecutor:
                 self._record_pause(
                     request.thread_id, request.run_id, "clarify", outcome
                 )
+                self._wait_runtime_attempt(request)
                 return outcome
 
             if outcome.attachment_wait is not None:
@@ -1597,6 +1889,7 @@ class RunExecutor:
                 # Same posture as the send route's pause: persist nothing and
                 # close; the next settled sweep drives this run.
                 self._record_pause(request.thread_id, request.run_id, None, outcome)
+                self._wait_runtime_attempt(request)
                 return outcome
 
             if outcome.final_state is None:
@@ -1604,6 +1897,15 @@ class RunExecutor:
                 # nothing — when the original send row exists it already tells
                 # the story, and appending a refuse row per failed Resume click
                 # would spam the turn table.
+                # The durable run still has to stop being "running": end it
+                # before the maintenance checkpoint write.
+                if self._runtime_attempt(request) is not None:
+                    self._interrupt_runtime_run(request)
+                    self._finalize_abandoned(
+                        request.thread_id,
+                        status="refuse",
+                        status_reason=outcome.refuse_reason or "",
+                    )
                 return outcome
 
             resume_question = (
@@ -1618,10 +1920,13 @@ class RunExecutor:
                 outcome,
                 thinking_type=None,
                 deleted_copy=THREAD_DELETED_RESUMING_COPY,
+                attempt=request.attempt,
             )
             return outcome
         finally:
-            self._finish_run(request, claim, stop_token, outcome)
+            self._finish_run(
+                request, claim, stop_token, outcome, keepalive
+            )
 
     # ----- internals -----
 
@@ -1650,6 +1955,7 @@ class RunExecutor:
         thinking_type: str | None,
         deleted_copy: str,
         turn_started: float | None = None,
+        attempt: AttemptLease | None = None,
     ) -> Generator[RunEvent, None, None]:
         """Persist a finished remainder and emit its one terminal event.
 
@@ -1676,6 +1982,21 @@ class RunExecutor:
         # Run-scoped, copied before the next send resets the state channel.
         claim_rows, claim_refusals = _visual_claims_wire_payload(
             final_state.get("visual_claims")
+        )
+        # The durable terminal commits BEFORE the turn row and before the
+        # terminal event: a reader (or a restarted process) can never see
+        # the row or the frame without its projection, sequence and outbox.
+        self._commit_durable_terminal(
+            run_id=run_id,
+            attempt=attempt,
+            payload=payload,
+            technical_result=(
+                outcome.technical_result.value
+                if outcome.technical_result is not None
+                else RunTechnicalResult.DONE.value
+            ),
+            semantic_result=("answered" if payload["status"] == "done" else None),
+            final_state=final_state,
         )
         if turn_started is not None:
             # The turn's terminal status (done / refuse / step_cap) and
@@ -1851,7 +2172,32 @@ class RunExecutor:
             # and its technical result always arrive together. A stream
             # that produced nothing established no end to report, and
             # naming one here would invent the failure it never had.
+            self._abandon_outcome(request)
             return outcome
+        # The durable terminal (refuse / timeout) commits before the row.
+        self._commit_durable_terminal(
+            run_id=request.run_id,
+            attempt=request.attempt,
+            payload={
+                "status": "refuse",
+                "answer": "",
+                "reason": outcome.refuse_reason or "",
+                "citations": [],
+                "assistant_message": outcome.refuse_copy or "",
+                "thinking_text": "",
+                "tool_summaries": [],
+                "track": "",
+                "track_decision": {},
+                "search_mode_decision": {},
+                "comparisons": [],
+                "analysis_results": [],
+                "evidence_locators": [],
+                "retrieval_window": {},
+            },
+            technical_result=outcome.technical_result.value,
+            semantic_result=None,
+            final_state=outcome.final_state,
+        )
         self._record_terminal(
             turn_started, "refuse", run_id=request.run_id
         )

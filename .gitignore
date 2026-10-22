@@ -19,7 +19,7 @@ build/
 # `node_modules` carries no trailing slash on purpose. A `node_modules/`
 # rule matches only a real directory, so a worktree sharing the main
 # checkout's modules through a SYMLINK of that name was not ignored — and
-# once such a link got committed (a private commit / that pull request, pointing at itself)
+# once such a link got committed (pointing at itself)
 # every `npm run` in a checkout carrying it died with ELOOP, which is how
 # husky's pre-commit came to fail for reasons unrelated to the staged
 # change. Matching the bare name covers directory, symlink and

@@ -64,6 +64,7 @@ offer one) plus the wired attachment service's per-thread reader.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import logging
@@ -73,6 +74,7 @@ import threading
 import time
 import unicodedata
 import uuid
+from collections import OrderedDict
 from collections.abc import Sequence
 from contextlib import nullcontext
 from datetime import datetime, timezone
@@ -111,7 +113,7 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.prebuilt import InjectedState, ToolNode
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command, Send, interrupt
-from pydantic.json_schema import WithJsonSchema
+from pydantic import BaseModel
 
 from fin.corpus.extracted import Locator
 from fin.corpus.catalog import catalog_document_titles, list_filings
@@ -263,6 +265,37 @@ from fin.host.span_seams import (
 from fin.corpus.catalog import DEFAULT_CATALOG_PATH
 from fin.host.tools import list_files
 from fin.host.tools.read_source import read_source
+from fin.host.tools.contracts import (
+    CompareFactsArgs,
+    EditUserProfileArgs,
+    ExtractTablesArgs,
+    GetXbrlFactArgs,
+    ListFilesArgs,
+    ReadSourceArgs,
+    ReadVisualDetailArgs,
+    RecallMemoryArgs,
+    RedlineArgs,
+    ResearchIssuersArgs,
+    RetrieveArgs,
+    SaveMemoryArgs,
+    ThreeYearStatementArgs,
+    UnknownToolContract,
+    contract_for as _tool_contract_for,
+)
+from fin.host.tools.validation import (
+    CorrectionTracker,
+    ToolValidationOutcome,
+)
+from fin.host.tools.ledger import (
+    OutcomeCode,
+    ToolOutcomeKind,
+    ToolOutcomeLedgerPort,
+    ToolOutcomeObservation,
+)
+from fin.host.tools.reconciliation import (
+    execution_decision,
+    refusal_code,
+)
 from fin.host.tools.issuer_fanout import (
     ISSUER_FANOUT_TOOL,
     MAX_ISSUERS,
@@ -338,6 +371,8 @@ from fin.host.question.extract_method_proposal import (
     proposal_is_pending,
 )
 from fin.host.question.nodes import (
+    ClarifyToolCall,
+    ClarifyToolValidation,
     QuestionNodeDeps,
     build_catalog_overview_node,
     build_clarify_node,
@@ -403,36 +438,17 @@ from fin.retrieve.tool import retrieve
 _LOG = logging.getLogger(__name__)
 
 
-_READ_SOURCE_REF_SCHEMA: Final[dict[str, Any]] = {
-    "anyOf": [
-        {
-            "type": "object",
-            "properties": {
-                "document_id": {"type": "string", "minLength": 1},
-                "version": {"type": "string", "minLength": 1},
-                "unit": {"type": "integer", "minimum": 1},
-            },
-            "required": ["document_id", "version", "unit"],
-            "additionalProperties": False,
-        },
-        {
-            "type": "object",
-            "properties": {
-                "kind": {"type": "string", "enum": ["attachment"]},
-                "attachment_id": {"type": "string", "minLength": 1},
-                "version": {
-                    "anyOf": [
-                        {"type": "string", "pattern": "^(0|[1-9][0-9]*)$"},
-                        {"type": "integer", "minimum": 0},
-                    ]
-                },
-                "unit": {"type": "integer", "minimum": 1},
-            },
-            "required": ["kind", "attachment_id", "version", "unit"],
-            "additionalProperties": False,
-        },
-    ]
-}
+def _plain_source_ref(source_ref: Any) -> Any:
+    """The locator as plain data.
+
+    The canonical argument contract types ``source_ref`` as a Pydantic
+    union, and LangChain hands the validated field value to the tool. The
+    read wrapper and the scope gate both take a ``Mapping``, so the typed
+    locator is dumped back to its declared shape here.
+    """
+    if isinstance(source_ref, BaseModel):
+        return source_ref.model_dump()
+    return source_ref
 
 
 def _tool_schema_tokens(tools: Sequence[Any]) -> int:
@@ -452,6 +468,9 @@ if TYPE_CHECKING:  # ``fin.corpus.facts`` is imported lazily at call time
         AttachmentRetrievalError,
         AttachmentSearchPort,
     )
+    # P1 T3: the compile root injects the durable admission coordinator.
+    # Type-only here so this module keeps its existing import graph.
+    from fin.host.runtime.admission import RuntimeCoordinator
 
 
 # ----- typed errors -----
@@ -739,7 +758,7 @@ def _make_list_files_tool(
     table.
     """
 
-    @tool("list_files")
+    @tool("list_files", args_schema=ListFilesArgs)
     def list_files_tool(
         company: str | None = None,
         period: str | None = None,
@@ -2213,11 +2232,9 @@ def _make_read_source_tool(
     The tool's registered name is ``read_source``.
     """
 
-    @tool("read_source")
+    @tool("read_source", args_schema=ReadSourceArgs)
     def read_source_tool(
-        source_ref: Annotated[
-            dict[str, Any], WithJsonSchema(_READ_SOURCE_REF_SCHEMA)
-        ],
+        source_ref: dict[str, Any],
         position: int = 0,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
         config: Annotated[RunnableConfig, InjectedToolArg()] = cast(
@@ -2242,6 +2259,7 @@ def _make_read_source_tool(
         leg's own answer instead, and invalid positions and unavailable
         sources contribute nothing.
         """
+        source_ref = _plain_source_ref(source_ref)
         attachment_reader = _attachment_reader_for_run(
             attachment_reader_factory, config
         )
@@ -2449,7 +2467,7 @@ def _make_read_visual_detail_tool(
     The tool's registered name is ``read_visual_detail``.
     """
 
-    @tool("read_visual_detail")
+    @tool("read_visual_detail", args_schema=ReadVisualDetailArgs)
     def read_visual_detail_tool(
         attachment_id: str,
         page: int,
@@ -2786,7 +2804,7 @@ def _make_retrieve_tool(
     excluded_arm_signal: DegradationSignal | None = None
     excluded_arm_degradation: tuple[str, ...] = ()
 
-    @tool(RETRIEVE_TOOL)
+    @tool(RETRIEVE_TOOL, args_schema=RetrieveArgs)
     @traced_seam("retrieve_tool", _seam_identity)
     def retrieve_tool(
         query: str,
@@ -3622,7 +3640,7 @@ def _make_get_xbrl_fact_tool(
     documents an unfiltered lookup would reach.
     """
 
-    @tool("get_xbrl_fact")
+    @tool("get_xbrl_fact", args_schema=GetXbrlFactArgs)
     def get_xbrl_fact_tool(
         concept: str,
         period: str,
@@ -3742,7 +3760,7 @@ def _make_save_memory_tool(
     the advisory marker).
     """
 
-    @tool("save_memory")
+    @tool("save_memory", args_schema=SaveMemoryArgs)
     def save_memory_tool(
         title: str,
         body: str,
@@ -3780,7 +3798,7 @@ def _make_recall_memory_tool(
     does NOT close over a compile-time path.
     """
 
-    @tool("recall_memory")
+    @tool("recall_memory", args_schema=RecallMemoryArgs)
     def recall_memory_tool(
         query: str,
         limit: int = 8,
@@ -3818,7 +3836,7 @@ def _make_edit_user_profile_tool(
     instead of a crashed run.
     """
 
-    @tool("edit_user_profile")
+    @tool("edit_user_profile", args_schema=EditUserProfileArgs)
     def edit_user_profile_tool(layer: str, text: str) -> dict:
         """Write ``text`` to one user-profile layer.
 
@@ -4003,7 +4021,9 @@ def _make_locator_tool(spec: _LocatorToolSpec) -> Any:
     wrapped = namespace["_wrapped"]
     wrapped.__doc__ = spec.description
     wrapped.__name__ = f"{spec.name}_tool"
-    return tool(spec.name)(wrapped)
+    return tool(
+        spec.name, args_schema=_tool_contract_for(spec.name).args_model
+    )(wrapped)
 
 
 # Per-impl coerce shims. Match the pre-refactor coercions exactly so
@@ -4390,7 +4410,7 @@ def _make_research_issuers_tool(issuer_cap: int):
     readable tool result rather than a crashed run.
     """
 
-    @tool(ISSUER_FANOUT_TOOL)
+    @tool(ISSUER_FANOUT_TOOL, args_schema=ResearchIssuersArgs)
     def research_issuers_tool(issuers: list[str], query: str) -> dict:
         """Research one question across several issuers at once.
 
@@ -5364,6 +5384,692 @@ def _pending_tool_calls(state: AgentState) -> list[tuple[str, dict, str]]:
     return []
 
 
+_TOOL_CORRECTION_TRACKER_LIMIT: Final[int] = 256
+_TOOL_CORRECTION_TRACKERS: "OrderedDict[str, CorrectionTracker]" = OrderedDict()
+_TOOL_CORRECTION_TRACKERS_LOCK = threading.Lock()
+
+
+def _correction_tracker_key(configurable: Mapping[str, Any]) -> str:
+    """The registry key of the correction tracker this run belongs to.
+
+    The RUNTIME run id is the identity of one question: the same run id
+    means the same correction loop, and a different one means a different
+    question with its own budget. The graph-level ``run_id`` is the
+    fallback for a caller that drives the graph without the Runtime, and
+    the thread id is the last resort. Keying on the thread alone would
+    let a finished run's exhaustion answer the NEXT question on that
+    thread.
+
+    The THREAD is always part of the key: a run id alone is not a
+    conversation. Two threads that carry the same run id (a reused
+    fixture, a resumed thread under a new run) must not share one
+    correction loop, or the first thread's spent correction answers the
+    second thread's first invalid call.
+    """
+    thread = _blank_id(configurable.get("thread_id"))
+    for candidate in (
+        configurable.get("runtime_run_id"),
+        configurable.get("run_id"),
+    ):
+        run = _blank_id(candidate)
+        if run:
+            return f"{thread}\x1f{run}"
+    return thread
+
+
+def _blank_id(value: Any) -> str:
+    """The id as a usable string, empty when it is absent or blank."""
+    if isinstance(value, str) and value.strip():
+        return value
+    return ""
+
+
+def _correction_tracker_for(
+    config: Mapping[str, Any] | None,
+    ledger: ToolOutcomeLedgerPort | None = None,
+) -> CorrectionTracker:
+    """The correction tracker this run's tool calls belong to.
+
+    A caller (a test, or a future ledger owner) may inject one through
+    ``configurable.tool_correction_tracker``. Otherwise the tracker is
+    resolved from a bounded process-local registry keyed by the RUNTIME
+    run id (falling back to the graph run id, then the thread id): the
+    server is long-lived, so an unbounded map would leak one entry per
+    run. An invocation that carries no id at all still validates, but gets
+    a fresh tracker because it cannot correlate a correction across model
+    turns.
+
+    A tracker created for a run is REBUILT from that run's committed
+    ledger facts, so a takeover (or an LRU eviction) resumes the same
+    one-correction bound instead of handing the model a second
+    correction.
+    """
+    configurable = dict((config or {}).get("configurable") or {})
+    injected = configurable.get("tool_correction_tracker")
+    if isinstance(injected, CorrectionTracker):
+        return injected
+    run_id = configurable.get("run_id")
+    thread_id = configurable.get("thread_id")
+    key = _correction_tracker_key(configurable)
+    if not key:
+        return CorrectionTracker("", "")
+    with _TOOL_CORRECTION_TRACKERS_LOCK:
+        tracker = _TOOL_CORRECTION_TRACKERS.get(key)
+        created = tracker is None
+        if tracker is None:
+            tracker = CorrectionTracker(
+                thread_id if isinstance(thread_id, str) else "",
+                run_id if isinstance(run_id, str) else "",
+            )
+            _TOOL_CORRECTION_TRACKERS[key] = tracker
+            while (
+                len(_TOOL_CORRECTION_TRACKERS)
+                > _TOOL_CORRECTION_TRACKER_LIMIT
+            ):
+                _TOOL_CORRECTION_TRACKERS.popitem(last=False)
+        else:
+            _TOOL_CORRECTION_TRACKERS.move_to_end(key)
+    if created:
+        _hydrate_correction_tracker(tracker, ledger, config)
+    return tracker
+
+
+def _hydrate_correction_tracker(
+    tracker: CorrectionTracker,
+    ledger: ToolOutcomeLedgerPort | None,
+    config: Mapping[str, Any] | None,
+) -> None:
+    """Rebuild a fresh tracker's state from the run's committed facts.
+
+    A takeover (or an LRU eviction) starts a tracker that remembers
+    nothing. The ledger already holds the run's validation facts, so the
+    correction loop is restored from them: the one-correction bound
+    survives the handover instead of being handed to the model twice.
+    """
+    if ledger is None:
+        return
+    from fin.host.runtime.fencing import resolve_ownership
+
+    ownership = resolve_ownership(config)
+    if ownership is None:
+        # EXIT: without a Runtime identity there is no run to read the
+        # committed facts of, so the tracker starts empty.
+        return
+    tracker.hydrate(ledger.read_run(ownership.run_id))
+
+
+@dataclass(frozen=True)
+class _ValidatedToolCall:
+    """One model-emitted tool call and its pre-effect validation outcome."""
+
+    name: str
+    args: Any
+    tool_call_id: str
+    outcome: ToolValidationOutcome | None
+    unknown_tool: bool = False
+    #: The execution attempt this call's dispatch is, allocated per
+    #: logical call by the tracker. It is NOT the model attempt: one
+    #: model attempt may carry several execution attempts.
+    execution_attempt: int | None = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.outcome is not None and self.outcome.accepted
+
+
+def _accepted_call(
+    tracker: CorrectionTracker,
+    *,
+    name: str,
+    args: dict,
+    tool_call_id: str,
+    logical_call_id: str,
+    model_attempt: int,
+    execution_attempt: int | None,
+) -> _ValidatedToolCall:
+    """A validated call whose arguments the canonical contract accepted.
+
+    The clarify lane validates its own call and hands the identity back
+    to the composition root, which owns the ledger facts; this rebuilds
+    the validated call from that identity.
+    """
+    return _ValidatedToolCall(
+        name=name,
+        args=args,
+        tool_call_id=tool_call_id,
+        outcome=ToolValidationOutcome(
+            thread_id=tracker.thread_id,
+            run_id=tracker.run_id,
+            tool_name=name,
+            logical_call_id=logical_call_id,
+            attempt_id=tool_call_id,
+            model_attempt=model_attempt,
+            outcome="valid_input_accepted",
+            accepted=True,
+            schema_rejected=False,
+            correction_offered=False,
+            feedback=None,
+            field_paths=(),
+            normalized_args=args,
+        ),
+        execution_attempt=execution_attempt,
+    )
+
+
+def _turn_id_for_state(state: AgentState) -> str:
+    """The identity of the operator question this run is answering.
+
+    The last HumanMessage is the question: its own id when the provider
+    stamped one, else a digest of its content. Two questions on one
+    thread therefore carry two turn ids, and the correction budget of the
+    first question never reaches the second.
+    """
+    for message in reversed(list(state.get("messages") or [])):
+        if not isinstance(message, HumanMessage):
+            continue
+        identifier = getattr(message, "id", None)
+        if isinstance(identifier, str) and identifier.strip():
+            return identifier.strip()
+        content = message.content
+        text = content if isinstance(content, str) else str(content)
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return ""
+
+
+def _validate_pending_tool_calls(
+    pending: Sequence[tuple[str, dict, str]],
+    tracker: CorrectionTracker,
+    *,
+    turn_id: str | None = None,
+) -> list[_ValidatedToolCall]:
+    """Validate every pending call BEFORE any dispatcher can run it."""
+    tracker.begin_model_attempt(
+        [
+            {"name": name, "args": args, "id": tool_call_id}
+            for name, args, tool_call_id in pending
+        ],
+        turn_id=turn_id,
+    )
+    validated: list[_ValidatedToolCall] = []
+    for name, args, tool_call_id in pending:
+        try:
+            outcome = tracker.record_validation(
+                name, args, tool_call_id=tool_call_id
+            )
+        except UnknownToolContract:
+            validated.append(
+                _ValidatedToolCall(
+                    name=name,
+                    args=args,
+                    tool_call_id=tool_call_id,
+                    outcome=None,
+                    unknown_tool=True,
+                )
+            )
+            continue
+        validated.append(
+            _ValidatedToolCall(
+                name=name,
+                args=args,
+                tool_call_id=tool_call_id,
+                outcome=outcome,
+            )
+        )
+    return validated
+
+
+#: Effect classes whose execution cannot leave a durable side effect, so an
+#: error result is a KNOWN failure. Every other class may already have
+#: happened, and its error is an unknown outcome.
+_READ_ONLY_EFFECTS: Final[frozenset[str]] = frozenset(
+    {"none", "local_read", "network_read"}
+)
+
+
+def _call_observation(
+    call: _ValidatedToolCall,
+    kind: ToolOutcomeKind,
+    *,
+    execution: bool = False,
+    outcome_code: OutcomeCode | None = None,
+    field_paths: tuple[str, ...] = (),
+) -> ToolOutcomeObservation:
+    """One ledger observation for a validated call.
+
+    ``execution_attempt`` is the DISPATCH count of the logical call, not
+    the model attempt that produced it: one model attempt may carry
+    several execution attempts of one logical call, and the two
+    identities stay separate.
+    """
+    outcome = call.outcome
+    if outcome is None:
+        raise HostGraphError(
+            "tool outcome observation without a validation outcome"
+        )
+    return ToolOutcomeObservation(
+        logical_call_id=outcome.logical_call_id,
+        tool_name=outcome.tool_name,
+        model_attempt=outcome.model_attempt,
+        kind=kind,
+        provider_tool_call_id=call.tool_call_id or None,
+        execution_attempt=call.execution_attempt if execution else None,
+        outcome_code=outcome_code,
+        field_paths=field_paths,
+    )
+
+
+def _validation_observations(
+    validated: Sequence[_ValidatedToolCall],
+) -> list[ToolOutcomeObservation]:
+    """The facts the schema produced: what the contract said.
+
+    A rejected call carries ``schema_rejected`` plus the correction it
+    earned (``correction_offered``) or the terminal exhaustion
+    (``correction_exhausted``); an accepted call carries
+    ``valid_input_accepted``. An unregistered tool has no contract and
+    produces no facts.
+    """
+    observations: list[ToolOutcomeObservation] = []
+    for call in validated:
+        outcome = call.outcome
+        if outcome is None:
+            continue
+        if outcome.accepted:
+            observations.append(_call_observation(call, "valid_input_accepted"))
+            continue
+        observations.append(
+            _call_observation(
+                call,
+                "schema_rejected",
+                outcome_code="invalid_tool_arguments",
+                field_paths=outcome.field_paths,
+            )
+        )
+        if outcome.correction_offered:
+            observations.append(
+                _call_observation(
+                    call,
+                    "correction_offered",
+                    outcome_code="invalid_tool_arguments",
+                    field_paths=outcome.field_paths,
+                )
+            )
+        else:
+            observations.append(
+                _call_observation(
+                    call,
+                    "correction_exhausted",
+                    outcome_code="tool_validation_exhausted",
+                    field_paths=outcome.field_paths,
+                )
+            )
+    return observations
+
+
+def _tool_result_reported_error(content: Any) -> bool:
+    """Whether a tool's own result payload carries an ``"error"`` key.
+
+    A tool may answer a typed failure with a successful ToolMessage
+    (``{"error": "retrieve_unavailable"}``). Only a mapping or a JSON
+    object string is inspected; any other content is not a failure
+    envelope.
+    """
+    if isinstance(content, Mapping):
+        return "error" in content
+    if not isinstance(content, str):
+        return False
+    try:
+        parsed = json.loads(content)
+    except ValueError:
+        return False
+    return isinstance(parsed, Mapping) and "error" in parsed
+
+
+def _execution_observations(
+    validated: Sequence[_ValidatedToolCall],
+    results: Sequence[BaseMessage],
+) -> list[ToolOutcomeObservation]:
+    """The facts the dispatch produced: what the execution did.
+
+    The results map back by provider tool-call id: an error result on a
+    read-effect contract is ``known_failed``, the same error on a
+    persistent-write or external-effect contract is ``outcome_unknown``
+    (the effect may already have happened), and an accepted call with no
+    result is ``outcome_unknown`` too. A success-status result whose
+    payload the tool wrote as ``{"error": ...}`` is a known failure: the
+    tool itself reported it.
+    """
+    results_by_call: dict[str, list[ToolMessage]] = {}
+    for message in results:
+        if isinstance(message, ToolMessage):
+            call_id = str(message.tool_call_id or "")
+            if call_id:
+                results_by_call.setdefault(call_id, []).append(message)
+
+    observations: list[ToolOutcomeObservation] = []
+    for call in validated:
+        outcome = call.outcome
+        if outcome is None or not outcome.accepted:
+            continue
+        messages = results_by_call.get(call.tool_call_id) or []
+        if not messages:
+            observations.append(
+                _call_observation(
+                    call,
+                    "outcome_unknown",
+                    execution=True,
+                    outcome_code="result_missing",
+                )
+            )
+        elif str(messages[-1].status) == "error":
+            effect = _tool_contract_for(call.name).effect
+            observations.append(
+                _call_observation(
+                    call,
+                    "known_failed"
+                    if effect in _READ_ONLY_EFFECTS
+                    else "outcome_unknown",
+                    execution=True,
+                    outcome_code="tool_result_error",
+                )
+            )
+        elif _tool_result_reported_error(messages[-1].content):
+            observations.append(
+                _call_observation(
+                    call,
+                    "known_failed",
+                    execution=True,
+                    outcome_code="tool_result_error",
+                )
+            )
+        else:
+            # EXIT: a result that is not an error is a success. The
+            # dispatcher answers a refused or broken call with an error
+            # status, so no other status reaches this branch.
+            observations.append(
+                _call_observation(call, "succeeded", execution=True)
+            )
+    return observations
+
+
+def _in_flight_observations(
+    dispatchable: Sequence[_ValidatedToolCall],
+) -> list[ToolOutcomeObservation]:
+    """The in-flight facts: one per call that is about to be dispatched.
+
+    They are committed BEFORE the dispatch, so a crash between the effect
+    and its result still leaves a durable record that the call started.
+    """
+    return [
+        _call_observation(call, "execution_started", execution=True)
+        for call in dispatchable
+        if call.accepted
+    ]
+
+
+def _tool_outcome_observations(
+    validated: Sequence[_ValidatedToolCall],
+    results: Sequence[BaseMessage],
+) -> list[ToolOutcomeObservation]:
+    """Every ledger fact one tool step produced, in call order.
+
+    The validation facts come from the tracker, the in-flight facts from
+    the calls that are dispatched, and the terminal facts from the
+    dispatcher's results. The graph commits them in two fenced writes (the
+    in-flight fact BEFORE the dispatch, the terminal facts after it); this
+    helper is the single view of both halves.
+    """
+    return [
+        *_validation_observations(validated),
+        *_in_flight_observations([c for c in validated if c.accepted]),
+        *_execution_observations(validated, results),
+    ]
+
+
+def _record_tool_outcome_facts(
+    ledger: ToolOutcomeLedgerPort,
+    config: Any,
+    observations: Sequence[ToolOutcomeObservation],
+) -> None:
+    """Append one tool step's facts under the caller's worker attempt.
+
+    A caller with no Runtime identity (the CLI's direct graph invoke) has
+    no fencing authority to record under, so it writes nothing; the
+    checkpoint adapter already fails such a call closed only when it is a
+    mis-wired worker, which always carries an identity. A PARTIAL identity
+    still raises from ``resolve_ownership``.
+    """
+    if not observations:
+        return
+    from fin.host.runtime.fencing import resolve_ownership
+
+    ownership = resolve_ownership(config)
+    if ownership is None:
+        # EXIT: the caller carries no worker attempt, so there is no fence
+        # to commit under and the facts are dropped. The drop is logged
+        # (never the values) so a silent gap in the measurement source is
+        # visible.
+        _LOG.warning(
+            "tool outcome facts dropped: the caller carries no Runtime "
+            "worker attempt to commit them under"
+        )
+        return
+    ledger.record(
+        observations,
+        thread_id=ownership.thread_id,
+        run_id=ownership.run_id,
+        attempt_id=ownership.attempt_id,
+        attempt_generation=ownership.attempt_generation,
+        thread_generation=ownership.thread_generation,
+    )
+
+
+def _business_operation_id_for_call(call: _ValidatedToolCall) -> str | None:
+    """The stable business operation id a call belongs to, if any.
+
+    The CONTRACT is where the identity is declared: a tool that declares
+    an ``operation_identity`` has one stable business operation, and the
+    reconciliation decision is scoped to it instead of to the logical
+    call.
+
+    EXIT: no registered tool declares a DERIVABLE operation identity.
+    ``read_visual_detail`` names its scheme in prose ("DetailKey(...)"),
+    but the contract does not say which of the call's arguments form the
+    key, so no id can be derived from it and the id is ``None`` for
+    every current tool. The replay decision then scopes to the logical
+    call id instead.
+    """
+    try:
+        contract = _tool_contract_for(call.name)
+    except UnknownToolContract:
+        # EXIT: an unregistered tool has no contract and therefore no
+        # declared identity.
+        return None
+    if contract.operation_identity is None:
+        return None
+    # EXIT: the contract names the identity SCHEME, not the arguments that
+    # form the key, so no id is derived from it yet.
+    return None
+
+
+def _succeeded_for_attempt(
+    facts: Sequence[Any],
+    logical_call_id: str,
+    provider_tool_call_id: str,
+) -> bool:
+    """Whether this provider attempt already succeeded in this run.
+
+    The pair (logical call, provider attempt) is the delivery identity:
+    the same provider tool call arriving twice is the same delivery, not
+    a new intent.
+    """
+    return any(
+        fact.kind == "succeeded"
+        and fact.logical_call_id == logical_call_id
+        and fact.provider_tool_call_id == provider_tool_call_id
+        for fact in facts
+    )
+
+
+def _execution_refusal(
+    facts: Sequence[Any] | None,
+    call: _ValidatedToolCall,
+) -> ToolMessage | None:
+    """The typed answer that keeps a duplicate or blocked call from running.
+
+    Two rules, in order:
+
+    1. DUPLICATE DELIVERY: the run already committed a ``succeeded`` fact
+       for this (logical call, provider attempt) — the same provider tool
+       call arriving twice. The tool does not run again, and the call is
+       answered with the fixed ``tool_duplicate_delivery`` code.
+    2. REPLAY DECISION: ``execution_decision`` reads the run's facts for
+       EVERY tool, scoped to the business operation id when the contract
+       yields one, otherwise to the logical call id. The declared retry
+       and reconciliation policies decide the answer; ``blocked_slices``
+       is not a second shortcut.
+
+    ``None`` when the call may execute. A refusal records no new fact:
+    the decision is read from what the run already committed.
+    """
+    if facts is None:
+        # EXIT: without Runtime ownership there are no run facts to read,
+        # so neither rule can decide and the call dispatches.
+        return None
+    outcome = call.outcome
+    if outcome is None:
+        return None
+    if _succeeded_for_attempt(
+        facts, outcome.logical_call_id, call.tool_call_id
+    ):
+        return _refusal_message(call, "tool_duplicate_delivery")
+
+    try:
+        contract = _tool_contract_for(call.name)
+    except UnknownToolContract:
+        # EXIT: an unregistered tool has no declared policies, so nothing
+        # can decide a replay and the call dispatches.
+        return None
+    decision = execution_decision(
+        contract,
+        facts,
+        business_operation_id=_business_operation_id_for_call(call),
+        logical_call_id=outcome.logical_call_id,
+    )
+    code = refusal_code(decision)
+    if code is None:
+        return None
+    return _refusal_message(call, code)
+
+
+def _refusal_message(call: _ValidatedToolCall, code: str) -> ToolMessage:
+    """The fixed, value-free answer a blocked call gets.
+
+    The payload carries the typed code only: no operation id, no tool
+    result, no reason text and no submitted value.
+    """
+    return ToolMessage(
+        content=json.dumps({"error": code}),
+        name=call.name,
+        tool_call_id=call.tool_call_id,
+        status="error",
+    )
+
+
+def _run_facts(
+    ledger: ToolOutcomeLedgerPort,
+    config: Any,
+) -> Sequence[Any] | None:
+    """This run's committed ledger facts, ``None`` without ownership.
+
+    The facts are read once per tool step: both guard rules read the same
+    commit order.
+    """
+    from fin.host.runtime.fencing import resolve_ownership
+
+    ownership = resolve_ownership(config)
+    if ownership is None:
+        # EXIT: a caller with no Runtime identity has no run to read the
+        # committed facts of, so the guard has nothing to decide on.
+        return None
+    return ledger.read_run(ownership.run_id)
+
+
+def _validation_error_message(call: _ValidatedToolCall) -> ToolMessage:
+    """The safe error ToolMessage a rejected call answers with.
+
+    The payload carries a fixed code plus, for a first failure, the
+    value-free feedback. No submitted value, raw kwargs, exception text,
+    stack trace, credential, or source content is copied here.
+    """
+    if call.unknown_tool:
+        # EXIT: the model called a tool the host never registered — a
+        # wiring fault, not a schema failure, so the answer names the
+        # unknown tool and offers no correction.
+        payload: dict[str, Any] = {"error": "unknown_tool"}
+    elif call.outcome is not None and call.outcome.correction_offered:
+        payload = {
+            "error": "invalid_tool_arguments",
+            "feedback": call.outcome.feedback,
+        }
+    else:
+        payload = {"error": "tool_validation_exhausted"}
+    return ToolMessage(
+        content=json.dumps(payload),
+        name=call.name or "unknown_tool",
+        tool_call_id=call.tool_call_id,
+        status="error",
+    )
+
+
+def _state_with_accepted_tool_calls(
+    state: AgentState, accepted_ids: set[str]
+) -> AgentState:
+    """A state copy whose pending AIMessage declares only accepted calls."""
+    messages = list(state.get("messages") or [])
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, AIMessage) and message.tool_calls:
+            messages[index] = message.model_copy(
+                update={
+                    "tool_calls": [
+                        call
+                        for call in message.tool_calls
+                        if str(call.get("id") or "") in accepted_ids
+                    ]
+                }
+            )
+            break
+    dispatch_state = cast(AgentState, dict(state))
+    dispatch_state["messages"] = messages
+    return dispatch_state
+
+
+def _messages_in_call_order(
+    validated: Sequence[_ValidatedToolCall],
+    dispatched: Sequence[BaseMessage],
+) -> list[BaseMessage]:
+    """Real results and validation errors in the ORIGINAL call order."""
+    by_call: dict[str, list[BaseMessage]] = {}
+    extra: list[BaseMessage] = []
+    for message in dispatched:
+        call_id = str(getattr(message, "tool_call_id", "") or "")
+        if isinstance(message, ToolMessage) and call_id:
+            by_call.setdefault(call_id, []).append(message)
+        else:
+            extra.append(message)
+    ordered: list[BaseMessage] = []
+    for call in validated:
+        if call.accepted:
+            ordered.extend(by_call.pop(call.tool_call_id, []))
+        else:
+            ordered.append(_validation_error_message(call))
+    for leftover in by_call.values():
+        ordered.extend(leftover)
+    ordered.extend(extra)
+    return ordered
+
+
 def _json_content(message: BaseMessage) -> Any:
     """Decode a message's ``content`` as JSON, ``None``-shaped result
     for non-string content.
@@ -6049,6 +6755,8 @@ def compile_graph(
     snapshot_reader: SourceScopeReader | None = None,
     run_call_supervisor: RunCallSupervisor | None = None,
     run_call_context_registry: RunCallContextRegistry | None = None,
+    runtime: RuntimeCoordinator | None = None,
+    tool_ledger: ToolOutcomeLedgerPort | None = None,
 ) -> "_LockedGraph":
     """Build the v1 host graph (T6).
 
@@ -6312,6 +7020,20 @@ def compile_graph(
         intersecting with ``scope_restriction``, and its identities are
         rechecked against current authority on each read, so an accepted
         intent is never a permission and never widens a restriction.
+    runtime
+        P1 T3: the durable admission coordinator the production compile
+        built beside the fenced checkpointer. ``None`` (the default for
+        every direct caller and test) keeps the proxy unchanged; when
+        supplied it is exposed as ``graph.runtime`` for the layers that
+        admit and recover runs. This factory does not call it — it only
+        carries the object the compile root already owns.
+    tool_ledger
+        P3 T4: the append-only outcome ledger the tool node writes its
+        validation and execution observations to, fenced by the run's
+        worker attempt. ``None`` (the default for every direct caller and
+        test) writes no facts at all; when supplied it is exposed as
+        ``graph.tool_ledger``. This factory does not call it — the tool
+        node does, once per tool step, in one transaction.
 
     Returns
     -------
@@ -6643,6 +7365,118 @@ def compile_graph(
         name="tool_node",
         handle_tool_errors=True,
     )
+
+    def _validate_clarify_tool_calls(
+        config: RunnableConfig,
+        state: AgentState,
+        pending: list[tuple[str, dict, str]],
+    ) -> ClarifyToolValidation:
+        """Validate the clarify lane's pending calls before the dispatch.
+
+        The clarify lane dispatches the RAW model call, so a schema
+        failure used to reach the model as LangGraph's raw-kwargs error.
+        The canonical contract answers it here instead: the rejected call
+        gets the same value-free payload the ordinary tool lane uses, and
+        its validation facts are recorded like every other rejected call.
+        """
+        tracker = _correction_tracker_for(config, tool_ledger)
+        tracker.begin_model_attempt(
+            [
+                {"name": name, "args": args, "id": call_id}
+                for name, args, call_id in pending
+            ],
+            turn_id=_turn_id_for_state(state),
+        )
+        accepted: list[ClarifyToolCall] = []
+        refusals: list[tuple[str, BaseMessage]] = []
+        validated: list[_ValidatedToolCall] = []
+        for name, args, call_id in pending:
+            try:
+                outcome = tracker.record_validation(
+                    name, args, tool_call_id=call_id
+                )
+            except UnknownToolContract:
+                refusals.append(
+                    (
+                        call_id,
+                        _validation_error_message(
+                            _ValidatedToolCall(
+                                name=name,
+                                args=args,
+                                tool_call_id=call_id,
+                                outcome=None,
+                                unknown_tool=True,
+                            )
+                        ),
+                    )
+                )
+                continue
+            call = _ValidatedToolCall(
+                name=name,
+                args=args,
+                tool_call_id=call_id,
+                outcome=outcome,
+            )
+            validated.append(call)
+            if not outcome.accepted:
+                refusals.append((call_id, _validation_error_message(call)))
+                continue
+            execution_attempt = tracker.next_execution_attempt(
+                outcome.logical_call_id
+            )
+            accepted.append(
+                ClarifyToolCall(
+                    name=name,
+                    args=args,
+                    tool_call_id=call_id,
+                    logical_call_id=outcome.logical_call_id,
+                    model_attempt=outcome.model_attempt,
+                    execution_attempt=execution_attempt,
+                )
+            )
+            validated[-1] = dataclass_replace(
+                validated[-1], execution_attempt=execution_attempt
+            )
+        if tool_ledger is not None:
+            # The in-flight fact is committed BEFORE the dispatch, so a
+            # crash between the effect and its result still leaves a
+            # durable record that the call started.
+            _record_tool_outcome_facts(
+                tool_ledger,
+                config,
+                [
+                    *_validation_observations(validated),
+                    *_in_flight_observations(validated),
+                ],
+            )
+        return ClarifyToolValidation(accepted=accepted, refusals=refusals)
+
+    def _record_clarify_tool_execution(
+        config: RunnableConfig,
+        accepted: Sequence[ClarifyToolCall],
+        results: Sequence[BaseMessage],
+    ) -> None:
+        """Commit the terminal facts of the clarify lane's dispatch."""
+        if tool_ledger is None or not accepted:
+            return
+        tracker = _correction_tracker_for(config, tool_ledger)
+        validated = [
+            _accepted_call(
+                tracker,
+                name=call.name,
+                args=call.args,
+                tool_call_id=call.tool_call_id,
+                logical_call_id=call.logical_call_id,
+                model_attempt=call.model_attempt,
+                execution_attempt=call.execution_attempt,
+            )
+            for call in accepted
+        ]
+        _record_tool_outcome_facts(
+            tool_ledger,
+            config,
+            _execution_observations(validated, results),
+        )
 
     # ----- node functions -----
 
@@ -7048,9 +7882,20 @@ def compile_graph(
             "track": "grounded",
         }
 
-    def tool_node_with_summaries(state: AgentState) -> dict[str, Any]:
-        """Run the prebuilt ToolNode, then append human-readable
-        one-liners to ``state['tool_summaries']``.
+    def tool_node_with_summaries(
+        state: AgentState, config: RunnableConfig
+    ) -> dict[str, Any]:
+        """Validate the pending calls, run the accepted ones, summarize.
+
+        Every model-emitted tool call is checked against its canonical
+        contract BEFORE the prebuilt ToolNode sees anything (P3 T2/T3).
+        The first invalid response for a logical call answers one safe,
+        value-free correction; the second is the typed terminal
+        ``tool_validation_exhausted``. Neither reaches the tool body.
+        Valid siblings in the same model turn still run, and the real
+        results and validation errors are assembled back in the order the
+        model emitted them. Then append human-readable one-liners to
+        ``state['tool_summaries']``.
 
         Why a wrapper (vs. registering ToolNode directly): the
         summaries are presentation state derived from the SAME
@@ -7076,16 +7921,99 @@ def compile_graph(
         具名失败 (T3) reads it.
         """
         pending = list(_pending_tool_calls(state))
-        raw_update: Any = tool_dispatcher.invoke(state)
+        tracker = _correction_tracker_for(config, tool_ledger)
+        validated = _validate_pending_tool_calls(
+            pending,
+            tracker,
+            turn_id=_turn_id_for_state(state),
+        )
+        accepted = [call for call in validated if call.accepted]
+        # P3 T5: a call that is a DUPLICATE DELIVERY of an attempt this
+        # run already succeeded, or whose business operation is known
+        # succeeded/failed (or still unknown), is answered with a typed
+        # error instead of being dispatched.
+        refusals: dict[str, ToolMessage] = {}
+        facts: Sequence[Any] | None = None
+        if tool_ledger is not None:
+            facts = _run_facts(tool_ledger, config)
+            for call in accepted:
+                refusal = _execution_refusal(facts, call)
+                if refusal is not None:
+                    refusals[call.tool_call_id] = refusal
+        dispatchable = [
+            call for call in accepted if call.tool_call_id not in refusals
+        ]
+        # The execution attempt of every dispatchable call is allocated
+        # per LOGICAL CALL, never per model attempt: the two identities
+        # stay separate in the ledger.
+        dispatchable = [
+            dataclass_replace(
+                call,
+                execution_attempt=tracker.next_execution_attempt(
+                    call.outcome.logical_call_id
+                ),
+            )
+            for call in dispatchable
+            if call.outcome is not None
+        ]
+        # A refused call records nothing: its decision came from facts
+        # already committed, and a refusal starts no execution.
+        recorded = [
+            call for call in validated if call.tool_call_id not in refusals
+        ]
+        recorded_dispatchable = [
+            call for call in dispatchable if call.tool_call_id not in refusals
+        ]
+        if tool_ledger is not None:
+            # P3 T4: the step's canonical facts commit as fenced ledger
+            # writes under this worker attempt. The FIRST write carries
+            # what is known BEFORE the dispatch (the schema verdict and
+            # the in-flight fact), so a crash between the effect and its
+            # result still leaves a durable in-flight record; the
+            # terminal facts follow in a SECOND write. No ledger (the
+            # fake/test path) writes nothing.
+            _record_tool_outcome_facts(
+                tool_ledger,
+                config,
+                [
+                    *_validation_observations(recorded),
+                    *_in_flight_observations(recorded_dispatchable),
+                ],
+            )
+        if dispatchable:
+            raw_update: Any = tool_dispatcher.invoke(
+                _state_with_accepted_tool_calls(
+                    state, {call.tool_call_id for call in dispatchable}
+                )
+            )
+        else:
+            # An all-invalid, all-blocked (or empty) step must not invoke
+            # any tool.
+            raw_update = {"messages": []}
 
         merged = _fold_tool_update(raw_update)
         merged_messages = merged["messages"]
         merged_evidence = merged["evidence"]
         merged_outcomes = merged["retrieve_outcomes"]
 
-        new_summaries = _build_tool_summaries(pending, merged_messages)
-        update: dict[str, Any] = {"messages": merged_messages}
-        if any(name == RETRIEVE_TOOL for name, _args, _id in pending):
+        if tool_ledger is not None:
+            _record_tool_outcome_facts(
+                tool_ledger,
+                config,
+                _execution_observations(recorded_dispatchable, merged_messages),
+            )
+        ordered_messages = _messages_in_call_order(
+            validated, [*merged_messages, *refusals.values()]
+        )
+        new_summaries = _build_tool_summaries(
+            [
+                (call.name, call.args, call.tool_call_id)
+                for call in accepted
+            ],
+            ordered_messages,
+        )
+        update: dict[str, Any] = {"messages": ordered_messages}
+        if any(call.name == RETRIEVE_TOOL for call in dispatchable):
             # GE-2: the invocation is recorded even when the tool's Command
             # records no outcome (typed EXIT / binding refusal); see
             # ``AgentState.retrieve_attempted``. Omit the key when no
@@ -7162,7 +8090,79 @@ def compile_graph(
             ],
         }
 
-    def issuer_fanout_node(state: AgentState) -> dict[str, Any]:
+    def _fanout_validation_refusal(
+        state: AgentState,
+        config: RunnableConfig,
+        args: dict[str, Any],
+        tool_call_id: str,
+    ) -> dict[str, Any] | None:
+        """The refusal for a fan-out request the canonical contract rejects.
+
+        ``None`` when the request is valid. A rejected request is answered
+        with the SAME value-free payload the ordinary tool lane uses (a
+        fixed code plus, for a first failure, the field path and the
+        expected shape), it opens no branch, and the validation facts of
+        the call are recorded like every other rejected call.
+        """
+        if not tool_call_id:
+            # EXIT: no fan-out call is pending, so there is nothing to
+            # validate; the planner answers the empty request itself.
+            return None
+        tracker = _correction_tracker_for(config, tool_ledger)
+        tracker.begin_model_attempt(
+            [
+                {
+                    "name": ISSUER_FANOUT_TOOL,
+                    "args": args,
+                    "id": tool_call_id,
+                }
+            ],
+            turn_id=_turn_id_for_state(state),
+        )
+        try:
+            outcome = tracker.record_validation(
+                ISSUER_FANOUT_TOOL, args, tool_call_id=tool_call_id
+            )
+        except UnknownToolContract:
+            return None
+        if outcome.accepted:
+            return None
+        call = _ValidatedToolCall(
+            name=ISSUER_FANOUT_TOOL,
+            args=args,
+            tool_call_id=tool_call_id,
+            outcome=outcome,
+        )
+        if tool_ledger is not None:
+            _record_tool_outcome_facts(
+                tool_ledger, config, _validation_observations([call])
+            )
+        code = (
+            "invalid_tool_arguments"
+            if outcome.correction_offered
+            else "tool_validation_exhausted"
+        )
+        return {
+            "issuer_plan": {"error": code, "tool_call_id": tool_call_id},
+            "issuer_fanout": {},
+            # Clear any earlier fan-out's findings before this one's
+            # branches start writing to the additive channel.
+            "issuer_findings": FANOUT_RESET,
+            "messages": [_validation_error_message(call)],
+            "tool_summaries": [
+                {
+                    "name": ISSUER_FANOUT_TOOL,
+                    "summary": format_tool_summary(
+                        ISSUER_FANOUT_TOOL, result={"error": code}, args=None
+                    ),
+                    "tool_call_id": tool_call_id,
+                }
+            ],
+        }
+
+    def issuer_fanout_node(
+        state: AgentState, config: RunnableConfig
+    ) -> dict[str, Any]:
         """Plan the fan-out: normalize the roster and apply the cap.
 
         The cap is enforced HERE, on the request, before any branch
@@ -7177,8 +8177,17 @@ def compile_graph(
         ``empty_fanout`` is NOT terminal: no issuers to research is an
         empty-hit shape like ``{"filings": []}``, so the model gets the
         typed dict back and may continue with the ordinary tools.
+
+        The request is validated against the canonical
+        ``ResearchIssuersArgs`` contract BEFORE the plan runs: a roster
+        that is not a list of strings is refused with the same
+        value-free payload the ordinary tool lane uses, and no branch
+        opens.
         """
         args, tool_call_id = _first_fanout_call(state)
+        refusal = _fanout_validation_refusal(state, config, args, tool_call_id)
+        if refusal is not None:
+            return refusal
         question = ""
         for message in reversed(state.get("messages") or []):
             if isinstance(message, HumanMessage):
@@ -7626,6 +8635,8 @@ def compile_graph(
         read_profile_text=_read_profile_text,
         clarify_binding=_clarify_binding,
         clarify_tool_dispatcher=clarify_tool_dispatcher,
+        validate_clarify_tool_calls=_validate_clarify_tool_calls,
+        record_clarify_tool_execution=_record_clarify_tool_execution,
         list_files_tool=list_files_tool,
         step_cap=step_cap,
         cpath=cpath,
@@ -7911,6 +8922,12 @@ def compile_graph(
         visual_ledger_factory=visual_ledger_factory,
         run_call_supervisor=run_call_supervisor,
         run_call_context_registry=run_call_context_registry,
+        # P1 T3: options only — the durable admission coordinator is
+        # carried for callers, never consulted while building topology.
+        runtime=runtime,
+        # P3 T4: the tool node writes its facts here; the ledger is also
+        # carried on the proxy so a caller can read the run back.
+        tool_ledger=tool_ledger,
         # T6: memory_port changes the bound tool set (ON adds three
         # tools; OFF keeps the eight ToolNode tools), so the cache must
         # distinguish graphs by memory surface. Keep the port itself
@@ -7984,6 +9001,8 @@ def _make_locked_graph(
     visual_ledger_factory: Callable[[], Any] | None = None,
     run_call_supervisor: RunCallSupervisor | None = None,
     run_call_context_registry: RunCallContextRegistry | None = None,
+    runtime: RuntimeCoordinator | None = None,
+    tool_ledger: ToolOutcomeLedgerPort | None = None,
     memory_port: Any | None = None,
     enable_choice_window: bool = False,
     attachment_service: Any | None = None,
@@ -8039,6 +9058,14 @@ def _make_locked_graph(
         scope_restriction,
         _IdentityKey(run_call_supervisor),
         _IdentityKey(run_call_context_registry),
+        # P1 T3: the coordinator is what the caller reads off the proxy. A
+        # cached compile made with a different boot's runtime must never be
+        # served to this caller.
+        _IdentityKey(runtime),
+        # P3 T4: the ledger decides whether the tool node records facts at
+        # all, so a cached compile made without one must never be served to
+        # a wired caller (same rule as the runtime coordinator).
+        _IdentityKey(tool_ledger),
     )
     cached = _IDEMPOTENCE_CACHE.get(key)
     if cached is not None:
@@ -8053,6 +9080,8 @@ def _make_locked_graph(
         visual_ledger_factory=visual_ledger_factory,
         run_call_supervisor=run_call_supervisor,
         run_call_context_registry=run_call_context_registry,
+        runtime=runtime,
+        tool_ledger=tool_ledger,
     )
     _IDEMPOTENCE_CACHE[key] = proxy
     return proxy
@@ -8198,6 +9227,8 @@ class _LockedGraph:
         visual_ledger_factory: Callable[[], Any] | None = None,
         run_call_supervisor: RunCallSupervisor | None = None,
         run_call_context_registry: RunCallContextRegistry | None = None,
+        runtime: RuntimeCoordinator | None = None,
+        tool_ledger: ToolOutcomeLedgerPort | None = None,
     ) -> None:
         self._graph = compiled_graph
         # ``recursion_limit`` is exposed via the public attribute
@@ -8227,6 +9258,12 @@ class _LockedGraph:
         self._visual_ledger_factory = visual_ledger_factory
         self.run_call_supervisor = run_call_supervisor
         self._run_call_context_registry = run_call_context_registry
+        # P1 T3: the durable admission coordinator the compile root built,
+        # or ``None`` for direct callers and the test surface.
+        self.runtime = runtime
+        # P3 T4: the append-only outcome ledger this compile's tool node
+        # writes to, or ``None`` for a graph that records no facts.
+        self.tool_ledger = tool_ledger
         self._thread_locks: dict[str, threading.Lock] = {}
         self._meta_lock = threading.Lock()
 

@@ -47,7 +47,9 @@ from fin.host.graph import (
     _MissSourceReader,
     compile_graph,
 )
+from test_tool_contracts import _canonical
 from fin.host.stream_map import format_tool_summary
+from fin.host.tools.contracts import contract_for
 from fin.host.tools.read_source import read_source
 from fin.retrieve.fake_port import FakeRetrievePort
 from fin.retrieve.source_read import (
@@ -227,6 +229,28 @@ def _invoke_tool(
             "id": "c-read-source",
             "type": "tool_call",
         },
+        config={"configurable": {"thread_id": thread_id}},
+    )
+
+
+def _invoke_domain(
+    tool: Any,
+    *,
+    source_ref: Mapping[str, Any],
+    position: int | Any = 0,
+    thread_id: str = "t-run",
+) -> Any:
+    """Call the tool body directly, below the canonical schema.
+
+    ``tool.invoke`` now rejects a malformed locator with the contract's
+    typed outcome before the body runs (P3 T2). These cases pin the domain
+    wrapper beneath that boundary, which still owns the ``invalid_locator``
+    verdict for a direct caller.
+    """
+    return tool.func(
+        source_ref=dict(source_ref),
+        position=position,
+        tool_call_id="c-read-source",
         config={"configurable": {"thread_id": thread_id}},
     )
 
@@ -553,7 +577,7 @@ def test_malformed_locators_keep_typed_refusal_and_admit_no_evidence(
         lambda thread_id: AttachmentSourceReader(object(), thread_id),
     )
 
-    command = _invoke_tool(tool, source_ref=source_ref)
+    command = _invoke_domain(tool, source_ref=source_ref)
 
     assert _tool_payload(command) == {"error": "invalid_locator", "reason": reason}
     assert _command_update(command)["evidence"] == []
@@ -714,7 +738,7 @@ def test_model_supplied_thread_id_cannot_widen_the_scope() -> None:
         lambda thread_id: seen.append(thread_id) or _SlicingReader(UNIT_TEXT),
     )
 
-    _invoke_tool(
+    _invoke_domain(
         tool,
         source_ref=_attachment_ref(thread_id="other-thread"),
         thread_id="t-trusted",
@@ -782,41 +806,18 @@ def test_graph_bound_read_source_schema_describes_both_locator_shapes() -> None:
     schema = tool.tool_call_schema.model_json_schema()
     source_ref = schema["properties"]["source_ref"]
 
-    assert source_ref == {
-        "title": "Source Ref",
-        "anyOf": [
-            {
-                "type": "object",
-                "properties": {
-                    "document_id": {"type": "string", "minLength": 1},
-                    "version": {"type": "string", "minLength": 1},
-                    "unit": {"type": "integer", "minimum": 1},
-                },
-                "required": ["document_id", "version", "unit"],
-                "additionalProperties": False,
-            },
-            {
-                "type": "object",
-                "properties": {
-                    "kind": {"type": "string", "enum": ["attachment"]},
-                    "attachment_id": {"type": "string", "minLength": 1},
-                    "version": {
-                        "anyOf": [
-                            {"type": "string", "pattern": "^(0|[1-9][0-9]*)$"},
-                            {"type": "integer", "minimum": 0},
-                        ]
-                    },
-                    "unit": {"type": "integer", "minimum": 1},
-                },
-                "required": ["kind", "attachment_id", "version", "unit"],
-                "additionalProperties": False,
-            },
-        ]
-    }
+    # The canonical contract model is now the exposure source, and the
+    # bound tool exposes exactly that model: the declared shape (and
+    # ``const`` vs ``enum`` for the single Literal) is the one the model
+    # sees, with no second schema beside it.
+    canonical = contract_for("read_source").args_model.model_json_schema()
+    assert _canonical(source_ref, schema) == _canonical(
+        canonical["properties"]["source_ref"], canonical
+    )
     model_schema = convert_to_openai_tool(tool)["function"]["parameters"]
-    assert model_schema["properties"]["source_ref"] == {
-        key: value for key, value in source_ref.items() if key != "title"
-    }
+    assert _canonical(
+        model_schema["properties"]["source_ref"], model_schema
+    ) == _canonical(source_ref, schema)
 
 
 class _RecordingModel:

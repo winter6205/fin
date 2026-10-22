@@ -42,7 +42,15 @@ ROOT = Path(__file__).resolve().parents[1]
 # The capability packages the boundary rule governs. The application
 # boundary is not one of them: it owns composition and lifetime, so it
 # reaches the graph composition root on purpose (plan T3).
-HOST_CAPABILITIES = ("attachment", "evidence", "grounded", "question", "session", "task")
+HOST_CAPABILITIES = (
+    "attachment",
+    "evidence",
+    "grounded",
+    "question",
+    "runtime",
+    "session",
+    "task",
+)
 WEB_CAPABILITIES = ("clarification", "evidence", "task", "trace")
 
 # A capability package must not import these modules at all. Matched by

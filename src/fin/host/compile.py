@@ -53,6 +53,13 @@ when those heavy runtime deps are missing or have been replaced
 in ``sys.modules`` by a test fixture. Production boot pulls the
 real symbols; tests inject fakes.
 
+The real saver is recognized by class identity, not by importing its
+module: :func:`_is_installed_postgres_saver` matches the defining module
+and name in the saver's MRO. Importing ``langgraph.checkpoint.postgres``
+evaluates a module-level psycopg pool annotation, so it must stay inside
+the production boot path. A test double is defined in its own module, so
+it never matches and keeps the un-fenced pre-P1 shape.
+
 URL contract (OpenAI SDK)
 --------------------------
 ``ChatOpenAI`` is built on the official ``openai`` SDK; the
@@ -91,6 +98,10 @@ from fin.host.memory_port import (
     MemoryPort,
     build_memory_port,
 )
+from fin.host.runtime.admission import RuntimeCoordinator
+from fin.host.runtime.schema import RuntimeStoreError
+from fin.host.runtime.store import PostgresRuntimeStore
+from fin.host.tools.ledger import PostgresToolOutcomeLedger
 from fin.host.run_call_supervisor import (
     RunCallCancelled,
     RunCallContextRegistry,
@@ -102,6 +113,14 @@ from fin.host.stream_map import reasoning_preserving_chat_openai
 if TYPE_CHECKING:
     # Type-only import: attachment_vision imports this module at runtime.
     from fin.host.attachment.attachment_prepare import AttachmentPreparationService
+
+
+# The real saver's identity is recognized by its defining module and name,
+# NOT by importing it here: importing ``langgraph.checkpoint.postgres``
+# evaluates its module-level psycopg pool annotation, so it must stay inside
+# the production boot where the dependency already exists.
+_INSTALLED_POSTGRES_SAVER_MODULE: Final[str] = "langgraph.checkpoint.postgres"
+_INSTALLED_POSTGRES_SAVER_NAME: Final[str] = "PostgresSaver"
 
 
 # ----- public constants -----
@@ -168,6 +187,14 @@ CHECKPOINT_CONNECT_TIMEOUT_SECONDS: Final[int] = 2
 CHECKPOINT_LOCK_TIMEOUT_MS: Final[int] = 2000
 CHECKPOINT_STATEMENT_TIMEOUT_MS: Final[int] = 5000
 _CHECKPOINT_LOCK_POLL_SECONDS: Final[float] = 0.025
+
+# Durable Runtime admission limits (ADR 0103). Both are configuration, so
+# an impossible value stops the boot instead of surfacing as a request
+# outcome. The defaults match ``RuntimeCoordinator``.
+RUNTIME_QUEUE_CAPACITY_ENV: Final[str] = "FIN_RUNTIME_QUEUE_CAPACITY"
+RUNTIME_LEASE_SECONDS_ENV: Final[str] = "FIN_RUNTIME_LEASE_SECONDS"
+DEFAULT_RUNTIME_QUEUE_CAPACITY: Final[int] = 8
+DEFAULT_RUNTIME_LEASE_SECONDS: Final[float] = 30.0
 
 
 class _RunAwareCheckpointLock:
@@ -388,6 +415,14 @@ class CheckpointSetupError(HostCompileError):
     """
 
 
+class RuntimeConfigError(HostCompileError):
+    """A durable Runtime admission setting is missing, malformed or unusable."""
+
+    def __init__(self, env_var: str, reason: str = "must be a positive number") -> None:
+        self.env_var = env_var
+        super().__init__(f"{env_var} {reason}")
+
+
 # ----- env helpers -----
 
 
@@ -404,6 +439,61 @@ def _read_env(
     if value is None or value.strip() == "":
         return None
     return value
+
+
+def runtime_queue_capacity(env: Mapping[str, str] | None = None) -> int:
+    """The per-thread accepted-operation bound for this boot."""
+    raw = _read_env(env, RUNTIME_QUEUE_CAPACITY_ENV)
+    if raw is None:
+        return DEFAULT_RUNTIME_QUEUE_CAPACITY
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeConfigError(
+            RUNTIME_QUEUE_CAPACITY_ENV, "must be an integer"
+        ) from exc
+    if value < 1:
+        raise RuntimeConfigError(
+            RUNTIME_QUEUE_CAPACITY_ENV, "must be at least 1"
+        )
+    return value
+
+
+def runtime_lease_seconds(env: Mapping[str, str] | None = None) -> float:
+    """The lease bound for one worker attempt, in seconds."""
+    raw = _read_env(env, RUNTIME_LEASE_SECONDS_ENV)
+    if raw is None:
+        return DEFAULT_RUNTIME_LEASE_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeConfigError(
+            RUNTIME_LEASE_SECONDS_ENV, "must be a number"
+        ) from exc
+    if value <= 0:
+        raise RuntimeConfigError(
+            RUNTIME_LEASE_SECONDS_ENV, "must be positive"
+        )
+    return value
+
+
+def _is_installed_postgres_saver(saver: Any) -> bool:
+    """True only for the real saver class (or a subclass), never a double.
+
+    Identity is the defining module and name in the MRO, which recognizes a
+    real production saver without importing langgraph's Postgres module into
+    every ``fin.host.compile`` importer. A test double is defined in its own
+    module, so it never matches.
+    """
+    for base in type(saver).__mro__:
+        if (
+            getattr(base, "__module__", None)
+            == _INSTALLED_POSTGRES_SAVER_MODULE
+            and getattr(base, "__name__", None)
+            == _INSTALLED_POSTGRES_SAVER_NAME
+        ):
+            return True
+    return False
 
 
 def _resolve_retrieve_adapter(env: Mapping[str, str] | None) -> str:
@@ -506,6 +596,58 @@ def _build_default_model(
         timeout=120.0,
         max_retries=0,
     )
+
+
+def _fence_checkpoint_saver(
+    saver: Any,
+    *,
+    url: str,
+    env: Mapping[str, str] | None,
+) -> RuntimeCoordinator:
+    """Attach Runtime ownership to a real production saver.
+
+    Called only when the saver is the installed ``PostgresSaver``. A test
+    double has no connection or lock to fence, and pretending it did would
+    hide a missing adapter instead of failing closed.
+
+    The Runtime store is a separate short-transaction connection pool, so it
+    is built from the operator URL rather than the saver's bounded session.
+    An unusable store becomes the same typed boot stop as a broken
+    checkpointer schema; the caller closes the acquisition stack.
+    """
+    from fin.host.runtime.fencing import fence_postgres_saver
+
+    capacity = runtime_queue_capacity(env)
+    lease = runtime_lease_seconds(env)
+    try:
+        store = PostgresRuntimeStore(url)
+        store.setup()
+    except RuntimeStoreError as exc:
+        raise CheckpointSetupError(
+            "could not initialize the durable Runtime store"
+        ) from exc
+    coordinator = RuntimeCoordinator(
+        store, queue_capacity=capacity, lease_seconds=lease
+    )
+    fence_postgres_saver(saver, store)
+    return coordinator
+
+
+def _open_tool_outcome_ledger(url: str) -> PostgresToolOutcomeLedger:
+    """The append-only tool outcome ledger beside the Runtime store.
+
+    Same database and URL as the store: every fact is fenced against the
+    very attempt rows the store owns. A broken setup is the same typed boot
+    stop as a broken checkpointer schema.
+    """
+    try:
+        ledger = PostgresToolOutcomeLedger(url)
+        ledger.setup()
+    except RuntimeStoreError as exc:
+        raise CheckpointSetupError(
+            "could not initialize the tool outcome ledger"
+        ) from exc
+    return ledger
 
 
 # ----- the helper -----
@@ -688,9 +830,21 @@ def compile_runtime_handle(
         stack.close()
         raise
 
+    runtime: RuntimeCoordinator | None = None
+    tool_ledger: PostgresToolOutcomeLedger | None = None
     try:
         saver.setup()
         bind_checkpoint_session_bounds(saver, url)
+        # P1 T3: a real saver gains the generation-aware fencing adapter and
+        # the coordinator the compiled graph exposes. A test double keeps the
+        # pre-P1 shape with ``runtime=None`` — it cannot offer atomic fencing,
+        # so this is a test seam, never a production fallback.
+        if _is_installed_postgres_saver(saver):
+            runtime = _fence_checkpoint_saver(saver, url=url, env=env)
+            # P3 T4: the tool outcome ledger lives in the same database and
+            # is fenced by the same worker attempts, so a real boot records
+            # its tool facts and a fake saver records none.
+            tool_ledger = _open_tool_outcome_ledger(url)
         run_call_context_registry = RunCallContextRegistry()
         _bind_checkpoint_run_cancellation(saver, run_call_context_registry)
     except psycopg.OperationalError as exc:
@@ -786,6 +940,12 @@ def compile_runtime_handle(
             # whose lifetime is the APPLICATION's, not this compile's.
             run_call_supervisor=run_call_supervisor,
             run_call_context_registry=run_call_context_registry,
+            # P1 T3: ``None`` for the fake/test path; a real boot exposes the
+            # durable admission coordinator on the compiled proxy.
+            runtime=runtime,
+            # P3 T4: ``None`` for the fake/test path; a real boot records
+            # every tool step's canonical facts in the ledger.
+            tool_ledger=tool_ledger,
         )
     except BaseException:
         stack.close()
@@ -873,7 +1033,10 @@ __all__ = [
     "HostCompileError",
     "MissingCheckpointURLError",
     "MissingModelError",
+    "RuntimeConfigError",
     "compile_for_runtime",
     "compile_for_runtime_dev",
     "compile_runtime_handle",
+    "runtime_lease_seconds",
+    "runtime_queue_capacity",
 ]

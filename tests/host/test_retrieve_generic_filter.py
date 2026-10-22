@@ -108,11 +108,19 @@ def test_host_tool_surfaces_the_port_refusal_envelope() -> None:
     """A port ``invalid_filter`` refusal reaches the model as the error
     dict — no chunks, no rewrite, no evidence."""
     port = _RecordingPort(result={"error": "invalid_filter"})
-    command = _invoke(port, filters={"cik": "1"})
+    # ``{"company": "Acme"}`` is SHAPE-valid: the canonical schema owns the
+    # shape (the four keys, value bounds), while the port owns the semantic
+    # refusal. A shape-valid map therefore reaches the port, so this test
+    # observes the port's own ``invalid_filter`` verdict forwarded unchanged.
+    command = _invoke(port, filters={"company": "Acme"})
     payload = json.loads(command.update["messages"][0].content)
     assert payload == {"error": "invalid_filter"}
     assert "chunks" not in payload
     assert not command.update.get("evidence")
+    # The refusal is the port's, not a host-side shape rejection: the call
+    # was actually forwarded with the shape-valid map.
+    assert len(port.calls) == 1
+    assert port.calls[0]["filters"] == {"company": "Acme"}
 
 
 # ----- a generic filter beside a structured request is refused, not dropped -----

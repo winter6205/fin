@@ -842,7 +842,12 @@ def test_unknown_tool_name_becomes_error_tool_message():
 
     tool_messages = [m for m in out["messages"] if isinstance(m, _TM)]
     assert len(tool_messages) == 1
-    assert "nonexistent_tool" in str(tool_messages[0].content)
+    # P3 T2: the validation boundary answers the typed unknown-tool code,
+    # names the call on the message, and never echoes the submitted args.
+    assert json.loads(str(tool_messages[0].content)) == {"error": "unknown_tool"}
+    assert tool_messages[0].name == "nonexistent_tool"
+    assert tool_messages[0].status == "error"
+    assert '"x"' not in str(tool_messages[0].content)
 
 
 def test_malformed_evidence_raises_typed_error(aapl_page1_text):

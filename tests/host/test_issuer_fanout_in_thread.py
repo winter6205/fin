@@ -16,6 +16,7 @@ synthesized answer. This suite pins that shape end to end:
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -161,12 +162,14 @@ def _run(
     thread_id: str,
     question: str = FANOUT_QUESTION,
     config_extra: dict[str, Any] | None = None,
+    ledger: Any | None = None,
 ) -> dict:
     graph = compile_graph(
         checkpointer=InMemorySaver(),
         model=ScriptedChatModel(script=script),
         adapter=adapter,
         known_document_ids=KNOWN_IDS,
+        tool_ledger=ledger,
     )
     configurable: dict[str, Any] = {"thread_id": thread_id}
     configurable.update(config_extra or {})
@@ -494,6 +497,130 @@ def test_empty_roster_is_a_typed_exit_the_model_can_see() -> None:
     # match, so it bounces to the repair cap and refuses).
     assert out["status"] in ("refuse", "done", "step_cap")
     assert port.queries == []
+
+
+# ----- the request is validated against the canonical contract ------------
+
+
+def _raw_fanout_call(issuers: Any, query: str = QUERY) -> AIMessage:
+    """A fan-out call whose ``issuers`` is whatever the model typed.
+
+    ``args`` are passed through untouched on purpose: the point of these
+    cases is that the RUNTIME refusal happens before the planner can
+    raise or fan out per character.
+    """
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": ISSUER_FANOUT_TOOL,
+                "args": {"issuers": issuers, "query": query},
+                "id": "c-fanout",
+                "type": "tool_call",
+            }
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    "issuers",
+    [5, "AAPL"],
+    ids=["wrong-type-int", "wrong-type-string"],
+)
+def test_a_wrong_typed_roster_is_refused_before_the_fanout(
+    issuers: Any,
+) -> None:
+    """A non-list roster is a schema refusal, not a TypeError or a fan-out.
+
+    ``5`` used to raise ``TypeError`` inside the planner and ``"AAPL"``
+    used to fan out per character; both now answer the model with the
+    same value-free payload the ordinary tool lane uses.
+    """
+    port = RecordingPort(issuers=CAP_ROSTER)
+    out = _run(
+        [_raw_fanout_call(issuers), AIMessage(content="Answer.")],
+        adapter=port,
+        thread_id=f"t-fanout-invalid-{type(issuers).__name__}",
+    )
+
+    messages = _tool_messages(out, ISSUER_FANOUT_TOOL)
+    assert len(messages) == 1, messages
+    payload = json.loads(str(messages[0].content))
+    assert payload["error"] == "invalid_tool_arguments"
+    # Value-free: the submitted roster is not echoed back.
+    assert str(issuers) not in str(messages[0].content)
+    assert "issuers" in payload["feedback"]
+    # No branch opened and no worker ran.
+    assert port.queries == []
+    assert out.get("issuer_findings") == []
+    assert out.get("issuer_plan", {}).get("error") == "invalid_tool_arguments"
+
+
+def test_a_refused_roster_is_never_a_type_error() -> None:
+    """The refusal is a value the run carries, not an exception."""
+    port = RecordingPort(issuers=CAP_ROSTER)
+    out = _run(
+        [_raw_fanout_call(5), AIMessage(content="Answer.")],
+        adapter=port,
+        thread_id="t-fanout-no-typeerror",
+    )
+    assert out["messages"]
+    assert "TypeError" not in str(out["messages"])
+    assert "Traceback" not in str(out["messages"])
+
+
+class _RecordingLedger:
+    """The ledger port, captured in memory."""
+
+    def __init__(self) -> None:
+        self.observations: list[Any] = []
+
+    def record(
+        self,
+        observations: Any,
+        *,
+        thread_id: str,
+        run_id: str,
+        attempt_id: str,
+        attempt_generation: int,
+        thread_generation: int,
+    ) -> int:
+        self.observations.extend(observations)
+        return len(observations)
+
+    def read_run(self, run_id: str) -> Any:
+        return ()
+
+
+def test_a_refused_roster_records_its_validation_facts() -> None:
+    """The refusal is a ledger fact, not a silent rejection.
+
+    The refused fan-out commits the same schema verdict the ordinary
+    tool lane commits, so the measurement source sees the rejection.
+    """
+    ledger = _RecordingLedger()
+    port = RecordingPort(issuers=CAP_ROSTER)
+    _run(
+        [_raw_fanout_call(5), AIMessage(content="Answer.")],
+        adapter=port,
+        thread_id="t-fanout-validation-facts",
+        ledger=ledger,
+        config_extra={
+            "runtime_run_id": "run-fanout-1",
+            "runtime_attempt_id": "attempt-1",
+            "runtime_attempt_generation": 1,
+            "thread_generation": 1,
+        },
+    )
+
+    kinds = [observation.kind for observation in ledger.observations]
+    assert kinds == ["schema_rejected", "correction_offered"], kinds
+    assert {
+        observation.tool_name for observation in ledger.observations
+    } == {ISSUER_FANOUT_TOOL}
+    # The fact carries the field path, never the submitted roster.
+    assert ledger.observations[0].field_paths == ("issuers",)
+    assert "5" not in repr(ledger.observations)
 
 
 # ----- the single citation verifier still gates the synthesis -----

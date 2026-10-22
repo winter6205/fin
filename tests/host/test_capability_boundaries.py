@@ -26,7 +26,15 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / "scripts" / "check_capability_boundaries.py"
 
-HOST_CAPABILITIES = ("attachment", "evidence", "grounded", "question", "session", "task")
+HOST_CAPABILITIES = (
+    "attachment",
+    "evidence",
+    "grounded",
+    "question",
+    "runtime",
+    "session",
+    "task",
+)
 WEB_CAPABILITIES = ("clarification", "evidence", "task", "trace")
 
 

@@ -255,15 +255,15 @@ class _FakeGraph:
 
 def _install_resume_recorder(
     monkeypatch: pytest.MonkeyPatch, raises_for: str | None = None
-) -> list[tuple[str, str, Any, dict[str, Any]]]:
+) -> list[tuple[str, str, Any, dict[str, Any], Any]]:
     """Record (and optionally poison) the shared resume drive.
 
     ``_resume_one_attachment_wait`` calls exactly ``_resume_run_stream``
     to drive a resume, so this is the honest stand-in seam: the
-    recording pins the resume VALUE and CONFIG the sweep builds, and
-    ``raises_for`` addresses a failure to one thread.
+    recording pins the resume VALUE, CONFIG and durable intent the sweep
+    builds, and ``raises_for`` addresses a failure to one thread.
     """
-    driven: list[tuple[str, str, Any, dict[str, Any]]] = []
+    driven: list[tuple[str, str, Any, dict[str, Any], Any]] = []
 
     def _fake(
         graph: Any,
@@ -276,8 +276,11 @@ def _install_resume_recorder(
         resume_config: dict[str, Any],
         receipts: Any = None,
         attachments: Any = None,
+        operation_input: Any = None,
     ) -> Iterator[str]:
-        driven.append((thread_id, run_id, resume_input, resume_config))
+        driven.append(
+            (thread_id, run_id, resume_input, resume_config, operation_input)
+        )
         if thread_id == raises_for:
             raise RuntimeError("poisoned checkpoint")
         return iter(())
@@ -654,11 +657,14 @@ def test_run_id_is_read_from_the_checkpoint_and_a_pause_without_one_waits(
         graph, threads, service, RunControl(), tid, workspace_root=tmp_path
     )
     assert ok is True
-    thread_id, run_id, resume_input, resume_config = driven[0]
+    thread_id, run_id, resume_input, resume_config, operation_input = driven[0]
     assert (thread_id, run_id) == (tid, "run-checkpoint")
     assert resume_config["configurable"]["thread_id"] == tid
     assert resume_config["configurable"]["run_id"] == "run-checkpoint"
     assert resume_config["configurable"]["workspace_root"] == str(tmp_path)
+    # The durable intent names the attachments, so a repeated notification
+    # lands on the same operation and a different one on its own.
+    assert operation_input == {"kind": "resume", "attachment_ids": ["att-1"]}
     # The pinned value shape: langgraph chokes on ``Command(resume=None)``
     # in this version, so the auto-resumer always sends a string sentinel.
     assert isinstance(resume_input, Command)

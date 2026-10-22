@@ -93,8 +93,10 @@ logger = logging.getLogger(__name__)
 
 # A plotted-value target part is a name the model typed, not a document: it
 # is bounded so one ask cannot smuggle a page of prose into the provider
-# prompt, the stored coverage record, and the claim row.
-_MAX_DETAIL_PART_CHARS: Final[int] = 120
+# prompt, the stored coverage record, and the claim row. Public: the tool
+# contract enforces the same bound, so it reads it here instead of
+# re-spelling the number.
+MAX_DETAIL_PART_CHARS: Final[int] = 120
 
 _QUESTION_SHAPE: Final[str] = (
     "What value is plotted for {chart} / series {series} / category "
@@ -247,7 +249,7 @@ def _page_lane(record: AttachmentRecord) -> bool:
 def _parts_bounded(detail: VisualDetail) -> bool:
     """Whether each plotted-target part stays a name rather than a document."""
     parts = (detail.chart, detail.series, detail.category)
-    return all(0 < len(part) <= _MAX_DETAIL_PART_CHARS for part in parts)
+    return all(0 < len(part) <= MAX_DETAIL_PART_CHARS for part in parts)
 
 
 def _requested_crop(
@@ -871,6 +873,7 @@ def observation_text(envelope: ObservationEnvelope) -> tuple[str, bool]:
 
 
 __all__ = [
+    "MAX_DETAIL_PART_CHARS",
     "VisualDetail",
     "VisualReadFaces",
     "VisualReadRequest",

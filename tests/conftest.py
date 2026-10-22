@@ -309,26 +309,38 @@ def jev_live_client() -> JevChoiceClient:
     return build_jev_live_client(merged)
 
 
+#: Opt-in marks that appear outside a single test directory. Each is
+#: deselected unless the operator names it in ``-m``. The marks are
+#: independent: selecting one never drags the other's items into the run.
+_ROOT_OPT_IN_MARKS: tuple[str, ...] = ("jev_live", "runtime_pg")
+
+
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
-    """Deselect ``jev_live`` items unless the CLI ``-m`` names that mark.
+    """Deselect root-level opt-in items unless the CLI ``-m`` names the mark.
 
     The ADR 0080 live Jev Choice round-trip talks to ``api.typesafe.ai``,
-    so the default hermetic run must not reach it — and the mark appears in
-    more than one test directory, which is why the switch is here rather
-    than in a per-directory hook. Register-style: a CLI ``-m jev_live`` (or
-    any expression naming the mark) re-selects them. Other opt-in marks are
-    owned by the directory that uses them.
+    and the P1 ``runtime_pg`` suites require an isolated ``_test``
+    database. Neither may leak into the default hermetic run, and both
+    marks appear in more than one test directory, which is why the switch
+    is here rather than in a per-directory hook. Register-style: a CLI
+    ``-m jev_live`` (or any expression naming the mark) re-selects exactly
+    that mark's items. ``sql_live`` keeps its pre-P1 semantics; it is owned
+    by the suites that already used it. Other opt-in marks
+    (``soft_track``, ``memory_on``, ``mcp``) are owned by the directory
+    that uses them.
     """
     markexpr = config.getoption("markexpr") or ""
-    if "jev_live" in markexpr:
-        return
 
     kept: list[pytest.Item] = []
     deselected: list[pytest.Item] = []
     for item in items:
-        if item.get_closest_marker("jev_live") is not None:
+        if any(
+            mark not in markexpr
+            and item.get_closest_marker(mark) is not None
+            for mark in _ROOT_OPT_IN_MARKS
+        ):
             deselected.append(item)
         else:
             kept.append(item)
